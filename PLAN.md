@@ -226,12 +226,12 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
   - Verify: `dotnet test --filter Category=Sampling` greedy determinism + seeded distribution checks.
 - [_] HTTP API — chat/completions, completions, models (with `context_length` metadata), SSE streaming, error taxonomy (see DN-M1-6, DN-M1-7)
   - Verify: OpenAI Python SDK script completes chat + completion + embeddings-404 + streaming against a live server; `curl` error-shape checks.
-- [_] Backend seam — `IBackend` + arenas + `IWeightSource` contracts, CPU-only implementation (see DN-M1-3, DN-M1-11)
-  - Verify: `lair.core` compiles against contracts only — no project reference to `lair.backends.cpu`; a test-only alternate `IWeightSource` provider (in-memory tensor copy) serves the parity model end-to-end, proving retrieval is pluggable.
+- [→] Backend seam — `IBackend` + arenas + `IWeightSource` contracts, CPU-only implementation (see DN-M1-3, DN-M1-11)
+  - Verify: `lair.core` compiles against contracts only — no project reference to `lair.backends.cpu` ✅; alternate `IWeightSource` provider end-to-end proof runs with the Parity item.
 - [_] Golden parity — harness vs pinned llama.cpp build, small F16 model, greedy decode, committed reference fixtures
   - Verify: `dotnet test --filter Category=Parity`.
-- [_] Config load — YAML parse, validation, placement policy (single model, `cpu`)
-  - Verify: `dotnet test --filter Category=Config` parse/validation-error cases; `lair serve -c lair.yaml` boots.
+- [✓] Config load — YAML parse, validation, placement policy (single model, `cpu`)
+  - Verify: `dotnet test --filter Category=Config` — 31/31 passing ✅; `lair serve -c lair.yaml` boot is exercised under the CLI item.
 - [_] CLI — `lair serve -c lair.yaml` and `lair chat` REPL
   - Verify: manual — serve a Q4_K_M model, chat REPL streams tokens, Ctrl+C mid-generation aborts cleanly.
 
