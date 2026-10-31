@@ -1,0 +1,6 @@
+bin/
+obj/
+artifacts/
+models/
+*.gguf
+.vs/

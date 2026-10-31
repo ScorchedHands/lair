@@ -158,7 +158,7 @@ llama.cpp/ggml (fused dequant kernels, block quant formats, hybrid offload pitfa
 
 ## Phases
 
-### MVP1 [v0.1.0] - Refined
+### MVP1 [v0.1.0] - In Progress
 
 One dense GGUF model answers one OpenAI request, streamed, on CPU.
 
