@@ -210,8 +210,8 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 
 #### Implementation Items
 
-- [_] GGUF loader — mmap tensors, metadata, vocab (see DN-M1-3)
-  - Verify: `dotnet test --filter Category=Loader` against fixture GGUFs; `lair serve` loads SmolLM-135M-F16 and Qwen2-1.5B-Q4_K_M without error.
+- [→] GGUF loader — mmap tensors, metadata, vocab (see DN-M1-3)
+  - Verify: `dotnet test --filter Category=Loader` — 8/8 passing on synthetic GGUF v3 fixtures ✅ (incl. mmap byte-exactness); real-model load check (SmolLM-135M-F16, Qwen2-1.5B-Q4_K_M) runs at the CLI/Parity items.
 - [_] GGUF tokenizer — BPE + special tokens decode/encode
   - Verify: `dotnet test --filter Category=Tokenizer` round-trip against llama.cpp tokenization fixtures.
 - [_] Chat templates — mini Jinja-subset interpreter
