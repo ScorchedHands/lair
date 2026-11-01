@@ -211,7 +211,7 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 #### Implementation Items
 
 - [✓] GGUF loader — mmap tensors, metadata, vocab (see DN-M1-3)
-  - Verify: `dotnet test --filter Category=Loader` — 8/8 on synthetic GGUF v3 ✅; real-file load verified on SmolLM-135M-Instruct-F16.gguf via tokenizer integration ✅; Q4_K_M real load runs at Parity.
+  - Verify: `dotnet test --filter Category=Loader` — 8/8 on synthetic GGUF v3 ✅; real-file load verified on SmolLM-135M-Instruct-F16.gguf via tokenizer integration ✅; quantized real-load runs at Parity against a pinned Q8_0 build (SmolLM dims are not block-divisible, so llama.cpp's own quantizer emits legacy fallback tensors there); full Q4_K_M family support tracked in Backlog.
 - [✓] GGUF tokenizer — BPE + special tokens decode/encode
   - Verify: `dotnet test --filter Category=Tokenizer` — 18/18 ✅ (13 synthetic + 5 against the real SmolLM GGUF: ASCII/newline/emoji round-trips, control tokens).
 - [✓] Chat templates — mini Jinja-subset interpreter
@@ -228,8 +228,8 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
   - Verify: `dotnet test --filter Category=Api` — 10/10 ✅ against a live server on the real SmolLM fixture: non-stream chat + completions shapes, SSE chunk stream ending `[DONE]`, `/v1/models` with `context_length`, `/healthz`, embeddings-404, error taxonomy (model_not_found / context_length_exceeded / engine_overloaded / invalid_request), `x-lair-request-id` on every response. OpenAI Python SDK probe runs under Manual Serve.
 - [→] Backend seam — `IBackend` + arenas + `IWeightSource` contracts, CPU-only implementation (see DN-M1-3, DN-M1-11)
   - Verify: `lair.core` compiles against contracts only — no project reference to `lair.backends.cpu` ✅; alternate `IWeightSource` provider end-to-end proof runs with the Parity item.
-- [_] Golden parity — harness vs pinned llama.cpp build, small F16 model, greedy decode, committed reference fixtures
-  - Verify: `dotnet test --filter Category=Parity`.
+- [→] Golden parity — logit-agreement harness vs pinned llama.cpp (server-mode reference), committed fixtures with documented tolerance (see Decision Log 2026-11-01)
+  - Verify: `dotnet test --filter Category=Parity` — per-prompt position-0 distribution agreement: every reference top-5 token present in LAIR's top-8 with |Δlogprob| ≤ 0.25; full greedy continuations recorded for inspection but not string-compared (cross-tool exact match proven unattainable: pinned llama.cpp CLI and server disagree on identical temp-0 runs of the same model).
 - [✓] Config load — YAML parse, validation, placement policy (single model, `cpu`)
   - Verify: `dotnet test --filter Category=Config` — 31/31 passing ✅; `lair serve -c lair.yaml` boot is exercised under the CLI item.
 - [✓] CLI — `lair serve -c lair.yaml` and `lair chat` REPL
@@ -244,7 +244,7 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 - [✓] Automated Layers: per-layer activations vs hand-computed references + real-model smoke — 24/24
 - [✓] Automated Kv: block allocator alloc/free/reuse and budget enforcement — 8/8
 - [✓] Automated Sampling: determinism under greedy/seed; statistical top-k/p behavior — 9/9
-- [_] Automated Parity: token-sequence match vs llama.cpp reference on SmolLM-135M-F16, fixed prompts
+- [_] Automated Parity: logit-distribution agreement vs pinned llama.cpp server references on SmolLM-135M-F16 + Q4_K_M, fixed prompts — top-5 coverage within tolerance; argmax flips inside the near-tie band reported, not failed
 - [✓] Automated Config: YAML schema validation and error messages — 31/31
 - [_] Manual Serve: full serve→chat REPL session with streaming, abort, and reload-after-config-edit
 
@@ -518,6 +518,7 @@ Vision input on chat models.
 | idea | Prefill GEMM shim microkernel | tiled-matmul native microkernel via `[LibraryImport]` where the bench harness proves the managed tile wall |
 | idea | Core-set overcommit | allow models to share/partially oversubscribe core sets as an explicit knob |
 | idea | `auto` device fallback | silent CPU fallback when a configured CUDA device is absent — deliberately not a default (DN-M3-3) |
+| bug | Q4_K_M family coverage gap | kernels implement only the Q4_K block format; real Q4_K_M files mix Q5_K/Q6_K tensors, and non-block-divisible dims force legacy formats (Q4_0/Q5_0…) — loader/kernel extension needed before serving published quants in production |
 
 ## Decision Log
 
@@ -533,3 +534,4 @@ Vision input on chat models.
 - **2026-10-31 — Performance thesis vs incumbents.** CPU dense decode: parity with llama.cpp is plausible (bandwidth-bound; dotLLM already 66–88%). CPU prefill: parity only via `[LibraryImport]` microkernels, not pure managed. GPU: match vLLM's serving features (batching, paged KV, prefix caching), not its CUDA kernels. Over-perform target: CPU MoE decode via capacity/cost-model residency — mainline llama.cpp is weak there (ik_llama.cpp +15–160%) and the niche is open.
 - **2026-10-31 — License undecided.** Private repo for now; dotLLM is GPLv3 — its ideas may be studied, its code may not be copied into LAIR.
 - **2026-10-31 — MVP2–MVP5 refined.** Batch-step scheduling with decode priority and chunked prefill; hot-reload knob mutation classes; CUDA via nvcc microkernels + cuBLASLt with contiguous layer split and fail-fast device policy; multi-model admission via global ledger with no runtime preemption until MVP6 (backlog: preemptive KV swap); Flash-Next quants IQ3_XXS primary with Q4_K_M baseline behind a reality-check gate; expert-aware batching as the MoE engine win; MTP-only drafting at MVP5.
+- **2026-11-01 — Parity criterion is logit-distribution agreement, not exact token match.** Evidence from the pinned llama.cpp b12032 build: its own CLI and server modes produce different greedy (temp 0) continuations for identical prompts on SmolLM-135M-F16, and near-tie argmax flips (Δlogprob < 0.2) appear between any two independent fp pipelines. Cross-tool exact 48-token string equality is therefore unattainable; fixtures record position-0 top-5 logprobs from pinned server runs with a documented tolerance, and divergences inside the near-tie band are reported rather than failed.
