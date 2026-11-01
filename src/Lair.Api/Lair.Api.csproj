@@ -2,6 +2,13 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Lair.Core\Lair.Core.csproj" />
+    <ProjectReference Include="..\Lair.Loader\Lair.Loader.csproj" />
+    <ProjectReference Include="..\Lair.Backends.Cpu\Lair.Backends.Cpu.csproj" />
+    <ProjectReference Include="..\Lair.Kv\Lair.Kv.csproj" />
+    <ProjectReference Include="..\Lair.Tokenizer\Lair.Tokenizer.csproj" />
+    <ProjectReference Include="..\Lair.Sampling\Lair.Sampling.csproj" />
+    <ProjectReference Include="..\Lair.Models\Lair.Models.csproj" />
+    <ProjectReference Include="..\Lair.Host\Lair.Host.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
