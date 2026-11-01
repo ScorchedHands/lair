@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Lair.Core\Lair.Core.csproj" />
+    <ProjectReference Include="..\Lair.Loader\Lair.Loader.csproj" />
   </ItemGroup>
 
   <PropertyGroup>

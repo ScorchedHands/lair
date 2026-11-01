@@ -210,10 +210,10 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 
 #### Implementation Items
 
-- [→] GGUF loader — mmap tensors, metadata, vocab (see DN-M1-3)
-  - Verify: `dotnet test --filter Category=Loader` — 8/8 passing on synthetic GGUF v3 fixtures ✅ (incl. mmap byte-exactness); real-model load check (SmolLM-135M-F16, Qwen2-1.5B-Q4_K_M) runs at the CLI/Parity items.
-- [_] GGUF tokenizer — BPE + special tokens decode/encode
-  - Verify: `dotnet test --filter Category=Tokenizer` round-trip against llama.cpp tokenization fixtures.
+- [✓] GGUF loader — mmap tensors, metadata, vocab (see DN-M1-3)
+  - Verify: `dotnet test --filter Category=Loader` — 8/8 on synthetic GGUF v3 ✅; real-file load verified on SmolLM-135M-Instruct-F16.gguf via tokenizer integration ✅; Q4_K_M real load runs at Parity.
+- [✓] GGUF tokenizer — BPE + special tokens decode/encode
+  - Verify: `dotnet test --filter Category=Tokenizer` — 18/18 ✅ (13 synthetic + 5 against the real SmolLM GGUF: ASCII/newline/emoji round-trips, control tokens).
 - [_] Chat templates — mini Jinja-subset interpreter
   - Verify: `dotnet test --filter Category=Template` golden renders for ChatML, Llama-3, and Phi templates extracted from real GGUF metadata.
 - [_] Dense kernels — fused dequant GEMV for Q4_K_M/Q8_0/F16, AVX2, row-block threading
