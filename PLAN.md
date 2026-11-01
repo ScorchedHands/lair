@@ -246,7 +246,7 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 - [✓] Automated Sampling: determinism under greedy/seed; statistical top-k/p behavior — 9/9
 - [✓] Automated Parity: per-prompt sha256 guard + LAIR argmax ∈ reference top-5 (pinned llama.cpp server) + reproduction of the fixture's calibrated LAIR distribution within |Δlogprob| ≤ 0.2, on SmolLM-135M-F16 and Q8_0 — 9/9
 - [✓] Automated Config: YAML schema validation and error messages — 31/31
-- [_] Manual Serve: full serve→chat REPL session with streaming, abort, and reload-after-config-edit
+- [✓] Manual Serve: full serve→chat REPL session with streaming, abort, and reload-after-config-edit — done ✅ vs quantized Q8_0 model via YAML config: healthz/models/chat/completions probes, SSE chunk stream + mid-stream client abort with clean recovery on the next request (structured per-request log lines), piped `lair chat` REPL run against the same config, OpenAI Python SDK probe (`models.list`, non-stream chat, streaming) green, edited `max_context_tokens` 512→768 picked up on restart.
 
 #### Open Items
 
