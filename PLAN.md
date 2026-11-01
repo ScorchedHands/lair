@@ -284,13 +284,16 @@ Many requests at once, tuned, with live reconfiguration.
 - **DN-M2-8** — Tool calls: per-family tool schema injection into the chat template; `tool_calls` parsed from streamed output; tool execution stays client-side.
   - Rationale: coding-agent compatibility (Strata's whole tool story) requires the wire contract, not execution.
   - Contract: `lair.api` request/response pipeline.
+- **DN-M2-9** — Latency budget: decode ITL p95 ≤ 400 ms for N=8 concurrent SmolLM-class requests on the dev machine; chunked prefill must hold short-request ITL within the same budget with an 8K-token prompt in flight.
+  - Rationale: measured single-stream baseline is ~70–105 ms/token (SmolLM-135M Q8_0, full threads); a concrete ceiling makes batching regressions catchable without machine-specific absolutes.
+  - Contract: Concurrency and Prefill test thresholds.
 
 #### Implementation Items
 
 - [_] Continuous batching — shared decode steps across sequences (see DN-M2-1)
-  - Verify: `dotnet test --filter Category=Concurrency` — N=8 parallel requests produce outputs identical to sequential execution; ITL p95 within budget.
+  - Verify: `dotnet test --filter Category=Concurrency` — N=8 parallel requests produce outputs identical to sequential execution; decode ITL p95 ≤ 400 ms (DN-M2-9).
 - [_] Chunked prefill — prefill chunks interleaved with decode tokens in the same step (see DN-M2-2)
-  - Verify: integration test — an 8K-token prompt in flight does not push short-request ITL p95 past budget.
+  - Verify: integration test — an 8K-token prompt in flight does not push short-request ITL p95 past the DN-M2-9 budget (400 ms).
 - [_] Prompt caching — reference-counted prefix blocks reused across requests (see DN-M2-3)
   - Verify: `dotnet test --filter Category=Cache` — second request with shared prefix reports cache hit in metrics and skips prefill tokens.
 - [_] Cancellation — abort sequences mid-batch-step without stalling the rest of the batch (see DN-M2-4)
@@ -303,6 +306,8 @@ Many requests at once, tuned, with live reconfiguration.
   - Verify: unit test of encoder forward on a small fixture model produces stable pooled vectors.
 - [_] Thread pools — sized to memory channels, per-model quotas, core-set affinity (see DN-M2-6)
   - Verify: `dotnet test --filter Category=Affinity` asserts worker threads land in configured core sets.
+- [_] Hot-reload application path — config watcher pushes validated changes through the change-application bus by mutation class: live knobs apply at the next step boundary, new-requests-only knobs affect admission only, restart-only knobs are refused with an actionable message (see DN-M2-5)
+  - Verify: `dotnet test --filter Category=HotReload` — a mid-serving edit to a live knob is observable in engine behavior without restart; editing a restart-only knob returns refusal naming the mutation class.
 
 #### Tests
 
@@ -310,6 +315,7 @@ Many requests at once, tuned, with live reconfiguration.
 - [_] Automated Prefill: chunked prefill ITL protection
 - [_] Automated Cache: prefix hit, CoW integrity, LRU eviction
 - [_] Automated Cancel: abort isolation and block reclamation
+- [_] Automated HotReload: watcher detection, mutation-class enforcement, mid-serving application
 - [_] Automated API: tool calls, logprobs, penalties, seed reproducibility via SDK scripts
 - [_] Manual Monitor-lite: `lair monitor` live stats under mixed load
 
@@ -535,3 +541,5 @@ Vision input on chat models.
 - **2026-10-31 — License undecided.** Private repo for now; dotLLM is GPLv3 — its ideas may be studied, its code may not be copied into LAIR.
 - **2026-10-31 — MVP2–MVP5 refined.** Batch-step scheduling with decode priority and chunked prefill; hot-reload knob mutation classes; CUDA via nvcc microkernels + cuBLASLt with contiguous layer split and fail-fast device policy; multi-model admission via global ledger with no runtime preemption until MVP6 (backlog: preemptive KV swap); Flash-Next quants IQ3_XXS primary with Q4_K_M baseline behind a reality-check gate; expert-aware batching as the MoE engine win; MTP-only drafting at MVP5.
 - **2026-11-01 — Parity criterion is logit-distribution agreement, not exact token match.** Evidence from the pinned llama.cpp b12032 build: its own CLI and server modes produce different greedy (temp 0) continuations for identical prompts on SmolLM-135M-F16, and near-tie argmax flips (Δlogprob < 0.2) appear between any two independent fp pipelines. Cross-tool exact 48-token string equality is therefore unattainable; fixtures record position-0 top-5 logprobs from pinned server runs with a documented tolerance, and divergences inside the near-tie band are reported rather than failed.
+- **2026-11-01 — Concrete latency budgets for batching gates (DN-M2-9).** Decode ITL p95 ≤ 400 ms at N=8 concurrent SmolLM-class requests; chunked prefill must hold short-request ITL within the same budget with an 8K-token prompt in flight. Unnumbered "within budget" verify lines are not gates; baselines measured on the dev box (single-stream ~70–105 ms/token).
+- **2026-11-01 — Hot-reload application path added to MVP2.** Scope promises live reconfiguration and DN-M2-5 defines mutation semantics, but no implementation item owned the watcher/change-application bus; MVP2's outcome ("live reconfiguration") requires it in-phase rather than orphaned.
