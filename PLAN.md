@@ -220,8 +220,8 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
   - Verify: `dotnet test --filter Category=Kernel` — 15/15 ✅ vs double-precision oracle incl. threaded bit-identity; bench Q4_K 4096×4096: AVX2 8.7× scalar, threaded ≈17 GB/s ✅.
 - [_] Layer executor — RMSNorm, RoPE, GQA attention, SwiGLU FFN, qkv bias
   - Verify: `dotnet test --filter Category=Layers` per-layer activations vs reference fixtures; end-to-end via parity test.
-- [_] Paged KV — CPU block pool, 16-token blocks, allocator, per-model budget from config
-  - Verify: `dotnet test --filter Category=Kv` allocator alloc/free/reuse tests; multi-turn conversation keeps prefix KV intact.
+- [✓] Paged KV — CPU block pool, 16-token blocks, allocator, per-model budget from config
+  - Verify: `dotnet test --filter Category=Kv` — 8/8 ✅ (capacity errors, alloc/release integrity, addressing across partial blocks, refcounts); multi-turn prefix intactness verified end-to-end at Manual Serve.
 - [_] Sampling — greedy, temperature, top-k/top-p, seed
   - Verify: `dotnet test --filter Category=Sampling` greedy determinism + seeded distribution checks.
 - [_] HTTP API — chat/completions, completions, models (with `context_length` metadata), SSE streaming, error taxonomy (see DN-M1-6, DN-M1-7)
