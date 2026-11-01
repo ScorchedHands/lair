@@ -252,7 +252,7 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 
 - [X] **Jinja subset scope** — resolved by the Template implementation item: the interpreter supports conditionals, loops, variable access/indexing, concatenation, and the filters demanded by golden templates (`tojson`, `join`, `trim` as starting set); any unsupported construct fails with an explicit error naming the construct rather than rendering silently wrong.
 
-### MVP2 [v0.2.0] - Refined
+### MVP2 [v0.2.0] - In Progress
 
 Many requests at once, tuned, with live reconfiguration.
 
@@ -290,7 +290,7 @@ Many requests at once, tuned, with live reconfiguration.
 
 #### Implementation Items
 
-- [_] Continuous batching — shared decode steps across sequences (see DN-M2-1)
+- [→] Continuous batching — shared decode steps across sequences (see DN-M2-1)
   - Verify: `dotnet test --filter Category=Concurrency` — N=8 parallel requests produce outputs identical to sequential execution; decode ITL p95 ≤ 400 ms (DN-M2-9).
 - [_] Chunked prefill — prefill chunks interleaved with decode tokens in the same step (see DN-M2-2)
   - Verify: integration test — an 8K-token prompt in flight does not push short-request ITL p95 past the DN-M2-9 budget (400 ms).

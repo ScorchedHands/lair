@@ -28,6 +28,9 @@ public sealed unsafe class CpuBackend : IBackend
     // Output rows per scheduling unit for threaded GEMV.
     private const int RowBlock = 64;
 
+    // Upper bound on activation vectors per batched GEMV call.
+    private const int MaxBatch = 16;
+
     // Below this row count the threading overhead is not worth paying.
     private const int ParallelRowThreshold = 256;
 
@@ -125,6 +128,76 @@ public sealed unsafe class CpuBackend : IBackend
 
             WorkerPool pool = GetOrCreatePool();
             pool.Run((rows + RowBlock - 1) / RowBlock, new RowBlockJob(pBytes, pX, pOut, stride, rows, cols, format, _useAvx2));
+        }
+    }
+
+    public void GemvBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs)
+    {
+        int[] dims = w.Shape.Dims;
+        if (dims.Length < 2 || dims[0] <= 0 || dims[^1] <= 0)
+        {
+            throw new ArgumentException("Weight shape must be a matrix with positive row and column counts.", nameof(w));
+        }
+
+        int rows = dims[0];
+        int cols = dims[^1];
+
+        long strideBytes = w.Shape.RowStrideBytes(w.Format);
+        if (strideBytes > int.MaxValue)
+        {
+            throw new ArgumentException("Row byte size exceeds the addressable span limit.", nameof(w));
+        }
+
+        long expectedBytes = rows * strideBytes;
+        if ((long)w.Bytes.Length != expectedBytes)
+        {
+            throw new ArgumentException(
+                $"WeightRef byte length is {w.Bytes.Length} but shape {rows}x{cols} in format {w.Format} " +
+                $"requires {expectedBytes} bytes ({rows} rows x {strideBytes}-byte row stride).",
+                nameof(w));
+        }
+
+        ArgumentOutOfRangeException.ThrowIfLessThan(count, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(count, MaxBatch);
+
+        if ((long)inputs.Length != (long)count * cols)
+        {
+            throw new ArgumentException(
+                $"Batched input length {inputs.Length} must equal count {count} times the weight column count {cols}.",
+                nameof(inputs));
+        }
+
+        if ((long)outputs.Length < (long)count * rows)
+        {
+            throw new ArgumentException(
+                $"Batched output length {outputs.Length} is shorter than count {count} times the weight row count {rows}.",
+                nameof(outputs));
+        }
+
+        int stride = (int)strideBytes;
+        QuantFormat format = w.Format;
+
+        // Same raw-pointer job contract as Gemv: pinned spans stay stable for the duration of the call and every
+        // claimed block finishes before WorkerPool.Run returns. Rows are independent, so row partitioning stays
+        // bit-identical; each batch vector is computed by its own accumulator chain exactly like a single GEMV.
+        fixed (byte* pBytes = w.Bytes)
+        fixed (float* pIn = inputs)
+        fixed (float* pOut = outputs)
+        {
+            bool parallel = _threads > 1 && rows >= ParallelRowThreshold;
+
+            if (!parallel)
+            {
+                for (int row = 0; row < rows; row++)
+                {
+                    RowBatchDot(pBytes + (long)row * stride, pIn, count, rows, cols, format, _useAvx2, pOut + row);
+                }
+
+                return;
+            }
+
+            WorkerPool pool = GetOrCreatePool();
+            pool.Run((rows + RowBlock - 1) / RowBlock, new BatchRowJob(pBytes, pIn, pOut, stride, rows, cols, count, format, _useAvx2));
         }
     }
 
@@ -383,6 +456,325 @@ public sealed unsafe class CpuBackend : IBackend
     internal interface IGemvJob
     {
         void ProcessBlock(int block);
+    }
+
+    /// <summary>
+    /// Row-block executor for one batched GEMV call. Each row computes its batch vector dots independently, so
+    /// any partition of blocks yields bit-identical output; batch vectors are never split across workers.
+    /// </summary>
+    private sealed unsafe class BatchRowJob : IGemvJob
+    {
+        private readonly byte* _bytes;
+        private readonly float* _inputs;
+        private readonly float* _out;
+        private readonly int _stride;
+        private readonly int _rows;
+        private readonly int _cols;
+        private readonly int _count;
+        private readonly QuantFormat _format;
+        private readonly bool _avx2;
+
+        public BatchRowJob(byte* bytes, float* inputs, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2)
+        {
+            _bytes = bytes;
+            _inputs = inputs;
+            _out = outPtr;
+            _stride = stride;
+            _rows = rows;
+            _cols = cols;
+            _count = count;
+            _format = format;
+            _avx2 = avx2;
+        }
+
+        public void ProcessBlock(int block)
+        {
+            int firstRow = block * RowBlock;
+            int lastRow = Math.Min(firstRow + RowBlock, _rows);
+            for (int row = firstRow; row < lastRow; row++)
+            {
+                RowBatchDot(_bytes + (long)row * _stride, _inputs, _count, _rows, _cols, _format, _avx2, _out + row);
+            }
+        }
+    }
+
+    // Batched row evaluator for one row: outBase points at column `row` of the flat batch output buffer and
+    // receives outBase[b * rows] = dot(row, inputs[b]), i.e. absolute position b*rows + row per
+    // IBackend.GemvBatch's layout. The row's packed bytes are traversed exactly once: every dequantized chunk
+    // is materialized one time into a stack scratch buffer and fed to all count accumulator chains. Each chain
+    // advances exactly like the single-vector kernel's - eight-lane FMAs over successive chunks in the same
+    // element order, then scalar tail accumulation, then a lane reduction identical to HSum - so every output
+    // is bit-identical to a single-vector GEMV row.
+    private static void RowBatchDot(byte* rowBytes, float* inputs, int count, int rows, int cols, QuantFormat format, bool avx2, float* outBase)
+    {
+        switch (format)
+        {
+            case QuantFormat.F32:
+                if (avx2)
+                {
+                    BatchF32Avx2((float*)rowBytes, inputs, count, rows, cols, outBase);
+                }
+                else
+                {
+                    for (int b = 0; b < count; b++)
+                    {
+                        outBase[b * rows] = DotScalar((float*)rowBytes, inputs + (long)b * cols, cols);
+                    }
+                }
+
+                break;
+            case QuantFormat.F16:
+                if (avx2)
+                {
+                    BatchF16Avx2(rowBytes, inputs, count, rows, cols, outBase);
+                }
+                else
+                {
+                    for (int b = 0; b < count; b++)
+                    {
+                        outBase[b * rows] = RowDotF16Scalar(rowBytes, inputs + (long)b * cols, cols);
+                    }
+                }
+
+                break;
+            case QuantFormat.Q8_0:
+                if (avx2)
+                {
+                    BatchQ8Avx2(rowBytes, inputs, count, rows, cols, outBase);
+                }
+                else
+                {
+                    for (int b = 0; b < count; b++)
+                    {
+                        outBase[b * rows] = RowDotQ8Scalar(rowBytes, inputs + (long)b * cols, cols);
+                    }
+                }
+
+                break;
+            case QuantFormat.Q4_K:
+                if (avx2)
+                {
+                    BatchQ4KAvx2(rowBytes, inputs, count, rows, cols, outBase);
+                }
+                else
+                {
+                    for (int b = 0; b < count; b++)
+                    {
+                        outBase[b * rows] = RowDotQ4KScalar(rowBytes, inputs + (long)b * cols, cols);
+                    }
+                }
+
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(format), format, "Unknown quant format.");
+        }
+    }
+
+    // Batched F32 row: one weight window load per chunk feeds all accumulator chains, so the row is streamed
+    // once for the whole batch. Accumulator lanes live in stack scratch (count x eight slots, reused per row)
+    // and each chain's FMA operand order matches DotCore exactly.
+    private static void BatchF32Avx2(float* row, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> acc = stackalloc float[MaxBatch * 8];
+        Span<float> tail = stackalloc float[MaxBatch];
+        BatchInit(acc, tail, count);
+
+        fixed (float* pAcc = acc)
+        {
+            int i = 0;
+            for (; i + 8 <= cols; i += 8)
+            {
+                Vector256<float> wv = Avx.LoadVector256(row + i);
+                for (int b = 0; b < count; b++)
+                {
+                    float* chain = pAcc + b * 8;
+                    Avx.Store(chain, Fma.MultiplyAdd(wv, Avx.LoadVector256(inputs + (long)b * cols + i), Avx.LoadVector256(chain)));
+                }
+            }
+
+            for (; i < cols; i++)
+            {
+                float w = row[i];
+                for (int b = 0; b < count; b++)
+                {
+                    tail[b] += w * inputs[(long)b * cols + i];
+                }
+            }
+
+            BatchFinish(pAcc, tail, count, rows, outBase);
+        }
+    }
+
+    // Batched F16 row: one half-bit expansion per chunk feeds all accumulator chains with the same FMA operand
+    // order as RowDotF16Avx2, so the packed bytes are streamed once for the whole batch.
+    private static void BatchF16Avx2(byte* row, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> acc = stackalloc float[MaxBatch * 8];
+        Span<float> tail = stackalloc float[MaxBatch];
+        BatchInit(acc, tail, count);
+
+        fixed (float* pAcc = acc)
+        {
+            int i = 0;
+            for (; i + 8 <= cols; i += 8)
+            {
+                Vector256<int> bits = Vector256.Create(
+                    Sse41.ConvertToVector128Int32((ushort*)(row + 2L * i)),
+                    Sse41.ConvertToVector128Int32((ushort*)(row + 2L * i) + 4));
+                Vector256<float> w = HalfBitsToFloat(bits);
+                for (int b = 0; b < count; b++)
+                {
+                    float* chain = pAcc + b * 8;
+                    Avx.Store(chain, Fma.MultiplyAdd(w, Avx.LoadVector256(inputs + (long)b * cols + i), Avx.LoadVector256(chain)));
+                }
+            }
+
+            for (; i < cols; i++)
+            {
+                float w = ReadHalfLE(row + 2 * i);
+                for (int b = 0; b < count; b++)
+                {
+                    tail[b] += w * inputs[(long)b * cols + i];
+                }
+            }
+
+            BatchFinish(pAcc, tail, count, rows, outBase);
+        }
+    }
+
+    // Batched Q8_0 row: one quant unpack per eight-element chunk feeds all accumulator chains with the same
+    // (x * q) * d association as RowDotQ8Avx2, so the packed bytes are streamed once for the whole batch.
+    private static void BatchQ8Avx2(byte* row, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> acc = stackalloc float[MaxBatch * 8];
+        Span<float> tail = stackalloc float[MaxBatch];
+        BatchInit(acc, tail, count);
+
+        fixed (float* pAcc = acc)
+        {
+            for (int baseIdx = 0; baseIdx < cols; baseIdx += Qk8)
+            {
+                byte* block = row + (long)(baseIdx / Qk8) * (Qk8 + 2);
+                float dHalf = ReadHalfLE(block);
+
+                int limit = Math.Min(Qk8, cols - baseIdx); // padded quants are zero: stop at the real column count.
+                for (int l = 0; l + 8 <= limit; l += 8)
+                {
+                    Vector256<int> qi = Avx2.ConvertToVector256Int32((sbyte*)(block + 2 + l)); // vpmovsxbd: eight signed quants, in-block only
+                    Vector256<float> qf = Avx.ConvertToVector256Single(qi); // dequantization unpack, materialized once per chunk
+                    float dLocal = dHalf;
+                    Vector256<float> dv = Avx.BroadcastScalarToVector256(&dLocal);
+                    for (int b = 0; b < count; b++)
+                    {
+                        float* chain = pAcc + b * 8;
+                        Avx.Store(chain, Fma.MultiplyAdd(Avx.Multiply(Avx.LoadVector256(inputs + (long)b * cols + baseIdx + l), qf), dv, Avx.LoadVector256(chain)));
+                    }
+                }
+
+                for (int k = (limit / 8) * 8; k < limit; k++)
+                {
+                    float w = (float)(sbyte)block[2 + k] * dHalf; // partial final block: at most seven elements per row
+                    for (int b = 0; b < count; b++)
+                    {
+                        tail[b] += w * inputs[(long)b * cols + baseIdx + k];
+                    }
+                }
+            }
+
+            BatchFinish(pAcc, tail, count, rows, outBase);
+        }
+    }
+
+    // Batched Q4_K row: one nibble unpack and fused scale/shift per chunk feeds all accumulator chains with the
+    // same FMA shape as RowDotQ4KAvx2, so the packed bytes are streamed once for the whole batch.
+    private static void BatchQ4KAvx2(byte* row, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> acc = stackalloc float[MaxBatch * 8];
+        Span<float> tail = stackalloc float[MaxBatch];
+        BatchInit(acc, tail, count);
+
+        fixed (float* pAcc = acc)
+        {
+            for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+            {
+                byte* block = row + (long)(baseIdx / QkK) * Q4KBlockBytes;
+                byte* blockEnd = block + Q4KBlockBytes;
+                float dHalf = ReadHalfLE(block);
+                float minHalf = ReadHalfLE(block + 2);
+
+                for (int j = 0; j < 8; j++)
+                {
+                    int subStart = baseIdx + j * 32;
+                    if (subStart >= cols)
+                    {
+                        break; // zero-padded tail block: no elements left to consume.
+                    }
+
+                    GetScaleMinK4(j, block + 4, out byte sc, out byte m);
+                    float scale = dHalf * sc;
+                    Vector256<float> scaleV = Avx.BroadcastScalarToVector256(&scale);
+                    float negShift = -(minHalf * m);
+                    Vector256<float> shiftV = Avx.BroadcastScalarToVector256(&negShift);
+
+                    byte* q = block + 16 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
+                    int limit = Math.Min(32, cols - subStart); // padded nibbles are zero: stop at the real column count.
+
+                    for (int c = 0; c + 8 <= limit; c += 8)
+                    {
+                        Vector128<byte> window = LoadGroupBytes(q, blockEnd, c);
+
+                        if ((j & 1) != 0)
+                        {
+                            // High nibbles per byte lane: srli_epi16 then a 0x0F byte mask (the classic SSE2 pattern).
+                            window = Sse2.ShiftRightLogical(window.AsUInt16(), 4).AsByte();
+                        }
+
+                        Vector128<byte> masked = Sse2.And(window, GetNibbleMask()); // needed nibbles now in each byte lane's low bits
+
+                        Vector128<int> lo = Sse41.ConvertToVector128Int32(masked); // bytes 0..3 -> dword lanes (pmovzxbd)
+                        Vector128<int> hi = Sse41.ConvertToVector128Int32(Ssse3.Shuffle(masked, GetUpperBytesShuffle())); // bytes 4..7 -> dword lanes
+
+                        Vector256<float> wchunk = Fma.MultiplyAdd(scaleV, Avx.ConvertToVector256Single(Vector256.Create(lo, hi)), shiftV); // dequantized chunk, materialized once
+                        for (int b = 0; b < count; b++)
+                        {
+                            float* chain = pAcc + b * 8;
+                            Avx.Store(chain, Fma.MultiplyAdd(Avx.LoadVector256(inputs + (long)b * cols + subStart + c), wchunk, Avx.LoadVector256(chain)));
+                        }
+                    }
+
+                    for (int l = (limit / 8) * 8; l < limit; l++)
+                    {
+                        // Partial final chunk of the group: scalar cleanup, at most seven elements per group.
+                        float nibble = ((q[l] >> (4 * (j & 1))) & 0xF) * scale - minHalf * m;
+                        for (int b = 0; b < count; b++)
+                        {
+                            tail[b] += nibble * inputs[(long)b * cols + subStart + l];
+                        }
+                    }
+                }
+            }
+
+            BatchFinish(pAcc, tail, count, rows, outBase);
+        }
+    }
+
+    // Batch scratch plumbing: zero the per-chain lanes and tails for one row. stackalloc scratch is reused for
+    // every row and call; nothing here allocates.
+    private static void BatchInit(Span<float> acc, Span<float> tail, int count)
+    {
+        acc.Clear();
+        tail.Clear();
+    }
+
+    // Batch scratch plumbing: fold each chain's eight lanes with the same reduction the single kernels use and
+    // write outBase[b * rows]. Scalar tails are added afterwards (F32/F16) or are already folded in (Q8_0/Q4_K,
+    // whose chains end with an empty tail).
+    private static void BatchFinish(float* pAcc, Span<float> tail, int count, int rows, float* outBase)
+    {
+        for (int b = 0; b < count; b++)
+        {
+            outBase[b * rows] = HSum(Avx.LoadVector256(pAcc + b * 8)) + tail[b];
+        }
     }
 
     // Little-endian half-float load from raw memory.
