@@ -8,12 +8,18 @@ internal static class ModelFixture
 {
     public const string SmolLmRelativePath = "models/SmolLM-135M-Instruct-F16.gguf";
 
-    public static string? Resolve()
+    public static string? Resolve() => ResolveRepoRelative(SmolLmRelativePath);
+
+    /// <summary>
+    /// Locates any repository-relative path (model files, recorded fixtures) the same way: walk up from the
+    /// assembly location until the candidate exists.
+    /// </summary>
+    public static string? ResolveRepoRelative(string repoRelativePath)
     {
         DirectoryInfo? directory = new(AppContext.BaseDirectory);
         for (int depth = 0; directory is not null && depth < 8; depth++)
         {
-            string candidate = Path.Combine(directory.FullName, SmolLmRelativePath);
+            string candidate = Path.Combine(directory.FullName, repoRelativePath);
             if (File.Exists(candidate))
             {
                 return candidate;

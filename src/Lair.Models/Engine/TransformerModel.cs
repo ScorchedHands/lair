@@ -18,7 +18,11 @@ namespace Lair.Models.Engine;
 public sealed class TransformerModel : IDisposable
 {
     private readonly IBackend _backend;
-    private readonly GgufMmapWeightSource _weights;
+    private readonly IWeightSource _weights;
+
+    // Only a source this instance created is its own to release: a caller-supplied source stays under the caller's
+    // lifetime rules and must outlive the model.
+    private readonly bool _ownsWeights;
 
     // Kept for tensor name lookups only: the mmap source owns payload access.
     private readonly LogicalTensorTable _fileTensors;
@@ -66,9 +70,19 @@ public sealed class TransformerModel : IDisposable
     /// <summary>Largest sequence length this model can forward: the extent of its precomputed RoPE tables.</summary>
     public int MaxContextTokens { get; }
 
-    public static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens) => new(file, backend, maxContextTokens);
+    /// <summary>Opens the engine over a memory-mapped view of the file's own tensor payloads.</summary>
+    public static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens) => new(file, backend, maxContextTokens, null);
 
-    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens)
+    /// <summary>
+    /// Opens the engine with weight payloads supplied by an alternate <see cref="IWeightSource"/>: every tensor read
+    /// goes through that source instead of a mmap view. Tensor metadata (names, shapes, formats, offsets) still comes
+    /// from <paramref name="file"/>, and the caller keeps ownership of the source — it must outlive the model and is
+    /// disposed by the caller, not here.
+    /// </summary>
+    public static TransformerModel Open(GgufFile file, IWeightSource weights, IBackend backend, int maxContextTokens) =>
+        new(file, backend, maxContextTokens, weights);
+
+    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(backend);
@@ -77,7 +91,8 @@ public sealed class TransformerModel : IDisposable
         _backend = backend;
         Desc = ModelDesc.FromGguf(file);
         MaxContextTokens = maxContextTokens;
-        _weights = new GgufMmapWeightSource(file);
+        _ownsWeights = weights is null;
+        _weights = weights ?? new GgufMmapWeightSource(file);
         _fileTensors = file.Tensors;
 
         if (Desc.HeadDim % 2 != 0)
@@ -178,6 +193,12 @@ public sealed class TransformerModel : IDisposable
         ForwardToken(tokenId, kv.Length, kv);
         return _logits.AsSpan();
     }
+
+    /// <summary>
+    /// Logits from the most recent forward: after a prefill these are already the next-token distribution for the
+    /// sequence's final token — sampling them avoids re-forwarding (and double-appending) that token.
+    /// </summary>
+    public Span<float> LastLogits() => _logits.AsSpan();
 
     public void Dispose()
     {

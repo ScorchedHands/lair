@@ -13,10 +13,11 @@ public class CliTests
 {
     private const string ModelName = "smollm-chat";
 
-    // Measured against the fixture's 512-token window: 2 pangram repetitions render to ~110 prompt tokens,
-    // 13 render to 604 and overflow even after the REPL trims the oldest exchange.
+    // Measured against the fixture's 512-token window: each pangram repetition encodes to ~10 tokens on top of the
+    // chat-template overhead, so 2 repetitions render well inside the limit and 60 overflow even after the REPL trims
+    // the oldest exchange.
     private static readonly string ModeratePrompt = Repeat("the quick brown fox jumps over the lazy dog. ", 2);
-    private static readonly string OversizedPrompt = Repeat("the quick brown fox jumps over the lazy dog. ", 13);
+    private static readonly string OversizedPrompt = Repeat("the quick brown fox jumps over the lazy dog. ", 60);
 
     [Fact]
     public async Task RunAsync_HelloThenExit_PrintsBannerAndReply_AndExitsZero()

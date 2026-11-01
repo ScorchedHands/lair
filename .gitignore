@@ -4,3 +4,4 @@ artifacts/
 models/
 *.gguf
 .vs/
+tools/

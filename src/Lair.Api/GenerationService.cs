@@ -192,18 +192,23 @@ public sealed class GenerationService : IDisposable
         _model.Prefill(prompt, kv);
 
         int maxTokens = Math.Min(request.MaxTokens, Model.ContextLength - prompt.Count);
+
+        // Prefill already forwarded the final prompt token: its logits are the first next-token distribution.
+        ReadOnlySpan<float> logits = _model.LastLogits();
         for (int i = 0; i < maxTokens; i++)
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            int token = sampler.Sample(_model.DecodeNext(generated.Count == 0 ? prompt[^1] : generated[^1], kv));
-            generated.Add(token);
+            int token = sampler.Sample(logits);
 
             if (token == _tokenizer.EosId)
             {
                 finishReason = "eos";
-                break;
+                break; // eos ends the turn and is never forwarded into the sequence.
             }
+
+            generated.Add(token);
+            logits = _model.DecodeNext(token, kv);
 
             string piece = _tokenizer.Decode([token]);
             if (piece.Length > 0)
@@ -254,7 +259,9 @@ public sealed class GenerationService : IDisposable
                 "rendered; serve a model with a chat template or send a completion request with a raw 'prompt'.");
         }
 
-        return _tokenizer.EncodeWithBos(_chatTemplate.Render(messages, addGenerationPrompt: true));
+        return _tokenizer.AddBosToken
+            ? _tokenizer.EncodeWithBos(_chatTemplate.Render(messages, addGenerationPrompt: true))
+            : _tokenizer.Encode(_chatTemplate.Render(messages, addGenerationPrompt: true));
     }
 
     private IReadOnlyList<int> EncodeCompletion(GenerationRequest request)
@@ -266,7 +273,7 @@ public sealed class GenerationService : IDisposable
                 nameof(request));
         }
 
-        return _tokenizer.EncodeWithBos(request.Prompt);
+        return _tokenizer.AddBosToken ? _tokenizer.EncodeWithBos(request.Prompt) : _tokenizer.Encode(request.Prompt);
     }
 
     private static int StopIndex(string text, IReadOnlyList<string>? stopStrings)

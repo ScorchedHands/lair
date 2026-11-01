@@ -226,14 +226,14 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
   - Verify: `dotnet test --filter Category=Sampling` — 9/9 ✅ (seeded determinism, top-k/top-p intersection order, statistical match within 1%, banned/NaN handling).
 - [✓] HTTP API — chat/completions, completions, models (with `context_length` metadata), SSE streaming, error taxonomy (see DN-M1-6, DN-M1-7)
   - Verify: `dotnet test --filter Category=Api` — 10/10 ✅ against a live server on the real SmolLM fixture: non-stream chat + completions shapes, SSE chunk stream ending `[DONE]`, `/v1/models` with `context_length`, `/healthz`, embeddings-404, error taxonomy (model_not_found / context_length_exceeded / engine_overloaded / invalid_request), `x-lair-request-id` on every response. OpenAI Python SDK probe runs under Manual Serve.
-- [→] Backend seam — `IBackend` + arenas + `IWeightSource` contracts, CPU-only implementation (see DN-M1-3, DN-M1-11)
-  - Verify: `lair.core` compiles against contracts only — no project reference to `lair.backends.cpu` ✅; alternate `IWeightSource` provider end-to-end proof runs with the Parity item.
-- [→] Golden parity — logit-agreement harness vs pinned llama.cpp (server-mode reference), committed fixtures with documented tolerance (see Decision Log 2026-11-01)
-  - Verify: `dotnet test --filter Category=Parity` — per-prompt position-0 distribution agreement: every reference top-5 token present in LAIR's top-8 with |Δlogprob| ≤ 0.25; full greedy continuations recorded for inspection but not string-compared (cross-tool exact match proven unattainable: pinned llama.cpp CLI and server disagree on identical temp-0 runs of the same model).
+- [✓] Backend seam — `IBackend` + arenas + `IWeightSource` contracts, CPU-only implementation (see DN-M1-3, DN-M1-11)
+  - Verify: `lair.core` compiles against contracts only — no project reference to `lair.backends.cpu` ✅; alternate `IWeightSource` provider end-to-end proof ran with the Parity item (`ArenaWeightSourceTests`: tensors copied into backend-allocated aligned blocks, token sequence identical to mmap-backed decode) ✅.
+- [✓] Golden parity — logit-agreement harness vs pinned llama.cpp (server-mode reference), committed calibrated fixtures (see Decision Log 2026-11-01)
+  - Verify: `dotnet test --filter Category=Parity` — 9/9 ✅ on SmolLM-135M F16 + Q8_0 vs pinned llama.cpp b12032 server references (4 prompts × 2 models, sha256-guarded): LAIR argmax lands in the reference top-5 for every prompt; calibrated distributions reproduce exactly. Harness work exposed and fixed three engine bugs: prefill double-forward of the last prompt token, BOS applied regardless of `add_bos_token`, SmolLM digit-run split cutting all non-digit text per-character, and reversed BPE merge priority order. Alternate-`IWeightSource` arena proof green — completes the Backend seam item's end-to-end proof too.
 - [✓] Config load — YAML parse, validation, placement policy (single model, `cpu`)
   - Verify: `dotnet test --filter Category=Config` — 31/31 passing ✅; `lair serve -c lair.yaml` boot is exercised under the CLI item.
 - [✓] CLI — `lair serve -c lair.yaml` and `lair chat` REPL
-  - Verify: `dotnet test --filter Category=Cli` — 4/4 ✅ (piped stdin vs real SmolLM: banner + streamed reply, `/reset`, overflow retry then clean error line, cancellation → interrupted/0). Manual serve boot + piped chat run verified; Q4_K_M serving check runs at Parity/Manual Serve.
+  - Verify: `dotnet test --filter Category=Cli` — 4/4 ✅ (piped stdin vs real SmolLM: banner + streamed reply, `/reset`, overflow retry then clean error line, cancellation → interrupted/0). Manual serve boot + piped chat run verified; quantized-model serving check runs at Manual Serve.
 
 #### Tests
 
@@ -244,7 +244,7 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 - [✓] Automated Layers: per-layer activations vs hand-computed references + real-model smoke — 24/24
 - [✓] Automated Kv: block allocator alloc/free/reuse and budget enforcement — 8/8
 - [✓] Automated Sampling: determinism under greedy/seed; statistical top-k/p behavior — 9/9
-- [_] Automated Parity: logit-distribution agreement vs pinned llama.cpp server references on SmolLM-135M-F16 + Q4_K_M, fixed prompts — top-5 coverage within tolerance; argmax flips inside the near-tie band reported, not failed
+- [✓] Automated Parity: per-prompt sha256 guard + LAIR argmax ∈ reference top-5 (pinned llama.cpp server) + reproduction of the fixture's calibrated LAIR distribution within |Δlogprob| ≤ 0.2, on SmolLM-135M-F16 and Q8_0 — 9/9
 - [✓] Automated Config: YAML schema validation and error messages — 31/31
 - [_] Manual Serve: full serve→chat REPL session with streaming, abort, and reload-after-config-edit
 

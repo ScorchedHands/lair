@@ -364,7 +364,7 @@ public sealed class GgufTokenizer
             for (int pos = start; pos < end;)
             {
                 bool isDigit = char.IsNumber(text, pos);
-                if (pos > runStart && (!isDigit || !char.IsNumber(text, runStart)))
+                if (pos > runStart && isDigit != char.IsNumber(text, runStart))
                 {
                     next.Add(pos - runStart);
                     runStart = pos;
@@ -761,7 +761,7 @@ public sealed class GgufTokenizer
 
             PriorityQueue<BigramEntry, (int Rank, int Left)> queue =
                 new(Comparer<(int Rank, int Left)>.Create((a, b) =>
-                    a.Rank != b.Rank ? b.Rank.CompareTo(a.Rank) : b.Left.CompareTo(a.Left)));
+                    a.Rank != b.Rank ? a.Rank.CompareTo(b.Rank) : a.Left.CompareTo(b.Left)));
 
             void TryAddBigram(int left, int right)
             {
