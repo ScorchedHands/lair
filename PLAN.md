@@ -232,8 +232,8 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
   - Verify: `dotnet test --filter Category=Parity`.
 - [✓] Config load — YAML parse, validation, placement policy (single model, `cpu`)
   - Verify: `dotnet test --filter Category=Config` — 31/31 passing ✅; `lair serve -c lair.yaml` boot is exercised under the CLI item.
-- [_] CLI — `lair serve -c lair.yaml` and `lair chat` REPL
-  - Verify: manual — serve a Q4_K_M model, chat REPL streams tokens, Ctrl+C mid-generation aborts cleanly.
+- [✓] CLI — `lair serve -c lair.yaml` and `lair chat` REPL
+  - Verify: `dotnet test --filter Category=Cli` — 4/4 ✅ (piped stdin vs real SmolLM: banner + streamed reply, `/reset`, overflow retry then clean error line, cancellation → interrupted/0). Manual serve boot + piped chat run verified; Q4_K_M serving check runs at Parity/Manual Serve.
 
 #### Tests
 

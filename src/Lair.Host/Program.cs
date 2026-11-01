@@ -1,5 +1,6 @@
 ﻿using System.Reflection;
 using Lair.Api;
+using Lair.Host;
 using Lair.Host.Config;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.Hosting;
@@ -48,9 +49,36 @@ if (args.Length == 3 && args[0] == "serve" && args[1] == "-c")
     return 0;
 }
 
+if (args.Length == 3 && args[0] == "chat" && args[1] == "-c")
+{
+    LairConfig chatConfig;
+    try
+    {
+        chatConfig = YamlConfigLoader.Load(args[2]);
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"lair: {ex.Message}");
+        return 1;
+    }
+
+    using (CancellationTokenSource cancel = new())
+    {
+        Console.CancelKeyPress += (_, eventArgs) =>
+        {
+            // Ctrl+C aborts the current generation and ends the REPL cleanly.
+            eventArgs.Cancel = true;
+            cancel.Cancel();
+        };
+
+        return await ChatCommand.RunAsync(chatConfig, Console.In, Console.Out, cancel.Token);
+    }
+}
+
 Console.Error.WriteLine("""
     usage:
       lair serve -c <configPath>   serve the configured model over the OpenAI-compatible HTTP API
+      lair chat -c <configPath>    chat with the configured model in an interactive REPL
       lair --version               print the lair version
     """);
 return 1;
