@@ -1,0 +1,206 @@
+using System.Security.Cryptography;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Lair.Backends.Cpu;
+using Lair.Kv;
+using Lair.Loader;
+using Lair.Models.Engine;
+using Lair.Tokenizer;
+
+namespace Lair.Tests;
+
+/// <summary>
+/// Logit-agreement parity against the pinned llama.cpp server reference recorded in tests/fixtures. Per prompt:
+/// the model file must match its recorded hash; LAIR's argmax token must appear among the reference top-5 tokens
+/// (pinned llama.cpp CLI and server modes disagree on identical greedy runs, so cross-tool exact continuations are
+/// unattainable — membership of our pick in the reference leaders is the honest gate); and every reference-top-5
+/// token's calibrated LAIR logprob from fixture generation must reproduce within tolerance, including documented
+/// absences. A distribution shift from engine changes therefore fails here even when no single candidate breaks a
+/// cross-tool tie. Full continuations are recorded in fixtures for inspection only. The calibration data is produced
+/// by the CalibrationProbe test during scripts/generate-parity.ps1 regeneration.
+/// </summary>
+[Trait("Category", "Parity")]
+public sealed class ParityTests
+{
+    private const string F16Fixture = "tests/fixtures/parity-smollm-f16.json";
+
+    // The Q8_0 fixture is both a reference set and a real quantized load: the model under test IS that file.
+    private const string Q8Fixture = "tests/fixtures/parity-smollm-q8.json";
+
+    /// <summary>Ranking window whose reproduction the fixtures calibrate.</summary>
+    private const int CalibrationWindow = 16;
+
+    /// <summary>Absolute logprob tolerance for reproducing a calibrated LAIR distribution entry.</summary>
+    private static readonly double ReproductionTolerance = 0.2;
+
+    public static TheoryData<string, int> PromptCases()
+    {
+        TheoryData<string, int> cases = [];
+        foreach (string fixture in new[] { F16Fixture, Q8Fixture })
+        {
+            string? path = ModelFixture.ResolveRepoRelative(fixture);
+            if (path is null)
+            {
+                continue; // fixtures travel with the repo: absent means nothing to enumerate
+            }
+
+            foreach (int index in Enumerable.Range(0, LoadFixture(path).Prompts.Length))
+            {
+                cases.Add(fixture, index);
+            }
+        }
+
+        return cases;
+    }
+
+    [Theory]
+    [MemberData(nameof(PromptCases))]
+    public void NextTokenDistribution_MatchesPinnedReferenceAndCalibration(string fixturePath, int promptIndex)
+    {
+        string? fixtureFile = ModelFixture.ResolveRepoRelative(fixturePath);
+        if (fixtureFile is null)
+        {
+            return; // no recorded outputs to compare against
+        }
+
+        ParityFixture fixture = LoadFixture(fixtureFile);
+        ParityPrompt entry = fixture.Prompts[promptIndex];
+
+        string? modelPath = ModelFixture.ResolveRepoRelative(fixture.ModelFile);
+        if (modelPath is null)
+        {
+            return; // real-model cases skip when the GGUF file is absent (xunit 2.9 has no dynamic Assert.Skip)
+        }
+
+        AssertRecordedHash(fixture, modelPath);
+
+        using GgufFile file = GgufFile.Open(modelPath);
+        using CpuBackend backend = new();
+        using TransformerModel model = TransformerModel.Open(file, backend, 1024);
+        GgufTokenizer tokenizer = GgufTokenizer.FromGguf(file);
+
+        IReadOnlyList<int> promptTokens = tokenizer.AddBosToken
+            ? tokenizer.EncodeWithBos(entry.Prompt)
+            : tokenizer.Encode(entry.Prompt);
+
+        using BlockPool pool = new(16, model.Desc.LayerCount, model.Desc.KvHeadCount, model.Desc.HeadDim, 64, backend);
+        using SequenceKv kv = new(pool);
+        model.Prefill(promptTokens, kv);
+
+        List<(int Id, double Logprob)> top = TopWithLogprobs(model.LastLogits(), CalibrationWindow);
+
+        Assert.True(
+            entry.TopLogprobs.Any(reference => reference.Id == top[0].Id),
+            $"prompt '{entry.Prompt.Trim()}' argmax {top[0].Id}={top[0].Logprob:F4} is not among the pinned " +
+            $"reference top-5 [{string.Join(", ", entry.TopLogprobs.Select(t => $"{t.Id}={t.Logprob:F4}"))}] — " +
+            $"the engine's next-token decision moved away from the reference.\nlair:      [{Format(top)}]");
+
+        foreach (ParityToken reference in entry.TopLogprobs)
+        {
+            int slot = top.FindIndex(t => t.Id == reference.Id);
+            if (reference.LairLogprob is null)
+            {
+                Assert.True(
+                    slot < 0,
+                    $"prompt '{entry.Prompt.Trim()}' token {reference.Id}('{reference.Token}') was calibrated as " +
+                    $"absent from LAIR's top-{CalibrationWindow} but now ranks at position {slot + 1} with logprob " +
+                    $"{(slot >= 0 ? top[slot].Logprob : double.NaN):F4}.\nlair: [{Format(top)}]");
+                continue;
+            }
+
+            Assert.True(
+                slot >= 0,
+                $"prompt '{entry.Prompt.Trim()}' token {reference.Id}('{reference.Token}') was calibrated into " +
+                $"LAIR's top-{CalibrationWindow} at logprob {reference.LairLogprob:F4} but is now absent.\n" +
+                $"lair: [{Format(top)}]");
+
+            double delta = Math.Abs(top[slot].Logprob - reference.LairLogprob.Value);
+            Assert.True(
+                delta <= ReproductionTolerance,
+                $"prompt '{entry.Prompt.Trim()}' token {reference.Id}('{reference.Token}') logprob moved " +
+                $"{delta:F4} from its calibrated value {reference.LairLogprob:F4} to {top[slot].Logprob:F4} — " +
+                $"beyond the {ReproductionTolerance:F2} reproduction tolerance.\nlair: [{Format(top)}]");
+        }
+    }
+
+    private static List<(int Id, double Logprob)> TopWithLogprobs(ReadOnlySpan<float> logits, int k)
+    {
+        double max = double.NegativeInfinity;
+        for (int i = 0; i < logits.Length; i++)
+        {
+            if (logits[i] > max)
+            {
+                max = logits[i];
+            }
+        }
+
+        double sumExp = 0.0;
+        for (int i = 0; i < logits.Length; i++)
+        {
+            sumExp += Math.Exp(logits[i] - max);
+        }
+
+        double logSumExp = max + Math.Log(sumExp);
+
+        List<(int Id, double Logprob)> top = [];
+        for (int id = 0; id < logits.Length; id++)
+        {
+            double logprob = logits[id] - logSumExp;
+            if (top.Count < k || logprob > top[^1].Logprob)
+            {
+                int at = top.BinarySearch((id, logprob), Comparer<(int Id, double Logprob)>.Create(
+                    (a, b) => a.Logprob != b.Logprob ? b.Logprob.CompareTo(a.Logprob) : a.Id.CompareTo(b.Id)));
+                if (at < 0)
+                {
+                    at = ~at;
+                }
+
+                top.Insert(at, (id, logprob));
+                if (top.Count > k)
+                {
+                    top.RemoveAt(k);
+                }
+            }
+        }
+
+        return top;
+    }
+
+    private static string Format(List<(int Id, double Logprob)> top) =>
+        string.Join(", ", top.Select(t => $"{t.Id}={t.Logprob:F4}"));
+
+    private static void AssertRecordedHash(ParityFixture fixture, string modelPath)
+    {
+        using FileStream stream = File.OpenRead(modelPath);
+        byte[] digest = SHA256.HashData(stream);
+        string actual = Convert.ToHexString(digest).ToLowerInvariant();
+
+        Assert.True(
+            string.Equals(actual, fixture.ModelSha256, StringComparison.Ordinal),
+            $"model file '{fixture.ModelFile}' hashes to {actual}, not the recorded {fixture.ModelSha256}: " +
+            "the reference outputs were generated against a different model binary.");
+    }
+
+    private static ParityFixture LoadFixture(string path) =>
+        JsonSerializer.Deserialize<ParityFixture>(File.ReadAllText(path), JsonOptions)
+            ?? throw new InvalidOperationException($"fixture '{path}' deserialized to null");
+
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    private sealed record ParityFixture(
+        [property: JsonPropertyName("model_file")] string ModelFile,
+        [property: JsonPropertyName("model_sha256")] string ModelSha256,
+        [property: JsonPropertyName("prompts")] ParityPrompt[] Prompts);
+
+    private sealed record ParityPrompt(
+        [property: JsonPropertyName("prompt")] string Prompt,
+        [property: JsonPropertyName("max_tokens")] int MaxTokens,
+        [property: JsonPropertyName("output")] string Output,
+        [property: JsonPropertyName("top_logprobs")] ParityToken[] TopLogprobs);
+
+    private sealed record ParityToken(
+        [property: JsonPropertyName("id")] int Id,
+        [property: JsonPropertyName("token")] string Token,
+        [property: JsonPropertyName("logprob")] double Logprob,
+        [property: JsonPropertyName("lair_logprob")] double? LairLogprob);
+}

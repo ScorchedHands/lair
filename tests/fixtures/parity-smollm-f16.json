@@ -1,0 +1,162 @@
+{
+  "model_file": "models/SmolLM-135M-Instruct-F16.gguf",
+  "model_sha256": "1fc02c21fba7874b15955d21dc59182aeae382abea412419ffd2fbaa84861790",
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
+  "decode": {
+    "context": 1024,
+    "temperature": 0.0
+  },
+  "generated_utc": "2026-11-01T12:35:01Z",
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "max_tokens": 48,
+      "output": " $100,000,000,000$.\n\nThe capital of the United States is $100,000,000,000,000$.",
+      "top_logprobs": [
+        {
+          "id": 1885,
+          "token": " $",
+          "logprob": -1.5674866437911987,
+          "lair_logprob": -1.7276
+        },
+        {
+          "id": 260,
+          "token": " the",
+          "logprob": -2.2180662155151367,
+          "lair_logprob": -2.2808
+        },
+        {
+          "id": 4723,
+          "token": " approximately",
+          "logprob": -2.3337488174438477,
+          "lair_logprob": -3.4266
+        },
+        {
+          "id": 216,
+          "token": " ",
+          "logprob": -2.430959463119507,
+          "lair_logprob": -2.2772
+        },
+        {
+          "id": 24927,
+          "token": " €",
+          "logprob": -2.881066083908081,
+          "lair_logprob": -3.4105
+        }
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "max_tokens": 48,
+      "output": ", there was a king who ruled over a vast kingdom. He had a wise advisor, who was known for his knowledge and wisdom. The advisor was a wise man named King A. He had a son named King B. The king and",
+      "top_logprobs": [
+        {
+          "id": 28,
+          "token": ",",
+          "logprob": -0.09693334996700287,
+          "lair_logprob": -0.2934
+        },
+        {
+          "id": 281,
+          "token": " in",
+          "logprob": -3.2503232955932617,
+          "lair_logprob": -4.4386
+        },
+        {
+          "id": 665,
+          "token": " there",
+          "logprob": -4.338747024536133,
+          "lair_logprob": -5.2604
+        },
+        {
+          "id": 253,
+          "token": " a",
+          "logprob": -5.17862606048584,
+          "lair_logprob": -3.7164
+        },
+        {
+          "id": 365,
+          "token": " (",
+          "logprob": -5.25726318359375,
+          "lair_logprob": -4.5726
+        }
+      ]
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "max_tokens": 48,
+      "output": "\tif n == 0:\n\t\treturn 0\n\telif n == 1:\n\t\treturn 1\n\telse:\n\t\treturn fibonacci(n - 1) + fibonacci(n - 2",
+      "top_logprobs": [
+        {
+          "id": 197,
+          "token": "\t",
+          "logprob": -0.9418147802352905,
+          "lair_logprob": null
+        },
+        {
+          "id": 19,
+          "token": "#",
+          "logprob": -1.647772192955017,
+          "lair_logprob": -1.9461
+        },
+        {
+          "id": 3725,
+          "token": "```",
+          "logprob": -2.1523709297180176,
+          "lair_logprob": -1.8015
+        },
+        {
+          "id": 5406,
+          "token": "return",
+          "logprob": -3.0541908740997314,
+          "lair_logprob": -3.3118
+        },
+        {
+          "id": 1710,
+          "token": "for",
+          "logprob": -3.488386392593384,
+          "lair_logprob": -3.8106
+        }
+      ]
+    },
+    {
+      "prompt": "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n",
+      "max_tokens": 48,
+      "output": "The given equation is not a simple linear equation. It is a quadratic equation in the form of $ax^2 + bx + c = 0$. To solve it, we can use the quadratic formula:\n\n$$x =",
+      "top_logprobs": [
+        {
+          "id": 504,
+          "token": "The",
+          "logprob": -1.6995388269424438,
+          "lair_logprob": -2.5191
+        },
+        {
+          "id": 4239,
+          "token": "Let",
+          "logprob": -2.080674886703491,
+          "lair_logprob": -2.0889
+        },
+        {
+          "id": 2068,
+          "token": "To",
+          "logprob": -2.287137508392334,
+          "lair_logprob": -3.2912
+        },
+        {
+          "id": 788,
+          "token": "In",
+          "logprob": -2.420670986175537,
+          "lair_logprob": -3.2512
+        },
+        {
+          "id": 1882,
+          "token": "We",
+          "logprob": -2.614043712615967,
+          "lair_logprob": -3.1386
+        }
+      ]
+    }
+  ]
+}

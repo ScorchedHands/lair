@@ -1,0 +1,452 @@
+using Lair.Host.Config;
+
+namespace Lair.Tests;
+
+[Trait("Category", "Config")]
+public sealed class ConfigTests : IDisposable
+{
+    private readonly List<string> _tempPaths = [];
+
+    public void Dispose()
+    {
+        foreach (string path in _tempPaths)
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (IOException)
+            {
+                // Best-effort cleanup of temp fixtures.
+            }
+        }
+    }
+
+    [Fact]
+    public void Load_ValidConfig_ParsesEverySection()
+    {
+        string yaml = $"""
+            server:
+              bind: 0.0.0.0
+              port: 8081
+            engine:
+              threads: 12
+              block_size: 16
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                type: chat
+                max_context_tokens: 8192
+                kv_blocks: 512
+                placement:
+                  device: cpu
+                  kv_residency: dram
+                  prefill: cpu
+                  core_set: "0-15"
+            """;
+
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+
+        Assert.Equal("0.0.0.0", config.Server.Bind);
+        Assert.Equal(8081, config.Server.Port);
+        Assert.Equal(12, config.Engine.Threads);
+        Assert.Equal(16, config.Engine.BlockSize);
+
+        Assert.Single(config.Models);
+        ModelConfig model = config.Models[0];
+        Assert.Equal("qwen-test", model.Name);
+        Assert.Equal("chat", model.Type);
+        Assert.Equal(8192, model.MaxContextTokens);
+        Assert.Equal(512, model.KvBlocks);
+        Assert.Equal("cpu", model.Placement.Device);
+        Assert.Equal("dram", model.Placement.KvResidency);
+        Assert.Equal("cpu", model.Placement.Prefill);
+        Assert.Equal(16, model.Placement.CoreSet.Count);
+        Assert.Contains(0, model.Placement.CoreSet);
+        Assert.Contains(15, model.Placement.CoreSet);
+    }
+
+    [Fact]
+    public void Load_OmittedOptionalKeys_AppliesDefaults()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """;
+
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+
+        Assert.Equal("127.0.0.1", config.Server.Bind);
+        Assert.Equal(8080, config.Server.Port);
+        Assert.Equal(0, config.Engine.Threads);
+        Assert.Equal(16, config.Engine.BlockSize);
+
+        ModelConfig model = Assert.Single(config.Models);
+        Assert.Equal("chat", model.Type);
+        Assert.Equal(4096, model.MaxContextTokens);
+        Assert.Equal(256, model.KvBlocks);
+        Assert.Equal("cpu", model.Placement.Device);
+        Assert.Equal("dram", model.Placement.KvResidency);
+        Assert.Equal("cpu", model.Placement.Prefill);
+        Assert.Empty(model.Placement.CoreSet);
+    }
+
+    [Fact]
+    public void Load_TwoModels_Fails()
+    {
+        string modelPath = TempModelFile();
+        string yaml = $"""
+            models:
+              - name: first
+                path: '{modelPath}'
+              - name: second
+                path: '{modelPath}'
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("exactly one model", error.Message);
+        Assert.Contains("single model", error.Message);
+        Assert.Contains("found 2", error.Message);
+    }
+
+    [Fact]
+    public void Load_EmptyModelList_Fails()
+    {
+        ConfigException error = Assert.Throws<ConfigException>(
+            () => YamlConfigLoader.Load(WriteConfig("models: []")));
+
+        Assert.Contains("exactly one model", error.Message);
+        Assert.Contains("found 0", error.Message);
+    }
+
+    [Fact]
+    public void Load_MissingModelsKey_Fails()
+    {
+        ConfigException error = Assert.Throws<ConfigException>(
+            () => YamlConfigLoader.Load(WriteConfig("server:\n  port: 8080\n")));
+
+        Assert.Contains("Missing required key 'models'", error.Message);
+        Assert.Contains("server, engine, models", error.Message);
+    }
+
+    [Fact]
+    public void Load_ModelPathMustExistOnDisk_Fails()
+    {
+        string missing = Path.Combine(Path.GetTempPath(), $"lair-missing-{Guid.NewGuid():N}.gguf");
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{missing}'
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].path", error.Message);
+        Assert.Contains("does not exist on disk", error.Message);
+    }
+
+    [Fact]
+    public void Load_EmptyModelPath_Fails()
+    {
+        string yaml = """
+            models:
+              - name: qwen-test
+                path: "   "
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].path", error.Message);
+        Assert.Contains("non-empty path", error.Message);
+    }
+
+    [Fact]
+    public void Load_MissingModelPath_Fails()
+    {
+        string yaml = """
+            models:
+              - name: qwen-test
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("Missing required key 'path'", error.Message);
+        Assert.Contains("name, path, type, max_context_tokens, kv_blocks, placement", error.Message);
+    }
+
+    [Fact]
+    public void Load_NonChatModelType_Fails()
+    {
+        string yaml = $"""
+            models:
+              - name: embed-test
+                path: '{TempModelFile()}'
+                type: embed
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].type 'embed'", error.Message);
+        Assert.Contains("embed models are not supported in this build", error.Message);
+        Assert.Contains("'chat' is the only accepted value", error.Message);
+    }
+
+    [Fact]
+    public void Load_PlacementDeviceMustBeCpu_Fails()
+    {
+        ConfigException error = Assert.Throws<ConfigException>(
+            () => YamlConfigLoader.Load(WriteConfig(PlacementYaml("device: cuda"))));
+
+        Assert.Contains("placement.device 'cuda'", error.Message);
+        Assert.Contains("only accepted value for 'device' is 'cpu'", error.Message);
+    }
+
+    [Fact]
+    public void Load_PlacementKvResidencyMustBeDram_Fails()
+    {
+        ConfigException error = Assert.Throws<ConfigException>(
+            () => YamlConfigLoader.Load(WriteConfig(PlacementYaml("kv_residency: vram"))));
+
+        Assert.Contains("placement.kv_residency 'vram'", error.Message);
+        Assert.Contains("only accepted value for 'kv_residency' is 'dram'", error.Message);
+    }
+
+    [Fact]
+    public void Load_PlacementPrefillMustBeCpu_Fails()
+    {
+        ConfigException error = Assert.Throws<ConfigException>(
+            () => YamlConfigLoader.Load(WriteConfig(PlacementYaml("prefill: gpu"))));
+
+        Assert.Contains("placement.prefill 'gpu'", error.Message);
+        Assert.Contains("only accepted value for 'prefill' is 'cpu'", error.Message);
+    }
+
+    [Fact]
+    public void Load_BlockSizeIsFixedTo16_Fails()
+    {
+        string yaml = $"""
+            engine:
+              block_size: 32
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("engine.block_size 32", error.Message);
+        Assert.Contains("block size is fixed to 16", error.Message);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(65536)]
+    [InlineData(-1)]
+    public void Load_PortOutOfRange_Fails(int port)
+    {
+        string yaml = $"""
+            server:
+              port: {port}
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains($"server.port {port}", error.Message);
+        Assert.Contains("must be between 1 and 65535", error.Message);
+    }
+
+    [Fact]
+    public void Load_NegativeThreads_Fails()
+    {
+        string yaml = $"""
+            engine:
+              threads: -4
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("engine.threads -4", error.Message);
+        Assert.Contains("'threads' must be 0 or greater", error.Message);
+    }
+
+    [Theory]
+    [InlineData(7)]
+    [InlineData(0)]
+    public void Load_KvBlocksTooSmall_Fails(int kvBlocks)
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                kv_blocks: {kvBlocks}
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains($"models[0].kv_blocks {kvBlocks}", error.Message);
+        Assert.Contains("'kv_blocks' must be 8 or greater", error.Message);
+    }
+
+    [Theory]
+    [InlineData(127)]
+    [InlineData(0)]
+    public void Load_MaxContextTokensTooSmall_Fails(int maxContextTokens)
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_context_tokens: {maxContextTokens}
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains($"models[0].max_context_tokens {maxContextTokens}", error.Message);
+        Assert.Contains("'max_context_tokens' must be 128 or greater", error.Message);
+    }
+
+    [Fact]
+    public void Load_UnknownKeys_NamedWithAllowedKeysAtThatLevel()
+    {
+        string modelPath = TempModelFile();
+
+        (string Yaml, string UnknownKey, string Where, string AllowedKeys)[] cases =
+        [
+            (
+                "bogus: 1\nmodels:\n  - name: qwen-test\n    path: '" + modelPath + "'\n",
+                "bogus",
+                "the top level",
+                "server, engine, models"
+            ),
+            (
+                "server:\n  bindd: 127.0.0.1\nmodels:\n  - name: qwen-test\n    path: '" + modelPath + "'\n",
+                "bindd",
+                "'server'",
+                "bind, port"
+            ),
+            (
+                "engine:\n  thread: 8\nmodels:\n  - name: qwen-test\n    path: '" + modelPath + "'\n",
+                "thread",
+                "'engine'",
+                "threads, block_size"
+            ),
+            (
+                "models:\n  - name: qwen-test\n    path: '" + modelPath + "'\n    context: 4096\n",
+                "context",
+                "models[0]",
+                "name, path, type, max_context_tokens, kv_blocks, placement"
+            ),
+            (
+                "models:\n  - name: qwen-test\n    path: '" + modelPath + "'\n    placement:\n      device_id: 0\n",
+                "device_id",
+                "models[0].placement",
+                "device, kv_residency, prefill, core_set"
+            ),
+        ];
+
+        foreach ((string yaml, string unknownKey, string where, string allowedKeys) in cases)
+        {
+            ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+            Assert.Contains($"Unknown key '{unknownKey}'", error.Message);
+            Assert.Contains(where, error.Message);
+            Assert.Contains($"allowed keys are: {allowedKeys}", error.Message);
+        }
+    }
+
+    [Fact]
+    public void Load_CoreSetRange_ParsesInclusiveRange()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                placement:
+                  core_set: "0-15"
+            """;
+
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+        IReadOnlySet<int> coreSet = config.Models[0].Placement.CoreSet;
+
+        Assert.Equal(16, coreSet.Count);
+        Assert.True(coreSet.IsSupersetOf([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]));
+    }
+
+    [Fact]
+    public void Load_CoreSetMixedIdsAndRanges_ParsesToExpectedSet()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                placement:
+                  core_set: "0,2,8-11"
+            """;
+
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+        IReadOnlySet<int> coreSet = config.Models[0].Placement.CoreSet;
+
+        Assert.Equal(6, coreSet.Count);
+        int[] expected = [0, 2, 8, 9, 10, 11];
+        Assert.Equal(expected, coreSet.OrderBy(core => core).ToArray());
+    }
+
+    [Theory]
+    [InlineData("0-")]
+    [InlineData("-5")]
+    [InlineData("15-0")]
+    [InlineData("abc")]
+    [InlineData("0,,")]
+    public void Load_CoreSetInvalidSyntax_Fails(string coreSet)
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                placement:
+                  core_set: "{coreSet}"
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].placement.core_set", error.Message);
+        Assert.Contains("core_set", error.Message);
+    }
+
+    [Fact]
+    public void Load_MissingFile_Fails()
+    {
+        string missing = Path.Combine(Path.GetTempPath(), $"lair-absent-{Guid.NewGuid():N}.yaml");
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(missing));
+        Assert.Contains("does not exist", error.Message);
+    }
+
+    [Fact]
+    public void Load_MalformedYaml_Fails()
+    {
+        ConfigException error = Assert.Throws<ConfigException>(
+            () => YamlConfigLoader.Load(WriteConfig("server: [1, 2\n")));
+
+        Assert.Contains("could not be read as YAML", error.Message);
+    }
+
+    private string PlacementYaml(string placementLine) =>
+        "models:\n" +
+        "  - name: qwen-test\n" +
+        $"    path: '{TempModelFile()}'\n" +
+        "    placement:\n" +
+        $"      {placementLine}\n";
+
+    private string WriteConfig(string yaml)
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"lair-config-{Guid.NewGuid():N}.yaml");
+        File.WriteAllText(path, yaml);
+        _tempPaths.Add(path);
+        return path;
+    }
+
+    private string TempModelFile()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"lair-model-{Guid.NewGuid():N}.gguf");
+        File.WriteAllBytes(path, [0x47, 0x47, 0x55, 0x46]);
+        _tempPaths.Add(path);
+        return path;
+    }
+}

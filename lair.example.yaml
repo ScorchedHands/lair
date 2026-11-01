@@ -1,0 +1,23 @@
+# LAIR configuration example.
+# Copy to lair.yaml and adjust; `models` must list exactly one model and `path`
+# must point at a GGUF file that exists on disk.
+
+server:
+  bind: 127.0.0.1
+  port: 8080
+
+engine:
+  threads: 0          # 0 = pick automatically
+  block_size: 16      # fixed to 16
+
+models:
+  - name: qwen3.8-flash-next
+    path: models/qwen3.8-flash-next.iq4_xs.gguf
+    type: chat
+    max_context_tokens: 4096
+    kv_blocks: 256
+    placement:
+      device: cpu
+      kv_residency: dram
+      prefill: cpu
+      core_set: "0-15"   # optional; omit to leave the model unpinned

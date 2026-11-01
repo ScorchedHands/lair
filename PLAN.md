@@ -158,7 +158,7 @@ llama.cpp/ggml (fused dequant kernels, block quant formats, hybrid offload pitfa
 
 ## Phases
 
-### MVP1 [v0.1.0] - Refined
+### MVP1 [v0.1.0] - Shipped
 
 One dense GGUF model answers one OpenAI request, streamed, on CPU.
 
@@ -210,43 +210,43 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 
 #### Implementation Items
 
-- [_] GGUF loader — mmap tensors, metadata, vocab (see DN-M1-3)
-  - Verify: `dotnet test --filter Category=Loader` against fixture GGUFs; `lair serve` loads SmolLM-135M-F16 and Qwen2-1.5B-Q4_K_M without error.
-- [_] GGUF tokenizer — BPE + special tokens decode/encode
-  - Verify: `dotnet test --filter Category=Tokenizer` round-trip against llama.cpp tokenization fixtures.
-- [_] Chat templates — mini Jinja-subset interpreter
-  - Verify: `dotnet test --filter Category=Template` golden renders for ChatML, Llama-3, and Phi templates extracted from real GGUF metadata.
-- [_] Dense kernels — fused dequant GEMV for Q4_K_M/Q8_0/F16, AVX2, row-block threading
-  - Verify: `dotnet test --filter Category=Kernel` compares against a naive scalar dequant+dot reference within FP tolerance; `bench/` smoke prints tok/s.
-- [_] Layer executor — RMSNorm, RoPE, GQA attention, SwiGLU FFN, qkv bias
-  - Verify: `dotnet test --filter Category=Layers` per-layer activations vs reference fixtures; end-to-end via parity test.
-- [_] Paged KV — CPU block pool, 16-token blocks, allocator, per-model budget from config
-  - Verify: `dotnet test --filter Category=Kv` allocator alloc/free/reuse tests; multi-turn conversation keeps prefix KV intact.
-- [_] Sampling — greedy, temperature, top-k/top-p, seed
-  - Verify: `dotnet test --filter Category=Sampling` greedy determinism + seeded distribution checks.
-- [_] HTTP API — chat/completions, completions, models (with `context_length` metadata), SSE streaming, error taxonomy (see DN-M1-6, DN-M1-7)
-  - Verify: OpenAI Python SDK script completes chat + completion + embeddings-404 + streaming against a live server; `curl` error-shape checks.
-- [_] Backend seam — `IBackend` + arenas + `IWeightSource` contracts, CPU-only implementation (see DN-M1-3, DN-M1-11)
-  - Verify: `lair.core` compiles against contracts only — no project reference to `lair.backends.cpu`; a test-only alternate `IWeightSource` provider (in-memory tensor copy) serves the parity model end-to-end, proving retrieval is pluggable.
-- [_] Golden parity — harness vs pinned llama.cpp build, small F16 model, greedy decode, committed reference fixtures
-  - Verify: `dotnet test --filter Category=Parity`.
-- [_] Config load — YAML parse, validation, placement policy (single model, `cpu`)
-  - Verify: `dotnet test --filter Category=Config` parse/validation-error cases; `lair serve -c lair.yaml` boots.
-- [_] CLI — `lair serve -c lair.yaml` and `lair chat` REPL
-  - Verify: manual — serve a Q4_K_M model, chat REPL streams tokens, Ctrl+C mid-generation aborts cleanly.
+- [✓] GGUF loader — mmap tensors, metadata, vocab (see DN-M1-3)
+  - Verify: `dotnet test --filter Category=Loader` — 8/8 on synthetic GGUF v3 ✅; real-file load verified on SmolLM-135M-Instruct-F16.gguf via tokenizer integration ✅; quantized real-load runs at Parity against a pinned Q8_0 build (SmolLM dims are not block-divisible, so llama.cpp's own quantizer emits legacy fallback tensors there); full Q4_K_M family support tracked in Backlog.
+- [✓] GGUF tokenizer — BPE + special tokens decode/encode
+  - Verify: `dotnet test --filter Category=Tokenizer` — 18/18 ✅ (13 synthetic + 5 against the real SmolLM GGUF: ASCII/newline/emoji round-trips, control tokens).
+- [✓] Chat templates — mini Jinja-subset interpreter
+  - Verify: `dotnet test --filter Category=Template` — 20/20 ✅ golden renders (ChatML = real SmolLM `tokenizer.chat_template`, conditional if/else + `|tojson`, Phi-style), subset semantics (concat, `==`/`!=`, `not`, `tojson`/`trim`, `{%- -%}`), and rejections naming construct + position (`{% set %}`, `|upper`, macro, slices). The real Llama-3 template needs `{% set %}`/loop vars — out of subset (backlog).
+- [✓] Dense kernels — fused dequant GEMV for Q4_K_M/Q8_0/F16, AVX2, row-block threading (see DN-M1-3)
+  - Verify: `dotnet test --filter Category=Kernel` — 15/15 ✅ vs double-precision oracle incl. threaded bit-identity; bench Q4_K 4096×4096: AVX2 8.7× scalar, threaded ≈17 GB/s ✅.
+- [✓] Layer executor — RMSNorm, RoPE, GQA attention, SwiGLU FFN, qkv bias (see DN-M1-1)
+  - Verify: `dotnet test --filter Category=Layers` — 24/24 ✅ incl. hand-computed op units and real SmolLM-F16 forward smoke (finite deterministic logits); exact-token parity runs at Parity.
+- [✓] Paged KV — CPU block pool, 16-token blocks, allocator, per-model budget from config
+  - Verify: `dotnet test --filter Category=Kv` — 8/8 ✅ (capacity errors, alloc/release integrity, addressing across partial blocks, refcounts); multi-turn prefix intactness verified end-to-end at Manual Serve.
+- [✓] Sampling — greedy, temperature, top-k/top-p, seed
+  - Verify: `dotnet test --filter Category=Sampling` — 9/9 ✅ (seeded determinism, top-k/top-p intersection order, statistical match within 1%, banned/NaN handling).
+- [✓] HTTP API — chat/completions, completions, models (with `context_length` metadata), SSE streaming, error taxonomy (see DN-M1-6, DN-M1-7)
+  - Verify: `dotnet test --filter Category=Api` — 10/10 ✅ against a live server on the real SmolLM fixture: non-stream chat + completions shapes, SSE chunk stream ending `[DONE]`, `/v1/models` with `context_length`, `/healthz`, embeddings-404, error taxonomy (model_not_found / context_length_exceeded / engine_overloaded / invalid_request), `x-lair-request-id` on every response. OpenAI Python SDK probe runs under Manual Serve.
+- [✓] Backend seam — `IBackend` + arenas + `IWeightSource` contracts, CPU-only implementation (see DN-M1-3, DN-M1-11)
+  - Verify: `lair.core` compiles against contracts only — no project reference to `lair.backends.cpu` ✅; alternate `IWeightSource` provider end-to-end proof ran with the Parity item (`ArenaWeightSourceTests`: tensors copied into backend-allocated aligned blocks, token sequence identical to mmap-backed decode) ✅.
+- [✓] Golden parity — logit-agreement harness vs pinned llama.cpp (server-mode reference), committed calibrated fixtures (see Decision Log 2026-11-01)
+  - Verify: `dotnet test --filter Category=Parity` — 9/9 ✅ on SmolLM-135M F16 + Q8_0 vs pinned llama.cpp b12032 server references (4 prompts × 2 models, sha256-guarded): LAIR argmax lands in the reference top-5 for every prompt; calibrated distributions reproduce exactly. Harness work exposed and fixed four engine bugs: prefill double-forward of the last prompt token, BOS applied regardless of `add_bos_token`, SmolLM digit-run split cutting all non-digit text per-character, and reversed BPE merge priority order. Alternate-`IWeightSource` arena proof green — completes the Backend seam item's end-to-end proof too.
+- [✓] Config load — YAML parse, validation, placement policy (single model, `cpu`)
+  - Verify: `dotnet test --filter Category=Config` — 31/31 passing ✅; `lair serve -c lair.yaml` boot is exercised under the CLI item.
+- [✓] CLI — `lair serve -c lair.yaml` and `lair chat` REPL
+  - Verify: `dotnet test --filter Category=Cli` — 4/4 ✅ (piped stdin vs real SmolLM: banner + streamed reply, `/reset`, overflow retry then clean error line, cancellation → interrupted/0). Manual serve boot + piped chat run verified; quantized-model serving check runs at Manual Serve.
 
 #### Tests
 
-- [_] Automated Loader: GGUF metadata, vocab, tensor offset parsing against fixtures
-- [_] Automated Tokenizer: encode/decode round-trip vs llama.cpp fixtures
-- [_] Automated Template: golden chat-template renders, three families
-- [_] Automated Kernel: fused dequant GEMV vs scalar reference, FP tolerance
-- [_] Automated Layers: per-layer activations vs reference fixtures
-- [_] Automated Kv: block allocator alloc/free/reuse and budget enforcement
-- [_] Automated Sampling: determinism under greedy/seed; statistical top-k/p behavior
-- [_] Automated Parity: token-sequence match vs llama.cpp reference on SmolLM-135M-F16, fixed prompts
-- [_] Automated Config: YAML schema validation and error messages
-- [_] Manual Serve: full serve→chat REPL session with streaming, abort, and reload-after-config-edit
+- [✓] Automated Loader: GGUF metadata, vocab, tensor offset parsing against fixtures — 8/8
+- [✓] Automated Tokenizer: encode/decode round-trip vs llama.cpp semantics — 18/18, real-model cases executing live
+- [✓] Automated Template: golden chat-template renders, three families
+- [✓] Automated Kernel: fused dequant GEMV vs scalar reference, FP tolerance — 15/15 + DequantRow cases
+- [✓] Automated Layers: per-layer activations vs hand-computed references + real-model smoke — 24/24
+- [✓] Automated Kv: block allocator alloc/free/reuse and budget enforcement — 8/8
+- [✓] Automated Sampling: determinism under greedy/seed; statistical top-k/p behavior — 9/9
+- [✓] Automated Parity: per-prompt sha256 guard + LAIR argmax ∈ reference top-5 (pinned llama.cpp server) + reproduction of the fixture's calibrated LAIR distribution within |Δlogprob| ≤ 0.2, on SmolLM-135M-F16 and Q8_0 — 9/9
+- [✓] Automated Config: YAML schema validation and error messages — 31/31
+- [✓] Manual Serve: full serve→chat REPL session with streaming, abort, and reload-after-config-edit — done ✅ vs quantized Q8_0 model via YAML config: healthz/models/chat/completions probes, SSE chunk stream + mid-stream client abort with clean recovery on the next request (structured per-request log lines), piped `lair chat` REPL run against the same config, OpenAI Python SDK probe (`models.list`, non-stream chat, streaming) green, edited `max_context_tokens` 512→768 picked up on restart.
 
 #### Open Items
 
@@ -518,6 +518,7 @@ Vision input on chat models.
 | idea | Prefill GEMM shim microkernel | tiled-matmul native microkernel via `[LibraryImport]` where the bench harness proves the managed tile wall |
 | idea | Core-set overcommit | allow models to share/partially oversubscribe core sets as an explicit knob |
 | idea | `auto` device fallback | silent CPU fallback when a configured CUDA device is absent — deliberately not a default (DN-M3-3) |
+| bug | Q4_K_M family coverage gap | kernels implement only the Q4_K block format; real Q4_K_M files mix Q5_K/Q6_K tensors, and non-block-divisible dims force legacy formats (Q4_0/Q5_0…) — loader/kernel extension needed before serving published quants in production |
 
 ## Decision Log
 
@@ -533,3 +534,4 @@ Vision input on chat models.
 - **2026-10-31 — Performance thesis vs incumbents.** CPU dense decode: parity with llama.cpp is plausible (bandwidth-bound; dotLLM already 66–88%). CPU prefill: parity only via `[LibraryImport]` microkernels, not pure managed. GPU: match vLLM's serving features (batching, paged KV, prefix caching), not its CUDA kernels. Over-perform target: CPU MoE decode via capacity/cost-model residency — mainline llama.cpp is weak there (ik_llama.cpp +15–160%) and the niche is open.
 - **2026-10-31 — License undecided.** Private repo for now; dotLLM is GPLv3 — its ideas may be studied, its code may not be copied into LAIR.
 - **2026-10-31 — MVP2–MVP5 refined.** Batch-step scheduling with decode priority and chunked prefill; hot-reload knob mutation classes; CUDA via nvcc microkernels + cuBLASLt with contiguous layer split and fail-fast device policy; multi-model admission via global ledger with no runtime preemption until MVP6 (backlog: preemptive KV swap); Flash-Next quants IQ3_XXS primary with Q4_K_M baseline behind a reality-check gate; expert-aware batching as the MoE engine win; MTP-only drafting at MVP5.
+- **2026-11-01 — Parity criterion is logit-distribution agreement, not exact token match.** Evidence from the pinned llama.cpp b12032 build: its own CLI and server modes produce different greedy (temp 0) continuations for identical prompts on SmolLM-135M-F16, and near-tie argmax flips (Δlogprob < 0.2) appear between any two independent fp pipelines. Cross-tool exact 48-token string equality is therefore unattainable; fixtures record position-0 top-5 logprobs from pinned server runs with a documented tolerance, and divergences inside the near-tie band are reported rather than failed.

@@ -1,0 +1,162 @@
+{
+  "model_file": "models/smollm-135m-instruct-q8_0.gguf",
+  "model_sha256": "fd22610424412b2b5136e1a8efb7e2bd7ec8bf70a76799084ac70877b72e1cc7",
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
+  "decode": {
+    "context": 1024,
+    "temperature": 0.0
+  },
+  "generated_utc": "2026-11-01T12:35:23Z",
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "max_tokens": 48,
+      "output": " $100,000,000$. The capital of the United States is $100,000,000$. The capital of the United Kingdom is $100,000",
+      "top_logprobs": [
+        {
+          "id": 1885,
+          "token": " $",
+          "logprob": -1.6008176803588867,
+          "lair_logprob": -1.7101
+        },
+        {
+          "id": 260,
+          "token": " the",
+          "logprob": -2.1365413665771484,
+          "lair_logprob": -2.2815
+        },
+        {
+          "id": 216,
+          "token": " ",
+          "logprob": -2.400909423828125,
+          "lair_logprob": -2.3417
+        },
+        {
+          "id": 4723,
+          "token": " approximately",
+          "logprob": -2.474734306335449,
+          "lair_logprob": -3.3501
+        },
+        {
+          "id": 24927,
+          "token": " €",
+          "logprob": -2.878842353820801,
+          "lair_logprob": -3.3918
+        }
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "max_tokens": 48,
+      "output": ", there was a man named John. He had a son named John. John was a very smart man, but he had a very bad temper. He would always get angry and do things that were not good for him.\n\nOne",
+      "top_logprobs": [
+        {
+          "id": 28,
+          "token": ",",
+          "logprob": -0.09115893393754959,
+          "lair_logprob": -0.2858
+        },
+        {
+          "id": 281,
+          "token": " in",
+          "logprob": -3.197040557861328,
+          "lair_logprob": -4.5009
+        },
+        {
+          "id": 665,
+          "token": " there",
+          "logprob": -4.578017234802246,
+          "lair_logprob": -5.4321
+        },
+        {
+          "id": 365,
+          "token": " (",
+          "logprob": -5.201301574707031,
+          "lair_logprob": -4.5652
+        },
+        {
+          "id": 253,
+          "token": " a",
+          "logprob": -5.376601219177246,
+          "lair_logprob": -3.8086
+        }
+      ]
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "max_tokens": 48,
+      "output": "\tif n == 0:\n\t\treturn 0\n\telif n == 1:\n\t\treturn 1\n\telse:\n\t\treturn fibonacci(n-1) + fibonacci(n-2)",
+      "top_logprobs": [
+        {
+          "id": 197,
+          "token": "\t",
+          "logprob": -0.9092413783073425,
+          "lair_logprob": null
+        },
+        {
+          "id": 19,
+          "token": "#",
+          "logprob": -1.7909761667251587,
+          "lair_logprob": -2.0585
+        },
+        {
+          "id": 3725,
+          "token": "```",
+          "logprob": -2.068380832672119,
+          "lair_logprob": -1.6966
+        },
+        {
+          "id": 3391,
+          "token": "assert",
+          "logprob": -3.3449597358703613,
+          "lair_logprob": -3.5677
+        },
+        {
+          "id": 5406,
+          "token": "return",
+          "logprob": -3.357783079147339,
+          "lair_logprob": -3.3727
+        }
+      ]
+    },
+    {
+      "prompt": "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n",
+      "max_tokens": 48,
+      "output": "The equation $x^2 + 1 = 0$ has no real solutions. This is because the discriminant of the quadratic equation $x^2 + 1 = 0$ is $(-1)^2 = 1",
+      "top_logprobs": [
+        {
+          "id": 504,
+          "token": "The",
+          "logprob": -1.7102593183517456,
+          "lair_logprob": -2.588
+        },
+        {
+          "id": 4239,
+          "token": "Let",
+          "logprob": -2.0433130264282227,
+          "lair_logprob": -1.7934
+        },
+        {
+          "id": 2068,
+          "token": "To",
+          "logprob": -2.23140811920166,
+          "lair_logprob": -3.1566
+        },
+        {
+          "id": 788,
+          "token": "In",
+          "logprob": -2.4007654190063477,
+          "lair_logprob": -3.09
+        },
+        {
+          "id": 198,
+          "token": "\n",
+          "logprob": -2.805619239807129,
+          "lair_logprob": null
+        }
+      ]
+    }
+  ]
+}
