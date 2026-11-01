@@ -222,8 +222,8 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
   - Verify: `dotnet test --filter Category=Layers` — 24/24 ✅ incl. hand-computed op units and real SmolLM-F16 forward smoke (finite deterministic logits); exact-token parity runs at Parity.
 - [✓] Paged KV — CPU block pool, 16-token blocks, allocator, per-model budget from config
   - Verify: `dotnet test --filter Category=Kv` — 8/8 ✅ (capacity errors, alloc/release integrity, addressing across partial blocks, refcounts); multi-turn prefix intactness verified end-to-end at Manual Serve.
-- [_] Sampling — greedy, temperature, top-k/top-p, seed
-  - Verify: `dotnet test --filter Category=Sampling` greedy determinism + seeded distribution checks.
+- [✓] Sampling — greedy, temperature, top-k/top-p, seed
+  - Verify: `dotnet test --filter Category=Sampling` — 9/9 ✅ (seeded determinism, top-k/top-p intersection order, statistical match within 1%, banned/NaN handling).
 - [_] HTTP API — chat/completions, completions, models (with `context_length` metadata), SSE streaming, error taxonomy (see DN-M1-6, DN-M1-7)
   - Verify: OpenAI Python SDK script completes chat + completion + embeddings-404 + streaming against a live server; `curl` error-shape checks.
 - [→] Backend seam — `IBackend` + arenas + `IWeightSource` contracts, CPU-only implementation (see DN-M1-3, DN-M1-11)
@@ -243,7 +243,7 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 - [✓] Automated Kernel: fused dequant GEMV vs scalar reference, FP tolerance — 15/15 + DequantRow cases
 - [✓] Automated Layers: per-layer activations vs hand-computed references + real-model smoke — 24/24
 - [✓] Automated Kv: block allocator alloc/free/reuse and budget enforcement — 8/8
-- [_] Automated Sampling: determinism under greedy/seed; statistical top-k/p behavior
+- [✓] Automated Sampling: determinism under greedy/seed; statistical top-k/p behavior — 9/9
 - [_] Automated Parity: token-sequence match vs llama.cpp reference on SmolLM-135M-F16, fixed prompts
 - [✓] Automated Config: YAML schema validation and error messages — 31/31
 - [_] Manual Serve: full serve→chat REPL session with streaming, abort, and reload-after-config-edit
