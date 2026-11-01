@@ -7,4 +7,9 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Lair.Core\Lair.Core.csproj" />
+    <ProjectReference Include="..\..\src\Lair.Backends.Cpu\Lair.Backends.Cpu.csproj" />
+  </ItemGroup>
+
 </Project>

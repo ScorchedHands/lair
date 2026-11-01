@@ -20,21 +20,20 @@ public sealed record TensorShape(int[] Dims)
 
     // Packed row size in bytes for a row of Dims[^1] elements:
     //   F16   2 bytes per element, stored exactly with no padding.
-    //   Q8_0  1 byte per element; quantized payloads live in whole 32-byte blocks,
-    //         so a row is rounded up to a 32-byte multiple.
-    //   Q4_K  4-bit nibbles packed 2 per byte (0.5 bytes per element); an odd element
-    //         count leaves a half byte, so the row is rounded up to a 32-byte multiple.
+    //   Q8_0  whole 34-byte blocks (int16 scale + 32 int8 quants); the final block is
+    //         zero-padded to cover a partial run of up to 32 elements.
+    //   Q4_K  whole 144-byte blocks (half d, half dmin, 12 packed 6-bit group scales/mins,
+    //         128 bytes of 4-bit quants); the final block is zero-padded to cover a partial
+    //         run of up to 256 elements.
     public long RowStrideBytes(QuantFormat fmt)
     {
         long elements = Dims.Length > 0 ? Dims[^1] : 0;
-        long raw = fmt switch
+        return fmt switch
         {
             QuantFormat.F16 => elements * 2,
-            QuantFormat.Q8_0 => elements,
-            QuantFormat.Q4_K => (elements + 1) / 2,
+            QuantFormat.Q8_0 => (elements + 31) / 32 * 34,
+            QuantFormat.Q4_K => (elements + 255) / 256 * 144,
             _ => throw new ArgumentOutOfRangeException(nameof(fmt), fmt, "Unknown quant format."),
         };
-
-        return fmt == QuantFormat.F16 ? raw : (raw + 31) / 32 * 32;
     }
 }
