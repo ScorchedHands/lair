@@ -361,7 +361,7 @@ public sealed class GgufTokenizer
         {
             int end = start + length;
             int runStart = start;
-            for (int pos = start; pos < end; pos++)
+            for (int pos = start; pos < end;)
             {
                 bool isDigit = char.IsNumber(text, pos);
                 if (pos > runStart && (!isDigit || !char.IsNumber(text, runStart)))
@@ -369,6 +369,9 @@ public sealed class GgufTokenizer
                     next.Add(pos - runStart);
                     runStart = pos;
                 }
+
+                // Step whole codepoints so a surrogate pair never lands on a digit-run boundary.
+                pos += char.IsHighSurrogate(text[pos]) && pos + 1 < end ? 2 : 1;
             }
 
             next.Add(end - runStart);
@@ -400,9 +403,18 @@ public sealed class GgufTokenizer
                     previousEnd = tokenEnd;
                 }
 
-                if (text[pos] == '\'' && pos + 1 < end)
-                {
-                    int contractionLength = 0;
+                    // A surrogate pair is one codepoint and must stay in a single pre-token: splitting it would make
+                    // UTF-8 encoding emit replacement bytes.
+                    if (char.IsHighSurrogate(text[pos]) && pos + 1 < end && char.IsLowSurrogate(text[pos + 1]))
+                    {
+                        pos += 2;
+                        AddToken(pos);
+                        continue;
+                    }
+
+                    if (text[pos] == '\'' && pos + 1 < end)
+                    {
+                        int contractionLength = 0;
                     bool isContraction = IsAsciiLetter(text, pos + 1)
                         && IsContractionSuffix(text, pos, end, out contractionLength);
 
@@ -525,9 +537,18 @@ public sealed class GgufTokenizer
                     previousEnd = tokenEnd;
                 }
 
-                if (text[pos] == '\'' && pos + 1 < end)
-                {
-                    int suffixLength = 0;
+                    // A surrogate pair is one codepoint and must stay in a single pre-token: splitting it would make
+                    // UTF-8 encoding emit replacement bytes.
+                    if (char.IsHighSurrogate(text[pos]) && pos + 1 < end && char.IsLowSurrogate(text[pos + 1]))
+                    {
+                        pos += 2;
+                        AddToken(pos);
+                        continue;
+                    }
+
+                    if (text[pos] == '\'' && pos + 1 < end)
+                    {
+                        int suffixLength = 0;
                     bool isContraction = IsAsciiLetter(text, pos + 1)
                         && IsContractionSuffix(text, pos, end, out suffixLength, caseInsensitive: true);
 

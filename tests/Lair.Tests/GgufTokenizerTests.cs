@@ -15,8 +15,6 @@ public sealed class GgufTokenizerTests : IDisposable
 {
     private const uint GgufMagic = 0x46554747; // "GGUF"
 
-    private const string ModelPath = "models/SmolLM-135M-Instruct-F16.gguf";
-
     private readonly List<string> _tempFiles = [];
 
     public void Dispose()
@@ -207,12 +205,13 @@ public sealed class GgufTokenizerTests : IDisposable
     [Fact]
     public void RealModel_GgufFileOpen_Succeeds()
     {
-        if (!File.Exists(ModelPath))
+        string? modelPath = ModelFixture.Resolve();
+        if (modelPath is null)
         {
             return; // real-model tests skip when the fixture is absent (xunit 2.9 has no dynamic Assert.Skip)
         }
 
-        using GgufFile gguf = GgufFile.Open(ModelPath);
+        using GgufFile gguf = GgufFile.Open(modelPath);
 
         Assert.Equal(3, gguf.Version);
         Assert.Equal(272, gguf.Tensors.Tensors.Count);
@@ -222,12 +221,13 @@ public sealed class GgufTokenizerTests : IDisposable
     [Fact]
     public void RealModel_MetadataMatchesTokenizerIds()
     {
-        if (!File.Exists(ModelPath))
+        string? modelPath = ModelFixture.Resolve();
+        if (modelPath is null)
         {
             return; // real-model tests skip when the fixture is absent (xunit 2.9 has no dynamic Assert.Skip)
         }
 
-        using GgufFile gguf = GgufFile.Open(ModelPath);
+        using GgufFile gguf = GgufFile.Open(modelPath);
         GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
 
         Assert.Equal(49152, tokenizer.VocabSize);
@@ -242,12 +242,13 @@ public sealed class GgufTokenizerTests : IDisposable
     [Fact]
     public void RealModel_EncodeDecode_RoundTripsSamples()
     {
-        if (!File.Exists(ModelPath))
+        string? modelPath = ModelFixture.Resolve();
+        if (modelPath is null)
         {
             return; // real-model tests skip when the fixture is absent (xunit 2.9 has no dynamic Assert.Skip)
         }
 
-        using GgufFile gguf = GgufFile.Open(ModelPath);
+        using GgufFile gguf = GgufFile.Open(modelPath);
         GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
 
         string[] samples =
@@ -270,12 +271,13 @@ public sealed class GgufTokenizerTests : IDisposable
     [Fact]
     public void RealModel_ControlTokenEncodesToSingleId()
     {
-        if (!File.Exists(ModelPath))
+        string? modelPath = ModelFixture.Resolve();
+        if (modelPath is null)
         {
             return; // real-model tests skip when the fixture is absent (xunit 2.9 has no dynamic Assert.Skip)
         }
 
-        using GgufFile gguf = GgufFile.Open(ModelPath);
+        using GgufFile gguf = GgufFile.Open(modelPath);
         GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
 
         int? imStart = tokenizer.IdOf("<|im_start|>");
@@ -290,12 +292,13 @@ public sealed class GgufTokenizerTests : IDisposable
     [Fact]
     public void RealModel_DetectsUnsupportedPreTokenizer()
     {
-        if (!File.Exists(ModelPath))
+        string? modelPath = ModelFixture.Resolve();
+        if (modelPath is null)
         {
             return; // real-model tests skip when the fixture is absent (xunit 2.9 has no dynamic Assert.Skip)
         }
 
-        using GgufFile gguf = GgufFile.Open(ModelPath);
+        using GgufFile gguf = GgufFile.Open(modelPath);
 
         // The fixture declares tokenizer.ggml.pre = "smollm"; anything else must fail loudly.
         Assert.Equal("smollm", gguf.Metadata.GetString("tokenizer.ggml.pre", ""));

@@ -654,24 +654,7 @@ public sealed class LayerTests : IDisposable
     }
 
     // The test host's working directory varies per runner: walk up from the assembly location to find the repo fixture.
-    private static string? ResolveModelPath()
-    {
-        string relative = $"models{Path.DirectorySeparatorChar}SmolLM-135M-Instruct-F16.gguf";
-
-        DirectoryInfo? directory = new(AppContext.BaseDirectory);
-        for (int depth = 0; directory is not null && depth < 8; depth++)
-        {
-            string candidate = Path.Combine(directory.FullName, relative);
-            if (File.Exists(candidate))
-            {
-                return candidate;
-            }
-
-            directory = directory.Parent;
-        }
-
-        return null;
-    }
+    private static string? ResolveModelPath() => ModelFixture.Resolve();
 
     // Canonical llama/qwen2 metadata pairs with the same values as the real fixture (parse-only fixtures need no tensors).
     private static List<(string Key, object Value)> RequiredLlamaMetadata(string prefix = "llama") =>

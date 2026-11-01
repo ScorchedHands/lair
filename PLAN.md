@@ -214,8 +214,8 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
   - Verify: `dotnet test --filter Category=Loader` — 8/8 on synthetic GGUF v3 ✅; real-file load verified on SmolLM-135M-Instruct-F16.gguf via tokenizer integration ✅; Q4_K_M real load runs at Parity.
 - [✓] GGUF tokenizer — BPE + special tokens decode/encode
   - Verify: `dotnet test --filter Category=Tokenizer` — 18/18 ✅ (13 synthetic + 5 against the real SmolLM GGUF: ASCII/newline/emoji round-trips, control tokens).
-- [_] Chat templates — mini Jinja-subset interpreter
-  - Verify: `dotnet test --filter Category=Template` golden renders for ChatML, Llama-3, and Phi templates extracted from real GGUF metadata.
+- [✓] Chat templates — mini Jinja-subset interpreter
+  - Verify: `dotnet test --filter Category=Template` — 20/20 ✅ golden renders (ChatML = real SmolLM `tokenizer.chat_template`, conditional if/else + `|tojson`, Phi-style), subset semantics (concat, `==`/`!=`, `not`, `tojson`/`trim`, `{%- -%}`), and rejections naming construct + position (`{% set %}`, `|upper`, macro, slices). The real Llama-3 template needs `{% set %}`/loop vars — out of subset (backlog).
 - [✓] Dense kernels — fused dequant GEMV for Q4_K_M/Q8_0/F16, AVX2, row-block threading (see DN-M1-3)
   - Verify: `dotnet test --filter Category=Kernel` — 15/15 ✅ vs double-precision oracle incl. threaded bit-identity; bench Q4_K 4096×4096: AVX2 8.7× scalar, threaded ≈17 GB/s ✅.
 - [✓] Layer executor — RMSNorm, RoPE, GQA attention, SwiGLU FFN, qkv bias (see DN-M1-1)
@@ -237,15 +237,15 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 
 #### Tests
 
-- [_] Automated Loader: GGUF metadata, vocab, tensor offset parsing against fixtures
-- [_] Automated Tokenizer: encode/decode round-trip vs llama.cpp fixtures
-- [_] Automated Template: golden chat-template renders, three families
-- [_] Automated Kernel: fused dequant GEMV vs scalar reference, FP tolerance
-- [_] Automated Layers: per-layer activations vs reference fixtures
-- [_] Automated Kv: block allocator alloc/free/reuse and budget enforcement
+- [✓] Automated Loader: GGUF metadata, vocab, tensor offset parsing against fixtures — 8/8
+- [✓] Automated Tokenizer: encode/decode round-trip vs llama.cpp semantics — 18/18, real-model cases executing live
+- [✓] Automated Template: golden chat-template renders, three families
+- [✓] Automated Kernel: fused dequant GEMV vs scalar reference, FP tolerance — 15/15 + DequantRow cases
+- [✓] Automated Layers: per-layer activations vs hand-computed references + real-model smoke — 24/24
+- [✓] Automated Kv: block allocator alloc/free/reuse and budget enforcement — 8/8
 - [_] Automated Sampling: determinism under greedy/seed; statistical top-k/p behavior
 - [_] Automated Parity: token-sequence match vs llama.cpp reference on SmolLM-135M-F16, fixed prompts
-- [_] Automated Config: YAML schema validation and error messages
+- [✓] Automated Config: YAML schema validation and error messages — 31/31
 - [_] Manual Serve: full serve→chat REPL session with streaming, abort, and reload-after-config-edit
 
 #### Open Items
