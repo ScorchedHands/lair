@@ -2,10 +2,11 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Lair.Core\Lair.Core.csproj" />
+    <ProjectReference Include="..\Lair.Api\Lair.Api.csproj" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="YamlDotNet" Version="18.1.0" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
   <PropertyGroup>
@@ -14,6 +15,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <Version>0.1.0</Version>
   </PropertyGroup>
 
 </Project>
