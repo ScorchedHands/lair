@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Runtime.InteropServices;
 using Lair.Backends.Cpu;
 using Lair.Core.Contracts;
 
@@ -220,6 +221,120 @@ public class KernelTests
         byte[] exact = new byte[expected];
         Assert.Throws<ArgumentException>(() => backend.Gemv(new float[69], new WeightRef(exact, shape, format), output));
         Assert.Throws<ArgumentException>(() => backend.Gemv(x, new WeightRef(exact, shape, format), new float[3]));
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.F16)]
+    [InlineData(QuantFormat.Q8_0)]
+    [InlineData(QuantFormat.Q4_K)]
+    public void DequantRow_MatchesDoubleOracleAcrossFormats(QuantFormat format)
+    {
+        foreach ((int rows, int cols) in MatrixSizes)
+        {
+            (float[] _, byte[] weights) = CreateCase(rows, cols, format, seed: 4242);
+
+            using CpuBackend scalar = new(threads: 1, allowAvx2: false);
+            using CpuBackend avx2 = new(threads: 1, allowAvx2: true);
+            WeightRef w = new(weights, MatrixShape(rows, cols), format);
+
+            float[] actualScalar = new float[cols];
+            float[] actualAvx2 = new float[cols];
+
+            foreach (int row in new[] { 0, rows / 2, rows - 1 })
+            {
+                double[] expected = OracleDequantRow(weights, row, cols, format);
+                scalar.DequantRow(w, row, actualScalar);
+                avx2.DequantRow(w, row, actualAvx2);
+
+                AssertValuesClose(actualScalar, expected, relativeTolerance: 1e-4, $"scalar {format} DequantRow({row}) at {rows}x{cols}");
+                AssertValuesClose(actualAvx2, expected, relativeTolerance: 1e-4, $"avx2 {format} DequantRow({row}) at {rows}x{cols}");
+
+                // The AVX2 fused scale/shift is bit-compatible with the scalar unpack except for fma rounding on
+                // Q4_K group values; keep both paths within a tiny band of each other.
+                Assert.True(actualScalar.AsSpan().SequenceEqual(actualAvx2.AsSpan()) || MaxAbsDiff(actualScalar, actualAvx2) <= 1e-6 * MaxAbs(expected), $"DequantRow({row}) {format}: avx2 diverges from scalar");
+            }
+
+            // Dequantized rows must feed GEMV identically to the packed path (embedding lookups rely on this).
+            foreach ((float[] x, byte[] weightsG) in new[] { CreateCase(rows, cols, format, seed: 4242) })
+            {
+                Assert.Equal(weights, weightsG); // same seed must reproduce the same packed image
+
+                float[] gemvOut = new float[rows];
+                avx2.Gemv(x, w, gemvOut);
+
+                (double[] oracle, double[] magnitudes) = OracleDot(x, weights, rows, cols, format);
+                AssertClose(gemvOut, oracle, magnitudes, relativeTolerance: 1e-4, $"packed vs {format} GEMV at {rows}x{cols}");
+
+                float[] row0 = new float[cols];
+                avx2.DequantRow(w, 0, row0);
+                double manualDot = 0;
+                for (int i = 0; i < cols; i++)
+                {
+                    manualDot += (double)x[i] * row0[i];
+                }
+
+                Assert.True(Math.Abs(gemvOut[0] - manualDot) <= 1e-4 * Math.Max(1e-6, magnitudes[0]), $"{format}: Gemv(row0) vs dequant-row dot mismatch");
+            }
+        }
+    }
+
+    [Fact]
+    public void DequantRow_F32_CopiesExactFloats()
+    {
+        const int rows = 5;
+        const int cols = 71; // odd tail: no padding absorbs a wide load in any vector path
+        TensorShape shape = MatrixShape(rows, cols);
+        byte[] packed = new byte[rows * (long)shape.RowStrideBytes(QuantFormat.F32)];
+
+        Random rng = new(808);
+        float[] source = NextFloats(rng, rows * cols);
+        source.CopyTo(MemoryMarshal.Cast<byte, float>(packed.AsSpan()));
+
+        using CpuBackend backend = new();
+        WeightRef w = new(packed, shape, QuantFormat.F32);
+        float[] outRow = new float[cols];
+
+        for (int row = 0; row < rows; row++)
+        {
+            backend.DequantRow(w, row, outRow);
+            Assert.True(outRow.AsSpan().SequenceEqual(source.AsSpan(row * cols, cols)), $"F32 DequantRow({row}) must be bit-exact");
+        }
+
+        // 1-D tensors (norm weights) are addressed as a single-row matrix.
+        float[] norm = NextFloats(rng, cols);
+        byte[] packedNorm = new byte[cols * 4];
+        norm.CopyTo(MemoryMarshal.Cast<byte, float>(packedNorm.AsSpan()));
+        WeightRef w1 = new(packedNorm, MatrixShape(1, cols), QuantFormat.F32);
+
+        float[] outNorm = new float[cols];
+        backend.DequantRow(w1, 0, outNorm);
+        Assert.True(outNorm.AsSpan().SequenceEqual(norm.AsSpan()), "F32 single-row DequantRow must be bit-exact");
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.F32)]
+    [InlineData(QuantFormat.Q4_K)]
+    public void DequantRow_BadRowIndexOrOutputLength_ThrowsClearMessage(QuantFormat format)
+    {
+        TensorShape shape = MatrixShape(4, 70);
+        byte[] packed = new byte[4 * (long)new TensorShape([1, 70]).RowStrideBytes(format)];
+
+        using CpuBackend backend = new();
+
+        // WeightRef is a ref struct: construct one inside each lambda instead of capturing a local.
+        ArgumentOutOfRangeException rowEx = Assert.Throws<ArgumentOutOfRangeException>(
+            () => backend.DequantRow(new WeightRef(packed, shape, format), 4, new float[70]));
+        Assert.Contains("outside the weight", rowEx.Message);
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => backend.DequantRow(new WeightRef(packed, shape, format), -1, new float[70]));
+
+        ArgumentException outEx = Assert.Throws<ArgumentException>(
+            () => backend.DequantRow(new WeightRef(packed, shape, format), 0, new float[69]));
+        Assert.Contains("shorter than the weight column count", outEx.Message);
+
+        byte[] tooShort = new byte[packed.Length - 1];
+        Assert.Throws<ArgumentException>(
+            () => backend.DequantRow(new WeightRef(tooShort, shape, format), 0, new float[70]));
     }
 
     private static TensorShape MatrixShape(int rows, int cols) => new([rows, cols]);
@@ -520,6 +635,116 @@ public class KernelTests
     {
         dst[offset] = (byte)value;
         dst[offset + 1] = (byte)(value >> 8);
+    }
+
+    // Independent row oracle: decode one packed row to double with naive block math, sharing no code with the kernels.
+    private static unsafe double[] OracleDequantRow(byte[] weights, int row, int cols, QuantFormat format)
+    {
+        long stride = MatrixShape(1, cols).RowStrideBytes(format);
+
+        fixed (byte* pW = weights)
+        {
+            byte* r = pW + row * stride;
+            double[] values = new double[cols];
+
+            if (format == QuantFormat.F16)
+            {
+                for (int i = 0; i < cols; i++)
+                {
+                    values[i] = (float)BitConverter.Int16BitsToHalf((short)ReadLE(r, 2 * i));
+                }
+
+                return values;
+            }
+
+            if (format == QuantFormat.Q8_0)
+            {
+                int blocks = (cols + 31) / 32;
+                for (int b = 0; b < blocks; b++)
+                {
+                    double d = (float)BitConverter.Int16BitsToHalf((short)ReadLE(r, b * 34));
+                    int limit = Math.Min(32, cols - b * 32);
+                    for (int l = 0; l < limit; l++)
+                    {
+                        values[b * 32 + l] = (sbyte)r[b * 34 + 2 + l] * d;
+                    }
+                }
+
+                return values;
+            }
+
+            int qBlocks = (cols + 255) / 256;
+            for (int b = 0; b < qBlocks; b++)
+            {
+                byte* block = r + b * 144;
+                double d = (float)BitConverter.Int16BitsToHalf((short)ReadLE(block, 0));
+                double min = (float)BitConverter.Int16BitsToHalf((short)ReadLE(block, 2));
+
+                for (int j = 0; j < 8; j++)
+                {
+                    int subStart = b * 256 + j * 32;
+                    if (subStart >= cols)
+                    {
+                        break; // zero-padded tail block carries no real columns
+                    }
+
+                    double sc, m;
+                    if (j < 4)
+                    {
+                        sc = block[4 + j] & 0x3F;
+                        m = block[8 + j] & 0x3F;
+                    }
+                    else
+                    {
+                        sc = (block[12 + (j - 4)] & 0xF) | ((block[4 + (j - 4)] >> 6) << 4);
+                        m = (block[12 + (j - 4)] >> 4) | ((block[8 + (j - 4)] >> 6) << 4);
+                    }
+
+                    int limit = Math.Min(32, cols - subStart); // padded nibbles are zero: stop at the real column count.
+                    for (int l = 0; l < limit; l++)
+                    {
+                        byte qByte = block[16 + 32 * (j / 2) + l];
+                        int q = (qByte >> (4 * (j & 1))) & 0xF;
+                        values[subStart + l] = (d * sc * q) - (min * m);
+                    }
+                }
+            }
+
+            return values;
+        }
+    }
+
+    private static void AssertValuesClose(ReadOnlySpan<float> actual, ReadOnlySpan<double> expected, double relativeTolerance, string context)
+    {
+        for (int i = 0; i < actual.Length; i++)
+        {
+            double diff = Math.Abs(actual[i] - expected[i]);
+
+            // Per-element dequant error is bounded by eps * |w|: bound it against the value magnitude.
+            Assert.True(diff <= relativeTolerance * Math.Max(1e-6, Math.Abs(expected[i])), $"{context}: [{i}] differs by {diff:G6} (expected {expected[i]:G9}, got {actual[i]:G9})");
+        }
+    }
+
+    private static double MaxAbsDiff(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
+    {
+        double max = 0;
+        for (int i = 0; i < a.Length; i++)
+        {
+            max = Math.Max(max, Math.Abs(a[i] - b[i]));
+        }
+
+        return max;
+    }
+
+    private static double MaxAbs(ReadOnlySpan<double> v)
+    {
+        double max = 0;
+        foreach (double d in v)
+        {
+            max = Math.Max(max, Math.Abs(d));
+        }
+
+        return max;
     }
 
     private static unsafe ushort ReadLE(byte* p, int offset) => (ushort)(p[offset] | (p[offset + 1] << 8));

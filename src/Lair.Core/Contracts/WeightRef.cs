@@ -4,6 +4,7 @@ namespace Lair.Core.Contracts;
 /// A resolved weight tensor: packed row bytes plus the metadata needed to interpret them. Bytes holds one
 /// packed row after another and must be exactly Shape.Rows * Shape.RowStrideBytes(Format) long. Row packing
 /// per format:
+///   F32   4 bytes per element, no padding.
 ///   F16   2 bytes per element, no padding.
 ///   Q8_0  whole blocks of 34 bytes (half-float scale + 32 int8 quants), last block zero-padded to cols.
 ///   Q4_K  whole blocks of 144 bytes (two half scales, 12 packed 6-bit group scales/mins, 128 bytes of

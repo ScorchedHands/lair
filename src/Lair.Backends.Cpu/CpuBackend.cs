@@ -128,6 +128,128 @@ public sealed unsafe class CpuBackend : IBackend
         }
     }
 
+    public void DequantRow(WeightRef w, int row, Span<float> output)
+    {
+        int[] dims = w.Shape.Dims;
+        if (dims.Length < 2 || dims[0] <= 0 || dims[^1] <= 0)
+        {
+            throw new ArgumentException("Weight shape must be a matrix with positive row and column counts.", nameof(w));
+        }
+
+        int rows = dims[0];
+        int cols = dims[^1];
+
+        long strideBytes = w.Shape.RowStrideBytes(w.Format);
+        if (strideBytes > int.MaxValue)
+        {
+            throw new ArgumentException("Row byte size exceeds the addressable span limit.", nameof(w));
+        }
+
+        long expectedBytes = rows * strideBytes;
+        if ((long)w.Bytes.Length != expectedBytes)
+        {
+            throw new ArgumentException(
+                $"WeightRef byte length is {w.Bytes.Length} but shape {rows}x{cols} in format {w.Format} " +
+                $"requires {expectedBytes} bytes ({rows} rows x {strideBytes}-byte row stride).",
+                nameof(w));
+        }
+
+        if ((uint)row >= (uint)rows)
+        {
+            throw new ArgumentOutOfRangeException(nameof(row), $"Row {row} is outside the weight of {rows} rows.");
+        }
+
+        if (output.Length < cols)
+        {
+            throw new ArgumentException($"Output span length {output.Length} is shorter than the weight column count {cols}.", nameof(output));
+        }
+
+        fixed (byte* pBytes = w.Bytes)
+        fixed (float* pOut = output)
+        {
+            byte* rowPtr = pBytes + (long)row * strideBytes;
+            switch (w.Format)
+            {
+                case QuantFormat.F32:
+                    new ReadOnlySpan<float>(rowPtr, cols).CopyTo(new Span<float>(pOut, cols));
+                    break;
+                case QuantFormat.F16:
+                    if (_useAvx2)
+                    {
+                        DequantF16Avx2(rowPtr, pOut, cols);
+                    }
+                    else
+                    {
+                        for (int i = 0; i < cols; i++)
+                        {
+                            pOut[i] = ReadHalfLE(rowPtr + 2 * i);
+                        }
+                    }
+
+                    break;
+                case QuantFormat.Q8_0:
+                    if (_useAvx2)
+                    {
+                        DequantQ8Avx2(rowPtr, pOut, cols);
+                    }
+                    else
+                    {
+                        for (int baseIdx = 0; baseIdx < cols; baseIdx += Qk8)
+                        {
+                            byte* block = rowPtr + (long)(baseIdx / Qk8) * (Qk8 + 2);
+                            float d = ReadHalfLE(block);
+
+                            int limit = Math.Min(Qk8, cols - baseIdx); // padded quants are zero: stop at the real column count.
+                            for (int l = 0; l < limit; l++)
+                            {
+                                pOut[baseIdx + l] = (float)(sbyte)block[2 + l] * d;
+                            }
+                        }
+                    }
+
+                    break;
+                case QuantFormat.Q4_K:
+                    if (_useAvx2)
+                    {
+                        DequantQ4KAvx2(rowPtr, pOut, cols);
+                    }
+                    else
+                    {
+                        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+                        {
+                            byte* block = rowPtr + (long)(baseIdx / QkK) * Q4KBlockBytes;
+                            float d = ReadHalfLE(block);
+                            float min = ReadHalfLE(block + 2);
+
+                            for (int j = 0; j < 8; j++)
+                            {
+                                int subStart = baseIdx + j * 32;
+                                if (subStart >= cols)
+                                {
+                                    break; // zero-padded tail block: no elements left to consume.
+                                }
+
+                                GetScaleMinK4(j, block + 4, out byte sc, out byte m);
+                                float scale = d * sc;
+                                float shift = min * m;
+
+                                byte* q = block + 16 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
+                                int limit = Math.Min(32, cols - subStart); // padded nibbles are zero: stop at the real column count.
+                                for (int l = 0; l < limit; l++)
+                                {
+                                    pOut[subStart + l] = ((q[l] >> (4 * (j & 1))) & 0xF) * scale - shift;
+                                }
+                            }
+                        }
+                    }
+
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(w), w.Format, "Unknown quant format.");
+            }
+        }
+    }
+
     public float Dot(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
     {
         if (a.Length != b.Length)
@@ -211,6 +333,7 @@ public sealed unsafe class CpuBackend : IBackend
     {
         return format switch
         {
+            QuantFormat.F32 => avx2 ? DotCore((float*)row, x, cols) : DotScalar((float*)row, x, cols),
             QuantFormat.F16 => avx2 ? RowDotF16Avx2(row, x, cols) : RowDotF16Scalar(row, x, cols),
             QuantFormat.Q8_0 => avx2 ? RowDotQ8Avx2(row, x, cols) : RowDotQ8Scalar(row, x, cols),
             QuantFormat.Q4_K => avx2 ? RowDotQ4KAvx2(row, x, cols) : RowDotQ4KScalar(row, x, cols),
@@ -522,6 +645,108 @@ public sealed unsafe class CpuBackend : IBackend
             Avx2.AndNot(normalMask, subF.AsInt32())).AsSingle();
 
         return Avx2.Xor(selected.AsInt32(), Avx2.ShiftLeftLogical(signBit, 16)).AsSingle(); // apply the sign bit (0x8000 << 16)
+    }
+
+    // F16 row expansion: eight halves per chunk through HalfBitsToFloat; odd tails scalar. Same half-to-float math as RowDotF16Avx2.
+    private static void DequantF16Avx2(byte* row, float* outPtr, int cols)
+    {
+        int i = 0;
+        for (; i + 8 <= cols; i += 8)
+        {
+            Vector256<int> bits = Vector256.Create(
+                Sse41.ConvertToVector128Int32((ushort*)(row + 2L * i)),
+                Sse41.ConvertToVector128Int32((ushort*)(row + 2L * i) + 4));
+            Avx.Store(outPtr + i, HalfBitsToFloat(bits));
+        }
+
+        for (; i < cols; i++)
+        {
+            outPtr[i] = ReadHalfLE(row + 2 * i);
+        }
+    }
+
+    // Q8_0 row expansion: w = d * q per block. Same unpacking as RowDotQ8Avx2, storing instead of dotting.
+    private static void DequantQ8Avx2(byte* row, float* outPtr, int cols)
+    {
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += Qk8)
+        {
+            byte* block = row + (long)(baseIdx / Qk8) * (Qk8 + 2);
+            float dHalf = ReadHalfLE(block);
+
+            int limit = Math.Min(Qk8, cols - baseIdx); // padded quants are zero: stop at the real column count.
+            for (int l = 0; l < limit; l += 8)
+            {
+                if (l + 8 > limit)
+                {
+                    break;
+                }
+
+                Vector256<int> qi = Avx2.ConvertToVector256Int32((sbyte*)(block + 2 + l)); // vpmovsxbd: eight signed quants, in-block only
+                float dLocal = dHalf;
+                Vector256<float> dv = Avx.BroadcastScalarToVector256(&dLocal);
+                Avx.Store(outPtr + baseIdx + l, Avx.Multiply(Avx.ConvertToVector256Single(qi), dv));
+            }
+
+            for (int k = (limit / 8) * 8; k < limit; k++)
+            {
+                outPtr[baseIdx + k] = (float)(sbyte)block[2 + k] * dHalf; // partial final block: at most seven elements per row
+            }
+        }
+    }
+
+    // Q4_K row expansion: w = d*sc_j*q - dmin*m_j per group. Same nibble unpack and fused scale/shift as RowDotQ4KAvx2.
+    private static void DequantQ4KAvx2(byte* row, float* outPtr, int cols)
+    {
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+        {
+            byte* block = row + (long)(baseIdx / QkK) * Q4KBlockBytes;
+            byte* blockEnd = block + Q4KBlockBytes;
+            float dHalf = ReadHalfLE(block);
+            float minHalf = ReadHalfLE(block + 2);
+
+            for (int j = 0; j < 8; j++)
+            {
+                int subStart = baseIdx + j * 32;
+                if (subStart >= cols)
+                {
+                    break; // zero-padded tail block: no elements left to consume.
+                }
+
+                GetScaleMinK4(j, block + 4, out byte sc, out byte m);
+                float scale = dHalf * sc;
+                Vector256<float> scaleV = Avx.BroadcastScalarToVector256(&scale);
+                float negShift = -(minHalf * m);
+                Vector256<float> shiftV = Avx.BroadcastScalarToVector256(&negShift);
+
+                byte* q = block + 16 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
+                int limit = Math.Min(32, cols - subStart); // padded nibbles are zero: stop at the real column count.
+
+                for (int c = 0; c + 8 <= limit; c += 8)
+                {
+                    Vector128<byte> window = LoadGroupBytes(q, blockEnd, c);
+
+                    if ((j & 1) != 0)
+                    {
+                        // High nibbles per byte lane: srli_epi16 then a 0x0F byte mask (the classic SSE2 pattern).
+                        window = Sse2.ShiftRightLogical(window.AsUInt16(), 4).AsByte();
+                    }
+
+                    Vector128<byte> masked = Sse2.And(window, GetNibbleMask()); // needed nibbles now in each byte lane's low bits
+
+                    Vector128<int> lo = Sse41.ConvertToVector128Int32(masked); // bytes 0..3 -> dword lanes (pmovzxbd)
+                    Vector128<int> hi = Sse41.ConvertToVector128Int32(Ssse3.Shuffle(masked, GetUpperBytesShuffle())); // bytes 4..7 -> dword lanes
+
+                    Vector256<float> qf = Avx.ConvertToVector256Single(Vector256.Create(lo, hi)); // eight nibble values in element order
+                    Avx.Store(outPtr + subStart + c, Fma.MultiplyAdd(scaleV, qf, shiftV));
+                }
+
+                for (int l = (limit / 8) * 8; l < limit; l++)
+                {
+                    // Partial final chunk of the group: scalar cleanup, at most seven elements per group.
+                    outPtr[subStart + l] = ((q[l] >> (4 * (j & 1))) & 0xF) * scale - minHalf * m;
+                }
+            }
+        }
     }
 
     private static Vector128<byte> GetNibbleMask() => Vector128.Create((byte)0xF);

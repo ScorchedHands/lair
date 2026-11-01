@@ -17,7 +17,8 @@ namespace Lair.Loader;
 /// Block geometry verified against
 /// https://raw.githubusercontent.com/ggml-org/llama.cpp/master/ggml/src/ggml-common.h
 /// and the ggml_type_traits table in ggml/src/ggml.c:
-///   F16:  blck_size 1,   type_size 2   (sizeof(ggml_fp16_t))
+///   F32: blck_size 1,   type_size 4   (sizeof(float))
+///   F16: blck_size 1,   type_size 2   (sizeof(ggml_fp16_t))
 ///   Q8_0: blck_size 32,  type_size 34  (QK8_0 = 32; block_q8_0 = half d + int8 qs[32])
 ///   Q4_K: blck_size 256, type_size 144 (QK_K = 256, K_SCALE_SIZE = 12;
 ///         block_q4_K = 2*half dm + 12 scale bytes + 128 nibble bytes)
@@ -25,6 +26,7 @@ namespace Lair.Loader;
 /// </summary>
 internal static class GgmlType
 {
+    public const uint F32 = 0;
     public const uint F16 = 1;
     public const uint Q5_0 = 6;
     public const uint Q8_0 = 8;
@@ -34,6 +36,11 @@ internal static class GgmlType
     {
         switch (id)
         {
+            case F32:
+                format = QuantFormat.F32;
+                blockElements = 1;
+                blockBytes = 4;
+                return true;
             case F16:
                 format = QuantFormat.F16;
                 blockElements = 1;

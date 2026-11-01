@@ -218,8 +218,8 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
   - Verify: `dotnet test --filter Category=Template` golden renders for ChatML, Llama-3, and Phi templates extracted from real GGUF metadata.
 - [✓] Dense kernels — fused dequant GEMV for Q4_K_M/Q8_0/F16, AVX2, row-block threading (see DN-M1-3)
   - Verify: `dotnet test --filter Category=Kernel` — 15/15 ✅ vs double-precision oracle incl. threaded bit-identity; bench Q4_K 4096×4096: AVX2 8.7× scalar, threaded ≈17 GB/s ✅.
-- [_] Layer executor — RMSNorm, RoPE, GQA attention, SwiGLU FFN, qkv bias
-  - Verify: `dotnet test --filter Category=Layers` per-layer activations vs reference fixtures; end-to-end via parity test.
+- [✓] Layer executor — RMSNorm, RoPE, GQA attention, SwiGLU FFN, qkv bias (see DN-M1-1)
+  - Verify: `dotnet test --filter Category=Layers` — 24/24 ✅ incl. hand-computed op units and real SmolLM-F16 forward smoke (finite deterministic logits); exact-token parity runs at Parity.
 - [✓] Paged KV — CPU block pool, 16-token blocks, allocator, per-model budget from config
   - Verify: `dotnet test --filter Category=Kv` — 8/8 ✅ (capacity errors, alloc/release integrity, addressing across partial blocks, refcounts); multi-turn prefix intactness verified end-to-end at Manual Serve.
 - [_] Sampling — greedy, temperature, top-k/top-p, seed

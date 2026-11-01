@@ -21,6 +21,13 @@ public interface IBackend : IDisposable
     /// </summary>
     void Gemv(ReadOnlySpan<float> x, WeightRef w, Span<float> output);
 
+    /// <summary>
+    /// Dequantizes one weight row (w.Bytes-as-matrix row <paramref name="row"/>, cols = Dims[^1]) into an FP32
+    /// buffer. The dequant math matches the fused GEMV kernels exactly: F32 rows copy, F16 rows expand halves,
+    /// Q8_0/Q4_K rows unpack block scales and quant codes with the same arithmetic. Output must be at least cols long.
+    /// </summary>
+    void DequantRow(WeightRef w, int row, Span<float> output);
+
     float Dot(ReadOnlySpan<float> a, ReadOnlySpan<float> b);
 
     void Axpy(float alpha, ReadOnlySpan<float> x, Span<float> y);

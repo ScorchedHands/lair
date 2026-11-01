@@ -2,6 +2,15 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Lair.Core\Lair.Core.csproj" />
+    <ProjectReference Include="..\Lair.Loader\Lair.Loader.csproj" />
+    <ProjectReference Include="..\Lair.Kv\Lair.Kv.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Layer math is internal to the assembly but unit-tested directly against hand-computed values. -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>Lair.Tests</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
 
   <PropertyGroup>

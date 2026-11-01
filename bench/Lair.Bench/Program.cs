@@ -1,23 +1,61 @@
 ﻿using System.Diagnostics;
 using Lair.Backends.Cpu;
 using Lair.Core.Contracts;
+using Lair.Loader;
 
 if (args.Length == 0)
 {
-    Console.WriteLine("usage: Lair.Bench <gemv|help>");
+    Console.WriteLine("usage: Lair.Bench <gemv|gguf-dump|help>");
     return 1;
 }
 
 return args[0] switch
 {
     "gemv" => BenchGemv(),
+    "gguf-dump" => DumpGguf(args.Length > 1 ? args[1] : @"models\SmolLM-135M-Instruct-F16.gguf"),
     _ => Usage(),
 };
 
 static int Usage()
 {
-    Console.WriteLine("unknown subcommand; expected gemv");
+    Console.WriteLine("unknown subcommand; expected gemv or gguf-dump <path>");
     return 1;
+}
+
+// Print every KV pair and tensor header of a GGUF file, for verifying metadata key spellings and tensor names.
+static int DumpGguf(string path)
+{
+    using GgufFile gguf = GgufFile.Open(path);
+
+    Console.WriteLine($"file={gguf.Path} version={gguf.Version} alignment={gguf.Alignment} dataStart={gguf.DataStart} size={gguf.FileSize}");
+    Console.WriteLine($"kv_pairs={gguf.Metadata.Count} tensors={gguf.Tensors.Tensors.Count}");
+
+    foreach (string key in gguf.Metadata.Keys.OrderBy(k => k, StringComparer.Ordinal))
+    {
+        GgufValue value = gguf.Metadata.Get(key);
+        string rendered;
+        if (value.Type == GgufValueType.Array)
+        {
+            IReadOnlyList<GgufValue> elements = value.AsArray();
+            rendered = $"ARRAY[{elements.Count}] of {elements[0].Type}: " +
+                string.Join(", ", elements.Take(8).Select(e => e.ToString()));
+        }
+        else
+        {
+            rendered = $"{value.Type}: {value}";
+        }
+
+        Console.WriteLine($"KV  {key} = {rendered}");
+    }
+
+    foreach (LogicalTensor tensor in gguf.Tensors.Tensors)
+    {
+        Console.WriteLine(
+            $"TENSOR {tensor.Name} dims=[{string.Join(",", tensor.Shape.Dims)}] format={tensor.Format} " +
+            $"offset={tensor.Offset} bytes={tensor.SizeBytes}");
+    }
+
+    return 0;
 }
 
 // Synthetic dense GEMV: a full 4096x4096 Q4_K weight matrix, decoded scalar / AVX2-single-threaded / threaded.
