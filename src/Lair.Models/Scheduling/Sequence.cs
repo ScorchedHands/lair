@@ -44,6 +44,9 @@ internal sealed class Sequence
     /// <summary>Prompt tokens whose blocks were adopted from the prefix cache instead of prefilled; set once at admission.</summary>
     public int PrefillCachedTokens;
 
+    /// <summary>True while this sequence's pool admission window is open: its whole-lifetime block reservation may spend above a hot-shrunk soft cap until it finishes. Scheduler-thread only (every mutation runs under the gate).</summary>
+    public bool AdmissionWindowOpened;
+
     /// <summary>The sampled token awaiting its next decode step; valid once decoding starts.</summary>
     public int PendingToken;
 

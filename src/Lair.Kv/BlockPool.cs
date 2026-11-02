@@ -38,6 +38,20 @@ public sealed class BlockPool : IDisposable
     private readonly int[] _freeStack;
     private readonly int _totalFloats;
     private int _freeTop;
+
+    // Soft cap on usage within the fixed physical arena: allocations stop once this many blocks are handed out,
+    // even while physically free blocks remain. Raised or lowered at runtime without touching the reservation —
+    // a shrink never revokes already-allocated blocks, it only withholds new ones until usage drops back under
+    // the cap on its own. Volatile so observer threads (admission checks) see a hot edit immediately.
+    private int _budgetBlocks;
+
+    // Admission-window bookkeeping: windows opened by the admitting scheduler (one per admitted sequence) carry a
+    // shared ceiling — the widest reservation any still-running admitted sequence needs. While at least one window
+    // is open, allocations may reach that ceiling even above a shrunk soft cap; it resets when all close.
+    private readonly object _windowGate = new();
+    private int _openWindows;
+    private int _windowCeiling = -1;
+
     private bool _disposed;
 
     public unsafe BlockPool(int blockTokens, int layerCount, int kvHeads, int headDim, int capacityBlocks, IBackend backend)
@@ -58,6 +72,7 @@ public sealed class BlockPool : IDisposable
         FloatsPerBlock = checked((int)(LayerCount * LayerRegion));
         BytesPerBlock = checked(FloatsPerBlock * sizeof(float));
         CapacityBlocks = capacityBlocks;
+        _budgetBlocks = capacityBlocks; // no cap until one is set: a fresh pool budgets its whole reservation
         _backend = backend;
 
         long totalBytes = checked((long)capacityBlocks * BytesPerBlock);
@@ -108,6 +123,28 @@ public sealed class BlockPool : IDisposable
 
     public int CapacityBlocks { get; }
 
+    /// <summary>Soft usage cap within the physical reservation: allocations stop once this many blocks are handed out. Equal to <see cref="CapacityBlocks"/> until a budget is set.</summary>
+    public int EffectiveBudgetBlocks => Volatile.Read(ref _budgetBlocks);
+
+    /// <summary>Free blocks still reachable under the soft cap — what admission and step accounting actually spend from.</summary>
+    public int EffectiveFreeBlocks => Math.Max(Math.Min(FreeBlocks, EffectiveBudgetBlocks - UsedBlocks), 0);
+
+    /// <summary>The ceiling allocations currently reach: the soft cap, or an open admission window's wider reservation while admitted sequences still run under it.</summary>
+    public int AllocationCeiling => Math.Max(EffectiveBudgetBlocks, Volatile.Read(ref _windowCeiling));
+
+    /// <summary>
+    /// Sets the soft usage cap to <paramref name="blocks"/> blocks, clamped into [1, <see cref="CapacityBlocks"/>], and returns the value applied. The physical arena is never touched: raising the cap makes already-free blocks allocatable again immediately; lowering it withholds new allocations while in-use count exceeds the cap (already-allocated blocks are never revoked).
+    /// </summary>
+    public int SetEffectiveBudget(int blocks)
+    {
+        ThrowIfDisposed();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blocks);
+
+        int applied = Math.Min(blocks, CapacityBlocks);
+        Volatile.Write(ref _budgetBlocks, applied);
+        return applied;
+    }
+
     public int FreeBlocks => _freeTop;
 
     /// <summary>Physical blocks currently handed out, including shared (refcount &gt; 1) owners.</summary>
@@ -120,16 +157,29 @@ public sealed class BlockPool : IDisposable
     public long FreeSlots => (long)FreeBlocks * BlockTokens;
 
     /// <summary>Takes the next free block and returns its physical id with refcount 1.</summary>
-    /// <exception cref="KvFullException">The pool has no free blocks left.</exception>
+    /// <exception cref="KvFullException">The pool has no reachable blocks left — physically empty, or usage already at whichever ceiling governs: a shrunk soft cap, or an admission window opened by the admitting scheduler (see <see cref="BeginAdmissionWindow"/>) so a sequence admitted at an earlier cap completes its reserved lifetime untouched.</exception>
     public int Allocate()
     {
         ThrowIfDisposed();
+
+        // Physical exhaustion reports first. The budget gate then reaches only to the governing ceiling: the soft cap,
+        // lifted while admission windows are open to those windows' reservations — what pre-admission accounting
+        // reserved and eviction could not reclaim (blocks pinned by live sequences). Cached-block eviction and
+        // finished sequences bring usage back under a shrunk cap.
         if (_freeTop == 0)
         {
             long totalBytes = (long)CapacityBlocks * BytesPerBlock;
             throw new KvFullException(
                 $"KV block pool is full: all {CapacityBlocks} blocks of {BytesPerBlock} bytes " +
                 $"({totalBytes / (1024 * 1024)} MiB total) are in use. Release unused sequences or raise kv_blocks.");
+        }
+
+        int ceiling = Math.Max(EffectiveBudgetBlocks, Volatile.Read(ref _windowCeiling));
+        if (UsedBlocks >= ceiling)
+        {
+            throw new KvFullException(
+                $"KV block pool is at its soft cap: the budget allows {ceiling} of {CapacityBlocks} reserved blocks " +
+                $"to be in use and they are. Release unused sequences or raise kv_blocks.");
         }
 
         int id = _freeStack[--_freeTop];
@@ -140,6 +190,41 @@ public sealed class BlockPool : IDisposable
 
         _refCounts[id] = 1;
         return id;
+    }
+
+    /// <summary>
+    /// Opens one admission window for a sequence whose whole-lifetime block need was checked against the effective
+    /// budget by the admitting scheduler. Inside an open window, allocations may rise above the soft cap up to physical
+    /// capacity — that headroom is exactly what pre-admission accounting reserved and eviction could not reclaim
+    /// (blocks pinned by live sequences). A hot budget shrink landing mid-run therefore cannot strand a sequence that
+    /// was admitted at the earlier cap. Call <see cref="EndAdmissionWindow"/> when the sequence finishes so later
+    /// admissions respect the current cap again.
+    /// </summary>
+    public void BeginAdmissionWindow(int neededBlocks)
+    {
+        ThrowIfDisposed();
+
+        lock (_windowGate)
+        {
+            // The shared window ceiling is the greater of "current used + what admission reserved" and any wider
+            // ceiling an already-open window established (a shrink that drained nothing keeps every admitted sequence whole).
+            int ceiling = Math.Max(UsedBlocks + Math.Max(neededBlocks, 0), Volatile.Read(ref _windowCeiling));
+            Volatile.Write(ref _windowCeiling, Math.Min(Math.Max(ceiling, 1), CapacityBlocks));
+            _openWindows++;
+        }
+    }
+
+    /// <summary>Closes one admission window; the shared ceiling resets once every open window has closed.</summary>
+    public void EndAdmissionWindow()
+    {
+        lock (_windowGate)
+        {
+            if (--_openWindows <= 0)
+            {
+                _openWindows = 0;
+                Volatile.Write(ref _windowCeiling, -1);
+            }
+        }
     }
 
     /// <summary>Increments the reference count of a live block so another owner may share it.</summary>

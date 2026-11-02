@@ -35,7 +35,19 @@ public sealed unsafe class CpuBackend : IBackend
     // Below this row count the threading overhead is not worth paying.
     private const int ParallelRowThreshold = 256;
 
-    private readonly int _threads;
+    // The engine's own thread choice (0 = auto-sized) before any model quota capped it: the ceiling a hot quota edit
+    // may restore participation up to — raising a quota beyond this would be an engine-wide change, not a placement one.
+    private readonly int _uncappedThreads;
+
+    // Workers currently let participate in threaded GEMV: min(uncapped choice, current quota). Read fresh at every
+    // kernel call so an apply from another thread lands on the next step boundary; lowering it leaves pool workers
+    // parked and idle rather than killing them.
+    private volatile int _effectiveThreads;
+
+    // Guards lazy pool creation/growth against racing with ApplyThreadQuota calls. Forward consumers of one backend
+    // are serialized by the scheduler's gate, so a swap never races an in-flight kernel job.
+    private readonly object _poolGate = new();
+
     private readonly ulong? _coreMask;
     private bool _samplingRequested; // test-only instrumentation flag, read when the pool is created and pushed on enable
     private readonly bool _useAvx2;
@@ -70,7 +82,8 @@ public sealed unsafe class CpuBackend : IBackend
         }
 
         int global = threads == 0 ? AutoWorkerCount : threads;
-        _threads = Math.Min(global, threadQuota ?? global);
+        _uncappedThreads = global;
+        _effectiveThreads = Math.Min(global, threadQuota ?? global);
 
         if (coreSet is { Count: > 0 })
         {
@@ -84,7 +97,30 @@ public sealed unsafe class CpuBackend : IBackend
     public string DeviceId => "cpu";
 
     /// <summary>Worker count this backend actually runs threaded GEMV with (dispatcher plus pool workers), after quota and auto-sizing.</summary>
-    public int EffectiveWorkerCount => _threads;
+    public int EffectiveWorkerCount => _effectiveThreads;
+
+    /// <summary>
+    /// Applies a new per-model thread quota at runtime: the effective worker count becomes min(engine thread choice,
+    /// quota) — lowering it idles pool workers starting with the next kernel call (the scheduler's next step), and
+    /// raising participation back up to the engine's own thread choice re-grows the persistent pool once if needed.
+    /// Participation above <c>engine.threads</c> is not a placement decision this model owns, so a quota beyond that
+    /// ceiling simply reads as the uncapped count. Rows stay independent, so output bytes are unchanged at any worker
+    /// count; returns the effective worker count now in force.
+    /// </summary>
+    public int ApplyThreadQuota(int? threadQuota)
+    {
+        if (threadQuota is < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(threadQuota), threadQuota, "A thread quota must be at least 1; omit it to leave the worker count uncapped.");
+        }
+
+        lock (_poolGate)
+        {
+            _effectiveThreads = Math.Min(_uncappedThreads, threadQuota ?? _uncappedThreads);
+            return _effectiveThreads;
+        }
+    }
 
     /// <summary>Physical cores detected on the machine by the topology probe (0 when detection is unavailable); see <see cref="AutoWorkerCount"/>.</summary>
     public static int DetectedPhysicalCoreCount => ThreadAffinity.DetectPhysicalCoreCount();
@@ -165,7 +201,9 @@ public sealed unsafe class CpuBackend : IBackend
         fixed (float* pX = x)
         fixed (float* pOut = output)
         {
-            bool parallel = _threads > 1 && rows >= ParallelRowThreshold;
+            // Participation is sampled per call so a quota applied on another thread takes effect from this kernel on.
+            int workers = _effectiveThreads;
+            bool parallel = workers > 1 && rows >= ParallelRowThreshold;
 
             if (!parallel)
             {
@@ -235,7 +273,9 @@ public sealed unsafe class CpuBackend : IBackend
         fixed (float* pIn = inputs)
         fixed (float* pOut = outputs)
         {
-            bool parallel = _threads > 1 && rows >= ParallelRowThreshold;
+            // Participation is sampled per call so a quota applied on another thread takes effect from this kernel on.
+            int workers = _effectiveThreads;
+            bool parallel = workers > 1 && rows >= ParallelRowThreshold;
 
             if (!parallel)
             {
@@ -443,21 +483,31 @@ public sealed unsafe class CpuBackend : IBackend
 
     private WorkerPool GetOrCreatePool()
     {
-        WorkerPool? pool = _pool;
-        if (pool is not null)
+        lock (_poolGate)
         {
-            return pool;
+            int workersNeeded = Math.Max(_effectiveThreads - 1, 0);
+
+            WorkerPool? pool = _pool;
+            if (pool is not null && pool.WorkerCapacity >= workersNeeded)
+            {
+                return pool;
+            }
+
+            // A quota raised after the first threaded call may want more participants than the existing pool hosts:
+            // grow it once. Safe because forward consumers of one backend are serialized by the scheduler's gate, so
+            // no job can be mid-Run on the old pool — every Run returns only after all its blocks finished.
+            pool?.Dispose();
+
+            WorkerPool grown = new WorkerPool(workersNeeded, _coreMask);
+
+            if (_samplingRequested)
+            {
+                // sampling can be armed before the first threaded call ever builds the pool
+                grown.EnableSampling();
+            }
+
+            return _pool = grown;
         }
-
-        // Never used when no extra workers exist: parallel GEMV requires threads > 1.
-        pool = new WorkerPool(Math.Max(_threads - 1, 0), _coreMask);
-
-        if (_samplingRequested)
-        {
-            pool.EnableSampling(); // sampling can be armed before the first threaded call ever builds the pool
-        }
-
-        return _pool = pool;
     }
 
     /// <summary>Whether this backend pins its pool workers (a core set was configured) or leaves them unpinned.</summary>
@@ -1330,6 +1380,8 @@ public sealed unsafe class CpuBackend : IBackend
                 thread.Start();
             }
         }
+
+        public int WorkerCapacity => _workers?.Length ?? 0;
 
         public void Run(int blockCount, IGemvJob job)
         {

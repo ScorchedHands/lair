@@ -31,6 +31,14 @@ public sealed class GenerationService : IDisposable
     private readonly GenerationScheduler _scheduler;
     private EngineMetricsBus? _metrics;
 
+    // Change-application state: the configuration currently in force (restart-only refusals keep their old values),
+    // the advertised model facts recomputed whenever a live or new-requests field changes, and the last reload attempt.
+    // The applies serialize on one gate so concurrent apply calls never interleave half-applied states.
+    private readonly object _reloadGate = new();
+    private LairConfig _current;
+    private ModelInfo _modelInfo; // reference-swapped under the reload gate so observers read a complete record
+    private ReloadSummary? _lastReload;
+
     /// <summary>The metrics bus attached by the API host, if any — null for hosts that never attach one.</summary>
     internal EngineMetricsBus? Metrics => _metrics;
 
@@ -44,7 +52,8 @@ public sealed class GenerationService : IDisposable
         ChatTemplateRenderer? chatTemplate,
         BlockPool pool,
         GenerationScheduler scheduler,
-        ModelInfo info)
+        ModelInfo info,
+        LairConfig config)
     {
         _file = file;
         _backend = backend;
@@ -53,11 +62,12 @@ public sealed class GenerationService : IDisposable
         _chatTemplate = chatTemplate;
         _pool = pool;
         _scheduler = scheduler;
-        Model = info;
+        _current = config;
+        _modelInfo = info;
     }
 
-    /// <summary>The served model's advertised facts; requests must name <see cref="ModelInfo.Id"/>.</summary>
-    public ModelInfo Model { get; }
+    /// <summary>The served model's advertised facts; requests must name <see cref="ModelInfo.Id"/>. Recomputed when a hot-reloaded field changes what the engine advertises.</summary>
+    public ModelInfo Model => Volatile.Read(ref _modelInfo);
 
     /// <summary>Vocabulary size of the served model; token ids at or above it have no vocabulary text.</summary>
     public int VocabSize => Model.VocabSize;
@@ -90,6 +100,120 @@ public sealed class GenerationService : IDisposable
     /// <summary>Decodes one token id through the served model's tokenizer, special tokens included so control pieces round-trip.</summary>
     public string DecodeToken(int tokenId) => _tokenizer.Decode([tokenId], includeSpecial: true);
 
+    /// <summary>The KV block budget admission currently spends from — the soft cap within <see cref="ReservedKvBlocks"/>.</summary>
+    public int KvBudgetBlocks => _pool.EffectiveBudgetBlocks;
+
+    /// <summary>Physical KV blocks reserved for this engine at open; never changes while it runs.</summary>
+    public int ReservedKvBlocks => _pool.CapacityBlocks;
+
+    /// <summary>Physical blocks currently handed out by the pool, including shared cache references and active sequences.</summary>
+    public int KvUsedBlocks => _pool.UsedBlocks;
+
+    /// <summary>Prefix-cache entries holding a block reference right now — what a shrinking budget drains through LRU eviction.</summary>
+    public int CachedPrefixBlocks => _cacheForMetrics?.CachedBlocks ?? 0;
+
+    /// <summary>The scheduler's live engine counters (prefill chunks and tokens, decode steps, occupancy) as the step loop maintains them.</summary>
+    public SchedulerStats Stats => _scheduler.Stats;
+
+    /// <summary>The configuration currently in force: candidates applied so far merged over the opened one, with refused restart-only fields still at their old values. Read-only snapshot for hosts that diff reloads against it.</summary>
+    public LairConfig EffectiveConfiguration => Volatile.Read(ref _current);
+
+    /// <summary>The most recent completed reload attempt as one structured summary, or null if none has finished. Hosts assert against this instead of parsing log lines.</summary>
+    public ReloadSummary? LastReload => Volatile.Read(ref _lastReload);
+
+    /// <summary>Records the outcome of one reload attempt (applied or rejected) for programmatic observation by hosts and tests.</summary>
+    public void ReportReload(ReloadSummary summary)
+    {
+        ArgumentNullException.ThrowIfNull(summary);
+        Volatile.Write(ref _lastReload, summary);
+    }
+
+    /// <summary>
+    /// Entry point of the change-application pipeline: diffs a fully validated candidate configuration against what is
+    /// currently in force and dispatches every difference by its mutation class. Live changes apply to the running
+    /// engine (prefill width at the next step boundary, worker participation from the next kernel call, KV budget as one
+    /// gated cap-flip-plus-drain); new-requests-only changes update admission for later requests while sequences already in
+    /// flight run on unchanged limits; restart-only fields are refused naming field and class, their old values retained.
+    /// The effective configuration merges exactly the applied fields — a candidate carrying both an applicable live change
+    /// and a refused restart-only change ends up with the first in force and the second still at its old value. Returns one
+    /// per-field result per difference; nothing here re-validates (candidates arrive validated) and no failure leaves a
+    /// half-applied state: each field's apply is independent, and refusals are inert by construction.
+    /// </summary>
+    public IReadOnlyList<FieldResult> ApplyConfiguration(LairConfig candidate)
+    {
+        ArgumentNullException.ThrowIfNull(candidate);
+        ObjectDisposedException.ThrowIf(_disposed, typeof(GenerationService));
+
+        lock (_reloadGate)
+        {
+            List<FieldResult> results = [];
+            LairConfig effective = _current;
+
+            foreach (FieldChange change in ConfigMutationTable.Diff(effective, candidate))
+            {
+                switch (change.Field)
+                {
+                    case "engine.max_batch_tokens":
+                        _scheduler.ApplyMaxBatchTokens(candidate.Engine.MaxBatchTokens);
+                        effective = effective with { Engine = effective.Engine with { MaxBatchTokens = candidate.Engine.MaxBatchTokens } };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            "prefill chunk width takes effect at the next step boundary; sequences mid-chunk finish that chunk at the old width"));
+                        break;
+
+                    case "models[0].placement.thread_quota":
+                        int workersBefore = _backend.EffectiveWorkerCount;
+                        int workersAfter = _backend.ApplyThreadQuota(candidate.Models[0].Placement.ThreadQuota);
+                        effective = effective with { Models = [effective.Models[0] with { Placement = effective.Models[0].Placement with { ThreadQuota = candidate.Models[0].Placement.ThreadQuota } }] };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"effective workers {workersBefore} -> {workersAfter}; participation adjusts from the next kernel call (the scheduler's next step), lowered workers idle"));
+                        break;
+
+                    case "models[0].kv_blocks":
+                        GenerationScheduler.KvBudgetApply budget = _scheduler.ApplyKvBudget(candidate.Models[0].KvBlocks);
+                        effective = effective with { Models = [effective.Models[0] with { KvBlocks = candidate.Models[0].KvBlocks } ] };
+                        RefreshAdvertisedModel(effective);
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"KV budget {change.OldValue} -> {budget.AppliedBlocks} blocks within the {_pool.CapacityBlocks}-block physical reservation; drained {budget.EvictedCacheEntries} cached prefix blocks above the new cap (active sequences untouched)"));
+                        break;
+
+                    case "models[0].max_context_tokens":
+                        effective = effective with { Models = [effective.Models[0] with { MaxContextTokens = candidate.Models[0].MaxContextTokens } ] };
+                        RefreshAdvertisedModel(effective);
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"admission now validates against a {_modelInfo.ContextLength}-token window; sequences already in flight are unaffected"));
+                        break;
+
+                    default:
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Refused, RefusalDetail(change)));
+                        break;
+                }
+            }
+
+            _current = effective;
+            return results;
+        }
+    }
+
+    // Advertised model facts recomputed from the effective configuration and live pool state: the window admission
+    // validates against is the smallest of configured max context, what the forward engine can actually address
+    // (its precomputed RoPE extent), and the token slots the current KV budget can back. A raise beyond the engine's
+    // addressed extent clamps there — re-cutting those tables belongs to a model reload, not to a hot edit.
+    private void RefreshAdvertisedModel(LairConfig effective)
+    {
+        long backed = Math.Min((long)_pool.EffectiveBudgetBlocks * _pool.BlockTokens, _model.MaxContextTokens);
+        int context = (int)Math.Min(effective.Models[0].MaxContextTokens, backed);
+
+        Volatile.Write(ref _modelInfo, _modelInfo with { ContextLength = context, KvBlocks = _pool.EffectiveBudgetBlocks });
+    }
+
+    private static string RefusalDetail(FieldChange change) => change.Field switch
+    {
+        "models[0].path" => $"{change.Field} requires restart (restart-only): '{change.OldValue}' -> '{change.NewValue}'. Server-side model reload is not implemented in this build — stop and restart lair to serve a different model file.",
+        "engine.block_size" => $"{change.Field} requires restart (restart-only): {change.OldValue} -> {change.NewValue}. KV block geometry is fixed for the lifetime of a running engine; change it by restarting lair.",
+        "server.bind" or "server.port" => $"{change.Field} requires restart (restart-only): {change.OldValue} -> {change.NewValue}. The HTTP listener binds once at startup.",
+        _ => $"{change.Field} requires restart (restart-only): {change.OldValue} -> {change.NewValue}. This field is established when the engine opens; change it by restarting lair.",
+    };
+
     /// <summary>
     /// Opens the first model declared in the configuration: GGUF container, mmap-backed weights through the
     /// forward engine, tokenizer, chat template, a KV pool sized by the model entry, a prefix cache over that pool,
@@ -109,8 +233,12 @@ public sealed class GenerationService : IDisposable
         ModelConfig modelConfig = config.Models[0];
         int blockTokens = config.Engine.BlockSize;
 
-        // The KV pool holds KvBlocks * blockTokens token slots; the context cannot exceed what it can back.
-        int maxContext = Math.Min(modelConfig.MaxContextTokens, modelConfig.KvBlocks * blockTokens);
+        // The KV pool holds KvBlocks * blockTokens token slots, reserved physically at open. Admission validates against the
+        // smaller of the configured max context and those slots; the forward engine's addressable extent covers the whole
+        // reservation so a later hot raise of max_context_tokens stays applicable up to what the pool can back — raising it
+        // beyond the reservation would need new RoPE tables, i.e. a model reload.
+        int reservedSlots = checked(modelConfig.KvBlocks * blockTokens);
+        int maxContext = Math.Min(modelConfig.MaxContextTokens, reservedSlots);
 
         // The model's placement decides the backend's shape: the engine thread choice (0 = auto-sized from physical
         // cores) capped by the model's thread quota, and the model's core set pinned onto every pool worker.
@@ -123,7 +251,7 @@ public sealed class GenerationService : IDisposable
         {
             file = GgufFile.Open(modelConfig.Path);
             GgufTokenizer tokenizer = GgufTokenizer.FromGguf(file);
-            model = TransformerModel.Open(file, backend, maxContext);
+            model = TransformerModel.Open(file, backend, reservedSlots);
             pool = new BlockPool(
                 blockTokens,
                 model.Desc.LayerCount,
@@ -147,7 +275,7 @@ public sealed class GenerationService : IDisposable
                 model.Desc.Architecture,
                 model.Desc.VocabSize);
 
-            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, pool, scheduler, info);
+            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, pool, scheduler, info, config);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
             file = null;
             model = null;

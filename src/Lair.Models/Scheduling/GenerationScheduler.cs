@@ -24,7 +24,11 @@ public sealed class GenerationScheduler : IDisposable
     private readonly TransformerModel _model;
     private readonly BlockPool _pool;
     private readonly PrefixCache? _cache;
-    private readonly int _maxBatchTokens;
+
+    // Prefill chunk width, re-read at every chunk issue so a hot edit lands at the next step boundary: a sequence
+    // already mid-chunk finishes that chunk at the old width. Volatile because the apply path writes it from a
+    // caller thread while only the scheduler thread consumes it.
+    private volatile int _maxBatchTokens;
 
     // Serializes every mutation of the pool and cache that is not issued from the scheduler thread: admission-time
     // eviction runs on caller threads, while all forwards, adoptions, publications, releases, and shutdown finishes
@@ -102,26 +106,38 @@ public sealed class GenerationScheduler : IDisposable
             throw new ArgumentOutOfRangeException(nameof(request), $"MaxTokens must be greater than zero, got {request.MaxTokens}.");
         }
 
+        int needed = BlocksNeeded(request.PromptTokens.Length, request.MaxTokens);
+
         lock (_gate)
         {
-            int needed = BlocksNeeded(request.PromptTokens.Length, request.MaxTokens);
-            if (needed > _pool.FreeBlocks && _cache is not null)
+            // Admission spends from the pool's effective free side: physically free blocks that sit beyond a shrunk
+            // soft budget are unreachable until cached-block eviction brings usage under the cap. Evicting one cache
+            // entry moves at most one block out of the used column (a block shared with an active sequence stays in
+            // use), so both checks re-read EffectiveFreeBlocks instead of assuming each evicted block counts.
+            if (needed > _pool.EffectiveFreeBlocks && _cache is not null)
             {
-                // Admission pressure: the pool cannot back this sequence as things stand — reclaim cached prefix
-                // blocks for it, oldest first. Active sequences' allocations are never touched by eviction.
-                _cache.EvictBlocks(needed - _pool.FreeBlocks);
+                _cache.EvictBlocks(needed - _pool.EffectiveFreeBlocks);
             }
 
-            if (needed > _pool.FreeBlocks)
+            if (needed > _pool.EffectiveFreeBlocks)
             {
-                throw new SchedulerFullException(_pool.FreeSlots);
+                throw new SchedulerFullException((long)_pool.EffectiveFreeBlocks * _pool.BlockTokens);
             }
         }
 
         Sequence sequence = new(request, ct, _pool, Interlocked.Increment(ref _nextId));
+
+        // The admission window carries this submission's reserved headroom across its whole run: if a budget shrink
+        // lands while it is decoding (usage pushed above the cap by cache eviction that could not reclaim pinned
+        // blocks), its own appends still reach what Submit already accounted for. Closed when the sequence finishes.
+        _pool.BeginAdmissionWindow(needed);
+        sequence.AdmissionWindowOpened = true;
+
         Stats.SequencesAdmitted++;
         if (!_inbox.Writer.TryWrite(sequence))
         {
+            sequence.AdmissionWindowOpened = false;
+            _pool.EndAdmissionWindow();
             throw new ObjectDisposedException(nameof(GenerationScheduler));
         }
 
@@ -140,6 +156,45 @@ public sealed class GenerationScheduler : IDisposable
         int firstBlock = 0;
         int lastBlock = (promptTokens + maxTokens - 2) / blockTokens;
         return lastBlock - firstBlock + 1;
+    }
+
+    /// <summary>
+    /// Applies a new prefill chunk width. The value is read fresh at every chunk issue, so the change takes effect at
+    /// the next step boundary: sequences already mid-chunk finish that chunk at the old width, and decode steps are
+    /// untouched. Any in-flight sequence's token stream stays deterministic either way — chunk boundaries never move
+    /// tokens, only where one forward stops and the next begins.
+    /// </summary>
+    public void ApplyMaxBatchTokens(int maxBatchTokens)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxBatchTokens, 1);
+        ObjectDisposedException.ThrowIf(_disposed, typeof(GenerationScheduler));
+
+        _maxBatchTokens = maxBatchTokens;
+    }
+
+    /// <summary>The outcome of applying a new KV block budget to the pool this scheduler admits against.</summary>
+    public readonly record struct KvBudgetApply(int AppliedBlocks, int EvictedCacheEntries);
+
+    /// <summary>
+    /// Applies a new soft cap on KV usage within the pool's fixed physical reservation. The gate is held across the whole
+    /// operation so the budget flip and the cached-block drain land as one step-boundary change: raising the cap makes
+    /// already-free blocks allocatable again immediately, up to the physical reservation (the applied value reports any
+    /// clamp); lowering it withholds new allocations and drains least-recently-used cache entries until in-use count sits
+    /// at or below the cap — active sequences' blocks are never touched, so a mid-run sequence completes normally. The
+    /// freed usage flows straight into admission: <see cref="Submit"/> budgets against effective free blocks from its
+    /// next call on.
+    /// </summary>
+    public KvBudgetApply ApplyKvBudget(int kvBlocks)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(kvBlocks);
+        ObjectDisposedException.ThrowIf(_disposed, typeof(GenerationScheduler));
+
+        lock (_gate)
+        {
+            int applied = _pool.SetEffectiveBudget(kvBlocks);
+            int evicted = _cache?.TrimToBudget(applied) ?? 0;
+            return new KvBudgetApply(applied, evicted);
+        }
     }
 
     /// <summary>
@@ -240,11 +295,12 @@ public sealed class GenerationScheduler : IDisposable
 
         // Decode step: every decoding sequence advances in one shared batched forward. Sequences whose next append
         // would cross the pool's block limit or the engine's context limit are failed before the batch is issued, so
-        // the batched forward never fails halfway through and only the doomed sequences fail. The free-block count is
-        // sampled after this step's prefill (and any copy-on-write it performed), since those are the last pool
-        // changes visible to window accounting.
+        // the batched forward never fails halfway through and only the doomed sequences fail. The window budget uses
+        // the pool's current allocation ceiling — under an open admission window that reaches past a hot-shrunk cap to
+        // what those admitted sequences already reserved — sampled after this step's prefill (and any copy-on-write it
+        // performed), since those are the last pool changes visible to window accounting.
         _window.Clear();
-        int blocksLeft = _pool.FreeBlocks;
+        int blocksLeft = Math.Max(Math.Min(_pool.FreeBlocks, _pool.AllocationCeiling - _pool.UsedBlocks), 0);
         foreach (Sequence sequence in _active)
         {
             if (!sequence.IsDecoding || sequence.IsFinished)
@@ -264,8 +320,9 @@ public sealed class GenerationScheduler : IDisposable
                 if (blocksLeft == 0)
                 {
                     Finish(sequence, FinishReason.Failed, new KvFullException(
-                        $"KV block pool is full: the sequence at position {sequence.Kv.Length} needs a new block " +
-                        $"and all {_pool.CapacityBlocks} blocks are in use."));
+                        $"KV block pool cannot extend this sequence: the sequence at position {sequence.Kv.Length} " +
+                        $"needs a new block and only {_pool.EffectiveFreeBlocks} blocks are allocatable under the " +
+                        $"{_pool.EffectiveBudgetBlocks}-block budget on a pool of {_pool.CapacityBlocks}."));
                     continue;
                 }
 
@@ -484,8 +541,16 @@ public sealed class GenerationScheduler : IDisposable
         SequenceOutcome outcome = new([.. sequence.Generated], sequence.Request.PromptTokens.Length, sequence.Generated.Count, reason, error, sequence.PrefillCachedTokens, [.. sequence.LogProbEntries]);
 
         // Blocks go back before the completion is published: an observer woken by the task may immediately submit a
-        // new sequence that needs them.
+        // new sequence that needs them. The admission window closes with the same handover — from here on, only the
+        // current soft cap governs pool allocations for later admissions.
         sequence.Kv.Dispose();
+
+        if (sequence.AdmissionWindowOpened)
+        {
+            sequence.AdmissionWindowOpened = false;
+            _pool.EndAdmissionWindow();
+        }
+
         sequence.Outcome.TrySetResult(outcome);
 
         switch (reason)

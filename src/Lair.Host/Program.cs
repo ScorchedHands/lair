@@ -42,6 +42,11 @@ if (args.Length == 3 && args[0] == "serve" && args[1] == "-c")
         };
 
         WebApplication app = ApiApp.Build(config, engine);
+
+        // Hot reload belongs to the serving posture only: this watcher coalesces config edits and pushes validated changes through the engine's change-application bus. Declared last so it disposes before the engine it watches.
+        using ConfigWatcher hotReload = new(args[2], engine);
+        hotReload.Start();
+
         Console.WriteLine($"lair serving '{engine.Model.Id}' on http://{config.Server.Bind}:{config.Server.Port}");
         await ((IHost)app).RunAsync(shutdown.Token);
     }

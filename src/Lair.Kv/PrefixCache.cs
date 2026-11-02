@@ -206,6 +206,36 @@ public sealed class PrefixCache
         return freed;
     }
 
+    /// <summary>
+    /// Drains cache entries down to a block budget: while the pool's in-use count exceeds <paramref name="budgetBlocks"/>,
+    /// evicts least-recently-published entries (blocks pinned by active sequences are skipped, exactly as under capacity
+    /// pressure) until enough blocks have left the used side of the pool. This is the shrink path of a hot budget edit:
+    /// it frees cached copies down to the new cap and never touches memory an active sequence depends on. Returns the
+    /// number of cache entries evicted; a shortfall means every remaining cached block is pinned in use.
+    /// </summary>
+    public int TrimToBudget(int budgetBlocks)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(budgetBlocks);
+
+        // Cached blocks sit on the used side of the pool (their cache reference keeps them allocated), so exceeding
+        // the cap can only be relieved by releasing entries — from the LRU head forward, pinned ones skipped. A block
+        // shared with a live sequence leaves refcount &gt; 1 after its entry is evicted and stays in use: that alone
+        // does not end the drain, because later unpinned entries still sit behind it. Each step removes one more
+        // entry (or reports every remaining entry pinned), so the loop always terminates.
+        int evicted = 0;
+        while (_pool.UsedBlocks > budgetBlocks && _entries.Count > 0)
+        {
+            if (EvictBlocks(1) == 0)
+            {
+                break; // every remaining entry is pinned by a live sequence: nothing left to drain
+            }
+
+            evicted++;
+        }
+
+        return evicted;
+    }
+
     private void Touch(PrefixEntry entry)
     {
         LinkedListNode<PrefixEntry> node = entry.Node ?? entry.CreateNode();
