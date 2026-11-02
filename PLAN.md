@@ -325,7 +325,7 @@ Many requests at once, tuned, with live reconfiguration.
 - [✓] Automated API: tool calls, logprobs, penalties, seed reproducibility via SDK scripts — 49/49 (Release); SDK round-trip ✅ at ship
 - [✓] Manual Monitor-lite: `lair monitor` live stats under mixed load — verified live: table rendered against serve under shared-prefix chats + long completion; KV used rose 3→55/96 with `active=1` during decode, cache-hit % climbed 50→100% on prefix reuse, tok/s + step-ms updated per tick (Debug-JIT rates), clean exit.
 
-### MVP3 [v0.3.0] - In Progress
+### MVP3 [v0.3.0] - Shipped
 
 Operators see the engine live in a browser and can test it with a built-in chat UI — no external client needed.
 
@@ -336,7 +336,7 @@ Operators see the engine live in a browser and can test it with a built-in chat 
   - Rejected: WebSocket/SignalR (bidirectionality unused while the monitor is read-only; new framing/hub machinery); Blazor (runtime coupling to engine host); polling-only UI (fails the real-time requirement).
   - Contract: `lair.monitor` event schema over SSE (additive-only, versioned field), including per-request tok/s sample series for in-flight/recent request sparklines.
   - Carried forward from the multi-model phase design (formerly DN-M4-4) when the UI was pulled ahead of CUDA.
-- **DN-M3-2** — Chat test UI: shadcn primitives + a hand-rolled OpenAI-compatible SSE client; the Chat tab's model selector lists LLM (chat-type) models only.
+- **DN-M3-2** — Chat test UI: a hand-rolled OpenAI-compatible SSE client; shadcn primitives available as copy-in components but none ended up required (the mockup's DOM with token aliases sufficed); the Chat tab's model selector lists LLM (chat-type) models only.
   - Rationale: for a test client, a chat-runtime library's machinery (thread persistence, branching, cloud hooks) is dead weight; hand-rolling the SSE consumption doubles as a conformance check of LAIR's own API. License was never the differentiator — assistant-ui and shadcn are both MIT (verified 2026-11-02).
   - Rejected: assistant-ui (MIT, but pulls the Vercel AI SDK runtime tree for features this surface won't use); fully hand-rolled (shadcn primitives provide accessibility and composition for free).
   - Contract: chat surface consumes only public API endpoints (`/v1/chat/completions` SSE, `/v1/models`); no privileged engine access — the UI is a client like any other.
@@ -364,7 +364,7 @@ Security (accepted): SPA is static files on the existing Kestrel endpoint (loopb
 - [✓] Monitor SPA — implements the mockup's Monitor tab verbatim: KPI cards, configured-models table with expandable config/state rows, in-flight + recent tables with tok/s sparklines, placeholder tiles (see DN-M3-1, DN-M3-3, DN-M3-4)
   - Verify: manual live serve ✅ — `/monitor/stream` carried snapshots (incl. 10 additive per-model fields), request lifecycle frames with `samples[]`, Last-Event-ID replay (3 snapshots + resync), client-abort surfaced as cancelled; jsdom harness against the built bundle asserts KPI updates, model rows expand on live data, in-flight row lifecycle, sparkline points from samples (7 for 8 samples), badge transitions across reconnect/back-to-live. Targeted: MonitorUi 7/7 + WebUi 1/1. Honest deltas vs mockup statics: step-time sub-line is avg-over-window (no server p95 today); tool_calls tallies absent until fence-derived calls reach the stream; GPU/PCIe/power remain placeholders.
   - Verify: manual — browser shows live in-flight rows updating sub-second under load; model row expansion reveals config + per-model cache blocks and finish tallies; sparklines render for streaming requests; GPU/PCIe tiles show placeholders.
-- [✓] Chat tab — shadcn primitives + hand-rolled SSE client: LLM-only model selector, streamed multi-turn replies, mid-stream abort, tool-call rendering (see DN-M3-2, DN-M3-4)
+- [✓] Chat tab — hand-rolled OpenAI-compatible SSE client (no copy-in shadcn primitives proved necessary: the mockup DOM with token aliases covers it): LLM-only model selector, streamed multi-turn replies, mid-stream abort, tool-call rendering (see DN-M3-2, DN-M3-4)
   - Verify: manual live serve ✅ — scripted curl SSE capture matched the client's parse shapes end-to-end (role chunk → content pieces → complete-call tool chunks → finish_reason chunk → `[DONE]`); real-bundle harness 11/11 incl. multi-turn replay accepted, mid-stream cut keeping partial text with working next send, pre-header Stop resolving as flow control; jsdom smoke (`npm run smoke:chat`) 29/29 covering selector filtering via new additive `"type"` field on `/v1/models`, delta rendering incl. half-frame buffering, tool card assembly for both complete-call and index-keyed incremental shapes, inline error bubble with usable composer. No shadcn primitives pulled — mockup verbatim rule outranks; no MessageBody change needed (tool cards display-only). Targeted: WebUi 1 + MonitorUi 7 + extended models assertion green.
   - Verify: manual — multi-turn streamed chat against the serving engine; Stop aborts mid-stream and the next request works; a parser-produced tool call renders as a tool card.
 
