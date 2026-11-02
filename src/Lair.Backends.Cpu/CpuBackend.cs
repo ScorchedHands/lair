@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -35,17 +36,67 @@ public sealed unsafe class CpuBackend : IBackend
     private const int ParallelRowThreshold = 256;
 
     private readonly int _threads;
+    private readonly ulong? _coreMask;
+    private bool _samplingRequested; // test-only instrumentation flag, read when the pool is created and pushed on enable
     private readonly bool _useAvx2;
     private WorkerPool? _pool;
 
-    public CpuBackend(int threads = 0, bool allowAvx2 = true)
+    /// <summary>
+    /// Default auto-sizing rule: one worker per physical core, SMT siblings excluded. Dense GEMV decode is memory-
+    /// bandwidth-bound and two threads on one core share that core's front-end, L1/L2 caches, and execution ports, so
+    /// a sibling thread adds contention rather than bandwidth; logical processor counts therefore overstate usable
+    /// parallelism for this workload. Physical cores come from <see cref="ThreadAffinity.DetectPhysicalCoreCount"/>
+    /// (Windows topology API, probed once per process); when detection is unavailable the count falls back to
+    /// <see cref="Environment.ProcessorCount"/>, which can only overestimate and is then capped by it. An explicit
+    /// nonzero thread request wins over auto-sizing, and a per-model quota caps either choice.
+    /// </summary>
+    public static int AutoWorkerCount => Math.Min(Math.Max(ThreadAffinity.DetectPhysicalCoreCount(), 1), Environment.ProcessorCount);
+
+    /// <summary>
+    /// Opens the CPU backend for one model placement. <paramref name="threads"/> is the global worker request (0 = auto-size by
+    /// <see cref="AutoWorkerCount"/>); <paramref name="threadQuota"/> optionally caps that count to 1 or more; and a non-empty
+    /// <paramref name="coreSet"/> pins every persistent pool worker to those logical cores for their whole lifetime, so all of the
+    /// model's compute stays inside its configured processor set. Pinning is applied on Windows only: on other platforms it is a
+    /// documented no-op that warns once at startup (Linux affinity via sched_setaffinity is later hardening). Core ids must lie
+    /// within one 64-bit processor group ([0, 63]) because that is what an affinity mask can express.
+    /// </summary>
+    public CpuBackend(int threads = 0, IReadOnlySet<int>? coreSet = null, int? threadQuota = null, bool allowAvx2 = true)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(threads);
-        _threads = threads == 0 ? Math.Min(Environment.ProcessorCount, 16) : threads;
+        if (threadQuota is < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(threadQuota), threadQuota, "A thread quota must be at least 1; omit it to leave the worker count uncapped.");
+        }
+
+        int global = threads == 0 ? AutoWorkerCount : threads;
+        _threads = Math.Min(global, threadQuota ?? global);
+
+        if (coreSet is { Count: > 0 })
+        {
+            // Validate ids before any pool exists so an out-of-group core set fails the open call instead of a worker loop.
+            _coreMask = ThreadAffinity.BuildCoreMask(coreSet);
+        }
+
         _useAvx2 = allowAvx2 && Avx2.IsSupported && Fma.IsSupported && Ssse3.IsSupported;
     }
 
     public string DeviceId => "cpu";
+
+    /// <summary>Worker count this backend actually runs threaded GEMV with (dispatcher plus pool workers), after quota and auto-sizing.</summary>
+    public int EffectiveWorkerCount => _threads;
+
+    /// <summary>Physical cores detected on the machine by the topology probe (0 when detection is unavailable); see <see cref="AutoWorkerCount"/>.</summary>
+    public static int DetectedPhysicalCoreCount => ThreadAffinity.DetectPhysicalCoreCount();
+
+    /// <summary>
+    /// Turns on lightweight per-block execution sampling: each worker block records which logical processor it ran on, readable
+    /// through <see cref="ExecutionSamples"/>. Off by default so production runs pay no instrumentation cost beyond one field read.
+    /// </summary>
+    internal void EnableExecutionSampling() => _samplingRequested = true;
+
+    /// <summary>The processor number of each sampled worker-block execution since sampling was enabled (empty before the first threaded call).</summary>
+    internal IReadOnlyList<int> ExecutionSamples => _pool?.SampleSnapshot() ?? [];
 
     public MemoryHandle AllocateAligned(long bytes, int alignment)
     {
@@ -399,8 +450,18 @@ public sealed unsafe class CpuBackend : IBackend
         }
 
         // Never used when no extra workers exist: parallel GEMV requires threads > 1.
-        return _pool = new WorkerPool(Math.Max(_threads - 1, 0));
+        pool = new WorkerPool(Math.Max(_threads - 1, 0), _coreMask);
+
+        if (_samplingRequested)
+        {
+            pool.EnableSampling(); // sampling can be armed before the first threaded call ever builds the pool
+        }
+
+        return _pool = pool;
     }
+
+    /// <summary>Whether this backend pins its pool workers (a core set was configured) or leaves them unpinned.</summary>
+    internal bool IsPinningConfigured => _coreMask is not null;
 
     private static float RowDot(byte* row, float* x, int cols, QuantFormat format, bool avx2)
     {
@@ -1223,12 +1284,22 @@ public sealed unsafe class CpuBackend : IBackend
     /// <summary>
     /// Persistent worker pool: workers park on a monitor and are woken per job; the dispatcher thread joins the
     /// claim loop so small jobs pay no wake-up cost. All block claims happen under one lock, which is negligible
-    /// next to a row-block of kernel work. Workers outlive individual GEMV calls until Dispose.
+    /// next to a row-block of kernel work. Workers outlive individual GEMV calls until Dispose. Each worker pins
+    /// itself to <c>coreMask</c> (when configured) at loop start and re-pins defensively after any wake-up gap —
+    /// pinning lives in the thread body so pool bookkeeping can never undo it — and records the logical processor of
+    /// every block it executes while execution sampling is enabled on the owning backend. The dispatcher's own blocks
+    /// are deliberately neither pinned nor sampled: that thread belongs to the caller, not to the pool.
     /// </summary>
     private sealed class WorkerPool : IDisposable
     {
+        // Sampling stays bounded so a long run cannot grow memory without limit; 4096 covers any test workload.
+        private const int MaxSamples = 4096;
+
         private readonly object _gate = new();
         private readonly Thread[]? _workers;
+        private readonly ulong? _coreMask; // processor set for every pool worker, or null when the model is unpinned
+        private ConcurrentQueue<int>? _samples; // armed lazily via Interlocked so volatile-field type rules hold
+        private int _sampleCount;
 
         private IGemvJob? _job;
         private int _totalBlocks;
@@ -1236,8 +1307,10 @@ public sealed unsafe class CpuBackend : IBackend
         private int _pendingBlocks;
         private bool _disposed;
 
-        public WorkerPool(int workerCount)
+        public WorkerPool(int workerCount, ulong? coreMask)
         {
+            _coreMask = coreMask;
+
             if (workerCount == 0)
             {
                 return; // pool exists only to satisfy GetOrCreatePool; Run is never called for it
@@ -1321,12 +1394,38 @@ public sealed unsafe class CpuBackend : IBackend
             }
         }
 
+        /// <summary>Arms per-block processor sampling; the interlocked store publishes the queue to every worker thread.</summary>
+        internal void EnableSampling()
+        {
+            if (_samples is null)
+            {
+                Interlocked.CompareExchange(ref _samples, [], null); // a racing second arming keeps the first queue and drops its own
+            }
+        }
+
+        /// <summary>Snapshots the processor number recorded by each sampled worker-block execution so far.</summary>
+        internal IReadOnlyList<int> SampleSnapshot() => Volatile.Read(ref _samples) is ConcurrentQueue<int> queue ? [.. queue] : [];
+
         private void WorkerLoop()
         {
+            // Pin at thread start: affinity is process-lifetime state of this thread, so one call covers the whole
+            // loop. Unpinned models pass a zero mask and get the trivial accept back; Linux hosts get the documented
+            // no-op here. The pin re-asserts itself below on every wake-up for defense in depth.
+            ThreadAffinity.ApplyCoreSet(_coreMask ?? 0UL);
+
             while (true)
             {
+                if (_coreMask is not null)
+                {
+                    // Defensive re-pin at each wake-up: cheap next to kernel work, and it keeps the pin even if an
+                    // external tool or a thread-pool reuse ever reset this worker's affinity. The start-of-loop call
+                    // above already covers unpinned models with a trivial no-op return.
+                    ThreadAffinity.ApplyCoreSet(_coreMask.Value);
+                }
+
                 IGemvJob job;
                 int block;
+                bool claimed;
                 lock (_gate)
                 {
                     while (!_disposed && _nextBlock >= _totalBlocks)
@@ -1341,7 +1440,25 @@ public sealed unsafe class CpuBackend : IBackend
 
                     // A woken worker may find all blocks already claimed: claim fails, so loop back to sleep.
                     block = _nextBlock++;
+                    claimed = block < _totalBlocks;
                     job = _job!;
+                }
+
+                if (_coreMask is not null)
+                {
+                    // Defensive re-pin on every wake-up: cheap next to kernel work, and it keeps the pin even if an
+                    // external tool or a thread-pool reuse ever reset this worker's affinity.
+                    ThreadAffinity.ApplyCoreSet(_coreMask.Value);
+                }
+
+                ConcurrentQueue<int>? samples = Volatile.Read(ref _samples);
+                if (claimed && samples is not null && _sampleCount < MaxSamples)
+                {
+                    // Approximate cap under concurrent workers: a few blocks may race past it, which is fine for an
+                    // unbounded-memory guard on a test-only hook. The number records where this block executes; the
+                    // pin above guarantees a pinned worker answers from inside its core set.
+                    _sampleCount++;
+                    samples.Enqueue(ThreadAffinity.CurrentProcessorNumber());
                 }
 
                 job.ProcessBlock(block);

@@ -17,7 +17,7 @@ public static class YamlConfigLoader
     private static readonly string[] ServerKeys = ["bind", "port"];
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens"];
     private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement"];
-    private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set"];
+    private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota"];
 
     /// <summary>Loads and validates <paramref name="filePath"/>; no file watching.</summary>
     public static LairConfig Load(string filePath)
@@ -34,6 +34,7 @@ public static class YamlConfigLoader
         RejectUnknownKeys(top, TopLevel, TopLevelKeys);
 
         IReadOnlyList<ModelConfig> models = ParseModels(top);
+        ValidateCoreSetsDisjoint(models);
 
         return new LairConfig
         {
@@ -245,12 +246,20 @@ public static class YamlConfigLoader
             ? new HashSet<int>()
             : ParseCoreSet(coreSetSpec!, $"models[{index}].placement.core_set");
 
+        int? threadQuota = TryInteger(keys, "thread_quota", $"models[{index}].placement.thread_quota");
+        if (threadQuota is < 1)
+        {
+            throw new ConfigException(
+                $"models[{index}].placement.thread_quota {threadQuota} is invalid: 'thread_quota' must be 1 or greater.");
+        }
+
         return new PlacementConfig
         {
             Device = device,
             KvResidency = kvResidency,
             Prefill = prefill,
             CoreSet = coreSet,
+            ThreadQuota = threadQuota,
         };
     }
 
@@ -301,6 +310,30 @@ public static class YamlConfigLoader
         }
 
         return cores;
+    }
+
+    public static void ValidateCoreSetsDisjoint(IReadOnlyList<ModelConfig> models)
+    {
+        ArgumentNullException.ThrowIfNull(models);
+
+        // Two pinned models sharing a core id contend for the same execution resources and make the pinning contract
+        // meaningless. The current build serves exactly one model, so this rule guards the multi-model path that the
+        // placement vocabulary is written for; it validates parsed model objects directly so callers without a YAML
+        // document apply the same rule.
+        Dictionary<int, string> owners = [];
+        for (int index = 0; index < models.Count; index++)
+        {
+            ModelConfig model = models[index];
+            foreach (int core in model.Placement.CoreSet)
+            {
+                if (!owners.TryAdd(core, model.Name))
+                {
+                    throw new ConfigException(
+                        $"models '{owners[core]}' and '{model.Name}' both pin core {core}: placement core sets must " +
+                        "disjointly partition the machine so pinned models never share a core.");
+                }
+            }
+        }
     }
 
     private static YamlMappingNode AsMapping(YamlNode node, string where)

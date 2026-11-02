@@ -61,4 +61,7 @@ public sealed record PlacementConfig
 
     /// <summary>Pinned logical core ids; empty means unpinned.</summary>
     public IReadOnlySet<int> CoreSet { get; init; } = new HashSet<int>();
+
+    /// <summary>Hard cap on this model's worker threads (1 or greater); null leaves the engine thread choice uncapped.</summary>
+    public int? ThreadQuota { get; init; }
 }

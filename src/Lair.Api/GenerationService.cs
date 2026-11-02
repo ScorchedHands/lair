@@ -62,6 +62,9 @@ public sealed class GenerationService : IDisposable
     /// <summary>Vocabulary size of the served model; token ids at or above it have no vocabulary text.</summary>
     public int VocabSize => Model.VocabSize;
 
+    /// <summary>Worker count the served model's CPU backend actually runs with, after engine threads and the model's thread quota are combined.</summary>
+    public int EffectiveWorkerCount => _backend.EffectiveWorkerCount;
+
     /// <summary>
     /// Attaches the metrics bus that samples this engine's counters and feeds <c>/monitor/stream</c>. The API host
     /// calls it once while building the app; hosts that never attach one simply produce no snapshots. Idempotent:
@@ -109,7 +112,9 @@ public sealed class GenerationService : IDisposable
         // The KV pool holds KvBlocks * blockTokens token slots; the context cannot exceed what it can back.
         int maxContext = Math.Min(modelConfig.MaxContextTokens, modelConfig.KvBlocks * blockTokens);
 
-        CpuBackend backend = new(config.Engine.Threads);
+        // The model's placement decides the backend's shape: the engine thread choice (0 = auto-sized from physical
+        // cores) capped by the model's thread quota, and the model's core set pinned onto every pool worker.
+        CpuBackend backend = new(config.Engine.Threads, modelConfig.Placement.CoreSet, modelConfig.Placement.ThreadQuota);
         GgufFile? file = null;
         TransformerModel? model = null;
         BlockPool? pool = null;
