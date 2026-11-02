@@ -1,3 +1,5 @@
+using System.Buffers;
+
 using Lair.Core.Contracts;
 using Lair.Kv;
 using Lair.Loader;
@@ -397,6 +399,242 @@ public sealed class TransformerModel : IDisposable
         }
 
         return _batchLogits.AsSpan(0, n * Desc.VocabSize);
+    }
+
+    /// <summary>Token positions one encoder pass advances through the dense matrices per batched weight traversal.</summary>
+    public const int EncodeChunkTokens = 8;
+
+    /// <summary>Largest token count a single <see cref="Encode"/> call may forward.</summary>
+    public const int MaxEncodeTokens = 256;
+
+    /// <summary>
+    /// Encoder-only forward: runs the whole token sequence through every layer with full-sequence (bidirectional)
+    /// attention — each query position scores against all positions of its own sequence's KV contents instead of a
+    /// causal prefix — and returns the final hidden states after the output norm, without lm_head logits. Per-position
+    /// norms, RoPE at absolute positions, biases, residuals, and SwiGLU are exactly the decode-path operations; K/V for
+    /// every position is appended to <paramref name="kv"/> as usual (positions start at <see cref="SequenceKv.Length"/>,
+    /// so encoding a fresh sequence keeps each token attending only to its own sequence). Dense matrices are traversed
+    /// once per chunk of up to <see cref="EncodeChunkTokens"/> positions via <see cref="IBackend.GemvBatch"/>; every
+    /// position then attends over the whole finished KV span, which is what distinguishes this path from incremental
+    /// causal decode. All queries — whichever chunk they belong to — see exactly every position of their sequence after
+    /// appending (0..<see cref="SequenceKv.Length"/>) in ascending order, so results are independent of chunking.
+    /// This establishes the dense-LLM architecture running in encoder mode as groundwork for embedding extraction;
+    /// dedicated encoder-native architectures (ModernBERT-class) require their own tensor layouts and arrive with the
+    /// embeddings endpoint itself. The returned array is caller-owned: <c>hidden[position * HiddenSize + i]</c>, length
+    /// <c>tokens.Count * HiddenSize</c>.
+    /// </summary>
+    /// <exception cref="ArgumentException">
+    /// The token list is empty or larger than <see cref="MaxEncodeTokens"/>, a token id is outside the vocabulary, or
+    /// appending the sequence would exceed this model's max context.
+    /// </exception>
+    public float[] Encode(IReadOnlyList<int> tokens, SequenceKv kv)
+    {
+        ArgumentNullException.ThrowIfNull(tokens);
+        ArgumentNullException.ThrowIfNull(kv);
+
+        int n = tokens.Count;
+        if (n == 0 || n > MaxEncodeTokens)
+        {
+            throw new ArgumentException(
+                $"an encoder forward must hold between 1 and {MaxEncodeTokens} tokens, got {n}.", nameof(tokens));
+        }
+
+        int hidden = Desc.HiddenSize;
+        int basePosition = kv.Length;
+        if (basePosition + n > MaxContextTokens)
+        {
+            throw new ArgumentException(
+                $"{n} encoder tokens starting at position {basePosition} exceed this model's max context of {MaxContextTokens}.",
+                nameof(tokens));
+        }
+
+        int qkvRegion = Desc.HeadCount * Desc.HeadDim;
+        int kvRegion = Desc.KvHeadCount * Desc.HeadDim;
+        int inter = Desc.IntermediateSize;
+        float attnScale = 1f / MathF.Sqrt(Desc.HeadDim);
+
+        ArrayPool<float> poolBuffers = ArrayPool<float>.Shared;
+
+        // Position-major working streams for the whole sequence plus chunk-local scratch for batched GEMVs. The rented
+        // arrays are returned before any throw past this point, so a mid-call failure cannot leak pool entries.
+        float[] cur = poolBuffers.Rent(n * hidden);          // residual carrier per position; becomes the final stream
+        float[] normed = poolBuffers.Rent(n * hidden);       // rmsnorm result feeding the QKV / FFN GEMVs
+        float[] qAll = poolBuffers.Rent(n * qkvRegion);      // every position's rotated queries, kept for attention
+        float[] attnOut = poolBuffers.Rent(n * qkvRegion);   // concatenated heads per position before wo
+        float[] chunkNormed = poolBuffers.Rent(EncodeChunkTokens * hidden);
+        float[] chunkQ = poolBuffers.Rent(EncodeChunkTokens * qkvRegion);
+        float[] chunkK = poolBuffers.Rent(EncodeChunkTokens * kvRegion);
+        float[] chunkV = poolBuffers.Rent(EncodeChunkTokens * kvRegion);
+        float[] chunkProj = poolBuffers.Rent(EncodeChunkTokens * hidden);
+        float[] chunkGateUp = poolBuffers.Rent(EncodeChunkTokens * inter);
+        float[] chunkUp = poolBuffers.Rent(EncodeChunkTokens * inter);
+
+        try
+        {
+            // Embedding lookup: each token's dequantized token_embd row seeds that position's input stream.
+            ReadOnlySpan<byte> embBytes = _weights.Resolve(_tokenEmbd);
+            WeightRef embRef = new(embBytes, _tokenEmbd.Shape, _tokenEmbd.Format);
+            for (int i = 0; i < n; i++)
+            {
+                if ((uint)tokens[i] >= (uint)Desc.VocabSize)
+                {
+                    throw new ArgumentException($"token id {tokens[i]} at index {i} is outside the vocabulary of {Desc.VocabSize}.", nameof(tokens));
+                }
+
+                _backend.DequantRow(embRef, tokens[i], cur.AsSpan(i * hidden, hidden));
+            }
+
+            // Reserve every position's KV slot up front so later layer passes address them by absolute position.
+            for (int i = 0; i < n; i++)
+            {
+                kv.Append();
+            }
+
+            int chunkCount = (n + EncodeChunkTokens - 1) / EncodeChunkTokens;
+
+            for (int l = 0; l < Desc.LayerCount; l++)
+            {
+                // Phase 1: pre-attention norm, QKV GEMVs (+bias), RoPE at absolute positions, and the K/V writes — all
+                // per chunk. Queries stay in qAll so no position's attention runs before every position's K/V exists.
+                for (int c = 0; c < chunkCount; c++)
+                {
+                    int firstPos = basePosition + c * EncodeChunkTokens;
+                    int m = Math.Min(EncodeChunkTokens, n - c * EncodeChunkTokens);
+
+                    for (int i = 0; i < m; i++)
+                    {
+                        LayerOps.RmsNormWeighted(cur.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden), _attnNormWeight[l], Desc.EpsRmsNorm, chunkNormed.AsSpan(i * hidden, hidden));
+                    }
+
+                    ReadOnlySpan<byte> bytes = _weights.Resolve(_wq[l]);
+                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, new WeightRef(bytes, _wq[l].Shape, _wq[l].Format), chunkQ.AsSpan(0, m * qkvRegion));
+
+                    bytes = _weights.Resolve(_wk[l]);
+                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, new WeightRef(bytes, _wk[l].Shape, _wk[l].Format), chunkK.AsSpan(0, m * kvRegion));
+
+                    bytes = _weights.Resolve(_wv[l]);
+                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, new WeightRef(bytes, _wv[l].Shape, _wv[l].Format), chunkV.AsSpan(0, m * kvRegion));
+
+                    for (int i = 0; i < m; i++)
+                    {
+                        AddBias(chunkQ.AsSpan(i * qkvRegion, qkvRegion), _biasQ[l]);
+                        AddBias(chunkK.AsSpan(i * kvRegion, kvRegion), _biasK[l]);
+                        AddBias(chunkV.AsSpan(i * kvRegion, kvRegion), _biasV[l]);
+
+                        ApplyRopeHeads(chunkQ.AsSpan(i * qkvRegion, qkvRegion), Desc.HeadCount, firstPos + i);
+                        ApplyRopeHeads(chunkK.AsSpan(i * kvRegion, kvRegion), Desc.KvHeadCount, firstPos + i);
+
+                        int position = c * EncodeChunkTokens + i; // sequence-relative index into the streams
+                        kv.WriteK(basePosition + position, l, chunkK.AsSpan(i * kvRegion, kvRegion));
+                        kv.WriteV(basePosition + position, l, chunkV.AsSpan(i * kvRegion, kvRegion));
+
+                        chunkQ.AsSpan(i * qkvRegion, qkvRegion).CopyTo(qAll.AsSpan(position * qkvRegion, qkvRegion));
+                    }
+                }
+
+                // Phase 2: bidirectional attention per chunk — every query scores against all n positions of this
+                // sequence's finished KV. Chunk-local outputs land at each position's slot in attnOut.
+                for (int c = 0; c < chunkCount; c++)
+                {
+                    int m = Math.Min(EncodeChunkTokens, n - c * EncodeChunkTokens);
+
+                    LayerOps.BidirectionalAttention(
+                        _backend,
+                        qAll.AsSpan(c * EncodeChunkTokens * qkvRegion, m * qkvRegion),
+                        queryCount: m,
+                        fromPosition: 0,
+                        toPosition: basePosition + n - 1,
+                        Desc.HeadCount,
+                        Desc.KvHeadCount,
+                        Desc.HeadDim,
+                        kv,
+                        l,
+                        attnScale,
+                        attnOut.AsSpan(c * EncodeChunkTokens * qkvRegion, m * qkvRegion));
+                }
+
+                // Phase 3: output projection (+bias) and the ffn_inp residual add on each position's own stream.
+                for (int c = 0; c < chunkCount; c++)
+                {
+                    int m = Math.Min(EncodeChunkTokens, n - c * EncodeChunkTokens);
+
+                    ReadOnlySpan<byte> bytes = _weights.Resolve(_wo[l]);
+                    _backend.GemvBatch(attnOut.AsSpan(c * EncodeChunkTokens * qkvRegion, m * qkvRegion), m, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), chunkProj.AsSpan(0, m * hidden));
+
+                    for (int i = 0; i < m; i++)
+                    {
+                        AddBias(chunkProj.AsSpan(i * hidden, hidden), _biasO[l]);
+
+                        Span<float> posCur = cur.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden);
+                        ReadOnlySpan<float> proj = chunkProj.AsSpan(i * hidden, hidden);
+                        for (int x = 0; x < hidden; x++)
+                        {
+                            posCur[x] += proj[x];
+                        }
+
+                        LayerOps.RmsNormWeighted(posCur, _ffnNormWeight[l], Desc.EpsRmsNorm, normed.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden));
+                    }
+                }
+
+                // Phase 4: gate/up GEMVs and SwiGLU per chunk.
+                for (int c = 0; c < chunkCount; c++)
+                {
+                    int m = Math.Min(EncodeChunkTokens, n - c * EncodeChunkTokens);
+
+                    ReadOnlySpan<byte> bytes = _weights.Resolve(_ffnGate[l]);
+                    _backend.GemvBatch(normed.AsSpan(c * EncodeChunkTokens * hidden, m * hidden), m, new WeightRef(bytes, _ffnGate[l].Shape, _ffnGate[l].Format), chunkGateUp.AsSpan(0, m * inter));
+
+                    bytes = _weights.Resolve(_ffnUp[l]);
+                    _backend.GemvBatch(normed.AsSpan(c * EncodeChunkTokens * hidden, m * hidden), m, new WeightRef(bytes, _ffnUp[l].Shape, _ffnUp[l].Format), chunkUp.AsSpan(0, m * inter));
+
+                    for (int i = 0; i < m; i++)
+                    {
+                        Span<float> gateUp = chunkGateUp.AsSpan(i * inter, inter);
+                        ReadOnlySpan<float> up = chunkUp.AsSpan(i * inter, inter);
+                        for (int x = 0; x < inter; x++)
+                        {
+                            gateUp[x] = LayerOps.Silu(gateUp[x]) * up[x];
+                        }
+                    }
+
+                    // Phase 5: down GEMV and the ffn_out residual add, completing this layer for every position.
+                    bytes = _weights.Resolve(_ffnDown[l]);
+                    _backend.GemvBatch(chunkGateUp.AsSpan(0, m * inter), m, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), chunkProj.AsSpan(0, m * hidden));
+
+                    for (int i = 0; i < m; i++)
+                    {
+                        Span<float> posCur = cur.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden);
+                        ReadOnlySpan<float> proj = chunkProj.AsSpan(i * hidden, hidden);
+                        for (int x = 0; x < hidden; x++)
+                        {
+                            posCur[x] += proj[x]; // ffn_out + ffn_inp: this position's input stream for the next layer
+                        }
+                    }
+                }
+            }
+
+            float[] encoded = new float[n * hidden]; // caller-owned result, exact size — pooling helpers consume it row-wise
+            for (int i = 0; i < n; i++)
+            {
+                LayerOps.RmsNormWeighted(cur.AsSpan(i * hidden, hidden), _outputNormWeight, Desc.EpsRmsNorm, encoded.AsSpan(i * hidden, hidden));
+            }
+
+            return encoded;
+        }
+        finally
+        {
+            poolBuffers.Return(cur, clearArray: false);
+            poolBuffers.Return(normed, clearArray: false);
+            poolBuffers.Return(qAll, clearArray: false);
+            poolBuffers.Return(attnOut, clearArray: false);
+            poolBuffers.Return(chunkNormed, clearArray: false);
+            poolBuffers.Return(chunkQ, clearArray: false);
+            poolBuffers.Return(chunkK, clearArray: false);
+            poolBuffers.Return(chunkV, clearArray: false);
+            poolBuffers.Return(chunkProj, clearArray: false);
+            poolBuffers.Return(chunkGateUp, clearArray: false);
+            poolBuffers.Return(chunkUp, clearArray: false);
+        }
     }
 
     public void Dispose()

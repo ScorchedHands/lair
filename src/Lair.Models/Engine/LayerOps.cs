@@ -168,4 +168,103 @@ internal static class LayerOps
             }
         }
     }
+
+    /// <summary>
+    /// Full-sequence attention over one layer's KV contents: every query position attends to all logical positions in
+    /// the window instead of just a causal prefix. Queries are given position-major (queryCount * headCount * headDim)
+    /// so a whole batch is processed in one pass; each head maps to kv-head (h * kvHeadCount / headCount) and runs the
+    /// same online softmax as <see cref="CausalAttention"/> with its score window widened from [0, position] to
+    /// [fromPosition, toPosition], which must lie inside the sequence's existing KV (<see cref="SequenceKv.Length"/>).
+    /// Restricting that window yields a block-local variant used when long sequences are processed in chunks: every
+    /// query then sees exactly one contiguous range of positions. With fromPosition == 0 and toPosition == p over a
+    /// sequence of length p + 1 the numeric path is identical to <see cref="CausalAttention"/> at position p, which
+    /// lets chunk boundaries be verified against the causal decode kernels bit-for-bit.
+    /// </summary>
+    internal static void BidirectionalAttention(
+        IBackend backend,
+        ReadOnlySpan<float> qPositions, // queryCount * headCount * headDim, position-major
+        int queryCount,
+        int fromPosition,
+        int toPosition,
+        int headCount,
+        int kvHeadCount,
+        int headDim,
+        SequenceKv kv,
+        int layer,
+        float attnScale,
+        Span<float> outConcat) // queryCount * headCount * headDim, position-major
+    {
+        ArgumentNullException.ThrowIfNull(backend);
+        ArgumentNullException.ThrowIfNull(kv);
+
+        ArgumentOutOfRangeException.ThrowIfNegative(queryCount);
+        ArgumentOutOfRangeException.ThrowIfNegative(fromPosition);
+        if (toPosition < fromPosition || toPosition >= kv.Length)
+        {
+            throw new ArgumentException(
+                $"query window [{fromPosition}..{toPosition}] must lie inside the 0..{kv.Length - 1} positions already held by the sequence.",
+                nameof(toPosition));
+        }
+
+        int region = headCount * headDim;
+        if (qPositions.Length < queryCount * region || outConcat.Length < queryCount * region)
+        {
+            throw new ArgumentException("Attention operands must cover every query's full set of heads.", nameof(qPositions));
+        }
+
+        for (int p = 0; p < queryCount; p++)
+        {
+            ReadOnlySpan<float> qAtPosition = qPositions.Slice(p * region, region);
+            Span<float> outAtPosition = outConcat.Slice(p * region, region);
+
+            for (int h = 0; h < headCount; h++)
+            {
+                ReadOnlySpan<float> qh = qAtPosition.Slice(h * headDim, headDim);
+                int kvHead = h * kvHeadCount / headCount; // grouped-query mapping: consecutive heads share a kv-head
+                Span<float> outHead = outAtPosition.Slice(h * headDim, headDim);
+
+                float runningMax = float.NegativeInfinity;
+                float sumExp = 0f;
+                outHead.Clear();
+
+                for (int t = fromPosition; t <= toPosition; t++)
+                {
+                    ReadOnlySpan<float> kt = kv.ReadK(t, layer).Slice(kvHead * headDim, headDim);
+                    float score = backend.Dot(qh, kt) * attnScale;
+
+                    if (score > runningMax)
+                    {
+                        // Rescale everything accumulated under the old max so all weights share the new exponent base.
+                        if (!float.IsNegativeInfinity(runningMax))
+                        {
+                            float rescale = MathF.Exp(runningMax - score);
+                            sumExp *= rescale;
+
+                            for (int j = 0; j < headDim; j++)
+                            {
+                                outHead[j] *= rescale;
+                            }
+                        }
+
+                        runningMax = score;
+                    }
+
+                    float weight = MathF.Exp(score - runningMax); // the current max term contributes exactly 1
+                    sumExp += weight;
+
+                    ReadOnlySpan<float> vt = kv.ReadV(t, layer).Slice(kvHead * headDim, headDim);
+                    for (int j = 0; j < headDim; j++)
+                    {
+                        outHead[j] += weight * vt[j];
+                    }
+                }
+
+                float invSum = 1f / sumExp; // >= 1 because the max term contributes exp(0)
+                for (int j = 0; j < headDim; j++)
+                {
+                    outHead[j] *= invSum;
+                }
+            }
+        }
+    }
 }
