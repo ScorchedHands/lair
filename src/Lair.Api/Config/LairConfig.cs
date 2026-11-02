@@ -29,6 +29,9 @@ public sealed record EngineConfig
 
     /// <summary>Fixed weight block size.</summary>
     public int BlockSize { get; init; } = 16;
+
+    /// <summary>Largest prompt chunk the scheduler prefills in one step.</summary>
+    public int MaxBatchTokens { get; init; } = 512;
 }
 
 /// <summary>One served model and how it is placed on the machine.</summary>

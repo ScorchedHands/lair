@@ -233,29 +233,27 @@ public class ApiTests : IClassFixture<ApiFixture>
     }
 
     [Fact]
-    public async Task ConcurrentChat_SecondRequestGets503EngineOverloaded()
+    public async Task ConcurrentChat_RequestsRunTogetherThroughTheBatchScheduler()
     {
-        Task<HttpResponseMessage> firstRequest = PostJsonRawAsync(
+        // The batch scheduler admits both requests instead of holding a single engine slot: the second one
+        // arrives while the first is still generating and completes normally alongside it.
+        Task<(HttpResponseMessage, JsonElement)> first = PostJsonAsync(
             "/v1/chat/completions",
             """{"model":"smollm-test","messages":[{"role":"user","content":"Write a short paragraph about the sea."}],"max_tokens":32,"temperature":0}""");
 
-        // Headers only flush when generation completes, so the unawaited first request holds the engine slot.
         await Task.Delay(250);
 
-        (HttpResponseMessage second, JsonElement body) = await PostJsonAsync(
+        (HttpResponseMessage second, JsonElement secondBody) = await PostJsonAsync(
             "/v1/chat/completions",
             """{"model":"smollm-test","messages":[{"role":"user","content":"hi"}],"max_tokens":4}""");
 
-        Assert.Equal(HttpStatusCode.ServiceUnavailable, second.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, second.StatusCode);
         Assert.True(second.Headers.TryGetValues(ApiApp.RequestIdHeader, out _));
+        Assert.Equal("chat.completion", secondBody.GetProperty("object").GetString());
 
-        JsonElement error = body.GetProperty("error");
-        Assert.Equal("engine_overloaded", error.GetProperty("code").GetString());
-        Assert.Equal("engine_overloaded_error", error.GetProperty("type").GetString());
-
-        using HttpResponseMessage firstResponse = await firstRequest;
+        (HttpResponseMessage firstResponse, JsonElement firstBody) = await first;
         Assert.Equal(HttpStatusCode.OK, firstResponse.StatusCode);
-        Assert.Contains("chat.completion", await firstResponse.Content.ReadAsStringAsync());
+        Assert.Equal("chat.completion", firstBody.GetProperty("object").GetString());
     }
 
     [Fact]

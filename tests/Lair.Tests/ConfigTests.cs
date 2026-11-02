@@ -304,6 +304,39 @@ public sealed class ConfigTests : IDisposable
     }
 
     [Fact]
+    public void Load_MaxBatchTokens_DefaultsValidatesAndRejects()
+    {
+        LairConfig defaulted = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """));
+        Assert.Equal(512, defaulted.Engine.MaxBatchTokens);
+
+        LairConfig configured = YamlConfigLoader.Load(WriteConfig($"""
+            engine:
+              max_batch_tokens: 256
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """));
+        Assert.Equal(256, configured.Engine.MaxBatchTokens);
+
+        foreach (int invalid in new[] { 0, -3 })
+        {
+            ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+                engine:
+                  max_batch_tokens: {invalid}
+                models:
+                  - name: qwen-test
+                    path: '{TempModelFile()}'
+                """)));
+            Assert.Contains($"engine.max_batch_tokens {invalid}", error.Message);
+            Assert.Contains("'max_batch_tokens' must be 1 or greater", error.Message);
+        }
+    }
+
+    [Fact]
     public void Load_UnknownKeys_NamedWithAllowedKeysAtThatLevel()
     {
         string modelPath = TempModelFile();
@@ -326,7 +359,7 @@ public sealed class ConfigTests : IDisposable
                 "engine:\n  thread: 8\nmodels:\n  - name: qwen-test\n    path: '" + modelPath + "'\n",
                 "thread",
                 "'engine'",
-                "threads, block_size"
+                "threads, block_size, max_batch_tokens"
             ),
             (
                 "models:\n  - name: qwen-test\n    path: '" + modelPath + "'\n    context: 4096\n",

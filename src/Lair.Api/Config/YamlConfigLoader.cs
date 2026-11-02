@@ -15,7 +15,7 @@ public static class YamlConfigLoader
 
     private static readonly string[] TopLevelKeys = ["server", "engine", "models"];
     private static readonly string[] ServerKeys = ["bind", "port"];
-    private static readonly string[] EngineKeys = ["threads", "block_size"];
+    private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens"];
     private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set"];
 
@@ -119,7 +119,13 @@ public static class YamlConfigLoader
             throw new ConfigException($"engine.block_size {blockSize} is invalid: block size is fixed to 16 in this build.");
         }
 
-        return new EngineConfig { Threads = threads, BlockSize = blockSize };
+        int maxBatchTokens = TryInteger(keys, "max_batch_tokens", "engine.max_batch_tokens") ?? 512;
+        if (maxBatchTokens < 1)
+        {
+            throw new ConfigException($"engine.max_batch_tokens {maxBatchTokens} is invalid: 'max_batch_tokens' must be 1 or greater.");
+        }
+
+        return new EngineConfig { Threads = threads, BlockSize = blockSize, MaxBatchTokens = maxBatchTokens };
     }
 
     private static IReadOnlyList<ModelConfig> ParseModels(Dictionary<string, YamlNode> top)

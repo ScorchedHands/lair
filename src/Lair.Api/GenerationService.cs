@@ -3,6 +3,7 @@ using Lair.Host.Config;
 using Lair.Kv;
 using Lair.Loader;
 using Lair.Models.Engine;
+using Lair.Models.Scheduling;
 using Lair.Sampling;
 using Lair.Tokenizer;
 using Lair.Tokenizer.Templating;
@@ -11,8 +12,10 @@ namespace Lair.Api;
 
 /// <summary>
 /// Single-model generation facade: opens one configured GGUF model (weights, forward engine, tokenizer,
-/// chat template, paged KV pool) and runs <see cref="GenerationRequest"/>s against it. The engine forwards
-/// one sequence at a time; a second concurrent request fails immediately with <see cref="EngineBusyException"/>.
+/// chat template, paged KV pool) and runs <see cref="GenerationRequest"/>s against it. Requests are admitted
+/// to a continuous-batching scheduler, so admitted sequences decode together in shared steps and a long
+/// prompt never blocks shorter ones. A request is refused with <see cref="EngineBusyException"/> only when
+/// the KV pool cannot back its prompt plus token budget.
 /// </summary>
 public sealed class GenerationService : IDisposable
 {
@@ -22,9 +25,7 @@ public sealed class GenerationService : IDisposable
     private readonly GgufTokenizer _tokenizer;
     private readonly ChatTemplateRenderer? _chatTemplate;
     private readonly BlockPool _pool;
-
-    // 0 = idle, 1 = a generation is in flight.
-    private int _inFlight;
+    private readonly GenerationScheduler _scheduler;
 
     private bool _disposed;
 
@@ -35,6 +36,7 @@ public sealed class GenerationService : IDisposable
         GgufTokenizer tokenizer,
         ChatTemplateRenderer? chatTemplate,
         BlockPool pool,
+        GenerationScheduler scheduler,
         ModelInfo info)
     {
         _file = file;
@@ -43,6 +45,7 @@ public sealed class GenerationService : IDisposable
         _tokenizer = tokenizer;
         _chatTemplate = chatTemplate;
         _pool = pool;
+        _scheduler = scheduler;
         Model = info;
     }
 
@@ -51,8 +54,9 @@ public sealed class GenerationService : IDisposable
 
     /// <summary>
     /// Opens the first model declared in the configuration: GGUF container, mmap-backed weights through the
-    /// forward engine, tokenizer, chat template, and a KV pool sized by the model entry. The effective context
-    /// is the smaller of the configured max context and the token slots the KV pool can hold.
+    /// forward engine, tokenizer, chat template, a KV pool sized by the model entry, and the batch scheduler
+    /// over them. The effective context is the smaller of the configured max context and the token slots the
+    /// KV pool can hold.
     /// </summary>
     public static GenerationService Open(LairConfig config)
     {
@@ -73,6 +77,7 @@ public sealed class GenerationService : IDisposable
         GgufFile? file = null;
         TransformerModel? model = null;
         BlockPool? pool = null;
+        GenerationScheduler? scheduler = null;
         try
         {
             file = GgufFile.Open(modelConfig.Path);
@@ -86,6 +91,8 @@ public sealed class GenerationService : IDisposable
                 modelConfig.KvBlocks,
                 backend);
 
+            scheduler = new GenerationScheduler(model, pool, config.Engine.MaxBatchTokens);
+
             ChatTemplateRenderer? chatTemplate = file.Metadata.ChatTemplate is string source
                 ? ChatTemplateRenderer.Parse(source)
                 : null;
@@ -98,14 +105,16 @@ public sealed class GenerationService : IDisposable
                 model.Desc.Architecture,
                 model.Desc.VocabSize);
 
-            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, pool, info);
+            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, pool, scheduler, info);
             file = null;
             model = null;
             pool = null;
+            scheduler = null;
             return service;
         }
         catch
         {
+            scheduler?.Dispose();
             pool?.Dispose();
             model?.Dispose();
             file?.Dispose();
@@ -115,8 +124,9 @@ public sealed class GenerationService : IDisposable
     }
 
     /// <summary>
-    /// Runs one generation to completion. The prompt is tokenized, prefilled, then decoded token by token
-    /// until eos, the token budget, or a stop string. Cancellation surfaces as <see cref="OperationCanceledException"/>.
+    /// Runs one generation to completion through the batch scheduler. The prompt is tokenized, prefilled in
+    /// chunks, then decoded in shared steps until eos, the token budget, or a stop string. Cancellation
+    /// surfaces as <see cref="OperationCanceledException"/>.
     /// </summary>
     public async Task<GenerationResult> GenerateAsync(GenerationRequest request, CancellationToken cancellationToken)
     {
@@ -128,41 +138,6 @@ public sealed class GenerationService : IDisposable
             throw new ModelNotFoundException(request.Model);
         }
 
-        if (Interlocked.CompareExchange(ref _inFlight, 1, 0) != 0)
-        {
-            throw new EngineBusyException();
-        }
-
-        try
-        {
-            return await Task.Run(() => Generate(request, cancellationToken), CancellationToken.None)
-                .ConfigureAwait(false);
-        }
-        finally
-        {
-            Volatile.Write(ref _inFlight, 0);
-        }
-    }
-
-    public void Dispose()
-    {
-        if (_disposed)
-        {
-            return;
-        }
-
-        _disposed = true;
-
-        // SequenceKv instances hand out of the pool, so the pool must outlive them; the forward engine's
-        // mmap view must be released before the file handle it maps.
-        _pool.Dispose();
-        _model.Dispose();
-        _file.Dispose();
-        _backend.Dispose();
-    }
-
-    private GenerationResult Generate(GenerationRequest request, CancellationToken cancellationToken)
-    {
         cancellationToken.ThrowIfCancellationRequested();
 
         IReadOnlyList<int> prompt = request.IsChat
@@ -174,45 +149,39 @@ public sealed class GenerationService : IDisposable
             throw new ContextLengthExceededException(prompt.Count, Model.ContextLength);
         }
 
-        Sampler sampler = new(new SamplingParams
-        {
-            Temperature = request.Temperature,
-            TopK = request.TopK,
-            TopP = request.TopP,
-            Seed = request.Seed,
-        });
-
-        string finishReason = "length";
-        List<int> generated = [];
-        string streamed = string.Empty;
-        List<string> pieces = [];
-        int decodedChars = 0;
-
-        using SequenceKv kv = new(_pool);
-        _model.Prefill(prompt, kv);
-
         int maxTokens = Math.Min(request.MaxTokens, Model.ContextLength - prompt.Count);
-
-        // Prefill already forwarded the final prompt token: its logits are the first next-token distribution.
-        ReadOnlySpan<float> logits = _model.LastLogits();
-        for (int i = 0; i < maxTokens; i++)
+        if (maxTokens <= 0)
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            // The clamp left no budget: the sequence generates nothing and reports the budget as spent.
+            return new GenerationResult(string.Empty, prompt.Count, 0, "length");
+        }
 
-            int token = sampler.Sample(logits);
+        List<string> pieces = [];
+        string streamed = string.Empty;
+        int decodedChars = 0;
+        bool stopped = false;
+        SequenceHandle? handle = null;
 
-            if (token == _tokenizer.EosId)
+        ScheduledRequest scheduled = new()
+        {
+            PromptTokens = [.. prompt],
+            MaxTokens = maxTokens,
+            Sampling = new SamplingParams
             {
-                finishReason = "eos";
-                break; // eos ends the turn and is never forwarded into the sequence.
-            }
-
-            generated.Add(token);
-            logits = _model.DecodeNext(token, kv);
-
-            string piece = _tokenizer.Decode([token]);
-            if (piece.Length > 0)
+                Temperature = request.Temperature,
+                TopK = request.TopK,
+                TopP = request.TopP,
+                Seed = request.Seed,
+            },
+            EosId = _tokenizer.EosId,
+            OnTokenId = tokenId =>
             {
+                string piece = _tokenizer.Decode([tokenId]);
+                if (piece.Length == 0)
+                {
+                    return;
+                }
+
                 pieces.Add(piece);
                 if (request.Stream && request.OnToken is not null)
                 {
@@ -225,21 +194,84 @@ public sealed class GenerationService : IDisposable
                 {
                     // The stop literal is already streamed; trim it out of the final text below.
                     decodedChars = stopIndex;
-                    finishReason = "stop";
-                    break;
+                    stopped = true;
+                    handle?.Cancel();
                 }
+            },
+        };
 
-                decodedChars = streamed.Length;
-            }
-        }
-
-        string text = _tokenizer.Decode(generated, includeSpecial: false);
-        if (finishReason == "stop")
+        try
         {
-            text = text[..Math.Min(decodedChars, text.Length)];
+            handle = _scheduler.Submit(scheduled, cancellationToken);
+        }
+        catch (SchedulerFullException)
+        {
+            // The scheduler's capacity vocabulary is an engine-busy condition at this facade: surface it as the
+            // API-level EngineBusyException rather than leaking a scheduling type to callers.
+            throw new EngineBusyException();
         }
 
-        return new GenerationResult(text, prompt.Count, generated.Count, finishReason);
+        SequenceOutcome outcome;
+        try
+        {
+            outcome = await handle.Completion.ConfigureAwait(false);
+        }
+        finally
+        {
+            // Safety net: a sequence that is still running when this call is interrupted must not hold its blocks.
+            handle.Cancel();
+        }
+
+        if (stopped)
+        {
+            string text = _tokenizer.Decode(outcome.GeneratedTokens, includeSpecial: false);
+            return new GenerationResult(
+                text[..Math.Min(decodedChars, text.Length)],
+                outcome.PromptTokens,
+                outcome.CompletionTokens,
+                "stop");
+        }
+
+        switch (outcome.FinishReason)
+        {
+            case FinishReason.Failed:
+                throw new EngineBusyException();
+
+            case FinishReason.Canceled:
+                throw new OperationCanceledException(cancellationToken);
+
+            case FinishReason.Eos:
+                return new GenerationResult(
+                    _tokenizer.Decode(outcome.GeneratedTokens, includeSpecial: false),
+                    outcome.PromptTokens,
+                    outcome.CompletionTokens,
+                    "eos");
+
+            default:
+                return new GenerationResult(
+                    _tokenizer.Decode(outcome.GeneratedTokens, includeSpecial: false),
+                    outcome.PromptTokens,
+                    outcome.CompletionTokens,
+                    "length");
+        }
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+
+        // The scheduler releases every sequence's blocks before the pool they belong to goes away; the forward
+        // engine's mmap view must be released before the file handle it maps.
+        _scheduler.Dispose();
+        _pool.Dispose();
+        _model.Dispose();
+        _file.Dispose();
+        _backend.Dispose();
     }
 
     private IReadOnlyList<int> EncodeChat(GenerationRequest request)

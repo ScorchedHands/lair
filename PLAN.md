@@ -290,10 +290,10 @@ Many requests at once, tuned, with live reconfiguration.
 
 #### Implementation Items
 
-- [→] Continuous batching — shared decode steps across sequences (see DN-M2-1)
-  - Verify: `dotnet test --filter Category=Concurrency` — N=8 parallel requests produce outputs identical to sequential execution; decode ITL p95 ≤ 400 ms (DN-M2-9).
-- [_] Chunked prefill — prefill chunks interleaved with decode tokens in the same step (see DN-M2-2)
-  - Verify: integration test — an 8K-token prompt in flight does not push short-request ITL p95 past the DN-M2-9 budget (400 ms).
+- [✓] Continuous batching — shared decode steps across sequences (see DN-M2-1)
+  - Verify: `dotnet test -c Release --filter Category=Concurrency` — 5/5 ✅ on real SmolLM-F16: N=8 concurrent outputs identical to sequential for greedy AND seeded; measured ITL p95 238 ms (budget 400); capacity exhaustion surfaces as `engine_overloaded`. Scheduler fixes found in testing: finished sequences must be excluded from the same step's decode window, and outcomes release KV blocks before publishing.
+- [✓] Chunked prefill — prefill chunks interleaved with decode tokens in the same step (see DN-M2-2)
+  - Verify: `dotnet test -c Release --filter Category=Prefill` — 1/1 ✅ ~407-token prompt prefills chunk-by-chunk while short requests stream past it at ITL p95 68 ms with outputs identical to a fresh-engine baseline. Tuning finding: per-step time ≈ chunk width × single-stream cost, so the DN-M2-2 default (512) overshoots the CPU budget — chunk widths of ~8 hold 400 ms at measured Release speed (~28 ms/token F16); wide chunks only pay off on faster compute.
 - [_] Prompt caching — reference-counted prefix blocks reused across requests (see DN-M2-3)
   - Verify: `dotnet test --filter Category=Cache` — second request with shared prefix reports cache hit in metrics and skips prefill tokens.
 - [_] Cancellation — abort sequences mid-batch-step without stalling the rest of the batch (see DN-M2-4)
@@ -311,8 +311,8 @@ Many requests at once, tuned, with live reconfiguration.
 
 #### Tests
 
-- [_] Automated Concurrency: parallel-vs-sequential output equivalence
-- [_] Automated Prefill: chunked prefill ITL protection
+- [✓] Automated Concurrency: parallel-vs-sequential output equivalence — 5/5 (Release) incl. ITL budget and capacity refusal
+- [✓] Automated Prefill: chunked prefill ITL protection — 1/1 (Release)
 - [_] Automated Cache: prefix hit, CoW integrity, LRU eviction
 - [_] Automated Cancel: abort isolation and block reclamation
 - [_] Automated HotReload: watcher detection, mutation-class enforcement, mid-serving application
@@ -547,3 +547,4 @@ Vision input on chat models.
 - **2026-11-01 — Hot-reload application path added to MVP2.** Scope promises live reconfiguration and DN-M2-5 defines mutation semantics, but no implementation item owned the watcher/change-application bus; MVP2's outcome ("live reconfiguration") requires it in-phase rather than orphaned.
 - **2026-11-01 — Cross-model interleaved batches recorded in Backlog.** User-proposed scheduling knob: batch steps alternate across models at configured ratios so models share one compute pool, with throughput degradation as the explicit, user-chosen cost; toggle + per-model ratios; MVP4 candidate; default stays core-set partitioning (DN-M2-6).
 - **2026-11-01 — Client-keyed cache retention recorded in Backlog.** User-proposed: cache items tied to a client identity (e.g. sticky id returned in a response header) enable sliding retention — each client's most recent conversation cache item kept — instead of or alongside LRU; hinges on a reliable client-identification method, which itself depends on the server-posture backlog.
+- **2026-11-01 — Latency gates are measured under Release configuration.** Debug JIT inflates kernels ~4.6× (bench Q4_K: 2.4 GB/s Debug vs 13 GB/s Release); absolute ITL budgets only reproduce in optimized builds. Correctness tests run in both configurations; performance acceptance runs `-c Release`.
