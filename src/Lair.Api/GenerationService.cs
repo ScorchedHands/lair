@@ -54,9 +54,10 @@ public sealed class GenerationService : IDisposable
 
     /// <summary>
     /// Opens the first model declared in the configuration: GGUF container, mmap-backed weights through the
-    /// forward engine, tokenizer, chat template, a KV pool sized by the model entry, and the batch scheduler
-    /// over them. The effective context is the smaller of the configured max context and the token slots the
-    /// KV pool can hold.
+    /// forward engine, tokenizer, chat template, a KV pool sized by the model entry, a prefix cache over that pool,
+    /// and the batch scheduler over them. The prefix cache lives exactly as long as the pool, so each opened
+    /// service starts with an empty cache. The effective context is the smaller of the configured max context and
+    /// the token slots the KV pool can hold.
     /// </summary>
     public static GenerationService Open(LairConfig config)
     {
@@ -91,7 +92,7 @@ public sealed class GenerationService : IDisposable
                 modelConfig.KvBlocks,
                 backend);
 
-            scheduler = new GenerationScheduler(model, pool, config.Engine.MaxBatchTokens);
+            scheduler = new GenerationScheduler(model, pool, config.Engine.MaxBatchTokens, new PrefixCache(pool));
 
             ChatTemplateRenderer? chatTemplate = file.Metadata.ChatTemplate is string source
                 ? ChatTemplateRenderer.Parse(source)
@@ -124,9 +125,11 @@ public sealed class GenerationService : IDisposable
     }
 
     /// <summary>
-    /// Runs one generation to completion through the batch scheduler. The prompt is tokenized, prefilled in
-    /// chunks, then decoded in shared steps until eos, the token budget, or a stop string. Cancellation
-    /// surfaces as <see cref="OperationCanceledException"/>.
+    /// Runs one generation to completion through the batch scheduler. The prompt is tokenized, prefilled in chunks,
+    /// then decoded in shared steps until eos, the token budget, or a stop string. Prompt prefixes already computed by
+    /// earlier requests are adopted from the prefix cache instead of recomputed, and the adopted token count is
+    /// reported on the result as <see cref="GenerationResult.CachedPromptTokens"/>. Cancellation surfaces as
+    /// <see cref="OperationCanceledException"/>.
     /// </summary>
     public async Task<GenerationResult> GenerateAsync(GenerationRequest request, CancellationToken cancellationToken)
     {
@@ -229,7 +232,8 @@ public sealed class GenerationService : IDisposable
                 text[..Math.Min(decodedChars, text.Length)],
                 outcome.PromptTokens,
                 outcome.CompletionTokens,
-                "stop");
+                "stop",
+                outcome.PrefillCachedTokens);
         }
 
         switch (outcome.FinishReason)
@@ -245,14 +249,16 @@ public sealed class GenerationService : IDisposable
                     _tokenizer.Decode(outcome.GeneratedTokens, includeSpecial: false),
                     outcome.PromptTokens,
                     outcome.CompletionTokens,
-                    "eos");
+                    "eos",
+                    outcome.PrefillCachedTokens);
 
             default:
                 return new GenerationResult(
                     _tokenizer.Decode(outcome.GeneratedTokens, includeSpecial: false),
                     outcome.PromptTokens,
                     outcome.CompletionTokens,
-                    "length");
+                    "length",
+                    outcome.PrefillCachedTokens);
         }
     }
 

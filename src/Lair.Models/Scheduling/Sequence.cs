@@ -41,6 +41,9 @@ internal sealed class Sequence
     /// <summary>Prompt tokens forwarded so far; the sequence prefills while this is below the prompt length.</summary>
     public int PromptOffset;
 
+    /// <summary>Prompt tokens whose blocks were adopted from the prefix cache instead of prefilled; set once at admission.</summary>
+    public int PrefillCachedTokens;
+
     /// <summary>The sampled token awaiting its next decode step; valid once decoding starts.</summary>
     public int PendingToken;
 

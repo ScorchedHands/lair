@@ -294,8 +294,8 @@ Many requests at once, tuned, with live reconfiguration.
   - Verify: `dotnet test -c Release --filter Category=Concurrency` — 5/5 ✅ on real SmolLM-F16: N=8 concurrent outputs identical to sequential for greedy AND seeded; measured ITL p95 238 ms (budget 400); capacity exhaustion surfaces as `engine_overloaded`. Scheduler fixes found in testing: finished sequences must be excluded from the same step's decode window, and outcomes release KV blocks before publishing.
 - [✓] Chunked prefill — prefill chunks interleaved with decode tokens in the same step (see DN-M2-2)
   - Verify: `dotnet test -c Release --filter Category=Prefill` — 1/1 ✅ ~407-token prompt prefills chunk-by-chunk while short requests stream past it at ITL p95 68 ms with outputs identical to a fresh-engine baseline. Tuning finding: per-step time ≈ chunk width × single-stream cost, so the DN-M2-2 default (512) overshoots the CPU budget — chunk widths of ~8 hold 400 ms at measured Release speed (~28 ms/token F16); wide chunks only pay off on faster compute.
-- [_] Prompt caching — reference-counted prefix blocks reused across requests (see DN-M2-3)
-  - Verify: `dotnet test --filter Category=Cache` — second request with shared prefix reports cache hit in metrics and skips prefill tokens.
+- [✓] Prompt caching — reference-counted prefix blocks reused across requests (see DN-M2-3)
+  - Verify: `dotnet test -c Release --filter Category=Cache` — 6/6 ✅ on real SmolLM-F16: shared 127-token prefix → second request skips 112 prefill tokens with byte-identical output vs cold run; CoW copy verified bit-safe for the original sequence; LRU eviction never touches blocks referenced by active sequences; refcount release ordering tested. Cache lifetime = pool lifetime (covers reload/quant/block-size invalidation this phase).
 - [_] Cancellation — abort sequences mid-batch-step without stalling the rest of the batch (see DN-M2-4)
   - Verify: integration test — aborted request frees its blocks; other requests complete unchanged.
 - [_] API completeness — tool calls, logprobs, penalties, `logit_bias`, seed (see DN-M2-8)
@@ -313,7 +313,7 @@ Many requests at once, tuned, with live reconfiguration.
 
 - [✓] Automated Concurrency: parallel-vs-sequential output equivalence — 5/5 (Release) incl. ITL budget and capacity refusal
 - [✓] Automated Prefill: chunked prefill ITL protection — 1/1 (Release)
-- [_] Automated Cache: prefix hit, CoW integrity, LRU eviction
+- [✓] Automated Cache: prefix hit, CoW integrity, LRU eviction — 6/6 (Release)
 - [_] Automated Cancel: abort isolation and block reclamation
 - [_] Automated HotReload: watcher detection, mutation-class enforcement, mid-serving application
 - [_] Automated API: tool calls, logprobs, penalties, seed reproducibility via SDK scripts

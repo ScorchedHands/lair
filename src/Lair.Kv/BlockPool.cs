@@ -180,7 +180,11 @@ public sealed class BlockPool : IDisposable
     }
 
     /// <summary>The whole payload of one physical block as a span over the arena.</summary>
-    public unsafe ReadOnlySpan<float> BlockView(int physicalBlockId)
+    public unsafe ReadOnlySpan<float> BlockView(int physicalBlockId) => MutableBlockSpan(physicalBlockId);
+
+    // Writable twin of the block view: reserved for in-pool copies such as SequenceKv's copy-on-write, which must
+    // move a shared block's whole payload into a freshly allocated private block.
+    internal unsafe Span<float> MutableBlockSpan(int physicalBlockId)
     {
         ThrowIfDisposed();
         ValidateBlockId(physicalBlockId);
