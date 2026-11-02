@@ -82,6 +82,10 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     // Stream frames dropped at subscriber queues since open (slow consumers); surfaced on every snapshot.
     private long _droppedEvents;
 
+    // Model facts attached by the owning service; null until then, so snapshots carry nulls in those slots — the
+    // v1 shape untouched. Re-pushed on hot reload when a live-applied field changes them (worker quota today).
+    private ModelFacts? _modelFacts;
+
     private readonly List<MonitorSubscription> _subscriptions = [];
     private long _subscriptionSeq;
 
@@ -239,6 +243,16 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(provider);
         Volatile.Write(ref _inFlightProvider, provider);
+    }
+
+    /// <summary>
+    /// Attaches — or re-places, e.g. after a hot reload moved worker participation — the configuration and backend
+    /// facts embedded additively in every snapshot from now on. One volatile record swap; sampling reads it once per tick.
+    /// </summary>
+    public void AttachModelFacts(ModelFacts facts)
+    {
+        ArgumentNullException.ThrowIfNull(facts);
+        Volatile.Write(ref _modelFacts, facts);
     }
 
     /// <summary>
@@ -423,6 +437,7 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     private void PublishSnapshot(EngineSample current, long nowMs)
     {
         double windowMs = Math.Max(1, nowMs - _previous.TimestampMs);
+        ModelFacts? facts = Volatile.Read(ref _modelFacts);
 
         long decodeDelta = current.DecodeTokensAdvanced - _previous.DecodeTokensAdvanced;
         long stepsDelta = current.DecodeSteps - _previous.DecodeSteps;
@@ -462,7 +477,20 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 ProcessCpuPercent: windowMs > 0 ? Math.Round(cpuMs / windowMs * 100.0, 2) : 0.0,
                 EventsVersion: MonitorEventSchema.Version,
                 EventSeq: _eventSeq + 1, // the id this snapshot is about to take — embedded so payloads and SSE frames agree
-                DroppedEventsTotal: Volatile.Read(ref _droppedEvents));
+                DroppedEventsTotal: Volatile.Read(ref _droppedEvents),
+
+                // Additive operator-view fields (v1 shape untouched): pool geometry always known here; identity and
+                // placement ride along only once the owning service has attached facts.
+                ModelType: facts?.Type,
+                KvBlockTokens: _pool.BlockTokens,
+                KvBudgetBlocks: _pool.EffectiveBudgetBlocks,
+                KvPoolMb: Math.Round(_pool.BytesPerBlock * (double)_pool.CapacityBlocks / (1024.0 * 1024.0), 1),
+                WorkerThreads: facts?.WorkerThreads,
+                CoreSet: facts?.CoreSet,
+                ThreadQuota: facts?.ThreadQuota,
+                DecodeDevice: facts?.DecodeDevice,
+                PrefillDevice: facts?.PrefillDevice,
+                KvResidency: facts?.KvResidency);
 
             long id = ++_eventSeq;
             frame = new MonitorFrame(id, MonitorEventNames.Snapshot, snapshot.ToJson());

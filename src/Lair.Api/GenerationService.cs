@@ -96,13 +96,58 @@ public sealed class GenerationService : IDisposable
         PrefixCache? cache = _cacheForMetrics;
         EngineMetricsBus bus = new(Model.Id, _scheduler, _pool, cache, loggerFactory, interval);
 
-        // The monitor's request-side state starts from the configuration in force: the recent-request ring capacity
-        // and the live in-flight views a resync can dump.
+        // The monitor's request-side state starts from the configuration in force: the recent-request ring capacity,
+        // the live in-flight views a resync can dump, and the model facts snapshots carry additively.
         bus.SetRecentRequestCapacity(_current.Ui.RecentRequests);
         bus.AttachInFlightProvider(InFlightRequestViews);
+        bus.AttachModelFacts(BuildMonitorFacts(_current));
 
         _metrics = bus;
         return bus;
+    }
+
+    // Snapshot identity/placement facts straight from the configuration in force plus the backend's live worker count.
+    private ModelFacts BuildMonitorFacts(LairConfig config) => new(
+        config.Models[0].Type,
+        _backend.EffectiveWorkerCount,
+        FormatCoreSet(config.Models[0].Placement.CoreSet),
+        config.Models[0].Placement.ThreadQuota,
+        config.Models[0].Placement.Device,
+        config.Models[0].Placement.Prefill,
+        config.Models[0].Placement.KvResidency);
+
+    // Pinned core ids as compressed ranges ("0-23", "1, 4-6"); null when nothing is pinned.
+    private static string? FormatCoreSet(IReadOnlySet<int> cores)
+    {
+        if (cores.Count == 0)
+        {
+            return null;
+        }
+
+        int[] sorted = [.. cores];
+        Array.Sort(sorted);
+
+        List<string> ranges = [];
+        int runStart = sorted[0];
+        int previous = sorted[0];
+        for (int i = 1; i <= sorted.Length; i++)
+        {
+            if (i == sorted.Length || sorted[i] != previous + 1)
+            {
+                ranges.Add(runStart == previous ? runStart.ToString() : $"{runStart}-{previous}");
+                if (i < sorted.Length)
+                {
+                    runStart = sorted[i];
+                    previous = sorted[i];
+                }
+            }
+            else
+            {
+                previous = sorted[i];
+            }
+        }
+
+        return string.Join(", ", ranges);
     }
 
     // Current in-flight request views for a resync: volatile reads off each tracker, ordered by id so repeated
@@ -222,6 +267,15 @@ public sealed class GenerationService : IDisposable
             }
 
             _current = effective;
+
+            // Snapshots must speak the configuration in force: re-push model facts after every apply so additive
+            // snapshot fields (worker threads, quota) track live-applied changes without waiting for a new tick's config.
+            EngineMetricsBus? metricsForFacts = _metrics;
+            if (metricsForFacts is not null)
+            {
+                metricsForFacts.AttachModelFacts(BuildMonitorFacts(effective));
+            }
+
             return results;
         }
     }

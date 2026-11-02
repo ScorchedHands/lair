@@ -1,11 +1,8 @@
 import { useState } from "react";
-import type { ModelRowData } from "../../data/placeholder";
-import { models } from "../../data/placeholder";
+import type { ModelRowView } from "../../monitor/live";
 
-export function ModelsTable() {
-  const [expanded, setExpanded] = useState<Record<string, boolean>>(() =>
-    Object.fromEntries(models.map((model) => [model.id, model.expandedByDefault])),
-  );
+export function ModelsTable({ models }: { models: ModelRowView[] }) {
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
 
   return (
     <section className="block">
@@ -26,7 +23,12 @@ export function ModelsTable() {
         </thead>
         <tbody>
           {models.map((model) => (
-            <ModelRows key={model.id} model={model} open={expanded[model.id] === true} onToggle={() => setExpanded((current) => ({ ...current, [model.id]: !(current[model.id] === true) }))} />
+            <ModelRows
+              key={model.id}
+              model={model}
+              open={expanded[model.id] ?? model.expandedByDefault}
+              onToggle={() => setExpanded((current) => ({ ...current, [model.id]: !(current[model.id] ?? model.expandedByDefault) }))}
+            />
           ))}
         </tbody>
       </table>
@@ -35,7 +37,7 @@ export function ModelsTable() {
 }
 
 interface ModelRowsProps {
-  model: ModelRowData;
+  model: ModelRowView;
   open: boolean;
   onToggle: () => void;
 }

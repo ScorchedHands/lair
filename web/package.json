@@ -9,7 +9,8 @@
   },
   "scripts": {
     "build": "tsc --noEmit && esbuild src/main.tsx --bundle --minify --sourcemap --outdir=dist --entry-names=app && tailwindcss -i src/app.css -o dist/app.css --minify && node scripts/copy-index.mjs",
-    "watch": "node scripts/watch.mjs"
+    "watch": "node scripts/watch.mjs",
+    "smoke": "node scripts/smoke-monitor.mjs"
   },
   "dependencies": {
     "react": "19.3.1",
@@ -20,6 +21,7 @@
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "esbuild": "0.28.2",
+    "jsdom": "^29.1.1",
     "tailwindcss": "4.3.3",
     "typescript": "7.0.2"
   }

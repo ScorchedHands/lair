@@ -1,7 +1,7 @@
-import { inFlightRows } from "../../data/placeholder";
+import type { InFlightRowView } from "../../monitor/live";
 import { Sparkline } from "./Sparkline";
 
-export function InFlightTable() {
+export function InFlightTable({ rows }: { rows: InFlightRowView[] }) {
   return (
     <section className="block">
       <h2>In-flight requests</h2>
@@ -21,7 +21,7 @@ export function InFlightTable() {
           </tr>
         </thead>
         <tbody>
-          {inFlightRows.map((row) => (
+          {rows.map((row) => (
             <tr key={row.id}>
               <td>{row.id}</td>
               <td>{row.model}</td>

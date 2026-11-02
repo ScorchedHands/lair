@@ -100,6 +100,8 @@ header.app .badge {
   background: rgba(124, 199, 168, 0.15);
   color: var(--accent-2);
 }
+header.app .badge.reconnect { background: rgba(217, 164, 65, 0.15); color: var(--warn); }
+header.app .badge.down { background: rgba(217, 106, 106, 0.15); color: var(--err); }
 header.app select {
   background: var(--panel-2);
   color: var(--text);

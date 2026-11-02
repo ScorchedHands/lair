@@ -1,7 +1,7 @@
-import { recentRows } from "../../data/placeholder";
+import type { RecentRowView } from "../../monitor/live";
 import { Sparkline } from "./Sparkline";
 
-export function RecentTable() {
+export function RecentTable({ rows }: { rows: RecentRowView[] }) {
   return (
     <section className="block">
       <h2>Recent requests (X = 5, configurable)</h2>
@@ -19,7 +19,7 @@ export function RecentTable() {
           </tr>
         </thead>
         <tbody>
-          {recentRows.map((row) => (
+          {rows.map((row) => (
             <tr key={row.id}>
               <td>{row.id}</td>
               <td>{row.model}</td>
