@@ -60,7 +60,7 @@ graph TD
 
 ### Decisions
 
-**Backend seam** — all compute behind `IBackend`; `CpuBackend` default, `CudaBackend` arrives MVP3 but the contract exists in MVP1.
+**Backend seam** — all compute behind `IBackend`; `CpuBackend` default, `CudaBackend` arrives MVP4 but the contract exists in MVP1.
 - Rationale: dotLLM proves native C# kernels reach 66–88% of llama.cpp on decode; retrofitting a backend abstraction after the fact is costly.
 - Rejected: wrapping llama.cpp wholesale (LAIR is a runtime, not bindings).
 - Contract: op dispatch + tensor arena handles per device.
@@ -279,7 +279,7 @@ Many requests at once, tuned, with live reconfiguration.
 - **DN-M2-6** — Core-set affinity: models pinned to disjoint NUMA-local core sets; requests inherit their model's set.
   - Rationale: partition unit is the model; per-request core splitting duplicates weight streaming inside shared batch steps.
   - Contract: scheduler + thread pool configuration.
-- **DN-M2-7** — Metrics bus: engine counters (tok/s per model, step time, batch occupancy, cache hit rate, KV utilization) plus OS counters into an in-memory ring and JSON logs; CLI monitor consumes it now, MVP4's Web UI consumes the same bus later.
+- **DN-M2-7** — Metrics bus: engine counters (tok/s per model, step time, batch occupancy, cache hit rate, KV utilization) plus OS counters into an in-memory ring and JSON logs; CLI monitor consumes it now, MVP3's Web UI consumes the same bus later.
   - Contract: `lair.monitor` metrics bus.
 - **DN-M2-8** — Tool calls: per-family tool schema injection into the chat template; `tool_calls` parsed from streamed output; tool execution stays client-side.
   - Rationale: coding-agent compatibility (Strata's whole tool story) requires the wire contract, not execution.
@@ -309,7 +309,7 @@ Many requests at once, tuned, with live reconfiguration.
 - [✓] Metrics bus — engine counters + OS/driver stats streamed to logs and CLI monitor (see DN-M2-7)
   - Verify: `dotnet test -c Release --filter Category=Metrics` — 5/5 ✅ step-boundary counters (tok/s, step time, occupancy, prefill chunks/tokens, cache hits + skipped tokens, KV utilization, finish-reason tallies) ride the scheduler regardless of consumers; ring-bounded snapshots published only while active (`metrics_snapshot={…}` JSON lines alongside unchanged request logs); `/monitor/stream` SSE live-verified; `lair monitor [-u URL] [--interval ms]` renders a live table, clean Ctrl+C. Process working-set + CPU% included; hardware telemetry deferred per DN-M2-7 contract note.
 - [✓] Embeddings groundwork — encoder-only forward pass, no endpoint yet
-  - Verify: `dotnet test -c Release --filter Category=Embeddings` — 8/8 ✅ two-layer synthetic GGUF (tied head lets tests replay logits from Encode rows) + real SmolLM-F16 cases; sequential one-token encodes match incremental decode bit-for-bit while full-window encoding legitimately diverges at earlier positions — bidirectional wiring proven distinct from causal at op and run level. Mean/CLS pooling with L2 normalize (double accumulation). Endpoint deferred to the embeddings phase per DN-M4-3.
+  - Verify: `dotnet test -c Release --filter Category=Embeddings` — 8/8 ✅ two-layer synthetic GGUF (tied head lets tests replay logits from Encode rows) + real SmolLM-F16 cases; sequential one-token encodes match incremental decode bit-for-bit while full-window encoding legitimately diverges at earlier positions — bidirectional wiring proven distinct from causal at op and run level. Mean/CLS pooling with L2 normalize (double accumulation). Endpoint deferred to the embeddings phase per DN-M5-3.
 - [✓] Thread pools — sized to memory channels, per-model quotas, core-set affinity (see DN-M2-6)
   - Verify: `dotnet test --filter Category=Affinity` — 4/4 ✅ pinned workers land inside the configured core set across ≥100 sampled job executions (`SetThreadAffinityMask`, re-applied on wake; documented no-op + startup warning off-Windows); physical-core auto-sizing (SMT siblings excluded via `GetLogicalProcessorInformationEx`; i9-13900K: 24 workers vs old logical cap 16) with ProcessorCount fallback; `placement.thread_quota` caps effective workers (output byte-identical under quota); cross-model core-set overlap rejected at config load naming both models.
 - [✓] Hot-reload application path — config watcher pushes validated changes through the change-application bus by mutation class: live knobs apply at the next step boundary, new-requests-only knobs affect admission only, restart-only knobs are refused with an actionable message (see DN-M2-5)
@@ -325,90 +325,125 @@ Many requests at once, tuned, with live reconfiguration.
 - [✓] Automated API: tool calls, logprobs, penalties, seed reproducibility via SDK scripts — 49/49 (Release); SDK round-trip ✅ at ship
 - [✓] Manual Monitor-lite: `lair monitor` live stats under mixed load — verified live: table rendered against serve under shared-prefix chats + long completion; KV used rose 3→55/96 with `active=1` during decode, cache-hit % climbed 50→100% on prefix reuse, tok/s + step-ms updated per tick (Debug-JIT rates), clean exit.
 
-### MVP3 [v0.3.0] - Refined
+### MVP3 [v0.3.0] - Tentative
+
+Operators see the engine live in a browser and can test it with a built-in chat UI — no external client needed.
+
+#### Design Notes
+
+- **DN-M3-1** — Monitor Web UI: lightweight static SPA (TypeScript, esbuild) served by Kestrel; WebSocket stats stream from the metrics bus; recent-request ring buffer (configurable X).
+  - Rationale: the engine stays free of frontend runtime coupling; the metrics bus already exists.
+  - Rejected: Blazor (runtime coupling to engine host); polling-only UI (fails the real-time requirement).
+  - Contract: `lair.monitor` WS schema (additive-only, versioned field).
+  - Carried forward from the multi-model phase design (formerly DN-M4-4) when the UI was pulled ahead of CUDA.
+- **DN-M3-2 (proposed)** — Chat test UI: a simple chat surface for exercising the served model from the same browser — streaming replies, tool-call display, abort. Component-stack candidates to compare during refine: assistant-ui (React; batteries-included chat primitives, but heavier dependency tree and a stricter license) vs shadcn/ui (MIT; copy-in primitives, more assembly work, simpler build story); alternative: hand-rolled chat view in the same SPA. Decision criteria: license fit, streaming/SSE ergonomics, tool-call rendering support, build integration with the esbuild pipeline.
+  - Contract: chat surface consumes only public API endpoints (`/v1/chat/completions` SSE, `/v1/models`); no privileged engine access — the UI is a client like any other.
+- **DN-M3-3 (proposed)** — UI scope for this phase: the full observability surface from Scope (in-flight requests with per-request stats, per-model machine usage breakdown, cache usage with location, recent-X request log) is the target; GPU/PCIe/power/temperature tiles render only where the platform exposes them (CPU/RAM tiles live now; GPU tiles arrive with the CUDA phase).
+  - Contract: WS schema fields are additive — later phases add tiles without reshaping existing ones.
+- **DN-M3-4 (proposed)** — Tabbed shell with a shared stylesheet: one SPA, two tabs — Monitor and Chat — sharing a single stylesheet/design system; the tab shell is the mockup baseline before any production code.
+  - Rationale: one design system keeps the operator surface coherent and lets the chat tab double as a live test client for the monitor's data.
+  - Contract: `mockup/mvp3/` holds the tabbed mockups (shared stylesheet file + per-tab pages); production SPA derives from the approved mockups verbatim.
+
+#### Implementation Items
+
+- [_] Tabbed shell + shared stylesheet mockups — Monitor tab and Chat tab in one design system (`mockup/mvp3/`)
+  - Verify: manual — mockups opened in browser and approved before production code; approved state recorded in mockup headers.
+- [_] WS schema + server — versioned stats/request stream from the metrics bus to connected clients (see DN-M3-1, DN-M3-3)
+  - Verify: automated — a test client receives live snapshots during load with versioned field names; ring-buffer request log bounded by config X.
+- [_] Monitor SPA — real-time in-flight requests, per-model CPU/memory/cache breakdown, cache usage by location, recent X request log (see DN-M3-1, DN-M3-4)
+  - Verify: manual — browser shows live in-flight rows updating sub-second, per-model bars, cache breakdown, and completed-request log.
+- [_] Chat test UI — chat surface for exercising the served model: streaming replies, abort, tool-call display (see DN-M3-2, DN-M3-4)
+  - Verify: manual — multi-turn streamed chat against the serving engine, mid-stream abort, tool-call rendering on a parser-produced call.
+
+#### Tests
+
+- [_] Automated WS: versioned snapshot stream + bounded request ring
+- [_] Manual Monitor: real-time UI behaviors enumerated above
+- [_] Manual Chat UI: streamed multi-turn chat, abort, tool-call display against the live server
+
+### MVP4 [v0.4.0] - Refined
 
 CUDA joins the engine; hybrid CPU/GPU inference on the 4090.
 
 #### Design Notes
 
-- **DN-M3-1** — CUDA binding: nvcc-built microkernels via `[LibraryImport]` for fused dequant/GQA kernels; cuBLASLt for dense F16 GEMM paths.
+- **DN-M4-1** — CUDA binding: nvcc-built microkernels via `[LibraryImport]` for fused dequant/GQA kernels; cuBLASLt for dense F16 GEMM paths.
   - Rationale: GPU kernels are CUDA regardless of host language; "managed-first" was always a CPU-kernel doctrine. Fused dequant-FMA needs full control.
   - Rejected: ILGPU (cannot realistically fuse dequant into FMA chains); managed CUDA abstraction layer (immature, adds a translation tax).
   - Contract: `lair.backends.cuda` build target (`nvcc` MSBuild) + `[LibraryImport]` surface.
-- **DN-M3-2** — Contiguous layer split: first N transformer layers resident in VRAM, remainder on CPU; LM head defaults to CPU.
+- **DN-M4-2** — Contiguous layer split: first N transformer layers resident in VRAM, remainder on CPU; LM head defaults to CPU.
   - Rationale: exactly one PCIe activation crossing per token at the split boundary; activations are ≤32 KB. GPU LM head would spend scarce VRAM on the 248K-vocab head for marginal gain.
   - Rejected: interleaved layer split (crossing every layer); GPU LM head default.
   - Contract: `PlacementPolicy.gpu_layers`, engine executor split point.
-- **DN-M3-3** — Device policy is fail-fast: `device: cuda` or `hybrid` requires the device; no silent CPU fallback.
+- **DN-M4-3** — Device policy is fail-fast: `device: cuda` or `hybrid` requires the device; no silent CPU fallback.
   - Rationale: silent fallback hides misconfiguration and produces unmeasurable performance claims. An `auto` fallback mode is a backlog candidate, not a default.
   - Contract: host startup validation, consistent with DN-M1-9.
-- **DN-M3-4** — KV device pools: separate VRAM and DRAM block pools; `split` residency = device-tagged blocks, attention executed as two passes (VRAM set, then DRAM set); default residency follows the decode device.
+- **DN-M4-4** — KV device pools: separate VRAM and DRAM block pools; `split` residency = device-tagged blocks, attention executed as two passes (VRAM set, then DRAM set); default residency follows the decode device.
   - Rationale: attention reads all KV every token — placement follows the reader unless the user pays the measured split cost.
   - Contract: `lair.kv` device-backed pools.
-- **DN-M3-5** — Prefill offload: `prefill: gpu` runs prompt processing on CUDA; produced KV lands per `kv_residency`; decode continues per `device`.
+- **DN-M4-5** — Prefill offload: `prefill: gpu` runs prompt processing on CUDA; produced KV lands per `kv_residency`; decode continues per `device`.
   - Contract: scheduler step composition per model policy.
-- **DN-M3-6** — Pinned host staging buffers for activations crossing the split; transfers overlapped with compute where measurement justifies it.
+- **DN-M4-6** — Pinned host staging buffers for activations crossing the split; transfers overlapped with compute where measurement justifies it.
   - Contract: weight arena / device arena staging.
 
 #### Implementation Items
 
 - [_] Binding spike — nvcc MSBuild target + cuBLASLt `[LibraryImport]` smoke
   - Verify: build produces the CUDA kernel binary; smoke GEMM matches CPU reference within FP tolerance.
-- [_] CudaBackend — dense decode + prefill kernels behind `IBackend` (see DN-M3-1)
+- [_] CudaBackend — dense decode + prefill kernels behind `IBackend` (see DN-M4-1)
   - Verify: `dotnet test --filter Category=Parity` — same F16 model decodes token-identical on CPU, CUDA, and hybrid.
-- [_] Prefill offload — GPU prefill, CPU/hybrid decode (see DN-M3-5)
-  - Verify: bench records ≥2× prefill tok/s on the 4090 vs CPU for the reference model.
-- [_] Layer split — `gpu_layers` placement policy (see DN-M3-2)
-  - Verify: split-point sweep (0..N) on Qwen2-1.5B; parity holds at every split point; bench records decode tok/s curve.
+- [_] Prefill offload — GPU prefill, CPU/hybrid decode (see DN-M4-5)
+  - Verify: bench records ≥2× prefill tok/s on the 4090 vs CPU for the reference model. *(bench deferred — see Open Items)*
+- [_] Layer split — `gpu_layers` placement policy (see DN-M4-2)
+  - Verify: split-point sweep (0..N) on Qwen2-1.5B; parity holds at every split point; bench records decode tok/s curve. *(parity gate active; bench deferred)*
 - [_] VRAM residency — models fitting 24 GB resident on device
   - Verify: full-VRAM Q4_K_M 1.5B run; over-budget load rejected with ledger breakdown in the error.
-- [_] KV device pools — `dram` | `vram` | `split` residency policies (see DN-M3-4)
-  - Verify: parity across all three residencies; bench records the split-vs-follow cost curve.
+- [_] KV device pools — `dram` | `vram` | `split` residency policies (see DN-M4-4)
+  - Verify: parity across all three residencies; bench records the split-vs-follow cost curve. *(parity gate active; bench deferred)*
 
 #### Tests
 
 - [_] Automated Parity-Hybrid: token match across cpu / cuda / hybrid configurations
 - [_] Automated Budget: VRAM admission rejection with actionable error
 - [_] Automated Kernel: CUDA fused dequant GEMV vs scalar reference
-- [_] Manual Hybrid Serve: monitor shows GPU utilization and PCIe transfer counters during hybrid decode
+- [_] Manual Hybrid Serve: monitor shows GPU utilization and PCIe transfer counters during hybrid decode *(GPU tiles arrive with MVP3's UI; counters require the CUDA phase)*
 
-### MVP4 [v0.4.0] - Refined
+#### Open Items
+
+- [_] **Windows CUDA dev toolchain incomplete** — registry lists CUDA Development/Toolkit 13.0 at `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0`, but `nvcc.exe` is absent from the whole toolkit tree (only runtime DLLs + `cuda_runtime.h` are present; `cublasLt.h`/`nvrtc.h` missing). WSL Ubuntu-22.04 has nvcc 12.4 but cannot target a Windows .NET host. Resolve with a repair/reinstall of the CUDA 13.x developer components (or an explicit binding-strategy change via plan-update) before `/plan-build` starts.
+- [_] **Bench verification deferred** — owner decision 2026-11-02: benchmarks are not run in the current work window; bench-only verify lines stay pending until requested. The 4090 currently runs other workloads at ~95% utilization.
+
+### MVP5 [v0.5.0] - Refined
 
 Many models at once, each with its own placement policy.
 
 #### Design Notes
 
-- **DN-M4-1** — Registry and hot swap: models declared in config with `type: chat|embed`; add loads in the background and serves when ready; remove drains in-flight requests, then frees pools.
+- **DN-M5-1** — Registry and hot swap: models declared in config with `type: chat|embed`; add loads in the background and serves when ready; remove drains in-flight requests, then frees pools.
   - Rationale: model changes ride the same hot-reload bus as every other knob; drain-then-free avoids mid-flight collapse.
   - Rejected: restart-to-change-model; immediate unload (kills in-flight requests).
   - Contract: registry in `lair.core` + `IConfigSource`.
-- **DN-M4-2** — Global ledger admission: DRAM quota, VRAM pool, and core sets are accounted at load time; runtime KV exhaustion rejects new requests, never preempts running ones.
-  - Rationale: preemption needs swap to disk — that machinery arrives in MVP6; until then the honest answer is refusal.
-  - Rejected: best-effort oversubscription (thrash); preempt-to-fittest (needs MVP6 tiers).
+- **DN-M5-2** — Global ledger admission: DRAM quota, VRAM pool, and core sets are accounted at load time; runtime KV exhaustion rejects new requests, never preempts running ones.
+  - Rationale: preemption needs swap to disk — that machinery arrives in MVP7; until then the honest answer is refusal.
+  - Rejected: best-effort oversubscription (thrash); preempt-to-fittest (needs MVP7 tiers).
   - Contract: ledger in scheduler; errors via `engine_overloaded` / `context_length_exceeded`.
-- **DN-M4-3** — Embeddings: encoder-only forward, mean pooling default with CLS option and `normalize` flag; input batching reuses MVP2 batch steps.
+- **DN-M5-3** — Embeddings: encoder-only forward, mean pooling default with CLS option and `normalize` flag; input batching reuses MVP2 batch steps.
   - Contract: `/v1/embeddings` OpenAI shape; registry `type: embed`.
-- **DN-M4-4** — Monitor Web UI: lightweight static SPA (TypeScript, esbuild) served by Kestrel; WebSocket stats stream from the metrics bus; recent-request ring buffer (configurable X).
-  - Rationale: the engine stays free of frontend runtime coupling; the metrics bus already exists.
-  - Rejected: Blazor (runtime coupling to engine host); polling-only UI (fails the real-time requirement).
-  - Contract: `lair.monitor` WS schema (additive-only, versioned field).
-- **DN-M4-5** — Scheduler fairness: core-set partitioning is the isolation mechanism; FIFO within a model, per-model priority; no default core oversubscription (overcommit is a backlog knob).
+- **DN-M5-4** — Scheduler fairness: core-set partitioning is the isolation mechanism; FIFO within a model, per-model priority; no default core oversubscription (overcommit is a backlog knob).
   - Contract: scheduler admission order.
 
 #### Implementation Items
 
-- [_] Model registry — concurrent instances, add/remove via config reload (see DN-M4-1)
+- [_] Model registry — concurrent instances, add/remove via config reload (see DN-M5-1)
   - Verify: `dotnet test --filter Category=Registry` — model added and removed via config edit while another model serves; no request failures outside the removed model.
-- [_] Device budgets — admission control against VRAM + DRAM pools (see DN-M4-2)
+- [_] Device budgets — admission control against VRAM + DRAM pools (see DN-M5-2)
   - Verify: ledger test — over-committed config rejected at startup with per-device breakdown in the error.
-- [_] Scheduler fairness — time-slicing, preemption, priority (see DN-M4-5)
+- [_] Scheduler fairness — time-slicing, preemption, priority (see DN-M5-4)
   - Verify: two-model load test — per-model ITL stays within budget while the other model saturates its core set.
-- [_] Embeddings endpoint — `/v1/embeddings`, encoder-only models (ModernBERT-class) (see DN-M4-3)
+- [_] Embeddings endpoint — `/v1/embeddings`, encoder-only models (ModernBERT-class) (see DN-M5-3)
   - Verify: `dotnet test --filter Category=Embeddings` — pooled vectors match reference fixtures within FP tolerance.
 - [_] Flagship scenario — GPU-heavy coding model + CPU-only embedding model side by side
   - Verify: manual — both models serve concurrent load; monitor shows per-model device portioning.
-- [_] Monitor Web UI — real-time in-flight requests, per-model CPU/memory/GPU/PCIe/disk-I/O breakdown, cache usage by location, recent X request log (see DN-M4-4)
-  - Verify: manual — browser shows live in-flight rows updating sub-second, per-model device bars, cache breakdown, and completed-request log.
 
 #### Tests
 
@@ -416,53 +451,52 @@ Many models at once, each with its own placement policy.
 - [_] Automated Budget: ledger rejection paths and quota accounting
 - [_] Automated Fairness: cross-model ITL isolation
 - [_] Automated Embeddings: pooling parity vs reference fixtures
-- [_] Manual Monitor: real-time UI behaviors enumerated above
 
-### MVP5 [v0.5.0] - Refined
+### MVP6 [v0.6.0] - Refined
 
 Qwen3.8-Flash-Next runs: sparse MoE with residency management.
 
 #### Design Notes
 
-- **DN-M5-1** — Reality-check gate: no Flash-Next kernel work until llama.cpp/ik_llama.cpp measurements (tok/s, bytes/token, expert gather behavior) are recorded on the target GGUF.
+- **DN-M6-1** — Reality-check gate: no Flash-Next kernel work until llama.cpp/ik_llama.cpp measurements (tok/s, bytes/token, expert gather behavior) are recorded on the target GGUF.
   - Rationale: the archive's explicit recommendation; prevents building a C# engine against imagined numbers.
   - Contract: `bench/` measurement report committed before kernel items start.
-- **DN-M5-2** — Quant scope: IQ3_XXS primary (Strata's recommended consumer quant), Q4_K_M as the measured baseline; other formats added only as residency experiments.
+- **DN-M6-2** — Quant scope: IQ3_XXS primary (Strata's recommended consumer quant), Q4_K_M as the measured baseline; other formats added only as residency experiments.
   - Rationale: smaller quants shrink the expert hot set, but IQ3 dequant is shuffle-heavy on AVX2 — the gate decides whether the residency win survives the kernel cost.
   - Rejected: FP8 native containers (breaks the GGUF-first commitment); low-bit-only with no baseline (unmeasurable claims).
   - Contract: `IWeightSource` format descriptors for IQ3_XXS/Q4_K_M expert slabs.
-- **DN-M5-3** — Expert-aware batching: the residency cost function is the batch's union active-expert set, not per-sequence expert sets.
+- **DN-M6-3** — Expert-aware batching: the residency cost function is the batch's union active-expert set, not per-sequence expert sets.
   - Rationale: shared decode steps (MVP2) make expert reads amortized across sequences — this is the engine-level MoE win.
   - Rejected: per-sequence expert scheduling (re-reads shared experts per sequence).
   - Contract: scheduler batch composition + `IGatherKernel`.
-- **DN-M5-4** — Contiguous expert slabs via `IWeightSource` providers: experts stored as contiguous slabs, gathered through `IGatherKernel`, prefetched on top-K router pointers before the GEMV.
+- **DN-M6-4** — Contiguous expert slabs via `IWeightSource` providers: experts stored as contiguous slabs, gathered through `IGatherKernel`, prefetched on top-K router pointers before the GEMV.
   - Rationale: ik_llama.cpp proves prefetch; slabs make gather a pointer chase plus prefetch, not a scatter.
   - Rejected: expert-major interleaved layout (kills slab prefetch).
   - Contract: `IGatherKernel`, `IWeightSource` slab provider.
-- **DN-M5-5** — RAM hot tier: capacity/cost-model residency decides which experts stay hot — value = router hit frequency × gather cost saved, budget = RAM quota minus KV working set.
+- **DN-M6-5** — RAM hot tier: capacity/cost-model residency decides which experts stay hot — value = router hit frequency × gather cost saved, budget = RAM quota minus KV working set.
   - Rationale: prefetch is taken by ik_llama.cpp; capacity/cost-driven residency is the open niche.
   - Rejected: static top-N hot set (misses workload drift); pure LRU (ignores gather cost asymmetry).
   - Contract: `IResidencyTier` RAM implementation + tier stats on the metrics bus.
-- **DN-M5-6** — PLE: n-gram table as an `IResidencyTier` pageable table with indexed gather (row-offset addressing); sidecar index built at load only if the GGUF tensor layout doesn't align rows.
+- **DN-M6-6** — PLE: n-gram table as an `IResidencyTier` pageable table with indexed gather (row-offset addressing); sidecar index built at load only if the GGUF tensor layout doesn't align rows.
   - Contract: `IResidencyTier` PLE provider; load-time index builder.
-- **DN-M5-7** — MTP: draft-then-verify with accept-rate accounting; draft tokens verified in one batched forward; accept rates reported per model on the metrics bus.
+- **DN-M6-7** — MTP: draft-then-verify with accept-rate accounting; draft tokens verified in one batched forward; accept rates reported per model on the metrics bus.
   - Rationale: archive's top lever (12→25 tok/s on copy/code); verification batch amortizes expert reads.
   - Rejected: self/n-gram drafting at this phase (deferred to backlog); free-running draft without verification (quality risk).
   - Contract: `lair.sampling` drafter + scheduler verify step.
 
 #### Implementation Items
 
-- [_] Reality check — llama.cpp/ik_llama.cpp harness on target Flash-Next GGUF (see DN-M5-1)
+- [_] Reality check — llama.cpp/ik_llama.cpp harness on target Flash-Next GGUF (see DN-M6-1)
   - Verify: committed bench report with tok/s, bytes/token, and expert-gather observations on the dev box and, if reachable, the Xeon box.
-- [_] Router + gather — `IGatherKernel`, contiguous expert slabs (see DN-M5-4)
+- [_] Router + gather — `IGatherKernel`, contiguous expert slabs (see DN-M6-4)
   - Verify: `dotnet test --filter Category=Moe` — gathered expert output matches dense reference math; `bench/` reports gather tok/s vs dense-equivalent.
-- [_] RAM hot tier — capacity/cost-model expert residency (see DN-M5-5)
+- [_] RAM hot tier — capacity/cost-model expert residency (see DN-M6-5)
   - Verify: bench — hit-rate and tok/s improve over prefetch-only baseline on a replayed workload trace.
-- [_] PLE — pageable n-gram table, huge-page backed; indexed disk gather (row-offset addressing; sidecar index if the quant format doesn't align rows) (see DN-M5-6)
+- [_] PLE — pageable n-gram table, huge-page backed; indexed disk gather (row-offset addressing; sidecar index if the quant format doesn't align rows) (see DN-M6-6)
   - Verify: `dotnet test --filter Category=Ple` — indexed gather matches in-memory reference; `bench/` reports disk-gather latency distribution.
 - [_] GDN/QSA — recurrent state budgets, sparse attention semantics
   - Verify: layer-level parity fixtures vs llama.cpp qwen4exp reference activations for GDN and QSA layers.
-- [_] MTP drafting — speculative decode with accept-rate accounting (see DN-M5-7)
+- [_] MTP drafting — speculative decode with accept-rate accounting (see DN-M6-7)
   - Verify: parity — MTP output tokens match non-drafted greedy output; `bench/` reports accept rate and tok/s multiplier.
 - [_] Flash-Next parity — full-model output match vs llama.cpp/ik reference
   - Verify: `dotnet test --filter Category=Parity` on Flash-Next GGUF (tolerance rules from the reality-check report).
@@ -478,9 +512,9 @@ Qwen3.8-Flash-Next runs: sparse MoE with residency management.
 
 #### Open Items
 
-- [_] **qwen4exp GGUF layout** — exact tensor naming/shaping for router, experts, PLE, GDN state, and MTP head in target GGUF files; resolved by a loader spike at the start of MVP5 build, feeding DN-M5-4/5/6 contracts.
+- [_] **qwen4exp GGUF layout** — exact tensor naming/shaping for router, experts, PLE, GDN state, and MTP head in target GGUF files; resolved by a loader spike at the start of MVP6 build, feeding DN-M6-4/5/6 contracts.
 
-### MVP6 [v0.6.0] - Tentative
+### MVP7 [v0.7.0] - Tentative
 
 Residency spans RAM, VRAM, and NVMe.
 
@@ -491,7 +525,7 @@ Residency spans RAM, VRAM, and NVMe.
 - Slab migration — promote/demote experts between RAM, VRAM, and NVMe while serving, refcounted and double-buffered
 - Budget rebalancing — tier ratios adjustable at runtime
 
-### MVP7 [v0.7.0] - Tentative
+### MVP8 [v0.8.0] - Tentative
 
 Vision input on chat models.
 
@@ -516,8 +550,8 @@ Vision input on chat models.
 | idea | Embeddings model families | ModernBERT-class GGUF quants, pooling modes |
 | question | License | MIT / Apache 2.0 / private — dotLLM is GPLv3: study ideas, never copy code |
 | bug | 2DPC DIMM derate | production box derates 2400→2133 MT/s; more RAM ≠ speed |
-| question | CUDA binding choice | ILGPU vs LibraryImport+cuBLASLt vs nvcc microkernels (MVP3 open item) |
-| question | PLE index format | does the GGUF PLE tensor allow random row access, or is a repack sidecar index needed? (MVP5 open item) |
+| question | CUDA binding choice | resolved for planning: nvcc microkernels + cuBLASLt (DN-M4-1); revisit only if the toolchain open item forces a strategy change |
+| question | PLE index format | does the GGUF PLE tensor allow random row access, or is a repack sidecar index needed? (MVP6 open item) |
 | idea | Conversation cache policy | TTL/LRU eviction rules; optional encryption of disk snapshots; cache invalidation on model/config change |
 | idea | Client-keyed cache retention | tie prompt/conversation cache items to client identity — e.g. a sticky id issued in a response header — and use it for sliding retention (keep each client's most recent conversation cache item) instead of or alongside LRU; precondition: a reliable-enough client identification method (issued token header, optional API key/session, connection fingerprint); interacts with server-posture backlog |
 | idea | Byte-reduction experiments | MoD/layer skipping, expert pruning/distillation, dynamic quant switching — each as an `IWeightSource` provider |
@@ -525,15 +559,15 @@ Vision input on chat models.
 | question | Server posture | default bind address, optional API key, LAN exposure rules |
 | question | CPU power/temperature source on Windows | RAPL MSRs and CPU temp need kernel access — options: small signed helper service, HWiNFO shared-memory bridge, or omit on Windows and use Linux hwmon/RAPL for the Xeon boxes |
 | idea | RAM temperature via IPMI | Xeon production box may expose DIMM temps over BMC/IPMI; absent on the dev box |
-| idea | MTP on dense models | pull-forward candidate — MTP heads exist on some dense GGUFs; would move drafting from MVP5 toward MVP2/3 |
+| idea | MTP on dense models | pull-forward candidate — MTP heads exist on some dense GGUFs; would move drafting from MVP6 toward MVP2/4 |
 | idea | KV evict-and-recompute | retain prompt tokens, evict cold KV blocks, re-prefill on demand — a per-model speed/memory knob; precedent: llama.cpp `--cache-reuse`; recompute is compute-bound on CPU, so never a default |
-| idea | Preemptive KV swap | preempt a running sequence's KV to the NVMe tier under memory pressure — depends on MVP6 tiers |
+| idea | Preemptive KV swap | preempt a running sequence's KV to the NVMe tier under memory pressure — depends on MVP7 tiers |
 | idea | Prefill GEMM shim microkernel | tiled-matmul native microkernel via `[LibraryImport]` where the bench harness proves the managed tile wall |
 | idea | Core-set overcommit | allow models to share/partially oversubscribe core sets as an explicit knob |
-| idea | Cross-model interleaved batches | multi-model serving where batch steps alternate across models at configured ratios (e.g. 2:1) so all models share one compute/thread pool; per-model throughput degrades proportionally to share — explicit toggle with per-model ratios, never the default (DN-M2-6 core-set partitioning stays default); MVP4 scheduling candidate |
-| idea | Diffusion model support | UNet/DiT executor family (bidirectional attention, no KV cache), Conv2D/GroupNorm kernels, VAE encode/decode, noise-scheduler stack, CLIP/T5 conditioning; GGUF already hosts SD-class containers and the loader/backend/quant investment transfers; continuous batching fits denoise steps well; needs a Scope change (image generation is a current explicit non-goal) — proposed MVP8 candidate |
+| idea | Cross-model interleaved batches | multi-model serving where batch steps alternate across models at configured ratios (e.g. 2:1) so all models share one compute/thread pool; per-model throughput degrades proportionally to share — explicit toggle with per-model ratios, never the default (DN-M2-6 core-set partitioning stays default); MVP5 scheduling candidate |
+| idea | Diffusion model support | UNet/DiT executor family (bidirectional attention, no KV cache), Conv2D/GroupNorm kernels, VAE encode/decode, noise-scheduler stack, CLIP/T5 conditioning; GGUF already hosts SD-class containers and the loader/backend/quant investment transfers; continuous batching fits denoise steps well; needs a Scope change (image generation is a current explicit non-goal) — proposed MVP9 candidate |
 | idea | Server-side MCP injection | per-model, config-declared MCP servers whose tool definitions LAIR injects into chat requests regardless of client; injected tools execute server-side (contrast DN-M2-8: client-supplied tools stay client-side); enables cross-model composition — an LLM calling a diffusion model through its MCP endpoint, or the embeddings engine exposed as a vector/RAG MCP; interacts with tool-call API work and server posture |
-| idea | `auto` device fallback | silent CPU fallback when a configured CUDA device is absent — deliberately not a default (DN-M3-3) |
+| idea | `auto` device fallback | silent CPU fallback when a configured CUDA device is absent — deliberately not a default (DN-M4-3) |
 | bug | Q4_K_M family coverage gap | kernels implement only the Q4_K block format; real Q4_K_M files mix Q5_K/Q6_K tensors, and non-block-divisible dims force legacy formats (Q4_0/Q5_0…) — loader/kernel extension needed before serving published quants in production |
 
 ## Decision Log
@@ -559,4 +593,6 @@ Vision input on chat models.
 - **2026-11-02 — Diffusion support and server-side MCP injection recorded in Backlog.** User-proposed: diffusion as a phase-sized addition (MVP8 candidate) requiring a Scope change since image generation is an explicit v1 non-goal; per-model config-declared MCP servers whose tools LAIR injects into requests and executes server-side, enabling cross-model composition (LLM → diffusion via MCP; embeddings engine as vector/RAG MCP). The injection contract deliberately cuts against DN-M2-8's client-side-tools rule — a future phase must reconcile the two explicitly.
 - **2026-11-02 — Tool-call detection contract fixed (DN-M2-10).** MVP2 guarantees injection, a strict fenced-JSON detector, and `tool_calls` wire shape; actual call emission is model-dependent and not demanded of small fixture models — parser-level tests stand in for model compliance.
 - **2026-11-02 — Hot-reload KV budget = soft cap within pinned arena (DN-M2-11).** Physical arenas are reserved at startup; `kv_blocks` hot-edits move the usage ceiling inside the reservation (grow immediate, shrink drains evictable cache); physical re-reservation deferred to the tiered-pools phase.
-- **2026-11-02 — Tool-call detection contract fixed (DN-M2-10).** MVP2 guarantees injection, a strict fenced-JSON detector, and `tool_calls` wire shape; actual call emission is model-dependent and not demanded of small fixture models — parser-level tests stand in for model compliance.
+- **2026-11-02 — MVP3 inserted for the Web UI; CUDA and later phases shift down one.** New MVP3 [v0.3.0] (Tentative) ships the Monitor Web UI (design carried from the multi-model phase, formerly DN-M4-4 → DN-M3-1) plus a Chat test UI in a tabbed shell with a shared stylesheet (`mockup/mvp3/` mockups precede production code). CUDA becomes MVP4 [v0.4.0], multi-model MVP5 [v0.5.0], Flash-Next MVP6 [v0.6.0], residency MVP7 [v0.7.0], vision MVP8 [v0.8.0]. Rationale: the UI needs no GPU, exercises the shipped CPU engine, and the owner wants to test that engine hands-on now. Chat component stack (assistant-ui vs shadcn/ui vs hand-rolled — license, streaming ergonomics, build integration) is a refine-phase decision.
+- **2026-11-02 — Windows CUDA toolchain found incomplete; MVP4 blocked until repaired.** Registry lists CUDA Development/Toolkit 13.0, but `nvcc.exe` is absent from the toolkit tree and `cublasLt.h`/`nvrtc.h` are missing (runtime DLLs + `cuda_runtime.h` present). WSL Ubuntu-22.04 has nvcc 12.4 but cannot target a Windows .NET host. Recorded as an MVP4 Open Item; repair/reinstall of the developer components (or a binding-strategy change via plan-update) required before `/plan-build` MVP4.
+- **2026-11-02 — Benchmarks deferred by owner decision.** Perf/bench verify lines stay pending until requested; the 4090 currently runs other workloads at ~95% utilization. Correctness gates remain active.
