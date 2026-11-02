@@ -1,6 +1,7 @@
 using System.Threading.Channels;
 using Lair.Kv;
 using Lair.Models.Engine;
+using Lair.Sampling;
 
 namespace Lair.Models.Scheduling;
 
@@ -329,7 +330,7 @@ public sealed class GenerationScheduler : IDisposable
 
             // Prefill left the final prompt token's logits: sample the first generated token from them, exactly as
             // the single-flight loop did. It is reported now but forwarded on the next step.
-            int first = sequence.Sampler.Sample(_model.LastLogits());
+            int first = SampleForSequence(sequence, _model.LastLogits());
             if (first == sequence.Request.EosId)
             {
                 Finish(sequence, FinishReason.Eos);
@@ -381,7 +382,7 @@ public sealed class GenerationScheduler : IDisposable
             for (int i = 0; i < count; i++)
             {
                 Sequence sequence = window[start + i];
-                int next = sequence.Sampler.Sample(logits.Slice(i * vocab, vocab));
+                int next = SampleForSequence(sequence, logits.Slice(i * vocab, vocab));
 
                 if (next == sequence.Request.EosId)
                 {
@@ -412,6 +413,32 @@ public sealed class GenerationScheduler : IDisposable
     }
 
     /// <summary>
+    /// Samples one sequence's next token from its own logits row. When the sequence's sampling params carry
+    /// penalties or a logit bias, the row is transformed in place first — penalties over that sequence's prompt
+    /// plus already-generated history, biases added to their tokens' logits — so each sequence's transform stays
+    /// on its own row and the sampler pipeline itself sees only the adjusted logits. When the request asked for
+    /// logprobs, the chosen token's entry is captured from the transformed row; the eos token ends a sequence
+    /// without being generated, so it gets no entry.
+    /// </summary>
+    private static int SampleForSequence(Sequence sequence, Span<float> row)
+    {
+        SamplingParams p = sequence.Request.Sampling;
+        if (p.HasLogitTransform)
+        {
+            SamplingTransforms.Apply(row, p, sequence.Request.PromptTokens, sequence.Generated);
+        }
+
+        int token = sequence.Sampler.Sample(row);
+        if (sequence.Request.LogProbTopN is int topN && token != sequence.Request.EosId)
+        {
+            (double logProb, IReadOnlyList<(int TokenId, double LogProb)> top) = sequence.Sampler.LogProbsFor(row, token, topN);
+            sequence.LogProbEntries.Add(new TokenLogprob(token, logProb, top));
+        }
+
+        return token;
+    }
+
+    /// <summary>
     /// Publishes the sequence's outcome and releases its KV blocks. The generated ids are copied out of the sequence
     /// first, so nothing downstream touches the cache after this point; disposing is idempotent, which makes a second
     /// finish (for example an eos in the sampling loop followed by a batch fault) harmless. Releasing covers adopted
@@ -420,7 +447,7 @@ public sealed class GenerationScheduler : IDisposable
     /// </summary>
     private static void Finish(Sequence sequence, FinishReason reason, Exception? error = null)
     {
-        SequenceOutcome outcome = new([.. sequence.Generated], sequence.Request.PromptTokens.Length, sequence.Generated.Count, reason, error, sequence.PrefillCachedTokens);
+        SequenceOutcome outcome = new([.. sequence.Generated], sequence.Request.PromptTokens.Length, sequence.Generated.Count, reason, error, sequence.PrefillCachedTokens, [.. sequence.LogProbEntries]);
 
         // Blocks go back before the completion is published: an observer woken by the task may immediately submit a
         // new sequence that needs them.

@@ -30,6 +30,27 @@ public sealed class Sampler
             throw new ArgumentOutOfRangeException(nameof(p), $"TopP must be in (0, 1], got {p.TopP}.");
         }
 
+        if (p.PresencePenalty is < -2f or > 2f)
+        {
+            throw new ArgumentOutOfRangeException(nameof(p), $"PresencePenalty must be in [-2, 2], got {p.PresencePenalty}.");
+        }
+
+        if (p.FrequencyPenalty is < -2f or > 2f)
+        {
+            throw new ArgumentOutOfRangeException(nameof(p), $"FrequencyPenalty must be in [-2, 2], got {p.FrequencyPenalty}.");
+        }
+
+        if (p.LogitBias is not null)
+        {
+            foreach ((int id, float bias) in p.LogitBias)
+            {
+                if (bias is < -100f or > 100f)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(p), $"LogitBias for token {id} must be in [-100, 100], got {bias}.");
+                }
+            }
+        }
+
         _params = p;
         _random = p.Seed.HasValue ? new Random(MixSeed(p.Seed.Value)) : new Random();
     }
@@ -92,6 +113,65 @@ public sealed class Sampler
         }
 
         return [.. candidates.Select(c => (c.Id, c.Prob))];
+    }
+
+    /// <summary>
+    /// The log-probability entry for <paramref name="chosenId"/> under the distribution actually sampled
+    /// from at this step, reported over the full vocabulary. The reported distribution is the softmax of
+    /// the given logits at the configured temperature — after any temperature scaling but before the
+    /// top-k and top-p cuts — so the numbers describe the sampling distribution, not the truncated one;
+    /// greedy mode (temperature &lt;= 0) reports at temperature 1, the argmax it performs being equivalent
+    /// to that distribution's argmax. <paramref name="topN"/> highest-probability tokens are returned
+    /// sorted descending (probability ties toward the lower token id); when the chosen token is not among
+    /// them it is appended, so it is always present. Non-finite logits are excluded.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">No finite logit existed, so the distribution is empty.</exception>
+    public (double LogProb, IReadOnlyList<(int TokenId, double LogProb)> Top) LogProbsFor(
+        ReadOnlySpan<float> logits,
+        int chosenId,
+        int topN)
+    {
+        if (topN < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(topN), $"topN must be >= 0, got {topN}.");
+        }
+
+        List<Candidate> candidates = CollectCandidates(logits, banned: null);
+        if (candidates.Count == 0)
+        {
+            throw new InvalidOperationException("no candidate tokens: every logit was non-finite");
+        }
+
+        ApplySoftmax(candidates, _params.Greedy ? 1.0f : _params.Temperature);
+        SortByProb(candidates);
+
+        Candidate? chosen = null;
+        int chosenRank = -1;
+        int limit = Math.Min(topN, candidates.Count);
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            if (candidates[i].Id == chosenId)
+            {
+                chosen = candidates[i];
+                chosenRank = i;
+                break;
+            }
+        }
+
+        if (chosen is null)
+        {
+            throw new ArgumentException(
+                $"token {chosenId} is not in the reported distribution (its logit is non-finite).",
+                nameof(chosenId));
+        }
+
+        List<(int TokenId, double LogProb)> top = [.. candidates.Take(limit).Select(c => (c.Id, Math.Log(c.Prob)))];
+        if (chosenRank >= limit)
+        {
+            top.Add((chosenId, Math.Log(chosen.Prob)));
+        }
+
+        return (Math.Log(chosen.Prob), top);
     }
 
     private static List<Candidate> CollectCandidates(ReadOnlySpan<float> logits, IReadOnlySet<int>? banned)

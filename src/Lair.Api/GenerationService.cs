@@ -1,3 +1,4 @@
+using System.Globalization;
 using Lair.Backends.Cpu;
 using Lair.Host.Config;
 using Lair.Kv;
@@ -51,6 +52,12 @@ public sealed class GenerationService : IDisposable
 
     /// <summary>The served model's advertised facts; requests must name <see cref="ModelInfo.Id"/>.</summary>
     public ModelInfo Model { get; }
+
+    /// <summary>Vocabulary size of the served model; token ids at or above it have no vocabulary text.</summary>
+    public int VocabSize => Model.VocabSize;
+
+    /// <summary>Decodes one token id through the served model's tokenizer, special tokens included so control pieces round-trip.</summary>
+    public string DecodeToken(int tokenId) => _tokenizer.Decode([tokenId], includeSpecial: true);
 
     /// <summary>
     /// Opens the first model declared in the configuration: GGUF container, mmap-backed weights through the
@@ -143,8 +150,38 @@ public sealed class GenerationService : IDisposable
 
         cancellationToken.ThrowIfCancellationRequested();
 
+        if (request.PresencePenalty is < -2f or > 2f)
+        {
+            throw new ArgumentException($"'presence_penalty' must be in [-2, 2], got {request.PresencePenalty}.", nameof(request));
+        }
+
+        if (request.FrequencyPenalty is < -2f or > 2f)
+        {
+            throw new ArgumentException($"'frequency_penalty' must be in [-2, 2], got {request.FrequencyPenalty}.", nameof(request));
+        }
+
+        if (request.TopLogprobs is < 0 or > 20)
+        {
+            throw new ArgumentException($"'top_logprobs' must be in [0, 20], got {request.TopLogprobs}.", nameof(request));
+        }
+
+        IReadOnlyDictionary<int, float>? logitBias = ResolveLogitBias(request.LogitBias);
+
+        // Tool declarations and the choice are validated here too so programmatic callers meet the same rules as HTTP ones.
+        // The pipeline is active only for chat requests that declare tools under a mode other than none: injection happens on
+        // the rendered prompt, and detection reads fences out of the decoded text against the names this choice allows.
+        IReadOnlyList<ToolDefinition>? declaredTools = ValidateToolDeclarations(request.Tools);
+        ToolChoiceSelection toolChoice = ResolveToolChoice(request.ToolChoice, declaredTools);
+        bool toolsActive = request.IsChat && declaredTools is { Count: > 0 } && toolChoice.Mode != ToolChoiceMode.None;
+
+        IReadOnlyCollection<string> callableNames = toolsActive
+            ? toolChoice.Mode == ToolChoiceMode.Function
+                ? [toolChoice.FunctionName!]
+                : [.. declaredTools!.Select(tool => tool.Name)]
+            : [];
+
         IReadOnlyList<int> prompt = request.IsChat
-            ? EncodeChat(request)
+            ? EncodeChat(request, toolsActive ? declaredTools : null)
             : EncodeCompletion(request);
 
         if (prompt.Count >= Model.ContextLength)
@@ -180,8 +217,12 @@ public sealed class GenerationService : IDisposable
                 TopK = request.TopK,
                 TopP = request.TopP,
                 Seed = request.Seed,
+                PresencePenalty = request.PresencePenalty,
+                FrequencyPenalty = request.FrequencyPenalty,
+                LogitBias = logitBias,
             },
             EosId = _tokenizer.EosId,
+            LogProbTopN = request.LogProbs ? Math.Max(request.TopLogprobs, 0) : null,
             OnTokenId = tokenId =>
             {
                 string piece = _tokenizer.Decode([tokenId]);
@@ -230,41 +271,46 @@ public sealed class GenerationService : IDisposable
             handle.Cancel();
         }
 
+        string text = _tokenizer.Decode(outcome.GeneratedTokens, includeSpecial: false);
+        string finishReason;
         if (stopped)
         {
-            string text = _tokenizer.Decode(outcome.GeneratedTokens, includeSpecial: false);
-            return new GenerationResult(
-                text[..Math.Min(decodedChars, text.Length)],
-                outcome.PromptTokens,
-                outcome.CompletionTokens,
-                "stop",
-                outcome.PrefillCachedTokens);
+            text = text[..Math.Min(decodedChars, text.Length)];
+            finishReason = "stop";
         }
-
-        switch (outcome.FinishReason)
+        else
         {
-            case FinishReason.Failed:
-                throw new EngineBusyException();
-
-            case FinishReason.Canceled:
-                throw new OperationCanceledException(cancellationToken);
-
-            case FinishReason.Eos:
-                return new GenerationResult(
-                    _tokenizer.Decode(outcome.GeneratedTokens, includeSpecial: false),
-                    outcome.PromptTokens,
-                    outcome.CompletionTokens,
-                    "eos",
-                    outcome.PrefillCachedTokens);
-
-            default:
-                return new GenerationResult(
-                    _tokenizer.Decode(outcome.GeneratedTokens, includeSpecial: false),
-                    outcome.PromptTokens,
-                    outcome.CompletionTokens,
-                    "length",
-                    outcome.PrefillCachedTokens);
+            finishReason = outcome.FinishReason switch
+            {
+                FinishReason.Failed => throw new EngineBusyException(),
+                FinishReason.Canceled => throw new OperationCanceledException(cancellationToken),
+                FinishReason.Eos => "eos",
+                _ => "length",
+            };
         }
+
+        // Recognized fences take over the result: the fences vanish from the visible text, the calls ride along as data,
+        // and the finish reason becomes tool_calls no matter how decoding ended.
+        IReadOnlyList<ToolCall>? toolCalls = null;
+        if (toolsActive)
+        {
+            ToolDetection detection = ToolCallDetector.Detect(text, callableNames);
+            if (detection.Calls.Count > 0)
+            {
+                text = detection.VisibleText;
+                finishReason = "tool_calls";
+                toolCalls = detection.Calls;
+            }
+        }
+
+        return new GenerationResult(
+            text,
+            outcome.PromptTokens,
+            outcome.CompletionTokens,
+            finishReason,
+            outcome.PrefillCachedTokens,
+            request.LogProbs ? outcome.LogProbs : null,
+            toolCalls);
     }
 
     public void Dispose()
@@ -285,7 +331,7 @@ public sealed class GenerationService : IDisposable
         _backend.Dispose();
     }
 
-    private IReadOnlyList<int> EncodeChat(GenerationRequest request)
+    private IReadOnlyList<int> EncodeChat(GenerationRequest request, IReadOnlyList<ToolDefinition>? injectedTools)
     {
         IReadOnlyList<ChatMessage>? messages = request.Messages;
         if (messages is null || messages.Count == 0)
@@ -302,9 +348,17 @@ public sealed class GenerationService : IDisposable
                 "rendered; serve a model with a chat template or send a completion request with a raw 'prompt'.");
         }
 
+        // The tool block rides on the rendered text before encoding: the injection point is the prompt string, so every
+        // template family receives the same instruction line, schema fences, and reply contract.
+        string rendered = _chatTemplate.Render(messages, addGenerationPrompt: true);
+        if (injectedTools is not null)
+        {
+            rendered = ToolPromptComposer.Compose(rendered, injectedTools);
+        }
+
         return _tokenizer.AddBosToken
-            ? _tokenizer.EncodeWithBos(_chatTemplate.Render(messages, addGenerationPrompt: true))
-            : _tokenizer.Encode(_chatTemplate.Render(messages, addGenerationPrompt: true));
+            ? _tokenizer.EncodeWithBos(rendered)
+            : _tokenizer.Encode(rendered);
     }
 
     private IReadOnlyList<int> EncodeCompletion(GenerationRequest request)
@@ -317,6 +371,56 @@ public sealed class GenerationService : IDisposable
         }
 
         return _tokenizer.AddBosToken ? _tokenizer.EncodeWithBos(request.Prompt) : _tokenizer.Encode(request.Prompt);
+    }
+
+    // logit_bias keys are token strings or numeric token ids. A numeric key names its id directly; a string
+    // key resolves through the served tokenizer and must encode to exactly one vocabulary token. Anything
+    // unresolvable, out of vocabulary, or out of the [-100, 100] value range is rejected naming the key.
+    private IReadOnlyDictionary<int, float>? ResolveLogitBias(IReadOnlyDictionary<string, float>? bias)
+    {
+        if (bias is null || bias.Count == 0)
+        {
+            return null;
+        }
+
+        Dictionary<int, float> resolved = [];
+        foreach ((string key, float value) in bias)
+        {
+            int tokenId;
+            if (int.TryParse(key, NumberStyles.Integer, CultureInfo.InvariantCulture, out int numericId))
+            {
+                tokenId = numericId;
+                if (tokenId < 0 || tokenId >= Model.VocabSize)
+                {
+                    throw new ArgumentException(
+                        $"'logit_bias' key '{key}' is not a token id of this model's vocabulary.",
+                        nameof(bias));
+                }
+            }
+            else
+            {
+                IReadOnlyList<int> encoded = _tokenizer.Encode(key);
+                if (encoded.Count != 1)
+                {
+                    throw new ArgumentException(
+                        $"'logit_bias' key '{key}' does not resolve to a single token of this model's vocabulary.",
+                        nameof(bias));
+                }
+
+                tokenId = encoded[0];
+            }
+
+            if (value is < -100f or > 100f)
+            {
+                throw new ArgumentException(
+                    $"'logit_bias' value for '{key}' must be in [-100, 100], got {value}.",
+                    nameof(bias));
+            }
+
+            resolved[tokenId] = value;
+        }
+
+        return resolved;
     }
 
     private static int StopIndex(string text, IReadOnlyList<string>? stopStrings)
@@ -342,6 +446,66 @@ public sealed class GenerationService : IDisposable
         }
 
         return best;
+    }
+
+    // A tool declaration must carry a non-empty unique name; an absent or empty list declares nothing and the pipeline stays closed.
+    private static IReadOnlyList<ToolDefinition>? ValidateToolDeclarations(IReadOnlyList<ToolDefinition>? tools)
+    {
+        if (tools is null || tools.Count == 0)
+        {
+            return null;
+        }
+
+        HashSet<string> names = new(StringComparer.Ordinal);
+        foreach (ToolDefinition tool in tools)
+        {
+            if (tool.Name.Length == 0)
+            {
+                throw new ArgumentException("'tools' contains a declaration with an empty 'name'.", nameof(tools));
+            }
+
+            if (!names.Add(tool.Name))
+            {
+                throw new ArgumentException($"'tools' declares the tool '{tool.Name}' more than once.", nameof(tools));
+            }
+        }
+
+        return tools;
+    }
+
+    // A null choice means auto. A forced function must name one of the declared tools: its fences are then the only ones detection accepts.
+    private static ToolChoiceSelection ResolveToolChoice(ToolChoiceSelection? choice, IReadOnlyList<ToolDefinition>? declaredTools)
+    {
+        if (choice is null || choice.Mode == ToolChoiceMode.Auto)
+        {
+            return ToolChoiceSelection.Auto;
+        }
+
+        if (choice.Mode == ToolChoiceMode.None)
+        {
+            return ToolChoiceSelection.None;
+        }
+
+        string forced = choice.FunctionName ?? throw new ArgumentException(
+            "'tool_choice' of mode function must name a tool.", nameof(choice));
+
+        bool declared = false;
+        foreach (ToolDefinition tool in declaredTools ?? [])
+        {
+            if (string.Equals(tool.Name, forced, StringComparison.Ordinal))
+            {
+                declared = true;
+                break;
+            }
+        }
+
+        if (!declared)
+        {
+            throw new ArgumentException(
+                $"'tool_choice' names '{forced}', which is not one of the declared tools.", nameof(choice));
+        }
+
+        return ToolChoiceSelection.Function(forced);
     }
 
     // The file's quantization is the format most of its tensors are stored in; mixed files (quantized

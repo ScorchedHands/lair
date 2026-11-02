@@ -49,6 +49,9 @@ internal sealed class Sequence
 
     public readonly List<int> Generated = [];
 
+    /// <summary>Per-generated-token log-probability captures, appended in generation order; empty when the request did not ask for logprobs.</summary>
+    public readonly List<TokenLogprob> LogProbEntries = [];
+
     public bool IsPrefilling => PromptOffset < Request.PromptTokens.Length;
 
     public bool IsDecoding => PromptOffset == Request.PromptTokens.Length;

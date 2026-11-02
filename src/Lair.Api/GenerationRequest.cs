@@ -40,6 +40,27 @@ public sealed record GenerationRequest
     /// <summary>Literal substrings that end generation when they appear in the decoded text.</summary>
     public IReadOnlyList<string>? Stop { get; init; }
 
+    /// <summary>Additive penalty on each token already present in prompt plus generated output. In [-2, 2]; 0 disables it.</summary>
+    public float PresencePenalty { get; init; } = 0f;
+
+    /// <summary>Additive penalty scaled by how often each token appears in prompt plus generated output. In [-2, 2]; 0 disables it.</summary>
+    public float FrequencyPenalty { get; init; } = 0f;
+
+    /// <summary>Per-token logit offsets added at every sampling step, keyed by token string or numeric token id; values in [-100, 100]. Null disables them.</summary>
+    public IReadOnlyDictionary<string, float>? LogitBias { get; init; }
+
+    /// <summary>True reports per-generated-token log probabilities on the result and inside streamed deltas.</summary>
+    public bool LogProbs { get; init; } = false;
+
+    /// <summary>Highest-probability candidates reported alongside each sampled token. In [0, 20]; only used when <see cref="LogProbs"/> is set.</summary>
+    public int TopLogprobs { get; init; } = 0;
+
+    /// <summary>Declared tools whose schemas are injected into the rendered chat prompt and whose names the fenced-JSON detector accepts. Null declares none. Chat requests only.</summary>
+    public IReadOnlyList<ToolDefinition>? Tools { get; init; }
+
+    /// <summary>How tool use is constrained: auto (default), none (no injection, no detection), or a forced declared function. Null means auto.</summary>
+    public ToolChoiceSelection? ToolChoice { get; init; }
+
     /// <summary>True invokes <see cref="OnToken"/> with each decoded piece as it is produced.</summary>
     public bool Stream { get; init; }
 

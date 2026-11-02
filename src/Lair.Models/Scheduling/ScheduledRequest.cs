@@ -23,4 +23,10 @@ public sealed record ScheduledRequest
 
     /// <summary>Streaming sink invoked on the scheduler thread with each sampled token id, before it is forwarded.</summary>
     public Action<int>? OnTokenId { get; init; }
+
+    /// <summary>
+    /// When set, the scheduler captures a <see cref="TokenLogprob"/> entry for every generated token from its own
+    /// sampling step, reporting this many top candidates; null captures nothing.
+    /// </summary>
+    public int? LogProbTopN { get; init; } = null;
 }

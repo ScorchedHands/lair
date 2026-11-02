@@ -301,8 +301,8 @@ Many requests at once, tuned, with live reconfiguration.
   - Verify: `dotnet test -c Release --filter Category=Cache` — 6/6 ✅ on real SmolLM-F16: shared 127-token prefix → second request skips 112 prefill tokens with byte-identical output vs cold run; CoW copy verified bit-safe for the original sequence; LRU eviction never touches blocks referenced by active sequences; refcount release ordering tested. Cache lifetime = pool lifetime (covers reload/quant/block-size invalidation this phase).
 - [✓] Cancellation — abort sequences mid-batch-step without stalling the rest of the batch (see DN-M2-4)
   - Verify: `dotnet test -c Release --filter Category=Cancel` — 6/6 ✅ concurrent peers bit-identical to a no-cancel baseline; every block of an aborted sequence reclaimed (mid-decode, mid-prefill-chunk, and at-admission cases); stop literals now end the sequence early via a linked CTS (gap found: first-token stops previously no-op'd). HTTP client-abort contract covered live (`RequestAborted` already wired through both API paths; new test proves server stays healthy after mid-stream hang-up).
-- [→] API completeness — tool calls, logprobs, penalties, `logit_bias`, seed (see DN-M2-8, DN-M2-10)
-  - Verify: `dotnet test --filter "Category=Api"` extended cases — penalties alter sampling deterministically under seed; `logit_bias` shifts chosen tokens; `logprobs`/`top_logprobs` present and normalized; tool schemas injected into rendered prompts; fenced-JSON detector emits `tool_calls` wire shape (unit-level per DN-M2-10). OpenAI SDK round-trip probe at ship.
+- [✓] API completeness — tool calls, logprobs, penalties, `logit_bias`, seed (see DN-M2-8, DN-M2-10)
+  - Verify: `dotnet test -c Release --filter Category=Api` — 49/49 ✅ incl. 14 sampling-param cases (penalties alter seeded output deterministically; logit_bias flips the first greedy token, numeric AND token-string keys; logprobs normalized with chosen token included) and 24 tool cases (schema injection proven by prompt growth, `tool_choice: none` inertness, strict fenced-JSON detector incl. pretty→compact arguments, malformed-tools 400s naming fields, SSE complete-call deltas + `[DONE]`). Model-side call emission intentionally not demanded of the fixture (DN-M2-10). OpenAI SDK round-trip probe at ship.
 - [_] Metrics bus — engine counters + OS/driver stats streamed to logs and CLI monitor (see DN-M2-7)
   - Verify: JSON log lines carry per-model counters; `lair monitor` command renders live stats during load.
 - [_] Embeddings groundwork — encoder-only forward pass, no endpoint yet
@@ -319,7 +319,7 @@ Many requests at once, tuned, with live reconfiguration.
 - [✓] Automated Cache: prefix hit, CoW integrity, LRU eviction — 6/6 (Release)
 - [✓] Automated Cancel: abort isolation and block reclamation — 6/6 (Release) incl. HTTP client-abort health
 - [_] Automated HotReload: watcher detection, mutation-class enforcement, mid-serving application
-- [_] Automated API: tool calls, logprobs, penalties, seed reproducibility via SDK scripts
+- [✓] Automated API: tool calls, logprobs, penalties, seed reproducibility via SDK scripts — 49/49 (Release); SDK round-trip at ship
 - [_] Manual Monitor-lite: `lair monitor` live stats under mixed load
 
 ### MVP3 [v0.3.0] - Refined

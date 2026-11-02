@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
 using Lair.Host.Config;
+using Lair.Models.Scheduling;
 using Lair.Tokenizer.Templating;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -86,7 +87,7 @@ public static class ApiApp
         // A HttpContext-only lambda binds to the RequestDelegate overload, which discards a returned
         // IResult, so the result is executed explicitly here.
         app.MapPost("/v1/chat/completions", async (HttpContext http) =>
-            await HandleChat(await ReadBodyAsync<ChatCompletionBody>(http.Request), gen, http).ExecuteAsync(http));
+            await HandleChat(await ReadChatBodyAsync(http.Request), gen, http).ExecuteAsync(http));
 
         app.MapPost("/v1/completions", async (HttpContext http) =>
             await HandleCompletion(await ReadBodyAsync<CompletionBody>(http.Request), gen, http).ExecuteAsync(http));
@@ -114,11 +115,18 @@ public static class ApiApp
 
     private const string RequestAuditKey = "lair.request.audit";
 
-    private static IResult HandleChat(ChatCompletionBody body, GenerationService gen, HttpContext http)
+    private static IResult HandleChat(ChatRequestInput input, GenerationService gen, HttpContext http)
     {
+        ChatCompletionBody body = input.Body;
+
         if (body.Messages is null || body.Messages.Count == 0)
         {
             return InvalidRequest("a chat request requires a non-empty 'messages' list");
+        }
+
+        if (SamplingRangeError(body.PresencePenalty, body.FrequencyPenalty, body.TopLogprobs) is string rangeError)
+        {
+            return InvalidRequest(rangeError);
         }
 
         GenerationRequest request = new()
@@ -132,6 +140,13 @@ public static class ApiApp
             TopK = body.TopK ?? 40,
             Seed = body.Seed,
             Stop = body.Stop,
+            PresencePenalty = body.PresencePenalty ?? 0f,
+            FrequencyPenalty = body.FrequencyPenalty ?? 0f,
+            LogitBias = body.LogitBias,
+            LogProbs = body.LogProbs ?? false,
+            TopLogprobs = body.TopLogprobs ?? 0,
+            Tools = input.Tools.Count > 0 ? input.Tools : null,
+            ToolChoice = input.ToolChoice.Mode == ToolChoiceMode.Auto ? null : input.ToolChoice,
             Stream = body.Stream ?? false,
         };
 
@@ -145,6 +160,11 @@ public static class ApiApp
             return InvalidRequest("a completion request requires a 'prompt'");
         }
 
+        if (SamplingRangeError(body.PresencePenalty, body.FrequencyPenalty, body.TopLogprobs) is string rangeError)
+        {
+            return InvalidRequest(rangeError);
+        }
+
         GenerationRequest request = new()
         {
             Model = body.Model ?? string.Empty,
@@ -156,11 +176,23 @@ public static class ApiApp
             TopK = body.TopK ?? 40,
             Seed = body.Seed,
             Stop = body.Stop,
+            PresencePenalty = body.PresencePenalty ?? 0f,
+            FrequencyPenalty = body.FrequencyPenalty ?? 0f,
+            LogitBias = body.LogitBias,
+            LogProbs = body.LogProbs ?? false,
+            TopLogprobs = body.TopLogprobs ?? 0,
             Stream = body.Stream ?? false,
         };
 
         return RunGeneration(request, gen, http);
     }
+
+    // Sampling-knob ranges checked before the request reaches the engine; null means every value is in range.
+    private static string? SamplingRangeError(float? presencePenalty, float? frequencyPenalty, int? topLogprobs) =>
+        presencePenalty is < -2f or > 2f ? $"'presence_penalty' must be in [-2, 2], got {presencePenalty}." :
+        frequencyPenalty is < -2f or > 2f ? $"'frequency_penalty' must be in [-2, 2], got {frequencyPenalty}." :
+        topLogprobs is < 0 or > 20 ? $"'top_logprobs' must be in [0, 20], got {topLogprobs}." :
+        null;
 
     private static IResult InvalidRequest(string message) =>
         Results.Json(
@@ -185,8 +217,8 @@ public static class ApiApp
         AuditOf(http)?.Completion(result);
 
         return request.IsChat
-            ? Results.Json(BuildChatCompletion(request.Model, result))
-            : Results.Json(BuildTextCompletion(request.Model, result));
+            ? Results.Json(BuildChatCompletion(request, gen, result))
+            : Results.Json(BuildTextCompletion(request, gen, result));
     }
 
     private static async Task StreamCompletionsAsync(GenerationRequest request, GenerationService gen, Stream stream, HttpContext http)
@@ -208,11 +240,35 @@ public static class ApiApp
         GenerationResult result = await gen.GenerateAsync(pump, http.RequestAborted);
         AuditOf(http)?.Completion(result);
 
-        foreach (string piece in pieces)
+        if (request.LogProbs && result.LogProbs is { Count: > 0 } entries)
         {
-            await WriteChunkAsync(stream, new ChunkPayload(
-                completionId, "chat.completion.chunk", created, model,
-                [new ChunkChoice(0, new ChunkDelta(Content: piece), null)]), http);
+            // With logprobs on, every generated token gets its own content chunk carrying its logprob entry.
+            foreach (TokenLogprob entry in entries)
+            {
+                await WriteChunkAsync(stream, new ChunkPayload(
+                    completionId, "chat.completion.chunk", created, model,
+                    [new ChunkChoice(0, new ChunkDelta(Content: gen.DecodeToken(entry.TokenId), Logprobs: WireEntry(gen, entry)), null)]), http);
+            }
+        }
+        else
+        {
+            foreach (string piece in pieces)
+            {
+                await WriteChunkAsync(stream, new ChunkPayload(
+                    completionId, "chat.completion.chunk", created, model,
+                    [new ChunkChoice(0, new ChunkDelta(Content: piece), null)]), http);
+            }
+        }
+
+        if (result.ToolCalls is { Count: > 0 } recognized)
+        {
+            // Recognized calls arrive after every content delta as complete-call deltas, one chunk per call in document order; the fenced text that produced them was already delivered in those deltas. Each carries its own generated id and compact arguments string.
+            foreach (ToolCallWire wire in WireCalls(recognized) ?? [])
+            {
+                await WriteChunkAsync(stream, new ChunkPayload(
+                    completionId, "chat.completion.chunk", created, model,
+                    [new ChunkChoice(0, new ChunkDelta(ToolCalls: [wire]), null)]), http);
+            }
         }
 
         await WriteChunkAsync(stream, new ChunkPayload(
@@ -256,26 +312,64 @@ public static class ApiApp
             ?? throw new ArgumentException("the request body deserialized to null; expected a JSON object for this endpoint.");
     }
 
-    private static ChatCompletionResponse BuildChatCompletion(string model, GenerationResult result) =>
+    // The chat body plus its tool fields resolved while the parsed document is still alive, so no JsonElement outlives it.
+    private sealed record ChatRequestInput(ChatCompletionBody Body, IReadOnlyList<ToolDefinition> Tools, ToolChoiceSelection ToolChoice);
+
+    private static async Task<ChatRequestInput> ReadChatBodyAsync(HttpRequest request)
+    {
+        using JsonDocument document = await JsonDocument.ParseAsync(request.Body, cancellationToken: request.HttpContext.RequestAborted);
+        ChatCompletionBody body = document.RootElement.Deserialize<ChatCompletionBody>(RequestJson)
+            ?? throw new ArgumentException("the request body deserialized to null; expected a JSON object for this endpoint.");
+
+        IReadOnlyList<ToolDefinition> tools = ToolWire.ParseTools(document.RootElement);
+        ToolChoiceSelection toolChoice = ToolWire.ParseChoice(document.RootElement, tools);
+        return new ChatRequestInput(body, tools, toolChoice);
+    }
+
+    private static ChatCompletionResponse BuildChatCompletion(GenerationRequest request, GenerationService gen, GenerationResult result) =>
         new(
             "chatcmpl-" + Guid.NewGuid().ToString("N"),
             "chat.completion",
             DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-            model,
-            [new ChatChoice(0, new ChatMessage("assistant", result.Text), result.FinishReason)],
+            request.Model,
+            [new ChatChoice(0, new AssistantMessage("assistant", result.Text, WireCalls(result.ToolCalls)), result.FinishReason, LogProbsReportOf(request, gen, result))],
             UsageOf(result));
 
-    private static TextCompletionResponse BuildTextCompletion(string model, GenerationResult result) =>
+    private static TextCompletionResponse BuildTextCompletion(GenerationRequest request, GenerationService gen, GenerationResult result) =>
         new(
             "cmpl-" + Guid.NewGuid().ToString("N"),
             "text_completion",
             DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-            model,
-            [new TextChoice(0, result.Text, result.FinishReason)],
+            request.Model,
+            [new TextChoice(0, result.Text, result.FinishReason, LogProbsReportOf(request, gen, result))],
             UsageOf(result));
+
+    // The logprobs report rides on the choice only when the request asked for it; its entries mirror the
+    // generated tokens in order, each carrying the sampled distribution's top candidates.
+    private static LogProbsReport? LogProbsReportOf(GenerationRequest request, GenerationService gen, GenerationResult result) =>
+        request.LogProbs
+            ? new LogProbsReport([.. (result.LogProbs ?? []).Select(entry => WireEntry(gen, entry))])
+            : null;
+
+    private static LogProbEntry WireEntry(GenerationService gen, TokenLogprob entry) =>
+        new(
+            entry.TokenId,
+            gen.DecodeToken(entry.TokenId),
+            entry.LogProb,
+            entry.TopLogProbs.Count == 0
+                ? null
+                : [.. entry.TopLogProbs.Select(top => new LogProbEntry(top.TokenId, gen.DecodeToken(top.TokenId), top.LogProb, null))]);
 
     private static Usage UsageOf(GenerationResult result) =>
         new(result.PromptTokens, result.CompletionTokens, result.PromptTokens + result.CompletionTokens);
+
+    // Recognized calls take the OpenAI wire shape: a generated id per call, the function type, and arguments as a compact JSON string.
+    private static IReadOnlyList<ToolCallWire>? WireCalls(IReadOnlyList<ToolCall>? calls) =>
+        calls is { Count: > 0 }
+            ? [.. calls.Select(call => new ToolCallWire(ToolCallId(), "function", new FunctionCallWire(call.Name, call.Arguments)))]
+            : null;
+
+    private static string ToolCallId() => "call_" + Guid.NewGuid().ToString("N")[..12];
 
     private static RequestAudit? AuditOf(HttpContext http) =>
         http.Items.TryGetValue(RequestAuditKey, out object? value) ? value as RequestAudit : null;
