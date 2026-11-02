@@ -370,9 +370,9 @@ Security (accepted): SPA is static files on the existing Kestrel endpoint (loopb
 
 #### Tests
 
-- [_] Automated MonitorUi: versioned snapshot stream, `Last-Event-ID` replay, bounded request ring, subscriber coalescing
-- [_] Manual Monitor: configured-models panel first with expandable rows; per-model stats; in-flight + recent rows with tok/s sparklines; placeholder tiles; sub-second updates
-- [_] Manual Chat UI: LLM-only model selector, streamed multi-turn chat, mid-stream abort, tool-call card rendering against the live server
+- [✓] Automated MonitorUi: versioned snapshot stream, `Last-Event-ID` replay, bounded request ring, subscriber coalescing — 7/7 (targeted)
+- [✓] Manual Monitor: configured-models panel first with expandable rows; per-model stats; in-flight + recent rows with tok/s sparklines; placeholder tiles; sub-second updates — verified live ✅ against serve: `/ui` shell 200 with assets (`app.css`, `app.js`) and SPA fallback; stream carried request_start×2/update×3/complete×2/snapshot×2 all id-stamped with token sample arrays during chat+completion load; Last-Event-ID reconnect replayed snapshot + resync; jsdom harness vs built bundle 38/38 (KPI updates, live model-row expansion, in-flight lifecycle, sparkline points from samples, badge offline→reconnecting→live).
+- [✓] Manual Chat UI: LLM-only model selector, streamed multi-turn chat, mid-stream abort, tool-call card rendering against the live server — verified live ✅: curl SSE capture matched client parse shapes (role → content deltas → finish chunk → `[DONE]`); real-bundle harness 11/11 on live serve incl. multi-turn replay accepted and genuine mid-stream cut with working next send; jsdom smoke 29/29 (embed model excluded via additive `/v1/models type`, tool cards in both wire shapes, inline error bubble keeps composer usable).
 
 ### MVP4 [v0.4.0] - Refined
 
