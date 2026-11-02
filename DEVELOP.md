@@ -6,17 +6,20 @@
 dotnet build Lair.sln
 ```
 
-Target framework: net10.0. Solution layout: `src/Lair.*` projects (Core, Loader, Backends.Cpu, Kv, Tokenizer, Sampling, Models, Api, Host), `tests/Lair.Tests`, `bench/Lair.Bench`.
+Target framework: net10.0. Solution layout: `src/Lair.*` projects (Core, Loader, Backends.Cpu, Kv, Tokenizer, Sampling, Models, Api, Host), `tests/Lair.Tests`, `bench/Lair.Bench`. The continuous-batch scheduler lives in `src/Lair.Models/Scheduling/`; the metrics bus and monitor stream in `src/Lair.Api/Monitoring/`; the config watcher and change-application bus in `src/Lair.Host/ConfigWatcher.cs` + `src/Lair.Api/Config/ConfigReload.cs`.
 
 ## Test
 
 ```powershell
 dotnet test Lair.sln                          # full suite
+dotnet test Lair.sln -c Release               # full suite, optimized (required for perf gates)
 dotnet test Lair.sln --filter Category=Parity # golden parity vs pinned llama.cpp
 dotnet test Lair.sln --filter Category=Kernel # kernel oracle comparisons
 ```
 
-Test categories: `Loader`, `Tokenizer`, `Template`, `Kernel`, `Layers`, `Kv`, `Sampling`, `Api`, `Cli`, `Config`, `Parity`, `Calib`.
+Test categories: `Loader`, `Tokenizer`, `Template`, `Kernel`, `Layers`, `Kv`, `Sampling`, `Api`, `Cli`, `Config`, `Parity`, `Calib`, `Concurrency`, `Prefill`, `Cache`, `Cancel`, `HotReload`, `Metrics`, `Embeddings`, `Affinity`.
+
+Performance gates (inter-token latency budgets in `ConcurrencyTests`/`PrefillTests`) are only meaningful under `-c Release` — Debug JIT inflates kernels ~4.6× and the absolute budgets cannot reproduce there. Correctness suites pass in both configurations.
 
 Model fixtures live in `models/` (gitignored). Tests locate them via `ModelFixture.Resolve()` / `ModelFixture.ResolveRepoRelative(path)` and skip gracefully when a file is absent — so on a fresh clone the real-model cases (including Parity) no-op until models are placed.
 
@@ -52,4 +55,7 @@ copy lair.example.yaml lair.yaml   # point at a real model
 dotnet run --project src/Lair.Host -- serve -c lair.yaml
 curl http://127.0.0.1:8080/healthz
 dotnet run --project src/Lair.Host -- chat -c lair.yaml
+dotnet run --project src/Lair.Host -- monitor   # live engine stats table from the serving server
 ```
+
+Editing `lair.yaml` while `serve` runs hot-reloads live knobs (batch width, thread quota, KV budget) and new-request-only knobs; restart-only fields are refused with a log line.
