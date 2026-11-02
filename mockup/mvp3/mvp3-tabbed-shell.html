@@ -1,0 +1,198 @@
+<!--
+  phase: MVP3
+  component: tabbed-shell (Monitor + Chat tabs)
+  derives-from: mvp3-tabbed-shell.html rev A (same file, owner review 2026-11-02)
+
+  decisions:
+  - tabbed shell, Monitor | Chat, one shared stylesheet: LOCKED (owner 2026-11-02)
+  - dark developer-tool theme: proposed, confirm in review
+  - monitor shows ALL models; no header model selector: LOCKED (owner 2026-11-02)
+  - "Configured models" is the first panel; per-model stats (tok/s, seqs/step, KV, cache hit,
+    workers, VRAM reserved) live on the model rows, not in the top KPI cards: LOCKED (owner 2026-11-02)
+  - model rows expand vertically for config + state (cache blocks by location per model,
+    finish-reason tallies, experts hot/cold when MoE exists): LOCKED (owner 2026-11-02)
+  - in-flight and recent request rows carry tok/s + inline sparkline of tok/s over the request: LOCKED (owner 2026-11-02)
+    -> contract implication: the event schema must include per-request tok/s sample series
+  - chat tab owns the model selector, filtered to LLM (chat-type) models only: LOCKED (owner 2026-11-02)
+  - GPU / PCIe / power / temperature tiles: shown as placeholders until the CUDA phase (DN-M3-3)
+  - live transport: LOCKED — SSE reusing /monitor/stream + Last-Event-ID replay from the snapshot ring (owner 2026-11-02).
+    Rejected: WebSocket/SignalR — monitor is read-only, bidirectionality unused.
+  - chat component library: LOCKED — shadcn primitives + hand-rolled SSE client (owner 2026-11-02).
+    Rejected: assistant-ui (MIT but pulls Vercel AI SDK runtime tree; features unused here), fully hand-rolled (accessibility for free via shadcn), Blazor (engine coupling), polling-only UI (fails real-time).
+  - theme: LOCKED — dark developer-tool palette (owner 2026-11-02).
+  - APPROVED 2026-11-02 (rev B): this mockup is the verbatim spec for the production SPA.
+  - this mockup is static with a fake live ticker; production subscribes to the live stats stream.
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>lair — mockup: tabbed shell (rev B)</title>
+  <link rel="stylesheet" href="mvp3-shared.css">
+</head>
+<body>
+  <header class="app">
+    <span class="brand">LAIR</span>
+    <span class="badge">serving</span>
+    <span style="margin-left:auto" class="meta">http://127.0.0.1:8080 · up 04:12</span>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" aria-selected="true" data-tab="monitor">Monitor</button>
+    <button role="tab" aria-selected="false" data-tab="chat">Chat</button>
+  </nav>
+
+  <main>
+    <!-- ================= MONITOR TAB ================= -->
+    <section id="tab-monitor">
+      <div class="grid">
+        <div class="card"><div class="label">decode tok/s</div><div class="value" id="toks">27.4</div><div class="sub">cpu in use</div></div>
+        <div class="card"><div class="label">step time</div><div class="value" id="stepms">36 ms</div><div class="sub">p95 41 ms</div></div>
+        <div class="card"><div class="label">cache hit</div><div class="value" id="hit">62%</div><div class="sub">engine-wide prefix reuse</div></div>
+        <div class="card"><div class="label">active reqs</div><div class="value" id="active">2</div><div class="sub">queued 0</div></div>
+      </div>
+
+      <section class="block">
+        <h2>Configured models</h2>
+        <table>
+          <thead><tr><th></th><th>model</th><th>device</th><th>decode tok/s</th><th>seqs/step</th><th>KV used</th><th>cache hit</th><th>workers</th><th>VRAM</th></tr></thead>
+          <tbody>
+            <tr class="model-row">
+              <td class="expand" title="expand">▾</td>
+              <td>smollm-135m-instruct<br><span class="meta">chat · q8_0</span></td>
+              <td>cpu</td>
+              <td>27.4</td>
+              <td>2.00</td>
+              <td><div class="bar kv"><span style="width:56%"></span></div>54/96</td>
+              <td>62%</td>
+              <td>24</td>
+              <td><span class="meta">reserved —</span></td>
+            </tr>
+            <tr class="detail-row">
+              <td></td>
+              <td colspan="8">
+                <div class="detail-grid">
+                  <div><div class="label">context / block size</div><div class="val">1024 / 16</div></div>
+                  <div><div class="label">kv_blocks budget</div><div class="val">96 (soft cap)</div></div>
+                  <div><div class="label">core set / quota</div><div class="val">0-23 / —</div></div>
+                  <div><div class="label">prefill · decode · kv residency</div><div class="val">cpu · cpu · dram</div></div>
+                  <div><div class="label">cache blocks (DRAM)</div><div class="val">prefix 18 · active 36 · free 42</div></div>
+                  <div><div class="label">finish tallies</div><div class="val">stop 12 · length 5 · abort 1 · tool_calls 2</div></div>
+                  <div><div class="label">experts hot / cold</div><div class="val">n/a — dense model (MoE phase adds tier counts)</div></div>
+                  <div><div class="label">model RAM</div><div class="val">1.9 GB weights · 0.5 GB KV</div></div>
+                </div>
+              </td>
+            </tr>
+            <tr class="model-row">
+              <td class="expand" title="expand">▸</td>
+              <td>modernbert-embed<br><span class="meta">embed · f16</span></td>
+              <td>cpu</td>
+              <td>—</td>
+              <td>—</td>
+              <td><span class="meta">n/a</span></td>
+              <td>—</td>
+              <td>4</td>
+              <td><span class="meta">reserved —</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="block">
+        <h2>In-flight requests</h2>
+        <table>
+          <thead><tr><th>id</th><th>model</th><th>endpoint</th><th>prompt tok</th><th>gen tok</th><th>cached</th><th>tok/s</th><th></th><th>elapsed</th><th></th></tr></thead>
+          <tbody>
+            <tr>
+              <td>9f2c…a1</td><td>smollm-135m</td><td>chat/completions</td><td>127</td><td id="gen1">18</td><td>112</td><td id="tps1">28.1</td>
+              <td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,14 10,10 20,11 30,8 40,9 50,7 60,8 70,6 80,7 90,5"/></svg></td>
+              <td id="el1">1.2 s</td><td><span class="tag stream">streaming</span></td>
+            </tr>
+            <tr>
+              <td>4b70…0d</td><td>smollm-135m</td><td>completions</td><td>407</td><td id="gen2">3</td><td>0</td><td id="tps2">—</td>
+              <td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,16 15,16 30,16 45,16 60,12 75,8 90,6"/></svg></td>
+              <td id="el2">2.8 s</td><td><span class="tag stream">prefill chunk 24/51</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="block">
+        <h2>Recent requests (X = 5, configurable)</h2>
+        <table>
+          <thead><tr><th>id</th><th>model</th><th>status</th><th>finish</th><th>tok p/c</th><th>avg tok/s</th><th></th><th>duration</th></tr></thead>
+          <tbody>
+            <tr><td>77aa…31</td><td>smollm-135m</td><td><span class="tag done">200</span></td><td>stop</td><td>31 / 24</td><td>22.7</td><td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,12 15,9 30,10 45,8 60,9 75,7 90,8"/></svg></td><td>1.1 s</td></tr>
+            <tr><td>e0c4…9f</td><td>smollm-135m</td><td><span class="tag done">200</span></td><td>length</td><td>407 / 32</td><td>7.0</td><td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,16 20,16 40,16 55,10 70,7 90,6"/></svg></td><td>4.6 s</td></tr>
+            <tr><td>1b8d…55</td><td>smollm-135m</td><td><span class="tag err">499</span></td><td>client abort</td><td>18 / 7</td><td>7.8</td><td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,10 20,8 40,9 60,7 80,8"/></svg></td><td>0.9 s</td></tr>
+            <tr><td>c3f1…72</td><td>smollm-135m</td><td><span class="tag done">200</span></td><td>tool_calls</td><td>96 / 21</td><td>15.0</td><td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,13 15,10 30,11 45,9 60,10 75,8 90,9"/></svg></td><td>1.4 s</td></tr>
+            <tr><td>aa02…18</td><td>smollm-135m</td><td><span class="tag done">200</span></td><td>stop</td><td>127 / 19</td><td>23.8</td><td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,11 15,9 30,9 45,8 60,8 75,7 90,7"/></svg></td><td>0.8 s</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <div class="grid">
+        <div class="card placeholder"><div class="label">GPU util</div><div class="value">—</div><div class="sub">awaiting CUDA phase</div></div>
+        <div class="card placeholder"><div class="label">PCIe transfer</div><div class="value">—</div><div class="sub">awaiting CUDA phase</div></div>
+        <div class="card"><div class="label">process RAM</div><div class="value">2.4 GB</div><div class="sub">engine working set</div></div>
+        <div class="card"><div class="label">CPU power</div><div class="value">—</div><div class="sub">not exposed on Windows (backlog)</div></div>
+      </div>
+    </section>
+
+    <!-- ================= CHAT TAB ================= -->
+    <section id="tab-chat" hidden>
+      <div class="chat">
+        <div class="meta">
+          model:
+          <select id="chat-model" style="background:var(--panel-2);color:var(--text);border:1px solid var(--border);border-radius:var(--radius);padding:2px 6px">
+            <option>smollm-135m-instruct (chat)</option>
+          </select>
+          · temp 0.7 · max tokens 256 · SSE streaming · selector lists LLM models only
+        </div>
+        <div class="messages">
+          <div class="msg user">Explain what a KV cache is in one short paragraph.</div>
+          <div class="msg assistant">A KV cache stores the key and value vectors computed for earlier tokens so the model does not recompute them when generating each new token. It grows with the sequence and is the main memory cost of inference.</div>
+          <div class="msg user">Now use the calculator tool for 12*12.</div>
+          <div class="msg assistant">
+            Computing that for you.
+            <div class="tool">tool call → calculator { "expression": "12*12" } · result 144</div>
+          </div>
+          <div class="msg user">Write a haiku about paged memory.</div>
+          <div class="msg assistant streaming">Blocks of sixteen tokens, mapped like pages of a book —</div>
+        </div>
+        <div class="composer">
+          <input type="text" placeholder="Send a message…" value="">
+          <button class="btn stop">Stop</button>
+          <button class="btn">Send</button>
+        </div>
+        <div class="meta">abort mid-stream keeps the engine healthy · tool calls rendered from the fenced-JSON detector</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const tabs = document.querySelectorAll('nav.tabs button');
+    tabs.forEach(t => t.addEventListener('click', () => {
+      tabs.forEach(x => x.setAttribute('aria-selected', x === t));
+      document.getElementById('tab-monitor').hidden = t.dataset.tab !== 'monitor';
+      document.getElementById('tab-chat').hidden = t.dataset.tab !== 'chat';
+    }));
+    document.querySelectorAll('td.expand').forEach(td => td.addEventListener('click', () => {
+      const row = td.closest('tr').nextElementSibling;
+      if (row && row.classList.contains('detail-row')) {
+        row.hidden = !row.hidden;
+        td.textContent = row.hidden ? '▸' : '▾';
+      }
+    }));
+    // fake live ticker so the mockup shows what the live stream will drive
+    setInterval(() => {
+      const j = (v, jit) => (v + (Math.random() - 0.5) * jit).toFixed(1);
+      document.getElementById('toks').textContent = j(27.4, 3);
+      document.getElementById('stepms').textContent = j(36, 6) + ' ms';
+      document.getElementById('gen1').textContent = (+document.getElementById('gen1').textContent + 1);
+      document.getElementById('tps1').textContent = j(28, 4);
+      document.getElementById('el1').textContent = (+document.getElementById('el1').textContent.replace(' s','') + 0.7).toFixed(1) + ' s';
+    }, 900);
+  </script>
+</body>
+</html>

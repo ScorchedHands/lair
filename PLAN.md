@@ -325,41 +325,51 @@ Many requests at once, tuned, with live reconfiguration.
 - [✓] Automated API: tool calls, logprobs, penalties, seed reproducibility via SDK scripts — 49/49 (Release); SDK round-trip ✅ at ship
 - [✓] Manual Monitor-lite: `lair monitor` live stats under mixed load — verified live: table rendered against serve under shared-prefix chats + long completion; KV used rose 3→55/96 with `active=1` during decode, cache-hit % climbed 50→100% on prefix reuse, tok/s + step-ms updated per tick (Debug-JIT rates), clean exit.
 
-### MVP3 [v0.3.0] - Tentative
+### MVP3 [v0.3.0] - Refined
 
 Operators see the engine live in a browser and can test it with a built-in chat UI — no external client needed.
 
 #### Design Notes
 
-- **DN-M3-1** — Monitor Web UI: lightweight static SPA (TypeScript, esbuild) served by Kestrel; WebSocket stats stream from the metrics bus; recent-request ring buffer (configurable X).
-  - Rationale: the engine stays free of frontend runtime coupling; the metrics bus already exists.
-  - Rejected: Blazor (runtime coupling to engine host); polling-only UI (fails the real-time requirement).
-  - Contract: `lair.monitor` WS schema (additive-only, versioned field).
+- **DN-M3-1** — Monitor Web UI: lightweight static SPA (TypeScript, esbuild) served by Kestrel at `/ui`; live stats over SSE reusing `/monitor/stream` with `Last-Event-ID` replay from the snapshot ring.
+  - Rationale: the engine stays free of frontend runtime coupling; the metrics bus already streams SSE, and the monitor is read-only — bidirectional transport buys nothing.
+  - Rejected: WebSocket/SignalR (bidirectionality unused while the monitor is read-only; new framing/hub machinery); Blazor (runtime coupling to engine host); polling-only UI (fails the real-time requirement).
+  - Contract: `lair.monitor` event schema over SSE (additive-only, versioned field), including per-request tok/s sample series for in-flight/recent request sparklines.
   - Carried forward from the multi-model phase design (formerly DN-M4-4) when the UI was pulled ahead of CUDA.
-- **DN-M3-2 (proposed)** — Chat test UI: a simple chat surface for exercising the served model from the same browser — streaming replies, tool-call display, abort. Component-stack candidates to compare during refine: assistant-ui (React; batteries-included chat primitives, but heavier dependency tree and a stricter license) vs shadcn/ui (MIT; copy-in primitives, more assembly work, simpler build story); alternative: hand-rolled chat view in the same SPA. Decision criteria: license fit, streaming/SSE ergonomics, tool-call rendering support, build integration with the esbuild pipeline.
+- **DN-M3-2** — Chat test UI: shadcn primitives + a hand-rolled OpenAI-compatible SSE client; the Chat tab's model selector lists LLM (chat-type) models only.
+  - Rationale: for a test client, a chat-runtime library's machinery (thread persistence, branching, cloud hooks) is dead weight; hand-rolling the SSE consumption doubles as a conformance check of LAIR's own API. License was never the differentiator — assistant-ui and shadcn are both MIT (verified 2026-11-02).
+  - Rejected: assistant-ui (MIT, but pulls the Vercel AI SDK runtime tree for features this surface won't use); fully hand-rolled (shadcn primitives provide accessibility and composition for free).
   - Contract: chat surface consumes only public API endpoints (`/v1/chat/completions` SSE, `/v1/models`); no privileged engine access — the UI is a client like any other.
-- **DN-M3-3 (proposed)** — UI scope for this phase: the full observability surface from Scope (in-flight requests with per-request stats, per-model machine usage breakdown, cache usage with location, recent-X request log) is the target; GPU/PCIe/power/temperature tiles render only where the platform exposes them (CPU/RAM tiles live now; GPU tiles arrive with the CUDA phase).
-  - Contract: WS schema fields are additive — later phases add tiles without reshaping existing ones.
-- **DN-M3-4 (proposed)** — Tabbed shell with a shared stylesheet: one SPA, two tabs — Monitor and Chat — sharing a single stylesheet/design system; the tab shell is the mockup baseline before any production code.
+- **DN-M3-3** — UI information architecture: "Configured models" is the primary panel — one row per model with per-model stats (decode tok/s, seqs/step, KV used/cap, cache hit, workers, VRAM reserved) and expandable rows revealing config + state (context/block size, kv budget, core set/quota, prefill·decode·residency, cache blocks by location per model, finish-reason tallies, expert tier counts when MoE exists, model RAM). Request rows (in-flight + recent) carry tok/s + inline sparkline. GPU/PCIe/power/temperature tiles render as placeholders until the CUDA phase.
+  - Rationale: stats belong where they're attributable; engine-level KPI cards stay few, model detail lives on the model rows (owner review 2026-11-02).
+  - Contract: event schema fields are additive — later phases add tiles without reshaping existing ones; scheduler exposes per-sequence token-timestamp series.
+- **DN-M3-4** — Tabbed shell, shared stylesheet, locked dark developer-tool theme: one SPA, two tabs (Monitor, Chat), one design system; the approved mockup is the verbatim spec for production code.
   - Rationale: one design system keeps the operator surface coherent and lets the chat tab double as a live test client for the monitor's data.
-  - Contract: `mockup/mvp3/` holds the tabbed mockups (shared stylesheet file + per-tab pages); production SPA derives from the approved mockups verbatim.
+  - Contract: `mockup/mvp3/` holds the approved mockups (`mvp3-tabbed-shell.html` rev B + `mvp3-shared.css`); production SPA derives from them verbatim.
+- **DN-M3-5** — Live data semantics: SSE reconnect replays from the 300-snapshot ring via `Last-Event-ID`; live tail coalesces to latest-per-subscriber with a bounded drop policy for slow consumers; recent-request ring bounded by a config knob (`ui.recent_requests`, live mutation class); UI state is volatile — no persistence.
+  - Rationale: unbounded per-subscriber channels are a memory-growth risk under slow clients; replay must survive refresh/reconnect without engine work.
+  - Contract: EngineMetricsBus subscriber channels gain latest-only coalescing + bounded queue; `ui.recent_requests` hot-reloads live.
+
+Security (accepted): SPA is static files on the existing Kestrel endpoint (loopback default; exposure governed by the server-posture backlog); monitor is read-only; chat uses only public endpoints with the established error taxonomy; no secrets in or behind the UI. Data (accepted): no new persistence — rings are in-memory and volatile; recent list capped at X, no pagination needed at this scale. Contracts (accepted): versioned additive event schema; SSE reconnect semantics via `Last-Event-ID`; idempotency N/A for read-only streams. Observability (accepted): request rows key on the existing `x-lair-request-id`; UI status badge reads `/healthz`; server logs gain connect/disconnect lines for stats subscribers. Resilience (accepted): EventSource auto-reconnect + ring replay; engine restart shows a disconnected state and recovers; quiet-while-prefilling streams show elapsed time rather than stalling. Compliance: N/A — single-operator local runtime; RBAC deferred to server posture. Deployment (accepted): SPA built by pinned npm toolchain, embedded as static assets in the Host build; rollback = app revert; no feature flags. Scale (accepted): fan-out bounded by coalescing + drop policy; snapshot cadence ~2 s while active is trivial load; rate limiting governed by server-posture backlog.
 
 #### Implementation Items
 
-- [_] Tabbed shell + shared stylesheet mockups — Monitor tab and Chat tab in one design system (`mockup/mvp3/`)
-  - Verify: manual — mockups opened in browser and approved before production code; approved state recorded in mockup headers.
-- [_] WS schema + server — versioned stats/request stream from the metrics bus to connected clients (see DN-M3-1, DN-M3-3)
-  - Verify: automated — a test client receives live snapshots during load with versioned field names; ring-buffer request log bounded by config X.
-- [_] Monitor SPA — real-time in-flight requests, per-model CPU/memory/cache breakdown, cache usage by location, recent X request log (see DN-M3-1, DN-M3-4)
-  - Verify: manual — browser shows live in-flight rows updating sub-second, per-model bars, cache breakdown, and completed-request log.
-- [_] Chat test UI — chat surface for exercising the served model: streaming replies, abort, tool-call display (see DN-M3-2, DN-M3-4)
-  - Verify: manual — multi-turn streamed chat against the serving engine, mid-stream abort, tool-call rendering on a parser-produced call.
+- [✓] Tabbed shell + shared stylesheet mockups — Monitor tab and Chat tab in one design system (`mockup/mvp3/`)
+  - Verify: manual — approved 2026-11-02 (rev B): configured-models panel, expandable rows, sparklines, slimmed KPI cards, dark theme locked.
+- [_] SPA build pipeline — esbuild + shadcn init with pinned npm dependencies; built assets embedded in the Host's static file serving at `/ui`
+  - Verify: `dotnet build Lair.sln` then GET `/ui` returns the shell HTML and its stylesheet/JS bundle from embedded assets; npm build reproducible from lockfile.
+- [_] Event schema + stats endpoint — versioned SSE event schema (per-model snapshots, per-request tok/s series, request ring bounded by `ui.recent_requests`) with `Last-Event-ID` replay and latest-only subscriber coalescing
+  - Verify: automated (`Category=MonitorUi`) — a test client receives live snapshots during load with versioned field names, replays missed events after reconnect via `Last-Event-ID`, and the request ring never exceeds X.
+- [_] Monitor SPA — implements the mockup's Monitor tab verbatim: KPI cards, configured-models table with expandable config/state rows, in-flight + recent tables with tok/s sparklines, placeholder tiles (see DN-M3-1, DN-M3-3, DN-M3-4)
+  - Verify: manual — browser shows live in-flight rows updating sub-second under load; model row expansion reveals config + per-model cache blocks and finish tallies; sparklines render for streaming requests; GPU/PCIe tiles show placeholders.
+- [_] Chat tab — shadcn primitives + hand-rolled SSE client: LLM-only model selector, streamed multi-turn replies, mid-stream abort, tool-call rendering (see DN-M3-2, DN-M3-4)
+  - Verify: manual — multi-turn streamed chat against the serving engine; Stop aborts mid-stream and the next request works; a parser-produced tool call renders as a tool card.
 
 #### Tests
 
-- [_] Automated WS: versioned snapshot stream + bounded request ring
-- [_] Manual Monitor: real-time UI behaviors enumerated above
-- [_] Manual Chat UI: streamed multi-turn chat, abort, tool-call display against the live server
+- [_] Automated MonitorUi: versioned snapshot stream, `Last-Event-ID` replay, bounded request ring, subscriber coalescing
+- [_] Manual Monitor: configured-models panel first with expandable rows; per-model stats; in-flight + recent rows with tok/s sparklines; placeholder tiles; sub-second updates
+- [_] Manual Chat UI: LLM-only model selector, streamed multi-turn chat, mid-stream abort, tool-call card rendering against the live server
 
 ### MVP4 [v0.4.0] - Refined
 
@@ -595,4 +605,5 @@ Vision input on chat models.
 - **2026-11-02 — Hot-reload KV budget = soft cap within pinned arena (DN-M2-11).** Physical arenas are reserved at startup; `kv_blocks` hot-edits move the usage ceiling inside the reservation (grow immediate, shrink drains evictable cache); physical re-reservation deferred to the tiered-pools phase.
 - **2026-11-02 — MVP3 inserted for the Web UI; CUDA and later phases shift down one.** New MVP3 [v0.3.0] (Tentative) ships the Monitor Web UI (design carried from the multi-model phase, formerly DN-M4-4 → DN-M3-1) plus a Chat test UI in a tabbed shell with a shared stylesheet (`mockup/mvp3/` mockups precede production code). CUDA becomes MVP4 [v0.4.0], multi-model MVP5 [v0.5.0], Flash-Next MVP6 [v0.6.0], residency MVP7 [v0.7.0], vision MVP8 [v0.8.0]. Rationale: the UI needs no GPU, exercises the shipped CPU engine, and the owner wants to test that engine hands-on now. Chat component stack (assistant-ui vs shadcn/ui vs hand-rolled — license, streaming ergonomics, build integration) is a refine-phase decision.
 - **2026-11-02 — Windows CUDA toolchain found incomplete; MVP4 blocked until repaired.** Registry lists CUDA Development/Toolkit 13.0, but `nvcc.exe` is absent from the toolkit tree and `cublasLt.h`/`nvrtc.h` are missing (runtime DLLs + `cuda_runtime.h` present). WSL Ubuntu-22.04 has nvcc 12.4 but cannot target a Windows .NET host. Recorded as an MVP4 Open Item; repair/reinstall of the developer components (or a binding-strategy change via plan-update) required before `/plan-build` MVP4.
+- **2026-11-02 — MVP3 refined: SSE transport, shadcn + hand-rolled chat, mockup rev B locked as spec.** Live stats reuse `/monitor/stream` SSE with `Last-Event-ID` replay from the snapshot ring (WebSocket/SignalR rejected — read-only monitor needs no bidirectionality); chat tab uses shadcn primitives with a hand-rolled OpenAI-compatible SSE client (assistant-ui rejected as runtime-library weight for a test client; both are MIT — the license difference assumed earlier does not exist); tabbed shell mockup (`mockup/mvp3/`, rev B) approved verbatim as the production spec with the dark theme locked; per-request tok/s series added to the event schema contract; `ui.recent_requests` config knob joins the live mutation class.
 - **2026-11-02 — Benchmarks deferred by owner decision.** Perf/bench verify lines stay pending until requested; the 4090 currently runs other workloads at ~95% utilization. Correctness gates remain active.
