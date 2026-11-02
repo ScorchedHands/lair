@@ -108,7 +108,8 @@ public static class ApiApp
                     "lair",
                     gen.Model.ContextLength,
                     gen.Model.Quant,
-                    gen.Model.Architecture)]);
+                    gen.Model.Architecture,
+                    gen.ModelType)]);
 
             return Results.Json(models, statusCode: 200);
         });

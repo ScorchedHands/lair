@@ -10,7 +10,8 @@
   "scripts": {
     "build": "tsc --noEmit && esbuild src/main.tsx --bundle --minify --sourcemap --outdir=dist --entry-names=app && tailwindcss -i src/app.css -o dist/app.css --minify && node scripts/copy-index.mjs",
     "watch": "node scripts/watch.mjs",
-    "smoke": "node scripts/smoke-monitor.mjs"
+    "smoke": "node scripts/smoke-monitor.mjs",
+    "smoke:chat": "node scripts/smoke-chat.mjs"
   },
   "dependencies": {
     "react": "19.3.1",

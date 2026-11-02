@@ -188,6 +188,10 @@ svg.spark polyline { fill: none; stroke: var(--accent); stroke-width: 1.5; }
 .msg.assistant { align-self: flex-start; background: var(--panel); border: 1px solid var(--border); }
 .msg.streaming::after { content: "▌"; color: var(--accent); animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
+/* live-chat states with no mockup counterpart: a single-line inline API error bubble and the stopped marker an
+   aborted stream leaves on its partial text — both built from existing tokens only */
+.msg.error { align-self: flex-start; background: rgba(217, 106, 106, 0.15); border: 1px solid var(--err); color: var(--text); }
+.msg .stopped { color: var(--warn); font-size: 12px; }
 .msg .tool {
   margin-top: 8px;
   font-family: var(--mono);

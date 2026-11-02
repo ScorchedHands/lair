@@ -119,7 +119,7 @@ internal sealed record ChunkDelta(
 /// <summary><c>/v1/models</c> envelope.</summary>
 internal sealed record ModelsResponse(string Object, IReadOnlyList<ModelEntry> Data);
 
-/// <summary>One advertised model: OpenAI baseline fields plus the context/quant/architecture metadata.</summary>
+/// <summary>One advertised model: OpenAI baseline fields plus the context/quant/architecture metadata and the configured model kind. The type field is additive payload so chat surfaces can exclude embed models on a fact; it defaults to "chat" because the config loader accepts no other value in this build.</summary>
 internal sealed record ModelEntry(
     string Id,
     string Object,
@@ -127,7 +127,8 @@ internal sealed record ModelEntry(
     string OwnedBy,
     int ContextLength,
     string Quant,
-    string Architecture);
+    string Architecture,
+    string Type = "chat");
 
 /// <summary><c>/healthz</c> body.</summary>
 internal sealed record HealthResponse(string Status, bool ModelReady);
