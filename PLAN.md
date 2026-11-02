@@ -296,8 +296,8 @@ Many requests at once, tuned, with live reconfiguration.
   - Verify: `dotnet test -c Release --filter Category=Prefill` — 1/1 ✅ ~407-token prompt prefills chunk-by-chunk while short requests stream past it at ITL p95 68 ms with outputs identical to a fresh-engine baseline. Tuning finding: per-step time ≈ chunk width × single-stream cost, so the DN-M2-2 default (512) overshoots the CPU budget — chunk widths of ~8 hold 400 ms at measured Release speed (~28 ms/token F16); wide chunks only pay off on faster compute.
 - [✓] Prompt caching — reference-counted prefix blocks reused across requests (see DN-M2-3)
   - Verify: `dotnet test -c Release --filter Category=Cache` — 6/6 ✅ on real SmolLM-F16: shared 127-token prefix → second request skips 112 prefill tokens with byte-identical output vs cold run; CoW copy verified bit-safe for the original sequence; LRU eviction never touches blocks referenced by active sequences; refcount release ordering tested. Cache lifetime = pool lifetime (covers reload/quant/block-size invalidation this phase).
-- [→] Cancellation — abort sequences mid-batch-step without stalling the rest of the batch (see DN-M2-4)
-  - Verify: integration test — aborted request frees its blocks; other requests complete unchanged.
+- [✓] Cancellation — abort sequences mid-batch-step without stalling the rest of the batch (see DN-M2-4)
+  - Verify: `dotnet test -c Release --filter Category=Cancel` — 6/6 ✅ concurrent peers bit-identical to a no-cancel baseline; every block of an aborted sequence reclaimed (mid-decode, mid-prefill-chunk, and at-admission cases); stop literals now end the sequence early via a linked CTS (gap found: first-token stops previously no-op'd). HTTP client-abort contract covered live (`RequestAborted` already wired through both API paths; new test proves server stays healthy after mid-stream hang-up).
 - [_] API completeness — tool calls, logprobs, penalties, `logit_bias`, seed (see DN-M2-8)
   - Verify: OpenAI SDK scripts — tool-call round trip, logprobs present and normalized, penalties alter sampling deterministically under seed.
 - [_] Metrics bus — engine counters + OS/driver stats streamed to logs and CLI monitor (see DN-M2-7)
@@ -314,7 +314,7 @@ Many requests at once, tuned, with live reconfiguration.
 - [✓] Automated Concurrency: parallel-vs-sequential output equivalence — 5/5 (Release) incl. ITL budget and capacity refusal
 - [✓] Automated Prefill: chunked prefill ITL protection — 1/1 (Release)
 - [✓] Automated Cache: prefix hit, CoW integrity, LRU eviction — 6/6 (Release)
-- [_] Automated Cancel: abort isolation and block reclamation
+- [✓] Automated Cancel: abort isolation and block reclamation — 6/6 (Release) incl. HTTP client-abort health
 - [_] Automated HotReload: watcher detection, mutation-class enforcement, mid-serving application
 - [_] Automated API: tool calls, logprobs, penalties, seed reproducibility via SDK scripts
 - [_] Manual Monitor-lite: `lair monitor` live stats under mixed load

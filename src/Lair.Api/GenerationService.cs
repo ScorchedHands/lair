@@ -165,6 +165,11 @@ public sealed class GenerationService : IDisposable
         bool stopped = false;
         SequenceHandle? handle = null;
 
+        // The stop signal is a cancellation the sequence observes at its next step boundary rather than a call through the
+        // handle: the scheduler can invoke the streaming hook for the first sampled token before this call has its handle
+        // back, and a stop literal seen in that token must still end the sequence.
+        using CancellationTokenSource stopSignal = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
         ScheduledRequest scheduled = new()
         {
             PromptTokens = [.. prompt],
@@ -198,14 +203,14 @@ public sealed class GenerationService : IDisposable
                     // The stop literal is already streamed; trim it out of the final text below.
                     decodedChars = stopIndex;
                     stopped = true;
-                    handle?.Cancel();
+                    stopSignal.Cancel();
                 }
             },
         };
 
         try
         {
-            handle = _scheduler.Submit(scheduled, cancellationToken);
+            handle = _scheduler.Submit(scheduled, stopSignal.Token);
         }
         catch (SchedulerFullException)
         {

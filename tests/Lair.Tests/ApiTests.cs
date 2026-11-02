@@ -257,6 +257,62 @@ public class ApiTests : IClassFixture<ApiFixture>
     }
 
     [Fact]
+    [Trait("Category", "Cancel")]
+    public async Task ClientAbortMidStream_LeavesTheServerHealthyForLaterRequests()
+    {
+        // The SSE body is drained only after the generation completes, so the line after the opening role chunk lands at the
+        // very end of the run: its absence within the window proves the sequence is still decoding when the client hangs up.
+        using HttpRequestMessage request = new(HttpMethod.Post, Url("/v1/completions"))
+        {
+            Content = new StringContent(
+                """{"model":"smollm-test","prompt":"Once upon a time in a land far away,","max_tokens":48,"temperature":0,"stream":true}""",
+                Encoding.UTF8,
+                "application/json"),
+        };
+
+        using HttpResponseMessage response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/event-stream", response.Content.Headers.ContentType?.MediaType);
+
+        Stream stream = await response.Content.ReadAsStreamAsync();
+        using StreamReader reader = new(stream);
+
+        string? opening = await reader.ReadLineAsync(CancellationToken.None);
+        Assert.StartsWith("data: ", opening); // the stream is live: the role chunk is already on the wire
+
+        Task<string?> nextChunk = ReadDataLineAsync(reader);
+        Assert.NotSame(nextChunk, await Task.WhenAny(nextChunk, Task.Delay(500))); // the run is still generating
+
+        response.Dispose(); // the client hangs up mid-stream: RequestAborted reaches the sequence still decoding
+        _ = nextChunk.ContinueWith(static faulted => _ = faulted.Exception, TaskContinuationOptions.OnlyOnFaulted);
+
+        // The aborted request left the engine and the batch loop intact: the server answers the next requests normally.
+        HttpResponseMessage health = await Http.GetAsync(Url("/healthz"));
+        Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+
+        (HttpResponseMessage followUp, JsonElement body) = await PostJsonAsync(
+            "/v1/completions",
+            """{"model":"smollm-test","prompt":"The capital of France is","max_tokens":8,"temperature":0}""");
+
+        Assert.Equal(HttpStatusCode.OK, followUp.StatusCode);
+        Assert.Equal("text_completion", body.GetProperty("object").GetString());
+        Assert.False(string.IsNullOrEmpty(body.GetProperty("choices")[0].GetProperty("text").GetString()));
+
+        // A fresh streaming request runs the whole pipeline again: prefill, shared decode steps, SSE chunks, and the done sentinel.
+        using HttpRequestMessage replay = new(HttpMethod.Post, Url("/v1/completions"))
+        {
+            Content = new StringContent(
+                """{"model":"smollm-test","prompt":"My favorite food is","max_tokens":8,"temperature":0,"stream":true}""",
+                Encoding.UTF8,
+                "application/json"),
+        };
+
+        using HttpResponseMessage replayResponse = await Http.SendAsync(replay, HttpCompletionOption.ResponseHeadersRead);
+        Assert.Equal(HttpStatusCode.OK, replayResponse.StatusCode);
+        Assert.Contains("data: [DONE]", await replayResponse.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
     public async Task PromptBeyondContextWindow_Returns400ContextLengthExceeded()
     {
         string prompt = string.Concat(Enumerable.Repeat("the quick brown fox jumps over the lazy dog. ", 60));
@@ -311,6 +367,19 @@ public class ApiTests : IClassFixture<ApiFixture>
     }
 
     private string Url(string path) => _fixture.BaseUrl + path;
+
+    // Reads the next SSE data line, skipping the blank separator lines between events.
+    private static async Task<string?> ReadDataLineAsync(StreamReader reader)
+    {
+        while (true)
+        {
+            string? line = await reader.ReadLineAsync();
+            if (line is null || line.Length > 0)
+            {
+                return line;
+            }
+        }
+    }
 
     private async Task<(HttpResponseMessage, JsonElement)> PostJsonAsync(string path, string jsonBody)
     {
