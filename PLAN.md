@@ -325,7 +325,7 @@ Many requests at once, tuned, with live reconfiguration.
 - [✓] Automated API: tool calls, logprobs, penalties, seed reproducibility via SDK scripts — 49/49 (Release); SDK round-trip ✅ at ship
 - [✓] Manual Monitor-lite: `lair monitor` live stats under mixed load — verified live: table rendered against serve under shared-prefix chats + long completion; KV used rose 3→55/96 with `active=1` during decode, cache-hit % climbed 50→100% on prefix reuse, tok/s + step-ms updated per tick (Debug-JIT rates), clean exit.
 
-### MVP3 [v0.3.0] - Refined
+### MVP3 [v0.3.0] - In Progress
 
 Operators see the engine live in a browser and can test it with a built-in chat UI — no external client needed.
 
@@ -356,9 +356,10 @@ Security (accepted): SPA is static files on the existing Kestrel endpoint (loopb
 
 - [✓] Tabbed shell + shared stylesheet mockups — Monitor tab and Chat tab in one design system (`mockup/mvp3/`)
   - Verify: manual — approved 2026-11-02 (rev B): configured-models panel, expandable rows, sparklines, slimmed KPI cards, dark theme locked.
-- [_] SPA build pipeline — esbuild + shadcn init with pinned npm dependencies; built assets embedded in the Host's static file serving at `/ui`
-  - Verify: `dotnet build Lair.sln` then GET `/ui` returns the shell HTML and its stylesheet/JS bundle from embedded assets; npm build reproducible from lockfile.
-- [_] Event schema + stats endpoint — versioned SSE event schema (per-model snapshots, per-request tok/s series, request ring bounded by `ui.recent_requests`) with `Last-Event-ID` replay and latest-only subscriber coalescing
+- [✓] SPA build pipeline — esbuild + shadcn init with pinned npm dependencies; built assets embedded in the Host's static file serving at `/ui`
+  - Verify: `dotnet test --filter Category=WebUi` — 1/1 ✅ `GET /ui` + `/ui/index.html` return 200 `text/html` shell with bundled `app.css`/`app.js`/`app.js.map` served; `/ui/chat` falls back to the shell; non-UI 404s preserved; embedding runs from clean state, incremental builds skip npm when web sources are unchanged, `-p:SkipWebUi=true` builds clean without Node. Pinned: react 19.3.1, esbuild 0.28.2, typescript 7.0.2, tailwindcss 4.3.3 (+CLI), npm 11 lockfile committed. Mockup rev B reproduced verbatim as React shell (jsdom-verified 18/18 interactivity checks: tabs, row expand/collapse); design tokens aliased to shadcn CSS-variable names via Tailwind v4 `@theme inline`.
+- [✓] Event schema + stats endpoint — versioned SSE event schema (per-model snapshots, per-request tok/s series, request ring bounded by `ui.recent_requests`) with `Last-Event-ID` replay and latest-only subscriber coalescing
+  - Verify: `dotnet test --filter Category=MonitorUi` — 7/7 ✅ v1 events (`snapshot`, `request_start/update/complete`, id-less `resync`) on bus-scoped incrementing frame ids; per-request tok/s series from a zero-alloc 64-slot sample ring driven at the existing step-boundary hook (updates at token 1 then every 8th); `ui.recent_requests` ring (default 25, validated 1..1000) hot-reloads live — shrink narrows visibility, grow re-seats the retained tail; Last-Event-ID replays retained snapshots oldest-first with resync fallback for unknown/stale/caught-up ids; per-subscriber snapshot coalescing (capacity-1 latest-only) + bounded 200 request queue with drop counters on snapshots. `Category=Metrics` 5/5 unchanged — additive contract held, CLI monitor untouched.
   - Verify: automated (`Category=MonitorUi`) — a test client receives live snapshots during load with versioned field names, replays missed events after reconnect via `Last-Event-ID`, and the request ring never exceeds X.
 - [_] Monitor SPA — implements the mockup's Monitor tab verbatim: KPI cards, configured-models table with expandable config/state rows, in-flight + recent tables with tok/s sparklines, placeholder tiles (see DN-M3-1, DN-M3-3, DN-M3-4)
   - Verify: manual — browser shows live in-flight rows updating sub-second under load; model row expansion reveals config + per-model cache blocks and finish tallies; sparklines render for streaming requests; GPU/PCIe tiles show placeholders.

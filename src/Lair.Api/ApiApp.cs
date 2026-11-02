@@ -66,6 +66,7 @@ public static class ApiApp
             Stopwatch clock = Stopwatch.StartNew();
             RequestAudit audit = new();
             context.Items[RequestAuditKey] = audit;
+            context.Items[RequestIdItemKey] = requestId; // handlers hand the same id to the engine so monitor lifecycle rows correlate with this response
 
             try
             {
@@ -204,6 +205,12 @@ public static class ApiApp
     internal static readonly TimeSpan MetricsSnapshotInterval = TimeSpan.FromSeconds(2);
 
     private const string RequestAuditKey = "lair.request.audit";
+    private const string RequestIdItemKey = "lair.request.id";
+
+    // The middleware-minted correlation id, read back by handlers to key monitor lifecycle frames on the same value
+    // this response carries in x-lair-request-id.
+    private static string? RequestIdOf(HttpContext http) =>
+        http.Items.TryGetValue(RequestIdItemKey, out object? value) ? value as string : null;
 
     private static IResult HandleChat(ChatRequestInput input, GenerationService gen, HttpContext http)
     {
@@ -238,6 +245,7 @@ public static class ApiApp
             Tools = input.Tools.Count > 0 ? input.Tools : null,
             ToolChoice = input.ToolChoice.Mode == ToolChoiceMode.Auto ? null : input.ToolChoice,
             Stream = body.Stream ?? false,
+            RequestId = RequestIdOf(http),
         };
 
         return RunGeneration(request, gen, http);
@@ -272,6 +280,7 @@ public static class ApiApp
             LogProbs = body.LogProbs ?? false,
             TopLogprobs = body.TopLogprobs ?? 0,
             Stream = body.Stream ?? false,
+            RequestId = RequestIdOf(http),
         };
 
         return RunGeneration(request, gen, http);

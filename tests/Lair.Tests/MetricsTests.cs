@@ -129,6 +129,7 @@ public sealed class MetricsTests
             StreamReader reader = new(await response.Content.ReadAsStreamAsync(timeout.Token));
 
             string? dataLine = null;
+            string eventName = "message";
             while (dataLine is null && !timeout.IsCancellationRequested)
             {
                 string? line = await reader.ReadLineAsync(timeout.Token);
@@ -137,8 +138,15 @@ public sealed class MetricsTests
                     break; // stream closed before the first snapshot — caught by Assert.NotNull below
                 }
 
-                if (line.StartsWith("data: ", StringComparison.Ordinal))
+                if (line.StartsWith("event: ", StringComparison.Ordinal))
                 {
+                    eventName = line["event: ".Length..].Trim();
+                    continue;
+                }
+
+                if (line.StartsWith("data: ", StringComparison.Ordinal) && eventName == "snapshot")
+                {
+                    // Versioned v1 framing: lifecycle frames share the stream, so snapshot assertions key on the event name.
                     dataLine = line["data: ".Length..];
                 }
             }

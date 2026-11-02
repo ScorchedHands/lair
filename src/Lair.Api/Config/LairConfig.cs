@@ -11,6 +11,15 @@ public sealed record LairConfig
     public required EngineConfig Engine { get; init; }
 
     public required IReadOnlyList<ModelConfig> Models { get; init; }
+
+    public UiConfig Ui { get; init; } = new();
+}
+
+/// <summary>Monitor surface settings — what the live stats stream retains and replays.</summary>
+public sealed record UiConfig
+{
+    /// <summary>Completed requests kept in the monitor's recent-request ring, newest first. In [1, 1000]; a hot edit takes effect immediately (shrinking drops the oldest entries).</summary>
+    public int RecentRequests { get; init; } = 25;
 }
 
 /// <summary>HTTP listener settings.</summary>

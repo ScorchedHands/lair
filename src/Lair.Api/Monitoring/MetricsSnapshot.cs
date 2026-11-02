@@ -38,7 +38,16 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_requests_failed_total")] long RequestsFailedTotal,
 
     [property: JsonPropertyName("metrics_process_working_set_mb")] double ProcessWorkingSetMb,
-    [property: JsonPropertyName("metrics_process_cpu_percent")] double ProcessCpuPercent)
+    [property: JsonPropertyName("metrics_process_cpu_percent")] double ProcessCpuPercent,
+
+    /// <summary>The monitor stream schema version this snapshot's payload belongs to.</summary>
+    [property: JsonPropertyName("metrics_events_version")] int EventsVersion = MonitorEventSchema.Version,
+
+    /// <summary>The server-scoped event id the bus assigned this snapshot; equals its SSE frame id and anchors Last-Event-ID replay.</summary>
+    [property: JsonPropertyName("metrics_event_seq")] long EventSeq = 0,
+
+    /// <summary>Totals of stream frames dropped from subscriber queues since the bus opened — how often slow consumers lost events.</summary>
+    [property: JsonPropertyName("metrics_dropped_events_total")] long DroppedEventsTotal = 0)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

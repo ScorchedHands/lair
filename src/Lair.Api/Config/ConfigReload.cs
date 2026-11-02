@@ -147,6 +147,11 @@ public static class ConfigMutationTable
             changes.Add(new FieldChange("models[0].placement.thread_quota", TextOrNone(oldPlacement.ThreadQuota), TextOrNone(newPlacement.ThreadQuota), ConfigMutationClass.Live));
         }
 
+        if (candidate.Ui.RecentRequests != current.Ui.RecentRequests)
+        {
+            changes.Add(new FieldChange("ui.recent_requests", Text(current.Ui.RecentRequests), Text(candidate.Ui.RecentRequests), ConfigMutationClass.Live));
+        }
+
         return changes;
     }
 
@@ -205,6 +210,7 @@ public static class ConfigMutationTable
         "engine.max_batch_tokens" => ConfigMutationClass.Live,
         "models[0].kv_blocks" => ConfigMutationClass.Live,
         "models[0].placement.thread_quota" => ConfigMutationClass.Live,
+        "ui.recent_requests" => ConfigMutationClass.Live,
         "models[0].max_context_tokens" => ConfigMutationClass.NewRequestsOnly,
         _ => ConfigMutationClass.RestartOnly,
     };
@@ -240,6 +246,8 @@ public static class ConfigMutationTable
         yield return ("models[0].placement.kv_residency", ScalarText(placement, "kv_residency"));
         yield return ("models[0].placement.prefill", ScalarText(placement, "prefill"));
         yield return ("models[0].placement.thread_quota", ScalarText(placement, "thread_quota"));
+
+        yield return ("ui.recent_requests", ScalarText(Child(root, "ui"), "recent_requests"));
     }
 
     // The current effective value of a known key in the same text form RawScalars produces, so comparison is like-for-like.
@@ -259,6 +267,7 @@ public static class ConfigMutationTable
         "models[0].placement.kv_residency" => current.Models[0].Placement.KvResidency,
         "models[0].placement.prefill" => current.Models[0].Placement.Prefill,
         "models[0].placement.thread_quota" => TextOrNone(current.Models[0].Placement.ThreadQuota),
+        "ui.recent_requests" => Text(current.Ui.RecentRequests),
         _ => string.Empty,
     };
 

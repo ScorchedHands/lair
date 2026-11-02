@@ -13,9 +13,10 @@ public static class YamlConfigLoader
 {
     private const string TopLevel = "the top level";
 
-    private static readonly string[] TopLevelKeys = ["server", "engine", "models"];
+    private static readonly string[] TopLevelKeys = ["server", "engine", "models", "ui"];
     private static readonly string[] ServerKeys = ["bind", "port"];
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens"];
+    private static readonly string[] UiKeys = ["recent_requests"];
     private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota"];
 
@@ -41,6 +42,7 @@ public static class YamlConfigLoader
             Server = ParseServer(top),
             Engine = ParseEngine(top),
             Models = models,
+            Ui = ParseUi(top),
         };
     }
 
@@ -95,6 +97,26 @@ public static class YamlConfigLoader
         }
 
         return new ServerConfig { Bind = bind, Port = port };
+    }
+
+    private static UiConfig ParseUi(Dictionary<string, YamlNode> top)
+    {
+        const string where = "'ui'";
+        if (!top.TryGetValue("ui", out YamlNode? node))
+        {
+            return new UiConfig();
+        }
+
+        Dictionary<string, YamlNode> keys = KeysOf(AsMapping(node, where), where);
+        RejectUnknownKeys(keys, where, UiKeys);
+
+        int recentRequests = TryInteger(keys, "recent_requests", "ui.recent_requests") ?? 25;
+        if (recentRequests is < 1 or > 1000)
+        {
+            throw new ConfigException($"ui.recent_requests {recentRequests} is out of range: 'recent_requests' must be between 1 and 1000.");
+        }
+
+        return new UiConfig { RecentRequests = recentRequests };
     }
 
     private static EngineConfig ParseEngine(Dictionary<string, YamlNode> top)
