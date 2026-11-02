@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Threading.Channels;
 using Lair.Kv;
 using Lair.Models.Engine;
@@ -42,6 +43,13 @@ public sealed class GenerationScheduler : IDisposable
     private readonly List<Sequence> _window = [];
     private readonly List<int> _windowTokens = [];
     private readonly List<SequenceKv> _windowKvs = [];
+
+    // Step-boundary engine counters, written only on the scheduler thread while the gate is held and read as
+    // volatile longs by observers — collection costs a handful of increments per step, never per token.
+    private readonly Stopwatch _stepClock = new();
+
+    /// <summary>Cumulative engine counters maintained live by the step loop; see <see cref="SchedulerStats"/>.</summary>
+    public SchedulerStats Stats { get; } = new();
 
     private readonly Task _thread;
     private long _nextId;
@@ -111,6 +119,7 @@ public sealed class GenerationScheduler : IDisposable
         }
 
         Sequence sequence = new(request, ct, _pool, Interlocked.Increment(ref _nextId));
+        Stats.SequencesAdmitted++;
         if (!_inbox.Writer.TryWrite(sequence))
         {
             throw new ObjectDisposedException(nameof(GenerationScheduler));
@@ -268,8 +277,17 @@ public sealed class GenerationScheduler : IDisposable
 
         if (_window.Count > 0)
         {
+            // Step-boundary clock: one started/stopped shared Stopwatch per step measures the forward work of this
+            // step's decode windows; no allocation and nothing inside the token loop.
+            _stepClock.Restart();
             DecodeWindow(_window, 0, _window.Count);
+            _stepClock.Stop();
+            Stats.DecodeSteps++;
+            Stats.DecodeWindowMicrosTotal += _stepClock.ElapsedTicks * 1_000_000 / Stopwatch.Frequency;
+            Stats.WindowSequenceSum += _window.Count;
         }
+
+        Stats.ActiveDecodingSequences = _window.Count;
 
         for (int i = _active.Count - 1; i >= 0; i--)
         {
@@ -278,6 +296,8 @@ public sealed class GenerationScheduler : IDisposable
                 _active.RemoveAt(i);
             }
         }
+
+        Stats.ActiveSequenceCount = _active.Count;
     }
 
     /// <summary>
@@ -302,6 +322,8 @@ public sealed class GenerationScheduler : IDisposable
             int skipped = adoptedBlocks * _pool.BlockTokens;
             sequence.PromptOffset = skipped;
             sequence.PrefillCachedTokens = skipped;
+            Stats.CacheHitSequences++;
+            Stats.CacheSkippedTokens += skipped;
         }
     }
 
@@ -314,6 +336,8 @@ public sealed class GenerationScheduler : IDisposable
         {
             _model.Prefill(prompt[sequence.PromptOffset..(sequence.PromptOffset + chunk)], sequence.Kv);
             sequence.PromptOffset += chunk;
+            Stats.PrefillChunksIssued++;
+            Stats.PrefillTokensForwarded += chunk;
 
             if (sequence.IsPrefilling)
             {
@@ -325,7 +349,9 @@ public sealed class GenerationScheduler : IDisposable
                 // Prefill done: every full prompt-prefix block now has its KV fully written, so publish them in chain
                 // order. Blocks already under their key (adopted by this same sequence, or published earlier by an
                 // identical prefix) are only renewed; the partial final block stays out of the cache.
-                _cache.Publish(prompt, sequence.Kv);
+                int publishedBlocks = _cache.Publish(prompt, sequence.Kv);
+                Stats.CachePublishedBlocksTotal += publishedBlocks;
+                Stats.CachePublishedTokensTotal += (long)publishedBlocks * _pool.BlockTokens;
             }
 
             // Prefill left the final prompt token's logits: sample the first generated token from them, exactly as
@@ -338,6 +364,7 @@ public sealed class GenerationScheduler : IDisposable
             }
 
             sequence.Generated.Add(first);
+            Stats.PrefillSampledTokens++;
             sequence.PendingToken = first;
             sequence.Request.OnTokenId?.Invoke(first);
         }
@@ -391,6 +418,7 @@ public sealed class GenerationScheduler : IDisposable
                 }
 
                 sequence.Generated.Add(next);
+                Stats.DecodeTokensAdvanced++;
                 if (!sequence.HasBudget)
                 {
                     Finish(sequence, FinishReason.Length);
@@ -404,7 +432,8 @@ public sealed class GenerationScheduler : IDisposable
         catch (Exception ex) when (ex is KvFullException || ex is InvalidOperationException)
         {
             // The batched forward reserves every sequence's slot before writing any layer, so which appends landed is
-            // unknowable: fail the whole batch rather than re-forward sequences onto a second slot.
+            // unknowable: fail the whole batch rather than re-forward sequences onto a second slot. Failed-token
+            // accounting rides on each Finish.
             for (int i = start; i < start + count; i++)
             {
                 Finish(window[i], FinishReason.Failed, ex);
@@ -445,13 +474,34 @@ public sealed class GenerationScheduler : IDisposable
     /// shared blocks too: they return to their remaining owners (the prefix cache entry or another sequence), and only
     /// reach the free list when the last reference goes.
     /// </summary>
-    private static void Finish(Sequence sequence, FinishReason reason, Exception? error = null)
+    private void Finish(Sequence sequence, FinishReason reason, Exception? error = null)
     {
+        if (reason == FinishReason.Failed)
+        {
+            Stats.FailedSequenceTokens += sequence.Generated.Count;
+        }
+
         SequenceOutcome outcome = new([.. sequence.Generated], sequence.Request.PromptTokens.Length, sequence.Generated.Count, reason, error, sequence.PrefillCachedTokens, [.. sequence.LogProbEntries]);
 
         // Blocks go back before the completion is published: an observer woken by the task may immediately submit a
         // new sequence that needs them.
         sequence.Kv.Dispose();
         sequence.Outcome.TrySetResult(outcome);
+
+        switch (reason)
+        {
+            case FinishReason.Eos:
+                Stats.FinishedEos++;
+                break;
+            case FinishReason.Length:
+                Stats.FinishedLength++;
+                break;
+            case FinishReason.Canceled:
+                Stats.FinishedCanceled++;
+                break;
+            default:
+                Stats.FinishedFailed++;
+                break;
+        }
     }
 }

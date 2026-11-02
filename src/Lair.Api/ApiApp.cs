@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
+using Lair.Api.Monitoring;
 using Lair.Host.Config;
 using Lair.Models.Scheduling;
 using Lair.Tokenizer.Templating;
@@ -16,8 +17,9 @@ namespace Lair.Api;
 /// <summary>
 /// Builds the OpenAI-compatible HTTP surface over one opened <see cref="GenerationService"/>:
 /// <c>/v1/chat/completions</c> (JSON and SSE), <c>/v1/completions</c> (JSON and SSE), <c>/v1/models</c>,
-/// and <c>/healthz</c>. Every response carries an <c>x-lair-request-id</c> header and one structured log line;
-/// engine exceptions are converted to the OpenAI error shape <c>{error:{message,type,code}}</c>.
+/// <c>/healthz</c>, and the operator stream <c>/monitor/stream</c>. Every response carries an
+/// <c>x-lair-request-id</c> header and one structured log line; engine exceptions are converted to the OpenAI
+/// error shape <c>{error:{message,type,code}}</c>.
 /// </summary>
 public static class ApiApp
 {
@@ -110,8 +112,17 @@ public static class ApiApp
 
         app.MapGet("/healthz", () => Results.Json(new HealthResponse("ok", true)));
 
+        // Operator surface, deliberately outside /v1/*: one SSE event per engine snapshot. The bus attaches here so
+        // only serving hosts sample; chat-style hosts never pay for it.
+        EngineMetricsBus metrics = gen.AttachMetrics(app.Services.GetRequiredService<ILoggerFactory>(), MetricsSnapshotInterval);
+
+        app.MapGet("/monitor/stream", async (HttpContext http) => await MonitorStreamHandler.HandleAsync(http, metrics));
+
         return app;
     }
+
+    /// <summary>Cadence of engine snapshot lines and stream events while the engine is active.</summary>
+    internal static readonly TimeSpan MetricsSnapshotInterval = TimeSpan.FromSeconds(2);
 
     private const string RequestAuditKey = "lair.request.audit";
 

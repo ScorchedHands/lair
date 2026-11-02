@@ -1,4 +1,5 @@
 using System.Globalization;
+using Lair.Api.Monitoring;
 using Lair.Backends.Cpu;
 using Lair.Host.Config;
 using Lair.Kv;
@@ -8,6 +9,7 @@ using Lair.Models.Scheduling;
 using Lair.Sampling;
 using Lair.Tokenizer;
 using Lair.Tokenizer.Templating;
+using Microsoft.Extensions.Logging;
 
 namespace Lair.Api;
 
@@ -27,6 +29,10 @@ public sealed class GenerationService : IDisposable
     private readonly ChatTemplateRenderer? _chatTemplate;
     private readonly BlockPool _pool;
     private readonly GenerationScheduler _scheduler;
+    private EngineMetricsBus? _metrics;
+
+    /// <summary>The metrics bus attached by the API host, if any — null for hosts that never attach one.</summary>
+    internal EngineMetricsBus? Metrics => _metrics;
 
     private bool _disposed;
 
@@ -55,6 +61,28 @@ public sealed class GenerationService : IDisposable
 
     /// <summary>Vocabulary size of the served model; token ids at or above it have no vocabulary text.</summary>
     public int VocabSize => Model.VocabSize;
+
+    /// <summary>
+    /// Attaches the metrics bus that samples this engine's counters and feeds <c>/monitor/stream</c>. The API host
+    /// calls it once while building the app; hosts that never attach one simply produce no snapshots. Idempotent:
+    /// a second call returns the already-attached bus.
+    /// </summary>
+    internal EngineMetricsBus AttachMetrics(ILoggerFactory loggerFactory, TimeSpan interval)
+    {
+        ArgumentNullException.ThrowIfNull(loggerFactory);
+        if (_metrics is not null)
+        {
+            return _metrics;
+        }
+
+        PrefixCache? cache = _cacheForMetrics;
+        EngineMetricsBus bus = new(Model.Id, _scheduler, _pool, cache, loggerFactory, interval);
+        _metrics = bus;
+        return bus;
+    }
+
+    // The scheduler owns its prefix cache privately; the service keeps what it passed so metrics can report cached blocks.
+    private PrefixCache? _cacheForMetrics;
 
     /// <summary>Decodes one token id through the served model's tokenizer, special tokens included so control pieces round-trip.</summary>
     public string DecodeToken(int tokenId) => _tokenizer.Decode([tokenId], includeSpecial: true);
@@ -99,7 +127,8 @@ public sealed class GenerationService : IDisposable
                 modelConfig.KvBlocks,
                 backend);
 
-            scheduler = new GenerationScheduler(model, pool, config.Engine.MaxBatchTokens, new PrefixCache(pool));
+            PrefixCache cache = new(pool);
+            scheduler = new GenerationScheduler(model, pool, config.Engine.MaxBatchTokens, cache);
 
             ChatTemplateRenderer? chatTemplate = file.Metadata.ChatTemplate is string source
                 ? ChatTemplateRenderer.Parse(source)
@@ -114,6 +143,7 @@ public sealed class GenerationService : IDisposable
                 model.Desc.VocabSize);
 
             GenerationService service = new(file, backend, model, tokenizer, chatTemplate, pool, scheduler, info);
+            service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
             file = null;
             model = null;
             pool = null;
@@ -277,6 +307,10 @@ public sealed class GenerationService : IDisposable
         {
             text = text[..Math.Min(decodedChars, text.Length)];
             finishReason = "stop";
+
+            // The scheduler reports a stop-ended sequence as cancelled — only the facade sees it was really the stop
+            // literal, so its tally feeds the metrics bus's finish-reason counts.
+            _metrics?.RecordStopCompletion();
         }
         else
         {
@@ -321,6 +355,21 @@ public sealed class GenerationService : IDisposable
         }
 
         _disposed = true;
+
+        // The metrics sampler notices disposal at its next tick and completes every open stream subscription on the
+        // way out; it is not worth blocking engine teardown on one sampling delay, so this is deliberately unawaited.
+        if (_metrics is not null)
+        {
+            ValueTask completion = _metrics.DisposeAsync();
+            if (!completion.IsCompletedSuccessfully)
+            {
+                // The sampler swallows its own tick faults; this just keeps any late one from surfacing as an
+                // unobserved task exception during teardown.
+                completion.AsTask().ContinueWith(static faulted => _ = faulted.Exception, TaskContinuationOptions.OnlyOnFaulted);
+            }
+
+            _metrics = null;
+        }
 
         // The scheduler releases every sequence's blocks before the pool they belong to goes away; the forward
         // engine's mmap view must be released before the file handle it maps.

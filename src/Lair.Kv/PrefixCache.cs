@@ -119,15 +119,17 @@ public sealed class PrefixCache
     /// block takes one cache reference on top of the publishing sequence's own ownership; blocks already under
     /// their key (adopted earlier by this same sequence, or published by an identical prefix) are only touched to
     /// mark them most-recently-used — they keep the physical block already registered. Partial final blocks stay
-    /// out of the cache because their KV is not fully written at publish time.
+    /// out of the cache because their KV is not fully written at publish time. Returns how many blocks this call
+    /// newly registered (renewals excluded).
     /// </summary>
-    public void Publish(ReadOnlySpan<int> promptTokens, SequenceKv kv)
+    public int Publish(ReadOnlySpan<int> promptTokens, SequenceKv kv)
     {
         ArgumentNullException.ThrowIfNull(kv);
 
         int blockTokens = _pool.BlockTokens;
         ulong key = 0UL;
         int depth = 0;
+        int published = 0;
 
         while ((depth + 1) * blockTokens <= promptTokens.Length)
         {
@@ -145,10 +147,13 @@ public sealed class PrefixCache
                 var entry = new PrefixEntry(key, physicalBlockId, tokens.ToArray());
                 _entries[key] = entry;
                 _lru.AddLast(entry.Node = entry.CreateNode());
+                published++;
             }
 
             depth++;
         }
+
+        return published;
     }
 
     /// <summary>
