@@ -28,7 +28,7 @@ dotnet run --project src/Lair.Host -- chat -c lair.yaml
 | `POST /v1/chat/completions` | JSON or SSE streaming (`"stream": true`); supports `tools`/`tool_choice`, `logprobs`/`top_logprobs`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `seed` |
 | `POST /v1/completions` | legacy text completions, JSON or SSE |
 | `GET /v1/models` | model list including `context_length` and quant metadata |
-| `GET /monitor/stream` | SSE stream of engine metrics snapshots |
+| `GET /monitor/stream` | SSE stream of engine metrics snapshots and request lifecycle events (versioned schema) |
 | `GET /healthz` | liveness + model readiness |
 
 Any OpenAI SDK works by pointing `base_url` at `http://127.0.0.1:8080/v1`. Errors use the OpenAI error shape with codes `invalid_request`, `model_not_found`, `context_length_exceeded`, `engine_overloaded`, `internal`. Every response carries `x-lair-request-id`.
@@ -39,7 +39,11 @@ Requests run concurrently through shared batch steps; `503 engine_overloaded` su
 
 `/exit` or `/quit` to leave, `/reset` to clear the conversation. Ctrl+C interrupts the current generation. Overlong turns are reported as a single-line error after an automatic trim-and-retry.
 
-## Monitor
+## Monitor UI
+
+Point a browser at `http://127.0.0.1:8080/ui` while the server runs: a tabbed web UI with live engine stats — configured models (expandable for config and state), in-flight requests, per-request throughput sparklines, recent request log — plus a built-in chat client for exercising the model directly from the browser (streaming replies, mid-stream stop, tool-call display).
+
+## Monitor CLI
 
 ```powershell
 dotnet run --project src/Lair.Host -- monitor            # default http://127.0.0.1:8080
@@ -50,6 +54,6 @@ Live table per model: tok/s, step time, batch occupancy, cache-hit rate, KV util
 
 ## Configuration
 
-One YAML file (`lair.example.yaml` shows every knob): server bind/port, engine `threads` and `max_batch_tokens`, block size, and exactly one model with path, name, type, `max_context_tokens`, `kv_blocks`, and optional placement policy (`core_set`, `thread_quota`).
+One YAML file (`lair.example.yaml` shows every knob): server bind/port, engine `threads` and `max_batch_tokens`, block size, exactly one model with path, name, type, `max_context_tokens`, `kv_blocks`, optional placement policy (`core_set`, `thread_quota`), and the UI ring size `ui.recent_requests`.
 
 A running server watches the config file and applies edits automatically: batch width, thread quota, and KV budget take effect live; context length applies to new requests; block size, model path, and quant geometry are refused with a message telling you to restart. Invalid edits are rejected without touching the running engine.

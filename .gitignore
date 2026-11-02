@@ -5,3 +5,6 @@ models/
 *.gguf
 .vs/
 tools/
+web/node_modules/
+web/dist/
+src/Lair.Host/wwwroot/ui/

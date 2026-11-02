@@ -9,7 +9,9 @@ using Lair.Tokenizer.Templating;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Logging;
 
 namespace Lair.Api;
@@ -64,6 +66,7 @@ public static class ApiApp
             Stopwatch clock = Stopwatch.StartNew();
             RequestAudit audit = new();
             context.Items[RequestAuditKey] = audit;
+            context.Items[RequestIdItemKey] = requestId; // handlers hand the same id to the engine so monitor lifecycle rows correlate with this response
 
             try
             {
@@ -105,7 +108,8 @@ public static class ApiApp
                     "lair",
                     gen.Model.ContextLength,
                     gen.Model.Quant,
-                    gen.Model.Architecture)]);
+                    gen.Model.Architecture,
+                    gen.ModelType)]);
 
             return Results.Json(models, statusCode: 200);
         });
@@ -118,13 +122,96 @@ public static class ApiApp
 
         app.MapGet("/monitor/stream", async (HttpContext http) => await MonitorStreamHandler.HandleAsync(http, metrics));
 
+        MapWebUi(app);
+
         return app;
+    }
+
+    // The SPA lives under /ui: the bundled wwwroot/ui next to the host assembly is served only when the build
+    // embedded it, and any unmatched /ui/* path falls back to ui/index.html so client-side routes resolve.
+    // Existing API endpoints are untouched.
+    private static void MapWebUi(WebApplication app)
+    {
+        string uiRoot = Path.Combine(AppContext.BaseDirectory, "wwwroot", "ui");
+        string shellPath = Path.Combine(uiRoot, "index.html");
+        if (!Directory.Exists(uiRoot) || !File.Exists(shellPath))
+        {
+            return;
+        }
+
+        IFileProvider uiFiles = new PhysicalFileProvider(uiRoot);
+
+        // The default mapping table lacks .map; sourcemaps would otherwise not be served at all.
+        FileExtensionContentTypeProvider contentTypes = new();
+        contentTypes.Mappings[".map"] = "application/json";
+
+        string shellHtml = File.ReadAllText(shellPath);
+
+        // A terminal middleware instead of UseStaticFiles: the fallback endpoint below matches every /ui/* path in
+        // routing, and static-file middleware declines requests that already carry a matched endpoint. This branch
+        // serves real bundle files (directory default included) and ends the pipeline; anything it passes through
+        // lands on the shell-fallback endpoint.
+        app.Use(async (http, next) =>
+        {
+            const string requestPath = "/ui";
+            if (!http.Request.Path.StartsWithSegments(requestPath, StringComparison.OrdinalIgnoreCase))
+            {
+                await next(http);
+                return;
+            }
+
+            if (!(HttpMethods.IsGet(http.Request.Method) || HttpMethods.IsHead(http.Request.Method)))
+            {
+                await next(http);
+                return;
+            }
+
+            if (http.Request.Path.Value is not string decodedPath)
+            {
+                await next(http);
+                return;
+            }
+
+            string relative = decodedPath[requestPath.Length..].TrimStart('/');
+            if (relative.Length == 0)
+            {
+                // GET /ui and /ui/ serve the shell as the directory default.
+                http.Response.ContentType = "text/html; charset=utf-8";
+                await http.Response.WriteAsync(shellHtml);
+                return;
+            }
+
+            IFileInfo file = uiFiles.GetFileInfo(relative);
+            if (!file.Exists || file.IsDirectory)
+            {
+                await next(http);
+                return;
+            }
+
+            if (!contentTypes.TryGetContentType(relative, out string? contentType))
+            {
+                contentType = "application/octet-stream";
+            }
+
+            http.Response.ContentType = contentType;
+            http.Response.ContentLength = file.Length;
+            using Stream stream = file.CreateReadStream();
+            await stream.CopyToAsync(http.Response.Body);
+        });
+
+        app.MapFallback("/ui/{*path}", () => Results.Text(shellHtml, "text/html; charset=utf-8"));
     }
 
     /// <summary>Cadence of engine snapshot lines and stream events while the engine is active.</summary>
     internal static readonly TimeSpan MetricsSnapshotInterval = TimeSpan.FromSeconds(2);
 
     private const string RequestAuditKey = "lair.request.audit";
+    private const string RequestIdItemKey = "lair.request.id";
+
+    // The middleware-minted correlation id, read back by handlers to key monitor lifecycle frames on the same value
+    // this response carries in x-lair-request-id.
+    private static string? RequestIdOf(HttpContext http) =>
+        http.Items.TryGetValue(RequestIdItemKey, out object? value) ? value as string : null;
 
     private static IResult HandleChat(ChatRequestInput input, GenerationService gen, HttpContext http)
     {
@@ -159,6 +246,7 @@ public static class ApiApp
             Tools = input.Tools.Count > 0 ? input.Tools : null,
             ToolChoice = input.ToolChoice.Mode == ToolChoiceMode.Auto ? null : input.ToolChoice,
             Stream = body.Stream ?? false,
+            RequestId = RequestIdOf(http),
         };
 
         return RunGeneration(request, gen, http);
@@ -193,6 +281,7 @@ public static class ApiApp
             LogProbs = body.LogProbs ?? false,
             TopLogprobs = body.TopLogprobs ?? 0,
             Stream = body.Stream ?? false,
+            RequestId = RequestIdOf(http),
         };
 
         return RunGeneration(request, gen, http);

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using Lair.Api.Monitoring;
 using Lair.Backends.Cpu;
@@ -30,6 +31,10 @@ public sealed class GenerationService : IDisposable
     private readonly BlockPool _pool;
     private readonly GenerationScheduler _scheduler;
     private EngineMetricsBus? _metrics;
+
+    // Generations currently publishing monitor lifecycle frames, keyed by their stream request id — the in-flight
+    // half of a resync state dump. Trackers are added at admission and removed when their completion frame publishes.
+    private readonly ConcurrentDictionary<string, RequestTracker> _monitoredRequests = new(StringComparer.Ordinal);
 
     // Change-application state: the configuration currently in force (restart-only refusals keep their old values),
     // the advertised model facts recomputed whenever a live or new-requests field changes, and the last reload attempt.
@@ -75,6 +80,9 @@ public sealed class GenerationService : IDisposable
     /// <summary>Worker count the served model's CPU backend actually runs with, after engine threads and the model's thread quota are combined.</summary>
     public int EffectiveWorkerCount => _backend.EffectiveWorkerCount;
 
+    /// <summary>The configured kind of the served model as advertised on <c>/v1/models</c>. The config loader accepts only "chat" in this build; surfaces that must exclude embed models filter on this fact instead of an assumption.</summary>
+    public string ModelType => _current.Models[0].Type;
+
     /// <summary>
     /// Attaches the metrics bus that samples this engine's counters and feeds <c>/monitor/stream</c>. The API host
     /// calls it once while building the app; hosts that never attach one simply produce no snapshots. Idempotent:
@@ -90,8 +98,73 @@ public sealed class GenerationService : IDisposable
 
         PrefixCache? cache = _cacheForMetrics;
         EngineMetricsBus bus = new(Model.Id, _scheduler, _pool, cache, loggerFactory, interval);
+
+        // The monitor's request-side state starts from the configuration in force: the recent-request ring capacity,
+        // the live in-flight views a resync can dump, and the model facts snapshots carry additively.
+        bus.SetRecentRequestCapacity(_current.Ui.RecentRequests);
+        bus.AttachInFlightProvider(InFlightRequestViews);
+        bus.AttachModelFacts(BuildMonitorFacts(_current));
+
         _metrics = bus;
         return bus;
+    }
+
+    // Snapshot identity/placement facts straight from the configuration in force plus the backend's live worker count.
+    private ModelFacts BuildMonitorFacts(LairConfig config) => new(
+        config.Models[0].Type,
+        _backend.EffectiveWorkerCount,
+        FormatCoreSet(config.Models[0].Placement.CoreSet),
+        config.Models[0].Placement.ThreadQuota,
+        config.Models[0].Placement.Device,
+        config.Models[0].Placement.Prefill,
+        config.Models[0].Placement.KvResidency);
+
+    // Pinned core ids as compressed ranges ("0-23", "1, 4-6"); null when nothing is pinned.
+    private static string? FormatCoreSet(IReadOnlySet<int> cores)
+    {
+        if (cores.Count == 0)
+        {
+            return null;
+        }
+
+        int[] sorted = [.. cores];
+        Array.Sort(sorted);
+
+        List<string> ranges = [];
+        int runStart = sorted[0];
+        int previous = sorted[0];
+        for (int i = 1; i <= sorted.Length; i++)
+        {
+            if (i == sorted.Length || sorted[i] != previous + 1)
+            {
+                ranges.Add(runStart == previous ? runStart.ToString() : $"{runStart}-{previous}");
+                if (i < sorted.Length)
+                {
+                    runStart = sorted[i];
+                    previous = sorted[i];
+                }
+            }
+            else
+            {
+                previous = sorted[i];
+            }
+        }
+
+        return string.Join(", ", ranges);
+    }
+
+    // Current in-flight request views for a resync: volatile reads off each tracker, ordered by id so repeated
+    // dumps of the same moment read alike.
+    private IReadOnlyList<RequestPayload> InFlightRequestViews()
+    {
+        List<RequestPayload> views = [];
+        foreach (KeyValuePair<string, RequestTracker> entry in _monitoredRequests)
+        {
+            views.Add(entry.Value.View());
+        }
+
+        views.Sort(static (a, b) => string.CompareOrdinal(a.RequestId, b.RequestId));
+        return views;
     }
 
     // The scheduler owns its prefix cache privately; the service keeps what it passed so metrics can report cached blocks.
@@ -183,6 +256,13 @@ public sealed class GenerationService : IDisposable
                             $"admission now validates against a {_modelInfo.ContextLength}-token window; sequences already in flight are unaffected"));
                         break;
 
+                    case "ui.recent_requests":
+                        _metrics?.SetRecentRequestCapacity(candidate.Ui.RecentRequests);
+                        effective = effective with { Ui = candidate.Ui };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"monitor recent-request ring now holds at most {candidate.Ui.RecentRequests} completed requests; entries beyond the new cap dropped oldest-first"));
+                        break;
+
                     default:
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Refused, RefusalDetail(change)));
                         break;
@@ -190,6 +270,15 @@ public sealed class GenerationService : IDisposable
             }
 
             _current = effective;
+
+            // Snapshots must speak the configuration in force: re-push model facts after every apply so additive
+            // snapshot fields (worker threads, quota) track live-applied changes without waiting for a new tick's config.
+            EngineMetricsBus? metricsForFacts = _metrics;
+            if (metricsForFacts is not null)
+            {
+                metricsForFacts.AttachModelFacts(BuildMonitorFacts(effective));
+            }
+
             return results;
         }
     }
@@ -359,6 +448,12 @@ public sealed class GenerationService : IDisposable
             return new GenerationResult(string.Empty, prompt.Count, 0, "length");
         }
 
+        // Monitor lifecycle keys on the caller's correlation id when one was given (the API host passes the same value it
+        // answers with in x-lair-request-id); programmatic callers get a generated id so their stream rows still correlate.
+        EngineMetricsBus? bus = _metrics;
+        string monitorRequestId = !string.IsNullOrWhiteSpace(request.RequestId) ? request.RequestId! : Guid.NewGuid().ToString("N");
+        RequestTracker? tracker = bus is null ? null : new(bus, monitorRequestId, Model.Id, request.IsChat ? "chat" : "completion", prompt.Count);
+
         List<string> pieces = [];
         string streamed = string.Empty;
         int decodedChars = 0;
@@ -388,6 +483,10 @@ public sealed class GenerationService : IDisposable
             LogProbTopN = request.LogProbs ? Math.Max(request.TopLogprobs, 0) : null,
             OnTokenId = tokenId =>
             {
+                // Step-boundary tok/s sampling rides the hook that already runs for every generated token: one tick,
+                // two array writes, and at most a throttled lifecycle publish.
+                tracker?.ObserveToken();
+
                 string piece = _tokenizer.Decode([tokenId]);
                 if (piece.Length == 0)
                 {
@@ -419,8 +518,15 @@ public sealed class GenerationService : IDisposable
         catch (SchedulerFullException)
         {
             // The scheduler's capacity vocabulary is an engine-busy condition at this facade: surface it as the
-            // API-level EngineBusyException rather than leaking a scheduling type to callers.
+            // API-level EngineBusyException rather than leaking a scheduling type to callers. No lifecycle frames were
+            // published — a refused admission never entered the stream.
             throw new EngineBusyException();
+        }
+
+        if (tracker is RequestTracker admitted)
+        {
+            _monitoredRequests[admitted.RequestId] = admitted;
+            admitted.PublishStart();
         }
 
         SequenceOutcome outcome;
@@ -445,15 +551,41 @@ public sealed class GenerationService : IDisposable
             // literal, so its tally feeds the metrics bus's finish-reason counts.
             _metrics?.RecordStopCompletion();
         }
+        else if (outcome.FinishReason == FinishReason.Failed)
+        {
+            finishReason = "failed";
+        }
+        else if (outcome.FinishReason == FinishReason.Canceled)
+        {
+            finishReason = "cancelled";
+        }
+        else if (outcome.FinishReason == FinishReason.Eos)
+        {
+            finishReason = "eos";
+        }
         else
         {
-            finishReason = outcome.FinishReason switch
-            {
-                FinishReason.Failed => throw new EngineBusyException(),
-                FinishReason.Canceled => throw new OperationCanceledException(cancellationToken),
-                FinishReason.Eos => "eos",
-                _ => "length",
-            };
+            finishReason = "length";
+        }
+
+        // The completion frame publishes before failure semantics surface: a failed or cancelled generation still gets
+        // its final lifecycle row with the status it ended on, so stream state matches engine state.
+        if (tracker is RequestTracker finished)
+        {
+            _monitoredRequests.TryRemove(finished.RequestId, out _);
+            finished.Complete(finishReason, outcome.PrefillCachedTokens, finishReason);
+        }
+
+        if (finishReason == "failed")
+        {
+            throw new EngineBusyException();
+        }
+
+        if (finishReason == "cancelled")
+        {
+            // A sequence the scheduler cancelled without a stop literal is either the caller's token or the safety net.
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new OperationCanceledException(cancellationToken);
         }
 
         // Recognized fences take over the result: the fences vanish from the visible text, the calls ride along as data,

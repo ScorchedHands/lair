@@ -66,4 +66,7 @@ public sealed record GenerationRequest
 
     /// <summary>Streaming sink for <see cref="Stream"/>; ignored otherwise.</summary>
     public Action<string>? OnToken { get; init; }
+
+    /// <summary>Correlation id the monitor stream keys this generation's lifecycle events on — the API host supplies its own <c>x-lair-request-id</c>; null lets the engine mint one. Not part of the OpenAI wire body.</summary>
+    public string? RequestId { get; init; }
 }

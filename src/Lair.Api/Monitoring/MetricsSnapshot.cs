@@ -38,7 +38,50 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_requests_failed_total")] long RequestsFailedTotal,
 
     [property: JsonPropertyName("metrics_process_working_set_mb")] double ProcessWorkingSetMb,
-    [property: JsonPropertyName("metrics_process_cpu_percent")] double ProcessCpuPercent)
+    [property: JsonPropertyName("metrics_process_cpu_percent")] double ProcessCpuPercent,
+
+    /// <summary>The monitor stream schema version this snapshot's payload belongs to.</summary>
+    [property: JsonPropertyName("metrics_events_version")] int EventsVersion = MonitorEventSchema.Version,
+
+    /// <summary>The server-scoped event id the bus assigned this snapshot; equals its SSE frame id and anchors Last-Event-ID replay.</summary>
+    [property: JsonPropertyName("metrics_event_seq")] long EventSeq = 0,
+
+    /// <summary>Totals of stream frames dropped from subscriber queues since the bus opened — how often slow consumers lost events.</summary>
+    [property: JsonPropertyName("metrics_dropped_events_total")] long DroppedEventsTotal = 0,
+
+    // Additive model-fact fields for operator views (configured-model detail rows). Every one is a trailing optional
+    // parameter with an inert default, so v1 payloads and constructions read exactly as before; pool-derived values
+    // are always filled, configuration-backed ones serialize null until the owning service attaches facts.
+
+    /// <summary>The configured model kind (<c>chat</c>, <c>embed</c>) this engine serves.</summary>
+    [property: JsonPropertyName("metrics_model_type")] string? ModelType = null,
+
+    /// <summary>Tokens per KV block — the fixed block geometry of this engine's pool.</summary>
+    [property: JsonPropertyName("metrics_kv_block_tokens")] int KvBlockTokens = 0,
+
+    /// <summary>The soft KV usage cap admission currently spends from, within the physical reservation.</summary>
+    [property: JsonPropertyName("metrics_kv_budget_blocks")] int KvBudgetBlocks = 0,
+
+    /// <summary>Total bytes physically reserved for the KV pool across all blocks, rounded to megabytes.</summary>
+    [property: JsonPropertyName("metrics_kv_pool_mb")] double KvPoolMb = 0.0,
+
+    /// <summary>Engine worker threads currently participating in kernels (the effective count after quota).</summary>
+    [property: JsonPropertyName("metrics_worker_threads")] int? WorkerThreads = null,
+
+    /// <summary>Pinned logical core ids rendered as compressed ranges (<c>0-23</c>), or null when unpinned.</summary>
+    [property: JsonPropertyName("metrics_core_set")] string? CoreSet = null,
+
+    /// <summary>The configured hard cap on this model's worker threads, or null when uncapped.</summary>
+    [property: JsonPropertyName("metrics_thread_quota")] int? ThreadQuota = null,
+
+    /// <summary>The compute device placement of the served model (decode side).</summary>
+    [property: JsonPropertyName("metrics_decode_device")] string? DecodeDevice = null,
+
+    /// <summary>The prefill-side device placement configured for this model.</summary>
+    [property: JsonPropertyName("metrics_prefill_device")] string? PrefillDevice = null,
+
+    /// <summary>The KV residency mode configured for this model (<c>dram</c>, ...).</summary>
+    [property: JsonPropertyName("metrics_kv_residency")] string? KvResidency = null)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

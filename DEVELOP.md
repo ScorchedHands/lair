@@ -8,6 +8,10 @@ dotnet build Lair.sln
 
 Target framework: net10.0. Solution layout: `src/Lair.*` projects (Core, Loader, Backends.Cpu, Kv, Tokenizer, Sampling, Models, Api, Host), `tests/Lair.Tests`, `bench/Lair.Bench`. The continuous-batch scheduler lives in `src/Lair.Models/Scheduling/`; the metrics bus and monitor stream in `src/Lair.Api/Monitoring/`; the config watcher and change-application bus in `src/Lair.Host/ConfigWatcher.cs` + `src/Lair.Api/Config/ConfigReload.cs`.
 
+## Web UI build (`web/`)
+
+The `/ui` SPA is a TypeScript/React app built with esbuild + Tailwind v4 (pinned deps, committed lockfile; Node 22 / npm 11). `dotnet build` auto-runs `npm install`/`npm run build` when web sources changed and stages `web/dist` into the Host's served assets at `/ui`; `-p:SkipWebUi=true` skips it entirely (no Node needed). Dev loop: `cd web && npm run watch`. UI smoke harnesses (jsdom): `npm run smoke` (monitor tab), `npm run smoke:chat` (chat tab) — run after bundle-affecting changes.
+
 ## Test
 
 ```powershell
@@ -17,7 +21,7 @@ dotnet test Lair.sln --filter Category=Parity # golden parity vs pinned llama.cp
 dotnet test Lair.sln --filter Category=Kernel # kernel oracle comparisons
 ```
 
-Test categories: `Loader`, `Tokenizer`, `Template`, `Kernel`, `Layers`, `Kv`, `Sampling`, `Api`, `Cli`, `Config`, `Parity`, `Calib`, `Concurrency`, `Prefill`, `Cache`, `Cancel`, `HotReload`, `Metrics`, `Embeddings`, `Affinity`.
+Test categories: `Loader`, `Tokenizer`, `Template`, `Kernel`, `Layers`, `Kv`, `Sampling`, `Api`, `Cli`, `Config`, `Parity`, `Calib`, `Concurrency`, `Prefill`, `Cache`, `Cancel`, `HotReload`, `Metrics`, `Embeddings`, `Affinity`, `MonitorUi`, `WebUi`.
 
 Performance gates (inter-token latency budgets in `ConcurrencyTests`/`PrefillTests`) are only meaningful under `-c Release` — Debug JIT inflates kernels ~4.6× and the absolute budgets cannot reproduce there. Correctness suites pass in both configurations.
 

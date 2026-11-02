@@ -4,6 +4,18 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-02
+
+### Added
+
+- Web UI at `/ui` (served by the API host): a tabbed dark-themed operator surface built from the approved mockup — Monitor tab with live KPI cards, configured-models table (rows expand to show config and state: context/block size, KV budget, core set/quota, workers, residency, cache blocks, finish-reason tallies), in-flight request rows with per-request throughput sparklines, recent-request ring (`ui.recent_requests`, hot-reloadable), GPU/PCIe/power tiles reserved for the CUDA phase; Chat tab is a built-in test client: LLM-only model selector, streamed multi-turn replies, mid-stream Stop, tool-call cards.
+- Versioned monitor event schema v1 on `/monitor/stream`: incrementing frame ids, `snapshot` / `request_start|update|complete` lifecycle events with per-request token-sample series (drives the sparklines), `resync` state dumps; `Last-Event-ID` reconnect replay from the snapshot buffer; latest-only coalescing and bounded subscriber queues with drop counters.
+- `/v1/models` entries now carry a model `type` field.
+
+### Changed
+
+- Frontend toolchain under version control: pinned esbuild/Tailwind v4/React build in `web/`, embedded into the Host build automatically (`-p:SkipWebUi=true` opts out).
+
 ## [0.2.0] - 2026-11-02
 
 ### Added

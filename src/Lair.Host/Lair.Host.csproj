@@ -15,7 +15,59 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <Version>0.2.0</Version>
+    <Version>0.3.0</Version>
   </PropertyGroup>
+
+  <!-- Web UI embedding: web/ is bundled into wwwroot/ui so the host can serve /ui.
+       Set SkipWebUi=true (e.g. -p:SkipWebUi=true) on machines without Node/npm; the host then
+       serves no UI and the WebUi test category skips. -->
+  <PropertyGroup>
+    <SkipWebUi Condition="'$(SkipWebUi)' == ''">false</SkipWebUi>
+    <WebUiProjectDirectory>$(MSBuildThisFileDirectory)..\..\web\</WebUiProjectDirectory>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <WebUiSource Include="$(WebUiProjectDirectory)**\*" Exclude="$(WebUiProjectDirectory)node_modules\**\*;$(WebUiProjectDirectory)dist\**\*" />
+  </ItemGroup>
+
+  <!-- Bundles web/ when any web source is newer than the stamp file (which records the last successful bundle)
+       or when dist is missing, stages the output into wwwroot/ui, and registers it as Content for the standard
+       output/publish copy. Hooked before both copy-item collectors so even a first-ever build embeds in one
+       pass; implicit restore fast-paths never run project targets, so restore-time hooks would not fire here. -->
+  <Target Name="PrepareWebUi"
+          BeforeTargets="GetCopyToOutputDirectoryItems;GetCopyToPublishDirectoryItems"
+          Condition="'$(SkipWebUi)' != 'true' And '$(DesignTimeBuild)' != 'true'">
+    <!-- Assigned at execution time: IntermediateOutputPath is only known after AssignTargetPaths has run. -->
+    <PropertyGroup>
+      <WebUiStampFile>$(IntermediateOutputPath)webui.stamp</WebUiStampFile>
+    </PropertyGroup>
+    <Error Text="web/ sources were not found at $(WebUiProjectDirectory); build with -p:SkipWebUi=true to skip the web UI." Condition="!Exists('$(WebUiProjectDirectory)package.json')" />
+    <Exec Command="npm install --no-audit --no-fund" WorkingDirectory="$(WebUiProjectDirectory)" Condition="!Exists('$(WebUiProjectDirectory)node_modules')" />
+    <ReadLinesFromFile File="$(WebUiStampFile)" Condition="Exists('$(WebUiStampFile)')">
+      <Output TaskParameter="Lines" PropertyName="_WebUiStampTicks" />
+    </ReadLinesFromFile>
+    <ItemGroup>
+      <_WebUiSourceTimes Include="@(WebUiSource)" Condition="'%(Identity)' != ''" NormalizedTicks="$([System.DateTime]::Parse('%(ModifiedTime)').Ticks)" />
+      <_WebUiNewerSources Include="@(_WebUiSourceTimes)" Condition="'%(_WebUiSourceTimes.NormalizedTicks)' &gt; $([MSBuild]::ValueOrDefault('$(_WebUiStampTicks)', '0'))" />
+    </ItemGroup>
+    <Exec Command="npm run build" WorkingDirectory="$(WebUiProjectDirectory)" Condition="'@(_WebUiNewerSources)' != '' Or !Exists('$(WebUiProjectDirectory)dist\index.html')" />
+    <WriteLinesToFile File="$(WebUiStampFile)" Lines="$([System.DateTime]::Now.Ticks)" Overwrite="true" />
+    <ItemGroup>
+      <_WebUiDistFiles Include="$(WebUiProjectDirectory)dist\**\*" />
+    </ItemGroup>
+    <RemoveDir Directories="$(MSBuildThisFileDirectory)wwwroot\ui" Condition="'@(_WebUiDistFiles)' != ''" />
+    <Copy SourceFiles="@(_WebUiDistFiles)" DestinationFolder="$(MSBuildThisFileDirectory)wwwroot\ui\%(RecursiveDir)" SkipUnchangedFiles="true" />
+    <!-- Registered straight into ContentWithTargetPath — the list the output/publish collectors actually read.
+         AssignTargetPaths built it before this target ran, so the staged files are given their TargetPath here. -->
+    <ItemGroup>
+      <_WebUiContentCandidates Include="$(MSBuildThisFileDirectory)wwwroot\ui\**\*" />
+    </ItemGroup>
+    <AssignTargetPath Files="@(_WebUiContentCandidates)" RootFolder="$(MSBuildProjectDirectory)">
+      <Output TaskParameter="AssignedFiles" ItemName="_WebUiAssignedContent" />
+    </AssignTargetPath>
+    <ItemGroup>
+      <ContentWithTargetPath Include="%(_WebUiAssignedContent.FullPath)" TargetPath="%(_WebUiAssignedContent.TargetPath)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" Visible="false" />
+    </ItemGroup>
+  </Target>
 
 </Project>

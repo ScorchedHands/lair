@@ -214,6 +214,7 @@ public class ApiTests : IClassFixture<ApiFixture>
         Assert.Equal(512, entry.GetProperty("context_length").GetInt32());
         Assert.Equal("F16", entry.GetProperty("quant").GetString());
         Assert.False(string.IsNullOrEmpty(entry.GetProperty("architecture").GetString()));
+        Assert.Equal("chat", entry.GetProperty("type").GetString()); // the additive kind flag chat surfaces filter on
     }
 
     [Fact]
