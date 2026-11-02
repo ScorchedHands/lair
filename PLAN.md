@@ -296,7 +296,7 @@ Many requests at once, tuned, with live reconfiguration.
   - Verify: `dotnet test -c Release --filter Category=Prefill` — 1/1 ✅ ~407-token prompt prefills chunk-by-chunk while short requests stream past it at ITL p95 68 ms with outputs identical to a fresh-engine baseline. Tuning finding: per-step time ≈ chunk width × single-stream cost, so the DN-M2-2 default (512) overshoots the CPU budget — chunk widths of ~8 hold 400 ms at measured Release speed (~28 ms/token F16); wide chunks only pay off on faster compute.
 - [✓] Prompt caching — reference-counted prefix blocks reused across requests (see DN-M2-3)
   - Verify: `dotnet test -c Release --filter Category=Cache` — 6/6 ✅ on real SmolLM-F16: shared 127-token prefix → second request skips 112 prefill tokens with byte-identical output vs cold run; CoW copy verified bit-safe for the original sequence; LRU eviction never touches blocks referenced by active sequences; refcount release ordering tested. Cache lifetime = pool lifetime (covers reload/quant/block-size invalidation this phase).
-- [_] Cancellation — abort sequences mid-batch-step without stalling the rest of the batch (see DN-M2-4)
+- [→] Cancellation — abort sequences mid-batch-step without stalling the rest of the batch (see DN-M2-4)
   - Verify: integration test — aborted request frees its blocks; other requests complete unchanged.
 - [_] API completeness — tool calls, logprobs, penalties, `logit_bias`, seed (see DN-M2-8)
   - Verify: OpenAI SDK scripts — tool-call round trip, logprobs present and normalized, penalties alter sampling deterministically under seed.
@@ -525,6 +525,8 @@ Vision input on chat models.
 | idea | Prefill GEMM shim microkernel | tiled-matmul native microkernel via `[LibraryImport]` where the bench harness proves the managed tile wall |
 | idea | Core-set overcommit | allow models to share/partially oversubscribe core sets as an explicit knob |
 | idea | Cross-model interleaved batches | multi-model serving where batch steps alternate across models at configured ratios (e.g. 2:1) so all models share one compute/thread pool; per-model throughput degrades proportionally to share — explicit toggle with per-model ratios, never the default (DN-M2-6 core-set partitioning stays default); MVP4 scheduling candidate |
+| idea | Diffusion model support | UNet/DiT executor family (bidirectional attention, no KV cache), Conv2D/GroupNorm kernels, VAE encode/decode, noise-scheduler stack, CLIP/T5 conditioning; GGUF already hosts SD-class containers and the loader/backend/quant investment transfers; continuous batching fits denoise steps well; needs a Scope change (image generation is a current explicit non-goal) — proposed MVP8 candidate |
+| idea | Server-side MCP injection | per-model, config-declared MCP servers whose tool definitions LAIR injects into chat requests regardless of client; injected tools execute server-side (contrast DN-M2-8: client-supplied tools stay client-side); enables cross-model composition — an LLM calling a diffusion model through its MCP endpoint, or the embeddings engine exposed as a vector/RAG MCP; interacts with tool-call API work and server posture |
 | idea | `auto` device fallback | silent CPU fallback when a configured CUDA device is absent — deliberately not a default (DN-M3-3) |
 | bug | Q4_K_M family coverage gap | kernels implement only the Q4_K block format; real Q4_K_M files mix Q5_K/Q6_K tensors, and non-block-divisible dims force legacy formats (Q4_0/Q5_0…) — loader/kernel extension needed before serving published quants in production |
 
