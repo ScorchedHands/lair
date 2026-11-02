@@ -290,6 +290,9 @@ Many requests at once, tuned, with live reconfiguration.
 - **DN-M2-10** — Tool-call detection (MVP2 scope): the wire contract is complete even for models without tool-trained templates. Schemas are injected into the rendered prompt per template family; a call is recognized ONLY when decoded output contains a fenced ```json block whose object matches `{name, arguments}` against a declared tool name (`arguments` JSON-encoded string). Recognized calls appear in `message.tool_calls` / streaming deltas and are stripped from visible text. Execution stays client-side. A model that never emits the contract simply returns ordinary text — valid behavior, tested at parser level, not demanded of small models.
   - Rationale: tool compliance is a property of the model, not the runtime; the runtime guarantees injection, detection, and wire shape.
   - Contract: `lair.api` tool pipeline + template injection.
+- **DN-M2-11** — Hot-reload KV budget semantics under pinned arenas: the pool's physical arena is reserved once at startup; `kv_blocks` hot-edits operate as a soft cap within that reservation — grow raises usage up to reserved capacity immediately, shrink drains blocks above the new cap through prefix-cache eviction (never touches active sequences) and tightens admission. Physical re-reservation belongs to the tiered-pools phase, not MVP2.
+  - Rationale: mid-serving arena reallocation over live block tables is exactly what step-boundary safety exists to avoid; a soft cap delivers the observable hot-reload behavior without engine risk.
+  - Contract: BlockPool soft-cap + PrefixCache eviction interplay at reload apply time.
 
 #### Implementation Items
 
@@ -309,7 +312,7 @@ Many requests at once, tuned, with live reconfiguration.
   - Verify: `dotnet test -c Release --filter Category=Embeddings` — 8/8 ✅ two-layer synthetic GGUF (tied head lets tests replay logits from Encode rows) + real SmolLM-F16 cases; sequential one-token encodes match incremental decode bit-for-bit while full-window encoding legitimately diverges at earlier positions — bidirectional wiring proven distinct from causal at op and run level. Mean/CLS pooling with L2 normalize (double accumulation). Endpoint deferred to the embeddings phase per DN-M4-3.
 - [✓] Thread pools — sized to memory channels, per-model quotas, core-set affinity (see DN-M2-6)
   - Verify: `dotnet test --filter Category=Affinity` — 4/4 ✅ pinned workers land inside the configured core set across ≥100 sampled job executions (`SetThreadAffinityMask`, re-applied on wake; documented no-op + startup warning off-Windows); physical-core auto-sizing (SMT siblings excluded via `GetLogicalProcessorInformationEx`; i9-13900K: 24 workers vs old logical cap 16) with ProcessorCount fallback; `placement.thread_quota` caps effective workers (output byte-identical under quota); cross-model core-set overlap rejected at config load naming both models.
-- [_] Hot-reload application path — config watcher pushes validated changes through the change-application bus by mutation class: live knobs apply at the next step boundary, new-requests-only knobs affect admission only, restart-only knobs are refused with an actionable message (see DN-M2-5)
+- [→] Hot-reload application path — config watcher pushes validated changes through the change-application bus by mutation class: live knobs apply at the next step boundary, new-requests-only knobs affect admission only, restart-only knobs are refused with an actionable message (see DN-M2-5)
   - Verify: `dotnet test --filter Category=HotReload` — a mid-serving edit to a live knob is observable in engine behavior without restart; editing a restart-only knob returns refusal naming the mutation class.
 
 #### Tests
