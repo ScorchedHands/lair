@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -28,21 +29,110 @@ public sealed unsafe class CpuBackend : IBackend
     // Output rows per scheduling unit for threaded GEMV.
     private const int RowBlock = 64;
 
+    // Upper bound on activation vectors per batched GEMV call.
+    private const int MaxBatch = 16;
+
     // Below this row count the threading overhead is not worth paying.
     private const int ParallelRowThreshold = 256;
 
-    private readonly int _threads;
+    // The engine's own thread choice (0 = auto-sized) before any model quota capped it: the ceiling a hot quota edit
+    // may restore participation up to — raising a quota beyond this would be an engine-wide change, not a placement one.
+    private readonly int _uncappedThreads;
+
+    // Workers currently let participate in threaded GEMV: min(uncapped choice, current quota). Read fresh at every
+    // kernel call so an apply from another thread lands on the next step boundary; lowering it leaves pool workers
+    // parked and idle rather than killing them.
+    private volatile int _effectiveThreads;
+
+    // Guards lazy pool creation/growth against racing with ApplyThreadQuota calls. Forward consumers of one backend
+    // are serialized by the scheduler's gate, so a swap never races an in-flight kernel job.
+    private readonly object _poolGate = new();
+
+    private readonly ulong? _coreMask;
+    private bool _samplingRequested; // test-only instrumentation flag, read when the pool is created and pushed on enable
     private readonly bool _useAvx2;
     private WorkerPool? _pool;
 
-    public CpuBackend(int threads = 0, bool allowAvx2 = true)
+    /// <summary>
+    /// Default auto-sizing rule: one worker per physical core, SMT siblings excluded. Dense GEMV decode is memory-
+    /// bandwidth-bound and two threads on one core share that core's front-end, L1/L2 caches, and execution ports, so
+    /// a sibling thread adds contention rather than bandwidth; logical processor counts therefore overstate usable
+    /// parallelism for this workload. Physical cores come from <see cref="ThreadAffinity.DetectPhysicalCoreCount"/>
+    /// (Windows topology API, probed once per process); when detection is unavailable the count falls back to
+    /// <see cref="Environment.ProcessorCount"/>, which can only overestimate and is then capped by it. An explicit
+    /// nonzero thread request wins over auto-sizing, and a per-model quota caps either choice.
+    /// </summary>
+    public static int AutoWorkerCount => Math.Min(Math.Max(ThreadAffinity.DetectPhysicalCoreCount(), 1), Environment.ProcessorCount);
+
+    /// <summary>
+    /// Opens the CPU backend for one model placement. <paramref name="threads"/> is the global worker request (0 = auto-size by
+    /// <see cref="AutoWorkerCount"/>); <paramref name="threadQuota"/> optionally caps that count to 1 or more; and a non-empty
+    /// <paramref name="coreSet"/> pins every persistent pool worker to those logical cores for their whole lifetime, so all of the
+    /// model's compute stays inside its configured processor set. Pinning is applied on Windows only: on other platforms it is a
+    /// documented no-op that warns once at startup (Linux affinity via sched_setaffinity is later hardening). Core ids must lie
+    /// within one 64-bit processor group ([0, 63]) because that is what an affinity mask can express.
+    /// </summary>
+    public CpuBackend(int threads = 0, IReadOnlySet<int>? coreSet = null, int? threadQuota = null, bool allowAvx2 = true)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(threads);
-        _threads = threads == 0 ? Math.Min(Environment.ProcessorCount, 16) : threads;
+        if (threadQuota is < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(threadQuota), threadQuota, "A thread quota must be at least 1; omit it to leave the worker count uncapped.");
+        }
+
+        int global = threads == 0 ? AutoWorkerCount : threads;
+        _uncappedThreads = global;
+        _effectiveThreads = Math.Min(global, threadQuota ?? global);
+
+        if (coreSet is { Count: > 0 })
+        {
+            // Validate ids before any pool exists so an out-of-group core set fails the open call instead of a worker loop.
+            _coreMask = ThreadAffinity.BuildCoreMask(coreSet);
+        }
+
         _useAvx2 = allowAvx2 && Avx2.IsSupported && Fma.IsSupported && Ssse3.IsSupported;
     }
 
     public string DeviceId => "cpu";
+
+    /// <summary>Worker count this backend actually runs threaded GEMV with (dispatcher plus pool workers), after quota and auto-sizing.</summary>
+    public int EffectiveWorkerCount => _effectiveThreads;
+
+    /// <summary>
+    /// Applies a new per-model thread quota at runtime: the effective worker count becomes min(engine thread choice,
+    /// quota) — lowering it idles pool workers starting with the next kernel call (the scheduler's next step), and
+    /// raising participation back up to the engine's own thread choice re-grows the persistent pool once if needed.
+    /// Participation above <c>engine.threads</c> is not a placement decision this model owns, so a quota beyond that
+    /// ceiling simply reads as the uncapped count. Rows stay independent, so output bytes are unchanged at any worker
+    /// count; returns the effective worker count now in force.
+    /// </summary>
+    public int ApplyThreadQuota(int? threadQuota)
+    {
+        if (threadQuota is < 1)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(threadQuota), threadQuota, "A thread quota must be at least 1; omit it to leave the worker count uncapped.");
+        }
+
+        lock (_poolGate)
+        {
+            _effectiveThreads = Math.Min(_uncappedThreads, threadQuota ?? _uncappedThreads);
+            return _effectiveThreads;
+        }
+    }
+
+    /// <summary>Physical cores detected on the machine by the topology probe (0 when detection is unavailable); see <see cref="AutoWorkerCount"/>.</summary>
+    public static int DetectedPhysicalCoreCount => ThreadAffinity.DetectPhysicalCoreCount();
+
+    /// <summary>
+    /// Turns on lightweight per-block execution sampling: each worker block records which logical processor it ran on, readable
+    /// through <see cref="ExecutionSamples"/>. Off by default so production runs pay no instrumentation cost beyond one field read.
+    /// </summary>
+    internal void EnableExecutionSampling() => _samplingRequested = true;
+
+    /// <summary>The processor number of each sampled worker-block execution since sampling was enabled (empty before the first threaded call).</summary>
+    internal IReadOnlyList<int> ExecutionSamples => _pool?.SampleSnapshot() ?? [];
 
     public MemoryHandle AllocateAligned(long bytes, int alignment)
     {
@@ -111,7 +201,9 @@ public sealed unsafe class CpuBackend : IBackend
         fixed (float* pX = x)
         fixed (float* pOut = output)
         {
-            bool parallel = _threads > 1 && rows >= ParallelRowThreshold;
+            // Participation is sampled per call so a quota applied on another thread takes effect from this kernel on.
+            int workers = _effectiveThreads;
+            bool parallel = workers > 1 && rows >= ParallelRowThreshold;
 
             if (!parallel)
             {
@@ -125,6 +217,78 @@ public sealed unsafe class CpuBackend : IBackend
 
             WorkerPool pool = GetOrCreatePool();
             pool.Run((rows + RowBlock - 1) / RowBlock, new RowBlockJob(pBytes, pX, pOut, stride, rows, cols, format, _useAvx2));
+        }
+    }
+
+    public void GemvBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs)
+    {
+        int[] dims = w.Shape.Dims;
+        if (dims.Length < 2 || dims[0] <= 0 || dims[^1] <= 0)
+        {
+            throw new ArgumentException("Weight shape must be a matrix with positive row and column counts.", nameof(w));
+        }
+
+        int rows = dims[0];
+        int cols = dims[^1];
+
+        long strideBytes = w.Shape.RowStrideBytes(w.Format);
+        if (strideBytes > int.MaxValue)
+        {
+            throw new ArgumentException("Row byte size exceeds the addressable span limit.", nameof(w));
+        }
+
+        long expectedBytes = rows * strideBytes;
+        if ((long)w.Bytes.Length != expectedBytes)
+        {
+            throw new ArgumentException(
+                $"WeightRef byte length is {w.Bytes.Length} but shape {rows}x{cols} in format {w.Format} " +
+                $"requires {expectedBytes} bytes ({rows} rows x {strideBytes}-byte row stride).",
+                nameof(w));
+        }
+
+        ArgumentOutOfRangeException.ThrowIfLessThan(count, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(count, MaxBatch);
+
+        if ((long)inputs.Length != (long)count * cols)
+        {
+            throw new ArgumentException(
+                $"Batched input length {inputs.Length} must equal count {count} times the weight column count {cols}.",
+                nameof(inputs));
+        }
+
+        if ((long)outputs.Length < (long)count * rows)
+        {
+            throw new ArgumentException(
+                $"Batched output length {outputs.Length} is shorter than count {count} times the weight row count {rows}.",
+                nameof(outputs));
+        }
+
+        int stride = (int)strideBytes;
+        QuantFormat format = w.Format;
+
+        // Same raw-pointer job contract as Gemv: pinned spans stay stable for the duration of the call and every
+        // claimed block finishes before WorkerPool.Run returns. Rows are independent, so row partitioning stays
+        // bit-identical; each batch vector is computed by its own accumulator chain exactly like a single GEMV.
+        fixed (byte* pBytes = w.Bytes)
+        fixed (float* pIn = inputs)
+        fixed (float* pOut = outputs)
+        {
+            // Participation is sampled per call so a quota applied on another thread takes effect from this kernel on.
+            int workers = _effectiveThreads;
+            bool parallel = workers > 1 && rows >= ParallelRowThreshold;
+
+            if (!parallel)
+            {
+                for (int row = 0; row < rows; row++)
+                {
+                    RowBatchDot(pBytes + (long)row * stride, pIn, count, rows, cols, format, _useAvx2, pOut + row);
+                }
+
+                return;
+            }
+
+            WorkerPool pool = GetOrCreatePool();
+            pool.Run((rows + RowBlock - 1) / RowBlock, new BatchRowJob(pBytes, pIn, pOut, stride, rows, cols, count, format, _useAvx2));
         }
     }
 
@@ -319,15 +483,35 @@ public sealed unsafe class CpuBackend : IBackend
 
     private WorkerPool GetOrCreatePool()
     {
-        WorkerPool? pool = _pool;
-        if (pool is not null)
+        lock (_poolGate)
         {
-            return pool;
-        }
+            int workersNeeded = Math.Max(_effectiveThreads - 1, 0);
 
-        // Never used when no extra workers exist: parallel GEMV requires threads > 1.
-        return _pool = new WorkerPool(Math.Max(_threads - 1, 0));
+            WorkerPool? pool = _pool;
+            if (pool is not null && pool.WorkerCapacity >= workersNeeded)
+            {
+                return pool;
+            }
+
+            // A quota raised after the first threaded call may want more participants than the existing pool hosts:
+            // grow it once. Safe because forward consumers of one backend are serialized by the scheduler's gate, so
+            // no job can be mid-Run on the old pool — every Run returns only after all its blocks finished.
+            pool?.Dispose();
+
+            WorkerPool grown = new WorkerPool(workersNeeded, _coreMask);
+
+            if (_samplingRequested)
+            {
+                // sampling can be armed before the first threaded call ever builds the pool
+                grown.EnableSampling();
+            }
+
+            return _pool = grown;
+        }
     }
+
+    /// <summary>Whether this backend pins its pool workers (a core set was configured) or leaves them unpinned.</summary>
+    internal bool IsPinningConfigured => _coreMask is not null;
 
     private static float RowDot(byte* row, float* x, int cols, QuantFormat format, bool avx2)
     {
@@ -383,6 +567,325 @@ public sealed unsafe class CpuBackend : IBackend
     internal interface IGemvJob
     {
         void ProcessBlock(int block);
+    }
+
+    /// <summary>
+    /// Row-block executor for one batched GEMV call. Each row computes its batch vector dots independently, so
+    /// any partition of blocks yields bit-identical output; batch vectors are never split across workers.
+    /// </summary>
+    private sealed unsafe class BatchRowJob : IGemvJob
+    {
+        private readonly byte* _bytes;
+        private readonly float* _inputs;
+        private readonly float* _out;
+        private readonly int _stride;
+        private readonly int _rows;
+        private readonly int _cols;
+        private readonly int _count;
+        private readonly QuantFormat _format;
+        private readonly bool _avx2;
+
+        public BatchRowJob(byte* bytes, float* inputs, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2)
+        {
+            _bytes = bytes;
+            _inputs = inputs;
+            _out = outPtr;
+            _stride = stride;
+            _rows = rows;
+            _cols = cols;
+            _count = count;
+            _format = format;
+            _avx2 = avx2;
+        }
+
+        public void ProcessBlock(int block)
+        {
+            int firstRow = block * RowBlock;
+            int lastRow = Math.Min(firstRow + RowBlock, _rows);
+            for (int row = firstRow; row < lastRow; row++)
+            {
+                RowBatchDot(_bytes + (long)row * _stride, _inputs, _count, _rows, _cols, _format, _avx2, _out + row);
+            }
+        }
+    }
+
+    // Batched row evaluator for one row: outBase points at column `row` of the flat batch output buffer and
+    // receives outBase[b * rows] = dot(row, inputs[b]), i.e. absolute position b*rows + row per
+    // IBackend.GemvBatch's layout. The row's packed bytes are traversed exactly once: every dequantized chunk
+    // is materialized one time into a stack scratch buffer and fed to all count accumulator chains. Each chain
+    // advances exactly like the single-vector kernel's - eight-lane FMAs over successive chunks in the same
+    // element order, then scalar tail accumulation, then a lane reduction identical to HSum - so every output
+    // is bit-identical to a single-vector GEMV row.
+    private static void RowBatchDot(byte* rowBytes, float* inputs, int count, int rows, int cols, QuantFormat format, bool avx2, float* outBase)
+    {
+        switch (format)
+        {
+            case QuantFormat.F32:
+                if (avx2)
+                {
+                    BatchF32Avx2((float*)rowBytes, inputs, count, rows, cols, outBase);
+                }
+                else
+                {
+                    for (int b = 0; b < count; b++)
+                    {
+                        outBase[b * rows] = DotScalar((float*)rowBytes, inputs + (long)b * cols, cols);
+                    }
+                }
+
+                break;
+            case QuantFormat.F16:
+                if (avx2)
+                {
+                    BatchF16Avx2(rowBytes, inputs, count, rows, cols, outBase);
+                }
+                else
+                {
+                    for (int b = 0; b < count; b++)
+                    {
+                        outBase[b * rows] = RowDotF16Scalar(rowBytes, inputs + (long)b * cols, cols);
+                    }
+                }
+
+                break;
+            case QuantFormat.Q8_0:
+                if (avx2)
+                {
+                    BatchQ8Avx2(rowBytes, inputs, count, rows, cols, outBase);
+                }
+                else
+                {
+                    for (int b = 0; b < count; b++)
+                    {
+                        outBase[b * rows] = RowDotQ8Scalar(rowBytes, inputs + (long)b * cols, cols);
+                    }
+                }
+
+                break;
+            case QuantFormat.Q4_K:
+                if (avx2)
+                {
+                    BatchQ4KAvx2(rowBytes, inputs, count, rows, cols, outBase);
+                }
+                else
+                {
+                    for (int b = 0; b < count; b++)
+                    {
+                        outBase[b * rows] = RowDotQ4KScalar(rowBytes, inputs + (long)b * cols, cols);
+                    }
+                }
+
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(format), format, "Unknown quant format.");
+        }
+    }
+
+    // Batched F32 row: one weight window load per chunk feeds all accumulator chains, so the row is streamed
+    // once for the whole batch. Accumulator lanes live in stack scratch (count x eight slots, reused per row)
+    // and each chain's FMA operand order matches DotCore exactly.
+    private static void BatchF32Avx2(float* row, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> acc = stackalloc float[MaxBatch * 8];
+        Span<float> tail = stackalloc float[MaxBatch];
+        BatchInit(acc, tail, count);
+
+        fixed (float* pAcc = acc)
+        {
+            int i = 0;
+            for (; i + 8 <= cols; i += 8)
+            {
+                Vector256<float> wv = Avx.LoadVector256(row + i);
+                for (int b = 0; b < count; b++)
+                {
+                    float* chain = pAcc + b * 8;
+                    Avx.Store(chain, Fma.MultiplyAdd(wv, Avx.LoadVector256(inputs + (long)b * cols + i), Avx.LoadVector256(chain)));
+                }
+            }
+
+            for (; i < cols; i++)
+            {
+                float w = row[i];
+                for (int b = 0; b < count; b++)
+                {
+                    tail[b] += w * inputs[(long)b * cols + i];
+                }
+            }
+
+            BatchFinish(pAcc, tail, count, rows, outBase);
+        }
+    }
+
+    // Batched F16 row: one half-bit expansion per chunk feeds all accumulator chains with the same FMA operand
+    // order as RowDotF16Avx2, so the packed bytes are streamed once for the whole batch.
+    private static void BatchF16Avx2(byte* row, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> acc = stackalloc float[MaxBatch * 8];
+        Span<float> tail = stackalloc float[MaxBatch];
+        BatchInit(acc, tail, count);
+
+        fixed (float* pAcc = acc)
+        {
+            int i = 0;
+            for (; i + 8 <= cols; i += 8)
+            {
+                Vector256<int> bits = Vector256.Create(
+                    Sse41.ConvertToVector128Int32((ushort*)(row + 2L * i)),
+                    Sse41.ConvertToVector128Int32((ushort*)(row + 2L * i) + 4));
+                Vector256<float> w = HalfBitsToFloat(bits);
+                for (int b = 0; b < count; b++)
+                {
+                    float* chain = pAcc + b * 8;
+                    Avx.Store(chain, Fma.MultiplyAdd(w, Avx.LoadVector256(inputs + (long)b * cols + i), Avx.LoadVector256(chain)));
+                }
+            }
+
+            for (; i < cols; i++)
+            {
+                float w = ReadHalfLE(row + 2 * i);
+                for (int b = 0; b < count; b++)
+                {
+                    tail[b] += w * inputs[(long)b * cols + i];
+                }
+            }
+
+            BatchFinish(pAcc, tail, count, rows, outBase);
+        }
+    }
+
+    // Batched Q8_0 row: one quant unpack per eight-element chunk feeds all accumulator chains with the same
+    // (x * q) * d association as RowDotQ8Avx2, so the packed bytes are streamed once for the whole batch.
+    private static void BatchQ8Avx2(byte* row, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> acc = stackalloc float[MaxBatch * 8];
+        Span<float> tail = stackalloc float[MaxBatch];
+        BatchInit(acc, tail, count);
+
+        fixed (float* pAcc = acc)
+        {
+            for (int baseIdx = 0; baseIdx < cols; baseIdx += Qk8)
+            {
+                byte* block = row + (long)(baseIdx / Qk8) * (Qk8 + 2);
+                float dHalf = ReadHalfLE(block);
+
+                int limit = Math.Min(Qk8, cols - baseIdx); // padded quants are zero: stop at the real column count.
+                for (int l = 0; l + 8 <= limit; l += 8)
+                {
+                    Vector256<int> qi = Avx2.ConvertToVector256Int32((sbyte*)(block + 2 + l)); // vpmovsxbd: eight signed quants, in-block only
+                    Vector256<float> qf = Avx.ConvertToVector256Single(qi); // dequantization unpack, materialized once per chunk
+                    float dLocal = dHalf;
+                    Vector256<float> dv = Avx.BroadcastScalarToVector256(&dLocal);
+                    for (int b = 0; b < count; b++)
+                    {
+                        float* chain = pAcc + b * 8;
+                        Avx.Store(chain, Fma.MultiplyAdd(Avx.Multiply(Avx.LoadVector256(inputs + (long)b * cols + baseIdx + l), qf), dv, Avx.LoadVector256(chain)));
+                    }
+                }
+
+                for (int k = (limit / 8) * 8; k < limit; k++)
+                {
+                    float w = (float)(sbyte)block[2 + k] * dHalf; // partial final block: at most seven elements per row
+                    for (int b = 0; b < count; b++)
+                    {
+                        tail[b] += w * inputs[(long)b * cols + baseIdx + k];
+                    }
+                }
+            }
+
+            BatchFinish(pAcc, tail, count, rows, outBase);
+        }
+    }
+
+    // Batched Q4_K row: one nibble unpack and fused scale/shift per chunk feeds all accumulator chains with the
+    // same FMA shape as RowDotQ4KAvx2, so the packed bytes are streamed once for the whole batch.
+    private static void BatchQ4KAvx2(byte* row, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> acc = stackalloc float[MaxBatch * 8];
+        Span<float> tail = stackalloc float[MaxBatch];
+        BatchInit(acc, tail, count);
+
+        fixed (float* pAcc = acc)
+        {
+            for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+            {
+                byte* block = row + (long)(baseIdx / QkK) * Q4KBlockBytes;
+                byte* blockEnd = block + Q4KBlockBytes;
+                float dHalf = ReadHalfLE(block);
+                float minHalf = ReadHalfLE(block + 2);
+
+                for (int j = 0; j < 8; j++)
+                {
+                    int subStart = baseIdx + j * 32;
+                    if (subStart >= cols)
+                    {
+                        break; // zero-padded tail block: no elements left to consume.
+                    }
+
+                    GetScaleMinK4(j, block + 4, out byte sc, out byte m);
+                    float scale = dHalf * sc;
+                    Vector256<float> scaleV = Avx.BroadcastScalarToVector256(&scale);
+                    float negShift = -(minHalf * m);
+                    Vector256<float> shiftV = Avx.BroadcastScalarToVector256(&negShift);
+
+                    byte* q = block + 16 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
+                    int limit = Math.Min(32, cols - subStart); // padded nibbles are zero: stop at the real column count.
+
+                    for (int c = 0; c + 8 <= limit; c += 8)
+                    {
+                        Vector128<byte> window = LoadGroupBytes(q, blockEnd, c);
+
+                        if ((j & 1) != 0)
+                        {
+                            // High nibbles per byte lane: srli_epi16 then a 0x0F byte mask (the classic SSE2 pattern).
+                            window = Sse2.ShiftRightLogical(window.AsUInt16(), 4).AsByte();
+                        }
+
+                        Vector128<byte> masked = Sse2.And(window, GetNibbleMask()); // needed nibbles now in each byte lane's low bits
+
+                        Vector128<int> lo = Sse41.ConvertToVector128Int32(masked); // bytes 0..3 -> dword lanes (pmovzxbd)
+                        Vector128<int> hi = Sse41.ConvertToVector128Int32(Ssse3.Shuffle(masked, GetUpperBytesShuffle())); // bytes 4..7 -> dword lanes
+
+                        Vector256<float> wchunk = Fma.MultiplyAdd(scaleV, Avx.ConvertToVector256Single(Vector256.Create(lo, hi)), shiftV); // dequantized chunk, materialized once
+                        for (int b = 0; b < count; b++)
+                        {
+                            float* chain = pAcc + b * 8;
+                            Avx.Store(chain, Fma.MultiplyAdd(Avx.LoadVector256(inputs + (long)b * cols + subStart + c), wchunk, Avx.LoadVector256(chain)));
+                        }
+                    }
+
+                    for (int l = (limit / 8) * 8; l < limit; l++)
+                    {
+                        // Partial final chunk of the group: scalar cleanup, at most seven elements per group.
+                        float nibble = ((q[l] >> (4 * (j & 1))) & 0xF) * scale - minHalf * m;
+                        for (int b = 0; b < count; b++)
+                        {
+                            tail[b] += nibble * inputs[(long)b * cols + subStart + l];
+                        }
+                    }
+                }
+            }
+
+            BatchFinish(pAcc, tail, count, rows, outBase);
+        }
+    }
+
+    // Batch scratch plumbing: zero the per-chain lanes and tails for one row. stackalloc scratch is reused for
+    // every row and call; nothing here allocates.
+    private static void BatchInit(Span<float> acc, Span<float> tail, int count)
+    {
+        acc.Clear();
+        tail.Clear();
+    }
+
+    // Batch scratch plumbing: fold each chain's eight lanes with the same reduction the single kernels use and
+    // write outBase[b * rows]. Scalar tails are added afterwards (F32/F16) or are already folded in (Q8_0/Q4_K,
+    // whose chains end with an empty tail).
+    private static void BatchFinish(float* pAcc, Span<float> tail, int count, int rows, float* outBase)
+    {
+        for (int b = 0; b < count; b++)
+        {
+            outBase[b * rows] = HSum(Avx.LoadVector256(pAcc + b * 8)) + tail[b];
+        }
     }
 
     // Little-endian half-float load from raw memory.
@@ -831,12 +1334,22 @@ public sealed unsafe class CpuBackend : IBackend
     /// <summary>
     /// Persistent worker pool: workers park on a monitor and are woken per job; the dispatcher thread joins the
     /// claim loop so small jobs pay no wake-up cost. All block claims happen under one lock, which is negligible
-    /// next to a row-block of kernel work. Workers outlive individual GEMV calls until Dispose.
+    /// next to a row-block of kernel work. Workers outlive individual GEMV calls until Dispose. Each worker pins
+    /// itself to <c>coreMask</c> (when configured) at loop start and re-pins defensively after any wake-up gap —
+    /// pinning lives in the thread body so pool bookkeeping can never undo it — and records the logical processor of
+    /// every block it executes while execution sampling is enabled on the owning backend. The dispatcher's own blocks
+    /// are deliberately neither pinned nor sampled: that thread belongs to the caller, not to the pool.
     /// </summary>
     private sealed class WorkerPool : IDisposable
     {
+        // Sampling stays bounded so a long run cannot grow memory without limit; 4096 covers any test workload.
+        private const int MaxSamples = 4096;
+
         private readonly object _gate = new();
         private readonly Thread[]? _workers;
+        private readonly ulong? _coreMask; // processor set for every pool worker, or null when the model is unpinned
+        private ConcurrentQueue<int>? _samples; // armed lazily via Interlocked so volatile-field type rules hold
+        private int _sampleCount;
 
         private IGemvJob? _job;
         private int _totalBlocks;
@@ -844,8 +1357,10 @@ public sealed unsafe class CpuBackend : IBackend
         private int _pendingBlocks;
         private bool _disposed;
 
-        public WorkerPool(int workerCount)
+        public WorkerPool(int workerCount, ulong? coreMask)
         {
+            _coreMask = coreMask;
+
             if (workerCount == 0)
             {
                 return; // pool exists only to satisfy GetOrCreatePool; Run is never called for it
@@ -865,6 +1380,8 @@ public sealed unsafe class CpuBackend : IBackend
                 thread.Start();
             }
         }
+
+        public int WorkerCapacity => _workers?.Length ?? 0;
 
         public void Run(int blockCount, IGemvJob job)
         {
@@ -929,12 +1446,38 @@ public sealed unsafe class CpuBackend : IBackend
             }
         }
 
+        /// <summary>Arms per-block processor sampling; the interlocked store publishes the queue to every worker thread.</summary>
+        internal void EnableSampling()
+        {
+            if (_samples is null)
+            {
+                Interlocked.CompareExchange(ref _samples, [], null); // a racing second arming keeps the first queue and drops its own
+            }
+        }
+
+        /// <summary>Snapshots the processor number recorded by each sampled worker-block execution so far.</summary>
+        internal IReadOnlyList<int> SampleSnapshot() => Volatile.Read(ref _samples) is ConcurrentQueue<int> queue ? [.. queue] : [];
+
         private void WorkerLoop()
         {
+            // Pin at thread start: affinity is process-lifetime state of this thread, so one call covers the whole
+            // loop. Unpinned models pass a zero mask and get the trivial accept back; Linux hosts get the documented
+            // no-op here. The pin re-asserts itself below on every wake-up for defense in depth.
+            ThreadAffinity.ApplyCoreSet(_coreMask ?? 0UL);
+
             while (true)
             {
+                if (_coreMask is not null)
+                {
+                    // Defensive re-pin at each wake-up: cheap next to kernel work, and it keeps the pin even if an
+                    // external tool or a thread-pool reuse ever reset this worker's affinity. The start-of-loop call
+                    // above already covers unpinned models with a trivial no-op return.
+                    ThreadAffinity.ApplyCoreSet(_coreMask.Value);
+                }
+
                 IGemvJob job;
                 int block;
+                bool claimed;
                 lock (_gate)
                 {
                     while (!_disposed && _nextBlock >= _totalBlocks)
@@ -949,7 +1492,25 @@ public sealed unsafe class CpuBackend : IBackend
 
                     // A woken worker may find all blocks already claimed: claim fails, so loop back to sleep.
                     block = _nextBlock++;
+                    claimed = block < _totalBlocks;
                     job = _job!;
+                }
+
+                if (_coreMask is not null)
+                {
+                    // Defensive re-pin on every wake-up: cheap next to kernel work, and it keeps the pin even if an
+                    // external tool or a thread-pool reuse ever reset this worker's affinity.
+                    ThreadAffinity.ApplyCoreSet(_coreMask.Value);
+                }
+
+                ConcurrentQueue<int>? samples = Volatile.Read(ref _samples);
+                if (claimed && samples is not null && _sampleCount < MaxSamples)
+                {
+                    // Approximate cap under concurrent workers: a few blocks may race past it, which is fine for an
+                    // unbounded-memory guard on a test-only hook. The number records where this block executes; the
+                    // pin above guarantees a pinned worker answers from inside its core set.
+                    _sampleCount++;
+                    samples.Enqueue(ThreadAffinity.CurrentProcessorNumber());
                 }
 
                 job.ProcessBlock(block);

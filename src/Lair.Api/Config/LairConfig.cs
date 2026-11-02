@@ -29,6 +29,9 @@ public sealed record EngineConfig
 
     /// <summary>Fixed weight block size.</summary>
     public int BlockSize { get; init; } = 16;
+
+    /// <summary>Largest prompt chunk the scheduler prefills in one step.</summary>
+    public int MaxBatchTokens { get; init; } = 512;
 }
 
 /// <summary>One served model and how it is placed on the machine.</summary>
@@ -58,4 +61,7 @@ public sealed record PlacementConfig
 
     /// <summary>Pinned logical core ids; empty means unpinned.</summary>
     public IReadOnlySet<int> CoreSet { get; init; } = new HashSet<int>();
+
+    /// <summary>Hard cap on this model's worker threads (1 or greater); null leaves the engine thread choice uncapped.</summary>
+    public int? ThreadQuota { get; init; }
 }

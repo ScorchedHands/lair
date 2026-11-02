@@ -34,11 +34,13 @@ public class GenerationServiceTests
     }
 
     [Fact]
-    public void EngineBusyException_ExplainsSingleFlight_AndRetry()
+    public void EngineBusyException_ExplainsKvCapacity_AndRetry()
     {
         EngineBusyException ex = new();
 
-        Assert.Contains("busy generating another request", ex.Message);
+        Assert.Contains("cannot admit this request", ex.Message);
+        Assert.Contains("KV pool", ex.Message);
+        Assert.Contains("kv_blocks", ex.Message);
         Assert.Contains("Retry", ex.Message);
     }
 

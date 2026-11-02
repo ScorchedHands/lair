@@ -64,6 +64,7 @@ public sealed class ConfigTests : IDisposable
         Assert.Equal(16, model.Placement.CoreSet.Count);
         Assert.Contains(0, model.Placement.CoreSet);
         Assert.Contains(15, model.Placement.CoreSet);
+        Assert.Null(model.Placement.ThreadQuota);
     }
 
     [Fact]
@@ -90,6 +91,7 @@ public sealed class ConfigTests : IDisposable
         Assert.Equal("dram", model.Placement.KvResidency);
         Assert.Equal("cpu", model.Placement.Prefill);
         Assert.Empty(model.Placement.CoreSet);
+        Assert.Null(model.Placement.ThreadQuota);
     }
 
     [Fact]
@@ -304,6 +306,39 @@ public sealed class ConfigTests : IDisposable
     }
 
     [Fact]
+    public void Load_MaxBatchTokens_DefaultsValidatesAndRejects()
+    {
+        LairConfig defaulted = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """));
+        Assert.Equal(512, defaulted.Engine.MaxBatchTokens);
+
+        LairConfig configured = YamlConfigLoader.Load(WriteConfig($"""
+            engine:
+              max_batch_tokens: 256
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """));
+        Assert.Equal(256, configured.Engine.MaxBatchTokens);
+
+        foreach (int invalid in new[] { 0, -3 })
+        {
+            ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+                engine:
+                  max_batch_tokens: {invalid}
+                models:
+                  - name: qwen-test
+                    path: '{TempModelFile()}'
+                """)));
+            Assert.Contains($"engine.max_batch_tokens {invalid}", error.Message);
+            Assert.Contains("'max_batch_tokens' must be 1 or greater", error.Message);
+        }
+    }
+
+    [Fact]
     public void Load_UnknownKeys_NamedWithAllowedKeysAtThatLevel()
     {
         string modelPath = TempModelFile();
@@ -326,7 +361,7 @@ public sealed class ConfigTests : IDisposable
                 "engine:\n  thread: 8\nmodels:\n  - name: qwen-test\n    path: '" + modelPath + "'\n",
                 "thread",
                 "'engine'",
-                "threads, block_size"
+                "threads, block_size, max_batch_tokens"
             ),
             (
                 "models:\n  - name: qwen-test\n    path: '" + modelPath + "'\n    context: 4096\n",
@@ -338,7 +373,7 @@ public sealed class ConfigTests : IDisposable
                 "models:\n  - name: qwen-test\n    path: '" + modelPath + "'\n    placement:\n      device_id: 0\n",
                 "device_id",
                 "models[0].placement",
-                "device, kv_residency, prefill, core_set"
+                "device, kv_residency, prefill, core_set, thread_quota"
             ),
         ];
 
@@ -416,6 +451,66 @@ public sealed class ConfigTests : IDisposable
 
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(missing));
         Assert.Contains("does not exist", error.Message);
+    }
+
+    [Fact]
+    public void Load_ThreadQuota_ParsesAndDefaultsToNull()
+    {
+        LairConfig config = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                placement:
+                  thread_quota: 4
+            """));
+
+        Assert.Equal(4, config.Models[0].Placement.ThreadQuota);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-2)]
+    public void Load_ThreadQuotaTooSmall_Fails(int quota)
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                placement:
+                  thread_quota: {quota}
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains($"models[0].placement.thread_quota {quota}", error.Message);
+        Assert.Contains("'thread_quota' must be 1 or greater", error.Message);
+    }
+
+    [Fact]
+    public void ValidateCoreSetsDisjoint_OverlappingModels_NamesBothModels()
+    {
+        List<ModelConfig> models =
+        [
+            new ModelConfig { Name = "first", Path = "a.gguf", Placement = new PlacementConfig { CoreSet = new HashSet<int>([0, 1, 2]) } },
+            new ModelConfig { Name = "second", Path = "b.gguf", Placement = new PlacementConfig { CoreSet = new HashSet<int>([2, 3]) } },
+        ];
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.ValidateCoreSetsDisjoint(models));
+        Assert.Contains("both pin core 2", error.Message);
+        Assert.Contains("'first'", error.Message);
+        Assert.Contains("'second'", error.Message);
+    }
+
+    [Fact]
+    public void ValidateCoreSetsDisjoint_DisjointAndUnpinnedModels_Pass()
+    {
+        List<ModelConfig> models =
+        [
+            new ModelConfig { Name = "first", Path = "a.gguf", Placement = new PlacementConfig { CoreSet = new HashSet<int>([0, 1]) } },
+            new ModelConfig { Name = "second", Path = "b.gguf", Placement = new PlacementConfig { CoreSet = new HashSet<int>([2, 3]) } },
+            new ModelConfig { Name = "third", Path = "c.gguf" }, // unpinned: an empty core set shares nothing
+        ];
+
+        YamlConfigLoader.ValidateCoreSetsDisjoint(models);
     }
 
     [Fact]

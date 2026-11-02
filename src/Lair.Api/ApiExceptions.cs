@@ -37,13 +37,13 @@ public sealed class ContextLengthExceededException : Exception
 }
 
 /// <summary>
-/// The engine forwards one sequence at a time and one is already running.
+/// The KV pool cannot back this request's prompt plus token budget alongside what is already running.
 /// </summary>
 public sealed class EngineBusyException : Exception
 {
     public EngineBusyException()
-        : base("the engine is busy generating another request. Retry once the current generation finishes; " +
-               "run additional engine instances to serve concurrent requests.")
+        : base("the engine cannot admit this request: its prompt plus token budget exceeds the token slots the " +
+               "KV pool can back. Retry once the running generations finish, or raise kv_blocks in the config.")
     {
     }
 }

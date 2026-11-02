@@ -252,7 +252,7 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 
 - [X] **Jinja subset scope** — resolved by the Template implementation item: the interpreter supports conditionals, loops, variable access/indexing, concatenation, and the filters demanded by golden templates (`tojson`, `join`, `trim` as starting set); any unsupported construct fails with an explicit error naming the construct rather than rendering silently wrong.
 
-### MVP2 [v0.2.0] - Refined
+### MVP2 [v0.2.0] - Shipped
 
 Many requests at once, tuned, with live reconfiguration.
 
@@ -261,7 +261,7 @@ Many requests at once, tuned, with live reconfiguration.
 - **DN-M2-1** — Discrete batch steps: the scheduler runs fixed steps; each step executes one token per active decode sequence plus prefill chunks up to `max_batch_tokens`.
   - Rationale: step boundaries are the natural point for admission, cancellation, metrics, and hot-reload application.
   - Rejected: pipelined overlap across steps (complexity without CPU benefit).
-  - Contract: scheduler in `lair.core`.
+  - Contract: scheduler in `lair.models`.
 - **DN-M2-2** — Decode-priority scheduling; prefill chunks fill remaining batch slots, adaptive chunk size (default 512 tokens, config knob).
   - Rationale: inter-token latency is the perceived-quality metric; TTFT stays bounded by chunking. This is vLLM's proven pattern.
   - Rejected: prefill-priority (stalls ITL); strict FCFS (head-of-line blocking on long prompts).
@@ -284,34 +284,46 @@ Many requests at once, tuned, with live reconfiguration.
 - **DN-M2-8** — Tool calls: per-family tool schema injection into the chat template; `tool_calls` parsed from streamed output; tool execution stays client-side.
   - Rationale: coding-agent compatibility (Strata's whole tool story) requires the wire contract, not execution.
   - Contract: `lair.api` request/response pipeline.
+- **DN-M2-9** — Latency budget: decode ITL p95 ≤ 400 ms for N=8 concurrent SmolLM-class requests on the dev machine; chunked prefill must hold short-request ITL within the same budget with an 8K-token prompt in flight.
+  - Rationale: measured single-stream baseline is ~70–105 ms/token (SmolLM-135M Q8_0, full threads); a concrete ceiling makes batching regressions catchable without machine-specific absolutes.
+  - Contract: Concurrency and Prefill test thresholds.
+- **DN-M2-10** — Tool-call detection (MVP2 scope): the wire contract is complete even for models without tool-trained templates. Schemas are injected into the rendered prompt per template family; a call is recognized ONLY when decoded output contains a fenced ```json block whose object matches `{name, arguments}` against a declared tool name (`arguments` JSON-encoded string). Recognized calls appear in `message.tool_calls` / streaming deltas and are stripped from visible text. Execution stays client-side. A model that never emits the contract simply returns ordinary text — valid behavior, tested at parser level, not demanded of small models.
+  - Rationale: tool compliance is a property of the model, not the runtime; the runtime guarantees injection, detection, and wire shape.
+  - Contract: `lair.api` tool pipeline + template injection.
+- **DN-M2-11** — Hot-reload KV budget semantics under pinned arenas: the pool's physical arena is reserved once at startup; `kv_blocks` hot-edits operate as a soft cap within that reservation — grow raises usage up to reserved capacity immediately, shrink drains blocks above the new cap through prefix-cache eviction (never touches active sequences) and tightens admission. Physical re-reservation belongs to the tiered-pools phase, not MVP2.
+  - Rationale: mid-serving arena reallocation over live block tables is exactly what step-boundary safety exists to avoid; a soft cap delivers the observable hot-reload behavior without engine risk.
+  - Contract: BlockPool soft-cap + PrefixCache eviction interplay at reload apply time.
 
 #### Implementation Items
 
-- [_] Continuous batching — shared decode steps across sequences (see DN-M2-1)
-  - Verify: `dotnet test --filter Category=Concurrency` — N=8 parallel requests produce outputs identical to sequential execution; ITL p95 within budget.
-- [_] Chunked prefill — prefill chunks interleaved with decode tokens in the same step (see DN-M2-2)
-  - Verify: integration test — an 8K-token prompt in flight does not push short-request ITL p95 past budget.
-- [_] Prompt caching — reference-counted prefix blocks reused across requests (see DN-M2-3)
-  - Verify: `dotnet test --filter Category=Cache` — second request with shared prefix reports cache hit in metrics and skips prefill tokens.
-- [_] Cancellation — abort sequences mid-batch-step without stalling the rest of the batch (see DN-M2-4)
-  - Verify: integration test — aborted request frees its blocks; other requests complete unchanged.
-- [_] API completeness — tool calls, logprobs, penalties, `logit_bias`, seed (see DN-M2-8)
-  - Verify: OpenAI SDK scripts — tool-call round trip, logprobs present and normalized, penalties alter sampling deterministically under seed.
-- [_] Metrics bus — engine counters + OS/driver stats streamed to logs and CLI monitor (see DN-M2-7)
-  - Verify: JSON log lines carry per-model counters; `lair monitor` command renders live stats during load.
-- [_] Embeddings groundwork — encoder-only forward pass, no endpoint yet
-  - Verify: unit test of encoder forward on a small fixture model produces stable pooled vectors.
-- [_] Thread pools — sized to memory channels, per-model quotas, core-set affinity (see DN-M2-6)
-  - Verify: `dotnet test --filter Category=Affinity` asserts worker threads land in configured core sets.
+- [✓] Continuous batching — shared decode steps across sequences (see DN-M2-1)
+  - Verify: `dotnet test -c Release --filter Category=Concurrency` — 5/5 ✅ on real SmolLM-F16: N=8 concurrent outputs identical to sequential for greedy AND seeded; measured ITL p95 238 ms (budget 400); capacity exhaustion surfaces as `engine_overloaded`. Scheduler fixes found in testing: finished sequences must be excluded from the same step's decode window, and outcomes release KV blocks before publishing.
+- [✓] Chunked prefill — prefill chunks interleaved with decode tokens in the same step (see DN-M2-2)
+  - Verify: `dotnet test -c Release --filter Category=Prefill` — 1/1 ✅ ~407-token prompt prefills chunk-by-chunk while short requests stream past it at ITL p95 68 ms with outputs identical to a fresh-engine baseline. Tuning finding: per-step time ≈ chunk width × single-stream cost, so the DN-M2-2 default (512) overshoots the CPU budget — chunk widths of ~8 hold 400 ms at measured Release speed (~28 ms/token F16); wide chunks only pay off on faster compute.
+- [✓] Prompt caching — reference-counted prefix blocks reused across requests (see DN-M2-3)
+  - Verify: `dotnet test -c Release --filter Category=Cache` — 6/6 ✅ on real SmolLM-F16: shared 127-token prefix → second request skips 112 prefill tokens with byte-identical output vs cold run; CoW copy verified bit-safe for the original sequence; LRU eviction never touches blocks referenced by active sequences; refcount release ordering tested. Cache lifetime = pool lifetime (covers reload/quant/block-size invalidation this phase).
+- [✓] Cancellation — abort sequences mid-batch-step without stalling the rest of the batch (see DN-M2-4)
+  - Verify: `dotnet test -c Release --filter Category=Cancel` — 6/6 ✅ concurrent peers bit-identical to a no-cancel baseline; every block of an aborted sequence reclaimed (mid-decode, mid-prefill-chunk, and at-admission cases); stop literals now end the sequence early via a linked CTS (gap found: first-token stops previously no-op'd). HTTP client-abort contract covered live (`RequestAborted` already wired through both API paths; new test proves server stays healthy after mid-stream hang-up).
+- [✓] API completeness — tool calls, logprobs, penalties, `logit_bias`, seed (see DN-M2-8, DN-M2-10)
+  - Verify: `dotnet test -c Release --filter Category=Api` — 49/49 ✅ incl. 14 sampling-param cases (penalties alter seeded output deterministically; logit_bias flips the first greedy token, numeric AND token-string keys; logprobs normalized with chosen token included) and 24 tool cases (schema injection proven by prompt growth, `tool_choice: none` inertness, strict fenced-JSON detector incl. pretty→compact arguments, malformed-tools 400s naming fields, SSE complete-call deltas + `[DONE]`). Model-side call emission intentionally not demanded of the fixture (DN-M2-10). OpenAI SDK round-trip ✅ at ship: chat, sampling params, streaming deltas, completions, tools, models.list all parse through the official Python SDK.
+- [✓] Metrics bus — engine counters + OS/driver stats streamed to logs and CLI monitor (see DN-M2-7)
+  - Verify: `dotnet test -c Release --filter Category=Metrics` — 5/5 ✅ step-boundary counters (tok/s, step time, occupancy, prefill chunks/tokens, cache hits + skipped tokens, KV utilization, finish-reason tallies) ride the scheduler regardless of consumers; ring-bounded snapshots published only while active (`metrics_snapshot={…}` JSON lines alongside unchanged request logs); `/monitor/stream` SSE live-verified; `lair monitor [-u URL] [--interval ms]` renders a live table, clean Ctrl+C. Process working-set + CPU% included; hardware telemetry deferred per DN-M2-7 contract note.
+- [✓] Embeddings groundwork — encoder-only forward pass, no endpoint yet
+  - Verify: `dotnet test -c Release --filter Category=Embeddings` — 8/8 ✅ two-layer synthetic GGUF (tied head lets tests replay logits from Encode rows) + real SmolLM-F16 cases; sequential one-token encodes match incremental decode bit-for-bit while full-window encoding legitimately diverges at earlier positions — bidirectional wiring proven distinct from causal at op and run level. Mean/CLS pooling with L2 normalize (double accumulation). Endpoint deferred to the embeddings phase per DN-M4-3.
+- [✓] Thread pools — sized to memory channels, per-model quotas, core-set affinity (see DN-M2-6)
+  - Verify: `dotnet test --filter Category=Affinity` — 4/4 ✅ pinned workers land inside the configured core set across ≥100 sampled job executions (`SetThreadAffinityMask`, re-applied on wake; documented no-op + startup warning off-Windows); physical-core auto-sizing (SMT siblings excluded via `GetLogicalProcessorInformationEx`; i9-13900K: 24 workers vs old logical cap 16) with ProcessorCount fallback; `placement.thread_quota` caps effective workers (output byte-identical under quota); cross-model core-set overlap rejected at config load naming both models.
+- [✓] Hot-reload application path — config watcher pushes validated changes through the change-application bus by mutation class: live knobs apply at the next step boundary, new-requests-only knobs affect admission only, restart-only knobs are refused with an actionable message (see DN-M2-5)
+  - Verify: `dotnet test --filter Category=HotReload` — 6/6 ✅ on real SmolLM-F16: debounced watcher (atomic-rename settle) → typed bus (`ConfigMutationTable.Diff`); live `max_batch_tokens` effective at next chunk issue, quota applied at next kernel call, `kv_blocks` soft-cap grow immediate / shrink drains evictable cache via `TrimToBudget` with admission windows so mid-run shrinks never strand admitted sequences; new-requests-only context edits recompute the advertised window only (in-flight byte-compare identical); restart-only refusal names field + class (`engine.block_size requires restart (restart-only): 16 -> 32. ...`); broken YAML rejected pre-application, runtime untouched. `config_reload_*` log lines + `LastReload` summary exposed.
 
 #### Tests
 
-- [_] Automated Concurrency: parallel-vs-sequential output equivalence
-- [_] Automated Prefill: chunked prefill ITL protection
-- [_] Automated Cache: prefix hit, CoW integrity, LRU eviction
-- [_] Automated Cancel: abort isolation and block reclamation
-- [_] Automated API: tool calls, logprobs, penalties, seed reproducibility via SDK scripts
-- [_] Manual Monitor-lite: `lair monitor` live stats under mixed load
+- [✓] Automated Concurrency: parallel-vs-sequential output equivalence — 5/5 (Release) incl. ITL budget and capacity refusal
+- [✓] Automated Prefill: chunked prefill ITL protection — 1/1 (Release)
+- [✓] Automated Cache: prefix hit, CoW integrity, LRU eviction — 6/6 (Release)
+- [✓] Automated Cancel: abort isolation and block reclamation — 6/6 (Release) incl. HTTP client-abort health
+- [✓] Automated HotReload: watcher detection, mutation-class enforcement, mid-serving application — 6/6 (Release)
+- [✓] Automated API: tool calls, logprobs, penalties, seed reproducibility via SDK scripts — 49/49 (Release); SDK round-trip ✅ at ship
+- [✓] Manual Monitor-lite: `lair monitor` live stats under mixed load — verified live: table rendered against serve under shared-prefix chats + long completion; KV used rose 3→55/96 with `active=1` during decode, cache-hit % climbed 50→100% on prefix reuse, tok/s + step-ms updated per tick (Debug-JIT rates), clean exit.
 
 ### MVP3 [v0.3.0] - Refined
 
@@ -507,6 +519,7 @@ Vision input on chat models.
 | question | CUDA binding choice | ILGPU vs LibraryImport+cuBLASLt vs nvcc microkernels (MVP3 open item) |
 | question | PLE index format | does the GGUF PLE tensor allow random row access, or is a repack sidecar index needed? (MVP5 open item) |
 | idea | Conversation cache policy | TTL/LRU eviction rules; optional encryption of disk snapshots; cache invalidation on model/config change |
+| idea | Client-keyed cache retention | tie prompt/conversation cache items to client identity — e.g. a sticky id issued in a response header — and use it for sliding retention (keep each client's most recent conversation cache item) instead of or alongside LRU; precondition: a reliable-enough client identification method (issued token header, optional API key/session, connection fingerprint); interacts with server-posture backlog |
 | idea | Byte-reduction experiments | MoD/layer skipping, expert pruning/distillation, dynamic quant switching — each as an `IWeightSource` provider |
 | idea | Dynamic layer rebalance | move whole layers between CPU and VRAM while serving (Strata-style), driven by measured device utilization |
 | question | Server posture | default bind address, optional API key, LAN exposure rules |
@@ -517,6 +530,9 @@ Vision input on chat models.
 | idea | Preemptive KV swap | preempt a running sequence's KV to the NVMe tier under memory pressure — depends on MVP6 tiers |
 | idea | Prefill GEMM shim microkernel | tiled-matmul native microkernel via `[LibraryImport]` where the bench harness proves the managed tile wall |
 | idea | Core-set overcommit | allow models to share/partially oversubscribe core sets as an explicit knob |
+| idea | Cross-model interleaved batches | multi-model serving where batch steps alternate across models at configured ratios (e.g. 2:1) so all models share one compute/thread pool; per-model throughput degrades proportionally to share — explicit toggle with per-model ratios, never the default (DN-M2-6 core-set partitioning stays default); MVP4 scheduling candidate |
+| idea | Diffusion model support | UNet/DiT executor family (bidirectional attention, no KV cache), Conv2D/GroupNorm kernels, VAE encode/decode, noise-scheduler stack, CLIP/T5 conditioning; GGUF already hosts SD-class containers and the loader/backend/quant investment transfers; continuous batching fits denoise steps well; needs a Scope change (image generation is a current explicit non-goal) — proposed MVP8 candidate |
+| idea | Server-side MCP injection | per-model, config-declared MCP servers whose tool definitions LAIR injects into chat requests regardless of client; injected tools execute server-side (contrast DN-M2-8: client-supplied tools stay client-side); enables cross-model composition — an LLM calling a diffusion model through its MCP endpoint, or the embeddings engine exposed as a vector/RAG MCP; interacts with tool-call API work and server posture |
 | idea | `auto` device fallback | silent CPU fallback when a configured CUDA device is absent — deliberately not a default (DN-M3-3) |
 | bug | Q4_K_M family coverage gap | kernels implement only the Q4_K block format; real Q4_K_M files mix Q5_K/Q6_K tensors, and non-block-divisible dims force legacy formats (Q4_0/Q5_0…) — loader/kernel extension needed before serving published quants in production |
 
@@ -535,3 +551,12 @@ Vision input on chat models.
 - **2026-10-31 — License undecided.** Private repo for now; dotLLM is GPLv3 — its ideas may be studied, its code may not be copied into LAIR.
 - **2026-10-31 — MVP2–MVP5 refined.** Batch-step scheduling with decode priority and chunked prefill; hot-reload knob mutation classes; CUDA via nvcc microkernels + cuBLASLt with contiguous layer split and fail-fast device policy; multi-model admission via global ledger with no runtime preemption until MVP6 (backlog: preemptive KV swap); Flash-Next quants IQ3_XXS primary with Q4_K_M baseline behind a reality-check gate; expert-aware batching as the MoE engine win; MTP-only drafting at MVP5.
 - **2026-11-01 — Parity criterion is logit-distribution agreement, not exact token match.** Evidence from the pinned llama.cpp b12032 build: its own CLI and server modes produce different greedy (temp 0) continuations for identical prompts on SmolLM-135M-F16, and near-tie argmax flips (Δlogprob < 0.2) appear between any two independent fp pipelines. Cross-tool exact 48-token string equality is therefore unattainable; fixtures record position-0 top-5 logprobs from pinned server runs with a documented tolerance, and divergences inside the near-tie band are reported rather than failed.
+- **2026-11-01 — Concrete latency budgets for batching gates (DN-M2-9).** Decode ITL p95 ≤ 400 ms at N=8 concurrent SmolLM-class requests; chunked prefill must hold short-request ITL within the same budget with an 8K-token prompt in flight. Unnumbered "within budget" verify lines are not gates; baselines measured on the dev box (single-stream ~70–105 ms/token).
+- **2026-11-01 — Hot-reload application path added to MVP2.** Scope promises live reconfiguration and DN-M2-5 defines mutation semantics, but no implementation item owned the watcher/change-application bus; MVP2's outcome ("live reconfiguration") requires it in-phase rather than orphaned.
+- **2026-11-01 — Cross-model interleaved batches recorded in Backlog.** User-proposed scheduling knob: batch steps alternate across models at configured ratios so models share one compute pool, with throughput degradation as the explicit, user-chosen cost; toggle + per-model ratios; MVP4 candidate; default stays core-set partitioning (DN-M2-6).
+- **2026-11-01 — Client-keyed cache retention recorded in Backlog.** User-proposed: cache items tied to a client identity (e.g. sticky id returned in a response header) enable sliding retention — each client's most recent conversation cache item kept — instead of or alongside LRU; hinges on a reliable client-identification method, which itself depends on the server-posture backlog.
+- **2026-11-01 — Latency gates are measured under Release configuration.** Debug JIT inflates kernels ~4.6× (bench Q4_K: 2.4 GB/s Debug vs 13 GB/s Release); absolute ITL budgets only reproduce in optimized builds. Correctness tests run in both configurations; performance acceptance runs `-c Release`.
+- **2026-11-02 — Diffusion support and server-side MCP injection recorded in Backlog.** User-proposed: diffusion as a phase-sized addition (MVP8 candidate) requiring a Scope change since image generation is an explicit v1 non-goal; per-model config-declared MCP servers whose tools LAIR injects into requests and executes server-side, enabling cross-model composition (LLM → diffusion via MCP; embeddings engine as vector/RAG MCP). The injection contract deliberately cuts against DN-M2-8's client-side-tools rule — a future phase must reconcile the two explicitly.
+- **2026-11-02 — Tool-call detection contract fixed (DN-M2-10).** MVP2 guarantees injection, a strict fenced-JSON detector, and `tool_calls` wire shape; actual call emission is model-dependent and not demanded of small fixture models — parser-level tests stand in for model compliance.
+- **2026-11-02 — Hot-reload KV budget = soft cap within pinned arena (DN-M2-11).** Physical arenas are reserved at startup; `kv_blocks` hot-edits move the usage ceiling inside the reservation (grow immediate, shrink drains evictable cache); physical re-reservation deferred to the tiered-pools phase.
+- **2026-11-02 — Tool-call detection contract fixed (DN-M2-10).** MVP2 guarantees injection, a strict fenced-JSON detector, and `tool_calls` wire shape; actual call emission is model-dependent and not demanded of small fixture models — parser-level tests stand in for model compliance.

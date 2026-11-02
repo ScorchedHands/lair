@@ -233,29 +233,83 @@ public class ApiTests : IClassFixture<ApiFixture>
     }
 
     [Fact]
-    public async Task ConcurrentChat_SecondRequestGets503EngineOverloaded()
+    public async Task ConcurrentChat_RequestsRunTogetherThroughTheBatchScheduler()
     {
-        Task<HttpResponseMessage> firstRequest = PostJsonRawAsync(
+        // The batch scheduler admits both requests instead of holding a single engine slot: the second one
+        // arrives while the first is still generating and completes normally alongside it.
+        Task<(HttpResponseMessage, JsonElement)> first = PostJsonAsync(
             "/v1/chat/completions",
             """{"model":"smollm-test","messages":[{"role":"user","content":"Write a short paragraph about the sea."}],"max_tokens":32,"temperature":0}""");
 
-        // Headers only flush when generation completes, so the unawaited first request holds the engine slot.
         await Task.Delay(250);
 
-        (HttpResponseMessage second, JsonElement body) = await PostJsonAsync(
+        (HttpResponseMessage second, JsonElement secondBody) = await PostJsonAsync(
             "/v1/chat/completions",
             """{"model":"smollm-test","messages":[{"role":"user","content":"hi"}],"max_tokens":4}""");
 
-        Assert.Equal(HttpStatusCode.ServiceUnavailable, second.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, second.StatusCode);
         Assert.True(second.Headers.TryGetValues(ApiApp.RequestIdHeader, out _));
+        Assert.Equal("chat.completion", secondBody.GetProperty("object").GetString());
 
-        JsonElement error = body.GetProperty("error");
-        Assert.Equal("engine_overloaded", error.GetProperty("code").GetString());
-        Assert.Equal("engine_overloaded_error", error.GetProperty("type").GetString());
-
-        using HttpResponseMessage firstResponse = await firstRequest;
+        (HttpResponseMessage firstResponse, JsonElement firstBody) = await first;
         Assert.Equal(HttpStatusCode.OK, firstResponse.StatusCode);
-        Assert.Contains("chat.completion", await firstResponse.Content.ReadAsStringAsync());
+        Assert.Equal("chat.completion", firstBody.GetProperty("object").GetString());
+    }
+
+    [Fact]
+    [Trait("Category", "Cancel")]
+    public async Task ClientAbortMidStream_LeavesTheServerHealthyForLaterRequests()
+    {
+        // The SSE body is drained only after the generation completes, so the line after the opening role chunk lands at the
+        // very end of the run: its absence within the window proves the sequence is still decoding when the client hangs up.
+        using HttpRequestMessage request = new(HttpMethod.Post, Url("/v1/completions"))
+        {
+            Content = new StringContent(
+                """{"model":"smollm-test","prompt":"Once upon a time in a land far away,","max_tokens":48,"temperature":0,"stream":true}""",
+                Encoding.UTF8,
+                "application/json"),
+        };
+
+        using HttpResponseMessage response = await Http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/event-stream", response.Content.Headers.ContentType?.MediaType);
+
+        Stream stream = await response.Content.ReadAsStreamAsync();
+        using StreamReader reader = new(stream);
+
+        string? opening = await reader.ReadLineAsync(CancellationToken.None);
+        Assert.StartsWith("data: ", opening); // the stream is live: the role chunk is already on the wire
+
+        Task<string?> nextChunk = ReadDataLineAsync(reader);
+        Assert.NotSame(nextChunk, await Task.WhenAny(nextChunk, Task.Delay(500))); // the run is still generating
+
+        response.Dispose(); // the client hangs up mid-stream: RequestAborted reaches the sequence still decoding
+        _ = nextChunk.ContinueWith(static faulted => _ = faulted.Exception, TaskContinuationOptions.OnlyOnFaulted);
+
+        // The aborted request left the engine and the batch loop intact: the server answers the next requests normally.
+        HttpResponseMessage health = await Http.GetAsync(Url("/healthz"));
+        Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+
+        (HttpResponseMessage followUp, JsonElement body) = await PostJsonAsync(
+            "/v1/completions",
+            """{"model":"smollm-test","prompt":"The capital of France is","max_tokens":8,"temperature":0}""");
+
+        Assert.Equal(HttpStatusCode.OK, followUp.StatusCode);
+        Assert.Equal("text_completion", body.GetProperty("object").GetString());
+        Assert.False(string.IsNullOrEmpty(body.GetProperty("choices")[0].GetProperty("text").GetString()));
+
+        // A fresh streaming request runs the whole pipeline again: prefill, shared decode steps, SSE chunks, and the done sentinel.
+        using HttpRequestMessage replay = new(HttpMethod.Post, Url("/v1/completions"))
+        {
+            Content = new StringContent(
+                """{"model":"smollm-test","prompt":"My favorite food is","max_tokens":8,"temperature":0,"stream":true}""",
+                Encoding.UTF8,
+                "application/json"),
+        };
+
+        using HttpResponseMessage replayResponse = await Http.SendAsync(replay, HttpCompletionOption.ResponseHeadersRead);
+        Assert.Equal(HttpStatusCode.OK, replayResponse.StatusCode);
+        Assert.Contains("data: [DONE]", await replayResponse.Content.ReadAsStringAsync());
     }
 
     [Fact]
@@ -313,6 +367,19 @@ public class ApiTests : IClassFixture<ApiFixture>
     }
 
     private string Url(string path) => _fixture.BaseUrl + path;
+
+    // Reads the next SSE data line, skipping the blank separator lines between events.
+    private static async Task<string?> ReadDataLineAsync(StreamReader reader)
+    {
+        while (true)
+        {
+            string? line = await reader.ReadLineAsync();
+            if (line is null || line.Length > 0)
+            {
+                return line;
+            }
+        }
+    }
 
     private async Task<(HttpResponseMessage, JsonElement)> PostJsonAsync(string path, string jsonBody)
     {

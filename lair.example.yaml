@@ -7,8 +7,9 @@ server:
   port: 8080
 
 engine:
-  threads: 0          # 0 = pick automatically
+  threads: 0          # 0 = pick automatically: one worker per physical core (SMT siblings excluded)
   block_size: 16      # fixed to 16
+  max_batch_tokens: 512  # largest prompt chunk prefilled in one scheduler step
 
 models:
   - name: qwen3.8-flash-next
@@ -20,4 +21,5 @@ models:
       device: cpu
       kv_residency: dram
       prefill: cpu
-      core_set: "0-15"   # optional; omit to leave the model unpinned
+      core_set: "0-15"   # optional; omit to leave the model unpinned; pinned models may not share core ids
+      thread_quota: 8    # optional; caps this model's workers at 8 regardless of engine threads

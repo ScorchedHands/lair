@@ -4,6 +4,7 @@
     <ProjectReference Include="..\Lair.Core\Lair.Core.csproj" />
     <ProjectReference Include="..\Lair.Loader\Lair.Loader.csproj" />
     <ProjectReference Include="..\Lair.Kv\Lair.Kv.csproj" />
+    <ProjectReference Include="..\Lair.Sampling\Lair.Sampling.csproj" />
   </ItemGroup>
 
   <ItemGroup>

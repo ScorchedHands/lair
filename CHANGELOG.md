@@ -4,6 +4,25 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-02
+
+### Added
+
+- Continuous batching: shared decode steps across up to 16 sequences with decode-priority scheduling; concurrent requests run side by side (503 `engine_overloaded` only on capacity exhaustion). Verified output-identical to sequential execution for greedy and seeded runs.
+- Chunked prefill: long prompts prefill in `max_batch_tokens`-bounded chunks interleaved with decode tokens, keeping short-request inter-token latency within budget while a multi-hundred-token prompt streams in.
+- Prefix caching: reference-counted copy-on-write KV blocks reused across requests sharing a prompt prefix (LRU eviction, collision-guarded hash-chain keys); cached-prompt-token counts reported in usage.
+- Cancellation: mid-generation aborts (client hang-up, stop literals, explicit cancel) reclaim every KV block of the aborted sequence without disturbing concurrent peers.
+- API completeness: `tools` / `tool_choice` with schema injection and a fenced-JSON tool-call detector surfaced as OpenAI `tool_calls` (JSON + SSE deltas), `logprobs` / `top_logprobs`, `presence_penalty`, `frequency_penalty`, `logit_bias` (numeric ids or token strings), `seed`.
+- Metrics: step-boundary engine counters (tok/s, step time, batch occupancy, prefill chunks, cache hits, KV utilization, finish-reason tallies, process working-set/CPU%) published as `metrics_snapshot` log lines and streamed over `GET /monitor/stream` (SSE); `lair monitor [-u URL] [--interval ms]` CLI renders a live per-model stats table.
+- Config hot-reload: the serving process watches its config file; batch width, thread quota, and KV budget apply live, context length applies to new requests, restart-only fields (block size, model path, quant geometry) are refused with an actionable message; invalid edits never touch the running engine.
+- Thread placement: worker threads pinned to a model's configured `core_set` (Windows), per-model `thread_quota`, and automatic sizing from physical cores (SMT siblings excluded).
+- Encoder groundwork: bidirectional (non-causal) forward pass and mean/CLS pooling helpers for a future embeddings endpoint.
+
+### Changed
+
+- Default engine thread count now derives from physical cores instead of capping at 16.
+- Concurrent requests no longer receive `503` by default; single-flight serving was replaced by batched execution.
+
 ## [0.1.0] - 2026-11-01
 
 ### Added

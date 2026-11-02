@@ -22,6 +22,15 @@ public interface IBackend : IDisposable
     void Gemv(ReadOnlySpan<float> x, WeightRef w, Span<float> output);
 
     /// <summary>
+    /// Batched GEMV: <paramref name="count"/> activation vectors (each exactly cols long) stored consecutively in
+    /// <paramref name="inputs"/> are dotted against the same weight matrix in one pass over its packed bytes.
+    /// outputs[batch * rows + row] receives the dot of inputs[batch] with weight row <paramref name="row"/>, exactly
+    /// as a single-vector <see cref="Gemv"/> call would write output[row]. For every row and batch the result is
+    /// bit-identical to the single-vector path and deterministic regardless of internal parallelism.
+    /// </summary>
+    void GemvBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs);
+
+    /// <summary>
     /// Dequantizes one weight row (w.Bytes-as-matrix row <paramref name="row"/>, cols = Dims[^1]) into an FP32
     /// buffer. The dequant math matches the fused GEMV kernels exactly: F32 rows copy, F16 rows expand halves,
     /// Q8_0/Q4_K rows unpack block scales and quant codes with the same arithmetic. Output must be at least cols long.
