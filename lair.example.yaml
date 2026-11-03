@@ -4,7 +4,7 @@
 
 server:
   bind: 127.0.0.1
-  port: 8080
+  port: 8181
 
 engine:
   threads: 0          # 0 = pick automatically: one worker per physical core (SMT siblings excluded)
@@ -12,8 +12,8 @@ engine:
   max_batch_tokens: 512  # largest prompt chunk prefilled in one scheduler step
 
 models:
-  - name: qwen3.8-flash-next
-    path: models/qwen3.8-flash-next.iq4_xs.gguf
+  - name: smollm-135m-instruct-q8_0
+    path: models/smollm-135m-instruct-q8_0.gguf
     type: chat
     max_context_tokens: 4096
     kv_blocks: 256
@@ -23,3 +23,15 @@ models:
       prefill: cpu
       core_set: "0-15"   # optional; omit to leave the model unpinned; pinned models may not share core ids
       thread_quota: 8    # optional; caps this model's workers at 8 regardless of engine threads
+
+  # - name: qwen3.8-flash-next
+  #   path: models/qwen3.8-flash-next.iq4_xs.gguf
+  #   type: chat
+  #   max_context_tokens: 4096
+  #   kv_blocks: 256
+  #   placement:
+  #     device: cpu
+  #     kv_residency: dram
+  #     prefill: cpu
+  #     core_set: "0-15"   # optional; omit to leave the model unpinned; pinned models may not share core ids
+  #     thread_quota: 8    # optional; caps this model's workers at 8 regardless of engine threads
