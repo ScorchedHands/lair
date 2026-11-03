@@ -1,6 +1,6 @@
 using Lair.Tokenizer.Templating;
 
-namespace Lair.Api;
+namespace Lair.Http;
 
 /// <summary>
 /// One generation call. Chat requests render <see cref="Messages"/> through the model's chat template;

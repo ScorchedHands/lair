@@ -1,6 +1,6 @@
 using System.Text;
 
-using Lair.Core.Contracts;
+using Lair.Contracts;
 using Lair.Loader;
 
 namespace Lair.Tests;

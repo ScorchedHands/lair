@@ -1,5 +1,5 @@
 using Lair.Backends.Cpu;
-using Lair.Core.Contracts;
+using Lair.Contracts;
 using Lair.Kv;
 
 namespace Lair.Tests;

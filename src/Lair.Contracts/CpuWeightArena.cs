@@ -1,7 +1,7 @@
 using System.Buffers;
 using System.Runtime.InteropServices;
 
-namespace Lair.Core.Contracts;
+namespace Lair.Contracts;
 
 /// <summary>
 /// In-memory <see cref="IWeightSource"/>: a logical tensor table whose payloads are

@@ -2,7 +2,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
-using Lair.Api.Monitoring;
+using Lair.Http.Monitoring;
 using Lair.Host.Config;
 using Lair.Models.Scheduling;
 using Lair.Tokenizer.Templating;
@@ -14,7 +14,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Logging;
 
-namespace Lair.Api;
+namespace Lair.Http;
 
 /// <summary>
 /// Builds the OpenAI-compatible HTTP surface over one opened <see cref="GenerationService"/>:

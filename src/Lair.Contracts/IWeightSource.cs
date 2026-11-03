@@ -1,4 +1,4 @@
-namespace Lair.Core.Contracts;
+namespace Lair.Contracts;
 
 /// <summary>
 /// Resolves a logical tensor to its raw bytes.

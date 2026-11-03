@@ -1,7 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace Lair.Api.Monitoring;
+namespace Lair.Http.Monitoring;
 
 /// <summary>
 /// One published view of a served engine's live counters, process facts included. Every field serializes with a

@@ -1,4 +1,4 @@
-namespace Lair.Api;
+namespace Lair.Http;
 
 /// <summary>
 /// The request named a model this service does not serve.

@@ -6,7 +6,7 @@
 dotnet build Lair.sln
 ```
 
-Target framework: net10.0. Solution layout: `src/Lair.*` projects (Core, Loader, Backends.Cpu, Kv, Tokenizer, Sampling, Models, Api, Host), `tests/Lair.Tests`, `bench/Lair.Bench`. The continuous-batch scheduler lives in `src/Lair.Models/Scheduling/`; the metrics bus and monitor stream in `src/Lair.Api/Monitoring/`; the config watcher and change-application bus in `src/Lair.Host/ConfigWatcher.cs` + `src/Lair.Api/Config/ConfigReload.cs`.
+Target framework: net10.0. Solution layout: `src/Lair.*` projects (Contracts, Loader, Backends.Cpu, Kv, Tokenizer, Sampling, Models, Http, Host), `tests/Lair.Tests`, `bench/Lair.Bench`. The continuous-batch scheduler lives in `src/Lair.Models/Scheduling/`; the metrics bus and monitor stream in `src/Lair.Http/Monitoring/`; the config watcher and change-application bus in `src/Lair.Host/ConfigWatcher.cs` + `src/Lair.Http/Config/ConfigReload.cs`.
 
 ## Web UI build (`src/Lair.Host/ClientApp/`)
 

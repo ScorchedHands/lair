@@ -1,6 +1,6 @@
 using System.Collections.Concurrent;
 using System.Globalization;
-using Lair.Api.Monitoring;
+using Lair.Http.Monitoring;
 using Lair.Backends.Cpu;
 using Lair.Host.Config;
 using Lair.Kv;
@@ -12,7 +12,7 @@ using Lair.Tokenizer;
 using Lair.Tokenizer.Templating;
 using Microsoft.Extensions.Logging;
 
-namespace Lair.Api;
+namespace Lair.Http;
 
 /// <summary>
 /// Single-model generation facade: opens one configured GGUF model (weights, forward engine, tokenizer,

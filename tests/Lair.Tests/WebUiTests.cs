@@ -1,5 +1,5 @@
 using System.Net;
-using Lair.Api;
+using Lair.Http;
 using Lair.Host.Config;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.Hosting;

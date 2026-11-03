@@ -1,6 +1,6 @@
 using System.Threading.Channels;
 
-namespace Lair.Api.Monitoring;
+namespace Lair.Http.Monitoring;
 
 /// <summary>One delivered monitor stream frame: its server-scoped event id, the versioned event name, and the compact JSON payload.</summary>
 public sealed record MonitorFrame(long Id, string EventName, string Json);

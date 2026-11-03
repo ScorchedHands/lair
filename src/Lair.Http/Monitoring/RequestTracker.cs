@@ -1,6 +1,6 @@
 using System.Diagnostics;
 
-namespace Lair.Api.Monitoring;
+namespace Lair.Http.Monitoring;
 
 /// <summary>
 /// Per-generation tok/s tracker for the monitor stream: one fixed ring of step-boundary elapsed-time samples (no

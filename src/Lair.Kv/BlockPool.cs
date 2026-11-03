@@ -1,5 +1,5 @@
 using System.Buffers;
-using Lair.Core.Contracts;
+using Lair.Contracts;
 
 namespace Lair.Kv;
 

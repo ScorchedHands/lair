@@ -1,4 +1,4 @@
-namespace Lair.Core.Contracts;
+namespace Lair.Contracts;
 
 /// <summary>
 /// A resolved weight tensor: packed row bytes plus the metadata needed to interpret them. Bytes holds one

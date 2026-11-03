@@ -1,4 +1,4 @@
-namespace Lair.Core.Contracts;
+namespace Lair.Contracts;
 
 public enum QuantFormat
 {

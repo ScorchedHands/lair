@@ -1,6 +1,6 @@
 using Lair.Models.Scheduling;
 
-namespace Lair.Api;
+namespace Lair.Http;
 
 /// <summary>
 /// The outcome of one generation: the decoded text, token accounting, and why decoding stopped —

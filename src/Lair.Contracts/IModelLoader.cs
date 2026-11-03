@@ -1,4 +1,4 @@
-namespace Lair.Core.Contracts;
+namespace Lair.Contracts;
 
 /// <summary>
 /// Describes a model file. <see cref="Load"/> reads the file's metadata and returns a

@@ -5,7 +5,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
-namespace Lair.Api.Monitoring;
+namespace Lair.Http.Monitoring;
 
 /// <summary>
 /// Serves the live engine feed as versioned Server-Sent Events on <c>/monitor/stream</c>. Every frame carries a

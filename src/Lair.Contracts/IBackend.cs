@@ -1,6 +1,6 @@
 using System.Buffers;
 
-namespace Lair.Core.Contracts;
+namespace Lair.Contracts;
 
 /// <summary>
 /// Compute backend: aligned arena management plus dense kernels. Kernels consume packed

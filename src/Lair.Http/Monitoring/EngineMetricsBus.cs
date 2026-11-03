@@ -4,7 +4,7 @@ using Lair.Kv;
 using Lair.Models.Scheduling;
 using Microsoft.Extensions.Logging;
 
-namespace Lair.Api.Monitoring;
+namespace Lair.Http.Monitoring;
 
 /// <summary>
 /// In-process metrics bus for one engine: cheap scheduler counters plus pool and cache state are sampled at a

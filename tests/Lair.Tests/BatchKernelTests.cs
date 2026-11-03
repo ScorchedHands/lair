@@ -1,6 +1,6 @@
 using System.Runtime.InteropServices;
 using Lair.Backends.Cpu;
-using Lair.Core.Contracts;
+using Lair.Contracts;
 
 namespace Lair.Tests;
 

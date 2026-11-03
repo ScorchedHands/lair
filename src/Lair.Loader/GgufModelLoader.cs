@@ -1,4 +1,4 @@
-using Lair.Core.Contracts;
+using Lair.Contracts;
 
 namespace Lair.Loader;
 

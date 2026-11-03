@@ -1,6 +1,6 @@
 using System.Text.Json.Serialization;
 
-namespace Lair.Api;
+namespace Lair.Http;
 
 // Wire-format records for the OpenAI-compatible surface. JSON names are the C# names run through
 // the snake_case naming policy configured in the app builder and in the streaming serializer.

@@ -1,4 +1,4 @@
-namespace Lair.Api.Monitoring;
+namespace Lair.Http.Monitoring;
 
 /// <summary>
 /// Configuration- and backend-backed facts about the model a bus observes, attached once by the owning service

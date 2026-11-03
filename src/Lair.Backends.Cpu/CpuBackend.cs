@@ -3,7 +3,7 @@ using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
-using Lair.Core.Contracts;
+using Lair.Contracts;
 
 namespace Lair.Backends.Cpu;
 

@@ -1,6 +1,6 @@
 using System.Buffers;
 
-using Lair.Core.Contracts;
+using Lair.Contracts;
 using Lair.Kv;
 using Lair.Loader;
 

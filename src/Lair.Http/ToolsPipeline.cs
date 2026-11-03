@@ -1,7 +1,7 @@
 using System.Text;
 using System.Text.Json;
 
-namespace Lair.Api;
+namespace Lair.Http;
 
 /// <summary>How the request constrains tool use.</summary>
 public enum ToolChoiceMode

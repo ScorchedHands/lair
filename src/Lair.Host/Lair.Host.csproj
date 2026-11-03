@@ -1,8 +1,8 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
-    <ProjectReference Include="..\Lair.Core\Lair.Core.csproj" />
-    <ProjectReference Include="..\Lair.Api\Lair.Api.csproj" />
+    <ProjectReference Include="..\Lair.Contracts\Lair.Contracts.csproj" />
+    <ProjectReference Include="..\Lair.Http\Lair.Http.csproj" />
   </ItemGroup>
 
   <ItemGroup>

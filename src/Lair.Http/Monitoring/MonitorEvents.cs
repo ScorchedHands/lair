@@ -1,7 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace Lair.Api.Monitoring;
+namespace Lair.Http.Monitoring;
 
 /// <summary>
 /// Wire vocabulary for the versioned monitor stream (schema v1). Every frame on <c>/monitor/stream</c> is one of

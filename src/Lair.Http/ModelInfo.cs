@@ -1,4 +1,4 @@
-namespace Lair.Api;
+namespace Lair.Http;
 
 /// <summary>
 /// What a served model advertises: the id requests must name, the effective context window, the KV pool size,

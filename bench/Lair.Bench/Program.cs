@@ -1,6 +1,6 @@
 ﻿using System.Diagnostics;
 using Lair.Backends.Cpu;
-using Lair.Core.Contracts;
+using Lair.Contracts;
 using Lair.Loader;
 
 if (args.Length == 0)
