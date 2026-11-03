@@ -40,7 +40,7 @@ LAIR is a C#/.NET inference runtime for local LLMs on x64 hardware, serving CPU/
 
 ```mermaid
 graph TD
-    C[Clients] -->|OpenAI-compatible HTTP + SSE| API[lair.api]
+    C[Clients] -->|OpenAI-compatible HTTP + SSE| API[lair.http]
     API --> R[Model Router / Registry]
     R --> MI[ModelInstance x N]
     MI --> S[Scheduler: continuous batching, admission, placement]
@@ -118,8 +118,8 @@ graph TD
 ### Modules
 
 - `lair.host` — CLI + HTTP host, config watcher, lifecycle
-- `lair.api` — OpenAI-compatible endpoints, SSE streaming, request lifecycle
-- `lair.core` — engine, sequences, continuous batching
+- `lair.http` — serving layer: OpenAI-compatible endpoints, SSE streaming, request lifecycle, model router
+- `lair.contracts` — contracts-only leaf: `IBackend`, `IWeightSource`, quant formats, tensor shapes (engine/sequences/continuous batching live in `lair.models` + `lair.kv`)
 - `lair.models` — architecture definitions + GGUF tensor mapping (dense first; Flash-Next later)
 - `lair.backends.cpu` — intrinsics kernels, fused dequant GEMV/GEMM, shim escape
 - `lair.backends.cuda` — device kernels, hybrid layer-split execution
@@ -179,7 +179,7 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 - **DN-M1-4** — Chat templates render through a mini Jinja-subset interpreter (conditionals, loops, common filters, special-token handling).
   - Rationale: correctness on arbitrary GGUF templates; llama.cpp's minja is the working precedent.
   - Rejected: hardcoded per-family templates (breaks on custom templates); deferring chat to MVP2 (breaks `/v1/chat/completions` in MVP1).
-  - Contract: template render in `lair.api` request pipeline; `lair.tokenizer`.
+  - Contract: template render in `lair.http` request pipeline; `lair.tokenizer`.
 - **DN-M1-5** — Config file is YAML (YamlDotNet).
   - Rationale: the hot-reload schema grows with PlacementPolicy; comments matter in server config.
   - Rejected: TOML (weaker for nested policy blocks); JSON (poor hand-editing).
@@ -191,7 +191,7 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 - **DN-M1-7** — Errors use the OpenAI error shape `{error:{message,type,code}}` with a bounded code set: `invalid_request`, `model_not_found`, `context_length_exceeded`, `engine_overloaded`, `internal`.
   - Rationale: SDK clients handle errors uniformly; bounded codes keep behavior predictable.
   - Rejected: .NET exception passthrough (leaks internals, breaks SDK expectations).
-  - Contract: `lair.api` middleware.
+  - Contract: `lair.http` middleware.
 - **DN-M1-8** — Kestrel binds loopback by default; authentication deferred (backlog: server posture).
   - Rationale: local runtime default posture; exposure is an explicit later decision.
   - Contract: host binding config.
@@ -201,7 +201,7 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
   - Contract: host lifecycle + `/healthz`.
 - **DN-M1-10** — Every request carries `x-lair-request-id`; JSON structured logs correlate on it.
   - Rationale: correlation IDs must exist before multi-request phases make logs unreadable.
-  - Contract: `lair.api`/`lair.host` logging.
+  - Contract: `lair.http`/`lair.host` logging.
 
 - **DN-M1-11** — Loader/source split: `IModelLoader` parses the container into a logical tensor table (id, shape, format, offsets); retrieval strategy lives entirely in `IWeightSource` providers selected per model in config.
   - Rationale: experimental storage/retrieval modules (repacked sidecars, tiered streaming, read-time transforms) plug in as providers without touching loader or kernels — the byte-reduction experiment program depends on this split existing from day one.
@@ -227,7 +227,7 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 - [✓] HTTP API — chat/completions, completions, models (with `context_length` metadata), SSE streaming, error taxonomy (see DN-M1-6, DN-M1-7)
   - Verify: `dotnet test --filter Category=Api` — 10/10 ✅ against a live server on the real SmolLM fixture: non-stream chat + completions shapes, SSE chunk stream ending `[DONE]`, `/v1/models` with `context_length`, `/healthz`, embeddings-404, error taxonomy (model_not_found / context_length_exceeded / engine_overloaded / invalid_request), `x-lair-request-id` on every response. OpenAI Python SDK probe runs under Manual Serve.
 - [✓] Backend seam — `IBackend` + arenas + `IWeightSource` contracts, CPU-only implementation (see DN-M1-3, DN-M1-11)
-  - Verify: `lair.core` compiles against contracts only — no project reference to `lair.backends.cpu` ✅; alternate `IWeightSource` provider end-to-end proof ran with the Parity item (`ArenaWeightSourceTests`: tensors copied into backend-allocated aligned blocks, token sequence identical to mmap-backed decode) ✅.
+  - Verify: `lair.contracts` compiles with zero project references — no reference to `lair.backends.cpu` ✅; alternate `IWeightSource` provider end-to-end proof ran with the Parity item (`ArenaWeightSourceTests`: tensors copied into backend-allocated aligned blocks, token sequence identical to mmap-backed decode) ✅.
 - [✓] Golden parity — logit-agreement harness vs pinned llama.cpp (server-mode reference), committed calibrated fixtures (see Decision Log 2026-11-01)
   - Verify: `dotnet test --filter Category=Parity` — 9/9 ✅ on SmolLM-135M F16 + Q8_0 vs pinned llama.cpp b12032 server references (4 prompts × 2 models, sha256-guarded): LAIR argmax lands in the reference top-5 for every prompt; calibrated distributions reproduce exactly. Harness work exposed and fixed four engine bugs: prefill double-forward of the last prompt token, BOS applied regardless of `add_bos_token`, SmolLM digit-run split cutting all non-digit text per-character, and reversed BPE merge priority order. Alternate-`IWeightSource` arena proof green — completes the Backend seam item's end-to-end proof too.
 - [✓] Config load — YAML parse, validation, placement policy (single model, `cpu`)
@@ -283,13 +283,13 @@ Many requests at once, tuned, with live reconfiguration.
   - Contract: `lair.monitor` metrics bus.
 - **DN-M2-8** — Tool calls: per-family tool schema injection into the chat template; `tool_calls` parsed from streamed output; tool execution stays client-side.
   - Rationale: coding-agent compatibility (Strata's whole tool story) requires the wire contract, not execution.
-  - Contract: `lair.api` request/response pipeline.
+  - Contract: `lair.http` request/response pipeline.
 - **DN-M2-9** — Latency budget: decode ITL p95 ≤ 400 ms for N=8 concurrent SmolLM-class requests on the dev machine; chunked prefill must hold short-request ITL within the same budget with an 8K-token prompt in flight.
   - Rationale: measured single-stream baseline is ~70–105 ms/token (SmolLM-135M Q8_0, full threads); a concrete ceiling makes batching regressions catchable without machine-specific absolutes.
   - Contract: Concurrency and Prefill test thresholds.
 - **DN-M2-10** — Tool-call detection (MVP2 scope): the wire contract is complete even for models without tool-trained templates. Schemas are injected into the rendered prompt per template family; a call is recognized ONLY when decoded output contains a fenced ```json block whose object matches `{name, arguments}` against a declared tool name (`arguments` JSON-encoded string). Recognized calls appear in `message.tool_calls` / streaming deltas and are stripped from visible text. Execution stays client-side. A model that never emits the contract simply returns ordinary text — valid behavior, tested at parser level, not demanded of small models.
   - Rationale: tool compliance is a property of the model, not the runtime; the runtime guarantees injection, detection, and wire shape.
-  - Contract: `lair.api` tool pipeline + template injection.
+  - Contract: `lair.http` tool pipeline + template injection.
 - **DN-M2-11** — Hot-reload KV budget semantics under pinned arenas: the pool's physical arena is reserved once at startup; `kv_blocks` hot-edits operate as a soft cap within that reservation — grow raises usage up to reserved capacity immediately, shrink drains blocks above the new cap through prefix-cache eviction (never touches active sequences) and tightens admission. Physical re-reservation belongs to the tiered-pools phase, not MVP2.
   - Rationale: mid-serving arena reallocation over live block tables is exactly what step-boundary safety exists to avoid; a soft cap delivers the observable hot-reload behavior without engine risk.
   - Contract: BlockPool soft-cap + PrefixCache eviction interplay at reload apply time.
@@ -462,7 +462,7 @@ Many models at once, each with its own placement policy.
 - **DN-M5-1** — Registry and hot swap: models declared in config with `type: chat|embed`; add loads in the background and serves when ready; remove drains in-flight requests, then frees pools.
   - Rationale: model changes ride the same hot-reload bus as every other knob; drain-then-free avoids mid-flight collapse.
   - Rejected: restart-to-change-model; immediate unload (kills in-flight requests).
-  - Contract: registry in `lair.core` + `IConfigSource`.
+  - Contract: registry in `lair.http` + `IConfigSource`.
 - **DN-M5-2** — Global ledger admission: DRAM quota, VRAM pool, and core sets are accounted at load time; runtime KV exhaustion rejects new requests, never preempts running ones.
   - Rationale: preemption needs swap to disk — that machinery arrives in MVP7; until then the honest answer is refusal.
   - Rejected: best-effort oversubscription (thrash); preempt-to-fittest (needs MVP7 tiers).
@@ -638,4 +638,4 @@ Vision input on chat models.
 - **2026-11-02 — Benchmarks deferred by owner decision.** Perf/bench verify lines stay pending until requested; the 4090 currently runs other workloads at ~95% utilization. Correctness gates remain active.
 - **2026-11-03 — Q4_K_M family coverage pulled forward as MVP3.1 [v0.3.1].** Owner hit the gap directly with `models/smollm-135m-instruct-q4_k_m.gguf` (attn k/v are Q5_0, output is Q6_K); consuming published quants is a Scope commitment and "unsupported ggml type" on a user's own model is unusable. Backlog row removed; kernels mirror the established llama.cpp `ggml-quants.c` pattern (DN-M31-1).
 - **2026-11-03 — Repo layout conventions settled by owner.** SPA moves to ASP.NET convention: `src/Lair.Host/ClientApp/` with standard static-asset serving and root redirect (`/` -> `/ui`) replacing the root-level `web/`. The `Lair.Api` library + `Lair.Host` executable split stays (testable surface vs CLI composition root). Solution file and Directory.Build.props stay at repo root.
-- **2026-11-02 — Benchmarks deferred by owner decision.** Perf/bench verify lines stay pending until requested; the 4090 currently runs other workloads at ~95% utilization. Correctness gates remain active.
+- **2026-11-03 — Project renames: `Lair.Api` → `Lair.Http`, `Lair.Core` → `Lair.Contracts`.** Owner-driven role naming: "Api" reads as a console app serving the API, but the project is the HTTP serving layer; "Core" held contracts only. `Lair.Http` names the serving adapter (endpoints, SSE streaming, request lifecycle, model router); `Lair.Contracts` names the contracts-only leaf (`IBackend`, `IWeightSource`, quant formats, tensor shapes). Mechanical rename of project dirs, csproj files, namespaces, and solution entries.
