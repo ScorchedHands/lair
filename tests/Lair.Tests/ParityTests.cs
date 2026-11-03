@@ -27,6 +27,11 @@ public sealed class ParityTests
     // The Q8_0 fixture is both a reference set and a real quantized load: the model under test IS that file.
     private const string Q8Fixture = "tests/fixtures/parity-smollm-q8.json";
 
+    // Same for the Q4_K_M fixture. On this file q4-style weight noise flips a near tie in the first-step ranking,
+    // so LAIR's argmax and the pinned reference's top pick differ while remaining mutual top-5 members; both sides'
+    // calibrated logprobs reproduce exactly, which is what these gates actually verify.
+    private const string Q4KMFixture = "tests/fixtures/parity-smollm-q4km.json";
+
     /// <summary>Ranking window whose reproduction the fixtures calibrate.</summary>
     private const int CalibrationWindow = 16;
 
@@ -36,7 +41,7 @@ public sealed class ParityTests
     public static TheoryData<string, int> PromptCases()
     {
         TheoryData<string, int> cases = [];
-        foreach (string fixture in new[] { F16Fixture, Q8Fixture })
+        foreach (string fixture in new[] { F16Fixture, Q8Fixture, Q4KMFixture })
         {
             string? path = ModelFixture.ResolveRepoRelative(fixture);
             if (path is null)

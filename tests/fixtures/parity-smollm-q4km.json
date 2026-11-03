@@ -1,0 +1,162 @@
+{
+  "model_file": "models/smollm-135m-instruct-q4_k_m.gguf",
+  "model_sha256": "a78904bdaa615d58e317a27b3e6e07183da486bd26c1f1987d7d3334a87f7625",
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
+  "decode": {
+    "context": 1024,
+    "temperature": 0.0
+  },
+  "generated_utc": "2026-11-03T20:14:48Z",
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "max_tokens": 48,
+      "output": " $100,000,000,000,000,000,000,000,000,000,000,000",
+      "top_logprobs": [
+        {
+          "id": 1885,
+          "token": " $",
+          "logprob": -1.7252776622772217,
+          "lair_logprob": -2.0742
+        },
+        {
+          "id": 260,
+          "token": " the",
+          "logprob": -1.9876935482025146,
+          "lair_logprob": -1.8868
+        },
+        {
+          "id": 216,
+          "token": " ",
+          "logprob": -2.3628814220428467,
+          "lair_logprob": -2.2786
+        },
+        {
+          "id": 4723,
+          "token": " approximately",
+          "logprob": -2.588221311569214,
+          "lair_logprob": -3.6727
+        },
+        {
+          "id": 24927,
+          "token": " €",
+          "logprob": -3.108240842819214,
+          "lair_logprob": -3.9205
+        }
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "max_tokens": 48,
+      "output": ", there was a man named John. He had a son named John, and he was a very old man. He had a son named John, and he was a very old man. He had a son named John, and he was",
+      "top_logprobs": [
+        {
+          "id": 28,
+          "token": ",",
+          "logprob": -0.11150994896888733,
+          "lair_logprob": -0.1898
+        },
+        {
+          "id": 281,
+          "token": " in",
+          "logprob": -3.4940364360809326,
+          "lair_logprob": -4.1887
+        },
+        {
+          "id": 665,
+          "token": " there",
+          "logprob": -3.8982174396514893,
+          "lair_logprob": -5.4242
+        },
+        {
+          "id": 253,
+          "token": " a",
+          "logprob": -4.631656169891357,
+          "lair_logprob": -4.1547
+        },
+        {
+          "id": 339,
+          "token": " I",
+          "logprob": -5.520357131958008,
+          "lair_logprob": -4.5003
+        }
+      ]
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "max_tokens": 48,
+      "output": "\tif n < 0:\n\t\treturn 0\n\telse:\n\t\treturn fibonacci(n) + fibonacci(n-1)\n\ndef fibonacci_with_recursive(n):\n\tif",
+      "top_logprobs": [
+        {
+          "id": 197,
+          "token": "\t",
+          "logprob": -1.137418270111084,
+          "lair_logprob": null
+        },
+        {
+          "id": 3725,
+          "token": "```",
+          "logprob": -1.550004482269287,
+          "lair_logprob": -0.7735
+        },
+        {
+          "id": 19,
+          "token": "#",
+          "logprob": -1.858945369720459,
+          "lair_logprob": -2.2788
+        },
+        {
+          "id": 5406,
+          "token": "return",
+          "logprob": -2.332099437713623,
+          "lair_logprob": -3.8909
+        },
+        {
+          "id": 1710,
+          "token": "for",
+          "logprob": -3.1277260780334473,
+          "lair_logprob": -4.7242
+        }
+      ]
+    },
+    {
+      "prompt": "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n",
+      "max_tokens": 48,
+      "output": "The given question is equivalent to:\n\n$$\\lim_{x\\to 0}\\frac{1}{x}\\int_{0}^{x}\\frac{1}{1+t^2}dt$$\n\nThe limit is",
+      "top_logprobs": [
+        {
+          "id": 504,
+          "token": "The",
+          "logprob": -1.528476595878601,
+          "lair_logprob": -2.7036
+        },
+        {
+          "id": 4239,
+          "token": "Let",
+          "logprob": -2.1150436401367188,
+          "lair_logprob": -1.6061
+        },
+        {
+          "id": 2068,
+          "token": "To",
+          "logprob": -2.2433221340179443,
+          "lair_logprob": -3.024
+        },
+        {
+          "id": 1882,
+          "token": "We",
+          "logprob": -2.358663558959961,
+          "lair_logprob": -2.5534
+        },
+        {
+          "id": 788,
+          "token": "In",
+          "logprob": -2.767240524291992,
+          "lair_logprob": -3.8806
+        }
+      ]
+    }
+  ]
+}

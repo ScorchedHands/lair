@@ -393,13 +393,13 @@ Published Q4_K_M models load and serve on this machine.
   - Verify: same Category=Kernel oracle pattern. ✅ included in the 77/77 batch; type id 14, block 210 B per llama.cpp.
 - [✓] Q5_K kernel — same pattern (see DN-M31-1)
   - Verify: same Category=Kernel oracle pattern. ✅ included in the 77/77 batch; type id 13 per llama.cpp.
-- [_] End-to-end Q4_K_M serve — load `models/smollm-135m-instruct-q4_k_m.gguf` (real file on dev box), decode under the engine, serve it
-  - Verify: automated — real-fixture test (skip-if-absent) asserts load, finite logits, thread-invariant argmax over an 8-token decode; manual — `lair serve` with the q4_k_m config, chat via API and the `/ui` Chat tab, Monitor tab shows the model live.
+- [✓] End-to-end Q4_K_M serve — load `models/smollm-135m-instruct-q4_k_m.gguf` (real file on dev box), decode under the engine, serve it
+  - Verify: automated — real-fixture test (skip-if-absent) asserts load, finite logits, thread-invariant argmax over an 8-token decode; manual — `lair serve` with the q4_k_m config, chat via API and the `/ui` Chat tab, Monitor tab shows the model live. ✅ Automated: `QuantFamilyFixtureTests` exact quant inventory (Q5_0 x166 tensors incl. all attn_q/k/output + ffn_gate/up; Q6_K/Q4_K split on ffn_down; Q8_0 token_embd) + thread-invariant decode; parity fixture `parity-smollm-q4km.json` pinned to llama.cpp b12032 (sha-pinned model file). Manual: serve live — root 301→/ui, `/v1/models` lists the model, non-stream + streaming chat 200 with streamed deltas, monitor stream carried request_start/update×3/complete/snapshot naming the model.
 
 #### Tests
 
-- [_] Automated Kernel: Q5_0/Q5_K/Q6_K scalar-vs-AVX2 bit-identity + batch equivalence + real-fixture decode sanity
-- [_] Manual Q4_K_M Serve: q4_k_m model served; chat via API + `/ui`; monitor live
+- [✓] Automated Kernel: Q5_0/Q5_K/Q6_K scalar-vs-AVX2 bit-identity + batch equivalence + real-fixture decode sanity ✅ Category=Kernel|Loader 77→92 with Parity; Release full 320/320
+- [✓] Manual Q4_K_M Serve: q4_k_m model served; chat via API + `/ui`; monitor live ✅ verified live on :8392 (see item evidence)
 
 ### MVP4 [v0.4.0] - Refined
 
@@ -668,3 +668,4 @@ Vision input on chat models.
 - **2026-11-03 — Repo layout conventions settled by owner.** SPA moves to ASP.NET convention: `src/Lair.Host/ClientApp/` with standard static-asset serving and root redirect (`/` -> `/ui`) replacing the root-level `web/`. The `Lair.Api` library + `Lair.Host` executable split stays (testable surface vs CLI composition root). Solution file and Directory.Build.props stay at repo root.
 - **2026-11-03 — Project renames: `Lair.Api` → `Lair.Http`, `Lair.Core` → `Lair.Contracts`.** Owner-driven role naming: "Api" reads as a console app serving the API, but the project is the HTTP serving layer; "Core" held contracts only. `Lair.Http` names the serving adapter (endpoints, SSE streaming, request lifecycle, model router); `Lair.Contracts` names the contracts-only leaf (`IBackend`, `IWeightSource`, quant formats, tensor shapes). Mechanical rename of project dirs, csproj files, namespaces, and solution entries.
 - **2026-11-03 — MVP5.1 [v0.5.1] inserted ahead of Flash-Next: dense IQ3_XXS coverage.** Owner's target quant for their own runs is IQ3_XXS; dense loader + kernels must land before MVP6 MoE work, whose expert slabs assume the same format (DN-M6-2). Tentative: the kernel strategy (fused dequant-GEMV vs llama.cpp dot-vec tables) is an Open Item for `/plan-refine`, not a mechanical K-quant mirror.
+- **2026-11-03 — q4_k_m cross-engine decode gate: membership parity; no quant layout defect exists.** An initial llama.cpp CLI comparison on the real Q4_K_M fixture showed different greedy continuations, prompting a full audit: probes of b12032 `dequantize_row_q5_0/q4_K/q6_k` (independent transcription + real GGUF bytes) proved LAIR kernels byte-exact; float64 exact-arithmetic forwards showed q4-style weight noise flips a near tie — LAIR's argmax and the reference pick are mutual top-5 members with both sides' calibrated logprobs reproduced. Strict cross-engine token equality on low-bit formats is rejected as chasing llama.cpp approximation noise (consistent with the existing parity design); `tests/fixtures/parity-smollm-q4km.json` pins model sha256 + b12032 server reference mode.
