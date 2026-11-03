@@ -374,6 +374,33 @@ Security (accepted): SPA is static files on the existing Kestrel endpoint (loopb
 - [✓] Manual Monitor: configured-models panel first with expandable rows; per-model stats; in-flight + recent rows with tok/s sparklines; placeholder tiles; sub-second updates — verified live ✅ against serve: `/ui` shell 200 with assets (`app.css`, `app.js`) and SPA fallback; stream carried request_start×2/update×3/complete×2/snapshot×2 all id-stamped with token sample arrays during chat+completion load; Last-Event-ID reconnect replayed snapshot + resync; jsdom harness vs built bundle 38/38 (KPI updates, live model-row expansion, in-flight lifecycle, sparkline points from samples, badge offline→reconnecting→live).
 - [✓] Manual Chat UI: LLM-only model selector, streamed multi-turn chat, mid-stream abort, tool-call card rendering against the live server — verified live ✅: curl SSE capture matched client parse shapes (role → content deltas → finish chunk → `[DONE]`); real-bundle harness 11/11 on live serve incl. multi-turn replay accepted and genuine mid-stream cut with working next send; jsdom smoke 29/29 (embed model excluded via additive `/v1/models type`, tool cards in both wire shapes, inline error bubble keeps composer usable).
 
+### MVP3.1 [v0.3.1] - Refined
+
+Published Q4_K_M models load and serve on this machine.
+
+#### Design Notes
+
+- **DN-M31-1** — Quant family coverage: implement loader acceptance + scalar/AVX2 fused-dequant GEMV kernels for Q5_0, Q5_K, and Q6_K, mirroring llama.cpp `ggml-quants.c` reference math, so published mixed-family quant files serve as-is (Q4_K_M puts attn k/v at Q5_0 and `output.weight` at Q6_K; Q4_K_S uses Q5_K).
+  - Rationale: consuming published GGUF quants is a Scope commitment; the repo already mirrors llama.cpp quant math for Q4_K/Q8_0 — same pattern extends.
+  - Rejected: offline requantization (breaks the GGUF-first commitment); rejection-with-a-nice-error (already exists; leaves the user's own model unusable).
+  - Contract: `GgmlType`/`TensorShape` row strides (Q5_0 22 B/32, Q5_K 176 B/256, Q6_K 216 B/256) + `CpuBackend.DequantRow`/`Gemv`/`GemvBatch` paths.
+
+#### Implementation Items
+
+- [_] Q5_0 kernel — loader acceptance + scalar oracle + AVX2 fused dequant + batch path (see DN-M31-1)
+  - Verify: `dotnet test --filter Category=Kernel` — synthetic-block scalar-vs-AVX2 and 1T-vs-4T bit-identity, `GemvBatch` equals solo `Gemv`.
+- [_] Q6_K kernel — same pattern (see DN-M31-1)
+  - Verify: same Category=Kernel oracle pattern.
+- [_] Q5_K kernel — same pattern (see DN-M31-1)
+  - Verify: same Category=Kernel oracle pattern.
+- [_] End-to-end Q4_K_M serve — load `models/smollm-135m-instruct-q4_k_m.gguf` (real file on dev box), decode under the engine, serve it
+  - Verify: automated — real-fixture test (skip-if-absent) asserts load, finite logits, thread-invariant argmax over an 8-token decode; manual — `lair serve` with the q4_k_m config, chat via API and the `/ui` Chat tab, Monitor tab shows the model live.
+
+#### Tests
+
+- [_] Automated Kernel: Q5_0/Q5_K/Q6_K scalar-vs-AVX2 bit-identity + batch equivalence + real-fixture decode sanity
+- [_] Manual Q4_K_M Serve: q4_k_m model served; chat via API + `/ui`; monitor live
+
 ### MVP4 [v0.4.0] - Refined
 
 CUDA joins the engine; hybrid CPU/GPU inference on the 4090.
@@ -581,7 +608,6 @@ Vision input on chat models.
 | idea | Diffusion model support | UNet/DiT executor family (bidirectional attention, no KV cache), Conv2D/GroupNorm kernels, VAE encode/decode, noise-scheduler stack, CLIP/T5 conditioning; GGUF already hosts SD-class containers and the loader/backend/quant investment transfers; continuous batching fits denoise steps well; needs a Scope change (image generation is a current explicit non-goal) — proposed MVP9 candidate |
 | idea | Server-side MCP injection | per-model, config-declared MCP servers whose tool definitions LAIR injects into chat requests regardless of client; injected tools execute server-side (contrast DN-M2-8: client-supplied tools stay client-side); enables cross-model composition — an LLM calling a diffusion model through its MCP endpoint, or the embeddings engine exposed as a vector/RAG MCP; interacts with tool-call API work and server posture |
 | idea | `auto` device fallback | silent CPU fallback when a configured CUDA device is absent — deliberately not a default (DN-M4-3) |
-| bug | Q4_K_M family coverage gap | kernels implement only the Q4_K block format; real Q4_K_M files mix Q5_K/Q6_K tensors, and non-block-divisible dims force legacy formats (Q4_0/Q5_0…) — loader/kernel extension needed before serving published quants in production |
 
 ## Decision Log
 
@@ -609,4 +635,7 @@ Vision input on chat models.
 - **2026-11-02 — MVP3 inserted for the Web UI; CUDA and later phases shift down one.** New MVP3 [v0.3.0] (Tentative) ships the Monitor Web UI (design carried from the multi-model phase, formerly DN-M4-4 → DN-M3-1) plus a Chat test UI in a tabbed shell with a shared stylesheet (`mockup/mvp3/` mockups precede production code). CUDA becomes MVP4 [v0.4.0], multi-model MVP5 [v0.5.0], Flash-Next MVP6 [v0.6.0], residency MVP7 [v0.7.0], vision MVP8 [v0.8.0]. Rationale: the UI needs no GPU, exercises the shipped CPU engine, and the owner wants to test that engine hands-on now. Chat component stack (assistant-ui vs shadcn/ui vs hand-rolled — license, streaming ergonomics, build integration) is a refine-phase decision.
 - **2026-11-02 — Windows CUDA toolchain found incomplete; MVP4 blocked until repaired.** Registry lists CUDA Development/Toolkit 13.0, but `nvcc.exe` is absent from the toolkit tree and `cublasLt.h`/`nvrtc.h` are missing (runtime DLLs + `cuda_runtime.h` present). WSL Ubuntu-22.04 has nvcc 12.4 but cannot target a Windows .NET host. Recorded as an MVP4 Open Item; repair/reinstall of the developer components (or a binding-strategy change via plan-update) required before `/plan-build` MVP4.
 - **2026-11-02 — MVP3 refined: SSE transport, shadcn + hand-rolled chat, mockup rev B locked as spec.** Live stats reuse `/monitor/stream` SSE with `Last-Event-ID` replay from the snapshot ring (WebSocket/SignalR rejected — read-only monitor needs no bidirectionality); chat tab uses shadcn primitives with a hand-rolled OpenAI-compatible SSE client (assistant-ui rejected as runtime-library weight for a test client; both are MIT — the license difference assumed earlier does not exist); tabbed shell mockup (`mockup/mvp3/`, rev B) approved verbatim as the production spec with the dark theme locked; per-request tok/s series added to the event schema contract; `ui.recent_requests` config knob joins the live mutation class.
+- **2026-11-02 — Benchmarks deferred by owner decision.** Perf/bench verify lines stay pending until requested; the 4090 currently runs other workloads at ~95% utilization. Correctness gates remain active.
+- **2026-11-03 — Q4_K_M family coverage pulled forward as MVP3.1 [v0.3.1].** Owner hit the gap directly with `models/smollm-135m-instruct-q4_k_m.gguf` (attn k/v are Q5_0, output is Q6_K); consuming published quants is a Scope commitment and "unsupported ggml type" on a user's own model is unusable. Backlog row removed; kernels mirror the established llama.cpp `ggml-quants.c` pattern (DN-M31-1).
+- **2026-11-03 — Repo layout conventions settled by owner.** SPA moves to ASP.NET convention: `src/Lair.Host/ClientApp/` with standard static-asset serving and root redirect (`/` -> `/ui`) replacing the root-level `web/`. The `Lair.Api` library + `Lair.Host` executable split stays (testable surface vs CLI composition root). Solution file and Directory.Build.props stay at repo root.
 - **2026-11-02 — Benchmarks deferred by owner decision.** Perf/bench verify lines stay pending until requested; the 4090 currently runs other workloads at ~95% utilization. Correctness gates remain active.
