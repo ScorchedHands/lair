@@ -127,9 +127,16 @@ public static class ApiApp
         return app;
     }
 
-    // The SPA lives under /ui: the bundled wwwroot/ui next to the host assembly is served only when the build
-    // embedded it, and any unmatched /ui/* path falls back to ui/index.html so client-side routes resolve.
-    // Existing API endpoints are untouched.
+    // Conventional .NET SPA hosting: the ClientApp bundle is staged into the web root (wwwroot/ui) by the
+    // Host build, served at /ui, and any unmatched /ui/* client route falls back to the shell so client-side
+    // routes resolve. The bare root redirects permanently to /ui/ so `lair serve` opens in a browser. All of
+    // this is registered only when the build embedded the UI (a SkipWebUi build keeps the previous 404
+    // behavior everywhere); existing API endpoints are untouched.
+    // Microsoft.AspNetCore.SpaServices.Extensions still ships for net10, but its UseSpa middleware rewrites
+    // every request without a matched endpoint to the default page from the web root — incompatible with a
+    // /ui mount, a root redirect, and preserving 404s outside /ui — and its SourcePath only powers dev-server
+    // proxies this app does not use. The current ASP.NET Core recommendation (SPA templates since 6.0) is
+    // exactly this shape: staged web-root assets plus a MapFallback shell route.
     private static void MapWebUi(WebApplication app)
     {
         string uiRoot = Path.Combine(AppContext.BaseDirectory, "wwwroot", "ui");
@@ -138,6 +145,9 @@ public static class ApiApp
         {
             return;
         }
+
+        // An exact-match endpoint wins over the fallback below, so the redirect only claims `/` itself.
+        app.MapGet("/", () => Results.Redirect("/ui/", permanent: true));
 
         IFileProvider uiFiles = new PhysicalFileProvider(uiRoot);
 

@@ -1,6 +1,6 @@
 // Empty-state defaults for the monitor surface (values read as em dashes until live stream frames arrive) and the
-// static tiles that stay placeholders by design. All measured monitor data now comes from web/src/monitor/live.ts;
-// the chat tab is fully wired to /v1/models + /v1/chat/completions (web/src/chat/client.ts), so nothing here feeds it.
+// static tiles that stay placeholders by design. All measured monitor data now comes from src/monitor/live.ts;
+// the chat tab is fully wired to /v1/models + /v1/chat/completions (src/chat/client.ts), so nothing here feeds it.
 
 export interface KpiCardData {
   id: string;
