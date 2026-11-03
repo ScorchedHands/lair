@@ -4,6 +4,18 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-11-03
+
+### Added
+
+- Q4_K_M family quant coverage: loader acceptance + scalar/AVX2 fused-dequant GEMV kernels for Q5_0, Q5_K, and Q6_K (llama.cpp `ggml-quants.c` parity), so published mixed-family files — attention at Q5_0, upgraded FFN downs at Q6_K — load and serve as-is. Real-fixture decode sanity tests plus a golden parity fixture pinned to llama.cpp b12032 on a real Q4_K_M model (membership gate: mutual top-5 calibrated logprobs; strict cross-engine token equality deliberately rejected).
+- `GET /` redirects permanently (`301`) to `/ui/`.
+
+### Changed
+
+- The Web UI client project moved from root-level `web/` to `src/Lair.Host/ClientApp/` (ASP.NET Core SPA convention); build embedding, docs, and example config updated accordingly.
+- Project renames: `Lair.Api` → `Lair.Http` (serving layer) and `Lair.Core` → `Lair.Contracts` (contracts-only leaf), namespaces included; no behavior change.
+
 ## [0.3.0] - 2026-11-02
 
 ### Added
