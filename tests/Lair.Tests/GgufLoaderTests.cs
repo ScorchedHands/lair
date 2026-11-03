@@ -14,8 +14,11 @@ public sealed class GgufLoaderTests : IDisposable
 {
     private const uint GgufMagic = 0x46554747; // "GGUF"
     private const uint GgmlF16 = 1;
-    private const uint GgmlQ8_0 = 8;
     private const uint GgmlQ5_0 = 6;
+    private const uint GgmlQ8_0 = 8;
+    private const uint GgmlQ2_K = 10;
+    private const uint GgmlQ5_K = 13;
+    private const uint GgmlQ6_K = 14;
 
     private const int EmbedCols = 4;
     private const int EmbedRows = 3;
@@ -164,13 +167,62 @@ public sealed class GgufLoaderTests : IDisposable
     }
 
     [Fact]
+    public void Open_AcceptsQ5_0Q5_KQ6_KTensorsWithCorrectRowStrides()
+    {
+        byte[] image = BuildQuantFixture();
+        string path = WriteTemp(image);
+
+        using GgufFile gguf = GgufFile.Open(path);
+        Assert.Equal(3, gguf.Tensors.Tensors.Count);
+
+        LogicalTensor q50 = Assert.IsType<LogicalTensor>(gguf.Tensors.Find("blk.0.attn_q.weight"));
+        Assert.Equal(QuantFormat.Q5_0, q50.Format);
+        Assert.Equal([2, 64], q50.Shape.Dims); // ggml stores [cols, rows]: stored [64, 2] reverses to logical [rows, cols]
+        Assert.Equal(44L, q50.Shape.RowStrideBytes(QuantFormat.Q5_0)); // ceil(64/32) * 22
+        Assert.Equal(0L, q50.Offset);
+        Assert.Equal(88L, q50.SizeBytes);
+
+        LogicalTensor q5k = Assert.IsType<LogicalTensor>(gguf.Tensors.Find("blk.0.attn_k.weight"));
+        Assert.Equal(QuantFormat.Q5_K, q5k.Format);
+        Assert.Equal([3, 256], q5k.Shape.Dims);
+        Assert.Equal(176L, q5k.Shape.RowStrideBytes(QuantFormat.Q5_K)); // ceil(256/256) * 176
+        Assert.Equal(96L, q5k.Offset);
+        Assert.Equal(528L, q5k.SizeBytes);
+
+        LogicalTensor q6k = Assert.IsType<LogicalTensor>(gguf.Tensors.Find("blk.0.attn_v.weight"));
+        Assert.Equal(QuantFormat.Q6_K, q6k.Format);
+        Assert.Equal([4, 512], q6k.Shape.Dims);
+        Assert.Equal(420L, q6k.Shape.RowStrideBytes(QuantFormat.Q6_K)); // ceil(512/256) * 210 (block_q6_K is 210 bytes, no alignment padding inside a row)
+        Assert.Equal(640L, q6k.Offset);
+        Assert.Equal(1680L, q6k.SizeBytes);
+
+        using GgufMmapWeightSource source = new(gguf);
+        ReadOnlySpan<byte> q50Span = source.Resolve(q50);
+        ReadOnlySpan<byte> q5kSpan = source.Resolve(q5k);
+        ReadOnlySpan<byte> q6kSpan = source.Resolve(q6k);
+
+        Assert.Equal(88, q50Span.Length);
+        Assert.Equal(528, q5kSpan.Length);
+        Assert.Equal(1680, q6kSpan.Length);
+
+        Assert.True(q50Span.SequenceEqual(new ReadOnlySpan<byte>(image, (int)gguf.DataStart, 88)));
+        Assert.True(q5kSpan.SequenceEqual(new ReadOnlySpan<byte>(image, (int)gguf.DataStart + 96, 528)));
+        Assert.True(q6kSpan.SequenceEqual(new ReadOnlySpan<byte>(image, (int)gguf.DataStart + 640, 1680)));
+
+        Assert.Equal(QuantPattern(0), q50Span[0]);
+        Assert.Equal(QuantPattern(87), q50Span[^1]); // payload pattern is indexed from the data-region start: last Q5_0 byte sits at data offset 87
+        Assert.Equal(QuantPattern(96), q5kSpan[0]);
+        Assert.Equal(QuantPattern(640 + 1680 - 1), q6kSpan[^1]);
+    }
+
+    [Fact]
     public void Open_UnsupportedTensorType_ThrowsWithTypeIdAndName()
     {
-        byte[] image = BuildFixture(q8GgmlType: GgmlQ5_0);
+        byte[] image = BuildFixture(q8GgmlType: GgmlQ2_K);
         string path = WriteTemp(image);
 
         GgufException ex = Assert.Throws<GgufException>(() => GgufFile.Open(path));
-        Assert.Contains("unsupported ggml type 6 (Q5_0)", ex.Message);
+        Assert.Contains("unsupported ggml type 10 (Q2_K)", ex.Message);
     }
 
     [Fact]
@@ -232,6 +284,56 @@ public sealed class GgufLoaderTests : IDisposable
     private static byte EmbedPattern(int i) => (byte)(i * 7 + 1);
 
     private static byte Q8Pattern(int i) => (byte)(255 - i * 3);
+
+    private static byte QuantPattern(int i) => (byte)(i * 13 + 5);
+
+    // Three quantized tensors exercising the Q5_0/Q5_K/Q6_K acceptance path: ggml-stored dims, offsets aligned to
+    // general.alignment (32), and payload bytes filled to each aligned offset so Resolve spans can be compared
+    // against the fixture image.
+    private static byte[] BuildQuantFixture()
+    {
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+
+        writer.Write(GgufMagic);
+        writer.Write(3u); // version
+        writer.Write(3ul); // n_tensors
+        writer.Write(12ul); // n_kv — must match the number of KV pairs written below
+
+        WriteKvString(writer, "general.architecture", "llama");
+        WriteKvString(writer, "general.name", "lair-quant-fixture");
+        WriteKvUint32(writer, "general.alignment", 32);
+        WriteKvString(writer, "tokenizer.ggml.model", "gpt2");
+        WriteKvStringArray(writer, "tokenizer.ggml.tokens", ["<unk>", "hello", "world", "!"]);
+        WriteKvInt32Array(writer, "tokenizer.ggml.token_type", [1, 1, 1, 3]);
+        WriteKvStringArray(writer, "tokenizer.ggml.merges", ["h e", "e l", "l o"]);
+        WriteKvUint32(writer, "tokenizer.ggml.bos_token_id", 151643);
+        WriteKvUint32(writer, "tokenizer.ggml.eos_token_id", 151645);
+        WriteKvString(writer, "tokenizer.chat_template", "chatml");
+        WriteKvInt32Array(writer, "test.array_int32", [10, 20, 30]);
+        WriteKvBool(writer, "test.flag", true);
+
+        WriteTensorInfo(writer, "blk.0.attn_q.weight", [64, 2], GgmlQ5_0, 0);
+        WriteTensorInfo(writer, "blk.0.attn_k.weight", [256, 3], GgmlQ5_K, 96);
+        WriteTensorInfo(writer, "blk.0.attn_v.weight", [512, 4], GgmlQ6_K, 640);
+
+        long headerLength = stream.Position;
+        long dataStart = (headerLength + 31) / 32 * 32;
+        for (long i = headerLength; i < dataStart; i++)
+        {
+            writer.Write((byte)0);
+        }
+
+        // Payload region: 0..95 = Q5_0 (88 bytes + 8 alignment pad), 96..639 = Q5_K (528 bytes + 112 pad to
+        // offset 640), 640..2319 = Q6_K (1680 bytes).
+        for (int i = 0; i < 640 + 1680; i++)
+        {
+            writer.Write(QuantPattern(i));
+        }
+
+        writer.Flush();
+        return stream.ToArray();
+    }
 
     private static byte[] BuildFixture(uint q8GgmlType = GgmlQ8_0, bool includeFloat32 = true, uint arrayElementType = 5u)
     {

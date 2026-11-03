@@ -383,16 +383,16 @@ Published Q4_K_M models load and serve on this machine.
 - **DN-M31-1** — Quant family coverage: implement loader acceptance + scalar/AVX2 fused-dequant GEMV kernels for Q5_0, Q5_K, and Q6_K, mirroring llama.cpp `ggml-quants.c` reference math, so published mixed-family quant files serve as-is (Q4_K_M puts attn k/v at Q5_0 and `output.weight` at Q6_K; Q4_K_S uses Q5_K).
   - Rationale: consuming published GGUF quants is a Scope commitment; the repo already mirrors llama.cpp quant math for Q4_K/Q8_0 — same pattern extends.
   - Rejected: offline requantization (breaks the GGUF-first commitment); rejection-with-a-nice-error (already exists; leaves the user's own model unusable).
-  - Contract: `GgmlType`/`TensorShape` row strides (Q5_0 22 B/32, Q5_K 176 B/256, Q6_K 216 B/256) + `CpuBackend.DequantRow`/`Gemv`/`GemvBatch` paths.
+  - Contract: `GgmlType`/`TensorShape` row strides (Q5_0 22 B/32, Q5_K 176 B/256, Q6_K 210 B/256 — llama.cpp `block_q6_k` is 210 B, no padding) + `CpuBackend.DequantRow`/`Gemv`/`GemvBatch` paths.
 
 #### Implementation Items
 
-- [_] Q5_0 kernel — loader acceptance + scalar oracle + AVX2 fused dequant + batch path (see DN-M31-1)
-  - Verify: `dotnet test --filter Category=Kernel` — synthetic-block scalar-vs-AVX2 and 1T-vs-4T bit-identity, `GemvBatch` equals solo `Gemv`.
-- [_] Q6_K kernel — same pattern (see DN-M31-1)
-  - Verify: same Category=Kernel oracle pattern.
-- [_] Q5_K kernel — same pattern (see DN-M31-1)
-  - Verify: same Category=Kernel oracle pattern.
+- [✓] Q5_0 kernel — loader acceptance + scalar oracle + AVX2 fused dequant + batch path (see DN-M31-1)
+  - Verify: `dotnet test --filter Category=Kernel` — synthetic-block scalar-vs-AVX2 and 1T-vs-4T bit-identity, `GemvBatch` equals solo `Gemv`. ✅ Kernel|Loader 77/77 Release.
+- [✓] Q6_K kernel — same pattern (see DN-M31-1)
+  - Verify: same Category=Kernel oracle pattern. ✅ included in the 77/77 batch; type id 14, block 210 B per llama.cpp.
+- [✓] Q5_K kernel — same pattern (see DN-M31-1)
+  - Verify: same Category=Kernel oracle pattern. ✅ included in the 77/77 batch; type id 13 per llama.cpp.
 - [_] End-to-end Q4_K_M serve — load `models/smollm-135m-instruct-q4_k_m.gguf` (real file on dev box), decode under the engine, serve it
   - Verify: automated — real-fixture test (skip-if-absent) asserts load, finite logits, thread-invariant argmax over an 8-token decode; manual — `lair serve` with the q4_k_m config, chat via API and the `/ui` Chat tab, Monitor tab shows the model live.
 
