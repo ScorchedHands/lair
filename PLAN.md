@@ -492,6 +492,34 @@ Many models at once, each with its own placement policy.
 - [_] Automated Fairness: cross-model ITL isolation
 - [_] Automated Embeddings: pooling parity vs reference fixtures
 
+### MVP5.1 [v0.5.1] - Tentative
+
+Published IQ3_XXS models load and serve on the CPU engine — dense coverage ahead of Flash-Next.
+
+#### Design Notes
+
+- **DN-M51-1** — Dense IQ3_XXS coverage is its own phase, gated ahead of MVP6: the owner's target quant for their own runs is IQ3_XXS, and MVP6's expert slabs (DN-M6-2) assume the same format. Loader acceptance + block geometry per llama.cpp (`block_iq3_xxs`; ggml type id and type_size verified against `ggml.h` at build time), scalar oracle + AVX2 paths, engine end-to-end serve of a real IQ3_XXS fixture.
+  - Rationale: the Q5_0/Q5_K/Q6_K batch (MVP3.1) proved the mirror-llama.cpp pattern; IQ3_XXS is 3-bit super-block packing — the kernel strategy (fused dequant-GEMV vs llama.cpp's dot-vec lookup tables) is a real design decision, not a mechanical mirror.
+  - Contract: `GgmlType`/`TensorShape` row stride + `CpuBackend` dequant/GEMV/GemvBatch paths, same shape as DN-M31-1.
+
+#### Implementation Items
+
+- [_] Loader acceptance + IQ3_XXS geometry — `GgmlType`/`QuantFormat`/`TensorShape` (see DN-M51-1)
+  - Verify: `dotnet test --filter Category=Loader` — synthetic IQ3_XXS tensor accepted with correct row stride.
+- [_] IQ3_XXS kernels — scalar oracle + AVX2 fused dequant + batch path per the refined strategy (see DN-M51-1)
+  - Verify: `dotnet test --filter Category=Kernel` — synthetic-block scalar-vs-AVX2 and 1T-vs-4T bit-identity, `GemvBatch` equals solo `Gemv`.
+- [_] End-to-end IQ3_XXS serve — real IQ3_XXS fixture loads, decodes, serves
+  - Verify: automated real-fixture decode sanity (skip-if-absent) + manual `lair serve` chat via API and `/ui`.
+
+#### Tests
+
+- [_] Automated Kernel: IQ3_XXS scalar-vs-AVX2 bit-identity + batch equivalence + real-fixture decode sanity
+- [_] Manual IQ3_XXS Serve: model served; chat via API + `/ui`; monitor live
+
+#### Open Items
+
+- [_] **IQ3_XXS kernel strategy** — fused dequant-GEMV (repo pattern) vs llama.cpp dot-vec lookup-table approach on AVX2; settle in `/plan-refine mvp5.1` before build.
+
 ### MVP6 [v0.6.0] - Refined
 
 Qwen3.8-Flash-Next runs: sparse MoE with residency management.
@@ -504,7 +532,7 @@ Qwen3.8-Flash-Next runs: sparse MoE with residency management.
 - **DN-M6-2** — Quant scope: IQ3_XXS primary (Strata's recommended consumer quant), Q4_K_M as the measured baseline; other formats added only as residency experiments.
   - Rationale: smaller quants shrink the expert hot set, but IQ3 dequant is shuffle-heavy on AVX2 — the gate decides whether the residency win survives the kernel cost.
   - Rejected: FP8 native containers (breaks the GGUF-first commitment); low-bit-only with no baseline (unmeasurable claims).
-  - Contract: `IWeightSource` format descriptors for IQ3_XXS/Q4_K_M expert slabs.
+  - Contract: `IWeightSource` format descriptors for IQ3_XXS/Q4_K_M expert slabs. Dense IQ3_XXS kernels land first in MVP5.1 and are reused by the gather path.
 - **DN-M6-3** — Expert-aware batching: the residency cost function is the batch's union active-expert set, not per-sequence expert sets.
   - Rationale: shared decode steps (MVP2) make expert reads amortized across sequences — this is the engine-level MoE win.
   - Rejected: per-sequence expert scheduling (re-reads shared experts per sequence).
@@ -639,3 +667,4 @@ Vision input on chat models.
 - **2026-11-03 — Q4_K_M family coverage pulled forward as MVP3.1 [v0.3.1].** Owner hit the gap directly with `models/smollm-135m-instruct-q4_k_m.gguf` (attn k/v are Q5_0, output is Q6_K); consuming published quants is a Scope commitment and "unsupported ggml type" on a user's own model is unusable. Backlog row removed; kernels mirror the established llama.cpp `ggml-quants.c` pattern (DN-M31-1).
 - **2026-11-03 — Repo layout conventions settled by owner.** SPA moves to ASP.NET convention: `src/Lair.Host/ClientApp/` with standard static-asset serving and root redirect (`/` -> `/ui`) replacing the root-level `web/`. The `Lair.Api` library + `Lair.Host` executable split stays (testable surface vs CLI composition root). Solution file and Directory.Build.props stay at repo root.
 - **2026-11-03 — Project renames: `Lair.Api` → `Lair.Http`, `Lair.Core` → `Lair.Contracts`.** Owner-driven role naming: "Api" reads as a console app serving the API, but the project is the HTTP serving layer; "Core" held contracts only. `Lair.Http` names the serving adapter (endpoints, SSE streaming, request lifecycle, model router); `Lair.Contracts` names the contracts-only leaf (`IBackend`, `IWeightSource`, quant formats, tensor shapes). Mechanical rename of project dirs, csproj files, namespaces, and solution entries.
+- **2026-11-03 — MVP5.1 [v0.5.1] inserted ahead of Flash-Next: dense IQ3_XXS coverage.** Owner's target quant for their own runs is IQ3_XXS; dense loader + kernels must land before MVP6 MoE work, whose expert slabs assume the same format (DN-M6-2). Tentative: the kernel strategy (fused dequant-GEMV vs llama.cpp dot-vec tables) is an Open Item for `/plan-refine`, not a mechanical K-quant mirror.
