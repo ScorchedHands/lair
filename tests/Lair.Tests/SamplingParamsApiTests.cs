@@ -1,7 +1,7 @@
 using System.Net;
 using System.Text;
 using System.Text.Json;
-using Lair.Api;
+using Lair.Http;
 
 namespace Lair.Tests;
 

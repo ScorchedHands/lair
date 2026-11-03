@@ -1,5 +1,5 @@
 using System.Net;
-using Lair.Api;
+using Lair.Http;
 using Lair.Host.Config;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.Hosting;
@@ -73,6 +73,9 @@ public class WebUiTests : IClassFixture<WebUiFixture>
 {
     private static readonly HttpClient Http = new();
 
+    // Redirects must be asserted as responses, not followed transparently.
+    private static readonly HttpClient NoRedirectHttp = new(new SocketsHttpHandler { AllowAutoRedirect = false });
+
     private const string ShellMarker = "data-lair-shell=\"tabbed-shell/rev-b\"";
 
     private static readonly string[] AssetAttributes = ["src", "href"];
@@ -109,6 +112,23 @@ public class WebUiTests : IClassFixture<WebUiFixture>
         // SPA fallback: an unmatched client route under /ui serves the shell instead of a 404.
         (HttpResponseMessage fallback, string fallbackHtml) = await GetHtmlAsync("/ui/monitor/models");
         Assert.Contains(ShellMarker, fallbackHtml);
+    }
+
+    [Fact]
+    public async Task Root_RedirectsPermanentlyToUi()
+    {
+        if (!WebUiFixture.EmbeddedUiExists())
+        {
+            return; // SkipWebUi build: no UI to redirect to.
+        }
+
+        using HttpResponseMessage redirect = await NoRedirectHttp.GetAsync(_fixture.BaseUrl + "/");
+        Assert.Equal(HttpStatusCode.MovedPermanently, redirect.StatusCode);
+        Assert.Equal("/ui/", redirect.Headers.Location?.ToString());
+
+        // The redirect target really serves the shell.
+        (HttpResponseMessage landing, string landingHtml) = await GetHtmlAsync("/ui/");
+        Assert.Contains(ShellMarker, landingHtml);
     }
 
     private async Task<(HttpResponseMessage Response, string Html)> GetHtmlAsync(string path)

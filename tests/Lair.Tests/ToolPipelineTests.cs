@@ -1,4 +1,4 @@
-using Lair.Api;
+using Lair.Http;
 
 namespace Lair.Tests;
 

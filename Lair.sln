@@ -5,7 +5,7 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{827E0CD3-B72D-47B6-A68D-7590B98EB39B}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Lair.Core", "src\Lair.Core\Lair.Core.csproj", "{CF0D0127-DBDB-4533-9654-9FB18D1992F8}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Lair.Contracts", "src\Lair.Contracts\Lair.Contracts.csproj", "{CF0D0127-DBDB-4533-9654-9FB18D1992F8}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Lair.Loader", "src\Lair.Loader\Lair.Loader.csproj", "{F2C18F2D-8099-40C0-A695-C637D4E38A25}"
 EndProject
@@ -19,7 +19,7 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Lair.Sampling", "src\Lair.S
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Lair.Models", "src\Lair.Models\Lair.Models.csproj", "{926D1BF5-E0B5-4230-883B-C84F8C2B3DF8}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Lair.Api", "src\Lair.Api\Lair.Api.csproj", "{3E01AEE2-D185-4D8E-BEF9-9AE03A714042}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Lair.Http", "src\Lair.Http\Lair.Http.csproj", "{3E01AEE2-D185-4D8E-BEF9-9AE03A714042}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Lair.Host", "src\Lair.Host\Lair.Host.csproj", "{1ADFB4A1-76B8-4A23-B46A-DCFAA4BF5CF9}"
 EndProject

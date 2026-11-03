@@ -1,4 +1,4 @@
-using Lair.Core.Contracts;
+using Lair.Contracts;
 
 namespace Lair.Loader;
 
@@ -22,6 +22,9 @@ namespace Lair.Loader;
 ///   Q8_0: blck_size 32,  type_size 34  (QK8_0 = 32; block_q8_0 = half d + int8 qs[32])
 ///   Q4_K: blck_size 256, type_size 144 (QK_K = 256, K_SCALE_SIZE = 12;
 ///         block_q4_K = 2*half dm + 12 scale bytes + 128 nibble bytes)
+///   Q5_0: blck_size 32,  type_size 22  (QK5_0 = 32; block_q5_0 = half d + uint8 qh[4] + 16 nibble bytes)
+///   Q5_K: blck_size 256, type_size 176 (block_q5_K = 2*half dm + 12 scale bytes + uint8 qh[32] + 128 nibble bytes)
+///   Q6_K: blck_size 256, type_size 210 (block_q6_K = uint8 ql[128] + uint8 qh[64] + int8 scales[16] + half d)
 /// ggml_row_size(type, ne) = type_size * ne / blck_size.
 /// </summary>
 internal static class GgmlType
@@ -31,6 +34,8 @@ internal static class GgmlType
     public const uint Q5_0 = 6;
     public const uint Q8_0 = 8;
     public const uint Q4_K = 12;
+    public const uint Q5_K = 13;
+    public const uint Q6_K = 14;
 
     public static bool TryGetSupported(uint id, out QuantFormat format, out int blockElements, out int blockBytes)
     {
@@ -46,6 +51,11 @@ internal static class GgmlType
                 blockElements = 1;
                 blockBytes = 2;
                 return true;
+            case Q5_0:
+                format = QuantFormat.Q5_0;
+                blockElements = 32;
+                blockBytes = 22;
+                return true;
             case Q8_0:
                 format = QuantFormat.Q8_0;
                 blockElements = 32;
@@ -55,6 +65,16 @@ internal static class GgmlType
                 format = QuantFormat.Q4_K;
                 blockElements = 256;
                 blockBytes = 144;
+                return true;
+            case Q5_K:
+                format = QuantFormat.Q5_K;
+                blockElements = 256;
+                blockBytes = 176;
+                return true;
+            case Q6_K:
+                format = QuantFormat.Q6_K;
+                blockElements = 256;
+                blockBytes = 210;
                 return true;
             default:
                 format = default;

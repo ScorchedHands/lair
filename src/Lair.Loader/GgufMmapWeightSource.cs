@@ -1,6 +1,6 @@
 using System.IO.MemoryMappedFiles;
 
-using Lair.Core.Contracts;
+using Lair.Contracts;
 
 namespace Lair.Loader;
 

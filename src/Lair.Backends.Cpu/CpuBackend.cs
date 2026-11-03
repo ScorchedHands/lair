@@ -1,17 +1,17 @@
-using System.Buffers;
+﻿using System.Buffers;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
-using Lair.Core.Contracts;
+using Lair.Contracts;
 
 namespace Lair.Backends.Cpu;
 
 /// <summary>
-/// CPU compute backend: aligned arena management plus dense kernels. GEMV fuses dequantization for F16/Q8_0/Q4_K
-/// in a single pass over the packed bytes, taking an AVX2 fast path when the runtime supports it and scalar
-/// reference paths otherwise. Rows are partitioned into blocks executed by a persistent worker pool; each row is
-/// computed independently so results are bit-identical regardless of thread count.
+/// CPU compute backend: aligned arena management plus dense kernels. GEMV fuses dequantization for F16/Q8_0/Q4_K/
+/// Q5_0/Q5_K/Q6_K in a single pass over the packed bytes, taking an AVX2 fast path when the runtime supports it and
+/// scalar reference paths otherwise. Rows are partitioned into blocks executed by a persistent worker pool; each
+/// row is computed independently so results are bit-identical regardless of thread count.
 /// </summary>
 public sealed unsafe class CpuBackend : IBackend
 {
@@ -25,6 +25,24 @@ public sealed unsafe class CpuBackend : IBackend
     private const int QkK = 256;
 
     private const int Q4KBlockBytes = 144;
+
+    // Q5_0 blocks hold 32 five-bit quants in 22 bytes: half-float d at byte 0, four little-endian bytes of 5th
+    // quant bits at bytes 2..5 (element i takes bit i of the 32-bit qh word), and 16 nibble bytes at bytes 6..21:
+    // element i < 16 is the low nibble of qs[i/2], element i >= 16 the high nibble of qs[(i-16)/2].
+    // w = (q - 16) * d with q in [0, 31].
+    private const int Q5_0BlockBytes = 22;
+
+    // Q5_K super-blocks hold 256 elements in 176 bytes: the Q4_K scale layout at bytes 0..15 (half d, half dmin,
+    // 12 packed 6-bit group scales/mins, see QkK), 32 bytes of 5th quant bits at bytes 16..47 (group j reads bit
+    // j of the window byte), and 128 nibble bytes at bytes 48..175 in the same group-pair windows as Q4_K.
+    // w = d * sc_j * q - dmin * m_j with q in [0, 31].
+    private const int Q5KBlockBytes = 176;
+
+    // Q6_K super-blocks hold 256 elements in 210 bytes: 128 low-nibble bytes at 0..127, 64 bytes carrying the
+    // high 2 bits of six-bit quants at 128..191, 16 signed int8 group scales at 192..207, and half-float d at
+    // bytes 208..209. Sixteen 16-element groups: group g covers elements [16g, 16g+16) with scale scales[g];
+    // w = d * sc_g * (q - 32) with q in [0, 63].
+    private const int Q6KBlockBytes = 210;
 
     // Output rows per scheduling unit for threaded GEMV.
     private const int RowBlock = 64;
@@ -408,6 +426,104 @@ public sealed unsafe class CpuBackend : IBackend
                     }
 
                     break;
+                case QuantFormat.Q5_0:
+                    if (_useAvx2)
+                    {
+                        DequantQ5_0Avx2(rowPtr, pOut, cols);
+                    }
+                    else
+                    {
+                        for (int baseIdx = 0; baseIdx < cols; baseIdx += Qk8)
+                        {
+                            byte* block = rowPtr + (long)(baseIdx / Qk8) * Q5_0BlockBytes;
+                            float d = ReadHalfLE(block);
+                            uint qh = ReadQhLE(block);
+
+                            int limit = Math.Min(Qk8, cols - baseIdx); // padded quants are zero: stop at the real column count.
+                            for (int l = 0; l < limit; l++)
+                            {
+                                int five = ((block[6 + (l & 15)] >> (4 * (l >> 4))) & 0xF) | ((int)(qh >> l) & 1) << 4;
+                                pOut[baseIdx + l] = (five - 16) * d;
+                            }
+                        }
+                    }
+
+                    break;
+                case QuantFormat.Q5_K:
+                    if (_useAvx2)
+                    {
+                        DequantQ5KAvx2(rowPtr, pOut, cols);
+                    }
+                    else
+                    {
+                        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+                        {
+                            byte* block = rowPtr + (long)(baseIdx / QkK) * Q5KBlockBytes;
+                            float d = ReadHalfLE(block);
+                            float min = ReadHalfLE(block + 2);
+
+                            for (int j = 0; j < 8; j++)
+                            {
+                                int subStart = baseIdx + j * 32;
+                                if (subStart >= cols)
+                                {
+                                    break; // zero-padded tail block: no elements left to consume.
+                                }
+
+                                GetScaleMinK4(j, block + 4, out byte sc, out byte m);
+                                float scale = d * sc;
+                                float shift = min * m;
+
+                                byte* q = block + 48 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
+                                byte* qh = block + 16 + 32 * (j / 2); // 5th bits for the same window bytes, bit j per byte
+                                int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
+                                for (int l = 0; l < limit; l++)
+                                {
+                                    int five = ((q[l] >> (4 * (j & 1))) & 0xF) | (((qh[l] >> j) & 1) << 4);
+                                    pOut[subStart + l] = five * scale - shift;
+                                }
+                            }
+                        }
+                    }
+
+                    break;
+                case QuantFormat.Q6_K:
+                    if (_useAvx2)
+                    {
+                        DequantQ6KAvx2(rowPtr, pOut, cols);
+                    }
+                    else
+                    {
+                        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+                        {
+                            byte* block = rowPtr + (long)(baseIdx / QkK) * Q6KBlockBytes;
+                            float d = ReadHalfLE(block + 208);
+
+                            for (int g = 0; g < 16; g++)
+                            {
+                                int subStart = baseIdx + g * 16;
+                                if (subStart >= cols)
+                                {
+                                    break; // zero-padded tail block: no elements left to consume.
+                                }
+
+                                int h = g >> 3; // 128-element half of the super-block
+                                int k = g & 7; // 16-element group inside the half
+                                int quarter = k >> 1; // 0..3: which 32-element quarter of the half the group starts in
+                                byte* q = block + 64 * h + 16 * (k & 3); // ql window: bytes [q, q+16) always inside the block
+                                byte* qh = block + 128 + 32 * h + 16 * (k & 1); // 2-bit fields for the same elements, shift 2*quarter
+                                float scale = d * (sbyte)block[192 + g];
+                                int limit = Math.Min(16, cols - subStart); // padded quants are zero: stop at the real column count.
+                                for (int e = 0; e < limit; e++)
+                                {
+                                    int six = ((q[e] >> (4 * (quarter >> 1))) & 0xF) | (((qh[e] >> (2 * quarter)) & 3) << 4);
+                                    pOut[subStart + e] = (six - 32) * scale;
+                                }
+                            }
+                        }
+                    }
+
+                    break;
                 default:
                     throw new ArgumentOutOfRangeException(nameof(w), w.Format, "Unknown quant format.");
             }
@@ -521,6 +637,9 @@ public sealed unsafe class CpuBackend : IBackend
             QuantFormat.F16 => avx2 ? RowDotF16Avx2(row, x, cols) : RowDotF16Scalar(row, x, cols),
             QuantFormat.Q8_0 => avx2 ? RowDotQ8Avx2(row, x, cols) : RowDotQ8Scalar(row, x, cols),
             QuantFormat.Q4_K => avx2 ? RowDotQ4KAvx2(row, x, cols) : RowDotQ4KScalar(row, x, cols),
+            QuantFormat.Q5_0 => avx2 ? RowDotQ5_0Avx2(row, x, cols) : RowDotQ5_0Scalar(row, x, cols),
+            QuantFormat.Q5_K => avx2 ? RowDotQ5KAvx2(row, x, cols) : RowDotQ5KScalar(row, x, cols),
+            QuantFormat.Q6_K => avx2 ? RowDotQ6KAvx2(row, x, cols) : RowDotQ6KScalar(row, x, cols),
             _ => throw new ArgumentOutOfRangeException(nameof(format), format, "Unknown quant format."),
         };
     }
@@ -672,6 +791,48 @@ public sealed unsafe class CpuBackend : IBackend
                     for (int b = 0; b < count; b++)
                     {
                         outBase[b * rows] = RowDotQ4KScalar(rowBytes, inputs + (long)b * cols, cols);
+                    }
+                }
+
+                break;
+            case QuantFormat.Q5_0:
+                if (avx2)
+                {
+                    BatchQ5_0Avx2(rowBytes, inputs, count, rows, cols, outBase);
+                }
+                else
+                {
+                    for (int b = 0; b < count; b++)
+                    {
+                        outBase[b * rows] = RowDotQ5_0Scalar(rowBytes, inputs + (long)b * cols, cols);
+                    }
+                }
+
+                break;
+            case QuantFormat.Q5_K:
+                if (avx2)
+                {
+                    BatchQ5KAvx2(rowBytes, inputs, count, rows, cols, outBase);
+                }
+                else
+                {
+                    for (int b = 0; b < count; b++)
+                    {
+                        outBase[b * rows] = RowDotQ5KScalar(rowBytes, inputs + (long)b * cols, cols);
+                    }
+                }
+
+                break;
+            case QuantFormat.Q6_K:
+                if (avx2)
+                {
+                    BatchQ6KAvx2(rowBytes, inputs, count, rows, cols, outBase);
+                }
+                else
+                {
+                    for (int b = 0; b < count; b++)
+                    {
+                        outBase[b * rows] = RowDotQ6KScalar(rowBytes, inputs + (long)b * cols, cols);
                     }
                 }
 
@@ -869,6 +1030,173 @@ public sealed unsafe class CpuBackend : IBackend
         }
     }
 
+    // Batched Q5_0 row: one 5-bit unpack per eight-element chunk feeds all accumulator chains with the same
+    // fused (x * q) * d association as RowDotQ5_0Avx2, so the packed bytes are streamed once for the whole batch.
+    private static void BatchQ5_0Avx2(byte* row, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> acc = stackalloc float[MaxBatch * 8];
+        Span<float> tail = stackalloc float[MaxBatch];
+        BatchInit(acc, tail, count);
+
+        fixed (float* pAcc = acc)
+        {
+            for (int baseIdx = 0; baseIdx < cols; baseIdx += Qk8)
+            {
+                byte* block = row + (long)(baseIdx / Qk8) * Q5_0BlockBytes;
+                float dHalf = ReadHalfLE(block);
+                uint qh = ReadQhLE(block);
+
+                int limit = Math.Min(Qk8, cols - baseIdx); // padded quants are zero: stop at the real column count.
+                for (int c = 0; c + 8 <= limit; c += 8)
+                {
+                    Vector256<float> qf = Avx.ConvertToVector256Single(LoadQ5_0Chunk(block, qh, c)); // dequantization unpack, materialized once per chunk
+                    float dLocal = dHalf;
+                    Vector256<float> dv = Avx.BroadcastScalarToVector256(&dLocal);
+                    for (int b = 0; b < count; b++)
+                    {
+                        float* chain = pAcc + b * 8;
+                        Avx.Store(chain, Fma.MultiplyAdd(Avx.Multiply(Avx.LoadVector256(inputs + (long)b * cols + baseIdx + c), qf), dv, Avx.LoadVector256(chain)));
+                    }
+                }
+
+                for (int l = (limit / 8) * 8; l < limit; l++)
+                {
+                    int five = ((block[6 + (l & 15)] >> (4 * (l >> 4))) & 0xF) | ((int)(qh >> l) & 1) << 4;
+                    float w = (five - 16) * dHalf; // partial final block: at most seven elements per row
+                    for (int b = 0; b < count; b++)
+                    {
+                        tail[b] += w * inputs[(long)b * cols + baseIdx + l];
+                    }
+                }
+            }
+
+            BatchFinish(pAcc, tail, count, rows, outBase);
+        }
+    }
+
+    // Batched Q5_K row: one nibble-plus-5th-bit unpack and fused scale/shift per chunk feeds all accumulator
+    // chains with the same FMA shape as RowDotQ5KAvx2, so the packed bytes are streamed once for the whole batch.
+    private static void BatchQ5KAvx2(byte* row, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> acc = stackalloc float[MaxBatch * 8];
+        Span<float> tail = stackalloc float[MaxBatch];
+        BatchInit(acc, tail, count);
+
+        fixed (float* pAcc = acc)
+        {
+            for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+            {
+                byte* block = row + (long)(baseIdx / QkK) * Q5KBlockBytes;
+                byte* blockEnd = block + Q5KBlockBytes;
+                float dHalf = ReadHalfLE(block);
+                float minHalf = ReadHalfLE(block + 2);
+
+                for (int j = 0; j < 8; j++)
+                {
+                    int subStart = baseIdx + j * 32;
+                    if (subStart >= cols)
+                    {
+                        break; // zero-padded tail block: no elements left to consume.
+                    }
+
+                    GetScaleMinK4(j, block + 4, out byte sc, out byte m);
+                    float scale = dHalf * sc;
+                    Vector256<float> scaleV = Avx.BroadcastScalarToVector256(&scale);
+                    float negShift = -(minHalf * m);
+                    Vector256<float> shiftV = Avx.BroadcastScalarToVector256(&negShift);
+
+                    byte* q = block + 48 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
+                    byte* qh = block + 16 + 32 * (j / 2); // 5th bits for the same window bytes, bit j per byte
+                    int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
+
+                    for (int c = 0; c + 8 <= limit; c += 8)
+                    {
+                        Vector256<int> five = LoadQ5KChunk(q, qh, blockEnd, j, c); // dequantization unpack, materialized once per chunk
+                        Vector256<float> wchunk = Fma.MultiplyAdd(scaleV, Avx.ConvertToVector256Single(five), shiftV);
+                        for (int b = 0; b < count; b++)
+                        {
+                            float* chain = pAcc + b * 8;
+                            Avx.Store(chain, Fma.MultiplyAdd(Avx.LoadVector256(inputs + (long)b * cols + subStart + c), wchunk, Avx.LoadVector256(chain)));
+                        }
+                    }
+
+                    for (int l = (limit / 8) * 8; l < limit; l++)
+                    {
+                        // Partial final chunk of the group: scalar cleanup, at most seven elements per group.
+                        int five = ((q[l] >> (4 * (j & 1))) & 0xF) | (((qh[l] >> j) & 1) << 4);
+                        float value = five * scale - minHalf * m;
+                        for (int b = 0; b < count; b++)
+                        {
+                            tail[b] += value * inputs[(long)b * cols + subStart + l];
+                        }
+                    }
+                }
+            }
+
+            BatchFinish(pAcc, tail, count, rows, outBase);
+        }
+    }
+
+    // Batched Q6_K row: one 6-bit unpack and fused scale per chunk feeds all accumulator chains with the same
+    // FMA shape as RowDotQ6KAvx2, so the packed bytes are streamed once for the whole batch.
+    private static void BatchQ6KAvx2(byte* row, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> acc = stackalloc float[MaxBatch * 8];
+        Span<float> tail = stackalloc float[MaxBatch];
+        BatchInit(acc, tail, count);
+
+        fixed (float* pAcc = acc)
+        {
+            for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+            {
+                byte* block = row + (long)(baseIdx / QkK) * Q6KBlockBytes;
+                float dHalf = ReadHalfLE(block + 208);
+
+                for (int g = 0; g < 16; g++)
+                {
+                    int subStart = baseIdx + g * 16;
+                    if (subStart >= cols)
+                    {
+                        break; // zero-padded tail block: no elements left to consume.
+                    }
+
+                    int h = g >> 3; // 128-element half of the super-block
+                    int k = g & 7; // 16-element group inside the half
+                    int quarter = k >> 1; // 0..3: which 32-element quarter of the half the group starts in
+                    byte* q = block + 64 * h + 16 * (k & 3); // ql window: bytes [q, q+16) always inside the block
+                    byte* qh = block + 128 + 32 * h + 16 * (k & 1); // 2-bit fields for the same elements, shift 2*quarter
+                    float scale = dHalf * (sbyte)block[192 + g];
+                    Vector256<float> scaleV = Avx.BroadcastScalarToVector256(&scale);
+                    int limit = Math.Min(16, cols - subStart); // padded quants are zero: stop at the real column count.
+
+                    for (int c = 0; c + 8 <= limit; c += 8)
+                    {
+                        Vector256<int> six = LoadQ6KChunk(q, qh, quarter, c); // dequantization unpack, materialized once per chunk
+                        Vector256<float> wchunk = Avx.Multiply(scaleV, Avx.ConvertToVector256Single(six)); // fused scale stays in the dot FMA chain
+                        for (int b = 0; b < count; b++)
+                        {
+                            float* chain = pAcc + b * 8;
+                            Avx.Store(chain, Fma.MultiplyAdd(Avx.LoadVector256(inputs + (long)b * cols + subStart + c), wchunk, Avx.LoadVector256(chain)));
+                        }
+                    }
+
+                    for (int e = (limit / 8) * 8; e < limit; e++)
+                    {
+                        // Partial final chunk of the group: scalar cleanup, at most seven elements per group.
+                        int six = ((q[e] >> (4 * (quarter >> 1))) & 0xF) | (((qh[e] >> (2 * quarter)) & 3) << 4);
+                        float w = (six - 32) * scale;
+                        for (int b = 0; b < count; b++)
+                        {
+                            tail[b] += w * inputs[(long)b * cols + subStart + e];
+                        }
+                    }
+                }
+            }
+
+            BatchFinish(pAcc, tail, count, rows, outBase);
+        }
+    }
+
     // Batch scratch plumbing: zero the per-chain lanes and tails for one row. stackalloc scratch is reused for
     // every row and call; nothing here allocates.
     private static void BatchInit(Span<float> acc, Span<float> tail, int count)
@@ -890,6 +1218,107 @@ public sealed unsafe class CpuBackend : IBackend
 
     // Little-endian half-float load from raw memory.
     private static float ReadHalfLE(byte* p) => (float)BitConverter.Int16BitsToHalf((short)(*p | (p[1] << 8)));
+
+    // Little-endian 32-bit load of the Q5_0 5th-bit field at block bytes 2..5.
+    private static uint ReadQhLE(byte* block) => (uint)(block[2] | (block[3] << 8) | (block[4] << 16) | (block[5] << 24));
+
+    // Q5_0 chunk loader for eight elements starting at c in {0, 8, 16, 24}: element j < 16 is the low nibble of
+    // qs[j] and element 16+j the high nibble of the same byte, each OR-ed with bit i of the qh dword. The window
+    // always loads the full 16-byte qs region (the only 16-byte read that stays inside the 22-byte block) and
+    // slides the high half down for c in {8, 24}.
+    private static Vector256<int> LoadQ5_0Chunk(byte* block, uint qh, int c)
+    {
+        byte* qs = block + 6;
+        Vector128<byte> window = Sse2.LoadVector128(qs); // full nibble region, always inside the block
+        if ((c & 8) != 0)
+        {
+            window = Ssse3.Shuffle(window, GetSlideHighBytesShuffle()); // qs bytes 8..15 land in lanes 0..7 for c in {8, 24}
+        }
+
+        if (c >= 16)
+        {
+            // High nibbles per byte lane: srli_epi16 then a 0x0F byte mask (the classic SSE2 pattern).
+            window = Sse2.ShiftRightLogical(window.AsUInt16(), 4).AsByte();
+        }
+
+        Vector128<byte> masked = Sse2.And(window, GetNibbleMask());
+
+        Vector128<int> lo = Sse41.ConvertToVector128Int32(masked); // bytes 0..3 -> dword lanes (pmovzxbd)
+        Vector128<int> hi = Sse41.ConvertToVector128Int32(Ssse3.Shuffle(masked, GetUpperBytesShuffle())); // bytes 4..7 -> dword lanes
+
+        byte qhByte = (byte)(c >> 3); // all eight 5th bits of this chunk live in one qh field byte
+        Vector128<byte> replicated = Ssse3.Shuffle(Sse2.LoadVector128(block + 2), Vector128.Create(qhByte));
+        Vector128<int> qhDwords = Sse41.ConvertToVector128Int32(replicated); // four dword lanes, each the qh field byte value
+        Vector256<int> highBit = Avx2.And(
+            Avx2.CompareGreaterThan(Avx2.And(Vector256.Create(qhDwords, qhDwords), GetQ5_0BitMasks()), Vector256<int>.Zero),
+            Vector256.Create(16));
+
+        return Avx2.Subtract(Avx2.Or(Vector256.Create(lo, hi), highBit), Vector256.Create(16)); // signed 5-bit values in element order
+    }
+
+    // Q5_K chunk loader for eight window bytes at offset c: low nibbles for even groups, high nibbles for odd,
+    // each OR-ed with bit j of the matching 5th-bit byte. Window loads are clamped so they never pass the end
+    // of the block, exactly like LoadGroupBytes.
+    private static Vector256<int> LoadQ5KChunk(byte* q, byte* qh, byte* blockEnd, int j, int c)
+    {
+        Vector128<byte> window = LoadGroupBytes(q, blockEnd, c);
+
+        if ((j & 1) != 0)
+        {
+            // High nibbles per byte lane: srli_epi16 then a 0x0F byte mask (the classic SSE2 pattern).
+            window = Sse2.ShiftRightLogical(window.AsUInt16(), 4).AsByte();
+        }
+
+        Vector128<byte> masked = Sse2.And(window, GetNibbleMask());
+
+        Vector128<int> lo = Sse41.ConvertToVector128Int32(masked); // bytes 0..3 -> dword lanes (pmovzxbd)
+        Vector128<int> hi = Sse41.ConvertToVector128Int32(Ssse3.Shuffle(masked, GetUpperBytesShuffle())); // bytes 4..7 -> dword lanes
+
+        // Widen the eight 5th-bit bytes to dwords and test bit j of each with a constant broadcast mask.
+        Vector128<byte> qhWindow = Sse2.LoadVector128(qh + c); // reads [qh+c, qh+c+16), clamped reads stay inside the block
+        Vector128<int> qhLo = Sse41.ConvertToVector128Int32(qhWindow); // bytes 0..3 -> dword lanes (pmovzxbd)
+        Vector128<int> qhHi = Sse41.ConvertToVector128Int32(Ssse3.Shuffle(qhWindow, GetUpperBytesShuffle())); // bytes 4..7 -> dword lanes
+        Vector256<int> highBit = Avx2.And(
+            Avx2.CompareGreaterThan(Avx2.And(Vector256.Create(qhLo, qhHi), Vector256.Create(1 << j)), Vector256<int>.Zero),
+            Vector256.Create(16));
+
+        return Avx2.Or(Vector256.Create(lo, hi), highBit); // unsigned 5-bit values in element order
+    }
+
+    // Q6_K chunk loader for eight window bytes at offset c in {0, 8}: low nibbles for quarters 0..1, high
+    // nibbles for quarters 2..3, each OR-ed with the 2-bit field at bit shift 2*quarter of the matching qh
+    // byte. The conversion widens with sign, so the values land pre-centered at [-32, 31].
+    private static Vector256<int> LoadQ6KChunk(byte* q, byte* qh, int quarter, int c)
+    {
+        Vector128<byte> window = Sse2.LoadVector128(q + c); // reads [q+c, q+c+16), always inside the 128-byte ql region
+
+        if ((quarter >> 1) != 0)
+        {
+            // High nibbles per byte lane: srli_epi16 then a 0x0F byte mask (the classic SSE2 pattern).
+            window = Sse2.ShiftRightLogical(window.AsUInt16(), 4).AsByte();
+        }
+
+        Vector128<byte> masked = Sse2.And(window, GetNibbleMask());
+
+        Vector128<int> lo = Sse41.ConvertToVector128Int32(masked); // bytes 0..3 -> dword lanes (pmovzxbd)
+        Vector128<int> hi = Sse41.ConvertToVector128Int32(Ssse3.Shuffle(masked, GetUpperBytesShuffle())); // bytes 4..7 -> dword lanes
+
+        // Widen the eight high-bit bytes to dwords and extract the 2-bit field at bit shift 2*quarter with
+        // constant immediates (the quarter loop variable selects the arm at compile time per unrolled group).
+        Vector128<byte> qhWindow = Sse2.LoadVector128(qh + c); // reads [qh+c, qh+c+16), clamped reads stay inside the block
+        Vector128<int> qhLo = Sse41.ConvertToVector128Int32(qhWindow); // bytes 0..3 -> dword lanes (pmovzxbd)
+        Vector128<int> qhHi = Sse41.ConvertToVector128Int32(Ssse3.Shuffle(qhWindow, GetUpperBytesShuffle())); // bytes 4..7 -> dword lanes
+        Vector256<int> qhDwords = Vector256.Create(qhLo, qhHi);
+        Vector256<int> highBit = Avx2.ShiftLeftLogical(quarter switch
+        {
+            0 => Avx2.And(qhDwords, Vector256.Create(3)),
+            1 => Avx2.And(Avx2.ShiftRightLogical(qhDwords, 2), Vector256.Create(3)),
+            2 => Avx2.And(Avx2.ShiftRightLogical(qhDwords, 4), Vector256.Create(3)),
+            _ => Avx2.And(Avx2.ShiftRightLogical(qhDwords, 6), Vector256.Create(3)),
+        }, 4);
+
+        return Avx2.Subtract(Avx2.Or(Vector256.Create(lo, hi), highBit), Vector256.Create(32));
+    }
 
     // Unpack the 6-bit scale/min pair for Q4_K group j (groups 4-7 split their high bits across bytes).
     private static void GetScaleMinK4(int j, byte* scales, out byte sc, out byte m)
@@ -1109,6 +1538,257 @@ public sealed unsafe class CpuBackend : IBackend
         return HSum(acc) + tail;
     }
 
+    // Q5_0: each 22-byte block covers 32 five-bit quants: half-float d at byte 0, the little-endian 32-bit qh
+    // word at bytes 2..5, and 16 nibble bytes at bytes 6..21. Element j < 16 is the low nibble of qs[j] and
+    // element 16+j the high nibble of the same byte; bit i of qh supplies the 5th bit. w = (q - 16) * d.
+    private static float RowDotQ5_0Scalar(byte* row, float* x, int cols)
+    {
+        float acc = 0f;
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += Qk8)
+        {
+            byte* block = row + (long)(baseIdx / Qk8) * Q5_0BlockBytes;
+            float d = ReadHalfLE(block);
+            uint qh = ReadQhLE(block);
+
+            int limit = Math.Min(Qk8, cols - baseIdx); // padded quants are zero: stop at the real column count.
+            for (int l = 0; l < limit; l++)
+            {
+                int five = ((block[6 + (l & 15)] >> (4 * (l >> 4))) & 0xF) | ((int)(qh >> l) & 1) << 4;
+                acc += x[baseIdx + l] * ((five - 16) * d);
+            }
+        }
+
+        return acc;
+    }
+
+    // AVX2: broadcast the block scale once and unpack eight five-bit quants per step from the 16-byte nibble
+    // window (low nibbles for elements 0..15, high nibbles for 16..31, each OR-ed with its 5th bit from the
+    // qh dword), then the same fused (x * q) * d FMA chain as RowDotQ8Avx2. Window loads stay inside the block.
+    // The padded tail of a partial final block falls to scalar accumulation.
+    private static float RowDotQ5_0Avx2(byte* row, float* x, int cols)
+    {
+        Vector256<float> acc = Vector256<float>.Zero;
+        float tail = 0f;
+
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += Qk8)
+        {
+            byte* block = row + (long)(baseIdx / Qk8) * Q5_0BlockBytes;
+            float dHalf = ReadHalfLE(block);
+            uint qh = ReadQhLE(block);
+
+            int limit = Math.Min(Qk8, cols - baseIdx); // padded quants are zero: stop at the real column count.
+            for (int l = 0; l < limit; l += 8)
+            {
+                if (l + 8 > limit)
+                {
+                    break;
+                }
+
+                Vector256<int> five = LoadQ5_0Chunk(block, qh, l);
+                Vector256<float> qf = Avx.ConvertToVector256Single(five); // signed 5-bit values in element order
+                Vector256<float> xv = Avx.LoadVector256(x + baseIdx + l); // safe: these columns are real and block-covered
+
+                float dLocal = dHalf;
+                acc = Fma.MultiplyAdd(Avx.Multiply(xv, qf), Avx.BroadcastScalarToVector256(&dLocal), acc);
+            }
+
+            for (int k = (limit / 8) * 8; k < limit; k++)
+            {
+                int five = ((block[6 + (k & 15)] >> (4 * (k >> 4))) & 0xF) | ((int)(qh >> k) & 1) << 4;
+                tail += x[baseIdx + k] * ((five - 16) * dHalf); // partial final block: at most seven elements per row
+            }
+        }
+
+        return HSum(acc) + tail;
+    }
+
+    // Q5_K: each 176-byte block covers 256 elements in eight 32-element groups j (0..7) with the Q4_K scale
+    // layout at bytes 0..15. Group j uses the low nibbles of qs[32*(j/2) .. +31] (qs at byte 48) when j is even
+    // and the high nibbles when odd; bit j of qh[32*(j/2) + l] (qh at byte 16) supplies the 5th bit.
+    // w = d * sc_j * q - dmin * m_j with q in [0, 31].
+    private static float RowDotQ5KScalar(byte* row, float* x, int cols)
+    {
+        float acc = 0f;
+
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+        {
+            byte* block = row + (long)(baseIdx / QkK) * Q5KBlockBytes;
+            float d = ReadHalfLE(block);
+            float min = ReadHalfLE(block + 2);
+
+            for (int j = 0; j < 8; j++)
+            {
+                int subStart = baseIdx + j * 32;
+                if (subStart >= cols)
+                {
+                    break; // zero-padded tail block: no elements left to consume.
+                }
+
+                GetScaleMinK4(j, block + 4, out byte sc, out byte m);
+                float scale = d * sc;
+                float shift = min * m;
+
+                byte* q = block + 48 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
+                byte* qh = block + 16 + 32 * (j / 2); // 5th bits for the same window bytes, bit j per byte
+                int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
+                for (int l = 0; l < limit; l++)
+                {
+                    int five = ((q[l] >> (4 * (j & 1))) & 0xF) | (((qh[l] >> j) & 1) << 4);
+                    acc += x[subStart + l] * (five * scale - shift);
+                }
+            }
+        }
+
+        return acc;
+    }
+
+    // AVX2: per group broadcast the fused scale and negated min-shift, unpack eight 5-bit quants at a time from
+    // the nibble window (same clamped window loads as Q4_K) plus the 5th-bit byte, then two FMAs for the
+    // four+four dword lanes. Partial chunks fall to scalar accumulation.
+    private static float RowDotQ5KAvx2(byte* row, float* x, int cols)
+    {
+        Vector256<float> acc = Vector256<float>.Zero;
+        float tail = 0f;
+
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+        {
+            byte* block = row + (long)(baseIdx / QkK) * Q5KBlockBytes;
+            byte* blockEnd = block + Q5KBlockBytes;
+            float dHalf = ReadHalfLE(block);
+            float minHalf = ReadHalfLE(block + 2);
+
+            for (int j = 0; j < 8; j++)
+            {
+                int subStart = baseIdx + j * 32;
+                if (subStart >= cols)
+                {
+                    break; // zero-padded tail block: no elements left to consume.
+                }
+
+                GetScaleMinK4(j, block + 4, out byte sc, out byte m);
+                float scale = dHalf * sc;
+                Vector256<float> scaleV = Avx.BroadcastScalarToVector256(&scale);
+                float negShift = -(minHalf * m);
+                Vector256<float> shiftV = Avx.BroadcastScalarToVector256(&negShift);
+
+                byte* q = block + 48 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
+                byte* qh = block + 16 + 32 * (j / 2); // 5th bits for the same window bytes, bit j per byte
+                int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
+
+                for (int c = 0; c + 8 <= limit; c += 8)
+                {
+                    Vector256<int> five = LoadQ5KChunk(q, qh, blockEnd, j, c);
+
+                    Vector256<float> qf = Avx.ConvertToVector256Single(five); // eight 5-bit values in element order
+                    Vector256<float> xv = Avx.LoadVector256(x + subStart + c); // safe: these eight columns are real and block-covered
+
+                    acc = Fma.MultiplyAdd(xv, Fma.MultiplyAdd(scaleV, qf, shiftV), acc);
+                }
+
+                for (int l = (limit / 8) * 8; l < limit; l++)
+                {
+                    // Partial final chunk of the group: scalar cleanup, at most seven elements per group.
+                    int five = ((q[l] >> (4 * (j & 1))) & 0xF) | (((qh[l] >> j) & 1) << 4);
+                    tail += x[subStart + l] * (five * scale - minHalf * m);
+                }
+            }
+        }
+
+        return HSum(acc) + tail;
+    }
+
+    // Q6_K: each 210-byte block covers 256 elements in sixteen 16-element groups g (0..15). Group g lives in
+    // half h = g/8 of the block, quarter k/2 of that half, at ql window 64h + 16*(k&3): low nibbles for
+    // quarters 0..1, high nibbles for quarters 2..3; qh byte 128 + 32h + 16*(k&1) + e carries the high 2 bits at
+    // bit shift 2*quarter. w = d * sc_g * (q - 32) with q in [0, 63] and sc_g the signed int8 scale at byte
+    // 192 + g.
+    private static float RowDotQ6KScalar(byte* row, float* x, int cols)
+    {
+        float acc = 0f;
+
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+        {
+            byte* block = row + (long)(baseIdx / QkK) * Q6KBlockBytes;
+            float d = ReadHalfLE(block + 208);
+
+            for (int g = 0; g < 16; g++)
+            {
+                int subStart = baseIdx + g * 16;
+                if (subStart >= cols)
+                {
+                    break; // zero-padded tail block: no elements left to consume.
+                }
+
+                int h = g >> 3; // 128-element half of the super-block
+                int k = g & 7; // 16-element group inside the half
+                int quarter = k >> 1; // 0..3: which 32-element quarter of the half the group starts in
+                byte* q = block + 64 * h + 16 * (k & 3); // ql window: bytes [q, q+16) always inside the block
+                byte* qh = block + 128 + 32 * h + 16 * (k & 1); // 2-bit fields for the same elements, shift 2*quarter
+                float scale = d * (sbyte)block[192 + g];
+                int limit = Math.Min(16, cols - subStart); // padded quants are zero: stop at the real column count.
+                for (int e = 0; e < limit; e++)
+                {
+                    int six = ((q[e] >> (4 * (quarter >> 1))) & 0xF) | (((qh[e] >> (2 * quarter)) & 3) << 4);
+                    acc += x[subStart + e] * ((six - 32) * scale);
+                }
+            }
+        }
+
+        return acc;
+    }
+
+    // AVX2: per group broadcast the signed group scale, unpack eight 6-bit quants at a time from the nibble
+    // window plus the 2-bit high-byte field (signed conversion absorbs the -32 centering), then the fused
+    // scale and the dot FMA in the same chain as RowDotQ4KAvx2. Partial chunks fall to scalar accumulation.
+    private static float RowDotQ6KAvx2(byte* row, float* x, int cols)
+    {
+        Vector256<float> acc = Vector256<float>.Zero;
+        float tail = 0f;
+
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+        {
+            byte* block = row + (long)(baseIdx / QkK) * Q6KBlockBytes;
+            float dHalf = ReadHalfLE(block + 208);
+
+            for (int g = 0; g < 16; g++)
+            {
+                int subStart = baseIdx + g * 16;
+                if (subStart >= cols)
+                {
+                    break; // zero-padded tail block: no elements left to consume.
+                }
+
+                int h = g >> 3; // 128-element half of the super-block
+                int k = g & 7; // 16-element group inside the half
+                int quarter = k >> 1; // 0..3: which 32-element quarter of the half the group starts in
+                byte* q = block + 64 * h + 16 * (k & 3); // ql window: bytes [q, q+16) always inside the block
+                byte* qh = block + 128 + 32 * h + 16 * (k & 1); // 2-bit fields for the same elements, shift 2*quarter
+                float scale = dHalf * (sbyte)block[192 + g];
+                Vector256<float> scaleV = Avx.BroadcastScalarToVector256(&scale);
+                int limit = Math.Min(16, cols - subStart); // padded quants are zero: stop at the real column count.
+
+                for (int c = 0; c + 8 <= limit; c += 8)
+                {
+                    Vector256<int> six = LoadQ6KChunk(q, qh, quarter, c);
+
+                    Vector256<float> qf = Avx.ConvertToVector256Single(six); // signed 6-bit values in element order
+                    Vector256<float> xv = Avx.LoadVector256(x + subStart + c); // safe: these eight columns are real and block-covered
+
+                    acc = Fma.MultiplyAdd(xv, Avx.Multiply(scaleV, qf), acc);
+                }
+
+                for (int e = (limit / 8) * 8; e < limit; e++)
+                {
+                    // Partial final chunk of the group: scalar cleanup, at most seven elements per group.
+                    int six = ((q[e] >> (4 * (quarter >> 1))) & 0xF) | (((qh[e] >> (2 * quarter)) & 3) << 4);
+                    tail += x[subStart + e] * ((six - 32) * scale);
+                }
+            }
+        }
+
+        return HSum(acc) + tail;
+    }
+
     // Load the sixteen bytes starting at window offset c inside [q, q+32). For offsets whose wide load would pass
     // the end of the block (only possible for the last group pair of a row), load from offset 16 instead and slide
     // the needed eight bytes down with pshufb; both variants stay strictly inside the 144-byte block.
@@ -1252,6 +1932,124 @@ public sealed unsafe class CpuBackend : IBackend
         }
     }
 
+    // Q5_0 row expansion: w = (q - 16) * d per block. Same 5-bit unpacking as RowDotQ5_0Avx2, storing instead of dotting.
+    private static void DequantQ5_0Avx2(byte* row, float* outPtr, int cols)
+    {
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += Qk8)
+        {
+            byte* block = row + (long)(baseIdx / Qk8) * Q5_0BlockBytes;
+            float dHalf = ReadHalfLE(block);
+            uint qh = ReadQhLE(block);
+
+            int limit = Math.Min(Qk8, cols - baseIdx); // padded quants are zero: stop at the real column count.
+            for (int l = 0; l < limit; l += 8)
+            {
+                if (l + 8 > limit)
+                {
+                    break;
+                }
+
+                Vector256<int> five = LoadQ5_0Chunk(block, qh, l);
+                float dLocal = dHalf;
+                Avx.Store(outPtr + baseIdx + l, Avx.Multiply(Avx.ConvertToVector256Single(five), Avx.BroadcastScalarToVector256(&dLocal)));
+            }
+
+            for (int k = (limit / 8) * 8; k < limit; k++)
+            {
+                int five = ((block[6 + (k & 15)] >> (4 * (k >> 4))) & 0xF) | ((int)(qh >> k) & 1) << 4;
+                outPtr[baseIdx + k] = (five - 16) * dHalf; // partial final block: at most seven elements per row
+            }
+        }
+    }
+
+    // Q5_K row expansion: w = d*sc_j*q - dmin*m_j per group. Same nibble-plus-5th-bit unpack and fused scale/shift
+    // as RowDotQ5KAvx2.
+    private static void DequantQ5KAvx2(byte* row, float* outPtr, int cols)
+    {
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+        {
+            byte* block = row + (long)(baseIdx / QkK) * Q5KBlockBytes;
+            byte* blockEnd = block + Q5KBlockBytes;
+            float dHalf = ReadHalfLE(block);
+            float minHalf = ReadHalfLE(block + 2);
+
+            for (int j = 0; j < 8; j++)
+            {
+                int subStart = baseIdx + j * 32;
+                if (subStart >= cols)
+                {
+                    break; // zero-padded tail block: no elements left to consume.
+                }
+
+                GetScaleMinK4(j, block + 4, out byte sc, out byte m);
+                float scale = dHalf * sc;
+                Vector256<float> scaleV = Avx.BroadcastScalarToVector256(&scale);
+                float negShift = -(minHalf * m);
+                Vector256<float> shiftV = Avx.BroadcastScalarToVector256(&negShift);
+
+                byte* q = block + 48 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
+                byte* qh = block + 16 + 32 * (j / 2); // 5th bits for the same window bytes, bit j per byte
+                int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
+
+                for (int c = 0; c + 8 <= limit; c += 8)
+                {
+                    Vector256<int> five = LoadQ5KChunk(q, qh, blockEnd, j, c);
+                    Vector256<float> qf = Avx.ConvertToVector256Single(five); // eight 5-bit values in element order
+                    Avx.Store(outPtr + subStart + c, Fma.MultiplyAdd(scaleV, qf, shiftV));
+                }
+
+                for (int l = (limit / 8) * 8; l < limit; l++)
+                {
+                    // Partial final chunk of the group: scalar cleanup, at most seven elements per group.
+                    int five = ((q[l] >> (4 * (j & 1))) & 0xF) | (((qh[l] >> j) & 1) << 4);
+                    outPtr[subStart + l] = five * scale - minHalf * m;
+                }
+            }
+        }
+    }
+
+    // Q6_K row expansion: w = d * sc_g * (q - 32) per group. Same 6-bit unpack and signed conversion as
+    // RowDotQ6KAvx2.
+    private static void DequantQ6KAvx2(byte* row, float* outPtr, int cols)
+    {
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+        {
+            byte* block = row + (long)(baseIdx / QkK) * Q6KBlockBytes;
+            float dHalf = ReadHalfLE(block + 208);
+
+            for (int g = 0; g < 16; g++)
+            {
+                int subStart = baseIdx + g * 16;
+                if (subStart >= cols)
+                {
+                    break; // zero-padded tail block: no elements left to consume.
+                }
+
+                int h = g >> 3; // 128-element half of the super-block
+                int k = g & 7; // 16-element group inside the half
+                int quarter = k >> 1; // 0..3: which 32-element quarter of the half the group starts in
+                byte* q = block + 64 * h + 16 * (k & 3); // ql window: bytes [q, q+16) always inside the block
+                byte* qh = block + 128 + 32 * h + 16 * (k & 1); // 2-bit fields for the same elements, shift 2*quarter
+                float scale = dHalf * (sbyte)block[192 + g];
+                Vector256<float> scaleV = Avx.BroadcastScalarToVector256(&scale);
+                int limit = Math.Min(16, cols - subStart); // padded quants are zero: stop at the real column count.
+
+                for (int c = 0; c + 8 <= limit; c += 8)
+                {
+                    Vector256<int> six = LoadQ6KChunk(q, qh, quarter, c);
+                    Avx.Store(outPtr + subStart + c, Avx.Multiply(scaleV, Avx.ConvertToVector256Single(six))); // signed 6-bit values, pre-centered
+                }
+
+                for (int e = (limit / 8) * 8; e < limit; e++)
+                {
+                    // Partial final chunk of the group: scalar cleanup, at most seven elements per group.
+                    int six = ((q[e] >> (4 * (quarter >> 1))) & 0xF) | (((qh[e] >> (2 * quarter)) & 3) << 4);
+                    outPtr[subStart + e] = (six - 32) * scale;
+                }
+            }
+        }
+    }
+
     private static Vector128<byte> GetNibbleMask() => Vector128.Create((byte)0xF);
 
     // pshufb selector: vector byte lane i = source byte 4+i (bytes 4..7 down to lanes 0..3).
@@ -1259,6 +2057,9 @@ public sealed unsafe class CpuBackend : IBackend
 
     // pshufb selector: vector byte lane i = source byte 8+i (high half of the window down to lanes 0..7).
     private static Vector128<byte> GetSlideHighBytesShuffle() => Vector128.Create((byte)8, (byte)9, (byte)10, (byte)11, (byte)12, (byte)13, (byte)14, (byte)15, (byte)8, (byte)9, (byte)10, (byte)11, (byte)12, (byte)13, (byte)14, (byte)15);
+
+    // Constant per-lane bit masks for Q5_0 5th-bit extraction: lane i tests bit i of the broadcast qh field byte.
+    private static Vector256<int> GetQ5_0BitMasks() => Vector256.Create(1, 2, 4, 8, 16, 32, 64, 128);
 
     private static float DotCore(float* a, float* b, int count)
     {

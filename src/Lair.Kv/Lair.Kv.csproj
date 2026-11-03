@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
-    <ProjectReference Include="..\Lair.Core\Lair.Core.csproj" />
+    <ProjectReference Include="..\Lair.Contracts\Lair.Contracts.csproj" />
   </ItemGroup>
 
   <ItemGroup>

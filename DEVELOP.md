@@ -6,11 +6,11 @@
 dotnet build Lair.sln
 ```
 
-Target framework: net10.0. Solution layout: `src/Lair.*` projects (Core, Loader, Backends.Cpu, Kv, Tokenizer, Sampling, Models, Api, Host), `tests/Lair.Tests`, `bench/Lair.Bench`. The continuous-batch scheduler lives in `src/Lair.Models/Scheduling/`; the metrics bus and monitor stream in `src/Lair.Api/Monitoring/`; the config watcher and change-application bus in `src/Lair.Host/ConfigWatcher.cs` + `src/Lair.Api/Config/ConfigReload.cs`.
+Target framework: net10.0. Solution layout: `src/Lair.*` projects (Contracts, Loader, Backends.Cpu, Kv, Tokenizer, Sampling, Models, Http, Host), `tests/Lair.Tests`, `bench/Lair.Bench`. The continuous-batch scheduler lives in `src/Lair.Models/Scheduling/`; the metrics bus and monitor stream in `src/Lair.Http/Monitoring/`; the config watcher and change-application bus in `src/Lair.Host/ConfigWatcher.cs` + `src/Lair.Http/Config/ConfigReload.cs`.
 
-## Web UI build (`web/`)
+## Web UI build (`src/Lair.Host/ClientApp/`)
 
-The `/ui` SPA is a TypeScript/React app built with esbuild + Tailwind v4 (pinned deps, committed lockfile; Node 22 / npm 11). `dotnet build` auto-runs `npm install`/`npm run build` when web sources changed and stages `web/dist` into the Host's served assets at `/ui`; `-p:SkipWebUi=true` skips it entirely (no Node needed). Dev loop: `cd web && npm run watch`. UI smoke harnesses (jsdom): `npm run smoke` (monitor tab), `npm run smoke:chat` (chat tab) — run after bundle-affecting changes.
+The `/ui` SPA is a TypeScript/React app built with esbuild + Tailwind v4 (pinned deps, committed lockfile; Node 22 / npm 11), living in `src/Lair.Host/ClientApp/` per the ASP.NET Core SPA convention. `dotnet build` auto-runs `npm install`/`npm run build` when client sources changed and stages `ClientApp/dist` into the Host's web root at `wwwroot/ui`, served under `/ui` (root `/` redirects there); `-p:SkipWebUi=true` skips it entirely (no Node needed). Dev loop: `cd src/Lair.Host/ClientApp && npm run watch`. UI smoke harnesses (jsdom): `npm run smoke` (monitor tab), `npm run smoke:chat` (chat tab) — run after bundle-affecting changes.
 
 ## Test
 

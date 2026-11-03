@@ -1,8 +1,8 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
-    <ProjectReference Include="..\Lair.Core\Lair.Core.csproj" />
-    <ProjectReference Include="..\Lair.Api\Lair.Api.csproj" />
+    <ProjectReference Include="..\Lair.Contracts\Lair.Contracts.csproj" />
+    <ProjectReference Include="..\Lair.Http\Lair.Http.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -15,25 +15,27 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <Version>0.3.0</Version>
+    <Version>0.3.1</Version>
   </PropertyGroup>
 
-  <!-- Web UI embedding: web/ is bundled into wwwroot/ui so the host can serve /ui.
+  <!-- Web UI embedding: ClientApp/ (the ASP.NET Core SPA convention — the client project lives
+       inside the host project) is bundled into the web root at wwwroot/ui so the host serves /ui.
        Set SkipWebUi=true (e.g. -p:SkipWebUi=true) on machines without Node/npm; the host then
        serves no UI and the WebUi test category skips. -->
   <PropertyGroup>
     <SkipWebUi Condition="'$(SkipWebUi)' == ''">false</SkipWebUi>
-    <WebUiProjectDirectory>$(MSBuildThisFileDirectory)..\..\web\</WebUiProjectDirectory>
+    <WebUiProjectDirectory>$(MSBuildThisFileDirectory)ClientApp\</WebUiProjectDirectory>
   </PropertyGroup>
 
   <ItemGroup>
     <WebUiSource Include="$(WebUiProjectDirectory)**\*" Exclude="$(WebUiProjectDirectory)node_modules\**\*;$(WebUiProjectDirectory)dist\**\*" />
   </ItemGroup>
 
-  <!-- Bundles web/ when any web source is newer than the stamp file (which records the last successful bundle)
-       or when dist is missing, stages the output into wwwroot/ui, and registers it as Content for the standard
-       output/publish copy. Hooked before both copy-item collectors so even a first-ever build embeds in one
-       pass; implicit restore fast-paths never run project targets, so restore-time hooks would not fire here. -->
+  <!-- Bundles ClientApp/ when any client source is newer than the stamp file (which records the last
+       successful bundle) or when dist is missing, stages the output into the web root at wwwroot/ui, and
+       registers it as Content for the standard output/publish copy. Hooked before both copy-item collectors
+       so even a first-ever build embeds in one pass; implicit restore fast-paths never run project targets,
+       so restore-time hooks would not fire here. -->
   <Target Name="PrepareWebUi"
           BeforeTargets="GetCopyToOutputDirectoryItems;GetCopyToPublishDirectoryItems"
           Condition="'$(SkipWebUi)' != 'true' And '$(DesignTimeBuild)' != 'true'">
@@ -41,7 +43,7 @@
     <PropertyGroup>
       <WebUiStampFile>$(IntermediateOutputPath)webui.stamp</WebUiStampFile>
     </PropertyGroup>
-    <Error Text="web/ sources were not found at $(WebUiProjectDirectory); build with -p:SkipWebUi=true to skip the web UI." Condition="!Exists('$(WebUiProjectDirectory)package.json')" />
+    <Error Text="ClientApp/ sources were not found at $(WebUiProjectDirectory); build with -p:SkipWebUi=true to skip the web UI." Condition="!Exists('$(WebUiProjectDirectory)package.json')" />
     <Exec Command="npm install --no-audit --no-fund" WorkingDirectory="$(WebUiProjectDirectory)" Condition="!Exists('$(WebUiProjectDirectory)node_modules')" />
     <ReadLinesFromFile File="$(WebUiStampFile)" Condition="Exists('$(WebUiStampFile)')">
       <Output TaskParameter="Lines" PropertyName="_WebUiStampTicks" />

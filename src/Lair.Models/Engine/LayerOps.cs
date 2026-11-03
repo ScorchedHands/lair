@@ -1,4 +1,4 @@
-using Lair.Core.Contracts;
+using Lair.Contracts;
 using Lair.Kv;
 
 namespace Lair.Models.Engine;

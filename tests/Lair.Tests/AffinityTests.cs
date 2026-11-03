@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
-using Lair.Api;
+using Lair.Http;
 using Lair.Backends.Cpu;
-using Lair.Core.Contracts;
+using Lair.Contracts;
 using Lair.Host.Config;
 
 namespace Lair.Tests;
