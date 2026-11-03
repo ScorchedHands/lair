@@ -408,7 +408,7 @@ public class BatchKernelTests
 
     // Test-only Q6_K writer: per 16-element group, amax = max|v|, signed 8-bit scale s = round(amax / (31 * d))
     // clamped to [-127, 127] against the block half-float d = amax(block) / 31, and six-bit codes q in [0, 63]
-    // centered at q - 32. ql nibbles at block+0 (low nibbles for even quarters, high for odd), 2-bit fields at
+    // centered at q - 32. ql nibbles at block+0 (low nibbles for quarters 0..1, high for 2..3), 2-bit fields at
     // bit 2*quarter of qh bytes block+128, scales at block+192, d at block+208. Padded elements produce zero blocks.
     private static void QuantizeQ6K(ReadOnlySpan<float> src, Span<byte> dst)
     {
@@ -454,14 +454,13 @@ public class BatchKernelTests
 
                 int h = g >> 3; // 128-element half of the super-block
                 int k = g & 7; // 16-element group inside the half
-                int quarter = k >> 2; // 0..3: which 32-element quarter of the half
-                int l = 16 * (k & 1); // window offset inside the half: 0 or 16
+                int quarter = k >> 1; // 0..3: which 32-element quarter of the half the group starts in
                 for (int e = 0; e < group.Length; e++)
                 {
                     int six = Math.Clamp((int)Math.Round((double)group[e] / ((float)sc * dBack), MidpointRounding.AwayFromZero) + 32, 0, 63);
 
-                    // Element e lives at ql window byte 64h + 32*(quarter&1) + l + e: low nibble for quarters 0..1, high for 2..3.
-                    ref byte target = ref dst[b * 210 + 64 * h + 32 * (quarter & 1) + l + e];
+                    // Element e lives at ql byte 64h + 16*(k&3) + e: low nibble for quarters 0..1, high for 2..3.
+                    ref byte target = ref dst[b * 210 + 64 * h + 16 * (k & 3) + e];
                     if ((quarter >> 1) == 0)
                     {
                         target = (byte)((target & 0xF0) | (six & 0xF));
@@ -471,8 +470,8 @@ public class BatchKernelTests
                         target = (byte)((target & 0x0F) | (six << 4));
                     }
 
-                    // The high 2 bits live at bit 2*quarter of the matching qh byte.
-                    dst[b * 210 + 128 + 32 * h + l + e] |= (byte)((six >> 4) << (2 * quarter));
+                    // The high 2 bits live at bit 2*quarter of qh byte 128 + 32h + 16*(k&1) + e.
+                    dst[b * 210 + 128 + 32 * h + 16 * (k & 1) + e] |= (byte)((six >> 4) << (2 * quarter));
                 }
             }
         }

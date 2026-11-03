@@ -509,10 +509,9 @@ public sealed unsafe class CpuBackend : IBackend
 
                                 int h = g >> 3; // 128-element half of the super-block
                                 int k = g & 7; // 16-element group inside the half
-                                int quarter = k >> 2; // 0..3: which 32-element quarter of the half
-                                int l = 16 * (k & 1); // window offset inside the half: 0 or 16
-                                byte* q = block + 64 * h + 32 * (quarter & 1) + l; // window: bytes [q, q+16) always inside the block
-                                byte* qh = block + 128 + 32 * h + l; // high 2 bits for the same window bytes, shift 2*quarter
+                                int quarter = k >> 1; // 0..3: which 32-element quarter of the half the group starts in
+                                byte* q = block + 64 * h + 16 * (k & 3); // ql window: bytes [q, q+16) always inside the block
+                                byte* qh = block + 128 + 32 * h + 16 * (k & 1); // 2-bit fields for the same elements, shift 2*quarter
                                 float scale = d * (sbyte)block[192 + g];
                                 int limit = Math.Min(16, cols - subStart); // padded quants are zero: stop at the real column count.
                                 for (int e = 0; e < limit; e++)
@@ -1163,10 +1162,9 @@ public sealed unsafe class CpuBackend : IBackend
 
                     int h = g >> 3; // 128-element half of the super-block
                     int k = g & 7; // 16-element group inside the half
-                    int quarter = k >> 2; // 0..3: which 32-element quarter of the half
-                    int l = 16 * (k & 1); // window offset inside the half: 0 or 16
-                    byte* q = block + 64 * h + 32 * (quarter & 1) + l; // window: bytes [q, q+16) always inside the block
-                    byte* qh = block + 128 + 32 * h + l; // high 2 bits for the same window bytes, shift 2*quarter
+                    int quarter = k >> 1; // 0..3: which 32-element quarter of the half the group starts in
+                    byte* q = block + 64 * h + 16 * (k & 3); // ql window: bytes [q, q+16) always inside the block
+                    byte* qh = block + 128 + 32 * h + 16 * (k & 1); // 2-bit fields for the same elements, shift 2*quarter
                     float scale = dHalf * (sbyte)block[192 + g];
                     Vector256<float> scaleV = Avx.BroadcastScalarToVector256(&scale);
                     int limit = Math.Min(16, cols - subStart); // padded quants are zero: stop at the real column count.
@@ -1700,8 +1698,8 @@ public sealed unsafe class CpuBackend : IBackend
     }
 
     // Q6_K: each 210-byte block covers 256 elements in sixteen 16-element groups g (0..15). Group g lives in
-    // half h = g/3 of the block, quarter k/4 of that half, at ql window 64h + 32*(quarter&1) + 16*(k&1): low
-    // nibbles for even quarters, high nibbles for odd; qh byte 128h + 16*(k&1) + e carries the high 2 bits at
+    // half h = g/8 of the block, quarter k/2 of that half, at ql window 64h + 16*(k&3): low nibbles for
+    // quarters 0..1, high nibbles for quarters 2..3; qh byte 128 + 32h + 16*(k&1) + e carries the high 2 bits at
     // bit shift 2*quarter. w = d * sc_g * (q - 32) with q in [0, 63] and sc_g the signed int8 scale at byte
     // 192 + g.
     private static float RowDotQ6KScalar(byte* row, float* x, int cols)
@@ -1723,10 +1721,9 @@ public sealed unsafe class CpuBackend : IBackend
 
                 int h = g >> 3; // 128-element half of the super-block
                 int k = g & 7; // 16-element group inside the half
-                int quarter = k >> 2; // 0..3: which 32-element quarter of the half
-                int l = 16 * (k & 1); // window offset inside the half: 0 or 16
-                byte* q = block + 64 * h + 32 * (quarter & 1) + l; // window: bytes [q, q+16) always inside the block
-                byte* qh = block + 128 + 32 * h + l; // high 2 bits for the same window bytes, shift 2*quarter
+                int quarter = k >> 1; // 0..3: which 32-element quarter of the half the group starts in
+                byte* q = block + 64 * h + 16 * (k & 3); // ql window: bytes [q, q+16) always inside the block
+                byte* qh = block + 128 + 32 * h + 16 * (k & 1); // 2-bit fields for the same elements, shift 2*quarter
                 float scale = d * (sbyte)block[192 + g];
                 int limit = Math.Min(16, cols - subStart); // padded quants are zero: stop at the real column count.
                 for (int e = 0; e < limit; e++)
@@ -1763,10 +1760,9 @@ public sealed unsafe class CpuBackend : IBackend
 
                 int h = g >> 3; // 128-element half of the super-block
                 int k = g & 7; // 16-element group inside the half
-                int quarter = k >> 2; // 0..3: which 32-element quarter of the half
-                int l = 16 * (k & 1); // window offset inside the half: 0 or 16
-                byte* q = block + 64 * h + 32 * (quarter & 1) + l; // window: bytes [q, q+16) always inside the block
-                byte* qh = block + 128 + 32 * h + l; // high 2 bits for the same window bytes, shift 2*quarter
+                int quarter = k >> 1; // 0..3: which 32-element quarter of the half the group starts in
+                byte* q = block + 64 * h + 16 * (k & 3); // ql window: bytes [q, q+16) always inside the block
+                byte* qh = block + 128 + 32 * h + 16 * (k & 1); // 2-bit fields for the same elements, shift 2*quarter
                 float scale = dHalf * (sbyte)block[192 + g];
                 Vector256<float> scaleV = Avx.BroadcastScalarToVector256(&scale);
                 int limit = Math.Min(16, cols - subStart); // padded quants are zero: stop at the real column count.
@@ -2031,10 +2027,9 @@ public sealed unsafe class CpuBackend : IBackend
 
                 int h = g >> 3; // 128-element half of the super-block
                 int k = g & 7; // 16-element group inside the half
-                int quarter = k >> 2; // 0..3: which 32-element quarter of the half
-                int l = 16 * (k & 1); // window offset inside the half: 0 or 16
-                byte* q = block + 64 * h + 32 * (quarter & 1) + l; // window: bytes [q, q+16) always inside the block
-                byte* qh = block + 128 + 32 * h + l; // high 2 bits for the same window bytes, shift 2*quarter
+                int quarter = k >> 1; // 0..3: which 32-element quarter of the half the group starts in
+                byte* q = block + 64 * h + 16 * (k & 3); // ql window: bytes [q, q+16) always inside the block
+                byte* qh = block + 128 + 32 * h + 16 * (k & 1); // 2-bit fields for the same elements, shift 2*quarter
                 float scale = dHalf * (sbyte)block[192 + g];
                 Vector256<float> scaleV = Avx.BroadcastScalarToVector256(&scale);
                 int limit = Math.Min(16, cols - subStart); // padded quants are zero: stop at the real column count.
