@@ -215,7 +215,7 @@ One dense GGUF model answers one OpenAI request, streamed, on CPU.
 - [✓] GGUF tokenizer — BPE + special tokens decode/encode
   - Verify: `dotnet test --filter Category=Tokenizer` — 18/18 ✅ (13 synthetic + 5 against the real SmolLM GGUF: ASCII/newline/emoji round-trips, control tokens).
 - [✓] Chat templates — mini Jinja-subset interpreter
-  - Verify: `dotnet test --filter Category=Template` — 20/20 ✅ golden renders (ChatML = real SmolLM `tokenizer.chat_template`, conditional if/else + `|tojson`, Phi-style), subset semantics (concat, `==`/`!=`, `not`, `tojson`/`trim`, `{%- -%}`), and rejections naming construct + position (`{% set %}`, `|upper`, macro, slices). The real Llama-3 template needs `{% set %}`/loop vars — out of subset (backlog).
+  - Verify: `dotnet test --filter Category=Template` — 20/20 ✅ golden renders (ChatML = real SmolLM `tokenizer.chat_template`, conditional if/else + `|tojson`, Phi-style), subset semantics (concat, `==`/`!=`, `not`, `tojson`/`trim`, `{%- -%}`), and rejections naming construct + position (`{% set %}`, `|upper`, macro, slices). The real Llama-3 template needs `{% set %}`/loop vars — out of subset (pulled forward as MVP3.2).
 - [✓] Dense kernels — fused dequant GEMV for Q4_K_M/Q8_0/F16, AVX2, row-block threading (see DN-M1-3)
   - Verify: `dotnet test --filter Category=Kernel` — 15/15 ✅ vs double-precision oracle incl. threaded bit-identity; bench Q4_K 4096×4096: AVX2 8.7× scalar, threaded ≈17 GB/s ✅.
 - [✓] Layer executor — RMSNorm, RoPE, GQA attention, SwiGLU FFN, qkv bias (see DN-M1-1)
@@ -400,6 +400,230 @@ Published Q4_K_M models load and serve on this machine.
 
 - [✓] Automated Kernel: Q5_0/Q5_K/Q6_K scalar-vs-AVX2 bit-identity + batch equivalence + real-fixture decode sanity ✅ Category=Kernel|Loader 77→92 with Parity; Release full 320/320
 - [✓] Manual Q4_K_M Serve: q4_k_m model served; chat via API + `/ui`; monitor live ✅ verified live on :8392 (see item evidence)
+
+### MVP3.2 [v0.3.2] - Refined
+
+Published Llama-family chat models serve chat end-to-end on this machine, rendering their own GGUF chat template through a managed full-minja-parity template library — starting with `models/Llama-3.2-1B-Instruct-Q8_0.gguf`.
+
+#### Design Notes
+
+- **DN-M32-1** — The blocker is the template interpreter, not the engine: the Llama-3.2 Q8_0 file satisfies every engine requirement already (architecture `llama` in the supported set, `tokenizer.ggml.pre = llama-bpe`, full-head RoPE with `rope.dimension_count == head_dim`, Q8_0 kernel), and loads cleanly under pinned b12032; LAIR refuses it at startup because `ChatTemplateRenderer` rejects its first construct — `{%- set tools = custom_tools %}` ("expected a tag close", template offset 37). Implement a managed `Lair.Templating.Minja` library with full minja parity for minja’s supported subset, verified against pinned llama.cpp b12032 `/apply-template`.
+  - Rationale: Scope commits to dense Llama/Qwen-class ≤3B GGUFs (2026-10-31), and MVP1 recorded this exact gap as out-of-subset; general GGUF compatibility should target the llama.cpp/minja behavior that published templates are validated against.
+  - Rejected: narrowed subset (leaves the same failure mode for other published templates); native minja interop (conflicts with LAIR's managed-first, self-contained packaging posture); .NET Jinja libraries (Jinja2-compatible is not minja-compatible without byte-exact proof); vendor llama.cpp/minja (imports a C++ dependency and native build burden); full Python Jinja2 parity (broader than GGUF chat templates and harder to verify against llama.cpp).
+  - Contract: `Lair.Templating.Minja` exposes parser/evaluator/chat-template APIs and is verified against prompts rendered by pinned llama.cpp b12032 for identical message sets.
+- **DN-M32-2** — LAIR adopts minja’s exact limitations as the MVP3.2 template contract: full expression syntax; statements, variable sections, and comments with whitespace elision; `if`/`elif`/`else`; `for` with `recursive`, `if`, `loop.*`, `break`, `continue`, and destructuring; `set` with namespaces and destructuring; `macro`/`call`/`filter`; minja’s extensible filter/test/function collection; no `{% raw %}`, `{% block %}`, `{% include %}`, `{% extends %}`, no tuples, no ternary-less `if` expressions.
+  - Rationale: minja is the GGUF compatibility oracle; broader Jinja features would create behavior LAIR cannot byte-verify against llama.cpp.
+  - Rejected: broader Jinja2 target (unverifiable against the GGUF oracle); minja plus LAIR-specific extensions (fragments the compatibility story).
+  - Contract: parser errors name unsupported construct + position and fail model startup before serving.
+- **DN-M32-3** — `Lair.Templating.Minja` uses a custom `MinjaValue` model: null/none, booleans, numbers, strings, lists, ordered maps, Python-like truthiness, no distinction between `none` and `undefined`, and minja-compatible JSON dump semantics for maps/strings.
+  - Rationale: minja byte-exactness depends on Python-like value semantics and its own JSON dump behavior, not ordinary .NET JSON serialization.
+  - Rejected: direct `System.Text.Json` values (ordering/dump semantics are not minja-compatible); dynamic/object dictionaries (undefined semantics and dump behavior drift).
+  - Contract: `MinjaValue` is the public context/value currency for templates, chat inputs, filters, macros, and capability probes.
+- **DN-M32-4** — Scoping follows minja/llama.cpp behavior proven by oracle goldens, including `{% set %}` visibility, namespace objects, re-binding loop inputs, macro/call/filter scoping, and destructuring.
+  - Rationale: Llama-3.2 re-binds `messages` through `{% set %}`; fidelity requires matching the engine that published templates are tested against.
+  - Rejected: Python Jinja2 block scoping (may differ from minja); simple global assignments (may pass one template but hides future divergence).
+  - Contract: scoping tests are derived from minja behavior and pinned llama.cpp `/apply-template` goldens.
+- **DN-M32-5** — `raise_exception` is implemented as a minja-compatible function/filter behavior. When reached during chat rendering, it surfaces as an OpenAI `invalid_request` 400 with the template-provided message.
+  - Rationale: full minja parity requires `raise_exception`; load-time rejection would reject templates that are valid for the request shape actually used.
+  - Rejected: load-time model rejection (too broad); ignoring raises (silently wrong output).
+  - Contract: `MinjaRenderException` carries a bounded template error taxonomy; `lair.http` maps it to `invalid_request`.
+- **DN-M32-6** — The existing `ChatTemplateRenderer` is replaced by a `MinjaChatTemplate` adapter over `Lair.Templating.Minja`; no fallback mini-Jinja path remains.
+  - Rationale: one template engine keeps GGUF behavior observable and prevents silent divergence between old and new renderers.
+  - Rejected: keep `ChatTemplateRenderer` as a compatibility facade (preserves the old semantics boundary); fallback path (hides template compatibility failures).
+  - Contract: model load parses the GGUF chat template once and either stores a `MinjaChatTemplate` or fails startup with an actionable template error.
+- **DN-M32-7** — Template tool precedence: when a model template declares or renders tool support, LAIR does not inject its own fenced-tool block for that request; LAIR injection is used only when the template lacks tool support or an explicit config override requests it. Capability detection is part of the template library output.
+  - Rationale: published GGUF templates increasingly own tool formatting; LAIR’s MVP2 fenced-JSON injection is a fallback, not the canonical rendering path for templates that already know how to render tools.
+  - Rejected: always injecting LAIR’s tool block (duplicates or corrupts native template tool sections); requiring model-specific hardcoded template handlers (breaks the GGUF-first template story).
+  - Contract: `TemplateCapabilities` reports tool/system/tool-call/tool-response/typed-content facts; `lair.http` chooses injection behavior from those facts plus request/config intent.
+- **DN-M32-8** — The chat-template wrapper implements minja chat context and polyfills: `messages`, `tools`, `add_generation_prompt`, `bos_token`, `eos_token`, `date_string`, system-role normalization, tool-call/tool-response normalization, typed-content handling, object-argument handling, and extra context.
+  - Rationale: GGUF compatibility requires minja’s chat-template layer, not just raw Jinja rendering.
+  - Rejected: raw Jinja context only (leaves HF chat quirks to LAIR callers); LAIR-specific facade only (prevents reusable minja parity).
+  - Contract: `MinjaChatTemplate.Render(ChatTemplateInput)` returns rendered prompt plus capability facts.
+- **DN-M32-9** — BOS/EOS handling avoids double BOS: the adapter renders the template exactly, then suppresses tokenizer BOS only when the rendered prompt already starts with the model BOS token.
+  - Rationale: Llama templates emit `bos_token` while LAIR’s llama-bpe tokenizer path may add BOS; both must not appear.
+  - Rejected: always add BOS (duplicates Llama BOS); strip template BOS blindly (breaks templates that intentionally emit BOS).
+  - Contract: adapter compares rendered prefix, tokenizer BOS metadata, and `add_bos_token` policy before encoding.
+- **DN-M32-10** — Untrusted GGUF templates get hard parse/render limits: max template size, parser/eval depth, loop iteration count, output size, and render timeout. Limits have library defaults in MVP3.2; no config knob is introduced yet.
+  - Rationale: a full template interpreter is a third-party input attack surface and resource-exhaustion surface.
+  - Rejected: no limits (unsafe); deferring limits (MVP3.2 is the first real GGUF template execution path).
+  - Contract: `MinjaLimits` are enforced inside `Lair.Templating.Minja` and surface as template parse/render errors.
+- **DN-M32-11** — Parsed templates are cached per loaded model; rendering is per request, but parsing happens once at model load.
+  - Rationale: model load should fail fast on bad templates and avoid repeated parser work per request.
+  - Rejected: parse per request (waste and late failures); lazy first-request parse (hides startup template errors).
+  - Contract: `GenerationService` stores the parsed `MinjaChatTemplate` for the model instance lifetime.
+- **DN-M32-12** — Template failures are observable but prompt injection remains out of scope: startup parse failures log model path + construct/position; request-time render failures log model name, request id, and bounded template error code/message; LAIR does not sanitize user messages against template-injection tricks in MVP3.2.
+  - Rationale: operators need actionable template diagnostics, while message-content injection is a model/security policy problem larger than this phase.
+  - Rejected: silent template fallback (hides GGUF incompatibility); full prompt-injection sanitization in MVP3.2 (scope creep without a defined policy).
+  - Contract: structured logs use existing `x-lair-request-id` for request-time failures and model-load context for startup failures.
+
+#### Implementation Items
+
+- [_] Minja library project — create `src/Lair.Templating.Minja` as a managed template engine with no dependency on `lair.http`, `lair.models`, `lair.tokenizer`, or native libraries (see DN-M32-1, DN-M32-2)
+  - Verify: `dotnet build src/Lair.Templating.Minja/Lair.Templating.Minja.csproj` succeeds; `dotnet list src/Lair.Templating.Minja/Lair.Templating.Minja.csproj reference` shows no LAIR runtime project references.
+- [_] Lexer/parser/AST — implement minja tokenization, two-phase parsing, comments, whitespace elision, statements, expressions, and unsupported-construct rejection (see DN-M32-2)
+  - Verify: `dotnet test --filter Category=MinjaSyntax` — syntax goldens for supported constructs plus actionable rejection tests for `{% raw %}`, `{% block %}`, `{% include %}`, `{% extends %}`, tuples, and ternary-less `if` expressions.
+- [_] `MinjaValue` and evaluator — implement ordered maps, Python-like truthiness, none/undefined equivalence, list/map/string operations, membership, boolean operators, slices, arithmetic/concatenation, and minja-compatible JSON dump (see DN-M32-3)
+  - Verify: `dotnet test --filter Category=MinjaEval` — expression/value goldens for truthiness, equality, membership, indexing, slicing, concatenation, map/list dump, and numeric behavior.
+- [_] Minja statements — implement `if`/`elif`/`else`, `for` with `loop.*`, `recursive`, `if`, `break`, `continue`, destructuring, `set` with namespaces/destructuring, `macro`, `call`, and `filter` with minja-compatible scoping (see DN-M32-4)
+  - Verify: `dotnet test --filter Category=MinjaStatements` — scoping goldens for `{% set %}` inside `if`/`for`, namespace objects, loop re-binding, macro/call/filter behavior, and destructuring.
+- [_] Minja filters/tests/functions — implement minja’s supported filter/test/function collection, including `raise_exception`, `tojson`, `trim`, `length`, `items`, `dictsort`, `join`, `range`, `select`/`reject` variants, `namespace`, `escape`, and chat-template helpers needed by oracle tests (see DN-M32-5)
+  - Verify: `dotnet test --filter Category=MinjaFilters` — filter/test goldens and `raise_exception` render-time error mapping tests.
+- [_] Chat-template wrapper — implement `MinjaChatTemplate`, `ChatTemplateInput`, `TemplateCapabilities`, chat context normalization, polyfills, BOS/EOS handling, and capability probes (see DN-M32-7, DN-M32-8, DN-M32-9)
+  - Verify: `dotnet test --filter Category=MinjaChat` — chat goldens for system/user/assistant/tool/tool-response cases, `add_generation_prompt` on/off, BOS/EOS behavior, and capability detection.
+- [_] Security limits — enforce library defaults for template size, parser/eval depth, loop iterations, output size, and render timeout (see DN-M32-10)
+  - Verify: `dotnet test --filter Category=MinjaLimits` — adversarial templates exceed limits and produce bounded actionable template errors rather than hanging or growing output unbounded.
+- [_] LAIR renderer adapter — replace `ChatTemplateRenderer` startup/render path with `MinjaChatTemplate`, cache parsed templates per model, map LAIR chat/tool inputs into minja values, and log template failures with model/request context (see DN-M32-6, DN-M32-11, DN-M32-12)
+  - Verify: `dotnet test --filter Category=Template` — existing ChatML/Phi goldens stay green; model startup fails fast for invalid templates with actionable logs; capability facts reach the request pipeline for tool precedence decisions.
+- [_] Llama-family template parity — LAIR's render of a pinned real chat_template matches llama.cpp b12032's own rendering byte-for-byte across system/user/assistant/tool multi-turn sets with and without `add_generation_prompt`
+  - Verify: `dotnet test --filter Category=TemplateParity` — golden renders captured from pinned llama.cpp `/apply-template` for identical messages/tools; existing ChatML/Phi goldens stay green (no regression to shipped templates).
+- [_] End-to-end Llama-3.2 serve — real file loads, chat routes through its own template, multi-turn conversation stays coherent via API and `/ui`
+  - Verify: automated skip-if-absent fixture test (load + render + finite logits), manual `lair serve` chat on the llama-3.2 config with a several-turn exchange in the Chat tab.
+
+#### Tests
+
+- [_] Automated MinjaSyntax: supported minja constructs, unsupported non-minja constructs, whitespace/comment handling, and parse errors naming construct + position.
+- [_] Automated MinjaEval: value model, truthiness, membership, indexing, slicing, concatenation, maps/lists, and minja-compatible JSON dump.
+- [_] Automated MinjaStatements: `if`, `for`, `loop.*`, `break`, `continue`, `set`, namespaces, destructuring, `macro`, `call`, `filter`, and scoping goldens.
+- [_] Automated MinjaFilters: minja filter/test/function collection, including `raise_exception` render-time `invalid_request` mapping.
+- [_] Automated MinjaChat: chat-template inputs, polyfills, capabilities, BOS/EOS behavior, tool precedence facts, and `add_generation_prompt` variants.
+- [_] Automated MinjaLimits: template size, parser/eval depth, loop iteration, output size, and render timeout guards.
+- [_] Automated Template regression: existing ChatML/Phi goldens remain green after replacing `ChatTemplateRenderer`.
+- [_] Automated TemplateDiagnostics: invalid startup templates log model path + construct/position; request-time template render failures log model name, request id, and bounded error code.
+- [_] Automated TemplateParity: pinned llama.cpp `/apply-template` byte-exact goldens for Llama-family templates.
+- [_] Manual Llama-3.2 Serve: model served; multi-turn chat via API and `/ui`; monitor live.
+
+### MVP3.3 [v0.3.3] - Tentative
+
+GGUF tokenizer variants load through load-time tokenizer profiles instead of hardcoded pre-tokenizer rules.
+
+#### Design Notes
+
+- **DN-M33-1** — Tokenizer compatibility is a profile/registry seam selected at model load. The shared BPE machinery remains central; GGUF metadata selects profile behavior for `tokenizer.ggml.model`, `tokenizer.ggml.pre`, special/control token handling, byte fallback, and BOS/EOS/EOT metadata. Variants are internal implementations, not separate runtime assemblies or per-token dispatch.
+  - Rationale: published GGUF tokenizers share BPE machinery but differ in pre-tokenization, control-token behavior, and metadata quirks. Selecting a profile at load keeps the hot tokenizer path concrete while making new families additive.
+  - Rejected: one hardcoded `GgufTokenizer` switch forever (blocks new families); one library per tokenizer variant (fragmentation without packaging benefit); per-token plugin dispatch (interface tax in tokenization).
+  - Contract: `lair.tokenizer` exposes a tokenizer-profile registry selected from GGUF metadata; profiles produce concrete tokenizer state before serving.
+
+#### Implementation Items
+
+- [_] Tokenizer profile registry — move `tokenizer.ggml.model` / `tokenizer.ggml.pre` selection behind load-time profiles and preserve current `llama-bpe`, `gpt2`, and `smollm` behavior.
+  - Verify: `dotnet test --filter Category=Tokenizer` — profile selection tests plus existing tokenizer goldens remain green.
+- [_] GGUF tokenizer metadata coverage — expand handling for token types, control ranges, byte fallback, UTF-8/control-token flush behavior, and BOS/EOS/EOT metadata as required by real GGUF families.
+  - Verify: `dotnet test --filter Category=Tokenizer` — oracle cases against pinned llama.cpp `/tokenize` for each supported profile.
+
+#### Tests
+
+- [_] Automated Tokenizer: profile selection, control-token/byte-fallback cases, llama.cpp `/tokenize` oracle parity.
+
+#### Open Items
+
+- [_] **Tokenizer profile taxonomy** — which GGUF model/pre-tokenizer combinations map to which internal profile implementations; settle in `/plan-refine mvp3.3`.
+
+### MVP3.4 [v0.3.4] - Tentative
+
+Dense GGUF architecture families load through architecture adapters and concrete model-graph plans instead of hardcoded `TransformerModel` assumptions.
+
+#### Design Notes
+
+- **DN-M34-1** — Architecture support is resolved at model load/plan time. An architecture adapter maps GGUF metadata and tensor names to a concrete execution plan: tensor layout, norm behavior, activation function, attention bias behavior, RoPE strategy, KV shape, and layer graph. Hot-path execution uses the resolved concrete plan, not per-token architecture interface dispatch.
+  - Rationale: Qwen3, Gemma, Phi, Mistral, and later MoE variants share dense transformer machinery but differ in tensor naming, norm/activation details, attention variants, and positional encoding. Adapters keep `TransformerModel` from accumulating architecture-specific branches.
+  - Rejected: hardcoded architecture branches in `TransformerModel`; runtime architecture plugins during decode; separate libraries per architecture family without packaging need.
+  - Contract: `lair.models` exposes architecture adapters and produces a concrete model plan consumed by the engine.
+
+#### Implementation Items
+
+- [_] Architecture adapter registry — replace hardcoded supported-architecture handling with load-time adapters and clearer unsupported-architecture errors.
+  - Verify: `dotnet test --filter Category=Loader|Layers` — supported architecture selection plus unsupported-architecture rejection naming the adapter gap.
+- [_] Qwen3 dense coverage — add Qwen3 dense GGUF support through the adapter model, including head-dim, bias, activation, and RoPE metadata differences.
+  - Verify: `dotnet test --filter Category=Layers|Parity` — Qwen3 layer fixtures and real-model parity within documented tolerance.
+
+#### Tests
+
+- [_] Automated Architecture Adapters: tensor mapping, graph plan selection, unsupported architecture rejection.
+- [_] Automated Qwen3 Parity: dense Qwen3 output parity vs pinned llama.cpp within documented tolerance.
+
+#### Open Items
+
+- [_] **Adapter API shape** — how architecture adapters describe tensor maps, norm/activation behavior, attention variants, and RoPE strategy without hot-path virtual dispatch; settle in `/plan-refine mvp3.4`.
+- [_] **Family inclusion order** — Qwen3 first; Gemma/Phi/Mistral only as owner demand or fixture evidence justifies them; settle in `/plan-refine mvp3.4`.
+
+### MVP3.5 [v0.3.5] - Tentative
+
+Tool-call and model output formats are handled by load-time parser registries instead of the static fenced-JSON detector.
+
+#### Design Notes
+
+- **DN-M35-1** — Output parsing is a registry selected at model load from architecture, chat-template capabilities, and explicit config overrides. Built-in parsers may implement fenced JSON plus native model-family tool formats; selection happens before serving, not per-token in the decode loop.
+  - Rationale: general GGUF compatibility requires recognizing more than LAIR’s MVP2 fenced-JSON fallback. Model families emit different tool/reasoning markup, and parser behavior must be attributable to the loaded model rather than inferred from raw text.
+  - Rejected: a single static detector for all models; per-token parser dispatch during decode; separate libraries per parser family without packaging need.
+  - Contract: `lair.http`/`lair.models` request pipeline consumes a resolved output-parser plan and preserves OpenAI wire shape.
+
+#### Implementation Items
+
+- [_] Tool-call parser registry — define the parser interface and selection path; move current fenced-JSON detection behind a built-in parser implementation.
+  - Verify: `dotnet test --filter Category=Api|ToolCalls` — existing tool wire tests remain green under the registry.
+- [_] Native output parser families — add parser implementations for model-native tool/reasoning formats as templates and fixtures require them.
+  - Verify: `dotnet test --filter Category=ToolCalls` — parser goldens for each supported family; visible text stripping and OpenAI `tool_calls` deltas verified.
+
+#### Tests
+
+- [_] Automated ToolCalls: parser selection, native tool-call goldens, reasoning-tag stripping, streaming delta compatibility.
+
+#### Open Items
+
+- [_] **Parser selection metadata** — whether selection comes from architecture name, template capabilities, GGUF metadata, or explicit config; settle in `/plan-refine mvp3.5`.
+
+### MVP3.6 [v0.3.6] - Tentative
+
+Published GGUF quant families are accepted through a load-time quant descriptor/kernel registry while CPU kernels remain concrete and performance-sensitive.
+
+#### Design Notes
+
+- **DN-M36-1** — Quant compatibility is split into a load-time descriptor/registry and concrete kernel implementations. The registry owns GGML type acceptance, block geometry, row strides, and loader diagnostics; kernels stay concrete in `lair.backends.cpu` or backend-specific code paths.
+  - Rationale: quant formats are performance-critical and must preserve bit-identity/parity behavior. A registry makes loader support extensible without introducing dynamic interface dispatch in GEMV/GEMM loops.
+  - Rejected: per-row `IQuantKernel` dispatch in hot paths; separate libraries per quant format without packaging need; loader acceptance without kernel parity gates.
+  - Contract: `lair.loader` and `lair.contracts` resolve quant descriptors at load; backends execute concrete kernels for the selected formats.
+
+#### Implementation Items
+
+- [_] Quant descriptor registry — move GGML type acceptance, block geometry, and row-stride validation behind a registry while preserving current F16/Q8_0/Q4_K/Q5_0/Q5_K/Q6_K behavior.
+  - Verify: `dotnet test --filter Category=Loader|Kernel` — existing quant geometry/kernel tests remain green; unsupported GGML type errors name the descriptor gap.
+- [_] Common quant family coverage — add published GGUF quant families as demand and fixtures require them, keeping each format behind scalar/AVX2 oracle parity.
+  - Verify: `dotnet test --filter Category=Kernel|Parity` — synthetic-block scalar-vs-AVX2 bit-identity, batch equivalence, and real-fixture decode sanity per added format.
+
+#### Tests
+
+- [_] Automated Quant Registry: GGML type acceptance, block geometry, row strides, unsupported type diagnostics.
+- [_] Automated Quant Family: per-format scalar-vs-AVX2 bit-identity and real-fixture decode sanity.
+
+#### Open Items
+
+- [_] **Quant priority list** — which common quants enter MVP3.6 versus remaining in MVP5.1/backlog; settle in `/plan-refine mvp3.6`.
+
+### MVP3.7 [v0.3.7] - Tentative
+
+RoPE scaling and positional-encoding variants load through RoPE strategy adapters, including YaRN/LongRoPE/partial rotary where GGUF metadata declares them.
+
+#### Design Notes
+
+- **DN-M37-1** — Positional encoding is a strategy selected at model load. Standard full-head RoPE remains the default; rope-scaling variants are adapters that resolve scaling tables, attention scaling behavior, partial rotary dimensions, and model-specific metadata before decode.
+  - Rationale: YaRN and related rope-scaling schemes are not just theta adjustments; they affect rotary table construction, attention scaling, and sometimes partial rotary handling. They should not be folded into MVP3.2 or hidden inside architecture branches.
+  - Rejected: treating rope scaling as a metadata-only tweak; implementing YaRN before template/tokenizer compatibility is stable; per-token rope strategy dispatch during decode.
+  - Contract: `lair.models` resolves a concrete RoPE plan at load and feeds the layer executor through table-driven operations.
+
+#### Implementation Items
+
+- [_] RoPE strategy adapter — separate standard RoPE from rope-scaling/partial-rotary variants and make unsupported rope metadata actionable.
+  - Verify: `dotnet test --filter Category=Layers` — standard RoPE goldens remain green; unsupported rope scaling metadata names the unsupported variant.
+- [_] YaRN support — implement YaRN/LongRoPE-style scaling once the adapter shape is refined and real model fixtures exist.
+  - Verify: `dotnet test --filter Category=Layers|Parity` — rope table/activation fixtures plus real-model parity within documented tolerance.
+
+#### Tests
+
+- [_] Automated RoPE Strategies: standard RoPE regression, partial rotary handling, YaRN/LongRoPE fixtures.
+
+#### Open Items
+
+- [_] **YaRN fixture set** — which GGUF models and rope metadata variants become golden fixtures; settle in `/plan-refine mvp3.7`.
 
 ### MVP4 [v0.4.0] - Refined
 
@@ -669,3 +893,7 @@ Vision input on chat models.
 - **2026-11-03 — Project renames: `Lair.Api` → `Lair.Http`, `Lair.Core` → `Lair.Contracts`.** Owner-driven role naming: "Api" reads as a console app serving the API, but the project is the HTTP serving layer; "Core" held contracts only. `Lair.Http` names the serving adapter (endpoints, SSE streaming, request lifecycle, model router); `Lair.Contracts` names the contracts-only leaf (`IBackend`, `IWeightSource`, quant formats, tensor shapes). Mechanical rename of project dirs, csproj files, namespaces, and solution entries.
 - **2026-11-03 — MVP5.1 [v0.5.1] inserted ahead of Flash-Next: dense IQ3_XXS coverage.** Owner's target quant for their own runs is IQ3_XXS; dense loader + kernels must land before MVP6 MoE work, whose expert slabs assume the same format (DN-M6-2). Tentative: the kernel strategy (fused dequant-GEMV vs llama.cpp dot-vec tables) is an Open Item for `/plan-refine`, not a mechanical K-quant mirror.
 - **2026-11-03 — q4_k_m cross-engine decode gate: membership parity; no quant layout defect exists.** An initial llama.cpp CLI comparison on the real Q4_K_M fixture showed different greedy continuations, prompting a full audit: probes of b12032 `dequantize_row_q5_0/q4_K/q6_k` (independent transcription + real GGUF bytes) proved LAIR kernels byte-exact; float64 exact-arithmetic forwards showed q4-style weight noise flips a near tie — LAIR's argmax and the reference pick are mutual top-5 members with both sides' calibrated logprobs reproduced. Strict cross-engine token equality on low-bit formats is rejected as chasing llama.cpp approximation noise (consistent with the existing parity design); `tests/fixtures/parity-smollm-q4km.json` pins model sha256 + b12032 server reference mode.
+- **2026-11-04 — Chat garbling root-caused to RoPE pair convention; parity gates widened beyond first-step distributions.** Every LAIR path carrying ChatML markers garbled from the first token on all quants while llama.cpp b12032 stayed coherent. The tokenizer was proven innocent (`GgufTokenizer.Encode` equals `/tokenize` id-for-id, including control-type specials mid-text), and KV paging/chunked prefill/prefix-cache were disproven by identical K/V bytes and identical greedy chains across pools differing only in block geometry. `LayerOps.ApplyRopeToHead` rotated half-split pairs `(i, i + headDim/2)` instead of the GGUF adjacent convention `(2i, 2i + 1)`: logits agreed with llama.cpp at absolute position 0 (≤0.02 nats) but diverged 1.4–2.8 nats from position ≥1, and greedy decoding amplified that into newline spam past ~17 tokens — so the defect looked length-dependent and tokenizer-adjacent while neither was causal. A from-scratch float64 forward of the same GGUF reproduced pre-fix LAIR exactly under half-pairs and llama.cpp exactly under adjacent pairs, confirming llama.cpp is not the outlier. Gates widened: Parity adds a cross-tool logit band (±0.05 nats F16, ±1.0 quantized) against pinned b12032 values, and `ContinuationParityTests` pins exact greedy continuations for every F16 fixture prompt; the 2026-11-01 membership criterion still governs the quantized files, where near-tie flips remain documented. Fixture `lair_logprob` calibration re-recorded from post-fix code with all llama.cpp-derived reference values left byte-identical.
+- **2026-11-04 — Llama-family chat template support pulled forward as MVP3.2 [v0.3.2].** Owner hit the gap while looking for a model capable of holding a short conversation: `models/Llama-3.2-1B-Instruct-Q8_0.gguf` loads under pinned b12032 but LAIR refuses to serve it, failing at startup in `ChatTemplateRenderer` on its first `{% set %}` (offset 37); the template also needs `is defined`, `none` tests, slices, extra filters, comments, membership/boolean operators. Engine-side compatibility is already satisfied (`llama` arch, `pre = llama-bpe`, full-head RoPE, Q8_0 kernel), so Scope's dense Llama-class ≤3B commitment is unmet purely at the template layer — recorded as out-of-subset in MVP1's chat-template item and now promoted to its own Tentative phase pending `/plan-refine mvp3.2`.
+- **2026-11-04 — GGUF compatibility phase family added as MVP3.3–MVP3.7.** Owner agreed to implement MVP3.2 as a managed `Lair.Templating.Minja` library and defer tokenizer profiles, architecture adapters, tool-call parser registry, quant descriptor/kernel registry, and RoPE strategy adapters to subsequent Tentative MVP3.x phases. Variant implementations are resolved at model load/plan time, not during runtime, and do not get separate assemblies unless packaging requires it.
+- **2026-11-04 — MVP3.2 refined as full minja parity.** MVP3.2 now targets a managed `Lair.Templating.Minja` library with full minja parity for minja’s supported subset, custom `MinjaValue` semantics, minja-compatible scoping, chat-template polyfills/capability detection, hard template resource limits, and byte-exact validation against pinned llama.cpp `/apply-template`. The existing `ChatTemplateRenderer` is replaced rather than kept as a fallback.
