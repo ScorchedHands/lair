@@ -462,8 +462,8 @@ Published Llama-family chat models serve chat end-to-end on this machine, render
   - Verify: `dotnet build src/Lair.Templating.Minja/Lair.Templating.Minja.csproj` — succeeded with 0 warnings/0 errors; `dotnet list src/Lair.Templating.Minja/Lair.Templating.Minja.csproj reference` shows no LAIR runtime project references. Added to solution under `src`.
 - [✓] Lexer/parser/AST — implement minja tokenization, two-phase parsing, comments, whitespace elision, statements, expressions, and unsupported-construct rejection (see DN-M32-2)
   - Verify: `dotnet test --filter Category=MinjaSyntax -c Release` — 38/38 passed. Full `dotnet test -c Release` passed 362/362 on the final rerun; earlier reruns hit borderline concurrency/affinity flakes unrelated to parser code.
-- [_] `MinjaValue` and evaluator — implement ordered maps, Python-like truthiness, none/undefined equivalence, list/map/string operations, membership, boolean operators, slices, arithmetic/concatenation, and minja-compatible JSON dump (see DN-M32-3)
-  - Verify: `dotnet test --filter Category=MinjaEval` — expression/value goldens for truthiness, equality, membership, indexing, slicing, concatenation, map/list dump, and numeric behavior.
+- [✓] `MinjaValue` and evaluator — implement ordered maps, Python-like truthiness, none/undefined equivalence, list/map/string operations, membership, boolean operators, slices, arithmetic/concatenation, and minja-compatible JSON dump (see DN-M32-3)
+  - Verify: `dotnet test --filter Category=MinjaEval -c Release` — 103/103 passed; full suite 465/465 green. Missing keys, out-of-range indexes, and undefined attributes evaluate as none; maps cannot be sliced; statements/filters/tests/calls currently raise bounded unsupported errors.
 - [_] Minja statements — implement `if`/`elif`/`else`, `for` with `loop.*`, `recursive`, `if`, `break`, `continue`, destructuring, `set` with namespaces/destructuring, `macro`, `call`, and `filter` with minja-compatible scoping (see DN-M32-4)
   - Verify: `dotnet test --filter Category=MinjaStatements` — scoping goldens for `{% set %}` inside `if`/`for`, namespace objects, loop re-binding, macro/call/filter behavior, and destructuring.
 - [_] Minja filters/tests/functions — implement minja’s supported filter/test/function collection, including `raise_exception`, `tojson`, `trim`, `length`, `items`, `dictsort`, `join`, `range`, `select`/`reject` variants, `namespace`, `escape`, and chat-template helpers needed by oracle tests (see DN-M32-5)
@@ -482,7 +482,7 @@ Published Llama-family chat models serve chat end-to-end on this machine, render
 #### Tests
 
 - [✓] Automated MinjaSyntax: supported minja constructs, unsupported non-minja constructs, whitespace/comment handling, and parse errors naming construct + position. ✅ 38 tests in `tests/Lair.Tests/MinjaSyntaxTests.cs`; targeted syntax filter passed 38/38.
-- [_] Automated MinjaEval: value model, truthiness, membership, indexing, slicing, concatenation, maps/lists, and minja-compatible JSON dump.
+- [✓] Automated MinjaEval: value model, truthiness, membership, indexing, slicing, concatenation, maps/lists, and minja-compatible JSON dump. ✅ `tests/Lair.Tests/MinjaEvalTests.cs` — 103 cases passed under `Category=MinjaEval`.
 - [_] Automated MinjaStatements: `if`, `for`, `loop.*`, `break`, `continue`, `set`, namespaces, destructuring, `macro`, `call`, `filter`, and scoping goldens.
 - [_] Automated MinjaFilters: minja filter/test/function collection, including `raise_exception` render-time `invalid_request` mapping.
 - [_] Automated MinjaChat: chat-template inputs, polyfills, capabilities, BOS/EOS behavior, tool precedence facts, and `add_generation_prompt` variants.

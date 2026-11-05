@@ -303,7 +303,11 @@ public sealed partial class MinjaParser
         if (PeekAt(_pos) == ']')
             throw Malformed(_pos, "empty index");
 
-        ExpressionNode? first = PeekAt(_pos) == ':' ? null : ParseExpression();
+        // A body that opens with ':' has no start bound; parse it as the colon-first slice form.
+        if (PeekAt(_pos) == ':')
+            return ParseColonSliceBody(target, start);
+
+        ExpressionNode? first = ParseExpression();
 
         SkipWhitespace();
 
@@ -329,6 +333,30 @@ public sealed partial class MinjaParser
         Expect(']', start);
 
         return new IndexExpression(target, first, stop, step, Slice: true) { Offset = start };
+    }
+
+    /// <summary>
+    /// Parses the body of [...] after the opening bracket when it starts directly with a colon: the [:b] and
+    /// [::s] forms have no start bound, so the body is parsed as an empty start followed by stop and step.
+    /// </summary>
+    private ExpressionNode ParseColonSliceBody(ExpressionNode target, int start)
+    {
+        Expect(':', start);
+
+        ExpressionNode? stop = PeekAny(']', ':') ? null : ParseExpression();
+        ExpressionNode? step = null;
+
+        SkipWhitespace();
+        if (PeekAt(_pos) == ':')
+        {
+            _pos++;
+            SkipWhitespace();
+            step = PeekAt(_pos) == ']' ? null : ParseExpression();
+        }
+
+        Expect(']', start);
+
+        return new IndexExpression(target, Start: null, stop, step, Slice: true) { Offset = start };
     }
 
     private bool PeekAny(params char[] candidates)
