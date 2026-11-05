@@ -2,8 +2,8 @@ namespace Lair.Templating.Minja;
 
 /// <summary>
 /// Thrown when a parsed template cannot be evaluated or rendered. The message names the failing construct
-/// and carries its 0-based character offset in the template source when known. Statement constructs are
-/// reported here until statement execution is implemented.
+/// and carries its 0-based character offset in the template source when known. Built-in filters, tests and
+/// function calls are reported here until the filters item implements them.
 /// </summary>
 public sealed class MinjaRenderException : Exception
 {
@@ -19,9 +19,6 @@ public sealed class MinjaRenderException : Exception
         Construct = construct;
         Position = position;
     }
-
-    internal static MinjaRenderException UnsupportedStatement(string statementName, int position) =>
-        new(statementName, position, $"'{statementName}' statements are not implemented yet");
 
     internal static MinjaRenderException UnsupportedExpression(string construct, int position) =>
         new(construct, position, $"'{construct}' is not supported by the expression evaluator yet");

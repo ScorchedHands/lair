@@ -388,19 +388,24 @@ public sealed class MinjaEvalTests
     }
 
     [Fact]
-    public void Render_StatementNodesThrowUnsupportedStatementError()
+    public void Render_StatementsExecuteWithContextValues()
     {
-        MinjaRenderException error = Assert.Throws<MinjaRenderException>(() => Render("{% if x %}a{% endif %}"));
-        Assert.Equal("if", error.Construct);
-        Assert.Contains("not implemented", error.Message);
+        // Statements used to raise an unsupported-statement error; they now execute against the context.
+        // Deeper statement and scoping goldens live under Category=MinjaStatements.
+        IReadOnlyDictionary<string, MinjaValue> context = Context(
+            ("x", MinjaValue.Of(1L)),
+            ("items", ListOf(MinjaValue.Of(1L), MinjaValue.Of(2L))));
 
-        Assert.Throws<MinjaRenderException>(() => Render("{% for i in items %}{{ i }}{% endfor %}"));
-        Assert.Throws<MinjaRenderException>(() => Render("{% set x = 1 %}"));
+        Assert.Equal("a", Render("{% if x %}a{% endif %}", context));
+        Assert.Equal("", Render("{% if missing %}a{% endif %}", context));
+        Assert.Equal("12", Render("{% for i in items %}{{ i }}{% endfor %}", context));
+        Assert.Equal("1", Render("{% set x = 1 %}{{ x }}", context));
     }
 
     [Fact]
     public void Render_FiltersTestsAndCallsRemainUnsupported()
     {
+        // Built-in filters, tests and function calls stay unsupported until the filters item lands.
         Assert.Throws<MinjaRenderException>(() => Render("{{ 'a' | upper }}"));
         Assert.Throws<MinjaRenderException>(() => Render("{{ x is defined }}"));
         Assert.Throws<MinjaRenderException>(() => Render("{{ range(3) }}"));

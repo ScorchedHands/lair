@@ -4,10 +4,14 @@ using System.Text;
 namespace Lair.Templating.Minja;
 
 /// <summary>
-/// Evaluates minja expressions and renders expression-only templates. Missing names, missing map keys and
-/// out-of-range indexes all evaluate as none, mirroring minja's none/undefined equivalence; string and list
-/// indexes accept Python-style negative offsets. Statement tags, filters, tests and calls raise
-/// <see cref="MinjaRenderException"/> until their runtime is implemented.
+/// Evaluates minja expressions and renders templates, including if/elif/else, for, set, macro, call and filter
+/// statements with minja-compatible scoping. Missing names, missing map keys and out-of-range indexes all
+/// evaluate as none, mirroring minja's none/undefined equivalence; string and list indexes accept Python-style
+/// negative offsets. Block bodies share the scope they are entered in, so <c>{% set %}</c> stays visible after
+/// its block, while macro, call and filter invocations render in a child scope that closes over its defining
+/// context for reads and keeps its own locals private. Built-in filters, tests and function calls raise
+/// <see cref="MinjaRenderException"/> until the filters item lands; user-defined macros and call bodies are
+/// callable.
 /// </summary>
 public static class MinjaEvaluator
 {
@@ -19,16 +23,19 @@ public static class MinjaEvaluator
         TemplateNode root = MinjaParser.Parse("{{ " + expression + " }}");
         OutputNode output = root.Nodes.OfType<OutputNode>().First();
 
-        return Eval(output.Expression, context);
+        return Eval(output.Expression, TemplateScope.Root(context));
     }
 
     /// <summary>Evaluates an expression node from an already parsed AST.</summary>
     public static MinjaValue Evaluate(ExpressionNode expression, IReadOnlyDictionary<string, MinjaValue>? context = null) =>
-        Eval(expression, context);
+        Eval(expression, TemplateScope.Root(context));
+
+    /// <summary>Evaluates an expression node against an existing runtime scope, so callables evaluate their arguments in their invocation scope.</summary>
+    internal static MinjaValue EvaluateInScope(ExpressionNode expression, TemplateScope scope) => Eval(expression, scope);
 
     /// <summary>
-    /// Renders a template that contains only text, comments and expression outputs. Text runs already carry
-    /// the exact bytes to emit because the parser applies whitespace elision at parse time.
+    /// Renders a template against a context. Text runs already carry the exact bytes to emit because the parser
+    /// applies whitespace elision at parse time; statement bodies execute against the shared template scope.
     /// </summary>
     public static string Render(string template, IReadOnlyDictionary<string, MinjaValue>? context = null)
     {
@@ -42,11 +49,22 @@ public static class MinjaEvaluator
         ArgumentNullException.ThrowIfNull(template);
 
         StringBuilder builder = new();
-        RenderNodes(template.Nodes, context, builder);
+        RenderFlow flow = RenderBody(template.Nodes, TemplateScope.Root(context), builder);
+
+        // A loop consumes its own break/continue; flow reaching the top level escaped every loop.
+        if (flow != RenderFlow.None)
+            throw FlowOutsideLoop(flow, -1);
+
         return builder.ToString();
     }
 
-    private static void RenderNodes(IReadOnlyList<MinjaNode> nodes, IReadOnlyDictionary<string, MinjaValue>? context, StringBuilder builder)
+    // ---------------------------------------------------------------- statement execution
+
+    /// <summary>
+    /// Renders a body into the builder and reports control flow requested by break/continue. Bodies share the
+    /// scope they are entered in, which is what keeps {% set %} inside an if or for block visible after the block.
+    /// </summary>
+    private static RenderFlow RenderBody(IReadOnlyList<MinjaNode> nodes, TemplateScope scope, StringBuilder builder)
     {
         foreach (MinjaNode node in nodes)
         {
@@ -60,34 +78,403 @@ public static class MinjaEvaluator
                     break;
 
                 case OutputNode output:
-                    builder.Append(Eval(output.Expression, context).ToString());
+                    builder.Append(Eval(output.Expression, scope).ToString());
                     break;
 
-                case StatementNode statement:
-                    throw MinjaRenderException.UnsupportedStatement(StatementName(statement), statement.Offset);
+                case IfStatement statement:
+                {
+                    RenderFlow branchFlow = RenderIf(statement, scope, builder);
+
+                    if (branchFlow != RenderFlow.None)
+                        return branchFlow;
+
+                    break;
+                }
+
+                case ForStatement statement:
+                    RenderItems(statement, statement.Iterable, scope, builder);
+                    break;
+
+                case SetStatement statement:
+                    RenderSet(statement, scope);
+                    break;
+
+                case MacroStatement statement:
+                    // A macro defined inside an if or for block stays callable after the block like any other set.
+                    scope.DefineCallable(statement.Name, new MacroValue(statement.Name, statement.Parameters, statement.Body, scope));
+                    break;
+
+                case CallStatement statement:
+                    RenderCall(statement, scope, builder);
+                    break;
+
+                case FilterStatement statement:
+                    RenderFilter(statement, scope, builder);
+                    break;
+
+                case BreakStatement:
+                    return RenderFlow.Break;
+
+                case ContinueStatement:
+                    return RenderFlow.Continue;
 
                 default:
                     throw MinjaRenderException.UnsupportedExpression(node.GetType().Name, node.Offset);
             }
         }
+
+        return RenderFlow.None;
     }
 
-    private static string StatementName(StatementNode statement) => statement switch
+    private static RenderFlow RenderIf(IfStatement statement, TemplateScope scope, StringBuilder builder)
     {
-        IfStatement => "if",
-        ForStatement => "for",
-        SetStatement => "set",
-        MacroStatement => "macro",
-        CallStatement => "call",
-        FilterStatement => "filter",
-        BreakStatement => "break",
-        ContinueStatement => "continue",
-        _ => statement.GetType().Name,
+        foreach (IfBranch branch in statement.Branches)
+        {
+            if (Eval(branch.Condition, scope).IsTruthy)
+                return RenderBody(branch.Body, scope, builder);
+        }
+
+        return statement.ElseBody is not null
+            ? RenderBody(statement.ElseBody, scope, builder)
+            : RenderFlow.None;
+    }
+
+    /// <summary>
+    /// Runs a for statement over a chosen iterable expression. Recursive loops re-enter through this method with
+    /// a nested iterable supplied by a loop(items) call, which is how templates flatten trees.
+    /// </summary>
+    private static void RenderItems(ForStatement statement, ExpressionNode iterable, TemplateScope scope, StringBuilder builder)
+    {
+        IReadOnlyList<MinjaValue> items = EnumerateIterable(Eval(iterable, scope), statement.Offset);
+
+        // Loop targets and the loop object are restored when the loop ends. Jinja leaks the last loop value into
+        // its frame; restoring instead keeps a loop from clobbering a same-named outer binding. This is the
+        // deliberate choice here until oracle parity tests settle the question.
+        (string Name, bool Had, MinjaValue Value)[] saved = CaptureBindings(TargetNames(statement.Target), scope);
+        bool hadLoop = scope.TryGetValue("loop", out MinjaValue outerLoop);
+
+        // minja binds the target while the loop condition runs, so the filter sees each candidate item.
+        List<MinjaValue> filtered = [];
+
+        foreach (MinjaValue item in items)
+        {
+            BindTarget(statement.Target, item, scope, statement.Offset);
+
+            if (statement.LoopCondition is null || Eval(statement.LoopCondition, scope).IsTruthy)
+                filtered.Add(item);
+        }
+
+        LoopState loop = new(filtered.Count);
+
+        for (int i = 0; i < filtered.Count; i++)
+        {
+            loop.Index0 = i;
+            scope.SetValue("loop", loop.ToMap());
+
+            // A recursive for also binds the loop name as a callable so {{ loop(nested) }} renders the same body
+            // over a nested iterable, with fresh loop bookkeeping for that nested pass.
+            if (statement.Recursive)
+                scope.DefineCallable("loop", new RecursiveLoopValue(statement, scope));
+
+            BindTarget(statement.Target, filtered[i], scope, statement.Offset);
+
+            if (RenderBody(statement.Body, scope, builder) == RenderFlow.Break)
+                break;
+        }
+
+        if (hadLoop)
+            scope.SetValue("loop", outerLoop);
+        else
+            scope.Remove("loop");
+
+        RestoreBindings(saved, scope);
+    }
+
+    private static void RenderSet(SetStatement statement, TemplateScope scope)
+    {
+        if (statement.Targets.Count == 1)
+        {
+            AssignTarget(statement.Targets[0], Eval(statement.Value, scope), scope, statement.Offset);
+            return;
+        }
+
+        // Flat set destructuring binds the single list value positionally across the target names.
+        MinjaValue value = Eval(statement.Value, scope);
+
+        if (value.Kind != MinjaValueKind.List)
+            throw new MinjaRenderException("set", statement.Offset, $"destructuring set requires a list value but found {value.Kind}");
+
+        IReadOnlyList<MinjaValue> items = value.Items;
+
+        if (items.Count != statement.Targets.Count)
+            throw new MinjaRenderException("set", statement.Offset, $"expected {statement.Targets.Count} values to destructure but found {items.Count}");
+
+        for (int i = 0; i < items.Count; i++)
+            AssignTarget(statement.Targets[i], items[i], scope, statement.Offset);
+    }
+
+    private static void RenderCall(CallStatement statement, TemplateScope scope, StringBuilder builder)
+    {
+        if (!scope.TryGetCallable(CallableName(statement.Callable), out MinjaCallable? callable) || callable is null)
+            throw new MinjaRenderException("call", statement.Offset, "call blocks need a macro or block callable in scope");
+
+        CallerBlockValue caller = new(statement.Body, scope);
+        MinjaValue rendered = callable.Invoke(statement.Arguments, scope, statement.Offset, caller, input: null);
+
+        builder.Append(rendered.ToString());
+    }
+
+    private static void RenderFilter(FilterStatement statement, TemplateScope scope, StringBuilder builder)
+    {
+        StringBuilder body = new();
+        RenderFlow bodyFlow = RenderBody(statement.Body, scope, body);
+
+        if (bodyFlow != RenderFlow.None)
+            throw FlowOutsideLoop(bodyFlow, statement.Offset);
+
+        string text = body.ToString();
+
+        // Jinja renders the else body when the filtered body is empty, then applies the callable to whichever text won.
+        if (text.Length == 0 && statement.ElseBody is not null)
+        {
+            StringBuilder elseBody = new();
+            RenderFlow elseFlow = RenderBody(statement.ElseBody, scope, elseBody);
+
+            if (elseFlow != RenderFlow.None)
+                throw FlowOutsideLoop(elseFlow, statement.Offset);
+
+            text = elseBody.ToString();
+        }
+
+        if (!scope.TryGetCallable(statement.Name, out MinjaCallable? callable) || callable is null)
+            throw new MinjaRenderException("filter", statement.Offset, $"no callable named '{statement.Name}'; built-in filters are not implemented yet");
+
+        MinjaValue result = callable.Invoke(statement.Arguments, scope, statement.Offset, caller: null, MinjaValue.Of(text));
+
+        builder.Append(result.ToString());
+    }
+
+    /// <summary>
+    /// Invokes a macro or captured block body in a child of its defining scope. Parameters and locals are defined
+    /// in the child, so they shadow and never overwrite outer bindings; the child reads through the chain, which
+    /// is the closure over the defining context. A macro invoked from a {% call %} block also receives the body
+    /// as _caller (and as the Jinja name caller).
+    /// </summary>
+    internal static MinjaValue InvokeBody(
+        IReadOnlyList<MinjaNode> body,
+        IReadOnlyList<MacroParameter> parameters,
+        TemplateScope definingScope,
+        IReadOnlyList<CallArgument> arguments,
+        int offset,
+        CallerBlockValue? caller,
+        MinjaValue? input)
+    {
+        TemplateScope local = TemplateScope.Child(definingScope);
+
+        BindArguments(parameters, arguments, definingScope, local, offset, input);
+
+        if (caller is not null)
+        {
+            local.DefineCallable("_caller", caller);
+            local.DefineCallable("caller", caller);
+        }
+
+        StringBuilder builder = new();
+        RenderFlow flow = RenderBody(body, local, builder);
+
+        if (flow != RenderFlow.None)
+            throw FlowOutsideLoop(flow, offset);
+
+        return MinjaValue.Of(builder.ToString());
+    }
+
+    private static void BindArguments(
+        IReadOnlyList<MacroParameter> parameters,
+        IReadOnlyList<CallArgument> arguments,
+        TemplateScope definingScope,
+        TemplateScope local,
+        int offset,
+        MinjaValue? input)
+    {
+        List<CallArgument> positional = [.. arguments.Where(argument => argument.Name is null)];
+        HashSet<string> bound = [];
+        int nextParameter = 0;
+
+        // A {% filter %} block passes the rendered body as the leading positional input value.
+        if (input is not null)
+        {
+            if (parameters.Count == 0)
+                throw new MinjaRenderException("filter", offset, "filter callables need at least one parameter to receive the body");
+
+            local.SetValue(parameters[0].Name, input);
+            bound.Add(parameters[0].Name);
+            nextParameter = 1;
+        }
+
+        if (nextParameter + positional.Count > parameters.Count)
+            throw new MinjaRenderException("call", offset, $"expected at most {parameters.Count - nextParameter} positional arguments but found {positional.Count}");
+
+        foreach (CallArgument argument in positional)
+        {
+            MacroParameter parameter = parameters[nextParameter++];
+            local.SetValue(parameter.Name, EvaluateInScope(argument.Value, local));
+            bound.Add(parameter.Name);
+        }
+
+        foreach (CallArgument argument in arguments)
+        {
+            if (argument.Name is null)
+                continue;
+
+            MacroParameter? parameter = parameters.FirstOrDefault(candidate => candidate.Name == argument.Name);
+
+            if (parameter is null)
+                throw new MinjaRenderException("call", offset, $"'{argument.Name}' is not a parameter of this macro");
+
+            if (!bound.Add(parameter.Name))
+                throw new MinjaRenderException("call", offset, $"'{parameter.Name}' was passed more than once");
+
+            local.SetValue(parameter.Name, EvaluateInScope(argument.Value, local));
+        }
+
+        foreach (MacroParameter parameter in parameters)
+        {
+            if (bound.Contains(parameter.Name))
+                continue;
+
+            if (parameter.DefaultValue is null)
+            {
+                local.SetValue(parameter.Name, MinjaValue.None);
+                continue;
+            }
+
+            // Defaults evaluate against the defining scope, matching Jinja macro default semantics.
+            local.SetValue(parameter.Name, EvaluateInScope(parameter.DefaultValue, definingScope));
+        }
+    }
+
+    private static string CallableName(ExpressionNode callee) => callee is NameExpression name
+        ? name.Name
+        : throw new MinjaRenderException("call", callee.Offset, "only plain macro names are callable until built-in functions land");
+
+    private static MinjaRenderException FlowOutsideLoop(RenderFlow flow, int offset) =>
+        new(flow == RenderFlow.Break ? "break" : "continue", offset, "break and continue are only valid inside a for loop");
+
+    // ---------------------------------------------------------------- targets and iteration
+
+    private static IReadOnlyList<MinjaValue> EnumerateIterable(MinjaValue value, int offset) => value.Kind switch
+    {
+        MinjaValueKind.List => value.Items,
+
+        // Iterating a map walks its keys in insertion order, like Jinja and minja.
+        MinjaValueKind.Map => [.. value.MapValue.Keys.Select(MinjaValue.Of)],
+
+        // Strings iterate as single-character strings, matching their indexing and slicing behavior.
+        MinjaValueKind.String => [.. value.StringValue.Select(character => MinjaValue.Of(character.ToString()))],
+
+        // Undefined iterates as an empty sequence, matching Jinja's sequence-like undefined.
+        MinjaValueKind.None => [],
+
+        _ => throw new MinjaRenderException("for", offset, $"cannot iterate a {value.Kind} value"),
     };
+
+    private static IEnumerable<string> TargetNames(TargetPattern target) => target switch
+    {
+        NameTarget name => [name.Name],
+        TupleTarget tuple => tuple.Items.SelectMany(TargetNames),
+        _ => throw new MinjaRenderException("for", target.Offset, $"'{target.GetType().Name}' targets are not supported"),
+    };
+
+    private static (string Name, bool Had, MinjaValue Value)[] CaptureBindings(IEnumerable<string> names, TemplateScope scope) =>
+        [.. names.Select(name => (name, scope.TryGetValue(name, out MinjaValue value), value))];
+
+    private static void RestoreBindings((string Name, bool Had, MinjaValue Value)[] saved, TemplateScope scope)
+    {
+        foreach ((string name, bool had, MinjaValue value) in saved)
+        {
+            if (had)
+                scope.SetValue(name, value);
+            else
+                scope.Remove(name);
+        }
+    }
+
+    private static void BindTarget(TargetPattern target, MinjaValue item, TemplateScope scope, int offset)
+    {
+        switch (target)
+        {
+            case NameTarget name:
+                scope.SetValue(name.Name, item);
+                return;
+
+            case TupleTarget tuple:
+            {
+                if (item.Kind != MinjaValueKind.List)
+                    throw new MinjaRenderException("for", offset, $"destructuring targets require list items but found {item.Kind}");
+
+                IReadOnlyList<MinjaValue> items = item.Items;
+
+                if (items.Count != tuple.Items.Count)
+                    throw new MinjaRenderException("for", offset, $"expected {tuple.Items.Count} values to destructure but found {items.Count}");
+
+                for (int i = 0; i < items.Count; i++)
+                    BindTarget(tuple.Items[i], items[i], scope, offset);
+
+                return;
+            }
+
+            default:
+                throw new MinjaRenderException("for", offset, $"'{target.GetType().Name}' targets are not supported");
+        }
+    }
+
+    private static void AssignTarget(SetTarget target, MinjaValue value, TemplateScope scope, int offset)
+    {
+        if (target.Attributes.Count == 1)
+        {
+            scope.SetValue(target.Name, value);
+            return;
+        }
+
+        // Namespaced dotted assignment walks to the owning map and mutates it in place, so every scope or value
+        // holding that same map reference sees the change.
+        if (!scope.TryGetValue(target.Name, out MinjaValue owner))
+            throw new MinjaRenderException("set", offset, $"cannot set an attribute of undefined name '{target.Name}'");
+
+        MinjaValue current = owner;
+
+        for (int i = 1; i < target.Attributes.Count - 1; i++)
+        {
+            if (current.Kind != MinjaValueKind.Map)
+                throw new MinjaRenderException("set", offset, $"cannot set an attribute on a {current.Kind} value");
+
+            current = current.MapValue.Get(target.Attributes[i]);
+        }
+
+        if (current.Kind != MinjaValueKind.Map)
+            throw new MinjaRenderException("set", offset, $"cannot set an attribute on a {current.Kind} value");
+
+        current.MapValue.Set(target.Attributes[^1], value);
+    }
+
+    /// <summary>Callable bound as the loop name inside a recursive for: it re-enters the same for statement with a nested iterable.</summary>
+    private sealed class RecursiveLoopValue(ForStatement statement, TemplateScope scope) : MinjaCallable
+    {
+        public MinjaValue Invoke(IReadOnlyList<CallArgument> arguments, TemplateScope callSite, int offset, CallerBlockValue? caller, MinjaValue? input)
+        {
+            if (arguments.Count != 1)
+                throw new MinjaRenderException("loop", offset, "recursive loops take exactly one iterable per call");
+
+            StringBuilder builder = new();
+            RenderItems(statement, arguments[0].Value, scope, builder);
+
+            return MinjaValue.Of(builder.ToString());
+        }
+    }
 
     // ---------------------------------------------------------------- expression evaluation
 
-    private static MinjaValue Eval(ExpressionNode node, IReadOnlyDictionary<string, MinjaValue>? context)
+    private static MinjaValue Eval(ExpressionNode node, TemplateScope? scope)
     {
         switch (node)
         {
@@ -108,33 +495,36 @@ public static class MinjaEvaluator
 
             case NameExpression name:
                 // Undefined names are none: minja does not distinguish missing from null.
-                if (context is not null && context.TryGetValue(name.Name, out MinjaValue? value))
+                if (scope is not null && scope.TryGetValue(name.Name, out MinjaValue value))
                     return value;
 
                 return MinjaValue.None;
 
             case AttributeExpression attribute:
-                return EvalAttribute(attribute, context);
+                return EvalAttribute(attribute, scope);
 
             case IndexExpression index:
-                return EvalIndex(index, context);
+                return EvalIndex(index, scope);
 
             case UnaryExpression unary:
-                return EvalUnary(unary, context);
+                return EvalUnary(unary, scope);
 
             case BinaryExpression binary:
-                return EvalBinary(binary, context);
+                return EvalBinary(binary, scope);
 
             case ComparisonExpression comparison:
-                return EvalComparison(comparison, context);
+                return EvalComparison(comparison, scope);
 
             case MembershipExpression membership:
-                return EvalMembership(membership, context);
+                return EvalMembership(membership, scope);
 
             case ConditionalExpression conditional:
-                return Eval(conditional.Condition, context).IsTruthy
-                    ? Eval(conditional.TrueBranch, context)
-                    : Eval(conditional.ElseBranch, context);
+                return Eval(conditional.Condition, scope).IsTruthy
+                    ? Eval(conditional.TrueBranch, scope)
+                    : Eval(conditional.ElseBranch, scope);
+
+            case CallExpression call:
+                return EvalCall(call, scope);
 
             case FilterChainExpression:
                 throw MinjaRenderException.UnsupportedExpression("filter", node.Offset);
@@ -142,30 +532,43 @@ public static class MinjaEvaluator
             case TestExpression:
                 throw MinjaRenderException.UnsupportedExpression("test", node.Offset);
 
-            case CallExpression:
-                throw MinjaRenderException.UnsupportedExpression("call", node.Offset);
-
             default:
                 throw MinjaRenderException.UnsupportedExpression(node.GetType().Name, node.Offset);
         }
     }
 
-    private static MinjaValue EvalAttribute(AttributeExpression node, IReadOnlyDictionary<string, MinjaValue>? context)
+    /// <summary>
+    /// Evaluates a call. Only names bound to macros or block callables are callable today; calling a plain value
+    /// is a render error, and built-in functions such as range or raise_exception land with the filters item.
+    /// </summary>
+    private static MinjaValue EvalCall(CallExpression node, TemplateScope? scope)
     {
-        MinjaValue target = Eval(node.Target, context);
+        TemplateScope callSite = scope ?? TemplateScope.Root(null);
+
+        if (node.Callee is NameExpression name && callSite.TryGetCallable(name.Name, out MinjaCallable? callable) && callable is not null)
+            return callable.Invoke(node.Arguments, callSite, node.Offset, caller: null, input: null);
+
+        MinjaValue callee = Eval(node.Callee, scope);
+
+        throw new MinjaRenderException("call", node.Offset, $"cannot call a {callee.Kind} value; only macros and block callables are callable until built-ins land");
+    }
+
+    private static MinjaValue EvalAttribute(AttributeExpression node, TemplateScope? scope)
+    {
+        MinjaValue target = Eval(node.Target, scope);
 
         // Attribute access on a map reads the key; anything else (including a missing map key) is undefined, which is none.
         return target.Kind == MinjaValueKind.Map ? target.MapValue.Get(node.Name) : MinjaValue.None;
     }
 
-    private static MinjaValue EvalIndex(IndexExpression node, IReadOnlyDictionary<string, MinjaValue>? context)
+    private static MinjaValue EvalIndex(IndexExpression node, TemplateScope? scope)
     {
-        MinjaValue target = Eval(node.Target, context);
+        MinjaValue target = Eval(node.Target, scope);
 
         if (node.Slice)
-            return EvalSlice(target, node, context);
+            return EvalSlice(target, node, scope);
 
-        MinjaValue key = Eval(node.Start!, context);
+        MinjaValue key = Eval(node.Start!, scope);
 
         switch (target.Kind)
         {
@@ -215,7 +618,7 @@ public static class MinjaEvaluator
         throw new MinjaRenderException("index", node.Offset, $"index must be an integer but found {key.Kind}");
     }
 
-    private static MinjaValue EvalSlice(MinjaValue target, IndexExpression node, IReadOnlyDictionary<string, MinjaValue>? context)
+    private static MinjaValue EvalSlice(MinjaValue target, IndexExpression node, TemplateScope? scope)
     {
         // Slicing an undefined value is itself undefined.
         if (target.Kind == MinjaValueKind.None)
@@ -229,9 +632,9 @@ public static class MinjaEvaluator
             _ => throw new MinjaRenderException("slice", node.Offset, $"cannot slice a {target.Kind}"),
         };
 
-        long? startRaw = node.Start is null ? null : RequireIndex(Eval(node.Start, context), node);
-        long? stopRaw = node.Stop is null ? null : RequireIndex(Eval(node.Stop, context), node);
-        long step = node.Step is null ? 1L : RequireIndex(Eval(node.Step, context), node);
+        long? startRaw = node.Start is null ? null : RequireIndex(Eval(node.Start, scope), node);
+        long? stopRaw = node.Stop is null ? null : RequireIndex(Eval(node.Stop, scope), node);
+        long step = node.Step is null ? 1L : RequireIndex(Eval(node.Step, scope), node);
 
         if (step == 0)
             throw new MinjaRenderException("slice", node.Offset, "slice step cannot be zero");
@@ -299,9 +702,9 @@ public static class MinjaEvaluator
         return (backwardStart, backwardStop);
     }
 
-    private static MinjaValue EvalUnary(UnaryExpression node, IReadOnlyDictionary<string, MinjaValue>? context)
+    private static MinjaValue EvalUnary(UnaryExpression node, TemplateScope? scope)
     {
-        MinjaValue operand = Eval(node.Operand, context);
+        MinjaValue operand = Eval(node.Operand, scope);
 
         if (node.Operator == UnaryOperator.Not)
             return MinjaValue.Of(!operand.IsTruthy);
@@ -322,18 +725,18 @@ public static class MinjaEvaluator
         }
     }
 
-    private static MinjaValue EvalBinary(BinaryExpression node, IReadOnlyDictionary<string, MinjaValue>? context)
+    private static MinjaValue EvalBinary(BinaryExpression node, TemplateScope? scope)
     {
-        MinjaValue left = Eval(node.Left, context);
+        MinjaValue left = Eval(node.Left, scope);
 
         // and/or short-circuit and return the operand itself, not a boolean, matching Python and minja.
         if (node.Operator == BinaryOperator.And)
-            return left.IsTruthy ? Eval(node.Right, context) : left;
+            return left.IsTruthy ? Eval(node.Right, scope) : left;
 
         if (node.Operator == BinaryOperator.Or)
-            return left.IsTruthy ? left : Eval(node.Right, context);
+            return left.IsTruthy ? left : Eval(node.Right, scope);
 
-        MinjaValue right = Eval(node.Right, context);
+        MinjaValue right = Eval(node.Right, scope);
 
         switch (node.Operator)
         {
@@ -439,10 +842,10 @@ public static class MinjaEvaluator
             throw new MinjaRenderException(op.ToString(), offset, $"cannot apply '{op}' to {left.Kind} and {right.Kind}");
     }
 
-    private static MinjaValue EvalComparison(ComparisonExpression node, IReadOnlyDictionary<string, MinjaValue>? context)
+    private static MinjaValue EvalComparison(ComparisonExpression node, TemplateScope? scope)
     {
-        MinjaValue left = Eval(node.Left, context);
-        MinjaValue right = Eval(node.Right, context);
+        MinjaValue left = Eval(node.Left, scope);
+        MinjaValue right = Eval(node.Right, scope);
 
         switch (node.Operator)
         {
@@ -492,10 +895,10 @@ public static class MinjaEvaluator
         throw new MinjaRenderException("comparison", offset, $"cannot order-compare {left.Kind} with {right.Kind}");
     }
 
-    private static MinjaValue EvalMembership(MembershipExpression node, IReadOnlyDictionary<string, MinjaValue>? context)
+    private static MinjaValue EvalMembership(MembershipExpression node, TemplateScope? scope)
     {
-        MinjaValue item = Eval(node.Item, context);
-        MinjaValue container = Eval(node.Container, context);
+        MinjaValue item = Eval(node.Item, scope);
+        MinjaValue container = Eval(node.Container, scope);
 
         bool found = container.Kind switch
         {
