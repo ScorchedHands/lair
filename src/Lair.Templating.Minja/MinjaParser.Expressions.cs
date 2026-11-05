@@ -143,7 +143,7 @@ public sealed partial class MinjaParser
                 string testName = ReadName(testStart);
                 List<CallArgument> arguments = MatchOpenParen() ? ParseArguments(testStart) : [];
 
-                left = new TestExpression(testName, arguments, Negated: negatedTest) { Offset = start };
+                left = new TestExpression(testName, arguments, negatedTest, left) { Offset = start };
                 continue;
             }
 
@@ -267,6 +267,9 @@ public sealed partial class MinjaParser
 
                 while (PeekAfterWhitespace('|'))
                 {
+                    // Whitespace before a chained pipe is allowed, so step over it before claiming the pipe itself.
+                    SkipWhitespace();
+
                     int filterStart = _pos;
                     _pos++;
 
@@ -274,7 +277,7 @@ public sealed partial class MinjaParser
                     string name = ReadName(filterStart);
                     List<CallArgument> arguments = MatchOpenParen() ? ParseArguments(filterStart) : [];
 
-                    filters.Add(new FilterApplication(name, arguments));
+                    filters.Add(new FilterApplication(name, arguments) { Offset = filterStart });
                 }
 
                 target = new FilterChainExpression(target, filters) { Offset = start };
@@ -423,6 +426,19 @@ public sealed partial class MinjaParser
             return inner;
         }
 
+        // '[' and '{' open inline literals only in primary position: postfix indexing peeks at a bracket after an existing expression, so it never reaches ParsePrimary.
+        if (c == '[')
+        {
+            _pos++;
+            return ParsePostfixChain(ParseListLiteralBody(start));
+        }
+
+        if (c == '{')
+        {
+            _pos++;
+            return ParsePostfixChain(ParseMapLiteralBody(start));
+        }
+
         if (IsWordStart(c))
         {
             string word = ReadWord();
@@ -485,6 +501,103 @@ public sealed partial class MinjaParser
             return new FloatLiteral(double.Parse(text, System.Globalization.CultureInfo.InvariantCulture)) { Offset = start };
 
         return new IntegerLiteral(long.Parse(text, System.Globalization.CultureInfo.InvariantCulture)) { Offset = start };
+    }
+
+    /// <summary>
+    /// Parses the body of a list literal after the opening bracket, mirroring minja's array grammar: comma-separated
+    /// expressions closed by ']', with an empty [] shortcut and no trailing comma.
+    /// </summary>
+    private ExpressionNode ParseListLiteralBody(int start)
+    {
+        List<ExpressionNode> items = [];
+
+        SkipWhitespace();
+        if (PeekAt(_pos) == ']')
+        {
+            _pos++;
+            return new ListLiteral(items) { Offset = start };
+        }
+
+        while (true)
+        {
+            items.Add(ParseExpression());
+
+            SkipWhitespace();
+
+            char c = PeekAt(_pos);
+
+            if (c == ',')
+            {
+                _pos++;
+
+                SkipWhitespace();
+                if (PeekAt(_pos) == ']')
+                    throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), "trailing comma in list literal");
+
+                continue;
+            }
+
+            if (c == ']')
+            {
+                _pos++;
+                break;
+            }
+
+            throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), "expected ',' or ']' in list literal");
+        }
+
+        return new ListLiteral(items) { Offset = start };
+    }
+
+    /// <summary>
+    /// Parses the body of a map literal after the opening brace, mirroring minja's dictionary grammar: key ':' value
+    /// pairs separated by commas closed by '}', with an empty {} shortcut and no trailing comma. A closing '}' is
+    /// never part of a '}}' output-tag close here because that closer only follows a complete expression or literal.
+    /// </summary>
+    private ExpressionNode ParseMapLiteralBody(int start)
+    {
+        List<MapEntry> entries = [];
+
+        SkipWhitespace();
+        if (PeekAt(_pos) == '}')
+        {
+            _pos++;
+            return new MapLiteral(entries) { Offset = start };
+        }
+
+        while (true)
+        {
+            ExpressionNode key = ParseExpression();
+
+            Expect(':', start);
+
+            entries.Add(new MapEntry(key, ParseExpression()));
+
+            SkipWhitespace();
+
+            char c = PeekAt(_pos);
+
+            if (c == ',')
+            {
+                _pos++;
+
+                SkipWhitespace();
+                if (PeekAt(_pos) == '}')
+                    throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), "trailing comma in map literal");
+
+                continue;
+            }
+
+            if (c == '}')
+            {
+                _pos++;
+                break;
+            }
+
+            throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), "expected ',' or '}' in map literal");
+        }
+
+        return new MapLiteral(entries) { Offset = start };
     }
 
     private string ParseQuotedString(char quote, int start)

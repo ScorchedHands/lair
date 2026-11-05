@@ -403,12 +403,28 @@ public sealed class MinjaEvalTests
     }
 
     [Fact]
-    public void Render_FiltersTestsAndCallsRemainUnsupported()
+    public void Render_KnownBuiltinsResolveAndUnknownOnesStayActionable()
     {
-        // Built-in filters, tests and function calls stay unsupported until the filters item lands.
-        Assert.Throws<MinjaRenderException>(() => Render("{{ 'a' | upper }}"));
-        Assert.Throws<MinjaRenderException>(() => Render("{{ x is defined }}"));
-        Assert.Throws<MinjaRenderException>(() => Render("{{ range(3) }}"));
+        // Built-in filters, tests and function calls resolve through the minja built-in namespace. Goldens for
+        // each one live under Category=MinjaFilters; this test keeps honest coverage for names outside that set.
+        Assert.Equal("3", Render("{{ 'abc' | length }}"));
+        Assert.Equal("True", Render("{{ x is defined }}", Context(("x", MinjaValue.Of(1L)))));
+        Assert.Equal("[0, 1, 2]", Render("{{ range(3) }}"));
+
+        MinjaRenderException unknownFilter = Assert.Throws<MinjaRenderException>(() => Render("{{ 'a' | upper }}"));
+        Assert.Equal("filter", unknownFilter.Construct);
+        Assert.Contains("unknown filter 'upper'", unknownFilter.Message);
+        Assert.True(unknownFilter.Position >= 0);
+
+        MinjaRenderException unknownTest = Assert.Throws<MinjaRenderException>(() => Render("{{ x is not_a_test }}"));
+        Assert.Equal("test", unknownTest.Construct);
+        Assert.Contains("not_a_test", unknownTest.Message);
+        Assert.True(unknownTest.Position >= 0);
+
+        MinjaRenderException unknownFunction = Assert.Throws<MinjaRenderException>(() => Render("{{ not_a_function(1) }}"));
+        Assert.Equal("call", unknownFunction.Construct);
+        Assert.Contains("not_a_function", unknownFunction.Message);
+        Assert.True(unknownFunction.Position >= 0);
     }
 
     [Fact]
@@ -489,6 +505,119 @@ public sealed class MinjaEvalTests
 
         MinjaValue value = MinjaValue.Map(map);
         Assert.Equal("{\"first\": 9, \"second\": 2}", value.ToJson());
+    }
+
+    // ---------------------------------------------------------------- inline list and map literals
+
+    [Theory]
+    [InlineData("[]", "[]")]
+    [InlineData("[1]", "[1]")]
+    [InlineData("['user', 'assistant']", "['user', 'assistant']")]
+    [InlineData("[[1, 2], [3]]", "[[1, 2], [3]]")]
+    [InlineData("{'role': 'system'}", "{'role': 'system'}")]
+    [InlineData("{}", "{}")]
+    // The value model renders none as empty text everywhere (its documented str() choice), so a nested None in a
+    // literal repr follows the same rule instead of Python's 'None'; JSON dump covers null separately.
+    [InlineData("{'k': None}", "{'k': }")]
+    [InlineData("{'xs': [1, {'k': 'v'}], 'n': 2}", "{'xs': [1, {'k': 'v'}], 'n': 2}")]
+    public void Literals_EvaluateAndRenderWithPythonRepr(string expression, string expected)
+    {
+        Assert.Equal(expected, Eval(expression).ToString());
+    }
+
+    [Fact]
+    public void LiteralList_PreservesSourceOrder_AndLiteralMapPreservesInsertionOrder()
+    {
+        MinjaValue list = Eval("['b', 'a', 'c']");
+        Assert.True(list.IsTruthy);
+        Assert.Equal(3, list.Items.Count);
+
+        IReadOnlyList<string> items = [.. list.Items.Select(item => item.StringValue)];
+        Assert.Equal(["b", "a", "c"], items.ToArray());
+
+        MinjaValue map = Eval("{'b': 2, 'a': 1}");
+        Assert.True(map.IsTruthy);
+        Assert.Equal(2, map.MapValue.Count);
+        Assert.Equal(["b", "a"], map.MapValue.Keys.ToArray());
+    }
+
+    [Theory]
+    [InlineData("[]", false)]
+    [InlineData("[0]", true)]
+    [InlineData("{}", false)]
+    [InlineData("{'k': None}", true)]
+    public void Literals_EmptyContainersAreFalsey_NonEmptyAreTruthy(string expression, bool expected)
+    {
+        Assert.Equal(expected, Eval(expression).IsTruthy);
+    }
+
+    [Fact]
+    public void LiteralMap_DuplicateKeyKeepsOriginalPositionWithLastValue()
+    {
+        // MinjaMap.Set semantics applied to literals: the later entry wins but the key stays at its first position.
+        Assert.Equal("{\"a\": 9, \"b\": 2}", Eval("{'a': 1, 'b': 2, 'a': 9}").ToJson());
+
+        MinjaValue map = Eval("{'a': 1, 'b': 2, 'a': 9}");
+        Assert.Equal(2, map.MapValue.Count);
+        Assert.Equal(["a", "b"], map.MapValue.Keys.ToArray());
+    }
+
+    [Theory]
+    // This library's maps are string-keyed everywhere (attributes, key lookups and JSON dumps), so a literal with a
+    // non-string key is an actionable render error instead of silent coercion. minja itself accepts primitive keys;
+    // this divergence is pinned until oracle parity work revisits the value model.
+    [InlineData("{1: 'x'}")]
+    [InlineData("{'a': 1, True: 2}")]
+    public void LiteralMap_NonStringKeysThrowRenderError(string expression)
+    {
+        MinjaRenderException error = Assert.Throws<MinjaRenderException>(() => Eval(expression));
+
+        Assert.Equal("map literal", error.Construct);
+        Assert.Contains("strings", error.Message);
+        Assert.True(error.Position >= 0);
+    }
+
+    [Fact]
+    public void Literals_MembershipIndexingSlicingConcatenationAndEqualityWork()
+    {
+        IReadOnlyDictionary<string, MinjaValue> context = Context(
+            ("message", MapOf(("role", MinjaValue.Of("user")))),
+            ("xs", ListOf(MinjaValue.Of("a"), MinjaValue.Of("b"))));
+
+        Assert.True(Eval("message['role'] in ['user', 'assistant']", context).IsTruthy);
+        Assert.True(Eval("'tool' not in ['user', 'assistant']").IsTruthy);
+        Assert.True(Eval("'k' in {'k': 1}").IsTruthy);
+
+        Assert.Equal("b", Eval("['a', 'b'][1]").StringValue);
+        Assert.True(Eval("{'xs': [1, 2]}['xs']").Equals(ListOf(MinjaValue.Of(1L), MinjaValue.Of(2L))));
+
+        // Indexing a string-keyed map with an integer key follows the existing lookup coercion and finds nothing.
+        Assert.True(Eval("m[0]", Context(("m", MapOf(("a", MinjaValue.Of(1L)))))).IsNone);
+
+        Assert.Equal("ab", Eval("'a' + ['b'][0]").StringValue);
+        Assert.True(Eval("[1] + [2]", context).Equals(ListOf(MinjaValue.Of(1L), MinjaValue.Of(2L))));
+        Assert.True(Eval("xs[0:2] == ['a', 'b']", context).IsTruthy);
+
+        // A filter chain applies to a literal source exactly as it does to a context value.
+        Assert.Equal(2L, Eval("[1, 2] | length").IntValue);
+        Assert.Equal("1-2", Render("{{ [1, 2] | join('-') }}"));
+
+        // Slicing a literal map stays the existing maps-cannot-be-sliced error.
+        Assert.Throws<MinjaRenderException>(() => Eval("{'a': 1}[:]"));
+    }
+
+    [Fact]
+    public void Literals_JsonDumpKeepsInsertionOrderAndEmptyShapes()
+    {
+        IReadOnlyDictionary<string, MinjaValue> context = Context(
+            ("b", MinjaValue.Of(2L)),
+            ("a", MinjaValue.Of("x")));
+
+        Assert.Equal("{\"b\": 2, \"xs\": [1, {\"k\": null}], \"empty\": []}", Eval("{'b': b, 'xs': [1, {'k': None}], 'empty': []}", context).ToJson());
+        Assert.Equal("[[1], {}]", Eval("[[1], {}]").ToJson());
+
+        // A set statement bound to a literal dumps exactly like its parsed form.
+        Assert.Equal("{\"first\": 1, \"second\": [2]}", Render("{% set metadata = {'first': 1, 'second': [2]} %}{{ metadata | tojson }}"));
     }
 
     // ---------------------------------------------------------------- helpers

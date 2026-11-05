@@ -431,6 +431,160 @@ public sealed class MinjaSyntaxTests
         Assert.Equal(0, exception.Position);
     }
 
+    // ---------------------------------------------------------------- inline list and map literals
+
+    [Fact]
+    public void OutputTag_ParsesListLiteralsWithItemsAndEmptyForm()
+    {
+        TemplateNode root = MinjaParser.Parse("{{ ['user', 'assistant'] }}");
+
+        ListLiteral roles = Assert.IsType<ListLiteral>(Output(root, 0).Expression);
+        Assert.Equal(2, roles.Items.Count);
+        StringLiteral first = Assert.IsType<StringLiteral>(roles.Items[0]);
+        Assert.Equal("user", first.Value);
+
+        TemplateNode empty = MinjaParser.Parse("{{ [] }}");
+        ListLiteral nothing = Assert.IsType<ListLiteral>(Output(empty, 0).Expression);
+        Assert.Empty(nothing.Items);
+    }
+
+    [Fact]
+    public void OutputTag_ParsesMapLiteralsWithEntriesAndEmptyForm()
+    {
+        TemplateNode root = MinjaParser.Parse("{{ {'role': 'system'} }}");
+
+        MapLiteral map = Assert.IsType<MapLiteral>(Output(root, 0).Expression);
+        MapEntry entry = Assert.Single(map.Entries);
+        StringLiteral key = Assert.IsType<StringLiteral>(entry.Key);
+        StringLiteral value = Assert.IsType<StringLiteral>(entry.Value);
+        Assert.Equal("role", key.Value);
+        Assert.Equal("system", value.Value);
+
+        TemplateNode empty = MinjaParser.Parse("{{ {} }}");
+        MapLiteral nothing = Assert.IsType<MapLiteral>(Output(empty, 0).Expression);
+        Assert.Empty(nothing.Entries);
+    }
+
+    [Fact]
+    public void OutputTag_ParsesNestedListAndMapLiterals()
+    {
+        TemplateNode root = MinjaParser.Parse("{{ {'tools': [{'name': 'x'}], 'empty': []} }}");
+
+        MapLiteral map = Assert.IsType<MapLiteral>(Output(root, 0).Expression);
+        Assert.Equal(2, map.Entries.Count);
+
+        ListLiteral tools = Assert.IsType<ListLiteral>(map.Entries[0].Value);
+        MapLiteral tool = Assert.IsType<MapLiteral>(Assert.Single(tools.Items));
+        StringLiteral name = Assert.IsType<StringLiteral>(tool.Entries[0].Key);
+        Assert.Equal("name", name.Value);
+
+        ListLiteral emptyList = Assert.IsType<ListLiteral>(map.Entries[1].Value);
+        Assert.Empty(emptyList.Items);
+    }
+
+    [Fact]
+    public void Literals_ParseInFilterArgumentsMembershipContainersAndIndexTargets()
+    {
+        TemplateNode filterArg = MinjaParser.Parse("{{ xs | select('in', ['user', 'assistant']) }}");
+        FilterChainExpression chain = Assert.IsType<FilterChainExpression>(Output(filterArg, 0).Expression);
+        ListLiteral container = Assert.IsType<ListLiteral>(chain.Filters[0].Arguments[1].Value);
+        Assert.Equal(2, container.Items.Count);
+
+        TemplateNode membership = MinjaParser.Parse("{{ message['role'] in ['user', 'assistant'] }}");
+        MembershipExpression inside = Assert.IsType<MembershipExpression>(Output(membership, 0).Expression);
+        ListLiteral roles = Assert.IsType<ListLiteral>(inside.Container);
+        Assert.Equal(2, roles.Items.Count);
+
+        TemplateNode indexedList = MinjaParser.Parse("{{ ['a', 'b'][1] }}");
+        IndexExpression index = Assert.IsType<IndexExpression>(Output(indexedList, 0).Expression);
+        Assert.False(index.Slice);
+        ListLiteral target = Assert.IsType<ListLiteral>(index.Target);
+        Assert.Equal(2, target.Items.Count);
+
+        TemplateNode slicedMapList = MinjaParser.Parse("{{ {'xs': [1, 2]}['xs'][0:1] }}");
+        IndexExpression slice = Assert.IsType<IndexExpression>(Output(slicedMapList, 0).Expression);
+        Assert.True(slice.Slice);
+    }
+
+    [Fact]
+    public void Literals_ParseInStatementExpressionsAndSetValues()
+    {
+        TemplateNode loop = MinjaParser.Parse("{% for role in ['user', 'assistant'] %}{{ role }}{% endfor %}");
+        ForStatement statement = Assert.IsType<ForStatement>(Assert.Single(loop.Nodes));
+        ListLiteral iterable = Assert.IsType<ListLiteral>(statement.Iterable);
+        Assert.Equal(2, iterable.Items.Count);
+
+        TemplateNode branch = MinjaParser.Parse("{% if {'a': 1}['a'] == 1 %}y{% endif %}");
+        IfStatement condition = Assert.IsType<IfStatement>(Assert.Single(branch.Nodes));
+        ComparisonExpression comparison = Assert.IsType<ComparisonExpression>(condition.Branches[0].Condition);
+        IndexExpression lookup = Assert.IsType<IndexExpression>(comparison.Left);
+        MapLiteral mapTarget = Assert.IsType<MapLiteral>(lookup.Target);
+        StringLiteral key = Assert.IsType<StringLiteral>(mapTarget.Entries[0].Key);
+        Assert.Equal("a", key.Value);
+
+        TemplateNode assignment = MinjaParser.Parse("{% set metadata = {'role': 'system', 'tools': []} %}");
+        SetStatement set = Assert.IsType<SetStatement>(Assert.Single(assignment.Nodes));
+        MapLiteral value = Assert.IsType<MapLiteral>(set.Value);
+        Assert.Equal(2, value.Entries.Count);
+
+        TemplateNode destructured = MinjaParser.Parse("{% set a, b = [1, 2] %}");
+        SetStatement pairSet = Assert.IsType<SetStatement>(Assert.Single(destructured.Nodes));
+        ListLiteral listValue = Assert.IsType<ListLiteral>(pairSet.Value);
+        Assert.Equal(2, listValue.Items.Count);
+
+        TemplateNode macroTemplate = MinjaParser.Parse("{% macro render(extra=['a']) %}{{ extra }}{% endmacro %}");
+        MacroStatement macro = Assert.IsType<MacroStatement>(Assert.Single(macroTemplate.Nodes));
+        ListLiteral defaultArgument = Assert.IsType<ListLiteral>(Assert.Single(macro.Parameters).DefaultValue!);
+        StringLiteral item = Assert.IsType<StringLiteral>(Assert.Single(defaultArgument.Items));
+        Assert.Equal("a", item.Value);
+
+        // Call argument lists keep parsing as call arguments, not tuple literals.
+        TemplateNode call = MinjaParser.Parse("{{ range(1, 2) }}");
+        CallExpression callExpression = Assert.IsType<CallExpression>(Output(call, 0).Expression);
+        Assert.Equal(2, callExpression.Arguments.Count);
+
+        // Destructuring target syntax keeps its parenthesized form.
+        TemplateNode tupleTarget = MinjaParser.Parse("{% for (k, v) in pairs %}{{ k }}{% endfor %}");
+        ForStatement destructuredLoop = Assert.IsType<ForStatement>(Assert.Single(tupleTarget.Nodes));
+        TupleTarget pairTarget = Assert.IsType<TupleTarget>(destructuredLoop.Target);
+        Assert.Equal(2, pairTarget.Items.Count);
+    }
+
+    [Fact]
+    public void ParenthesizedTuples_StayRejectedOutsideCallArgumentsAndTargets()
+    {
+        MinjaSyntaxException inOutput = Assert.Throws<MinjaSyntaxException>(() => MinjaParser.Parse("{{ (1, 2) }}"));
+        Assert.Contains("tuple", inOutput.Message);
+
+        MinjaSyntaxException nestedTuple = Assert.Throws<MinjaSyntaxException>(() => MinjaParser.Parse("{{ [[(1, 2)]] }}"));
+        Assert.Contains("tuple", nestedTuple.Message);
+    }
+
+    [Theory]
+    [InlineData("{{ [1, ] }}")]
+    [InlineData("{{ {'a': 1,} }}")]
+    [InlineData("{{ [1 }] }}")]
+    [InlineData("{{ {'a': 1 x} }}")]
+    public void MalformedInlineLiterals_ThrowActionableErrors(string template)
+    {
+        MinjaSyntaxException exception = Assert.Throws<MinjaSyntaxException>(() => MinjaParser.Parse(template));
+
+        Assert.Contains("literal", exception.Message);
+        Assert.True(exception.Position >= 0);
+    }
+
+    [Theory]
+    // minja has no comprehension forms; the literal parser refuses them instead of inventing semantics.
+    [InlineData("{{ [x for x in xs] }}")]
+    [InlineData("{{ {'k': v for k, v in pairs} }}")]
+    public void ComprehensionForms_StayRejected(string template)
+    {
+        MinjaSyntaxException exception = Assert.Throws<MinjaSyntaxException>(() => MinjaParser.Parse(template));
+
+        Assert.Contains("literal", exception.Message);
+        Assert.True(exception.Position >= 0);
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private static OutputNode Output(TemplateNode root, int index) => Assert.IsType<OutputNode>(root.Nodes[index]);

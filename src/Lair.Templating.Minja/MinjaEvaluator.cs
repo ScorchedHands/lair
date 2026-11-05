@@ -9,9 +9,11 @@ namespace Lair.Templating.Minja;
 /// evaluate as none, mirroring minja's none/undefined equivalence; string and list indexes accept Python-style
 /// negative offsets. Block bodies share the scope they are entered in, so <c>{% set %}</c> stays visible after
 /// its block, while macro, call and filter invocations render in a child scope that closes over its defining
-/// context for reads and keeps its own locals private. Built-in filters, tests and function calls raise
-/// <see cref="MinjaRenderException"/> until the filters item lands; user-defined macros and call bodies are
-/// callable.
+/// context for reads and keeps its own locals private. Filter chains, tests and function calls resolve names from
+/// the built-in minja namespace in <see cref="MinjaBuiltins"/>; names bound by macros or set statements shadow
+/// those built-ins, and unknown filters, tests and functions raise <see cref="MinjaRenderException"/> naming the
+/// construct and its position. Inline list and map literals evaluate into value lists/maps preserving source and
+/// insertion order; map literal keys must be strings in this library's string-keyed value model.
 /// </summary>
 public static class MinjaEvaluator
 {
@@ -194,7 +196,21 @@ public static class MinjaEvaluator
     {
         if (statement.Targets.Count == 1)
         {
-            AssignTarget(statement.Targets[0], Eval(statement.Value, scope), scope, statement.Offset);
+            // joiner() is the one builtin that yields a callable rather than a value, and {% set %} is where a
+            // template binds it to a name; every other assignment stores an evaluated value.
+            SetTarget target = statement.Targets[0];
+
+            if (target.Attributes.Count == 1
+                && statement.Value is CallExpression call
+                && call.Callee is NameExpression callee
+                && MinjaBuiltins.TryBindStateful(callee.Name, call.Arguments, scope, statement.Offset, out MinjaCallable? stateful)
+                && stateful is not null)
+            {
+                scope.DefineCallable(target.Name, stateful);
+                return;
+            }
+
+            AssignTarget(target, Eval(statement.Value, scope), scope, statement.Offset);
             return;
         }
 
@@ -247,7 +263,13 @@ public static class MinjaEvaluator
         }
 
         if (!scope.TryGetCallable(statement.Name, out MinjaCallable? callable) || callable is null)
-            throw new MinjaRenderException("filter", statement.Offset, $"no callable named '{statement.Name}'; built-in filters are not implemented yet");
+        {
+            // A filter block applies the same built-in namespace an inline chain does, with the body text as input.
+            FilterApplication application = new(statement.Name, statement.Arguments) { Offset = statement.Offset };
+
+            builder.Append(MinjaBuiltins.ApplyFilter(application, MinjaValue.Of(text), scope).ToString());
+            return;
+        }
 
         MinjaValue result = callable.Invoke(statement.Arguments, scope, statement.Offset, caller: null, MinjaValue.Of(text));
 
@@ -362,7 +384,8 @@ public static class MinjaEvaluator
 
     // ---------------------------------------------------------------- targets and iteration
 
-    private static IReadOnlyList<MinjaValue> EnumerateIterable(MinjaValue value, int offset) => value.Kind switch
+    /// <summary>Iteration order shared by for loops and the iterable built-ins: lists in order, maps by key, strings by character, undefined as empty.</summary>
+    internal static IReadOnlyList<MinjaValue> EnumerateIterable(MinjaValue value, int offset) => value.Kind switch
     {
         MinjaValueKind.List => value.Items,
 
@@ -493,6 +516,12 @@ public static class MinjaEvaluator
             case NoneLiteral:
                 return MinjaValue.None;
 
+            case ListLiteral list:
+                return EvalListLiteral(list, scope);
+
+            case MapLiteral map:
+                return EvalMapLiteral(map, scope);
+
             case NameExpression name:
                 // Undefined names are none: minja does not distinguish missing from null.
                 if (scope is not null && scope.TryGetValue(name.Name, out MinjaValue value))
@@ -526,20 +555,76 @@ public static class MinjaEvaluator
             case CallExpression call:
                 return EvalCall(call, scope);
 
-            case FilterChainExpression:
-                throw MinjaRenderException.UnsupportedExpression("filter", node.Offset);
+            case FilterChainExpression chain:
+                return EvalFilterChain(chain, scope);
 
-            case TestExpression:
-                throw MinjaRenderException.UnsupportedExpression("test", node.Offset);
+            case TestExpression test:
+                // Tests answer a predicate about the value they follow; 'is not' negates inside ApplyTest.
+                if (test.Subject is null)
+                    throw new MinjaRenderException("test", test.Offset, "the test has no subject expression to evaluate");
+
+                return MinjaBuiltins.ApplyTest(test, Eval(test.Subject, scope), scope ?? TemplateScope.Root(null));
+
+            case ValueExpression literal:
+                // An already-evaluated value re-enters evaluation unchanged (used for built-in predicate arguments).
+                return literal.Value;
 
             default:
                 throw MinjaRenderException.UnsupportedExpression(node.GetType().Name, node.Offset);
         }
     }
 
+    /// <summary>Evaluates an inline list literal into a value list preserving source order.</summary>
+    private static MinjaValue EvalListLiteral(ListLiteral node, TemplateScope? scope) =>
+        MinjaValue.List([.. node.Items.Select(item => Eval(item, scope))]);
+
     /// <summary>
-    /// Evaluates a call. Only names bound to macros or block callables are callable today; calling a plain value
-    /// is a render error, and built-in functions such as range or raise_exception land with the filters item.
+    /// Evaluates an inline map literal into an ordered value map. This library's maps are string-keyed everywhere —
+    /// attribute reads, key lookups and JSON dumps all work on text keys — so a non-string key expression is an
+    /// actionable render error rather than a silent coercion; minja itself accepts primitive keys this model cannot
+    /// hold without changing the public value type. Later entries for the same key update the value in place like
+    /// MinjaMap.Set, keeping the original insertion position.
+    /// </summary>
+    private static MinjaValue EvalMapLiteral(MapLiteral node, TemplateScope? scope)
+    {
+        MinjaMap map = new();
+
+        foreach (MapEntry entry in node.Entries)
+        {
+            MinjaValue key = Eval(entry.Key, scope);
+
+            if (key.Kind != MinjaValueKind.String)
+                throw new MinjaRenderException("map literal", node.Offset, $"map keys must be strings but found a {key.Kind} key");
+
+            map.Set(key.StringValue, Eval(entry.Value, scope));
+        }
+
+        return MinjaValue.Map(map);
+    }
+
+    /// <summary>
+    /// Applies a filter chain left to right. A name bound by a macro or set statement wins over the built-in
+    /// namespace, which is how templates override a built-in with their own helper of the same name.
+    /// </summary>
+    private static MinjaValue EvalFilterChain(FilterChainExpression chain, TemplateScope? scope)
+    {
+        TemplateScope callSite = scope ?? TemplateScope.Root(null);
+        MinjaValue value = Eval(chain.Source, scope);
+
+        foreach (FilterApplication filter in chain.Filters)
+        {
+            if (callSite.TryGetCallable(filter.Name, out MinjaCallable? callable) && callable is not null)
+                value = callable.Invoke(filter.Arguments, callSite, filter.Offset, caller: null, input: value);
+            else
+                value = MinjaBuiltins.ApplyFilter(filter, value, callSite);
+        }
+
+        return value;
+    }
+
+    /// <summary>
+    /// Evaluates a call. Names bound to macros, captured block bodies or joiner callables invoke directly; plain
+    /// names then resolve through the built-in function namespace, and anything else is an actionable render error.
     /// </summary>
     private static MinjaValue EvalCall(CallExpression node, TemplateScope? scope)
     {
@@ -548,9 +633,12 @@ public static class MinjaEvaluator
         if (node.Callee is NameExpression name && callSite.TryGetCallable(name.Name, out MinjaCallable? callable) && callable is not null)
             return callable.Invoke(node.Arguments, callSite, node.Offset, caller: null, input: null);
 
+        if (node.Callee is NameExpression function && !callSite.TryGetValue(function.Name, out _))
+            return MinjaBuiltins.InvokeFunction(function.Name, node.Arguments, callSite, node.Offset);
+
         MinjaValue callee = Eval(node.Callee, scope);
 
-        throw new MinjaRenderException("call", node.Offset, $"cannot call a {callee.Kind} value; only macros and block callables are callable until built-ins land");
+        throw new MinjaRenderException("call", node.Offset, $"cannot call a {callee.Kind} value; only macros, block callables and built-in functions are callable");
     }
 
     private static MinjaValue EvalAttribute(AttributeExpression node, TemplateScope? scope)
@@ -856,7 +944,7 @@ public static class MinjaEvaluator
                 return MinjaValue.Of(!left.Equals(right));
         }
 
-        int? order = CompareOrder(left, right, node.Offset);
+        int? order = CompareOrderValues(left, right, node.Offset);
 
         return node.Operator switch
         {
@@ -868,8 +956,8 @@ public static class MinjaEvaluator
         };
     }
 
-    /// <summary>Total ordering for ordered comparisons: numbers (including bools) compare numerically, strings ordinally, lists lexicographically. Anything else is a type error.</summary>
-    private static int CompareOrder(MinjaValue left, MinjaValue right, int offset)
+    /// <summary>Total ordering for ordered comparisons and built-in sorting: numbers (including bools) compare numerically, strings ordinally, lists lexicographically. Anything else is a type error.</summary>
+    internal static int CompareOrderValues(MinjaValue left, MinjaValue right, int offset)
     {
         if (left.IsNumberOrBool() && right.IsNumberOrBool())
             return left.NumberValue.CompareTo(right.NumberValue);
@@ -883,7 +971,7 @@ public static class MinjaEvaluator
 
             for (int i = 0; i < shared; i++)
             {
-                int itemOrder = CompareOrder(left.Items[i], right.Items[i], offset);
+                int itemOrder = CompareOrderValues(left.Items[i], right.Items[i], offset);
 
                 if (itemOrder != 0)
                     return itemOrder;

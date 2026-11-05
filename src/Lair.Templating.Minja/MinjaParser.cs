@@ -10,8 +10,9 @@ namespace Lair.Templating.Minja;
 /// trimmed to nothing is dropped from its body. Trim-left of an end/elif/else keyword is applied by the block parser that
 /// owns the preceding body because Jinja's whitespace control spans only directly adjacent literal text: an elision flag
 /// never crosses a statement boundary into another body list, and no literal text can sit between two adjacent tags.
-/// Comments never appear as literal output. Unsupported constructs ({% raw %}, {% block %}, {% include %}, {% extends %}
-/// and their trivial typo variants, tuple literals outside call arguments or destructuring targets, ternary-less if
+/// Comments never appear as literal output. Inline list ([a, b]) and map/object ({k: v}) literals parse in every
+/// expression context. Unsupported constructs ({% raw %}, {% block %}, {% include %}, {% extends %} and their trivial
+/// typo variants, parenthesized tuple literals outside call arguments or destructuring targets, ternary-less if
 /// expressions) and malformed tags throw <see cref="MinjaSyntaxException"/> naming the construct with its 0-based
 /// template offset. Parsing only: evaluation is a separate concern.
 /// </summary>
