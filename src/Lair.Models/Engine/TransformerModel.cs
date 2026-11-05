@@ -10,7 +10,7 @@ namespace Lair.Models.Engine;
 /// Forward engine for supported GGUF architectures (llama, qwen2): embedding lookup, per-layer RMSNorm / GQA
 /// attention with RoPE and paged KV via <see cref="SequenceKv"/>, SwiGLU feed-forward, final norm, and an untied
 /// output matrix or tied token-embedding rows for logits. The graph mirrors the reference structure: each layer
-/// normalizes its input stream (rmsnorm x weight) before the QKV GEMVs; RoPE rotates q/k pairs (i, i+headDim/2) at
+/// normalizes its input stream (rmsnorm x weight) before the QKV GEMVs; RoPE rotates q/k adjacent pairs (2i, 2i+1) at
 /// the absolute position with theta_i = base^(-2i/headDim); attention scores scale by 1/sqrt(headDim) and softmax
 /// runs online over positions 0..pos. The residual added before the FFN norm is the pre-attention stream value,
 /// matching the reference graph's ffn_inp add; rope scaling variants are not supported. FP32 buffers are allocated

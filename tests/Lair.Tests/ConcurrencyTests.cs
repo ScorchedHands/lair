@@ -130,30 +130,61 @@ public sealed class ConcurrencyTests
     }
 
     [Fact]
-    public async Task KvPoolExhausted_SecondSubmissionIsEngineBusy()
+    public async Task KvPoolExhausted_OneSubmissionIsEngineBusy()
     {
-        if (ModelFixture.Resolve() is null)
+        string? modelPath = ModelFixture.Resolve();
+        if (modelPath is null)
         {
             return; // real-model tests skip when the fixture is absent
         }
 
-        // One 16-slot block: the first request crosses every block its sequence will ever need, so the
-        // second submission has nothing left to admit.
-        using GenerationService service = OpenService(kvBlocks: 1, maxContextTokens: 128);
+        // A prompt long enough to need every block in the pool: the pool can hold one sequence at a time, so
+        // whichever submission reaches the scheduler second is turned away no matter how far the first one's
+        // generation runs. Finish reason and token counts stay unpinned because how long a greedy run goes
+        // before EOS is model behavior, not what this gate is about.
+        const int blockTokens = 16;
+        const int longMaxTokens = 8;
+        string longPrompt = string.Join("\n", Enumerable.Repeat("The capital of France is a city in Europe.", 16));
 
-        Task<GenerationResult> admitted = service.GenerateAsync(
-            CompletionRequest("Hello there", maxTokens: 12),
-            CancellationToken.None);
+        int promptTokens;
+        using (GgufFile gguf = GgufFile.Open(modelPath))
+        {
+            promptTokens = GgufTokenizer.FromGguf(gguf).Encode(longPrompt).Count;
+        }
 
-        EngineBusyException busy = await Assert.ThrowsAsync<EngineBusyException>(() => service.GenerateAsync(
-            CompletionRequest("hi", maxTokens: 4),
-            CancellationToken.None));
+        int blocksNeeded = (promptTokens + longMaxTokens - 2) / blockTokens + 1;
+        using GenerationService service = OpenService(kvBlocks: blocksNeeded, maxContextTokens: promptTokens + longMaxTokens);
 
-        Assert.Contains("KV pool", busy.Message);
+        (GenerationResult? Result, string? BusyMessage)[] raced = await Task.WhenAll(
+            [
+                RunForBusyAsync(service, CompletionRequest(longPrompt, longMaxTokens)),
+                RunForBusyAsync(service, CompletionRequest("hi", maxTokens: 4)),
+            ]);
 
-        GenerationResult first = await admitted;
-        Assert.Equal(12, first.CompletionTokens);
-        Assert.Equal("length", first.FinishReason);
+        (GenerationResult? admitted, GenerationResult? _) = (
+            raced.FirstOrDefault(r => r.Result is not null).Result,
+            null);
+
+        Assert.NotNull(admitted);
+        Assert.True(admitted.CompletionTokens >= 1, "the admitted sequence produced no tokens");
+
+        string? busy = raced.FirstOrDefault(r => r.BusyMessage is not null).BusyMessage;
+        Assert.NotNull(busy);
+        Assert.Contains("KV pool", busy);
+    }
+
+    private static async Task<(GenerationResult? Result, string? BusyMessage)> RunForBusyAsync(
+        GenerationService service,
+        GenerationRequest request)
+    {
+        try
+        {
+            return (await service.GenerateAsync(request, CancellationToken.None), null);
+        }
+        catch (EngineBusyException busy)
+        {
+            return (null, busy.Message);
+        }
     }
 
     [Fact]
@@ -192,7 +223,9 @@ public sealed class ConcurrencyTests
             CancellationToken.None));
         Assert.Equal(16, full.FreeSlots);
 
-        // A submission that fits the pool's blocks is admitted and runs to its token budget.
+        // A submission that fits the pool's blocks is admitted and runs. Whether it stops on EOS or on its
+        // token budget is model behavior, so only the admitted-and-ran fact is asserted here; what this gate
+        // owns is that an out-of-pool submission was rejected while a fitting one was not.
         SequenceHandle handle = scheduler.Submit(
             new ScheduledRequest
             {
@@ -204,8 +237,10 @@ public sealed class ConcurrencyTests
             CancellationToken.None);
 
         SequenceOutcome outcome = await handle.Completion;
-        Assert.Equal(FinishReason.Length, outcome.FinishReason);
-        Assert.Equal(6, outcome.CompletionTokens);
+        Assert.True(
+            outcome.FinishReason is FinishReason.Eos or FinishReason.Length,
+            $"admitted sequence ended with '{outcome.FinishReason}'");
+        Assert.InRange(outcome.CompletionTokens, 1, 6);
         Assert.Equal(prompt.Length, outcome.PromptTokens);
     }
 

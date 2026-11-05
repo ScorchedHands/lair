@@ -76,7 +76,7 @@ public sealed class LayerTests : IDisposable
     [Fact]
     public void RopeTables_AndRotation_MatchManualPairMath_AndPreserveHeadNorm()
     {
-        const int HeadDim = 8; // pairs (i, i+4); theta_i = base^(-2i/8)
+        const int HeadDim = 8; // adjacent pairs (2i, 2i+1); theta_i = base^(-2i/8)
         const double Base = 10_000.0;
 
         float[] cos = new float[2 * (HeadDim / 2)];
@@ -114,15 +114,19 @@ public sealed class LayerTests : IDisposable
             float c = (float)Math.Cos(invFreq); // pos == 1: the angle equals the inverse frequency itself
             float s = (float)Math.Sin(invFreq);
 
-            double loExpected = head[i] * (double)c - head[i + HeadDim / 2] * s;
-            double hiExpected = head[i + HeadDim / 2] * (double)c + head[i] * s;
+            // Pair i occupies adjacent head dimensions 2i and 2i + 1, the layout rotary rows carry in GGUF.
+            int lowIndex = 2 * i;
+            int highIndex = 2 * i + 1;
+
+            double loExpected = head[lowIndex] * (double)c - head[highIndex] * s;
+            double hiExpected = head[highIndex] * (double)c + head[lowIndex] * s;
 
             Assert.True(
-                Math.Abs(rotated[i] - loExpected) <= 1e-6 * Math.Max(1.0, Math.Abs(loExpected)),
-                $"rope pair [{i}] low: expected {loExpected:G9}, got {rotated[i]:G9}");
+                Math.Abs(rotated[lowIndex] - loExpected) <= 1e-6 * Math.Max(1.0, Math.Abs(loExpected)),
+                $"rope pair [{i}] low: expected {loExpected:G9}, got {rotated[lowIndex]:G9}");
             Assert.True(
-                Math.Abs(rotated[i + HeadDim / 2] - hiExpected) <= 1e-6 * Math.Max(1.0, Math.Abs(hiExpected)),
-                $"rope pair [{i}] high: expected {hiExpected:G9}, got {rotated[i + HeadDim / 2]:G9}");
+                Math.Abs(rotated[highIndex] - hiExpected) <= 1e-6 * Math.Max(1.0, Math.Abs(hiExpected)),
+                $"rope pair [{i}] high: expected {hiExpected:G9}, got {rotated[highIndex]:G9}");
         }
 
         // Each pair is a rotation matrix: the head's L2 norm must survive within float rounding.
