@@ -284,10 +284,22 @@ internal static class MinjaBuiltins
 
     private static MinjaValue ToJson(BuiltinCall call)
     {
-        RejectAnyArguments(call);
+        // tojson(value) dumps compactly; tojson(value, indent=N) or tojson(indent=N) pretty-prints with N-space
+        // nesting like Python json.dumps. Only an indent argument is accepted so typos still fail actionably.
+        IReadOnlyList<EvaluatedArgument> positional = PositionalArguments(call);
+        int? indent = TryNamed(call, "indent", out MinjaValue namedIndent)
+            ? (int)RequireInteger(namedIndent, "tojson", call.Offset)
+            : positional.Count > 0
+                ? (int)RequireInteger(positional[0].Value, "tojson", call.Offset)
+                : null;
+
+        RejectExtraPositional(call, allowed: 1);
+        RejectUnknownNamedArguments(call, ["indent"]);
 
         // The value model owns the dump: maps keep insertion order, strings escape like Python json.dumps.
-        return MinjaValue.Of(RequireInput(call).ToJson());
+        MinjaValue input = RequireInput(call);
+
+        return MinjaValue.Of(indent is int width ? input.ToJson(width) : input.ToJson());
     }
 
     private static MinjaValue Trim(BuiltinCall call)

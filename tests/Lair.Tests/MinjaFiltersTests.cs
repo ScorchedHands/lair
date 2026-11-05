@@ -78,12 +78,29 @@ public sealed class MinjaFiltersTests
     }
 
     [Fact]
-    public void ToJson_RejectsArguments()
+    public void ToJson_AcceptsIndentAndPrettyPrintsWithPythonSeparators()
     {
-        MinjaRenderException error = Assert.Throws<MinjaRenderException>(() => Eval("'a' | tojson(indent=2)"));
+        IReadOnlyDictionary<string, MinjaValue> context = Context(("record", MapOf(
+            ("b", MinjaValue.Of(2L)),
+            ("a", ListOf(MinjaValue.Of(1L), MapOf(("k", MinjaValue.Of("v"))))),
+            ("c", MinjaValue.EmptyList))));
+
+        // json.dumps(indent=4): each entry on its own line, ",\n" between entries, ": " after keys, empty containers inline.
+        Assert.Equal(
+            "{\n    \"b\": 2,\n    \"a\": [\n        1,\n        {\n            \"k\": \"v\"\n        }\n    ],\n    \"c\": []\n}",
+            Render("{{ record | tojson(indent=4) }}", context));
+
+        // A positional indent is accepted too; empty containers stay single-line even under pretty mode.
+        Assert.Equal("{\n  \"a\": 1\n}", Eval("{ 'a': 1 } | tojson(2)").StringValue);
+    }
+
+    [Fact]
+    public void ToJson_RejectsUnknownNamedArguments()
+    {
+        MinjaRenderException error = Assert.Throws<MinjaRenderException>(() => Eval("'a' | tojson(quote=True)"));
 
         Assert.Equal("tojson", error.Construct);
-        Assert.Contains("takes no arguments", error.Message);
+        Assert.Contains("named argument", error.Message);
     }
 
     // ---------------------------------------------------------------- e / escape

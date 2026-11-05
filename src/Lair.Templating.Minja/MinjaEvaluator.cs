@@ -50,8 +50,20 @@ public static class MinjaEvaluator
     {
         ArgumentNullException.ThrowIfNull(template);
 
+        return Render(template, TemplateScope.Root(context));
+    }
+
+    /// <summary>
+    /// Renders an already parsed template against a prebuilt scope. The chat-template wrapper uses this to bind
+    /// context callables (such as <c>strftime_now</c>) into the root scope before rendering; normal callers build
+    /// their own root from a plain value context through the overload above.
+    /// </summary>
+    internal static string Render(TemplateNode template, TemplateScope scope)
+    {
+        ArgumentNullException.ThrowIfNull(template);
+
         StringBuilder builder = new();
-        RenderFlow flow = RenderBody(template.Nodes, TemplateScope.Root(context), builder);
+        RenderFlow flow = RenderBody(template.Nodes, scope, builder);
 
         // A loop consumes its own break/continue; flow reaching the top level escaped every loop.
         if (flow != RenderFlow.None)

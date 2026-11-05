@@ -207,11 +207,24 @@ public sealed class MinjaValue : IEquatable<MinjaValue>
     public string ToJson()
     {
         StringBuilder builder = new();
-        AppendJson(builder);
+        AppendJson(builder, indentUnit: null, depth: 0);
         return builder.ToString();
     }
 
-    private void AppendJson(StringBuilder builder)
+    /// <summary>
+    /// Pretty JSON dump matching Python json.dumps(indent=N): every list element and map entry sits on its own
+    /// line indented N spaces deeper than its container, keys keep the <c>": "</c> separator, and empty
+    /// containers still render as <c>[]</c> and <c>{}</c> on a single line. Escaping, ordering and number
+    /// formatting are identical to the compact dump.
+    /// </summary>
+    public string ToJson(int indent)
+    {
+        StringBuilder builder = new();
+        AppendJson(builder, new string(' ', Math.Max(0, indent)), depth: 0);
+        return builder.ToString();
+    }
+
+    private void AppendJson(StringBuilder builder, string? indentUnit, int depth)
     {
         switch (Kind)
         {
@@ -237,40 +250,101 @@ public sealed class MinjaValue : IEquatable<MinjaValue>
 
             case MinjaValueKind.List:
             {
-                builder.Append('[');
-
-                for (int i = 0; i < _list!.Count; i++)
+                if (_list!.Count == 0)
                 {
-                    if (i > 0)
-                        builder.Append(", ");
-
-                    _list[i].AppendJson(builder);
+                    builder.Append("[]");
+                    break;
                 }
 
+                if (indentUnit is null)
+                {
+                    builder.Append('[');
+
+                    for (int i = 0; i < _list.Count; i++)
+                    {
+                        if (i > 0)
+                            builder.Append(", ");
+
+                        _list[i].AppendJson(builder, indentUnit: null, depth);
+                    }
+
+                    builder.Append(']');
+                    break;
+                }
+
+                builder.Append("[\n");
+
+                for (int i = 0; i < _list.Count; i++)
+                {
+                    if (i > 0)
+                        builder.Append(",\n");
+
+                    AppendIndent(builder, indentUnit, depth + 1);
+                    _list[i].AppendJson(builder, indentUnit, depth + 1);
+                }
+
+                builder.Append('\n');
+                AppendIndent(builder, indentUnit, depth);
                 builder.Append(']');
                 break;
             }
 
             case MinjaValueKind.Map:
             {
-                builder.Append('{');
-                bool first = true;
-
-                foreach (KeyValuePair<string, MinjaValue> entry in _map!)
+                if (_map!.Count == 0)
                 {
-                    if (!first)
-                        builder.Append(", ");
-
-                    first = false;
-                    AppendJsonString(builder, entry.Key);
-                    builder.Append(": ");
-                    entry.Value.AppendJson(builder);
+                    builder.Append("{}");
+                    break;
                 }
 
+                if (indentUnit is null)
+                {
+                    builder.Append('{');
+                    bool first = true;
+
+                    foreach (KeyValuePair<string, MinjaValue> entry in _map)
+                    {
+                        if (!first)
+                            builder.Append(", ");
+
+                        first = false;
+                        AppendJsonString(builder, entry.Key);
+                        builder.Append(": ");
+                        entry.Value.AppendJson(builder, indentUnit: null, depth);
+                    }
+
+                    builder.Append('}');
+                    break;
+                }
+
+                builder.Append('{');
+                bool prettyFirst = true;
+
+                foreach (KeyValuePair<string, MinjaValue> entry in _map)
+                {
+                    if (!prettyFirst)
+                        builder.Append(',');
+
+                    prettyFirst = false;
+                    builder.Append('\n');
+                    AppendIndent(builder, indentUnit, depth + 1);
+                    AppendJsonString(builder, entry.Key);
+                    builder.Append(": ");
+                    entry.Value.AppendJson(builder, indentUnit, depth + 1);
+                }
+
+                builder.Append('\n');
+                AppendIndent(builder, indentUnit, depth);
                 builder.Append('}');
                 break;
             }
         }
+    }
+
+    private static void AppendIndent(StringBuilder builder, string indentUnit, int count)
+    {
+        for (int i = 0; i < count; i++)
+            builder.Append(indentUnit);
     }
 
     /// <summary>Deep equality with Python semantics: int and float compare numerically, lists compare element-wise, maps compare entries regardless of insertion order.</summary>
