@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Lair.Contracts\Lair.Contracts.csproj" />
+    <ProjectReference Include="..\..\src\Lair.Templating.Minja\Lair.Templating.Minja.csproj" />
     <ProjectReference Include="..\..\src\Lair.Loader\Lair.Loader.csproj" />
     <ProjectReference Include="..\..\src\Lair.Backends.Cpu\Lair.Backends.Cpu.csproj" />
     <ProjectReference Include="..\..\src\Lair.Kv\Lair.Kv.csproj" />

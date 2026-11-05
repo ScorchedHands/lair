@@ -1,0 +1,711 @@
+namespace Lair.Templating.Minja;
+
+public sealed partial class MinjaParser
+{
+    // ---------------------------------------------------------------- expression phase
+    // Precedence (loosest first): ternary conditional, or, and, not, comparisons/tests/membership, + -, * / // %, unary -, **, postfix call/index/attribute with filter chains.
+    // Filters bind tighter than arithmetic: {{ a | f + b }} parses as {{ (a | f) + b }}, matching how chat templates apply filters to operands.
+
+    private ExpressionNode ParseExpression() => ParseConditional();
+
+    /// <summary>Ternary conditional, right-associative. Ternary-less 'a if b' is rejected as non-minja.</summary>
+    private ExpressionNode ParseConditional()
+    {
+        int start = _pos;
+        ExpressionNode value = ParseOrLevel();
+
+        SkipWhitespace();
+        if (PeekKeyword() != "if")
+            return value;
+
+        MatchKeyword("if");
+        ExpressionNode condition = ParseOrLevel();
+
+        SkipWhitespace();
+        if (!MatchKeyword("else"))
+            throw new MinjaSyntaxException("'a if b' without 'else'", start);
+
+        // Right recursion: a if b else c if d else e nests as a if b else (c if d else e).
+        ExpressionNode elseBranch = ParseConditional();
+
+        return new ConditionalExpression(value, condition, elseBranch) { Offset = start };
+    }
+
+    private ExpressionNode ParseOrLevel()
+    {
+        int start = _pos;
+        ExpressionNode left = ParseAndLevel();
+
+        while (MatchKeyword("or"))
+            left = new BinaryExpression(BinaryOperator.Or, left, ParseAndLevel()) { Offset = start };
+
+        return left;
+    }
+
+    private ExpressionNode ParseAndLevel()
+    {
+        int start = _pos;
+        ExpressionNode left = ParseNotLevel();
+
+        while (MatchKeyword("and"))
+            left = new BinaryExpression(BinaryOperator.And, left, ParseNotLevel()) { Offset = start };
+
+        return left;
+    }
+
+    private ExpressionNode ParseNotLevel()
+    {
+        int start = _pos;
+        if (!MatchKeyword("not"))
+            return ParseComparisonLevel();
+
+        return new UnaryExpression(UnaryOperator.Not, ParseNotLevel()) { Offset = start };
+    }
+
+    /// <summary>Non-chaining comparisons plus membership and test operators: == != < <= > >= in 'not in' is 'is not'.</summary>
+    private ExpressionNode ParseComparisonLevel()
+    {
+        int start = _pos;
+        ExpressionNode left = ParseConcatLevel();
+
+        while (true)
+        {
+            SkipWhitespace();
+
+            char c = PeekAt(_pos);
+
+            if (c == '=' && PeekAt(_pos + 1) == '=')
+            {
+                _pos += 2;
+                left = new ComparisonExpression(left, CompareOperator.Eq, ParseConcatLevel()) { Offset = start };
+                continue;
+            }
+
+            if (c == '!' && PeekAt(_pos + 1) == '=')
+            {
+                _pos += 2;
+                left = new ComparisonExpression(left, CompareOperator.Ne, ParseConcatLevel()) { Offset = start };
+                continue;
+            }
+
+            if (c == '>' && PeekAt(_pos + 1) == '=')
+            {
+                _pos += 2;
+                left = new ComparisonExpression(left, CompareOperator.Gte, ParseConcatLevel()) { Offset = start };
+                continue;
+            }
+
+            if (c == '<' && PeekAt(_pos + 1) == '=')
+            {
+                _pos += 2;
+                left = new ComparisonExpression(left, CompareOperator.Lte, ParseConcatLevel()) { Offset = start };
+                continue;
+            }
+
+            if (c == '>')
+            {
+                _pos++;
+                left = new ComparisonExpression(left, CompareOperator.Gt, ParseConcatLevel()) { Offset = start };
+                continue;
+            }
+
+            if (c == '<')
+            {
+                _pos++;
+                left = new ComparisonExpression(left, CompareOperator.Lt, ParseConcatLevel()) { Offset = start };
+                continue;
+            }
+
+            string keyword = PeekKeyword();
+
+            if (keyword == "in")
+            {
+                MatchKeyword("in");
+                left = new MembershipExpression(left, ParseConcatLevel(), Negated: false) { Offset = start };
+                continue;
+            }
+
+            if (keyword == "not" && KeywordAtEquals(WordEnd(_pos), "in"))
+            {
+                // This 'not' belongs to the membership test ('not in'), not to a right-hand unary operand.
+                MatchKeyword("not");
+                MatchKeyword("in");
+                left = new MembershipExpression(left, ParseConcatLevel(), Negated: true) { Offset = start };
+                continue;
+            }
+
+            if (keyword == "is")
+            {
+                int testStart = _pos;
+                MatchKeyword("is");
+                SkipWhitespace();
+                bool negatedTest = MatchKeyword("not");
+                string testName = ReadName(testStart);
+                List<CallArgument> arguments = MatchOpenParen() ? ParseArguments(testStart) : [];
+
+                left = new TestExpression(testName, arguments, Negated: negatedTest) { Offset = start };
+                continue;
+            }
+
+            return left;
+        }
+    }
+
+    private ExpressionNode ParseConcatLevel()
+    {
+        int start = _pos;
+        ExpressionNode left = ParseMulLevel();
+
+        while (true)
+        {
+            SkipWhitespace();
+
+            if (PeekAt(_pos) == '+')
+            {
+                _pos++;
+                left = new BinaryExpression(BinaryOperator.Add, left, ParseMulLevel()) { Offset = start };
+                continue;
+            }
+
+            // A dash directly before %} or }} is the tag's own trim marker, never a minus operator.
+            if (PeekAt(_pos) == '-' && PeekAt(_pos + 1) != '%' && PeekAt(_pos + 1) != '}')
+            {
+                _pos++;
+                left = new BinaryExpression(BinaryOperator.Sub, left, ParseMulLevel()) { Offset = start };
+                continue;
+            }
+
+            return left;
+        }
+    }
+
+    private ExpressionNode ParseMulLevel()
+    {
+        int start = _pos;
+        ExpressionNode left = ParseUnaryLevel();
+
+        while (true)
+        {
+            SkipWhitespace();
+
+            if (PeekAt(_pos) == '*' && PeekAt(_pos + 1) != '*')
+            {
+                _pos++;
+                left = new BinaryExpression(BinaryOperator.Mul, left, ParseUnaryLevel()) { Offset = start };
+                continue;
+            }
+
+            if (PeekAt(_pos) == '/' && PeekAt(_pos + 1) == '/')
+            {
+                _pos += 2;
+                left = new BinaryExpression(BinaryOperator.FloorDiv, left, ParseUnaryLevel()) { Offset = start };
+                continue;
+            }
+
+            // '%' is modulo only when it is not the start of a %} tag close.
+            if (PeekAt(_pos) == '/' || (PeekAt(_pos) == '%' && PeekAt(_pos + 1) != '}'))
+            {
+                BinaryOperator binaryOperator = _source[_pos] == '/' ? BinaryOperator.Div : BinaryOperator.Mod;
+                _pos++;
+                left = new BinaryExpression(binaryOperator, left, ParseUnaryLevel()) { Offset = start };
+                continue;
+            }
+
+            return left;
+        }
+    }
+
+    private ExpressionNode ParseUnaryLevel()
+    {
+        int start = _pos;
+        SkipWhitespace();
+
+        if (PeekAt(_pos) == '-')
+        {
+            _pos++;
+            return new UnaryExpression(UnaryOperator.Negate, ParseUnaryLevel()) { Offset = start };
+        }
+
+        return ParsePowerLevel();
+    }
+
+    private ExpressionNode ParsePostfixChain(ExpressionNode target)
+    {
+        int start = _pos;
+
+        while (true)
+        {
+            // Attribute access must stay adjacent; calls, indexes and filters may be spaced.
+            if (PeekAt(_pos) == '.')
+            {
+                _pos++;
+                string attribute = ReadName(start);
+                target = new AttributeExpression(target, attribute) { Offset = start };
+                continue;
+            }
+
+            if (MatchOpenParen())
+            {
+                List<CallArgument> arguments = ParseArguments(start);
+                target = new CallExpression(target, arguments) { Offset = start };
+                continue;
+            }
+
+            if (PeekAfterWhitespace('['))
+            {
+                SkipWhitespace();
+                _pos++;
+                target = ParseIndexOrSliceBody(target, start);
+                continue;
+            }
+
+            if (PeekAfterWhitespace('|'))
+            {
+                SkipWhitespace();
+
+                List<FilterApplication> filters = [];
+
+                while (PeekAfterWhitespace('|'))
+                {
+                    int filterStart = _pos;
+                    _pos++;
+
+                    SkipWhitespace();
+                    string name = ReadName(filterStart);
+                    List<CallArgument> arguments = MatchOpenParen() ? ParseArguments(filterStart) : [];
+
+                    filters.Add(new FilterApplication(name, arguments));
+                }
+
+                target = new FilterChainExpression(target, filters) { Offset = start };
+                continue;
+            }
+
+            return target;
+        }
+    }
+
+    private bool PeekAfterWhitespace(char candidate)
+    {
+        int pos = _pos;
+
+        while (char.IsWhiteSpace(CharAt(pos)))
+            pos++;
+
+        return CharAt(pos) == candidate;
+    }
+
+    /// <summary>Parses the body of [...] after the opening bracket: a plain index or one of the slice forms [a:b], [a:], [:b], [::s].</summary>
+    private ExpressionNode ParseIndexOrSliceBody(ExpressionNode target, int start)
+    {
+        SkipWhitespace();
+
+        if (PeekAt(_pos) == ']')
+            throw Malformed(_pos, "empty index");
+
+        ExpressionNode? first = PeekAt(_pos) == ':' ? null : ParseExpression();
+
+        SkipWhitespace();
+
+        if (PeekAt(_pos) == ']')
+        {
+            _pos++;
+            return new IndexExpression(target, first, Stop: null, Step: null, Slice: false) { Offset = start };
+        }
+
+        Expect(':', start);
+
+        ExpressionNode? stop = PeekAny(']', ':') ? null : ParseExpression();
+        ExpressionNode? step = null;
+
+        SkipWhitespace();
+        if (PeekAt(_pos) == ':')
+        {
+            _pos++;
+            SkipWhitespace();
+            step = PeekAt(_pos) == ']' ? null : ParseExpression();
+        }
+
+        Expect(']', start);
+
+        return new IndexExpression(target, first, stop, step, Slice: true) { Offset = start };
+    }
+
+    private bool PeekAny(params char[] candidates)
+    {
+        SkipWhitespace();
+
+        foreach (char candidate in candidates)
+        {
+            if (PeekAt(_pos) == candidate)
+                return true;
+        }
+
+        return false;
+    }
+
+    private void Expect(char expected, int contextOffset)
+    {
+        SkipWhitespace();
+
+        if (PeekAt(_pos) != expected)
+            throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), $"expected '{expected}'");
+
+        _pos++;
+    }
+
+    private ExpressionNode ParsePowerLevel()
+    {
+        int start = _pos;
+        ExpressionNode left = ParsePostfixChain(ParsePrimary());
+
+        SkipWhitespace();
+        if (PeekAt(_pos) == '*' && PeekAt(_pos + 1) == '*')
+        {
+            _pos += 2;
+            // ** is right-associative.
+            return new BinaryExpression(BinaryOperator.Pow, left, ParseUnaryLevel()) { Offset = start };
+        }
+
+        return left;
+    }
+
+    private ExpressionNode ParsePrimary()
+    {
+        SkipWhitespace();
+
+        int start = _pos;
+        char c = PeekAt(_pos);
+
+        if (c is >= '0' and <= '9')
+            return ParseNumberLiteral(start);
+
+        if (c == '\'' || c == '"')
+            return new StringLiteral(ParseQuotedString(c, start)) { Offset = start };
+
+        if (MatchOpenParen())
+        {
+            ExpressionNode inner = ParseExpression();
+
+            SkipWhitespace();
+            if (PeekAt(_pos) == ',')
+                throw new MinjaSyntaxException("tuple literal", start);
+
+            Expect(')', start);
+            return inner;
+        }
+
+        if (IsWordStart(c))
+        {
+            string word = ReadWord();
+
+            return word switch
+            {
+                "True" => new BoolLiteral(true) { Offset = start },
+                "False" => new BoolLiteral(false) { Offset = start },
+                "None" => new NoneLiteral() { Offset = start },
+                _ => new NameExpression(word) { Offset = start },
+            };
+        }
+
+        throw Malformed(start, $"unexpected character '{c}'");
+    }
+
+    private ExpressionNode ParseNumberLiteral(int start)
+    {
+        int begin = _pos;
+
+        while (PeekAt(_pos) is >= '0' and <= '9')
+            _pos++;
+
+        bool floating = false;
+
+        if (PeekAt(_pos) == '.' && PeekAt(_pos + 1) is >= '0' and <= '9')
+        {
+            floating = true;
+            _pos++;
+
+            while (PeekAt(_pos) is >= '0' and <= '9')
+                _pos++;
+        }
+
+        if (PeekAny('e', 'E'))
+        {
+            int mark = _pos;
+            _pos++;
+
+            if (PeekAny('+', '-'))
+                _pos++;
+
+            if (!IsDigit(PeekAt(_pos)))
+            {
+                // Not an exponent after all: rewind and let the caller treat e/E as a name boundary error.
+                _pos = mark;
+            }
+            else
+            {
+                floating = true;
+
+                while (PeekAt(_pos) is >= '0' and <= '9')
+                    _pos++;
+            }
+        }
+
+        string text = _source[begin.._pos];
+
+        if (floating)
+            return new FloatLiteral(double.Parse(text, System.Globalization.CultureInfo.InvariantCulture)) { Offset = start };
+
+        return new IntegerLiteral(long.Parse(text, System.Globalization.CultureInfo.InvariantCulture)) { Offset = start };
+    }
+
+    private string ParseQuotedString(char quote, int start)
+    {
+        _pos++; // opening quote
+        var value = new System.Text.StringBuilder();
+
+        while (true)
+        {
+            char c = PeekAt(_pos);
+
+            if (c == '\0')
+                throw Malformed(start, "unterminated string literal");
+
+            if (c == quote)
+            {
+                _pos++;
+                return value.ToString();
+            }
+
+            if (c == '\\')
+            {
+                char next = PeekAt(_pos + 1);
+                value.Append(next switch
+                {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '\\' => '\\',
+                    '\'' => '\'',
+                    '"' => '"',
+                    _ => "\\" + next,
+                });
+
+                _pos += 2;
+                continue;
+            }
+
+            value.Append(c);
+            _pos++;
+        }
+    }
+
+    // ---------------------------------------------------------------- names, targets and argument lists
+
+    private string ReadName(int contextOffset)
+    {
+        SkipWhitespace();
+
+        if (!IsWordStart(PeekAt(_pos)))
+            throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), "expected a name");
+
+        return ReadWord();
+    }
+
+    private bool MatchOpenParen()
+    {
+        SkipWhitespace();
+
+        if (PeekAt(_pos) != '(')
+            return false;
+
+        _pos++;
+        return true;
+    }
+
+    /// <summary>Parses a call or filter argument list after the opening '('. Bare commas are rejected as tuple literals.</summary>
+    private List<CallArgument> ParseArguments(int contextOffset)
+    {
+        List<CallArgument> arguments = [];
+
+        while (true)
+        {
+            SkipWhitespace();
+
+            if (PeekAt(_pos) == ')')
+                break;
+
+            string? name = TryNamedArgumentName();
+            ExpressionNode value = ParseExpression();
+            arguments.Add(new CallArgument(name, value));
+
+            SkipWhitespace();
+
+            if (PeekAt(_pos) != ',')
+                break;
+
+            _pos++;
+        }
+
+        Expect(')', contextOffset);
+        return arguments;
+    }
+
+    /// <summary>Detects name = value argument syntax by lookahead and consumes the name plus '=' when present.</summary>
+    private string? TryNamedArgumentName()
+    {
+        if (!IsWordStart(PeekAt(_pos)))
+            return null;
+
+        int scan = _pos;
+        while (scan < _source.Length && IsWordChar(_source[scan]))
+            scan++;
+
+        int after = scan;
+        while (after < _source.Length && char.IsWhiteSpace(_source[after]))
+            after++;
+
+        if (after >= _source.Length || _source[after] != '=' || PeekAt(after + 1) == '=')
+            return null;
+
+        string name = _source[_pos..scan];
+        _pos = after;
+        Expect('=', _pos);
+
+        return name;
+    }
+
+    private List<MacroParameter> ParseMacroParameters()
+    {
+        int listStart = _pos - 1;
+        List<MacroParameter> parameters = [];
+
+        while (true)
+        {
+            SkipWhitespace();
+
+            if (PeekAt(_pos) == ')')
+                break;
+
+            int start = _pos;
+            string name = ReadName(start);
+
+            ExpressionNode? defaultValue = null;
+            if (TakeAssignOperator())
+                defaultValue = ParseConditional();
+
+            parameters.Add(new MacroParameter(name, defaultValue));
+
+            SkipWhitespace();
+
+            if (PeekAt(_pos) != ',')
+                break;
+
+            _pos++;
+        }
+
+        Expect(')', listStart);
+        return parameters;
+    }
+
+    private TargetPattern ParseForTarget()
+    {
+        SkipWhitespace();
+
+        int start = _pos;
+
+        if (PeekAt(_pos) == '(')
+            return new TupleTarget(ParseTupleItems(start)) { Offset = start };
+
+        return new NameTarget(ReadName(start));
+    }
+
+    private List<TargetPattern> ParseTupleItems(int contextOffset)
+    {
+        Expect('(', contextOffset);
+
+        List<TargetPattern> items = [];
+
+        while (true)
+        {
+            SkipWhitespace();
+
+            if (PeekAt(_pos) == '(')
+                items.Add(new TupleTarget(ParseTupleItems(contextOffset)));
+            else
+                items.Add(new NameTarget(ReadName(_pos)));
+
+            SkipWhitespace();
+
+            if (PeekAt(_pos) != ',')
+                break;
+
+            _pos++;
+        }
+
+        Expect(')', contextOffset);
+        return items;
+    }
+
+    /// <summary>Parses set targets after the set keyword: one or more comma-separated names, optionally wrapped in parentheses.</summary>
+    private List<SetTarget> ParseSetTargets(int tagStart)
+    {
+        SkipWhitespace();
+
+        if (PeekAt(_pos) == '(')
+            return ParseParenthesizedSetTargets(tagStart);
+
+        List<SetTarget> targets = [ParseDottedTarget(tagStart)];
+
+        while (true)
+        {
+            SkipWhitespace();
+
+            if (PeekAt(_pos) != ',')
+                break;
+
+            _pos++;
+            targets.Add(ParseDottedTarget(tagStart));
+        }
+
+        return targets;
+    }
+
+    private List<SetTarget> ParseParenthesizedSetTargets(int tagStart)
+    {
+        Expect('(', tagStart);
+
+        List<SetTarget> targets = [ParseDottedTarget(tagStart)];
+
+        while (true)
+        {
+            SkipWhitespace();
+
+            if (PeekAt(_pos) != ',')
+                break;
+
+            _pos++;
+            targets.Add(ParseDottedTarget(tagStart));
+        }
+
+        Expect(')', tagStart);
+        return targets;
+    }
+
+    private SetTarget ParseDottedTarget(int contextOffset)
+    {
+        SkipWhitespace();
+
+        string first = ReadName(contextOffset);
+        List<string> parts = [first];
+
+        while (PeekAt(_pos) == '.')
+        {
+            _pos++;
+            parts.Add(ReadName(contextOffset));
+        }
+
+        return new SetTarget(first, parts);
+    }
+}
+

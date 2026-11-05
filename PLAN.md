@@ -460,8 +460,8 @@ Published Llama-family chat models serve chat end-to-end on this machine, render
 
 - [✓] Minja library project — create `src/Lair.Templating.Minja` as a managed template engine with no dependency on `lair.http`, `lair.models`, `lair.tokenizer`, or native libraries (see DN-M32-1, DN-M32-2)
   - Verify: `dotnet build src/Lair.Templating.Minja/Lair.Templating.Minja.csproj` — succeeded with 0 warnings/0 errors; `dotnet list src/Lair.Templating.Minja/Lair.Templating.Minja.csproj reference` shows no LAIR runtime project references. Added to solution under `src`.
-- [_] Lexer/parser/AST — implement minja tokenization, two-phase parsing, comments, whitespace elision, statements, expressions, and unsupported-construct rejection (see DN-M32-2)
-  - Verify: `dotnet test --filter Category=MinjaSyntax` — syntax goldens for supported constructs plus actionable rejection tests for `{% raw %}`, `{% block %}`, `{% include %}`, `{% extends %}`, tuples, and ternary-less `if` expressions.
+- [✓] Lexer/parser/AST — implement minja tokenization, two-phase parsing, comments, whitespace elision, statements, expressions, and unsupported-construct rejection (see DN-M32-2)
+  - Verify: `dotnet test --filter Category=MinjaSyntax -c Release` — 38/38 passed. Full `dotnet test -c Release` passed 362/362 on the final rerun; earlier reruns hit borderline concurrency/affinity flakes unrelated to parser code.
 - [_] `MinjaValue` and evaluator — implement ordered maps, Python-like truthiness, none/undefined equivalence, list/map/string operations, membership, boolean operators, slices, arithmetic/concatenation, and minja-compatible JSON dump (see DN-M32-3)
   - Verify: `dotnet test --filter Category=MinjaEval` — expression/value goldens for truthiness, equality, membership, indexing, slicing, concatenation, map/list dump, and numeric behavior.
 - [_] Minja statements — implement `if`/`elif`/`else`, `for` with `loop.*`, `recursive`, `if`, `break`, `continue`, destructuring, `set` with namespaces/destructuring, `macro`, `call`, and `filter` with minja-compatible scoping (see DN-M32-4)
@@ -481,7 +481,7 @@ Published Llama-family chat models serve chat end-to-end on this machine, render
 
 #### Tests
 
-- [_] Automated MinjaSyntax: supported minja constructs, unsupported non-minja constructs, whitespace/comment handling, and parse errors naming construct + position.
+- [✓] Automated MinjaSyntax: supported minja constructs, unsupported non-minja constructs, whitespace/comment handling, and parse errors naming construct + position. ✅ 38 tests in `tests/Lair.Tests/MinjaSyntaxTests.cs`; targeted syntax filter passed 38/38.
 - [_] Automated MinjaEval: value model, truthiness, membership, indexing, slicing, concatenation, maps/lists, and minja-compatible JSON dump.
 - [_] Automated MinjaStatements: `if`, `for`, `loop.*`, `break`, `continue`, `set`, namespaces, destructuring, `macro`, `call`, `filter`, and scoping goldens.
 - [_] Automated MinjaFilters: minja filter/test/function collection, including `raise_exception` render-time `invalid_request` mapping.
