@@ -401,7 +401,7 @@ Published Q4_K_M models load and serve on this machine.
 - [✓] Automated Kernel: Q5_0/Q5_K/Q6_K scalar-vs-AVX2 bit-identity + batch equivalence + real-fixture decode sanity ✅ Category=Kernel|Loader 77→92 with Parity; Release full 320/320
 - [✓] Manual Q4_K_M Serve: q4_k_m model served; chat via API + `/ui`; monitor live ✅ verified live on :8392 (see item evidence)
 
-### MVP3.2 [v0.3.2] - Refined
+### MVP3.2 [v0.3.2] - In Progress
 
 Published Llama-family chat models serve chat end-to-end on this machine, rendering their own GGUF chat template through a managed full-minja-parity template library — starting with `models/Llama-3.2-1B-Instruct-Q8_0.gguf`.
 
@@ -458,8 +458,8 @@ Published Llama-family chat models serve chat end-to-end on this machine, render
 
 #### Implementation Items
 
-- [_] Minja library project — create `src/Lair.Templating.Minja` as a managed template engine with no dependency on `lair.http`, `lair.models`, `lair.tokenizer`, or native libraries (see DN-M32-1, DN-M32-2)
-  - Verify: `dotnet build src/Lair.Templating.Minja/Lair.Templating.Minja.csproj` succeeds; `dotnet list src/Lair.Templating.Minja/Lair.Templating.Minja.csproj reference` shows no LAIR runtime project references.
+- [✓] Minja library project — create `src/Lair.Templating.Minja` as a managed template engine with no dependency on `lair.http`, `lair.models`, `lair.tokenizer`, or native libraries (see DN-M32-1, DN-M32-2)
+  - Verify: `dotnet build src/Lair.Templating.Minja/Lair.Templating.Minja.csproj` — succeeded with 0 warnings/0 errors; `dotnet list src/Lair.Templating.Minja/Lair.Templating.Minja.csproj reference` shows no LAIR runtime project references. Added to solution under `src`.
 - [_] Lexer/parser/AST — implement minja tokenization, two-phase parsing, comments, whitespace elision, statements, expressions, and unsupported-construct rejection (see DN-M32-2)
   - Verify: `dotnet test --filter Category=MinjaSyntax` — syntax goldens for supported constructs plus actionable rejection tests for `{% raw %}`, `{% block %}`, `{% include %}`, `{% extends %}`, tuples, and ternary-less `if` expressions.
 - [_] `MinjaValue` and evaluator — implement ordered maps, Python-like truthiness, none/undefined equivalence, list/map/string operations, membership, boolean operators, slices, arithmetic/concatenation, and minja-compatible JSON dump (see DN-M32-3)
