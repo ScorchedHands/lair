@@ -120,15 +120,15 @@ internal static class TokenizerProfiles
             int runStart = start;
             for (int pos = start; pos < end;)
             {
-                bool isDigit = char.IsNumber(text, pos);
-                if (pos > runStart && isDigit != char.IsNumber(text, runStart))
+                bool isDigit = IsNumberAt(text, pos);
+                if (pos > runStart && isDigit != IsNumberAt(text, runStart))
                 {
                     next.Add(pos - runStart);
                     runStart = pos;
                 }
 
                 // Step whole codepoints so a surrogate pair never lands on a digit-run boundary.
-                pos += char.IsHighSurrogate(text[pos]) && pos + 1 < end ? 2 : 1;
+                pos += CodepointLength(text, pos);
             }
 
             next.Add(end - runStart);
@@ -160,18 +160,20 @@ internal static class TokenizerProfiles
                     previousEnd = tokenEnd;
                 }
 
-                    // A surrogate pair is one codepoint and must stay in a single pre-token: splitting it would make
-                    // UTF-8 encoding emit replacement bytes.
-                    if (char.IsHighSurrogate(text[pos]) && pos + 1 < end && char.IsLowSurrogate(text[pos + 1]))
-                    {
-                        pos += 2;
-                        AddToken(pos);
-                        continue;
-                    }
+                // A surrogate pair is one codepoint and must stay in a single pre-token: splitting it would make
+                // UTF-8 encoding emit replacement bytes. A lone surrogate advances by one, never pairing with
+                // the next character.
+                int pairLength = CodepointLength(text, pos);
+                if (pairLength == 2)
+                {
+                    pos += 2;
+                    AddToken(pos);
+                    continue;
+                }
 
-                    if (text[pos] == '\'' && pos + 1 < end)
-                    {
-                        int contractionLength = 0;
+                if (text[pos] == '\'' && pos + 1 < end)
+                {
+                    int contractionLength = 0;
                     bool isContraction = IsAsciiLetter(text, pos + 1)
                         && IsContractionSuffix(text, pos, end, out contractionLength);
 
@@ -189,17 +191,17 @@ internal static class TokenizerProfiles
                 }
 
                 int letterStart = pos;
-                if (text[pos] == ' ' && pos + 1 < end && char.IsLetter(text, pos + 1))
+                if (text[pos] == ' ' && pos + 1 < end && IsLetterAt(text, pos + 1))
                 {
                     letterStart = pos + 1;
                 }
 
-                if (char.IsLetter(text, letterStart))
+                if (IsLetterAt(text, letterStart))
                 {
                     pos = letterStart;
-                    while (pos < end && char.IsLetter(text, pos))
+                    while (pos < end && IsLetterAt(text, pos))
                     {
-                        pos++;
+                        pos += CodepointLength(text, pos);
                     }
 
                     AddToken(pos);
@@ -207,17 +209,17 @@ internal static class TokenizerProfiles
                 }
 
                 int numberStart = pos;
-                if (text[pos] == ' ' && pos + 1 < end && char.IsNumber(text, pos + 1))
+                if (text[pos] == ' ' && pos + 1 < end && IsNumberAt(text, pos + 1))
                 {
                     numberStart = pos + 1;
                 }
 
-                if (char.IsNumber(text, numberStart))
+                if (IsNumberAt(text, numberStart))
                 {
                     pos = numberStart;
-                    while (pos < end && char.IsNumber(text, pos))
+                    while (pos < end && IsNumberAt(text, pos))
                     {
-                        pos++;
+                        pos += CodepointLength(text, pos);
                     }
 
                     AddToken(pos);
@@ -235,7 +237,7 @@ internal static class TokenizerProfiles
                     pos = symbolStart;
                     while (pos < end && IsGpt2Symbol(text, pos))
                     {
-                        pos++;
+                        pos += CodepointLength(text, pos);
                     }
 
                     AddToken(pos);
@@ -294,18 +296,20 @@ internal static class TokenizerProfiles
                     previousEnd = tokenEnd;
                 }
 
-                    // A surrogate pair is one codepoint and must stay in a single pre-token: splitting it would make
-                    // UTF-8 encoding emit replacement bytes.
-                    if (char.IsHighSurrogate(text[pos]) && pos + 1 < end && char.IsLowSurrogate(text[pos + 1]))
-                    {
-                        pos += 2;
-                        AddToken(pos);
-                        continue;
-                    }
+                // A surrogate pair is one codepoint and must stay in a single pre-token: splitting it would make
+                // UTF-8 encoding emit replacement bytes. A lone surrogate advances by one, never pairing with
+                // the next character.
+                int pairLength = CodepointLength(text, pos);
+                if (pairLength == 2)
+                {
+                    pos += 2;
+                    AddToken(pos);
+                    continue;
+                }
 
-                    if (text[pos] == '\'' && pos + 1 < end)
-                    {
-                        int suffixLength = 0;
+                if (text[pos] == '\'' && pos + 1 < end)
+                {
+                    int suffixLength = 0;
                     bool isContraction = IsAsciiLetter(text, pos + 1)
                         && IsContractionSuffix(text, pos, end, out suffixLength, caseInsensitive: true);
 
@@ -322,15 +326,15 @@ internal static class TokenizerProfiles
                     }
                 }
 
-                if (text[pos] != '\r' && text[pos] != '\n' && !char.IsNumber(text, pos))
+                if (text[pos] != '\r' && text[pos] != '\n' && !IsNumberAt(text, pos))
                 {
-                    int letterStart = char.IsLetter(text, pos) ? pos : pos + 1;
-                    if (letterStart < end && char.IsLetter(text, letterStart))
+                    int letterStart = IsLetterAt(text, pos) ? pos : pos + 1;
+                    if (letterStart < end && IsLetterAt(text, letterStart))
                     {
                         pos = letterStart;
-                        while (pos < end && char.IsLetter(text, pos))
+                        while (pos < end && IsLetterAt(text, pos))
                         {
-                            pos++;
+                            pos += CodepointLength(text, pos);
                         }
 
                         AddToken(pos);
@@ -338,12 +342,12 @@ internal static class TokenizerProfiles
                     }
                 }
 
-                if (char.IsNumber(text, pos))
+                if (IsNumberAt(text, pos))
                 {
                     int groupStart = pos;
-                    while (pos < end && char.IsNumber(text, pos))
+                    while (pos < end && IsNumberAt(text, pos))
                     {
-                        pos++;
+                        pos += CodepointLength(text, pos);
                         if (pos - groupStart >= 3)
                         {
                             AddToken(pos);
@@ -355,18 +359,20 @@ internal static class TokenizerProfiles
                     continue;
                 }
 
+                // The symbol alternative is ` ?[^\s\p{L}\p{N}]+[\r\n]*`: the leading space folds when the
+                // next character is a symbol; the space itself is not a symbol.
                 int symbolStart = pos;
                 if (text[pos] == ' ' && pos + 1 < end && IsLlama3Symbol(text, pos + 1))
                 {
                     symbolStart = pos + 1;
                 }
 
-                if (IsLlama3Symbol(text, pos) && IsLlama3Symbol(text, symbolStart))
+                if (IsLlama3Symbol(text, symbolStart))
                 {
                     pos = symbolStart;
                     while (pos < end && IsLlama3Symbol(text, pos))
                     {
-                        pos++;
+                        pos += CodepointLength(text, pos);
                     }
 
                     while (pos < end && (text[pos] == '\r' || text[pos] == '\n'))
@@ -458,23 +464,61 @@ internal static class TokenizerProfiles
     {
         return pos < text.Length
             && !char.IsWhiteSpace(text, pos)
-            && !char.IsLetter(text, pos)
-            && !char.IsNumber(text, pos)
-            && !IsUndefined(text[pos]);
+            && !IsLetterAt(text, pos)
+            && !IsNumberAt(text, pos)
+            && !IsUndefined(CategoryAt(text, pos));
     }
 
     private static bool IsLlama3Symbol(string text, int pos)
     {
         return pos < text.Length
             && !char.IsWhiteSpace(text, pos)
-            && !char.IsLetter(text, pos)
-            && !char.IsNumber(text, pos)
-            && !IsUndefined(text[pos]);
+            && !IsLetterAt(text, pos)
+            && !IsNumberAt(text, pos)
+            && !IsUndefined(CategoryAt(text, pos));
     }
 
-    private static bool IsUndefined(char ch)
+    // Classification is by Unicode code point: the (string, index) CharUnicodeInfo overload decodes a
+    // surrogate pair, so an astral character classifies as its real category (a lone surrogate stays
+    // Surrogate/undefined). The char overloads see only the high surrogate and classify it as none of
+    // letter/number/symbol, which cut the space fold and the symbol run before an astral character.
+    private static bool IsLetterAt(string text, int pos)
     {
-        UnicodeCategory category = CharUnicodeInfo.GetUnicodeCategory(ch);
+        UnicodeCategory category = CategoryAt(text, pos);
+        return category is UnicodeCategory.UppercaseLetter
+            or UnicodeCategory.LowercaseLetter
+            or UnicodeCategory.TitlecaseLetter
+            or UnicodeCategory.ModifierLetter
+            or UnicodeCategory.OtherLetter;
+    }
+
+    private static bool IsNumberAt(string text, int pos)
+    {
+        UnicodeCategory category = CategoryAt(text, pos);
+        return category is UnicodeCategory.DecimalDigitNumber
+            or UnicodeCategory.LetterNumber
+            or UnicodeCategory.OtherNumber;
+    }
+
+    private static UnicodeCategory CategoryAt(string text, int pos)
+    {
+        return CharUnicodeInfo.GetUnicodeCategory(text, pos);
+    }
+
+    // UTF-16 length of the character at pos: a surrogate pair counts as one code point. A lone surrogate
+    // advances by one and never pairs with the next character, so run loops cannot merge a surrogate with
+    // an unrelated character or cross a segment boundary.
+    private static int CodepointLength(string text, int pos)
+    {
+        return char.IsHighSurrogate(text[pos])
+            && pos + 1 < text.Length
+            && char.IsLowSurrogate(text[pos + 1])
+            ? 2
+            : 1;
+    }
+
+    private static bool IsUndefined(UnicodeCategory category)
+    {
         return category is UnicodeCategory.Format
             or UnicodeCategory.EnclosingMark
             or UnicodeCategory.Surrogate
