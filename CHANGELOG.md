@@ -4,6 +4,22 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-11-06
+
+### Added
+
+- Tokenizer profiles keyed by `tokenizer.ggml.pre`: `llama-bpe`, `gpt2`, and `smollm` are resolved once at model load into concrete tokenizer state (pre-split strategy, merge-lookup shortcut, decode space cleaning, BOS/EOS defaults). An unknown `pre` or model fails the load naming the offending value and the supported profile list.
+- GGUF tokenizer metadata coverage matching what llama.cpp reads: `tokenizer.ggml.byte_fallback`, `byte_to_token` (replaces the `<0xNN>` vocab scan when declared), `byte_to_utf8`, `add_space_prefix` (read and exposed), `eot_token_id`, and `utf8_flush_between_controls`. BOS/EOS fallbacks are profile-scoped and each applied default logs a `tokenizer_default` line.
+- Tokenizer parity harness: `scripts/generate-tokenizer-parity.ps1` captures pinned llama.cpp b12032 `/tokenize` id sequences for both real fixtures into `tests/fixtures/parity-tokenizer-smollm.json` and `tests/fixtures/parity-tokenizer-llama32.json` (model sha256 + `pre` guards), and `Category=Tokenizer` asserts LAIR's `Encode` matches id-for-id.
+
+### Changed
+
+- A model that declares `tokenizer.ggml.eot_token_id` now stops on that id instead of its EOS id.
+
+### Fixed
+
+- Pre-tokenizer classification works on Unicode code points, not UTF-16 code units: astral characters (emoji) no longer break the leading-space fold, and the llama-bpe symbol fold no longer requires the space itself to be a symbol. Both were caught by the new `/tokenize` goldens.
+
 ## [0.3.2] - 2026-11-06
 
 ### Added

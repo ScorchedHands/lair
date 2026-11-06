@@ -48,6 +48,13 @@ Template parity is a separate gate: `tests/fixtures/parity-templates-llama32.jso
 pwsh -File scripts/generate-template-parity.ps1
 ```
 
+Tokenizer parity is a third gate: `tests/fixtures/parity-tokenizer-smollm.json` and `tests/fixtures/parity-tokenizer-llama32.json` pin `/tokenize` id sequences (`add_special=false`, `parse_special=false`) for both real fixtures, with model sha256 and `tokenizer.ggml.pre` guards, asserted id-for-id by `Category=Tokenizer`. Regenerate with:
+
+```powershell
+pwsh -File scripts/generate-tokenizer-parity.ps1
+pwsh -File scripts/generate-tokenizer-parity.ps1 -ModelPath models/Llama-3.2-1B-Instruct-Q8_0.gguf -Out tests/fixtures/parity-tokenizer-llama32.json
+```
+
 `CalibrationProbeTests` (Category `Calib`) are silent unless `LAIR_CALIB_MODEL` and `LAIR_CALIB_OUT` are set; the generator script uses them to embed calibration data.
 
 ## Bench

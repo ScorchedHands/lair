@@ -1,6 +1,6 @@
 # LAIR — Local AI Inference Runtime
 
-A C#/.NET inference runtime that serves GGUF LLMs locally behind an OpenAI-compatible HTTP API, with a built-in chat REPL and a live metrics monitor. Dense models (Llama/Qwen-class), CPU-first AVX2 kernels, continuous batching with chunked prefill, paged KV cache with prefix reuse, config hot-reload, GGUF-embedded tokenizer, and chat templates rendered from GGUF metadata by a managed minja-parity template engine.
+A C#/.NET inference runtime that serves GGUF LLMs locally behind an OpenAI-compatible HTTP API, with a built-in chat REPL and a live metrics monitor. Dense models (Llama/Qwen-class), CPU-first AVX2 kernels, continuous batching with chunked prefill, paged KV cache with prefix reuse, config hot-reload, GGUF-embedded tokenizer with llama.cpp-parity profiles (`llama-bpe`/`gpt2`/`smollm`), and chat templates rendered from GGUF metadata by a managed minja-parity template engine.
 
 ## Requirements
 
