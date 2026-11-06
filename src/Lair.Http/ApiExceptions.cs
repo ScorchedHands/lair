@@ -47,3 +47,34 @@ public sealed class EngineBusyException : Exception
     {
     }
 }
+
+/// <summary>
+/// The loaded model's chat template parsed but failed to render a request's conversation: a deliberate
+/// <c>raise_exception</c>, a template limit, or a cancelled render. The message is bounded and names the model, so the
+/// HTTP layer surfaces it as an actionable <c>invalid_request</c> rather than an unhandled engine fault. A cancelled
+/// render reaches this type through the library's <see cref="Lair.Templating.Minja.RenderLimitsException"/>, never a
+/// raw <see cref="OperationCanceledException"/>.
+/// </summary>
+public sealed class TemplateRenderFailedException : Exception
+{
+    private const int MaxDetailLength = 512;
+
+    public TemplateRenderFailedException(string modelId, string requestId, string detail, Exception cause)
+        : base(BuildMessage(modelId, detail), cause)
+    {
+        ModelId = modelId;
+        RequestId = requestId;
+    }
+
+    /// <summary>The model whose template failed.</summary>
+    public string ModelId { get; }
+
+    /// <summary>The request correlation id (<c>x-lair-request-id</c>) this failure belongs to, empty when the caller supplied none.</summary>
+    public string RequestId { get; }
+
+    private static string BuildMessage(string modelId, string detail)
+    {
+        string bounded = detail.Length <= MaxDetailLength ? detail : detail[..MaxDetailLength] + "...";
+        return $"model '{modelId}' could not render the chat template for this request: {bounded}";
+    }
+}

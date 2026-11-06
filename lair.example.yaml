@@ -17,6 +17,7 @@ models:
     type: chat
     max_context_tokens: 4096
     kv_blocks: 256
+    # force_fenced_tools: false  # optional; true forces LAIR's fenced tool injection even when the model's chat template renders tools itself
     placement:
       device: cpu
       kv_residency: dram

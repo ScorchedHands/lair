@@ -5,30 +5,45 @@ public sealed partial class MinjaParser
     // ---------------------------------------------------------------- expression phase
     // Precedence (loosest first): ternary conditional, or, and, not, comparisons/tests/membership, + -, * / // %, unary -, **, postfix call/index/attribute with filter chains.
     // Filters bind tighter than arithmetic: {{ a | f + b }} parses as {{ (a | f) + b }}, matching how chat templates apply filters to operands.
+    //
+    // Recursion guard: every entry point that can nest (expression entry, primary, literal body, index body,
+    // tuple target, argument list) claims a parser frame, so adversarial nesting fails as a bounded
+    // "parser depth" syntax error instead of exhausting the .NET stack.
+
+    private void EnterExpressionFrame() => _limits.EnterParserFrame(Math.Min(_pos, Math.Max(_source.Length - 1, 0)));
 
     private ExpressionNode ParseExpression() => ParseConditional();
 
     /// <summary>Ternary conditional, right-associative. Ternary-less 'a if b' is rejected as non-minja.</summary>
     private ExpressionNode ParseConditional()
     {
-        int start = _pos;
-        ExpressionNode value = ParseOrLevel();
+        EnterExpressionFrame();
 
-        SkipWhitespace();
-        if (PeekKeyword() != "if")
-            return value;
+        try
+        {
+            int start = _pos;
+            ExpressionNode value = ParseOrLevel();
 
-        MatchKeyword("if");
-        ExpressionNode condition = ParseOrLevel();
+            SkipWhitespace();
+            if (PeekKeyword() != "if")
+                return value;
 
-        SkipWhitespace();
-        if (!MatchKeyword("else"))
-            throw new MinjaSyntaxException("'a if b' without 'else'", start);
+            MatchKeyword("if");
+            ExpressionNode condition = ParseOrLevel();
 
-        // Right recursion: a if b else c if d else e nests as a if b else (c if d else e).
-        ExpressionNode elseBranch = ParseConditional();
+            SkipWhitespace();
+            if (!MatchKeyword("else"))
+                throw new MinjaSyntaxException("'a if b' without 'else'", start);
 
-        return new ConditionalExpression(value, condition, elseBranch) { Offset = start };
+            // Right recursion: a if b else c if d else e nests as a if b else (c if d else e).
+            ExpressionNode elseBranch = ParseConditional();
+
+            return new ConditionalExpression(value, condition, elseBranch) { Offset = start };
+        }
+        finally
+        {
+            _limits.ExitParserFrame();
+        }
     }
 
     private ExpressionNode ParseOrLevel()
@@ -301,41 +316,50 @@ public sealed partial class MinjaParser
     /// <summary>Parses the body of [...] after the opening bracket: a plain index or one of the slice forms [a:b], [a:], [:b], [::s].</summary>
     private ExpressionNode ParseIndexOrSliceBody(ExpressionNode target, int start)
     {
-        SkipWhitespace();
+        EnterExpressionFrame();
 
-        if (PeekAt(_pos) == ']')
-            throw Malformed(_pos, "empty index");
-
-        // A body that opens with ':' has no start bound; parse it as the colon-first slice form.
-        if (PeekAt(_pos) == ':')
-            return ParseColonSliceBody(target, start);
-
-        ExpressionNode? first = ParseExpression();
-
-        SkipWhitespace();
-
-        if (PeekAt(_pos) == ']')
+        try
         {
-            _pos++;
-            return new IndexExpression(target, first, Stop: null, Step: null, Slice: false) { Offset = start };
-        }
-
-        Expect(':', start);
-
-        ExpressionNode? stop = PeekAny(']', ':') ? null : ParseExpression();
-        ExpressionNode? step = null;
-
-        SkipWhitespace();
-        if (PeekAt(_pos) == ':')
-        {
-            _pos++;
             SkipWhitespace();
-            step = PeekAt(_pos) == ']' ? null : ParseExpression();
+
+            if (PeekAt(_pos) == ']')
+                throw Malformed(_pos, "empty index");
+
+            // A body that opens with ':' has no start bound; parse it as the colon-first slice form.
+            if (PeekAt(_pos) == ':')
+                return ParseColonSliceBody(target, start);
+
+            ExpressionNode? first = ParseExpression();
+
+            SkipWhitespace();
+
+            if (PeekAt(_pos) == ']')
+            {
+                _pos++;
+                return new IndexExpression(target, first, Stop: null, Step: null, Slice: false) { Offset = start };
+            }
+
+            Expect(':', start);
+
+            ExpressionNode? stop = PeekAny(']', ':') ? null : ParseExpression();
+            ExpressionNode? step = null;
+
+            SkipWhitespace();
+            if (PeekAt(_pos) == ':')
+            {
+                _pos++;
+                SkipWhitespace();
+                step = PeekAt(_pos) == ']' ? null : ParseExpression();
+            }
+
+            Expect(']', start);
+
+            return new IndexExpression(target, first, stop, step, Slice: true) { Offset = start };
         }
-
-        Expect(']', start);
-
-        return new IndexExpression(target, first, stop, step, Slice: true) { Offset = start };
+        finally
+        {
+            _limits.ExitParserFrame();
+        }
     }
 
     /// <summary>
@@ -344,22 +368,31 @@ public sealed partial class MinjaParser
     /// </summary>
     private ExpressionNode ParseColonSliceBody(ExpressionNode target, int start)
     {
-        Expect(':', start);
+        EnterExpressionFrame();
 
-        ExpressionNode? stop = PeekAny(']', ':') ? null : ParseExpression();
-        ExpressionNode? step = null;
-
-        SkipWhitespace();
-        if (PeekAt(_pos) == ':')
+        try
         {
-            _pos++;
+            Expect(':', start);
+
+            ExpressionNode? stop = PeekAny(']', ':') ? null : ParseExpression();
+            ExpressionNode? step = null;
+
             SkipWhitespace();
-            step = PeekAt(_pos) == ']' ? null : ParseExpression();
+            if (PeekAt(_pos) == ':')
+            {
+                _pos++;
+                SkipWhitespace();
+                step = PeekAt(_pos) == ']' ? null : ParseExpression();
+            }
+
+            Expect(']', start);
+
+            return new IndexExpression(target, Start: null, stop, step, Slice: true) { Offset = start };
         }
-
-        Expect(']', start);
-
-        return new IndexExpression(target, Start: null, stop, step, Slice: true) { Offset = start };
+        finally
+        {
+            _limits.ExitParserFrame();
+        }
     }
 
     private bool PeekAny(params char[] candidates)
@@ -403,56 +436,69 @@ public sealed partial class MinjaParser
 
     private ExpressionNode ParsePrimary()
     {
-        SkipWhitespace();
+        EnterExpressionFrame();
 
-        int start = _pos;
-        char c = PeekAt(_pos);
-
-        if (c is >= '0' and <= '9')
-            return ParseNumberLiteral(start);
-
-        if (c == '\'' || c == '"')
-            return new StringLiteral(ParseQuotedString(c, start)) { Offset = start };
-
-        if (MatchOpenParen())
+        try
         {
-            ExpressionNode inner = ParseExpression();
-
             SkipWhitespace();
-            if (PeekAt(_pos) == ',')
-                throw new MinjaSyntaxException("tuple literal", start);
 
-            Expect(')', start);
-            return inner;
-        }
+            int start = _pos;
+            char c = PeekAt(_pos);
 
-        // '[' and '{' open inline literals only in primary position: postfix indexing peeks at a bracket after an existing expression, so it never reaches ParsePrimary.
-        if (c == '[')
-        {
-            _pos++;
-            return ParsePostfixChain(ParseListLiteralBody(start));
-        }
+            if (c is >= '0' and <= '9')
+                return ParseNumberLiteral(start);
 
-        if (c == '{')
-        {
-            _pos++;
-            return ParsePostfixChain(ParseMapLiteralBody(start));
-        }
+            if (c == '\'' || c == '"')
+                return new StringLiteral(ParseQuotedString(c, start)) { Offset = start };
 
-        if (IsWordStart(c))
-        {
-            string word = ReadWord();
-
-            return word switch
+            if (MatchOpenParen())
             {
-                "True" => new BoolLiteral(true) { Offset = start },
-                "False" => new BoolLiteral(false) { Offset = start },
-                "None" => new NoneLiteral() { Offset = start },
-                _ => new NameExpression(word) { Offset = start },
-            };
-        }
+                ExpressionNode inner = ParseExpression();
 
-        throw Malformed(start, $"unexpected character '{c}'");
+                SkipWhitespace();
+                if (PeekAt(_pos) == ',')
+                    throw new MinjaSyntaxException("tuple literal", start);
+
+                Expect(')', start);
+                return inner;
+            }
+
+            // '[' and '{' open inline literals only in primary position: postfix indexing peeks at a bracket after an existing expression, so it never reaches ParsePrimary.
+            if (c == '[')
+            {
+                _pos++;
+                return ParsePostfixChain(ParseListLiteralBody(start));
+            }
+
+            if (c == '{')
+            {
+                _pos++;
+                return ParsePostfixChain(ParseMapLiteralBody(start));
+            }
+
+            if (IsWordStart(c))
+            {
+                string word = ReadWord();
+
+                return word switch
+                {
+                    "True" => new BoolLiteral(true) { Offset = start },
+                    "False" => new BoolLiteral(false) { Offset = start },
+                    // Jinja/minja accept the lowercase spellings as the same boolean literals; real chat
+                    // templates (e.g. Llama-3.2's tools_in_user_message default) rely on them.
+                    "true" => new BoolLiteral(true) { Offset = start },
+                    "false" => new BoolLiteral(false) { Offset = start },
+                    "None" => new NoneLiteral() { Offset = start },
+                    _ => new NameExpression(word) { Offset = start },
+                };
+            }
+
+            throw Malformed(start, $"unexpected character '{c}'");
+        }
+        finally
+        {
+            _limits.ExitParserFrame();
+        }
     }
 
     private ExpressionNode ParseNumberLiteral(int start)
@@ -509,44 +555,54 @@ public sealed partial class MinjaParser
     /// </summary>
     private ExpressionNode ParseListLiteralBody(int start)
     {
-        List<ExpressionNode> items = [];
+        EnterExpressionFrame();
 
-        SkipWhitespace();
-        if (PeekAt(_pos) == ']')
+        try
         {
-            _pos++;
-            return new ListLiteral(items) { Offset = start };
-        }
-
-        while (true)
-        {
-            items.Add(ParseExpression());
+            List<ExpressionNode> items = [];
 
             SkipWhitespace();
-
-            char c = PeekAt(_pos);
-
-            if (c == ',')
+            if (PeekAt(_pos) == ']')
             {
                 _pos++;
+                return new ListLiteral(items) { Offset = start };
+            }
+
+            while (true)
+            {
+                _limits.CheckCancellation("list literal", Math.Min(_pos, Math.Max(_source.Length - 1, 0)));
+                items.Add(ParseExpression());
 
                 SkipWhitespace();
-                if (PeekAt(_pos) == ']')
-                    throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), "trailing comma in list literal");
 
-                continue;
+                char c = PeekAt(_pos);
+
+                if (c == ',')
+                {
+                    _pos++;
+
+                    SkipWhitespace();
+                    if (PeekAt(_pos) == ']')
+                        throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), "trailing comma in list literal");
+
+                    continue;
+                }
+
+                if (c == ']')
+                {
+                    _pos++;
+                    break;
+                }
+
+                throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), "expected ',' or ']' in list literal");
             }
 
-            if (c == ']')
-            {
-                _pos++;
-                break;
-            }
-
-            throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), "expected ',' or ']' in list literal");
+            return new ListLiteral(items) { Offset = start };
         }
-
-        return new ListLiteral(items) { Offset = start };
+        finally
+        {
+            _limits.ExitParserFrame();
+        }
     }
 
     /// <summary>
@@ -556,48 +612,59 @@ public sealed partial class MinjaParser
     /// </summary>
     private ExpressionNode ParseMapLiteralBody(int start)
     {
-        List<MapEntry> entries = [];
+        EnterExpressionFrame();
 
-        SkipWhitespace();
-        if (PeekAt(_pos) == '}')
+        try
         {
-            _pos++;
-            return new MapLiteral(entries) { Offset = start };
-        }
-
-        while (true)
-        {
-            ExpressionNode key = ParseExpression();
-
-            Expect(':', start);
-
-            entries.Add(new MapEntry(key, ParseExpression()));
+            List<MapEntry> entries = [];
 
             SkipWhitespace();
-
-            char c = PeekAt(_pos);
-
-            if (c == ',')
+            if (PeekAt(_pos) == '}')
             {
                 _pos++;
+                return new MapLiteral(entries) { Offset = start };
+            }
+
+            while (true)
+            {
+                _limits.CheckCancellation("map literal", Math.Min(_pos, Math.Max(_source.Length - 1, 0)));
+
+                ExpressionNode key = ParseExpression();
+
+                Expect(':', start);
+
+                entries.Add(new MapEntry(key, ParseExpression()));
 
                 SkipWhitespace();
-                if (PeekAt(_pos) == '}')
-                    throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), "trailing comma in map literal");
 
-                continue;
+                char c = PeekAt(_pos);
+
+                if (c == ',')
+                {
+                    _pos++;
+
+                    SkipWhitespace();
+                    if (PeekAt(_pos) == '}')
+                        throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), "trailing comma in map literal");
+
+                    continue;
+                }
+
+                if (c == '}')
+                {
+                    _pos++;
+                    break;
+                }
+
+                throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), "expected ',' or '}' in map literal");
             }
 
-            if (c == '}')
-            {
-                _pos++;
-                break;
-            }
-
-            throw Malformed(Math.Min(_pos, Math.Max(_source.Length - 1, 0)), "expected ',' or '}' in map literal");
+            return new MapLiteral(entries) { Offset = start };
         }
-
-        return new MapLiteral(entries) { Offset = start };
+        finally
+        {
+            _limits.ExitParserFrame();
+        }
     }
 
     private string ParseQuotedString(char quote, int start)
@@ -667,29 +734,40 @@ public sealed partial class MinjaParser
     /// <summary>Parses a call or filter argument list after the opening '('. Bare commas are rejected as tuple literals.</summary>
     private List<CallArgument> ParseArguments(int contextOffset)
     {
-        List<CallArgument> arguments = [];
+        EnterExpressionFrame();
 
-        while (true)
+        try
         {
-            SkipWhitespace();
+            List<CallArgument> arguments = [];
 
-            if (PeekAt(_pos) == ')')
-                break;
+            while (true)
+            {
+                SkipWhitespace();
 
-            string? name = TryNamedArgumentName();
-            ExpressionNode value = ParseExpression();
-            arguments.Add(new CallArgument(name, value));
+                if (PeekAt(_pos) == ')')
+                    break;
 
-            SkipWhitespace();
+                _limits.CheckCancellation("call arguments", Math.Min(_pos, Math.Max(_source.Length - 1, 0)));
 
-            if (PeekAt(_pos) != ',')
-                break;
+                string? name = TryNamedArgumentName();
+                ExpressionNode value = ParseExpression();
+                arguments.Add(new CallArgument(name, value));
 
-            _pos++;
+                SkipWhitespace();
+
+                if (PeekAt(_pos) != ',')
+                    break;
+
+                _pos++;
+            }
+
+            Expect(')', contextOffset);
+            return arguments;
         }
-
-        Expect(')', contextOffset);
-        return arguments;
+        finally
+        {
+            _limits.ExitParserFrame();
+        }
     }
 
     /// <summary>Detects name = value argument syntax by lookahead and consumes the name plus '=' when present.</summary>
@@ -763,29 +841,38 @@ public sealed partial class MinjaParser
 
     private List<TargetPattern> ParseTupleItems(int contextOffset)
     {
-        Expect('(', contextOffset);
+        EnterExpressionFrame();
 
-        List<TargetPattern> items = [];
-
-        while (true)
+        try
         {
-            SkipWhitespace();
+            Expect('(', contextOffset);
 
-            if (PeekAt(_pos) == '(')
-                items.Add(new TupleTarget(ParseTupleItems(contextOffset)));
-            else
-                items.Add(new NameTarget(ReadName(_pos)));
+            List<TargetPattern> items = [];
 
-            SkipWhitespace();
+            while (true)
+            {
+                SkipWhitespace();
 
-            if (PeekAt(_pos) != ',')
-                break;
+                if (PeekAt(_pos) == '(')
+                    items.Add(new TupleTarget(ParseTupleItems(contextOffset)));
+                else
+                    items.Add(new NameTarget(ReadName(_pos)));
 
-            _pos++;
+                SkipWhitespace();
+
+                if (PeekAt(_pos) != ',')
+                    break;
+
+                _pos++;
+            }
+
+            Expect(')', contextOffset);
+            return items;
         }
-
-        Expect(')', contextOffset);
-        return items;
+        finally
+        {
+            _limits.ExitParserFrame();
+        }
     }
 
     /// <summary>Parses set targets after the set keyword: one or more comma-separated names, optionally wrapped in parentheses.</summary>

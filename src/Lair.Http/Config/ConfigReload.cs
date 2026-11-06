@@ -132,6 +132,11 @@ public static class ConfigMutationTable
             changes.Add(new FieldChange("models[0].kv_blocks", Text(oldModel.KvBlocks), Text(newModel.KvBlocks), ConfigMutationClass.Live));
         }
 
+        if (newModel.ForceFencedTools != oldModel.ForceFencedTools)
+        {
+            changes.Add(new FieldChange("models[0].force_fenced_tools", Text(oldModel.ForceFencedTools), Text(newModel.ForceFencedTools), ConfigMutationClass.NewRequestsOnly));
+        }
+
         PlacementConfig oldPlacement = oldModel.Placement;
         PlacementConfig newPlacement = newModel.Placement;
         Add(changes, "models[0].placement.device", oldPlacement.Device, newPlacement.Device);
@@ -212,6 +217,7 @@ public static class ConfigMutationTable
         "models[0].placement.thread_quota" => ConfigMutationClass.Live,
         "ui.recent_requests" => ConfigMutationClass.Live,
         "models[0].max_context_tokens" => ConfigMutationClass.NewRequestsOnly,
+        "models[0].force_fenced_tools" => ConfigMutationClass.NewRequestsOnly,
         _ => ConfigMutationClass.RestartOnly,
     };
 
@@ -240,6 +246,7 @@ public static class ConfigMutationTable
         yield return ("models[0].type", ScalarText(model, "type"));
         yield return ("models[0].max_context_tokens", ScalarText(model, "max_context_tokens"));
         yield return ("models[0].kv_blocks", ScalarText(model, "kv_blocks"));
+        yield return ("models[0].force_fenced_tools", ScalarText(model, "force_fenced_tools"));
 
         YamlDotNet.RepresentationModel.YamlMappingNode? placement = Child(model, "placement");
         yield return ("models[0].placement.device", ScalarText(placement, "device"));
@@ -263,6 +270,7 @@ public static class ConfigMutationTable
         "models[0].type" => current.Models[0].Type,
         "models[0].max_context_tokens" => Text(current.Models[0].MaxContextTokens),
         "models[0].kv_blocks" => Text(current.Models[0].KvBlocks),
+        "models[0].force_fenced_tools" => Text(current.Models[0].ForceFencedTools),
         "models[0].placement.device" => current.Models[0].Placement.Device,
         "models[0].placement.kv_residency" => current.Models[0].Placement.KvResidency,
         "models[0].placement.prefill" => current.Models[0].Placement.Prefill,
@@ -290,6 +298,8 @@ public static class ConfigMutationTable
         cores.Count == 0 ? "(none)" : string.Join(",", cores.OrderBy(core => core));
 
     private static string Text(int value) => value.ToString(CultureInfo.InvariantCulture);
+
+    private static string Text(bool value) => value ? "true" : "false";
 
     private static string TextOrNone(int? value) => value is null ? "(unset)" : Text(value.Value);
 }

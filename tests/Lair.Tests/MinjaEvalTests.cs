@@ -364,6 +364,23 @@ public sealed class MinjaEvalTests
     }
 
     [Fact]
+    public void Render_LowercaseBooleanLiteralsMatchTheUppercaseOnes()
+    {
+        Assert.Equal("TrueFalse", Render("{{ true }}{{ false }}"));
+        Assert.Equal("yes", Render("{% if true %}yes{% else %}no{% endif %}"));
+        Assert.Equal("no", Render("{% if false %}yes{% else %}no{% endif %}"));
+    }
+
+    [Fact]
+    public void Render_SingleTrailingNewlineIsStrippedLikeKeepTrailingNewlineFalse()
+    {
+        Assert.Equal("a", Render("a\n"));
+        Assert.Equal("a", Render("a\r\n"));
+        Assert.Equal("a\n", Render("a\n\n"));
+        Assert.Equal("a", Render("{{ 'a' }}\n"));
+    }
+
+    [Fact]
     public void Render_CommentsNeverEmitOutput()
     {
         Assert.Equal("ab", Render("a{# hidden note #}b"));

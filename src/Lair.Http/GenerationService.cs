@@ -8,8 +8,8 @@ using Lair.Loader;
 using Lair.Models.Engine;
 using Lair.Models.Scheduling;
 using Lair.Sampling;
+using Lair.Templating.Minja;
 using Lair.Tokenizer;
-using Lair.Tokenizer.Templating;
 using Microsoft.Extensions.Logging;
 
 namespace Lair.Http;
@@ -27,7 +27,9 @@ public sealed class GenerationService : IDisposable
     private readonly CpuBackend _backend;
     private readonly TransformerModel _model;
     private readonly GgufTokenizer _tokenizer;
-    private readonly ChatTemplateRenderer? _chatTemplate;
+    private readonly MinjaChatTemplate? _chatTemplate;
+    private readonly TemplateCapabilities? _chatTemplateCapabilities;
+    private readonly ILogger? _logger;
     private readonly BlockPool _pool;
     private readonly GenerationScheduler _scheduler;
     private EngineMetricsBus? _metrics;
@@ -54,7 +56,9 @@ public sealed class GenerationService : IDisposable
         CpuBackend backend,
         TransformerModel model,
         GgufTokenizer tokenizer,
-        ChatTemplateRenderer? chatTemplate,
+        MinjaChatTemplate? chatTemplate,
+        TemplateCapabilities? chatTemplateCapabilities,
+        ILogger? logger,
         BlockPool pool,
         GenerationScheduler scheduler,
         ModelInfo info,
@@ -65,6 +69,8 @@ public sealed class GenerationService : IDisposable
         _model = model;
         _tokenizer = tokenizer;
         _chatTemplate = chatTemplate;
+        _chatTemplateCapabilities = chatTemplateCapabilities;
+        _logger = logger;
         _pool = pool;
         _scheduler = scheduler;
         _current = config;
@@ -73,6 +79,14 @@ public sealed class GenerationService : IDisposable
 
     /// <summary>The served model's advertised facts; requests must name <see cref="ModelInfo.Id"/>. Recomputed when a hot-reloaded field changes what the engine advertises.</summary>
     public ModelInfo Model => Volatile.Read(ref _modelInfo);
+
+    /// <summary>
+    /// Capability facts detected once for the loaded model's chat template (null when the model has no chat template).
+    /// These are the facts a request-time tool-precedence decision consumes to choose between the template's own tool
+    /// rendering and LAIR's fenced-tool injection; they are published here so that decision has a single source of
+    /// truth on the loaded-model path.
+    /// </summary>
+    public TemplateCapabilities? ChatTemplateCapabilities => _chatTemplateCapabilities;
 
     /// <summary>Vocabulary size of the served model; token ids at or above it have no vocabulary text.</summary>
     public int VocabSize => Model.VocabSize;
@@ -256,6 +270,12 @@ public sealed class GenerationService : IDisposable
                             $"admission now validates against a {_modelInfo.ContextLength}-token window; sequences already in flight are unaffected"));
                         break;
 
+                    case "models[0].force_fenced_tools":
+                        effective = effective with { Models = [effective.Models[0] with { ForceFencedTools = candidate.Models[0].ForceFencedTools }] };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"chat requests admitted from now on {(candidate.Models[0].ForceFencedTools ? "inject LAIR's fenced tool block even for a tool-capable template" : "follow the loaded template's tool capabilities")}; sequences already in flight are unaffected"));
+                        break;
+
                     case "ui.recent_requests":
                         _metrics?.SetRecentRequestCapacity(candidate.Ui.RecentRequests);
                         effective = effective with { Ui = candidate.Ui };
@@ -310,7 +330,7 @@ public sealed class GenerationService : IDisposable
     /// service starts with an empty cache. The effective context is the smaller of the configured max context and
     /// the token slots the KV pool can hold.
     /// </summary>
-    public static GenerationService Open(LairConfig config)
+    public static GenerationService Open(LairConfig config, ILogger? logger = null)
     {
         ArgumentNullException.ThrowIfNull(config);
         if (config.Models.Count == 0)
@@ -352,9 +372,39 @@ public sealed class GenerationService : IDisposable
             PrefixCache cache = new(pool);
             scheduler = new GenerationScheduler(model, pool, config.Engine.MaxBatchTokens, cache);
 
-            ChatTemplateRenderer? chatTemplate = file.Metadata.ChatTemplate is string source
-                ? ChatTemplateRenderer.Parse(source)
-                : null;
+            // The chat template is parsed once here, at model load, and cached for the loaded instance's lifetime: no
+            // per-request parse and no lazy first-request parse. An unparseable template fails model startup fast,
+            // naming the model path plus the offending construct and its offset. The model's literal BOS/EOS pieces
+            // are bound to the template's bos_token/eos_token context variables so the wrapper can report whether a
+            // rendered prompt already carries the model BOS.
+            MinjaChatTemplate? chatTemplate = null;
+            TemplateCapabilities? chatTemplateCapabilities = null;
+            if (file.Metadata.ChatTemplate is string source)
+            {
+                string bosToken = LiteralTokenPiece(tokenizer, tokenizer.BosId);
+                string eosToken = LiteralTokenPiece(tokenizer, tokenizer.EosId);
+
+                try
+                {
+                    chatTemplate = new MinjaChatTemplate(source, bosToken, eosToken);
+                }
+                catch (MinjaSyntaxException ex)
+                {
+                    logger?.LogError(
+                        "model path={ModelPath} has an invalid chat template: construct={Construct} at offset={Position}",
+                        modelConfig.Path,
+                        ex.Construct,
+                        ex.Position);
+
+                    throw new InvalidOperationException(
+                        $"model '{modelConfig.Name}' at '{modelConfig.Path}' has an invalid chat template: {ex.Message}",
+                        ex);
+                }
+
+                // Capability facts are probed once at load so request-time tool-precedence decisions have them without
+                // re-probing per request. Probing never throws: a probe that cannot render reports that capability absent.
+                chatTemplateCapabilities = chatTemplate.DetectCapabilities();
+            }
 
             ModelInfo info = new(
                 modelConfig.Name,
@@ -364,7 +414,7 @@ public sealed class GenerationService : IDisposable
                 model.Desc.Architecture,
                 model.Desc.VocabSize);
 
-            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, pool, scheduler, info, config);
+            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, logger, pool, scheduler, info, config);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
             file = null;
             model = null;
@@ -420,20 +470,19 @@ public sealed class GenerationService : IDisposable
         IReadOnlyDictionary<int, float>? logitBias = ResolveLogitBias(request.LogitBias);
 
         // Tool declarations and the choice are validated here too so programmatic callers meet the same rules as HTTP ones.
-        // The pipeline is active only for chat requests that declare tools under a mode other than none: injection happens on
-        // the rendered prompt, and detection reads fences out of the decoded text against the names this choice allows.
-        IReadOnlyList<ToolDefinition>? declaredTools = ValidateToolDeclarations(request.Tools);
-        ToolChoiceSelection toolChoice = ResolveToolChoice(request.ToolChoice, declaredTools);
-        bool toolsActive = request.IsChat && declaredTools is { Count: > 0 } && toolChoice.Mode != ToolChoiceMode.None;
+        // The pipeline is active only for chat requests that declare tools under a mode other than none: which tool surface
+        // the request gets — the template's own rendering or LAIR's fenced block — is resolved once by capability
+        // precedence, and detection reads fences out of the decoded text against the names this choice allows.
+        ToolPipeline tools = ResolveToolPipeline(request);
 
-        IReadOnlyCollection<string> callableNames = toolsActive
-            ? toolChoice.Mode == ToolChoiceMode.Function
-                ? [toolChoice.FunctionName!]
-                : [.. declaredTools!.Select(tool => tool.Name)]
+        IReadOnlyCollection<string> callableNames = tools.Active
+            ? tools.Choice.Mode == ToolChoiceMode.Function
+                ? [tools.Choice.FunctionName!]
+                : [.. tools.DeclaredTools!.Select(tool => tool.Name)]
             : [];
 
         IReadOnlyList<int> prompt = request.IsChat
-            ? EncodeChat(request, toolsActive ? declaredTools : null)
+            ? EncodeChat(request, tools, cancellationToken)
             : EncodeCompletion(request);
 
         if (prompt.Count >= Model.ContextLength)
@@ -589,9 +638,11 @@ public sealed class GenerationService : IDisposable
         }
 
         // Recognized fences take over the result: the fences vanish from the visible text, the calls ride along as data,
-        // and the finish reason becomes tool_calls no matter how decoding ended.
+        // and the finish reason becomes tool_calls no matter how decoding ended. Detection is unchanged by which tool
+        // surface the prompt used: it reads fenced-JSON calls out of the decoded text whenever the pipeline is active,
+        // whether LAIR injected the contract or the template rendered the tools itself.
         IReadOnlyList<ToolCall>? toolCalls = null;
-        if (toolsActive)
+        if (tools.Active)
         {
             ToolDetection detection = ToolCallDetector.Detect(text, callableNames);
             if (detection.Calls.Count > 0)
@@ -645,9 +696,24 @@ public sealed class GenerationService : IDisposable
         _backend.Dispose();
     }
 
-    private IReadOnlyList<int> EncodeChat(GenerationRequest request, IReadOnlyList<ToolDefinition>? injectedTools)
+    private IReadOnlyList<int> EncodeChat(GenerationRequest request, ToolPipeline tools, CancellationToken cancellationToken)
     {
-        IReadOnlyList<ChatMessage>? messages = request.Messages;
+        ChatPrompt prompt = BuildChatPrompt(request, tools, cancellationToken);
+
+        // BOS policy: the template is rendered exactly, then the tokenizer's own BOS is suppressed only when the
+        // rendered prompt already starts with the model BOS token. No blind stripping — when the template did not emit
+        // the BOS, the model's add_bos_token policy still prefixes it.
+        bool prefixBos = _tokenizer.AddBosToken && !prompt.RenderStartsWithBos;
+        return prefixBos
+            ? _tokenizer.EncodeWithBos(prompt.Text)
+            : _tokenizer.Encode(prompt.Text);
+    }
+
+    // The full chat-prompt build the request path performs: validate the conversation, render the model's template,
+    // and apply the resolved tool precedence — the template's own tool rendering or LAIR's fenced block, never both.
+    private ChatPrompt BuildChatPrompt(GenerationRequest request, ToolPipeline tools, CancellationToken cancellationToken)
+    {
+        IReadOnlyList<Lair.Tokenizer.Templating.ChatMessage>? messages = request.Messages;
         if (messages is null || messages.Count == 0)
         {
             throw new ArgumentException(
@@ -662,18 +728,107 @@ public sealed class GenerationService : IDisposable
                 "rendered; serve a model with a chat template or send a completion request with a raw 'prompt'.");
         }
 
-        // The tool block rides on the rendered text before encoding: the injection point is the prompt string, so every
-        // template family receives the same instruction line, schema fences, and reply contract.
-        string rendered = _chatTemplate.Render(messages, addGenerationPrompt: true);
-        if (injectedTools is not null)
+        ChatTemplateInput input = new()
         {
-            rendered = ToolPromptComposer.Compose(rendered, injectedTools);
+            Messages = [.. messages.Select(MapChatMessage)],
+            AddGenerationPrompt = true,
+
+            // DN-M32-7 precedence: when the template owns the tool surface, the declared tools enter the template
+            // context and the template formats them; the fenced-injection path keeps them out of the context so
+            // exactly one tool surface reaches the model.
+            Tools = tools.TemplateTools is null ? null : [.. tools.TemplateTools.Select(TemplateToolValues.Of)],
+        };
+
+        ChatTemplateRenderResult render;
+        try
+        {
+            render = _chatTemplate.Render(input, cancellationToken: cancellationToken);
+        }
+        catch (MinjaRenderException ex)
+        {
+            // A template that parsed but fails to render this request — a deliberate raise_exception, a limit, or a
+            // cancelled render (the library reports cancellation as RenderLimitsException, never a raw
+            // OperationCanceledException) — surfaces as a bounded, actionable template error naming the model and the
+            // correlation id. The HTTP layer maps it to an invalid_request response.
+            string requestId = string.IsNullOrWhiteSpace(request.RequestId) ? string.Empty : request.RequestId!;
+            string detail = ex is RenderLimitsException limits ? $"{limits.Limit} limit ({ex.Construct})" : ex.Construct;
+            _logger?.LogError(
+                "model '{Model}' request_id={RequestId} chat template render failed ({Detail}): {Message}",
+                Model.Id,
+                requestId,
+                detail,
+                ex.Message);
+
+            throw new TemplateRenderFailedException(Model.Id, requestId, ex.Message, ex);
         }
 
-        return _tokenizer.AddBosToken
-            ? _tokenizer.EncodeWithBos(rendered)
-            : _tokenizer.Encode(rendered);
+        // The tool block rides on the rendered text before encoding: the injection point is the prompt string, so every
+        // template family receives the same instruction line, schema fences, and reply contract.
+        string rendered = render.Prompt;
+        if (tools.InjectedTools is not null)
+        {
+            rendered = ToolPromptComposer.Compose(rendered, tools.InjectedTools);
+        }
+
+        return new ChatPrompt(rendered, render.StartsWithBos);
     }
+
+    // One built chat prompt: the exact string the tokenizer receives, and whether the template render already
+    // carried the model BOS (the tokenizer's own BOS is suppressed only in that case).
+    private sealed record ChatPrompt(string Text, bool RenderStartsWithBos);
+
+    /// <summary>
+    /// The exact chat-prompt build the request path performs for one chat request — tool validation, capability-driven
+    /// tool precedence, template render, and fenced injection — returned as the prompt string exactly as it is
+    /// tokenized. Hosts and tests observe the adapter's real prompt decision through this seam.
+    /// </summary>
+    internal string BuildChatPrompt(GenerationRequest request, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        return BuildChatPrompt(request, ResolveToolPipeline(request), cancellationToken).Text;
+    }
+
+    /// <summary>
+    /// The request's resolved tool pipeline: the declared tools, the resolved choice, whether the pipeline is active
+    /// for this request, and which tool surface the active pipeline uses — the tools the template renders itself or
+    /// the tools LAIR injects as its fenced block. Exactly one of the two tool lists is non-null when active.
+    /// </summary>
+    private sealed record ToolPipeline(
+        IReadOnlyList<ToolDefinition>? DeclaredTools,
+        ToolChoiceSelection Choice,
+        bool Active,
+        IReadOnlyList<ToolDefinition>? TemplateTools,
+        IReadOnlyList<ToolDefinition>? InjectedTools);
+
+    private ToolPipeline ResolveToolPipeline(GenerationRequest request)
+    {
+        IReadOnlyList<ToolDefinition>? declaredTools = ValidateToolDeclarations(request.Tools);
+        ToolChoiceSelection choice = ResolveToolChoice(request.ToolChoice, declaredTools);
+
+        // ToolChoiceMode.None closes the pipeline before any precedence decision: no template tools, no injection.
+        if (!request.IsChat || declaredTools is not { Count: > 0 } || choice.Mode == ToolChoiceMode.None)
+        {
+            return new ToolPipeline(declaredTools, choice, false, null, null);
+        }
+
+        return ShouldInjectFencedTools(_chatTemplateCapabilities, Volatile.Read(ref _current).Models[0].ForceFencedTools)
+            ? new ToolPipeline(declaredTools, choice, true, null, declaredTools)
+            : new ToolPipeline(declaredTools, choice, true, declaredTools, null);
+    }
+
+    // DN-M32-7 tool precedence: a loaded template that renders tools owns the tool surface for that request. LAIR's
+    // fenced block is the fallback for a template without tool support (and for a model with no chat template at all),
+    // and the model's force_fenced_tools override selects it even for a tool-capable template.
+    private static bool ShouldInjectFencedTools(TemplateCapabilities? capabilities, bool forceOverride) =>
+        forceOverride || capabilities is null || !capabilities.SupportsTools;
+
+    private static ChatMessage MapChatMessage(Lair.Tokenizer.Templating.ChatMessage message) =>
+        new() { Role = message.Role, Content = MinjaValue.Of(message.Content) };
+
+    // The literal vocabulary text of a special token id, or empty when the id is unset. This is the string bound to the
+    // template's bos_token/eos_token context variables and compared against a rendered prompt for BOS suppression.
+    private static string LiteralTokenPiece(GgufTokenizer tokenizer, int tokenId) =>
+        tokenId >= 0 ? tokenizer.Decode([tokenId], includeSpecial: true) : string.Empty;
 
     private IReadOnlyList<int> EncodeCompletion(GenerationRequest request)
     {

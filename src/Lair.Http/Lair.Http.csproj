@@ -8,6 +8,7 @@
     <ProjectReference Include="..\Lair.Tokenizer\Lair.Tokenizer.csproj" />
     <ProjectReference Include="..\Lair.Sampling\Lair.Sampling.csproj" />
     <ProjectReference Include="..\Lair.Models\Lair.Models.csproj" />
+    <ProjectReference Include="..\Lair.Templating.Minja\Lair.Templating.Minja.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -56,6 +56,14 @@ public sealed record ModelConfig
 
     public int KvBlocks { get; init; } = 256;
 
+    /// <summary>
+    /// Tool-precedence override. When true, chat requests with declared tools always receive LAIR's fenced tool
+    /// block even when the model's chat template reports tool support, and the declared tools are kept out of the
+    /// template's own <c>tools</c> context so exactly one tool surface reaches the model. Default false: the loaded
+    /// template's detected capabilities decide, and LAIR injection is the fallback for templates without tool support.
+    /// </summary>
+    public bool ForceFencedTools { get; init; }
+
     public PlacementConfig Placement { get; init; } = new();
 }
 

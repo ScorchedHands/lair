@@ -18,32 +18,32 @@ internal static class MinjaBuiltins
     // ---------------------------------------------------------------- call shapes
 
     /// <summary>Evaluates a filter application: the filtered value leads, then the evaluated arguments follow.</summary>
-    public static MinjaValue ApplyFilter(FilterApplication filter, MinjaValue source, TemplateScope scope)
+    public static MinjaValue ApplyFilter(FilterApplication filter, MinjaValue source, TemplateScope scope, MinjaLimits limits)
     {
         if (!Functions.TryGetValue(filter.Name, out BuiltinFunction? builtin) || builtin is null)
             throw Unknown("filter", filter.Name, filter.Offset);
 
-        return builtin.Invoke(EvaluateArguments(filter.Arguments, scope), scope, filter.Offset, input: source);
+        return builtin.Invoke(EvaluateArguments(filter.Arguments, scope, limits), scope, filter.Offset, input: source, limits);
     }
 
     /// <summary>Evaluates a test expression against the tested value and negates for 'is not'.</summary>
-    public static MinjaValue ApplyTest(TestExpression test, MinjaValue left, TemplateScope scope)
+    public static MinjaValue ApplyTest(TestExpression test, MinjaValue left, TemplateScope scope, MinjaLimits limits)
     {
         if (!Functions.TryGetValue(test.Name, out BuiltinFunction? builtin) || builtin is null)
             throw Unknown("test", test.Name, test.Offset);
 
-        MinjaValue result = builtin.Invoke(EvaluateArguments(test.Arguments, scope), scope, test.Offset, input: left);
+        MinjaValue result = builtin.Invoke(EvaluateArguments(test.Arguments, scope, limits), scope, test.Offset, input: left, limits);
 
         return MinjaValue.Of(test.Negated ? !result.IsTruthy : result.IsTruthy);
     }
 
     /// <summary>Evaluates a function-style call on a plain name that no template binding owns.</summary>
-    public static MinjaValue InvokeFunction(string name, IReadOnlyList<CallArgument> arguments, TemplateScope scope, int offset)
+    public static MinjaValue InvokeFunction(string name, IReadOnlyList<CallArgument> arguments, TemplateScope scope, int offset, MinjaLimits limits)
     {
         if (!Functions.TryGetValue(name, out BuiltinFunction? builtin) || builtin is null)
             throw new MinjaRenderException("call", offset, $"unknown function '{name}'");
 
-        return builtin.Invoke(EvaluateArguments(arguments, scope), scope, offset, input: null);
+        return builtin.Invoke(EvaluateArguments(arguments, scope, limits), scope, offset, input: null, limits);
     }
 
     /// <summary>Unknown-name wording shared by filters and tests; it names the construct plus the supported set.</summary>
@@ -139,6 +139,8 @@ internal static class MinjaBuiltins
         if (input.Kind != MinjaValueKind.Map)
             throw new MinjaRenderException("filter", call.Offset, $"items needs a map value but found {input.Kind}");
 
+        call.Limits.RequireSequenceLength(input.MapValue.Count, "items", call.Offset);
+
         return PairsOf(input);
     }
 
@@ -163,6 +165,8 @@ internal static class MinjaBuiltins
 
         if (by != "key" && by != "value")
             throw new MinjaRenderException("filter", call.Offset, $"dictsort sorts by 'key' or 'value' but found '{by}'");
+
+        call.Limits.RequireSequenceLength(input.MapValue.Count, "dictsort", call.Offset);
 
         List<KeyValuePair<string, MinjaValue>> entries = [.. input.MapValue];
         StringComparison comparison = caseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
@@ -198,6 +202,8 @@ internal static class MinjaBuiltins
             builder.Append(picked.ToString());
         }
 
+        call.Limits.RequireOutputLength(builder.Length, "join", call.Offset);
+
         return MinjaValue.Of(builder.ToString());
     }
 
@@ -220,7 +226,7 @@ internal static class MinjaBuiltins
         foreach (MinjaValue item in EnumerateItems(call))
             mapped.Add(path is not null ? LookupPath(item, path, call.Offset, fallback) : InvokePredicate(call, item, predicateName!, extra));
 
-        return MinjaValue.List(mapped);
+        return MaterializedList(call, mapped, "map");
     }
 
     private static MinjaValue Select(BuiltinCall call) => FilterItems(call, "select", keep: true);
@@ -299,7 +305,10 @@ internal static class MinjaBuiltins
         // The value model owns the dump: maps keep insertion order, strings escape like Python json.dumps.
         MinjaValue input = RequireInput(call);
 
-        return MinjaValue.Of(indent is int width ? input.ToJson(width) : input.ToJson());
+        string dumped = indent is int width ? input.ToJson(width) : input.ToJson();
+        call.Limits.RequireOutputLength(dumped.Length, "tojson", call.Offset);
+
+        return MinjaValue.Of(dumped);
     }
 
     private static MinjaValue Trim(BuiltinCall call)
@@ -313,7 +322,10 @@ internal static class MinjaBuiltins
         string text = RequireString(RequireInput(call), "trim", call.Offset);
         string chars = positional.Count > 0 ? RequireString(positional[0].Value, "trim", call.Offset) : " \t\n\r\f\v";
 
-        return MinjaValue.Of(text.Trim(chars.ToCharArray()));
+        string trimmed = text.Trim(chars.ToCharArray());
+        call.Limits.RequireOutputLength(trimmed.Length, "trim", call.Offset);
+
+        return MinjaValue.Of(trimmed);
     }
 
 
@@ -321,7 +333,10 @@ internal static class MinjaBuiltins
     {
         RejectAnyArguments(call);
 
-        return MinjaValue.Of(EscapeHtml(RequireInput(call).StringValue));
+        string escaped = EscapeHtml(RequireInput(call).StringValue);
+        call.Limits.RequireOutputLength(escaped.Length, "escape", call.Offset);
+
+        return MinjaValue.Of(escaped);
     }
 
     /// <summary>HTML escaping for e/escape: the five markupsafe entities, everything else passes through.</summary>
@@ -404,10 +419,10 @@ internal static class MinjaBuiltins
 
     // ---------------------------------------------------------------- chat-template helpers
 
-    private static MinjaValue RangeFunction(BuiltinCall call) => Range(call.Arguments, call.Offset);
+    private static MinjaValue RangeFunction(BuiltinCall call) => Range(call.Arguments, call.Limits, call.Offset);
 
     /// <summary>range(stop), range(start, stop) and range(start, stop, step), including negative steps.</summary>
-    internal static MinjaValue Range(IReadOnlyList<EvaluatedArgument> arguments, int offset)
+    internal static MinjaValue Range(IReadOnlyList<EvaluatedArgument> arguments, MinjaLimits limits, int offset)
     {
         List<MinjaValue> values = [.. arguments.Select(argument => argument.Value)];
 
@@ -447,6 +462,24 @@ internal static class MinjaBuiltins
         }
 
         List<MinjaValue> items = [];
+
+        // The count a span produces is computable from its bounds, so an over-budget range is rejected before
+        // the first item is allocated. The span subtraction is overflow-guarded: an overflowing span is by
+        // definition over budget, so it lands on the same limit error instead of wrapping to a small count.
+        long span;
+
+        try
+        {
+            span = step > 0 ? checked(stop - start) : checked(start - stop);
+        }
+        catch (OverflowException)
+        {
+            span = long.MaxValue;
+        }
+
+        long stride = Math.Abs(step);
+        long count = span <= 0 ? 0 : 1 + (span - 1) / stride;
+        limits.RequireSequenceLength(count, "range", offset);
 
         if (step > 0)
         {
@@ -549,7 +582,15 @@ internal static class MinjaBuiltins
 
     // ---------------------------------------------------------------- select/reject/map/sort plumbing
 
-    private static List<MinjaValue> EnumerateItems(BuiltinCall call) => [.. MinjaEvaluator.EnumerateIterable(RequireInput(call), call.Offset)];
+    private static List<MinjaValue> EnumerateItems(BuiltinCall call) => [.. MinjaEvaluator.EnumerateIterable(RequireInput(call), call.Limits, call.Offset)];
+
+    /// <summary>Charges a builtin's materialized list against the render's sequence budget before it is returned.</summary>
+    private static MinjaValue MaterializedList(BuiltinCall call, List<MinjaValue> items, string construct)
+    {
+        call.Limits.RequireSequenceLength(items.Count, construct, call.Offset);
+
+        return MinjaValue.List(items);
+    }
 
 
     private static MinjaValue FilterItems(BuiltinCall call, string construct, bool keep)
@@ -562,7 +603,7 @@ internal static class MinjaBuiltins
             if ((predicateName is null ? item.IsTruthy : InvokePredicate(call, item, predicateName, extra).IsTruthy) == keep)
                 kept.Add(item);
 
-        return MinjaValue.List(kept);
+        return MaterializedList(call, kept, construct);
     }
 
     private static MinjaValue FilterAttributes(BuiltinCall call, string construct, bool keep)
@@ -586,7 +627,7 @@ internal static class MinjaBuiltins
                     : InvokePredicate(call, LookupPath(item, path, call.Offset, fallback: null), predicateName, extra).IsTruthy) == keep)
                 kept.Add(item);
 
-        return MinjaValue.List(kept);
+        return MaterializedList(call, kept, construct);
     }
 
     private static (string? PredicateName, List<MinjaValue> Extra) ReadPredicate(BuiltinCall call, string construct)
@@ -607,7 +648,7 @@ internal static class MinjaBuiltins
         List<EvaluatedArgument> arguments = [.. extra.Select(value => new EvaluatedArgument(Name: null, value))];
 
         if (Functions.TryGetValue(predicateName, out BuiltinFunction? builtin) && builtin is not null)
-            return builtin.Invoke(arguments, call.Scope, call.Offset, input: subject);
+            return builtin.Invoke(arguments, call.Scope, call.Offset, input: subject, limits: call.Limits);
 
         // A macro or joiner bound in template scope works as a per-item predicate too, so user helpers stay usable.
         if (call.Scope.TryGetCallable(predicateName, out MinjaCallable? callable) && callable is not null)
@@ -623,10 +664,10 @@ internal static class MinjaBuiltins
     // ---------------------------------------------------------------- argument helpers
 
     /// <summary>Evaluates parsed call arguments left to right against the call site before a builtin consumes them.</summary>
-    private static List<EvaluatedArgument> EvaluateArguments(IReadOnlyList<CallArgument> arguments, TemplateScope scope) =>
+    private static List<EvaluatedArgument> EvaluateArguments(IReadOnlyList<CallArgument> arguments, TemplateScope scope, MinjaLimits limits) =>
         [.. arguments.Select(argument => new EvaluatedArgument(
             argument.Name,
-            MinjaEvaluator.EvaluateInScope(argument.Value, scope)))];
+            MinjaEvaluator.EvaluateInScope(argument.Value, scope, limits)))];
 
     /// <summary>An argument that has already been evaluated against the call site.</summary>
     internal sealed record EvaluatedArgument(string? Name, MinjaValue Value);
@@ -815,7 +856,8 @@ internal static class MinjaBuiltins
         IReadOnlyList<EvaluatedArgument> arguments,
         TemplateScope scope,
         int offset,
-        MinjaValue? input)
+        MinjaValue? input,
+        MinjaLimits limits)
     {
         /// <summary>The name the template used, which is also the name error messages quote.</summary>
         public string Name { get; } = name;
@@ -826,11 +868,15 @@ internal static class MinjaBuiltins
 
         /// <summary>The value the filter chain or test supplies, or null for a plain function call.</summary>
         public MinjaValue? Input { get; } = input;
+
+        /// <summary>The guard that owns the budgets of the render this builtin runs inside.</summary>
+        public MinjaLimits Limits { get; } = limits;
     }
 
     /// <summary>
     /// One entry of the built-in namespace. Built-ins consume arguments that are already evaluated against the
-    /// call site, so they keep their own invoke shape instead of the raw-argument callable interface.
+    /// call site, so they keep their own invoke shape instead of the raw-argument callable interface. The active
+    /// limits guard rides along on every call so allocation-heavy builtins charge the render's budget.
     /// </summary>
     internal sealed class BuiltinFunction
     {
@@ -844,8 +890,8 @@ internal static class MinjaBuiltins
 
         public string Name { get; }
 
-        public MinjaValue Invoke(IReadOnlyList<EvaluatedArgument> arguments, TemplateScope scope, int offset, MinjaValue? input) =>
-            _handler(new BuiltinCall(Name, arguments, scope, offset, input));
+        public MinjaValue Invoke(IReadOnlyList<EvaluatedArgument> arguments, TemplateScope scope, int offset, MinjaValue? input, MinjaLimits limits) =>
+            _handler(new BuiltinCall(Name, arguments, scope, offset, input, limits));
     }
 }
 

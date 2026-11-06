@@ -19,6 +19,7 @@ namespace Lair.Templating.Minja;
 public sealed partial class MinjaParser
 {
     private readonly string _source;
+    private readonly MinjaLimits _limits;
 
     // Single cursor for both phases: structure parsing advances it between tags, expression parsing inside tag contents.
     private int _pos;
@@ -26,13 +27,44 @@ public sealed partial class MinjaParser
     /// <summary>Depth of open macro/call/filter blocks; break and continue are only valid inside one.</summary>
     private int _blockDepth;
 
-    private MinjaParser(string source) => _source = source;
+    private MinjaParser(string source, MinjaLimits limits)
+    {
+        _source = source;
+        _limits = limits;
+    }
 
-    /// <summary>Parses a chat template into its AST. Throws <see cref="MinjaSyntaxException"/> for unsupported or malformed syntax.</summary>
-    public static TemplateNode Parse(string template)
+    /// <summary>
+    /// Parses a chat template into its AST. Throws <see cref="MinjaSyntaxException"/> for unsupported or
+    /// malformed syntax, including the library's parse guards (template size and parser depth), whose
+    /// <see cref="MinjaSyntaxException.Construct"/> names the limit that was exceeded.
+    /// </summary>
+    public static TemplateNode Parse(string template) => Parse(template, CancellationToken.None);
+
+    /// <summary>
+    /// Parses a chat template with cooperative cancellation. The token is additive: it lets a caller abandon
+    /// a parse it no longer needs and is not a way to widen any of the library's fixed limits.
+    /// </summary>
+    public static TemplateNode Parse(string template, CancellationToken cancellation)
     {
         ArgumentNullException.ThrowIfNull(template);
-        return new MinjaParser(template).ParseTemplate();
+
+        MinjaLimits limits = MinjaLimits.ForParse(cancellation);
+
+        if (template.Length > MinjaLimitDefaults.MaxTemplateSourceLength)
+            throw MinjaSyntaxException.LimitExceeded(
+                "template size",
+                $"the template source is {template.Length} characters but parsing accepts at most {MinjaLimitDefaults.MaxTemplateSourceLength}");
+
+        // Jinja/minja strip exactly one trailing newline from the template source (keep_trailing_newline is
+        // false); GGUF chat templates routinely end with one, and the pinned reference does not render it.
+        string source = template;
+
+        if (source.EndsWith("\r\n", StringComparison.Ordinal))
+            source = source[..^2];
+        else if (source.EndsWith('\n'))
+            source = source[..^1];
+
+        return new MinjaParser(source, limits).ParseTemplate();
     }
 
     // ---------------------------------------------------------------- structure phase
@@ -45,50 +77,61 @@ public sealed partial class MinjaParser
     /// </summary>
     private List<MinjaNode> ParseNodes(IReadOnlyList<string>? terminators)
     {
-        List<MinjaNode> nodes = [];
+        _limits.EnterParserFrame(Math.Min(_pos, Math.Max(_source.Length - 1, 0)));
 
-        while (_pos < _source.Length)
+        try
         {
-            int tagStart = NextTagStart();
-            if (tagStart < 0)
-            {
-                AddText(nodes, _pos, _source.Length);
-                _pos = _source.Length;
-                break;
-            }
+            List<MinjaNode> nodes = [];
 
-            char marker = _source[tagStart + 1];
-
-            if (marker == '%' && PeekTagKeyword(tagStart) is { } keyword && terminators is not null && ListContains(terminators, keyword))
+            while (_pos < _source.Length)
             {
-                // Text before a terminator belongs to the body being closed.
+                _limits.CheckCancellation("template parse", _pos);
+
+                int tagStart = NextTagStart();
+                if (tagStart < 0)
+                {
+                    AddText(nodes, _pos, _source.Length);
+                    _pos = _source.Length;
+                    break;
+                }
+
+                char marker = _source[tagStart + 1];
+
+                if (marker == '%' && PeekTagKeyword(tagStart) is { } keyword && terminators is not null && ListContains(terminators, keyword))
+                {
+                    // Text before a terminator belongs to the body being closed.
+                    AddText(nodes, _pos, tagStart);
+                    _pos = tagStart;
+                    break;
+                }
+
                 AddText(nodes, _pos, tagStart);
-                _pos = tagStart;
-                break;
+
+                // Opening-marker elision ({%- / {{- ) applies to the text run just added in this same body.
+                if (OpenTrimLeft(tagStart))
+                    TrimTrailing(nodes);
+
+                if (marker == '%')
+                {
+                    nodes.Add(ParseStatementTag(tagStart, PeekTagKeyword(tagStart)));
+                }
+                else if (marker == '{')
+                {
+                    nodes.Add(ParseOutputTag(tagStart));
+                }
+                else
+                {
+                    nodes.Add(ParseCommentTag(tagStart));
+                }
             }
 
-            AddText(nodes, _pos, tagStart);
-
-            // Opening-marker elision ({%- / {{- ) applies to the text run just added in this same body.
-            if (OpenTrimLeft(tagStart))
-                TrimTrailing(nodes);
-
-            if (marker == '%')
-            {
-                nodes.Add(ParseStatementTag(tagStart, PeekTagKeyword(tagStart)));
-            }
-            else if (marker == '{')
-            {
-                nodes.Add(ParseOutputTag(tagStart));
-            }
-            else
-            {
-                nodes.Add(ParseCommentTag(tagStart));
-            }
+            ApplyTrimRight(nodes);
+            return nodes;
         }
-
-        ApplyTrimRight(nodes);
-        return nodes;
+        finally
+        {
+            _limits.ExitParserFrame();
+        }
     }
 
     /// <summary>Parses a block body with break/continue allowed at this nesting depth.</summary>

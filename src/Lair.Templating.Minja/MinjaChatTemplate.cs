@@ -48,7 +48,13 @@ public sealed class MinjaChatTemplate
     /// whether to inject its own tool fallback), and whether the prompt already starts with the model BOS.
     /// </summary>
     /// <exception cref="MinjaRenderException">The template failed to render the (possibly normalized) input.</exception>
-    public ChatTemplateRenderResult Render(ChatTemplateInput input, ChatTemplateOptions? options = null)
+    /// <remarks>
+    /// <paramref name="cancellationToken"/> is additive request plumbing: it lets a caller abandon a render it no
+    /// longer needs. It does not widen any of the library's fixed resource limits, and a cancelled render surfaces as
+    /// the library's <see cref="RenderLimitsException"/> (a <see cref="MinjaRenderException"/>), never a raw
+    /// <see cref="OperationCanceledException"/>.
+    /// </remarks>
+    public ChatTemplateRenderResult Render(ChatTemplateInput input, ChatTemplateOptions? options = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(input);
 
@@ -70,7 +76,7 @@ public sealed class MinjaChatTemplate
         TemplateScope scope = TemplateScope.Root(context);
         scope.DefineCallable("strftime_now", new StrftimeNowValue(now));
 
-        string prompt = MinjaEvaluator.Render(_template, scope);
+        string prompt = MinjaEvaluator.Render(_template, scope, cancellationToken);
 
         return new ChatTemplateRenderResult
         {

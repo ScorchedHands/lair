@@ -374,6 +374,28 @@ public sealed class MinjaStatementsTests
         Assert.Equal("21", Render("{% for i in nums %}{% macro m() %}{% set i = 2 %}{{ i }}{% endmacro %}{{ m() }}{{ i }}{% endfor %}", context));
     }
 
+    [Fact]
+    public void Macro_CallArgumentsEvaluateInTheCallingScope()
+    {
+        // A recursive macro builds its next argument from its own frame, exactly like the pinned llama.cpp
+        // jinja engine, which gathers every call_expression argument from the caller's context.
+        Assert.Equal(
+            "321",
+            Render("{% macro countdown(n) %}{{ n }}{% if n > 1 %}{{ countdown(n - 1) }}{% endif %}{% endmacro %}{{ countdown(3) }}"));
+
+        // A macro called from inside a loop receives the loop's local binding as its argument.
+        IReadOnlyDictionary<string, MinjaValue> context = Context(("nums", ListOf(MinjaValue.Of(1L), MinjaValue.Of(2L))));
+
+        Assert.Equal(
+            "12",
+            Render("{% macro tag(x) %}{{ x }}{% endmacro %}{% for pair in nums %}{{ tag(pair) }}{% endfor %}", context));
+
+        // Keyword arguments resolve the same way.
+        Assert.Equal(
+            "12",
+            Render("{% macro tag(x) %}{{ x }}{% endmacro %}{% for pair in nums %}{{ tag(x=pair) }}{% endfor %}", context));
+    }
+
     // ---------------------------------------------------------------- call blocks
 
     [Fact]

@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using Lair.Templating.Minja;
 
 namespace Lair.Http;
 
@@ -86,6 +87,67 @@ public static class ToolPromptComposer
 
         return Encoding.UTF8.GetString(buffer.ToArray());
     }
+}
+
+/// <summary>
+/// Converts one LAIR tool declaration into the HF-style tool-definition map a minja chat template consumes:
+/// <c>{"type":"function","function":{"name":...,"description":...,"parameters":{...}}}</c> — the same shape the
+/// wrapper's capability probe validated when it reported <c>SupportsTools</c>, so declared tools land where the
+/// template already knows how to read them. The parameter schema is parsed from its raw JSON text; a schema that
+/// does not parse is rejected naming the tool, matching the fenced path's requirement that schemas are JSON.
+/// </summary>
+internal static class TemplateToolValues
+{
+    public static MinjaValue Of(ToolDefinition tool)
+    {
+        JsonDocument document;
+        try
+        {
+            document = JsonDocument.Parse(tool.ParametersSchema);
+        }
+        catch (JsonException)
+        {
+            throw new ArgumentException(
+                $"'tools' contains the declaration '{tool.Name}' whose 'parameters' is not valid JSON.", nameof(tool));
+        }
+
+        using (document)
+        {
+            List<KeyValuePair<string, MinjaValue>> function = [new("name", MinjaValue.Of(tool.Name))];
+
+            if (tool.Description is not null)
+            {
+                function.Add(new("description", MinjaValue.Of(tool.Description)));
+            }
+
+            function.Add(new("parameters", FromElement(document.RootElement)));
+
+            return MinjaValue.Map([
+                new KeyValuePair<string, MinjaValue>("type", MinjaValue.Of("function")),
+                new KeyValuePair<string, MinjaValue>("function", MinjaValue.Map(function)),
+            ]);
+        }
+    }
+
+    private static MinjaValue FromElement(JsonElement element) => element.ValueKind switch
+    {
+        JsonValueKind.Object => MinjaValue.Map(element.EnumerateObject().Select(property =>
+            new KeyValuePair<string, MinjaValue>(property.Name, FromElement(property.Value)))),
+
+        JsonValueKind.Array => MinjaValue.List(element.EnumerateArray().Select(FromElement)),
+
+        JsonValueKind.String => MinjaValue.Of(element.GetString() ?? string.Empty),
+
+        JsonValueKind.True => MinjaValue.True,
+        JsonValueKind.False => MinjaValue.False,
+        JsonValueKind.Null => MinjaValue.None,
+
+        JsonValueKind.Number => element.TryGetInt64(out long integer)
+            ? MinjaValue.Of(integer)
+            : MinjaValue.Of(element.GetDouble()),
+
+        _ => MinjaValue.None,
+    };
 }
 
 /// <summary>One fenced-JSON object recognized as a call: the declared tool's name and its arguments re-encoded compactly.</summary>

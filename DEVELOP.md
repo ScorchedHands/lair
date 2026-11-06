@@ -6,7 +6,7 @@
 dotnet build Lair.sln
 ```
 
-Target framework: net10.0. Solution layout: `src/Lair.*` projects (Contracts, Loader, Backends.Cpu, Kv, Tokenizer, Sampling, Models, Http, Host), `tests/Lair.Tests`, `bench/Lair.Bench`. The continuous-batch scheduler lives in `src/Lair.Models/Scheduling/`; the metrics bus and monitor stream in `src/Lair.Http/Monitoring/`; the config watcher and change-application bus in `src/Lair.Host/ConfigWatcher.cs` + `src/Lair.Http/Config/ConfigReload.cs`.
+Target framework: net10.0. Solution layout: `src/Lair.*` projects (Contracts, Loader, Backends.Cpu, Kv, Tokenizer, Templating.Minja, Sampling, Models, Http, Host), `tests/Lair.Tests`, `bench/Lair.Bench`. The continuous-batch scheduler lives in `src/Lair.Models/Scheduling/`; the metrics bus and monitor stream in `src/Lair.Http/Monitoring/`; the config watcher and change-application bus in `src/Lair.Host/ConfigWatcher.cs` + `src/Lair.Http/Config/ConfigReload.cs`. `src/Lair.Templating.Minja` is the managed minja-parity template engine (parser/evaluator/chat wrapper/limits) with no dependency on the HTTP, model, or tokenizer projects.
 
 ## Web UI build (`src/Lair.Host/ClientApp/`)
 
@@ -21,7 +21,7 @@ dotnet test Lair.sln --filter Category=Parity # golden parity vs pinned llama.cp
 dotnet test Lair.sln --filter Category=Kernel # kernel oracle comparisons
 ```
 
-Test categories: `Loader`, `Tokenizer`, `Template`, `Kernel`, `Layers`, `Kv`, `Sampling`, `Api`, `Cli`, `Config`, `Parity`, `Calib`, `Concurrency`, `Prefill`, `Cache`, `Cancel`, `HotReload`, `Metrics`, `Embeddings`, `Affinity`, `MonitorUi`, `WebUi`.
+Test categories: `Loader`, `Tokenizer`, `Template`, `TemplateDiagnostics`, `TemplateParity`, `Serve`, `MinjaSyntax`, `MinjaEval`, `MinjaStatements`, `MinjaFilters`, `MinjaChat`, `MinjaLimits`, `Kernel`, `Layers`, `Kv`, `Sampling`, `Api`, `Cli`, `Config`, `Parity`, `Calib`, `Concurrency`, `Prefill`, `Cache`, `Cancel`, `HotReload`, `Metrics`, `Embeddings`, `Affinity`, `MonitorUi`, `WebUi`.
 
 Performance gates (inter-token latency budgets in `ConcurrencyTests`/`PrefillTests`) are only meaningful under `-c Release` — Debug JIT inflates kernels ~4.6× and the absolute budgets cannot reproduce there. Correctness suites pass in both configurations.
 
@@ -41,6 +41,12 @@ pwsh -File scripts/generate-parity.ps1 -ModelPath models/smollm-135m-instruct-q8
 ```
 
 Parity gate: model-file sha256 guard; LAIR argmax must appear in the reference top-5; LAIR's calibrated distribution must reproduce within |Δlogprob| ≤ 0.2 (calibrated-missing tokens must stay outside LAIR's top-16). Cross-tool exact string equality is not asserted — llama.cpp CLI and server modes disagree on identical greedy runs (see the pinned `reference_mode` field in each fixture).
+
+Template parity is a separate gate: `tests/fixtures/parity-templates-llama32.json` pins byte-exact `/apply-template` renders for `models/Llama-3.2-1B-Instruct-Q8_0.gguf` (model + chat_template sha256 guards, pinned `date_string`), asserted by `Category=TemplateParity`. Regenerate with:
+
+```powershell
+pwsh -File scripts/generate-template-parity.ps1
+```
 
 `CalibrationProbeTests` (Category `Calib`) are silent unless `LAIR_CALIB_MODEL` and `LAIR_CALIB_OUT` are set; the generator script uses them to embed calibration data.
 

@@ -18,10 +18,20 @@ internal sealed class TemplateScope
 
     public TemplateScope? Parent { get; }
 
+    /// <summary>
+    /// Resource guard attached when a render builds this root scope, or null for a scope built without one.
+    /// Child scopes leave it null and reach the guard through their parent chain, so one render charges one
+    /// budget no matter how deep evaluation wanders.
+    /// </summary>
+    public MinjaLimits? Limits { get; private set; }
+
     /// <summary>Root scope holding the caller-supplied context. The context dictionary itself is never mutated.</summary>
-    public static TemplateScope Root(IReadOnlyDictionary<string, MinjaValue>? context)
+    public static TemplateScope Root(IReadOnlyDictionary<string, MinjaValue>? context) => Root(context, limits: null);
+
+    /// <summary>Root scope carrying the guard that owns the budgets for the render about to run.</summary>
+    public static TemplateScope Root(IReadOnlyDictionary<string, MinjaValue>? context, MinjaLimits? limits)
     {
-        TemplateScope scope = new(parent: null);
+        TemplateScope scope = new(parent: null) { Limits = limits };
 
         if (context is not null)
         {
@@ -150,7 +160,7 @@ internal sealed record MacroValue(
     TemplateScope DefiningScope) : MinjaCallable
 {
     public MinjaValue Invoke(IReadOnlyList<CallArgument> arguments, TemplateScope callSite, int offset, CallerBlockValue? caller, MinjaValue? input) =>
-        MinjaEvaluator.InvokeBody(Body, Parameters, DefiningScope, arguments, offset, caller, input);
+        MinjaEvaluator.InvokeBody(Body, Parameters, DefiningScope, arguments, offset, caller, input, callSite);
 }
 
 /// <summary>
@@ -160,5 +170,5 @@ internal sealed record MacroValue(
 internal sealed record CallerBlockValue(IReadOnlyList<MinjaNode> Body, TemplateScope DefiningScope) : MinjaCallable
 {
     public MinjaValue Invoke(IReadOnlyList<CallArgument> arguments, TemplateScope callSite, int offset, CallerBlockValue? caller, MinjaValue? input) =>
-        MinjaEvaluator.InvokeBody(Body, [], DefiningScope, arguments, offset, caller: null, input);
+        MinjaEvaluator.InvokeBody(Body, [], DefiningScope, arguments, offset, caller: null, input, callSite);
 }

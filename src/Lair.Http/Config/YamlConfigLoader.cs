@@ -17,7 +17,7 @@ public static class YamlConfigLoader
     private static readonly string[] ServerKeys = ["bind", "port"];
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens"];
     private static readonly string[] UiKeys = ["recent_requests"];
-    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement"];
+    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota"];
 
     /// <summary>Loads and validates <paramref name="filePath"/>; no file watching.</summary>
@@ -220,6 +220,10 @@ public static class YamlConfigLoader
             throw new ConfigException($"models[{index}].kv_blocks {kvBlocks} is invalid: 'kv_blocks' must be 8 or greater.");
         }
 
+        // Minimal tool-precedence override: when true, LAIR's fenced tool block is used for declared tools even when
+        // the model's chat template reports tool support. Absent means false — the template's capabilities decide.
+        bool forceFencedTools = TryBoolean(keys, "force_fenced_tools", $"models[{index}].force_fenced_tools") ?? false;
+
         return new ModelConfig
         {
             Name = name,
@@ -227,6 +231,7 @@ public static class YamlConfigLoader
             Type = type,
             MaxContextTokens = maxContextTokens,
             KvBlocks = kvBlocks,
+            ForceFencedTools = forceFencedTools,
             Placement = ParsePlacement(keys, index),
         };
     }
@@ -428,6 +433,23 @@ public static class YamlConfigLoader
             !int.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out int value))
         {
             throw new ConfigException($"{qualifiedKey} must be an integer value.");
+        }
+
+        return value;
+    }
+
+    private static bool? TryBoolean(Dictionary<string, YamlNode> keys, string key, string qualifiedKey)
+    {
+        if (!keys.TryGetValue(key, out YamlNode? node))
+        {
+            return null;
+        }
+
+        if (node.NodeType != YamlNodeType.Scalar ||
+            ((YamlScalarNode)node).Value is not string text ||
+            !bool.TryParse(text, out bool value))
+        {
+            throw new ConfigException($"{qualifiedKey} must be a true or false value.");
         }
 
         return value;
