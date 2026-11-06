@@ -498,7 +498,7 @@ Published Llama-family chat models serve chat end-to-end on this machine, render
 - [✓] Automated TemplateParity: pinned llama.cpp `/apply-template` byte-exact goldens for Llama-family templates. ✅ `tests/Lair.Tests/TemplateParityTests.cs` + `tests/fixtures/parity-templates-llama32.json` — 14 cases passed under `Category=TemplateParity` (12 byte-exact renders, sha256 guards, documented b12032 trailing-tool-call refusal divergence).
 - [✓] Manual Llama-3.2 Serve: model served; multi-turn chat via API and `/ui`; monitor live. ✅ verified live on :8181 — 3-turn exchange coherent (`2 + 2 = 4` / `3 + 3  = 6` / `4 + 4  = 8`), model's own chat_template rendered with single leading BOS, `x-lair-request-id` correlation on every turn, all requests finished `eos`, peak working set 1,588 MB under the 4 GB budget (metrics-reported 1,566 MB steady).
 
-### MVP3.3 [v0.3.3] - Tentative
+### MVP3.3 [v0.3.3] - Refined
 
 GGUF tokenizer variants load through load-time tokenizer profiles instead of hardcoded pre-tokenizer rules.
 
@@ -508,21 +508,35 @@ GGUF tokenizer variants load through load-time tokenizer profiles instead of har
   - Rationale: published GGUF tokenizers share BPE machinery but differ in pre-tokenization, control-token behavior, and metadata quirks. Selecting a profile at load keeps the hot tokenizer path concrete while making new families additive.
   - Rejected: one hardcoded `GgufTokenizer` switch forever (blocks new families); one library per tokenizer variant (fragmentation without packaging benefit); per-token plugin dispatch (interface tax in tokenization).
   - Contract: `lair.tokenizer` exposes a tokenizer-profile registry selected from GGUF metadata; profiles produce concrete tokenizer state before serving.
+- **DN-M33-2** — Profile taxonomy is keyed by `tokenizer.ggml.pre`. MVP3.3 formalizes the three behaviors LAIR already implements (`llama-bpe`, `gpt2`, `smollm`) as load-time profiles; `tokenizer.ggml.model` stays validated as `gpt2` BPE. A missing `pre` key keeps the `llama-bpe` default; an unknown `pre` or model stays a load-time `GgufException` naming the offending value and the supported profile list. Additional profiles (`none`, `nova2`, `llama-code`, decoupled, …) land only when a real fixture plus a `/tokenize` oracle justifies them.
+  - Rationale: the three shipped profiles cover both real fixtures on this machine (SmolLM declares `smollm`, Llama-3.2 declares `llama-bpe`); a speculative profile would ship behavior with no oracle to verify it against.
+  - Rejected: keying profiles by architecture (pre-tokenization is a tokenizer property, not an architecture one); silent fallback for an unknown `pre` (hides GGUF incompatibility — same posture as DN-M32-2's construct rejections); shipping `none`/`nova2` now (no fixture and no oracle evidence).
+  - Contract: `GgufTokenizer.FromGguf` resolves exactly one profile from `tokenizer.ggml.pre` at construction, and the registry is the single source of the rejection message's supported-profile list.
+- **DN-M33-3** — A profile is a load-time factory, not a runtime interface: it resolves the pre-split strategy (chosen once at construction), the merge-lookup shortcut (`ignore_merges`), decode space cleaning, and BOS defaults into concrete tokenizer state before serving. The per-call `switch` on the pre-rule inside `PreSplit` disappears; the hot BPE path keeps its current concrete shape.
+  - Rationale: profile flags are already constructor-resolved, but split dispatch still switches per pre-token chunk; resolving the strategy once keeps the hot path identical while making profiles additive.
+  - Rejected: per-token profile dispatch (interface tax in tokenization); splitting `GgufTokenizer` into per-family classes (duplicates the shared BPE/merge machinery); a public profile plugin API (no third-party tokenizer story in MVP3).
+  - Contract: `lair.tokenizer` keeps `GgufTokenizer.FromGguf`/`Encode`/`Decode` as the public surface; profiles stay internal.
+- **DN-M33-4** — Tokenizer metadata coverage follows what llama.cpp actually reads: `tokenizer.ggml.byte_fallback`, `byte_to_token`, `byte_to_utf8`, `add_space_prefix`, `eot_token_id`, `utf8_flush_between_controls`. A present `byte_to_token` replaces the hardcoded `<0xNN>` vocab scan; `add_space_prefix=false` is honored in the pre-split; `eot_token_id` is exposed and used as the stop/EOS signal when the model declares one. BOS/EOS fallback ids become profile-scoped defaults (llama-bpe keeps 11) with the applied default logged, instead of a hardcoded constant.
+  - Rationale: byte handling and special-id fallbacks are currently hardcoded GPT-2/llama assumptions, while GGUF families declare these keys and llama.cpp honors them — parity requires reading them.
+  - Rejected: keeping the hardcoded byte maps (breaks on models whose byte pieces are not the GPT-2 visual map); requiring every key to be present (rejects valid older GGUFs); changing out-of-range id handling (out-of-range stays `-1` as today).
+  - Contract: `GgufMetadata` gains typed accessors for these keys; `GgufTokenizer` consumes them at construction; `GenerationService` consumes `EotId` where EOS/stop decisions are made.
+- **DN-M33-5** — Tokenizer parity gets a committed oracle harness: `scripts/generate-tokenizer-parity.ps1` spawns pinned llama.cpp b12032 `llama-server`, captures `/tokenize` id sequences for the real fixtures (SmolLM = `smollm`, Llama-3.2 = `llama-bpe`) into `tests/fixtures/parity-tokenizer-*.json` with model sha256 guards, and `Category=Tokenizer` asserts LAIR's `Encode` matches id-for-id. The 2026-11-04 manual proof becomes reproducible.
+  - Rationale: profile and metadata changes touch the hot tokenizer path, and the 2026-11-04 RoPE investigation showed tokenizer divergence is expensive to diagnose without a pinned harness.
+  - Rejected: synthetic-only coverage (synthetic GGUFs cannot prove llama.cpp agreement); the CLI `llama-tokenize` tool instead of the server endpoint (the pinned asset's server mode is already the harness Parity and TemplateParity use).
+  - Contract: fixture shape mirrors `parity-templates-llama32.json` (guards + case list); parity cases skip cleanly when a model file is absent.
 
 #### Implementation Items
 
-- [_] Tokenizer profile registry — move `tokenizer.ggml.model` / `tokenizer.ggml.pre` selection behind load-time profiles and preserve current `llama-bpe`, `gpt2`, and `smollm` behavior.
-  - Verify: `dotnet test --filter Category=Tokenizer` — profile selection tests plus existing tokenizer goldens remain green.
-- [_] GGUF tokenizer metadata coverage — expand handling for token types, control ranges, byte fallback, UTF-8/control-token flush behavior, and BOS/EOS/EOT metadata as required by real GGUF families.
-  - Verify: `dotnet test --filter Category=Tokenizer` — oracle cases against pinned llama.cpp `/tokenize` for each supported profile.
+- [_] Tokenizer profile registry — move `tokenizer.ggml.pre` selection behind an internal profile registry (llama-bpe, gpt2, smollm), resolve the pre-split strategy once at construction instead of switching per call, and keep unsupported `pre`/`model` rejections naming the value plus the supported profile list (see DN-M33-2, DN-M33-3)
+  - Verify: `dotnet test --filter Category=Tokenizer -c Release` — the 18 existing goldens stay green plus new profile-selection facts: each supported `pre` resolves to its profile behavior, a missing key defaults to llama-bpe, and an unknown `pre` (e.g. `qwen2`) fails naming the value and the supported list.
+- [_] GGUF tokenizer metadata coverage — read `byte_fallback`, `byte_to_token`, `byte_to_utf8`, `add_space_prefix`, `eot_token_id`, and `utf8_flush_between_controls`; honor `byte_to_token` over the `<0xNN>` scan, honor `add_space_prefix=false`, expose `EotId` and use it for stop/EOS decisions, and make BOS/EOS fallbacks profile-scoped with the applied default logged (see DN-M33-4)
+  - Verify: `dotnet test --filter Category=Tokenizer -c Release` — synthetic GGUF cases per key (present/absent/invalid) plus real-fixture facts (SmolLM `smollm` ids, Llama-3.2 `llama-bpe` ids and `add_bos_token`).
+- [_] Tokenizer oracle harness — add `scripts/generate-tokenizer-parity.ps1` against pinned b12032 `/tokenize` and commit `tests/fixtures/parity-tokenizer-*.json` for both real fixtures, asserted id-for-id by `Category=Tokenizer` (see DN-M33-5)
+  - Verify: `pwsh -File scripts/generate-tokenizer-parity.ps1` regenerates both fixtures from the pinned build; `dotnet test --filter Category=Tokenizer -c Release` passes the parity cases from the committed fixtures.
 
 #### Tests
 
-- [_] Automated Tokenizer: profile selection, control-token/byte-fallback cases, llama.cpp `/tokenize` oracle parity.
-
-#### Open Items
-
-- [_] **Tokenizer profile taxonomy** — which GGUF model/pre-tokenizer combinations map to which internal profile implementations; settle in `/plan-refine mvp3.3`.
+- [_] Automated Tokenizer: profile selection, per-key metadata coverage, and pinned `/tokenize` oracle parity for every supported profile. Verify: `dotnet test --filter Category=Tokenizer -c Release`.
 
 ### MVP3.4 [v0.3.4] - Tentative
 
@@ -837,6 +851,7 @@ Vision input on chat models.
 | Type | Item | Description |
 |---|---|---|
 | idea | Anthropic API compat | Strata exposes both surfaces; LAIR-native later |
+| idea | Additional pre-tokenizer profiles | `none`/`nova2`/`llama-code`/decoupled profiles land only with a real fixture + `/tokenize` oracle (DN-M33-2) |
 | idea | AVX-512 dispatch path | +10–30% decode, 2–4× prefill on capable CPUs |
 | idea | Native AOT packaging | ~50 ms vs ~500 ms startup |
 | idea | Early-exit argmax | skip vocab rows; ~5–8% on 248K-vocab LM head |
@@ -908,3 +923,4 @@ Vision input on chat models.
 - **2026-11-06 — Reference refusal divergence documented, not adopted.** b12032 `/apply-template` answers 400 for conversations ending in an assistant tool-call message; LAIR renders them. `tests/fixtures/parity-templates-llama32.json` records the refusal as `reference_refusal` and `TemplateParityTests` asserts both sides, so the divergence is visible instead of silently matched.
 - **2026-11-06 — Legacy `ChatTemplateRenderer` retired with its rejection goldens.** The adapter replaces the mini-Jinja renderer (DN-M32-6) and the class is deleted; four `Category=Template` cases that asserted rejections of `{% set %}`, `|upper`, macros, and slices were retired because the minja parser accepts those constructs now — `Category=Template` goes 20→16 with no behavior regression for shipped ChatML/Phi goldens.
 - **2026-11-06 — Tool precedence wired with a model-scoped override knob.** `TemplateCapabilities.SupportsTools` now decides the tool surface per DN-M32-7: a tool-capable template renders declared tools itself and LAIR's fenced block is skipped; a toolless template keeps LAIR's injection byte-identically. `models[].force_fenced_tools` (bool, default false, `NewRequestsOnly` hot-reload class) is the explicit config override DN-M32-7 anticipated. Fenced-JSON detection remains the only detector; native (non-fenced) tool-call parsing stays owned by the tool-call parser registry phase.
+- **2026-11-06 — MVP3.3 refined: tokenizer profile taxonomy settled.** Profiles are keyed by `tokenizer.ggml.pre` and MVP3.3 formalizes only the three behaviors already implemented (`llama-bpe`, `gpt2`, `smollm`) — the two real fixtures on this machine declare exactly those. A profile is a load-time factory (split strategy resolved once, no hot-path switch, public `GgufTokenizer` surface unchanged), unknown `pre`/`model` stays an actionable load rejection naming the value and the supported list, metadata coverage follows llama.cpp's actual keys (`byte_fallback`, `byte_to_token`, `byte_to_utf8`, `add_space_prefix`, `eot_token_id`, `utf8_flush_between_controls`) with profile-scoped BOS/EOS defaults, and a committed `/tokenize` parity harness replaces the ad-hoc 2026-11-04 proof. Speculative profiles move to Backlog until fixture + oracle evidence exists.
