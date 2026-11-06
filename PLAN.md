@@ -498,7 +498,7 @@ Published Llama-family chat models serve chat end-to-end on this machine, render
 - [✓] Automated TemplateParity: pinned llama.cpp `/apply-template` byte-exact goldens for Llama-family templates. ✅ `tests/Lair.Tests/TemplateParityTests.cs` + `tests/fixtures/parity-templates-llama32.json` — 14 cases passed under `Category=TemplateParity` (12 byte-exact renders, sha256 guards, documented b12032 trailing-tool-call refusal divergence).
 - [✓] Manual Llama-3.2 Serve: model served; multi-turn chat via API and `/ui`; monitor live. ✅ verified live on :8181 — 3-turn exchange coherent (`2 + 2 = 4` / `3 + 3  = 6` / `4 + 4  = 8`), model's own chat_template rendered with single leading BOS, `x-lair-request-id` correlation on every turn, all requests finished `eos`, peak working set 1,588 MB under the 4 GB budget (metrics-reported 1,566 MB steady).
 
-### MVP3.3 [v0.3.3] - Refined
+### MVP3.3 [v0.3.3] - In Progress
 
 GGUF tokenizer variants load through load-time tokenizer profiles instead of hardcoded pre-tokenizer rules.
 
@@ -527,8 +527,8 @@ GGUF tokenizer variants load through load-time tokenizer profiles instead of har
 
 #### Implementation Items
 
-- [_] Tokenizer profile registry — move `tokenizer.ggml.pre` selection behind an internal profile registry (llama-bpe, gpt2, smollm), resolve the pre-split strategy once at construction instead of switching per call, and keep unsupported `pre`/`model` rejections naming the value plus the supported profile list (see DN-M33-2, DN-M33-3)
-  - Verify: `dotnet test --filter Category=Tokenizer -c Release` — the 18 existing goldens stay green plus new profile-selection facts: each supported `pre` resolves to its profile behavior, a missing key defaults to llama-bpe, and an unknown `pre` (e.g. `qwen2`) fails naming the value and the supported list.
+- [✓] Tokenizer profile registry — move `tokenizer.ggml.pre` selection behind an internal profile registry (llama-bpe, gpt2, smollm), resolve the pre-split strategy once at construction instead of switching per call, and keep unsupported `pre`/`model` rejections naming the value plus the supported profile list (see DN-M33-2, DN-M33-3)
+  - Verify: `dotnet test --filter Category=Tokenizer -c Release` — 23/23 passed: the 18 existing goldens unchanged plus profile-selection facts for all three pre keys, the missing-key llama-bpe default, and a registry-sourced rejection list. `PreRule` and the constructor are now internal; `FromGguf` is the only public entry.
 - [_] GGUF tokenizer metadata coverage — read `byte_fallback`, `byte_to_token`, `byte_to_utf8`, `add_space_prefix`, `eot_token_id`, and `utf8_flush_between_controls`; honor `byte_to_token` over the `<0xNN>` scan, honor `add_space_prefix=false`, expose `EotId` and use it for stop/EOS decisions, and make BOS/EOS fallbacks profile-scoped with the applied default logged (see DN-M33-4)
   - Verify: `dotnet test --filter Category=Tokenizer -c Release` — synthetic GGUF cases per key (present/absent/invalid) plus real-fixture facts (SmolLM `smollm` ids, Llama-3.2 `llama-bpe` ids and `add_bos_token`).
 - [_] Tokenizer oracle harness — add `scripts/generate-tokenizer-parity.ps1` against pinned b12032 `/tokenize` and commit `tests/fixtures/parity-tokenizer-*.json` for both real fixtures, asserted id-for-id by `Category=Tokenizer` (see DN-M33-5)
@@ -536,7 +536,7 @@ GGUF tokenizer variants load through load-time tokenizer profiles instead of har
 
 #### Tests
 
-- [_] Automated Tokenizer: profile selection, per-key metadata coverage, and pinned `/tokenize` oracle parity for every supported profile. Verify: `dotnet test --filter Category=Tokenizer -c Release`.
+- [→] Automated Tokenizer: profile selection, per-key metadata coverage, and pinned `/tokenize` oracle parity for every supported profile. Verify: `dotnet test --filter Category=Tokenizer -c Release`.
 
 ### MVP3.4 [v0.3.4] - Tentative
 

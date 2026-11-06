@@ -185,6 +185,81 @@ public sealed class GgufTokenizerTests : IDisposable
     }
 
     [Fact]
+    public void FromGguf_UnsupportedPreTokenizer_ListsSupportedProfiles()
+    {
+        byte[] image = BuildSyntheticImage(pre: "qwen2");
+        GgufException ex = Assert.Throws<GgufException>(() => GgufTokenizer.FromGguf(GgufFile.Open(WriteTemp(image))));
+
+        // The supported list is sourced from the profile registry itself.
+        Assert.Contains("(supported: 'llama-bpe', 'gpt2', 'smollm')", ex.Message);
+    }
+
+    [Fact]
+    public void ProfileSelection_Gpt2Pre_SplitsCaseSensitiveContractionsAndRunsMerges()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteSyntheticVocab("gpt2"));
+        GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
+
+        // "'s" is a contraction pre-token, but the merge shortcut is off for gpt2: the piece
+        // is still assembled from the "'" + "s" merge chain.
+        Assert.Equal([16], tokenizer.Encode("'s"));
+
+        // (?-i:'s|'t|'re|'ve|'m|'ll|'d) is case-sensitive: "'S" is not a contraction, so the
+        // apostrophe pre-token ends at the quote and the uppercase letter splits off to byte fallback.
+        Assert.Equal([14, 24 + 0x53], tokenizer.Encode("'S"));
+
+        // No merge shortcut: "abc" goes through the merge chain, not a whole-piece vocab hit.
+        Assert.Equal([7], tokenizer.Encode("abc"));
+
+        // Whole-number digit runs: the "3 4" merge spans digits the llama-bpe splitter would cut.
+        Assert.Equal([22, 23], tokenizer.Encode("1234"));
+    }
+
+    [Fact]
+    public void ProfileSelection_SmollmPre_SplitsDigitRunsAndSkipsDecodeSpaceCleaning()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteSyntheticVocab("smollm"));
+        GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
+
+        // GPT-2 split first: "hello" + " !" + " 1234"; then the digit-run pass cuts the space off
+        // the " 1234" pre-token, so "1234" merges to "12" + "34" exactly like gpt2.
+        Assert.Equal([11, 10, 13, 10, 22, 23], tokenizer.Encode("hello ! 1234"));
+
+        // clean_spaces is off for smollm: the "hello" + "Ġ!" decode stays "hello !" with the space.
+        Assert.Equal("hello !", tokenizer.Decode([11, 10, 13]));
+
+        // add_bos defaults to false for smollm.
+        Assert.False(tokenizer.AddBosToken);
+    }
+
+    [Fact]
+    public void ProfileSelection_MissingPreKey_DefaultsToLlamaBpe()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteSyntheticVocab(pre: null));
+        GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
+
+        // llama-bpe digit grouping: "1234" splits "123" + "4", so the "3 4" merge is unreachable.
+        Assert.Equal([22, 20, 21], tokenizer.Encode("1234"));
+
+        // Case-insensitive contractions plus the ignore-merges shortcut: "'S" hits the vocab whole.
+        Assert.Equal([17], tokenizer.Encode("'S"));
+
+        // add_bos defaults to true for llama-bpe.
+        Assert.True(tokenizer.AddBosToken);
+    }
+
+    [Fact]
+    public void ProfileSelection_AllSupportedPreKeys_LoadSuccessfully()
+    {
+        foreach (string pre in new[] { "llama-bpe", "gpt2", "smollm" })
+        {
+            using GgufFile gguf = GgufFile.Open(WriteSyntheticVocab(pre));
+            GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
+            Assert.Equal(280, tokenizer.VocabSize);
+        }
+    }
+
+    [Fact]
     public void FromGguf_UnsupportedModel_ThrowsWithItsName()
     {
         byte[] image = BuildSyntheticImage(model: "llama");
@@ -332,7 +407,7 @@ public sealed class GgufTokenizerTests : IDisposable
             extraKv: [("tokenizer.ggml.add_bos_token", 7u, writer => writer.Write((byte)0))]));
     }
 
-    private byte[] BuildSyntheticImage(string model = "gpt2", string pre = "gpt2")
+    private byte[] BuildSyntheticImage(string model = "gpt2", string? pre = "gpt2")
     {
         List<string> pieces =
         [
@@ -370,9 +445,47 @@ public sealed class GgufTokenizerTests : IDisposable
             ]);
     }
 
+    /// <summary>
+    /// Shared profile-selection vocab: the synthetic base vocab plus digit pieces, the "1 2"/"3 4"
+    /// merges, and apostrophe/contraction pieces, so one fixture distinguishes the three profiles.
+    /// A null <c>pre</c> omits the <c>tokenizer.ggml.pre</c> key entirely.
+    /// </summary>
+    private string WriteSyntheticVocab(string? pre)
+    {
+        List<string> pieces =
+        [
+            "<unk>", "<|im_start|>", "<|im_end|>",
+            "a", "b", "c", "ab", "abc", "Ġab", "aĠb", "Ġ", "hello", "world", "!",
+            "'", "Ġ'", "'s", "'S",
+            "1", "2", "3", "4", "12", "34",
+        ];
+        List<int> types = [2, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1];
+
+        for (int b = 0; b < 256; b++)
+        {
+            pieces.Add($"<0x{b:X2}>");
+            types.Add(6);
+        }
+
+        string[] merges =
+        [
+            "a b", "ab c", "Ġ ab",
+            "h e", "he l", "hel l", "hell o",
+            "w o", "wo r", "wor l", "worl d",
+            "1 2", "3 4", "' s",
+        ];
+
+        return WriteTemp(BuildImage(
+            "gpt2",
+            pre,
+            [.. pieces],
+            [.. types],
+            merges));
+    }
+
     private static byte[] BuildImage(
         string model,
-        string pre,
+        string? pre,
         string[] pieces,
         int[] types,
         string[] merges,
@@ -381,7 +494,7 @@ public sealed class GgufTokenizerTests : IDisposable
         using var stream = new MemoryStream();
         using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
 
-        int kvCount = 6 + (extraKv?.Count ?? 0);
+        int kvCount = (pre is null ? 5 : 6) + (extraKv?.Count ?? 0);
 
         writer.Write(GgufMagic);
         writer.Write(3u); // version
@@ -390,7 +503,10 @@ public sealed class GgufTokenizerTests : IDisposable
 
         WriteKvString(writer, "general.architecture", "llama");
         WriteKvString(writer, "tokenizer.ggml.model", model);
-        WriteKvString(writer, "tokenizer.ggml.pre", pre);
+        if (pre is not null)
+        {
+            WriteKvString(writer, "tokenizer.ggml.pre", pre);
+        }
         WriteKvStringArray(writer, "tokenizer.ggml.tokens", pieces);
         WriteKvInt32Array(writer, "tokenizer.ggml.token_type", types);
         WriteKvStringArray(writer, "tokenizer.ggml.merges", merges);

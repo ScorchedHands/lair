@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -36,22 +35,22 @@ public sealed class GgufTokenizer
     private readonly int[] _specialIds;
     private readonly Dictionary<(string First, string Second), int> _mergeRanks;
     private readonly int[] _byteTokenByValue;
-    private readonly PreRule _pre;
+    private readonly PreSplitStrategy _split;
     private readonly bool _ignoreMerges;
     private readonly bool _cleanSpaces;
     private readonly bool _addBos;
     private readonly Dictionary<string, int[]> _encodeCache = new(StringComparer.Ordinal);
 
-    public GgufTokenizer(
+    private GgufTokenizer(
         string[] pieces,
         int[] types,
         string[] merges,
-        PreRule pre,
-        int bosId = NullToken,
-        int eosId = NullToken,
-        int padId = NullToken,
-        int unkId = NullToken,
-        bool? addBos = null)
+        TokenizerProfile profile,
+        int bosId,
+        int eosId,
+        int padId,
+        int unkId,
+        bool addBos)
     {
         ArgumentNullException.ThrowIfNull(pieces);
         ArgumentNullException.ThrowIfNull(types);
@@ -119,10 +118,10 @@ public sealed class GgufTokenizer
             }
         }
 
-        _pre = pre;
-        _ignoreMerges = pre == PreRule.LlamaBpe;
-        _cleanSpaces = pre is not PreRule.Smollm;
-        _addBos = addBos ?? pre == PreRule.LlamaBpe;
+        _split = profile.Split;
+        _ignoreMerges = profile.IgnoreMerges;
+        _cleanSpaces = profile.CleanSpaces;
+        _addBos = addBos;
         BosId = bosId;
         EosId = eosId;
         PadId = padId;
@@ -168,28 +167,21 @@ public sealed class GgufTokenizer
                 $"tokenizer.ggml.model is '{model}' (expected 'gpt2'): only GGUF BPE vocabularies are supported");
         }
 
-        string pre = metadata.GetString("tokenizer.ggml.pre", "llama-bpe");
-        PreRule rule = pre switch
-        {
-            "llama-bpe" => PreRule.LlamaBpe,
-            "gpt2" => PreRule.Gpt2,
-            "smollm" => PreRule.Smollm,
-            _ => throw new GgufException(
-                $"unsupported pre-tokenizer '{pre}' in tokenizer.ggml.pre (supported: 'llama-bpe', 'gpt2', 'smollm')"),
-        };
+        string pre = metadata.GetString("tokenizer.ggml.pre", TokenizerProfiles.DefaultPreKey);
+        TokenizerProfile profile = TokenizerProfiles.Resolve(pre);
 
         string[] pieces = metadata.GetTokens();
         int[] types = metadata.GetTokenTypes();
         string[] merges = metadata.GetMerges();
 
-        int bosId = ReadSpecialId(metadata, "tokenizer.ggml.bos_token_id", fallback: 11, pieces.Length);
-        int eosId = ReadSpecialId(metadata, "tokenizer.ggml.eos_token_id", fallback: 11, pieces.Length);
+        int bosId = ReadSpecialId(metadata, "tokenizer.ggml.bos_token_id", fallback: profile.BosFallbackId, pieces.Length);
+        int eosId = ReadSpecialId(metadata, "tokenizer.ggml.eos_token_id", fallback: profile.EosFallbackId, pieces.Length);
         int padId = ReadSpecialId(metadata, "tokenizer.ggml.padding_token_id", fallback: NullToken, pieces.Length);
         int unkId = ReadSpecialId(metadata, "tokenizer.ggml.unknown_token_id", fallback: NullToken, pieces.Length);
 
-        bool addBos = metadata.GetBool("tokenizer.ggml.add_bos_token", rule == PreRule.LlamaBpe);
+        bool addBos = metadata.GetBool("tokenizer.ggml.add_bos_token", profile.AddBosDefault);
 
-        return new GgufTokenizer(pieces, types, merges, rule, bosId, eosId, padId, unkId, addBos);
+        return new GgufTokenizer(pieces, types, merges, profile, bosId, eosId, padId, unkId, addBos);
     }
 
     public IReadOnlyList<int> Encode(string text)
@@ -332,15 +324,8 @@ public sealed class GgufTokenizer
 
     private List<string> PreSplit(string text)
     {
-        List<int> offsets = [text.Length];
-
-        offsets = _pre switch
-        {
-            PreRule.LlamaBpe => SplitLlama3(text, offsets),
-            PreRule.Gpt2 => SplitGpt2(text, offsets),
-            PreRule.Smollm => SplitDigits(text, SplitGpt2(text, offsets)),
-            _ => throw new InvalidOperationException("unknown pre-tokenizer rule"),
-        };
+        // The profile resolved the strategy once at construction; this is a direct call, not a dispatch.
+        List<int> offsets = _split(text, [text.Length]);
 
         List<string> words = new(offsets.Count);
         int start = 0;
@@ -351,379 +336,6 @@ public sealed class GgufTokenizer
         }
 
         return words;
-    }
-
-    private static List<int> SplitDigits(string text, List<int> offsets)
-    {
-        List<int> next = [];
-        int start = 0;
-        foreach (int length in offsets)
-        {
-            int end = start + length;
-            int runStart = start;
-            for (int pos = start; pos < end;)
-            {
-                bool isDigit = char.IsNumber(text, pos);
-                if (pos > runStart && isDigit != char.IsNumber(text, runStart))
-                {
-                    next.Add(pos - runStart);
-                    runStart = pos;
-                }
-
-                // Step whole codepoints so a surrogate pair never lands on a digit-run boundary.
-                pos += char.IsHighSurrogate(text[pos]) && pos + 1 < end ? 2 : 1;
-            }
-
-            next.Add(end - runStart);
-            start = end;
-        }
-
-        return next;
-    }
-
-    private static List<int> SplitGpt2(string text, List<int> offsets)
-    {
-        List<int> words = [];
-        int start = 0;
-        foreach (int length in offsets)
-        {
-            int end = start + length;
-            int previousEnd = start;
-            int pos = start;
-
-            while (pos < end)
-            {
-                void AddToken(int tokenEnd)
-                {
-                    if (tokenEnd > previousEnd)
-                    {
-                        words.Add(tokenEnd - previousEnd);
-                    }
-
-                    previousEnd = tokenEnd;
-                }
-
-                    // A surrogate pair is one codepoint and must stay in a single pre-token: splitting it would make
-                    // UTF-8 encoding emit replacement bytes.
-                    if (char.IsHighSurrogate(text[pos]) && pos + 1 < end && char.IsLowSurrogate(text[pos + 1]))
-                    {
-                        pos += 2;
-                        AddToken(pos);
-                        continue;
-                    }
-
-                    if (text[pos] == '\'' && pos + 1 < end)
-                    {
-                        int contractionLength = 0;
-                    bool isContraction = IsAsciiLetter(text, pos + 1)
-                        && IsContractionSuffix(text, pos, end, out contractionLength);
-
-                    if (!isContraction)
-                    {
-                        contractionLength = 0;
-                    }
-
-                    if (contractionLength > 0)
-                    {
-                        pos += contractionLength;
-                        AddToken(pos);
-                        continue;
-                    }
-                }
-
-                int letterStart = pos;
-                if (text[pos] == ' ' && pos + 1 < end && char.IsLetter(text, pos + 1))
-                {
-                    letterStart = pos + 1;
-                }
-
-                if (char.IsLetter(text, letterStart))
-                {
-                    pos = letterStart;
-                    while (pos < end && char.IsLetter(text, pos))
-                    {
-                        pos++;
-                    }
-
-                    AddToken(pos);
-                    continue;
-                }
-
-                int numberStart = pos;
-                if (text[pos] == ' ' && pos + 1 < end && char.IsNumber(text, pos + 1))
-                {
-                    numberStart = pos + 1;
-                }
-
-                if (char.IsNumber(text, numberStart))
-                {
-                    pos = numberStart;
-                    while (pos < end && char.IsNumber(text, pos))
-                    {
-                        pos++;
-                    }
-
-                    AddToken(pos);
-                    continue;
-                }
-
-                int symbolStart = pos;
-                if (text[pos] == ' ' && pos + 1 < end && IsGpt2Symbol(text, pos + 1))
-                {
-                    symbolStart = pos + 1;
-                }
-
-                if (IsGpt2Symbol(text, symbolStart))
-                {
-                    pos = symbolStart;
-                    while (pos < end && IsGpt2Symbol(text, pos))
-                    {
-                        pos++;
-                    }
-
-                    AddToken(pos);
-                    continue;
-                }
-
-                int whitespaceRun = 0;
-                while (pos + whitespaceRun < end && char.IsWhiteSpace(text, pos + whitespaceRun))
-                {
-                    whitespaceRun++;
-                }
-
-                if (whitespaceRun > 1 && pos + whitespaceRun < end)
-                {
-                    pos += whitespaceRun - 1;
-                    AddToken(pos);
-                    continue;
-                }
-
-                if (whitespaceRun > 0)
-                {
-                    pos += whitespaceRun;
-                    AddToken(pos);
-                    continue;
-                }
-
-                pos++;
-                AddToken(pos);
-            }
-
-            start = end;
-        }
-
-        return words;
-    }
-
-    private static List<int> SplitLlama3(string text, List<int> offsets)
-    {
-        List<int> words = [];
-        int start = 0;
-        foreach (int length in offsets)
-        {
-            int end = start + length;
-            int previousEnd = start;
-            int pos = start;
-
-            while (pos < end)
-            {
-                void AddToken(int tokenEnd)
-                {
-                    if (tokenEnd > previousEnd)
-                    {
-                        words.Add(tokenEnd - previousEnd);
-                    }
-
-                    previousEnd = tokenEnd;
-                }
-
-                    // A surrogate pair is one codepoint and must stay in a single pre-token: splitting it would make
-                    // UTF-8 encoding emit replacement bytes.
-                    if (char.IsHighSurrogate(text[pos]) && pos + 1 < end && char.IsLowSurrogate(text[pos + 1]))
-                    {
-                        pos += 2;
-                        AddToken(pos);
-                        continue;
-                    }
-
-                    if (text[pos] == '\'' && pos + 1 < end)
-                    {
-                        int suffixLength = 0;
-                    bool isContraction = IsAsciiLetter(text, pos + 1)
-                        && IsContractionSuffix(text, pos, end, out suffixLength, caseInsensitive: true);
-
-                    if (!isContraction)
-                    {
-                        suffixLength = 0;
-                    }
-
-                    if (suffixLength > 0)
-                    {
-                        pos += suffixLength;
-                        AddToken(pos);
-                        continue;
-                    }
-                }
-
-                if (text[pos] != '\r' && text[pos] != '\n' && !char.IsNumber(text, pos))
-                {
-                    int letterStart = char.IsLetter(text, pos) ? pos : pos + 1;
-                    if (letterStart < end && char.IsLetter(text, letterStart))
-                    {
-                        pos = letterStart;
-                        while (pos < end && char.IsLetter(text, pos))
-                        {
-                            pos++;
-                        }
-
-                        AddToken(pos);
-                        continue;
-                    }
-                }
-
-                if (char.IsNumber(text, pos))
-                {
-                    int groupStart = pos;
-                    while (pos < end && char.IsNumber(text, pos))
-                    {
-                        pos++;
-                        if (pos - groupStart >= 3)
-                        {
-                            AddToken(pos);
-                            groupStart = pos;
-                        }
-                    }
-
-                    AddToken(pos);
-                    continue;
-                }
-
-                int symbolStart = pos;
-                if (text[pos] == ' ' && pos + 1 < end && IsLlama3Symbol(text, pos + 1))
-                {
-                    symbolStart = pos + 1;
-                }
-
-                if (IsLlama3Symbol(text, pos) && IsLlama3Symbol(text, symbolStart))
-                {
-                    pos = symbolStart;
-                    while (pos < end && IsLlama3Symbol(text, pos))
-                    {
-                        pos++;
-                    }
-
-                    while (pos < end && (text[pos] == '\r' || text[pos] == '\n'))
-                    {
-                        pos++;
-                    }
-
-                    AddToken(pos);
-                    continue;
-                }
-
-                int whitespaceRun = 0;
-                int lastNewlineEnd = 0;
-                while (pos + whitespaceRun < end && char.IsWhiteSpace(text, pos + whitespaceRun))
-                {
-                    if (text[pos + whitespaceRun] == '\r' || text[pos + whitespaceRun] == '\n')
-                    {
-                        lastNewlineEnd = pos + whitespaceRun + 1;
-                    }
-
-                    whitespaceRun++;
-                }
-
-                if (lastNewlineEnd > 0)
-                {
-                    pos = lastNewlineEnd;
-                    AddToken(pos);
-                    continue;
-                }
-
-                if (whitespaceRun > 1 && pos + whitespaceRun < end)
-                {
-                    pos += whitespaceRun - 1;
-                    AddToken(pos);
-                    continue;
-                }
-
-                if (whitespaceRun > 0)
-                {
-                    pos += whitespaceRun;
-                    AddToken(pos);
-                    continue;
-                }
-
-                pos++;
-                AddToken(pos);
-            }
-
-            start = end;
-        }
-
-        return words;
-    }
-
-    private static bool IsAsciiLetter(string text, int pos)
-    {
-        char ch = text[pos];
-        return ch is >= 'a' and <= 'z' or >= 'A' and <= 'Z';
-    }
-
-    private static bool IsContractionSuffix(string text, int pos, int limit, out int suffixLength, bool caseInsensitive = false)
-    {
-        char first = text[pos + 1];
-        char? second = pos + 2 < limit ? text[pos + 2] : null;
-
-        if (caseInsensitive)
-        {
-            first = char.ToLowerInvariant(first);
-            second = second is null ? null : char.ToLowerInvariant(second.Value);
-        }
-
-        if (first is 's' or 't' or 'm' or 'd')
-        {
-            suffixLength = 2;
-            return true;
-        }
-
-        if (second is not null && (first, second.Value) is ('r', 'e') or ('v', 'e') or ('l', 'l'))
-        {
-            suffixLength = 3;
-            return true;
-        }
-
-        suffixLength = 0;
-        return false;
-    }
-
-    private static bool IsGpt2Symbol(string text, int pos)
-    {
-        return pos < text.Length
-            && !char.IsWhiteSpace(text, pos)
-            && !char.IsLetter(text, pos)
-            && !char.IsNumber(text, pos)
-            && !IsUndefined(text[pos]);
-    }
-
-    private static bool IsLlama3Symbol(string text, int pos)
-    {
-        return pos < text.Length
-            && !char.IsWhiteSpace(text, pos)
-            && !char.IsLetter(text, pos)
-            && !char.IsNumber(text, pos)
-            && !IsUndefined(text[pos]);
-    }
-
-    private static bool IsUndefined(char ch)
-    {
-        UnicodeCategory category = CharUnicodeInfo.GetUnicodeCategory(ch);
-        return category is UnicodeCategory.Format
-            or UnicodeCategory.EnclosingMark
-            or UnicodeCategory.Surrogate
-            or UnicodeCategory.PrivateUse
-            or UnicodeCategory.MathSymbol
-            or UnicodeCategory.OtherNotAssigned;
     }
 
     private static string ByteEncode(string word)
@@ -1080,13 +692,6 @@ public sealed class GgufTokenizer
         }
 
         return map;
-    }
-
-    public enum PreRule
-    {
-        LlamaBpe,
-        Gpt2,
-        Smollm,
     }
 
     private readonly record struct Fragment(string Text, int TokenId);
