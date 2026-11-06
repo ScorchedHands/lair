@@ -5,8 +5,8 @@ namespace Lair.Models.Engine;
 
 /// <summary>
 /// The pure numeric operations of the transformer forward pass, isolated so each can be verified against
-/// hand-computed values independently of any model file. RoPE uses llama-style pairs (i, i + headDim/2) with
-/// theta_i = base^(-2i/headDim); RMSNorm accumulates in double; attention runs an online softmax over the paged
+/// hand-computed values independently of any model file. RoPE uses GGUF/llama-style adjacent pairs (2i, 2i + 1)
+/// with theta_i = base^(-2i/headDim); RMSNorm accumulates in double; attention runs an online softmax over the paged
 /// KV cache so no score row is ever materialized.
 /// </summary>
 internal static class LayerOps
@@ -37,8 +37,8 @@ internal static class LayerOps
 
     /// <summary>
     /// Fills position-major cos/sin tables for standard full-head RoPE up to maxPositions. Each position stores
-    /// headDim/2 entries: angle(pos, i) = pos * base^(-2i/headDim), computed in double and stored as float so the
-    /// same inputs always produce bit-identical rotations.
+    /// headDim/2 entries: angle(pos, i) = pos * base^(-2i/headDim), the angle of pair i, computed in double and stored
+    /// as float so the same inputs always produce bit-identical rotations.
     /// </summary>
     internal static void BuildRopeTables(double thetaBase, int headDim, int maxPositions, Span<float> cos, Span<float> sin)
     {
@@ -73,7 +73,11 @@ internal static class LayerOps
         }
     }
 
-    /// <summary>Rotates one head region in place: out[i] = x[i]*cos - x[i+half]*sin, out[i+half] = x[i+half]*cos + x[i]*sin.</summary>
+    /// <summary>
+    /// Rotates one head region in place with GGUF/llama-style adjacent pairs: out[2i] = x[2i]*cos_i - x[2i+1]*sin_i,
+    /// out[2i + 1] = x[2i + 1]*cos_i + x[2i]*sin_i. Table entry i is the angle of the pair occupying adjacent head
+    /// dimensions 2i and 2i + 1, which is how rotary q/k rows are laid out in converted GGUF checkpoints.
+    /// </summary>
     internal static void ApplyRopeToHead(Span<float> headRegion, int ropeHalf, ReadOnlySpan<float> cosAtPosition, ReadOnlySpan<float> sinAtPosition)
     {
         if (headRegion.Length < 2 * ropeHalf || cosAtPosition.Length < ropeHalf || sinAtPosition.Length < ropeHalf)
@@ -86,11 +90,14 @@ internal static class LayerOps
             float c = cosAtPosition[i];
             float s = sinAtPosition[i];
 
-            float lo = headRegion[i];
-            float hi = headRegion[i + ropeHalf];
+            int lowIndex = 2 * i;
+            int highIndex = 2 * i + 1;
 
-            headRegion[i] = lo * c - hi * s;
-            headRegion[i + ropeHalf] = hi * c + lo * s;
+            float lo = headRegion[lowIndex];
+            float hi = headRegion[highIndex];
+
+            headRegion[lowIndex] = lo * c - hi * s;
+            headRegion[highIndex] = hi * c + lo * s;
         }
     }
 

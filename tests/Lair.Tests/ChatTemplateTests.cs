@@ -1,20 +1,22 @@
 using Lair.Loader;
-using Lair.Tokenizer.Templating;
+using Lair.Templating.Minja;
 
 namespace Lair.Tests;
 
 /// <summary>
-/// Golden renders for the supported Mini Jinja subset: hand-verified exact output for ChatML, conditional, and
-/// Phi-style templates, rejection of constructs outside the subset, and a real-model integration render of
-/// tokenizer.chat_template from models/SmolLM-135M-Instruct-F16.gguf when the fixture is present.
+/// Golden renders for the chat template path: hand-verified exact output for ChatML, conditional, and Phi-style
+/// templates through <see cref="MinjaChatTemplate"/> (the renderer the LAIR adapter now runs), the template
+/// semantics the adapter inherits from minja (strict addition, Python json.dumps escaping, whitespace control,
+/// index access), and a real-model integration render of tokenizer.chat_template from
+/// models/SmolLM-135M-Instruct-F16.gguf when the fixture is present.
 /// </summary>
 [Trait("Category", "Template")]
 public sealed class ChatTemplateTests
 {
     private static readonly ChatMessage[] Conversation =
     [
-        new("system", "You are helpful."),
-        new("user", "Hello\nworld"),
+        ChatMessage.Text("system", "You are helpful."),
+        ChatMessage.Text("user", "Hello\nworld"),
     ];
 
     private const string ChatMlTemplate =
@@ -37,7 +39,7 @@ public sealed class ChatTemplateTests
     [Fact]
     public void ChatMl_WithGenerationPrompt_RendersExactChatML()
     {
-        string rendered = ChatTemplateRenderer.Parse(ChatMlTemplate).Render(Conversation, addGenerationPrompt: true);
+        string rendered = Render(ChatMlTemplate, Conversation, addGenerationPrompt: true);
 
         Assert.Equal(
             "<|im_start|>system\nYou are helpful.<|im_end|>\n"
@@ -49,7 +51,7 @@ public sealed class ChatTemplateTests
     [Fact]
     public void ChatMl_WithoutGenerationPrompt_OmitsAssistantTurn()
     {
-        string rendered = ChatTemplateRenderer.Parse(ChatMlTemplate).Render(Conversation, addGenerationPrompt: false);
+        string rendered = Render(ChatMlTemplate, Conversation, addGenerationPrompt: false);
 
         Assert.Equal(
             "<|im_start|>system\nYou are helpful.<|im_end|>\n"
@@ -60,7 +62,7 @@ public sealed class ChatTemplateTests
     [Fact]
     public void Conditional_WithGenerationPrompt_TakesSystemBranchAndJsonEscapes()
     {
-        string rendered = ChatTemplateRenderer.Parse(ConditionalTemplate).Render(Conversation, addGenerationPrompt: true);
+        string rendered = Render(ConditionalTemplate, Conversation, addGenerationPrompt: true);
 
         Assert.Equal("[SYS]\"You are helpful.\"[USER]Hello\nworldGEN", rendered);
     }
@@ -68,7 +70,7 @@ public sealed class ChatTemplateTests
     [Fact]
     public void Conditional_WithoutGenerationPrompt_TakesElseBranches()
     {
-        string rendered = ChatTemplateRenderer.Parse(ConditionalTemplate).Render(Conversation, addGenerationPrompt: false);
+        string rendered = Render(ConditionalTemplate, Conversation, addGenerationPrompt: false);
 
         Assert.Equal("[SYS]\"You are helpful.\"[USER]Hello\nworldNOGEN", rendered);
     }
@@ -76,7 +78,7 @@ public sealed class ChatTemplateTests
     [Fact]
     public void PhiStyle_WithGenerationPrompt_RendersRoleContentLoop()
     {
-        string rendered = ChatTemplateRenderer.Parse(PhiTemplate).Render(Conversation, addGenerationPrompt: true);
+        string rendered = Render(PhiTemplate, Conversation, addGenerationPrompt: true);
 
         Assert.Equal("system\nYou are helpful.\nuser\nHello\nworld\nassistant\n", rendered);
     }
@@ -84,115 +86,81 @@ public sealed class ChatTemplateTests
     [Fact]
     public void PhiStyle_WithoutGenerationPrompt_OmitsTrailingRole()
     {
-        string rendered = ChatTemplateRenderer.Parse(PhiTemplate).Render(Conversation, addGenerationPrompt: false);
+        string rendered = Render(PhiTemplate, Conversation, addGenerationPrompt: false);
 
         Assert.Equal("system\nYou are helpful.\nuser\nHello\nworld\n", rendered);
     }
 
-    // ---------------------------------------------------------------- unsupported constructs
+    // ---------------------------------------------------------------- adapter-path semantics
 
     [Fact]
-    public void SetTag_ThrowsNamingConstructAndPosition()
+    public void Addition_StringWithInteger_FailsActionablyInsteadOfCoercing()
     {
-        TemplateSyntaxException ex = Assert.Throws<TemplateSyntaxException>(
-            () => ChatTemplateRenderer.Parse("{% set loop_messages = messages %}"));
+        // The retired ChatTemplateRenderer coerced integers into concatenations; minja does not. A template that
+        // mixes a string and an integer fails as an actionable render error naming the construct.
+        MinjaRenderException error = Assert.Throws<MinjaRenderException>(
+            () => Render("{{ 'n=' + 3 }}", Conversation, false));
 
-        Assert.Contains("'{% set %}'", ex.Message);
-        Assert.Equal(3, ex.Position);
-    }
-
-    [Fact]
-    public void UnknownFilter_ThrowsNamingFilterAndPosition()
-    {
-        TemplateSyntaxException ex = Assert.Throws<TemplateSyntaxException>(
-            () => ChatTemplateRenderer.Parse("{{ 'shout' | upper }}"));
-
-        Assert.Contains("'upper'", ex.Message);
-        Assert.Equal(13, ex.Position);
-    }
-
-    [Fact]
-    public void MacroTag_ThrowsNamingConstructAndPosition()
-    {
-        TemplateSyntaxException ex = Assert.Throws<TemplateSyntaxException>(
-            () => ChatTemplateRenderer.Parse("{% macro render(msg) %}{{ msg }}{% endmacro %}"));
-
-        Assert.Contains("'{% macro %}'", ex.Message);
-        Assert.Equal(3, ex.Position);
-    }
-
-    [Fact]
-    public void SliceSyntax_ThrowsNamingConstructAndPosition()
-    {
-        TemplateSyntaxException ex = Assert.Throws<TemplateSyntaxException>(
-            () => ChatTemplateRenderer.Parse("{{ messages[0:2] }}"));
-
-        Assert.Contains("'slice'", ex.Message);
-        Assert.Equal(13, ex.Position);
-    }
-
-    [Fact]
-    public void UnclosedFor_ThrowsAtKeywordPosition()
-    {
-        TemplateSyntaxException ex = Assert.Throws<TemplateSyntaxException>(
-            () => ChatTemplateRenderer.Parse("{% for message in messages %}{{ message['role'] }}"));
-
-        Assert.Contains("unclosed '{% for %}'", ex.Message);
-        Assert.Equal(3, ex.Position);
-    }
-
-    // ---------------------------------------------------------------- subset semantics
-
-    [Fact]
-    public void Concat_CoercesIntegersToText()
-    {
-        Assert.Equal("n=3", ChatTemplateRenderer.Parse("{{ 'n=' + 3 }}").Render(Conversation, false));
+        Assert.Equal("addition", error.Construct);
+        Assert.Contains("cannot add", error.Message);
     }
 
     [Fact]
     public void Output_RendersBooleansAsPythonNames()
     {
+        // The adapter's renderer takes Python-style capitalized literals; the lowercase spellings are the same
+        // literals (minja and the pinned reference accept both), and values render with Python names.
         Assert.Equal(
             "True|False",
-            ChatTemplateRenderer.Parse("{{ true }}|{{ False }}").Render(Conversation, false));
+            Render("{{ True }}|{{ False }}", Conversation, false));
     }
 
     [Fact]
-    public void If_CoversNotEqualityAndElifChain()
+    public void If_CoversNotAndEquality()
     {
         Assert.Equal(
             "hidden",
-            ChatTemplateRenderer.Parse("{% if not add_generation_prompt %}hidden{% endif %}").Render(Conversation, false));
+            Render("{% if not add_generation_prompt %}hidden{% endif %}", Conversation, false));
         Assert.Equal(
             "ne",
-            ChatTemplateRenderer.Parse("{% if 'a' != 'b' %}ne{% else %}eq{% endif %}").Render(Conversation, false));
+            Render("{% if 'a' != 'b' %}ne{% else %}eq{% endif %}", Conversation, false));
+    }
+
+    [Fact]
+    public void If_ElifChain_TakesRoleBranchesInOrder()
+    {
+        // Pinned with normalization off: a role-conditional template cannot surface the wrapper's dummy probe
+        // content, so the capability probe reports system-role support as absent and the wrapper's fallback would
+        // merge the system message into the user turn. This test pins the template branch semantics themselves;
+        // the fallback behavior is pinned in the wrapper's own category.
         Assert.Equal(
             "SU",
-            ChatTemplateRenderer.Parse(
+            RenderExact(
                 """
                 {% for message in messages %}{% if message['role'] == 'system' %}S{% elif message['role'] == 'user' %}U{% else %}?{% endif %}{% endfor %}
-                """).Render(Conversation, false));
+                """, Conversation, false));
     }
 
     [Fact]
     public void Tojson_MatchesPythonJsonDumpsEscaping()
     {
-        ChatMessage[] tricky = [new("system", "a\tb\"c\\d\n€\U0001F600<|x|>")];
+        ChatMessage[] tricky = [ChatMessage.Text("system", "a\tb\"c\\d\n\u0001€\U0001F600<|x|>")];
 
+        // minja's tojson mirrors Python json.dumps with its default separators and ensure_ascii escaping: control
+        // characters and non-ASCII text (including the emoji's surrogate pair) land as \uXXXX escapes.
         Assert.Equal(
-            """{"role":"system","content":"a\tb\"c\\d\n\u0001€😀<|x|>"}""",
-            ChatTemplateRenderer.Parse("{{ messages[0] | tojson }}").Render(tricky, false));
-    }
+            """{"role": "system", "content": "a\tb\"c\\d\n\u0001\u20ac\ud83d\ude00<|x|>"}""",
+            Render("{{ messages[0] | tojson }}", tricky, false));    }
 
     [Fact]
     public void Tojson_EncodesConstructedListsAndMaps()
     {
         Assert.Equal(
-            """[1,"a",true,false]""",
-            ChatTemplateRenderer.Parse("{{ [1, 'a', true, false] | tojson }}").Render(Conversation, false));
+            """[1, "a", true, false]""",
+            Render("{{ [1, 'a', True, False] | tojson }}", Conversation, false));
         Assert.Equal(
-            """{"k":"v"}""",
-            ChatTemplateRenderer.Parse("{{ {'k': 'v'} | tojson }}").Render(Conversation, false));
+            """{"k": "v"}""",
+            Render("{{ {'k': 'v'} | tojson }}", Conversation, false));
     }
 
     [Fact]
@@ -200,7 +168,7 @@ public sealed class ChatTemplateTests
     {
         Assert.Equal(
             "pad",
-            ChatTemplateRenderer.Parse("{{ '  pad  ' | trim }}").Render(Conversation, false));
+            Render("{{ '  pad  ' | trim }}", Conversation, false));
     }
 
     [Fact]
@@ -208,18 +176,21 @@ public sealed class ChatTemplateTests
     {
         Assert.Equal(
             "abc",
-            ChatTemplateRenderer.Parse("a\n{%- if true -%}\n  b\n{%- endif -%}\nc").Render(Conversation, false));
+            Render("a\n{%- if True -%}\n  b\n{%- endif -%}\nc", Conversation, false));
         Assert.Equal(
             "xyesy",
-            ChatTemplateRenderer.Parse("x {%- if false -%} nope {%- else -%} yes {%- endif -%} y").Render(Conversation, false));
+            Render("x {%- if False -%} nope {%- else -%} yes {%- endif -%} y", Conversation, false));
     }
 
     [Fact]
     public void IndexAccess_NestsListThenMap()
     {
+        // Pinned with normalization off for the same reason as the elif-chain test: the single-message probe cannot
+        // demonstrate system-role rendering for a fixed-index template, so the wrapper fallback would reshape the
+        // conversation before this index semantics test runs.
         Assert.Equal(
             "Hello\nworld",
-            ChatTemplateRenderer.Parse("{{ messages[1]['content'] }}").Render(Conversation, false));
+            RenderExact("{{ messages[1]['content'] }}", Conversation, false));
     }
 
     // ---------------------------------------------------------------- real-model integration
@@ -237,17 +208,30 @@ public sealed class ChatTemplateTests
         string? template = gguf.Metadata.ChatTemplate;
         Assert.NotNull(template);
 
-        ChatTemplateRenderer renderer = ChatTemplateRenderer.Parse(template!);
-        ChatMessage[] messages = [new("system", "You are a helpful assistant."), new("user", "Hello")];
+        MinjaChatTemplate chat = new(template!);
+        ChatMessage[] messages = [ChatMessage.Text("system", "You are a helpful assistant."), ChatMessage.Text("user", "Hello")];
 
-        string withPrompt = renderer.Render(messages, addGenerationPrompt: true);
+        string withPrompt = chat.Render(new ChatTemplateInput { Messages = messages, AddGenerationPrompt = true }).Prompt;
         Assert.Contains("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n", withPrompt);
         Assert.Contains("<|im_start|>user\nHello<|im_end|>\n", withPrompt);
         Assert.EndsWith("<|im_start|>assistant\n", withPrompt);
 
-        string withoutPrompt = renderer.Render(messages, addGenerationPrompt: false);
+        string withoutPrompt = chat.Render(new ChatTemplateInput { Messages = messages, AddGenerationPrompt = false }).Prompt;
         Assert.Contains("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n", withoutPrompt);
         Assert.Contains("<|im_start|>user\nHello<|im_end|>\n", withoutPrompt);
         Assert.DoesNotContain("<|im_start|>assistant\n", withoutPrompt);
     }
+
+    // ---------------------------------------------------------------- helpers
+
+    // Renders through the adapter path: the wrapper with its default options (capability detection and message
+    // normalization on), exactly as GenerationService renders a chat request.
+    private static string Render(string template, IReadOnlyList<ChatMessage> messages, bool addGenerationPrompt) =>
+        new MinjaChatTemplate(template).Render(new ChatTemplateInput { Messages = messages, AddGenerationPrompt = addGenerationPrompt }).Prompt;
+
+    // Renders the supplied messages exactly as given: template semantics pinned without the wrapper's capability fallbacks.
+    private static string RenderExact(string template, IReadOnlyList<ChatMessage> messages, bool addGenerationPrompt) =>
+        new MinjaChatTemplate(template).Render(
+            new ChatTemplateInput { Messages = messages, AddGenerationPrompt = addGenerationPrompt },
+            new ChatTemplateOptions { NormalizeMessages = false }).Prompt;
 }

@@ -4,6 +4,28 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-11-06
+
+### Added
+
+- `Lair.Templating.Minja`: a managed template engine at full minja parity for minja's supported subset — statements (`if`/`elif`/`else`, `for` with `loop.*`/`recursive`/`if`/`break`/`continue`/destructuring, `set` with namespaces and destructuring, `macro`/`call`/`filter`), full expression syntax including inline list/map literals, slices, membership and boolean operators, minja's filter/test/function collection, and a chat-template wrapper with dummy-render capability probes, chat polyfills, and BOS handling. Templates are parsed once at model load and cached for the model's lifetime.
+- Hard template resource limits with library defaults and no config knobs: template source size, parser frames, evaluator/call depth, sequence length, loop iterations per render, rendered output size, a 30 s render deadline, and cooperative cancellation — parse guards fail as syntax errors, render guards as bounded actionable render errors.
+- Llama-family chat templates serve end-to-end: `Llama-3.2-1B-Instruct-Q8_0.gguf` renders its own GGUF chat template, with byte-exact golden parity against pinned llama.cpp b12032 `/apply-template` (`Category=TemplateParity`, regenerated with `scripts/generate-template-parity.ps1`) and real-model serve tests (`Category=Serve`).
+- `models[].force_fenced_tools` (bool, default false, hot-reload new-requests-only): forces LAIR's fenced tool injection even when the model's template renders tools itself.
+
+### Changed
+
+- Chat tool handling picks one surface from template capability: a tool-capable template renders declared tools natively and LAIR's fenced block is skipped; a toolless template keeps LAIR's schema injection and fenced-JSON detector exactly as before.
+- Template failures are actionable: model startup fails with model path + offending construct + offset; request-time render failures log model name + `x-lair-request-id` + bounded detail and map to the OpenAI `invalid_request` error shape.
+
+### Fixed
+
+- Minja semantics proven against the pinned oracle: lowercase `true`/`false` parse as boolean literals; the parser strips exactly one trailing newline from the template source; macro call arguments and defaults evaluate in the calling scope, so recursive macro helpers work.
+
+### Removed
+
+- The legacy mini-Jinja `ChatTemplateRenderer` (with `TemplateSyntaxException`/`TemplateRenderException`) is deleted; there is no fallback template engine.
+
 ## [0.3.1] - 2026-11-03
 
 ### Added

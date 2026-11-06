@@ -16,10 +16,11 @@ if (args.Length == 3 && args[0] == "serve" && args[1] == "-c")
 {
     LairConfig config;
     GenerationService engine;
+    using Microsoft.Extensions.Logging.ILoggerFactory loggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(static _ => { });
     try
     {
         config = YamlConfigLoader.Load(args[2]);
-        engine = GenerationService.Open(config);
+        engine = GenerationService.Open(config, loggerFactory.CreateLogger("Lair.Http.GenerationService"));
     }
     catch (Exception ex)
     {

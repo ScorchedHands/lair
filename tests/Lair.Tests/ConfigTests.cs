@@ -387,6 +387,34 @@ public sealed class ConfigTests : IDisposable
     }
 
     [Fact]
+    public void Load_ForceFencedTools_ParsesBoolean_AndDefaultsFalse()
+    {
+        LairConfig forced = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                force_fenced_tools: true
+            """));
+        Assert.True(forced.Models[0].ForceFencedTools);
+
+        LairConfig absent = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """));
+        Assert.False(absent.Models[0].ForceFencedTools);
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                force_fenced_tools: sometimes
+            """)));
+        Assert.Contains("models[0].force_fenced_tools", error.Message);
+        Assert.Contains("must be a true or false value", error.Message);
+    }
+
+    [Fact]
     public void Load_CoreSetRange_ParsesInclusiveRange()
     {
         string yaml = $"""

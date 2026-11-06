@@ -13,11 +13,14 @@ namespace Lair.Tests;
 /// Logit-agreement parity against the pinned llama.cpp server reference recorded in tests/fixtures. Per prompt:
 /// the model file must match its recorded hash; LAIR's argmax token must appear among the reference top-5 tokens
 /// (pinned llama.cpp CLI and server modes disagree on identical greedy runs, so cross-tool exact continuations are
-/// unattainable — membership of our pick in the reference leaders is the honest gate); and every reference-top-5
+/// unattainable — membership of our pick in the reference leaders is the honest gate); every reference-top-5
 /// token's calibrated LAIR logprob from fixture generation must reproduce within tolerance, including documented
-/// absences. A distribution shift from engine changes therefore fails here even when no single candidate breaks a
-/// cross-tool tie. Full continuations are recorded in fixtures for inspection only. The calibration data is produced
-/// by the CalibrationProbe test during scripts/generate-parity.ps1 regeneration.
+/// absences; and each shared candidate's live LAIR logprob must stay inside a cross-tool band around the pinned
+/// llama.cpp value — tight on F16, where the two pipelines agree to a few thousandths of a nat, looser on the
+/// quantized files where weight noise legitimately moves rankings. A forward-math regression that shifts the whole
+/// distribution by ~1 nat therefore fails here even when no single candidate breaks a cross-tool tie; continuations
+/// themselves are pinned in ContinuationParityTests for F16. The calibration data is produced by the CalibrationProbe
+/// test during scripts/generate-parity.ps1 regeneration.
 /// </summary>
 [Trait("Category", "Parity")]
 public sealed class ParityTests
@@ -37,6 +40,12 @@ public sealed class ParityTests
 
     /// <summary>Absolute logprob tolerance for reproducing a calibrated LAIR distribution entry.</summary>
     private static readonly double ReproductionTolerance = 0.2;
+
+    // Cross-tool band against the pinned llama.cpp value itself. F16 agrees with the reference to a few thousandths
+    // of a nat, so anything looser than this hides forward-math drift; the quantized files carry real weight noise
+    // and are calibrated near their tie-flips, so they get a wider band that still catches a ~1 nat shift.
+    private static double CrossToolTolerance(string fixturePath) =>
+        fixturePath == F16Fixture ? 0.05 : 1.0;
 
     public static TheoryData<string, int> PromptCases()
     {
@@ -125,6 +134,13 @@ public sealed class ParityTests
                 $"prompt '{entry.Prompt.Trim()}' token {reference.Id}('{reference.Token}') logprob moved " +
                 $"{delta:F4} from its calibrated value {reference.LairLogprob:F4} to {top[slot].Logprob:F4} — " +
                 $"beyond the {ReproductionTolerance:F2} reproduction tolerance.\nlair: [{Format(top)}]");
+
+            double crossToolDelta = Math.Abs(top[slot].Logprob - reference.Logprob);
+            Assert.True(
+                crossToolDelta <= CrossToolTolerance(fixturePath),
+                $"prompt '{entry.Prompt.Trim()}' token {reference.Id}('{reference.Token}') sits {crossToolDelta:F4} nats " +
+                $"from the pinned llama.cpp logprob {reference.Logprob:F4} (LAIR now {top[slot].Logprob:F4}), beyond the " +
+                $"{CrossToolTolerance(fixturePath):F2} cross-tool band for this fixture.\nlair: [{Format(top)}]");
         }
     }
 
