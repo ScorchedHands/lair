@@ -39,14 +39,17 @@ public sealed class GgufMetadata
 
     public string[] GetMerges() => TokenStringArray("tokenizer.ggml.merges");
 
-    public int[] GetTokenTypes()
+    public int[] GetTokenTypes() => GetInt32Array("tokenizer.ggml.token_type");
+
+    /// <summary>Required int32-array value (e.g. <c>tokenizer.ggml.byte_to_token</c>), failing like the other required accessors when the key is absent.</summary>
+    public int[] GetInt32Array(string key)
     {
-        if (!Has("tokenizer.ggml.token_type"))
+        if (!Has(key))
         {
-            throw new GgufException("GGUF metadata key 'tokenizer.ggml.token_type' is not present");
+            throw new GgufException($"GGUF metadata key '{key}' is not present");
         }
 
-        return Get("tokenizer.ggml.token_type").AsInt32Array();
+        return Get(key).AsInt32Array();
     }
 
     private string[] TokenStringArray(string key)

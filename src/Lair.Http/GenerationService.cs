@@ -88,6 +88,9 @@ public sealed class GenerationService : IDisposable
     /// </summary>
     public TemplateCapabilities? ChatTemplateCapabilities => _chatTemplateCapabilities;
 
+    /// <summary>The id that ends a generation: the model's declared EOT id (<c>tokenizer.ggml.eot_token_id</c>) when it has one, otherwise the EOS id.</summary>
+    internal int StopId => _tokenizer.EotId >= 0 ? _tokenizer.EotId : _tokenizer.EosId;
+
     /// <summary>Vocabulary size of the served model; token ids at or above it have no vocabulary text.</summary>
     public int VocabSize => Model.VocabSize;
 
@@ -359,7 +362,9 @@ public sealed class GenerationService : IDisposable
         try
         {
             file = GgufFile.Open(modelConfig.Path);
-            GgufTokenizer tokenizer = GgufTokenizer.FromGguf(file);
+            // Profile-scoped tokenizer defaults applied at load (absent BOS/EOS keys) surface as structured
+            // log lines on the host logger.
+            GgufTokenizer tokenizer = GgufTokenizer.FromGguf(file, line => logger?.LogInformation("{TokenizerLog}", line));
             model = TransformerModel.Open(file, backend, reservedSlots);
             pool = new BlockPool(
                 blockTokens,
@@ -514,6 +519,10 @@ public sealed class GenerationService : IDisposable
         // back, and a stop literal seen in that token must still end the sequence.
         using CancellationTokenSource stopSignal = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
+        // The stop signal is the model's declared EOT id when it has one (tokenizer.ggml.eot_token_id);
+        // models without an EOT id keep today's EOS behavior.
+        int stopId = StopId;
+
         ScheduledRequest scheduled = new()
         {
             PromptTokens = [.. prompt],
@@ -528,7 +537,7 @@ public sealed class GenerationService : IDisposable
                 FrequencyPenalty = request.FrequencyPenalty,
                 LogitBias = logitBias,
             },
-            EosId = _tokenizer.EosId,
+            EosId = stopId,
             LogProbTopN = request.LogProbs ? Math.Max(request.TopLogprobs, 0) : null,
             OnTokenId = tokenId =>
             {

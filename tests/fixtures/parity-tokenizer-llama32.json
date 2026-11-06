@@ -1,0 +1,208 @@
+{
+  "model_file": "models/Llama-3.2-1B-Instruct-Q8_0.gguf",
+  "model_sha256": "432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3",
+  "pre": "llama-bpe",
+  "add_bos": true,
+  "add_space_prefix": true,
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "llama-server /tokenize with add_special=false and parse_special=false — the same surface LAIR's GgufTokenizer.Encode exposes (no BOS, no special-token parsing). tokens are the reference id sequence and tokens_str the pieces the reference resolved them to; the parity tests assert LAIR's Encode matches id-for-id. Cases are plain text so a mismatch is a tokenizer mismatch, not a special-token one.",
+  "generated_utc": "2026-11-06T22:07:53Z",
+  "cases": [
+    {
+      "name": "hello_world",
+      "content": "Hello, world!",
+      "tokens": [
+        9906,
+        11,
+        1917,
+        0
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "leading_space",
+      "content": " world",
+      "tokens": [
+        1917
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "leading_space_punct",
+      "content": " world!",
+      "tokens": [
+        1917,
+        0
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "ascii_sentence",
+      "content": "The quick brown fox jumps over the lazy dog.",
+      "tokens": [
+        791,
+        4062,
+        14198,
+        39935,
+        35308,
+        927,
+        279,
+        16053,
+        5679,
+        13
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "digits",
+      "content": "1234567890 42 3.14159",
+      "tokens": [
+        4513,
+        10961,
+        16474,
+        15,
+        220,
+        2983,
+        220,
+        18,
+        13,
+        9335,
+        2946
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "newline_tab",
+      "content": "line1\nline2\ttabbed\r\ncrlf",
+      "tokens": [
+        1074,
+        16,
+        198,
+        1074,
+        17,
+        59249,
+        2788,
+        319,
+        66,
+        2438,
+        69
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "multibyte",
+      "content": "café ☕ 你好 — über",
+      "tokens": [
+        936,
+        59958,
+        26182,
+        243,
+        118195,
+        53901,
+        2001,
+        14104
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "emoji",
+      "content": "emoji 😀🎉 test",
+      "tokens": [
+        38623,
+        91416,
+        9468,
+        236,
+        231,
+        1296
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "repeated_words",
+      "content": "the the the the the the the the the the",
+      "tokens": [
+        1820,
+        279,
+        279,
+        279,
+        279,
+        279,
+        279,
+        279,
+        279,
+        279
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "long_prompt",
+      "content": "You are a helpful assistant. Answer the question concisely.\nQuestion: What is the capital of France?\nAnswer:",
+      "tokens": [
+        2675,
+        527,
+        264,
+        11190,
+        18328,
+        13,
+        22559,
+        279,
+        3488,
+        3613,
+        285,
+        989,
+        627,
+        14924,
+        25,
+        3639,
+        374,
+        279,
+        6864,
+        315,
+        9822,
+        5380,
+        16533,
+        25
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "empty",
+      "content": "",
+      "tokens": [],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "single_space",
+      "content": " ",
+      "tokens": [
+        220
+      ],
+      "tokens_str": [
+        null
+      ]
+    }
+  ]
+}

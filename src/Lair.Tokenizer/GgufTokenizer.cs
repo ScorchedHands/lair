@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -26,9 +25,12 @@ public sealed class GgufTokenizer
 
     private const int NullToken = -1;
     private const int EncodeCacheLimit = 50_000;
+    private const int MaxUnicodeCodepoint = 0x10FFFF;
 
-    private static readonly int[] ByteToEncoded = BuildByteToEncoded();
-    private static readonly int[] EncodedToByte = BuildEncodedToByte();
+    // The process-static GPT-2 byte-encoding map: byte -> visual codepoint, and its inverse.
+    // These are the fallback when a GGUF does not declare tokenizer.ggml.byte_to_utf8.
+    private static readonly int[] Gpt2ByteToUtf8 = BuildGpt2ByteToUtf8();
+    private static readonly int[] Gpt2VisualToByte = BuildVisualToByte(Gpt2ByteToUtf8);
 
     private readonly string[] _pieces;
     private readonly int[] _types;
@@ -36,22 +38,33 @@ public sealed class GgufTokenizer
     private readonly int[] _specialIds;
     private readonly Dictionary<(string First, string Second), int> _mergeRanks;
     private readonly int[] _byteTokenByValue;
-    private readonly PreRule _pre;
+    private readonly int[] _byteToUtf8;
+    private readonly int[] _visualToByte;
+    private readonly PreSplitStrategy _split;
     private readonly bool _ignoreMerges;
     private readonly bool _cleanSpaces;
+    private readonly bool _byteFallback;
+    private readonly bool _addSpacePrefix;
+    private readonly bool _utf8FlushBetweenControls;
     private readonly bool _addBos;
     private readonly Dictionary<string, int[]> _encodeCache = new(StringComparer.Ordinal);
 
-    public GgufTokenizer(
+    private GgufTokenizer(
         string[] pieces,
         int[] types,
         string[] merges,
-        PreRule pre,
-        int bosId = NullToken,
-        int eosId = NullToken,
-        int padId = NullToken,
-        int unkId = NullToken,
-        bool? addBos = null)
+        TokenizerProfile profile,
+        int bosId,
+        int eosId,
+        int padId,
+        int unkId,
+        int eotId,
+        bool addBos,
+        bool byteFallback,
+        bool addSpacePrefix,
+        bool utf8FlushBetweenControls,
+        int[] byteToUtf8,
+        int[] byteTokenByValue)
     {
         ArgumentNullException.ThrowIfNull(pieces);
         ArgumentNullException.ThrowIfNull(types);
@@ -98,35 +111,24 @@ public sealed class GgufTokenizer
             }
         }
 
-        _byteTokenByValue = new int[256];
-        Array.Fill(_byteTokenByValue, NullToken);
-        for (int id = 0; id < pieces.Length; id++)
-        {
-            if (types[id] != TokenTypeByte || pieces[id].Length != 6)
-            {
-                continue;
-            }
+        // All byte-map and byte-token state is resolved once at construction (FromGguf honors
+        // tokenizer.ggml.byte_to_token / byte_to_utf8 over the defaults here) so the hot path stays concrete.
+        _byteTokenByValue = byteTokenByValue;
+        _byteToUtf8 = byteToUtf8;
+        _visualToByte = BuildVisualToByte(byteToUtf8);
 
-            string piece = pieces[id];
-            if (piece.StartsWith("<0x", StringComparison.Ordinal) && piece[5] == '>'
-                && TryHexDigit(piece[3], out int high) && TryHexDigit(piece[4], out int low))
-            {
-                int value = (high << 4) | low;
-                if (_byteTokenByValue[value] == NullToken)
-                {
-                    _byteTokenByValue[value] = id;
-                }
-            }
-        }
-
-        _pre = pre;
-        _ignoreMerges = pre == PreRule.LlamaBpe;
-        _cleanSpaces = pre is not PreRule.Smollm;
-        _addBos = addBos ?? pre == PreRule.LlamaBpe;
+        _split = profile.Split;
+        _ignoreMerges = profile.IgnoreMerges;
+        _cleanSpaces = profile.CleanSpaces;
+        _byteFallback = byteFallback;
+        _addSpacePrefix = addSpacePrefix;
+        _utf8FlushBetweenControls = utf8FlushBetweenControls;
+        _addBos = addBos;
         BosId = bosId;
         EosId = eosId;
         PadId = padId;
         UnkId = unkId;
+        EotId = eotId;
     }
 
     public int BosId { get; }
@@ -136,6 +138,14 @@ public sealed class GgufTokenizer
     public int PadId { get; }
 
     public int UnkId { get; }
+
+    /// <summary><c>tokenizer.ggml.eot_token_id</c> when the model declares one in range; <see cref="NullToken"/> otherwise. When declared, it is the stop signal in place of <see cref="EosId"/>.</summary>
+    public int EotId { get; }
+
+    /// <summary>Declared value of <c>tokenizer.ggml.add_space_prefix</c> (default <see langword="true"/>).
+    /// Reported for parity diagnostics; the supported profiles' pre-split matches the pinned reference
+    /// whether the key is true or false.</summary>
+    public bool AddSpacePrefix => _addSpacePrefix;
 
     public int VocabSize => _pieces.Length;
 
@@ -155,7 +165,16 @@ public sealed class GgufTokenizer
         }
     }
 
-    public static GgufTokenizer FromGguf(GgufFile file)
+    /// <summary>
+    /// Builds a tokenizer from one GGUF, resolving every metadata-selected behavior once here:
+    /// the profile from <c>tokenizer.ggml.pre</c>, the special ids (with profile-scoped fallbacks
+    /// logged through <paramref name="logLine"/> when applied), <c>byte_fallback</c>,
+    /// <c>byte_to_token</c>, <c>byte_to_utf8</c>, <c>add_space_prefix</c>, <c>eot_token_id</c>, and
+    /// <c>utf8_flush_between_controls</c>.
+    /// </summary>
+    /// <param name="file">The GGUF to read tokenizer metadata from.</param>
+    /// <param name="logLine">Sink for each structured profile-default log line; hosts may capture instead.</param>
+    public static GgufTokenizer FromGguf(GgufFile file, Action<string>? logLine = null)
     {
         ArgumentNullException.ThrowIfNull(file);
 
@@ -168,28 +187,46 @@ public sealed class GgufTokenizer
                 $"tokenizer.ggml.model is '{model}' (expected 'gpt2'): only GGUF BPE vocabularies are supported");
         }
 
-        string pre = metadata.GetString("tokenizer.ggml.pre", "llama-bpe");
-        PreRule rule = pre switch
-        {
-            "llama-bpe" => PreRule.LlamaBpe,
-            "gpt2" => PreRule.Gpt2,
-            "smollm" => PreRule.Smollm,
-            _ => throw new GgufException(
-                $"unsupported pre-tokenizer '{pre}' in tokenizer.ggml.pre (supported: 'llama-bpe', 'gpt2', 'smollm')"),
-        };
+        string pre = metadata.GetString("tokenizer.ggml.pre", TokenizerProfiles.DefaultPreKey);
+        TokenizerProfile profile = TokenizerProfiles.Resolve(pre);
 
         string[] pieces = metadata.GetTokens();
         int[] types = metadata.GetTokenTypes();
         string[] merges = metadata.GetMerges();
 
-        int bosId = ReadSpecialId(metadata, "tokenizer.ggml.bos_token_id", fallback: 11, pieces.Length);
-        int eosId = ReadSpecialId(metadata, "tokenizer.ggml.eos_token_id", fallback: 11, pieces.Length);
-        int padId = ReadSpecialId(metadata, "tokenizer.ggml.padding_token_id", fallback: NullToken, pieces.Length);
-        int unkId = ReadSpecialId(metadata, "tokenizer.ggml.unknown_token_id", fallback: NullToken, pieces.Length);
+        int bosId = ReadSpecialId(metadata, "tokenizer.ggml.bos_token_id", profile.BosFallbackId, pieces.Length, file, logLine);
+        int eosId = ReadSpecialId(metadata, "tokenizer.ggml.eos_token_id", profile.EosFallbackId, pieces.Length, file, logLine);
+        int padId = ReadSpecialId(metadata, "tokenizer.ggml.padding_token_id", NullToken, pieces.Length, file, logLine);
+        int unkId = ReadSpecialId(metadata, "tokenizer.ggml.unknown_token_id", NullToken, pieces.Length, file, logLine);
+        int eotId = ReadSpecialId(metadata, "tokenizer.ggml.eot_token_id", NullToken, pieces.Length, file, logLine);
 
-        bool addBos = metadata.GetBool("tokenizer.ggml.add_bos_token", rule == PreRule.LlamaBpe);
+        bool addBos = metadata.GetBool("tokenizer.ggml.add_bos_token", profile.AddBosDefault);
+        bool byteFallback = metadata.GetBool("tokenizer.ggml.byte_fallback", true);
+        bool addSpacePrefix = metadata.GetBool("tokenizer.ggml.add_space_prefix", true);
+        bool utf8Flush = metadata.GetBool("tokenizer.ggml.utf8_flush_between_controls", true);
 
-        return new GgufTokenizer(pieces, types, merges, rule, bosId, eosId, padId, unkId, addBos);
+        int[] byteToUtf8 = metadata.Has("tokenizer.ggml.byte_to_utf8")
+            ? ReadByteToUtf8(metadata, "tokenizer.ggml.byte_to_utf8")
+            : Gpt2ByteToUtf8;
+
+        int[] byteTokenByValue = ResolveByteTokenByValue(metadata, pieces, types);
+
+        return new GgufTokenizer(
+            pieces,
+            types,
+            merges,
+            profile,
+            bosId,
+            eosId,
+            padId,
+            unkId,
+            eotId,
+            addBos,
+            byteFallback,
+            addSpacePrefix,
+            utf8Flush,
+            byteToUtf8,
+            byteTokenByValue);
     }
 
     public IReadOnlyList<int> Encode(string text)
@@ -209,6 +246,8 @@ public sealed class GgufTokenizer
         ArgumentNullException.ThrowIfNull(ids);
 
         List<byte> bytes = new(ids.Count * 4);
+        StringBuilder text = new();
+
         foreach (int id in ids)
         {
             if (id < 0 || id >= _pieces.Length)
@@ -216,13 +255,30 @@ public sealed class GgufTokenizer
                 continue;
             }
 
+            bool control = _types[id] is TokenTypeUnknown or TokenTypeControl or TokenTypeUserDefined;
+            if (control && !_utf8FlushBetweenControls)
+            {
+                // utf8_flush_between_controls=false: a partial UTF-8 sequence accumulated before the control
+                // boundary is flushed there — the incomplete tail decodes to replacement text instead of
+                // stitching across the boundary.
+                FlushBytes(bytes, text);
+                if (includeSpecial)
+                {
+                    text.Append(_pieces[id]);
+                }
+
+                continue;
+            }
+
             AppendPieceBytes(id, includeSpecial, bytes);
         }
 
         // Byte fallback tokens only form valid text when their bytes are reassembled
-        // across token boundaries, so the whole id stream decodes as one byte buffer.
-        string text = Encoding.UTF8.GetString(CollectionsMarshal.AsSpan(bytes));
-        return _cleanSpaces ? CleanSpaces(text) : text;
+        // across token boundaries, so each flush window decodes as one byte buffer.
+        FlushBytes(bytes, text);
+
+        string decoded = text.ToString();
+        return _cleanSpaces ? CleanSpaces(decoded) : decoded;
     }
 
     public int? IdOf(string token)
@@ -332,15 +388,10 @@ public sealed class GgufTokenizer
 
     private List<string> PreSplit(string text)
     {
-        List<int> offsets = [text.Length];
-
-        offsets = _pre switch
-        {
-            PreRule.LlamaBpe => SplitLlama3(text, offsets),
-            PreRule.Gpt2 => SplitGpt2(text, offsets),
-            PreRule.Smollm => SplitDigits(text, SplitGpt2(text, offsets)),
-            _ => throw new InvalidOperationException("unknown pre-tokenizer rule"),
-        };
+        // The profile resolved the strategy once at construction; this is a direct call, not a dispatch.
+        // add_space_prefix is read and exposed but never alters the split: b12032 /tokenize on a model
+        // that declares it false (smollm) still folds the leading space into the pre-token.
+        List<int> offsets = _split(text, [text.Length]);
 
         List<string> words = new(offsets.Count);
         int start = 0;
@@ -353,386 +404,13 @@ public sealed class GgufTokenizer
         return words;
     }
 
-    private static List<int> SplitDigits(string text, List<int> offsets)
-    {
-        List<int> next = [];
-        int start = 0;
-        foreach (int length in offsets)
-        {
-            int end = start + length;
-            int runStart = start;
-            for (int pos = start; pos < end;)
-            {
-                bool isDigit = char.IsNumber(text, pos);
-                if (pos > runStart && isDigit != char.IsNumber(text, runStart))
-                {
-                    next.Add(pos - runStart);
-                    runStart = pos;
-                }
-
-                // Step whole codepoints so a surrogate pair never lands on a digit-run boundary.
-                pos += char.IsHighSurrogate(text[pos]) && pos + 1 < end ? 2 : 1;
-            }
-
-            next.Add(end - runStart);
-            start = end;
-        }
-
-        return next;
-    }
-
-    private static List<int> SplitGpt2(string text, List<int> offsets)
-    {
-        List<int> words = [];
-        int start = 0;
-        foreach (int length in offsets)
-        {
-            int end = start + length;
-            int previousEnd = start;
-            int pos = start;
-
-            while (pos < end)
-            {
-                void AddToken(int tokenEnd)
-                {
-                    if (tokenEnd > previousEnd)
-                    {
-                        words.Add(tokenEnd - previousEnd);
-                    }
-
-                    previousEnd = tokenEnd;
-                }
-
-                    // A surrogate pair is one codepoint and must stay in a single pre-token: splitting it would make
-                    // UTF-8 encoding emit replacement bytes.
-                    if (char.IsHighSurrogate(text[pos]) && pos + 1 < end && char.IsLowSurrogate(text[pos + 1]))
-                    {
-                        pos += 2;
-                        AddToken(pos);
-                        continue;
-                    }
-
-                    if (text[pos] == '\'' && pos + 1 < end)
-                    {
-                        int contractionLength = 0;
-                    bool isContraction = IsAsciiLetter(text, pos + 1)
-                        && IsContractionSuffix(text, pos, end, out contractionLength);
-
-                    if (!isContraction)
-                    {
-                        contractionLength = 0;
-                    }
-
-                    if (contractionLength > 0)
-                    {
-                        pos += contractionLength;
-                        AddToken(pos);
-                        continue;
-                    }
-                }
-
-                int letterStart = pos;
-                if (text[pos] == ' ' && pos + 1 < end && char.IsLetter(text, pos + 1))
-                {
-                    letterStart = pos + 1;
-                }
-
-                if (char.IsLetter(text, letterStart))
-                {
-                    pos = letterStart;
-                    while (pos < end && char.IsLetter(text, pos))
-                    {
-                        pos++;
-                    }
-
-                    AddToken(pos);
-                    continue;
-                }
-
-                int numberStart = pos;
-                if (text[pos] == ' ' && pos + 1 < end && char.IsNumber(text, pos + 1))
-                {
-                    numberStart = pos + 1;
-                }
-
-                if (char.IsNumber(text, numberStart))
-                {
-                    pos = numberStart;
-                    while (pos < end && char.IsNumber(text, pos))
-                    {
-                        pos++;
-                    }
-
-                    AddToken(pos);
-                    continue;
-                }
-
-                int symbolStart = pos;
-                if (text[pos] == ' ' && pos + 1 < end && IsGpt2Symbol(text, pos + 1))
-                {
-                    symbolStart = pos + 1;
-                }
-
-                if (IsGpt2Symbol(text, symbolStart))
-                {
-                    pos = symbolStart;
-                    while (pos < end && IsGpt2Symbol(text, pos))
-                    {
-                        pos++;
-                    }
-
-                    AddToken(pos);
-                    continue;
-                }
-
-                int whitespaceRun = 0;
-                while (pos + whitespaceRun < end && char.IsWhiteSpace(text, pos + whitespaceRun))
-                {
-                    whitespaceRun++;
-                }
-
-                if (whitespaceRun > 1 && pos + whitespaceRun < end)
-                {
-                    pos += whitespaceRun - 1;
-                    AddToken(pos);
-                    continue;
-                }
-
-                if (whitespaceRun > 0)
-                {
-                    pos += whitespaceRun;
-                    AddToken(pos);
-                    continue;
-                }
-
-                pos++;
-                AddToken(pos);
-            }
-
-            start = end;
-        }
-
-        return words;
-    }
-
-    private static List<int> SplitLlama3(string text, List<int> offsets)
-    {
-        List<int> words = [];
-        int start = 0;
-        foreach (int length in offsets)
-        {
-            int end = start + length;
-            int previousEnd = start;
-            int pos = start;
-
-            while (pos < end)
-            {
-                void AddToken(int tokenEnd)
-                {
-                    if (tokenEnd > previousEnd)
-                    {
-                        words.Add(tokenEnd - previousEnd);
-                    }
-
-                    previousEnd = tokenEnd;
-                }
-
-                    // A surrogate pair is one codepoint and must stay in a single pre-token: splitting it would make
-                    // UTF-8 encoding emit replacement bytes.
-                    if (char.IsHighSurrogate(text[pos]) && pos + 1 < end && char.IsLowSurrogate(text[pos + 1]))
-                    {
-                        pos += 2;
-                        AddToken(pos);
-                        continue;
-                    }
-
-                    if (text[pos] == '\'' && pos + 1 < end)
-                    {
-                        int suffixLength = 0;
-                    bool isContraction = IsAsciiLetter(text, pos + 1)
-                        && IsContractionSuffix(text, pos, end, out suffixLength, caseInsensitive: true);
-
-                    if (!isContraction)
-                    {
-                        suffixLength = 0;
-                    }
-
-                    if (suffixLength > 0)
-                    {
-                        pos += suffixLength;
-                        AddToken(pos);
-                        continue;
-                    }
-                }
-
-                if (text[pos] != '\r' && text[pos] != '\n' && !char.IsNumber(text, pos))
-                {
-                    int letterStart = char.IsLetter(text, pos) ? pos : pos + 1;
-                    if (letterStart < end && char.IsLetter(text, letterStart))
-                    {
-                        pos = letterStart;
-                        while (pos < end && char.IsLetter(text, pos))
-                        {
-                            pos++;
-                        }
-
-                        AddToken(pos);
-                        continue;
-                    }
-                }
-
-                if (char.IsNumber(text, pos))
-                {
-                    int groupStart = pos;
-                    while (pos < end && char.IsNumber(text, pos))
-                    {
-                        pos++;
-                        if (pos - groupStart >= 3)
-                        {
-                            AddToken(pos);
-                            groupStart = pos;
-                        }
-                    }
-
-                    AddToken(pos);
-                    continue;
-                }
-
-                int symbolStart = pos;
-                if (text[pos] == ' ' && pos + 1 < end && IsLlama3Symbol(text, pos + 1))
-                {
-                    symbolStart = pos + 1;
-                }
-
-                if (IsLlama3Symbol(text, pos) && IsLlama3Symbol(text, symbolStart))
-                {
-                    pos = symbolStart;
-                    while (pos < end && IsLlama3Symbol(text, pos))
-                    {
-                        pos++;
-                    }
-
-                    while (pos < end && (text[pos] == '\r' || text[pos] == '\n'))
-                    {
-                        pos++;
-                    }
-
-                    AddToken(pos);
-                    continue;
-                }
-
-                int whitespaceRun = 0;
-                int lastNewlineEnd = 0;
-                while (pos + whitespaceRun < end && char.IsWhiteSpace(text, pos + whitespaceRun))
-                {
-                    if (text[pos + whitespaceRun] == '\r' || text[pos + whitespaceRun] == '\n')
-                    {
-                        lastNewlineEnd = pos + whitespaceRun + 1;
-                    }
-
-                    whitespaceRun++;
-                }
-
-                if (lastNewlineEnd > 0)
-                {
-                    pos = lastNewlineEnd;
-                    AddToken(pos);
-                    continue;
-                }
-
-                if (whitespaceRun > 1 && pos + whitespaceRun < end)
-                {
-                    pos += whitespaceRun - 1;
-                    AddToken(pos);
-                    continue;
-                }
-
-                if (whitespaceRun > 0)
-                {
-                    pos += whitespaceRun;
-                    AddToken(pos);
-                    continue;
-                }
-
-                pos++;
-                AddToken(pos);
-            }
-
-            start = end;
-        }
-
-        return words;
-    }
-
-    private static bool IsAsciiLetter(string text, int pos)
-    {
-        char ch = text[pos];
-        return ch is >= 'a' and <= 'z' or >= 'A' and <= 'Z';
-    }
-
-    private static bool IsContractionSuffix(string text, int pos, int limit, out int suffixLength, bool caseInsensitive = false)
-    {
-        char first = text[pos + 1];
-        char? second = pos + 2 < limit ? text[pos + 2] : null;
-
-        if (caseInsensitive)
-        {
-            first = char.ToLowerInvariant(first);
-            second = second is null ? null : char.ToLowerInvariant(second.Value);
-        }
-
-        if (first is 's' or 't' or 'm' or 'd')
-        {
-            suffixLength = 2;
-            return true;
-        }
-
-        if (second is not null && (first, second.Value) is ('r', 'e') or ('v', 'e') or ('l', 'l'))
-        {
-            suffixLength = 3;
-            return true;
-        }
-
-        suffixLength = 0;
-        return false;
-    }
-
-    private static bool IsGpt2Symbol(string text, int pos)
-    {
-        return pos < text.Length
-            && !char.IsWhiteSpace(text, pos)
-            && !char.IsLetter(text, pos)
-            && !char.IsNumber(text, pos)
-            && !IsUndefined(text[pos]);
-    }
-
-    private static bool IsLlama3Symbol(string text, int pos)
-    {
-        return pos < text.Length
-            && !char.IsWhiteSpace(text, pos)
-            && !char.IsLetter(text, pos)
-            && !char.IsNumber(text, pos)
-            && !IsUndefined(text[pos]);
-    }
-
-    private static bool IsUndefined(char ch)
-    {
-        UnicodeCategory category = CharUnicodeInfo.GetUnicodeCategory(ch);
-        return category is UnicodeCategory.Format
-            or UnicodeCategory.EnclosingMark
-            or UnicodeCategory.Surrogate
-            or UnicodeCategory.PrivateUse
-            or UnicodeCategory.MathSymbol
-            or UnicodeCategory.OtherNotAssigned;
-    }
-
-    private static string ByteEncode(string word)
+    private string ByteEncode(string word)
     {
         byte[] utf8 = Encoding.UTF8.GetBytes(word);
         char[] encoded = new char[utf8.Length];
         for (int i = 0; i < utf8.Length; i++)
         {
-            encoded[i] = (char)ByteToEncoded[utf8[i]];
+            encoded[i] = (char)_byteToUtf8[utf8[i]];
         }
 
         return new string(encoded);
@@ -846,15 +524,28 @@ public sealed class GgufTokenizer
             return;
         }
 
+        if (!_byteFallback)
+        {
+            // byte_fallback=false: unencodable text never falls through to byte tokens — it routes to the
+            // unknown token, or is dropped when the vocabulary declares none (matching the drop behavior
+            // for bytes with no byte token today).
+            if (UnkId != NullToken)
+            {
+                output.Add(UnkId);
+            }
+
+            return;
+        }
+
         Span<char> single = stackalloc char[2];
         Span<byte> utf8 = stackalloc byte[4];
 
         foreach (Rune rune in symbol.EnumerateRunes())
         {
             int cp = rune.Value;
-            if (cp < EncodedToByte.Length && EncodedToByte[cp] >= 0)
+            if (cp < _visualToByte.Length && _visualToByte[cp] >= 0)
             {
-                EmitByteToken(EncodedToByte[cp], output);
+                EmitByteToken(_visualToByte[cp], output);
                 continue;
             }
 
@@ -872,7 +563,7 @@ public sealed class GgufTokenizer
         int id = _byteTokenByValue[byteValue];
         if (id == NullToken)
         {
-            string atom = ((char)ByteToEncoded[byteValue]).ToString();
+            string atom = ((char)_byteToUtf8[byteValue]).ToString();
             id = _pieceToId.TryGetValue(atom, out int atomId) ? atomId : NullToken;
         }
 
@@ -921,9 +612,9 @@ public sealed class GgufTokenizer
                 {
                     bytes.Add((byte)cp);
                 }
-                else if (cp < EncodedToByte.Length && EncodedToByte[cp] >= 0)
+                else if (cp < _visualToByte.Length && _visualToByte[cp] >= 0)
                 {
-                    bytes.Add((byte)EncodedToByte[cp]);
+                    bytes.Add((byte)_visualToByte[cp]);
                 }
                 else
                 {
@@ -1015,15 +706,130 @@ public sealed class GgufTokenizer
         return new string(buffer, 0, total);
     }
 
-    private static int ReadSpecialId(GgufMetadata metadata, string key, int fallback, int vocabSize)
+    private static int ReadSpecialId(
+        GgufMetadata metadata,
+        string key,
+        int fallback,
+        int vocabSize,
+        GgufFile file,
+        Action<string>? logLine)
     {
         if (!metadata.Has(key))
         {
-            return fallback >= 0 && fallback < vocabSize ? fallback : NullToken;
+            int resolved = fallback >= 0 && fallback < vocabSize ? fallback : NullToken;
+            if (resolved != NullToken && logLine is not null)
+            {
+                // A profile-scoped default was applied because the GGUF does not declare the key: one
+                // structured line naming the model, the key, and the default applied.
+                string modelName = metadata.GetString("general.name", "");
+                logLine($"tokenizer_default model='{(modelName.Length > 0 ? modelName : file.Path)}' key={key} default={resolved}");
+            }
+
+            return resolved;
         }
 
         long id = metadata.Get(key).AsLong();
         return id >= 0 && id < vocabSize ? (int)id : NullToken;
+    }
+
+    /// <summary>
+    /// Resolves the byte-value -> byte-token-id table. A declared <c>tokenizer.ggml.byte_to_token</c>
+    /// replaces the <c>&lt;0xNN&gt;</c> vocab scan entirely; each of its 256 entries must be a vocab id
+    /// whose token type is byte, and an invalid entry fails at load naming the key and the byte index.
+    /// </summary>
+    private static int[] ResolveByteTokenByValue(GgufMetadata metadata, string[] pieces, int[] types)
+    {
+        int[] byValue = new int[256];
+
+        if (metadata.Has("tokenizer.ggml.byte_to_token"))
+        {
+            int[] declared = ReadByteMap(metadata, "tokenizer.ggml.byte_to_token");
+            for (int byteValue = 0; byteValue < 256; byteValue++)
+            {
+                int id = declared[byteValue];
+                if (id < 0 || id >= pieces.Length)
+                {
+                    throw new GgufException(
+                        $"GGUF metadata key 'tokenizer.ggml.byte_to_token' entry {byteValue} is {id} " +
+                        $"(expected a token id in [0, {pieces.Length}) with byte type)");
+                }
+
+                if (types[id] != TokenTypeByte)
+                {
+                    throw new GgufException(
+                        $"GGUF metadata key 'tokenizer.ggml.byte_to_token' entry {byteValue} maps to token {id} " +
+                        $"'{pieces[id]}' which is not a byte token");
+                }
+
+                byValue[byteValue] = id;
+            }
+
+            return byValue;
+        }
+
+        Array.Fill(byValue, NullToken);
+        for (int id = 0; id < pieces.Length; id++)
+        {
+            if (types[id] != TokenTypeByte || pieces[id].Length != 6)
+            {
+                continue;
+            }
+
+            string piece = pieces[id];
+            if (piece.StartsWith("<0x", StringComparison.Ordinal) && piece[5] == '>'
+                && TryHexDigit(piece[3], out int high) && TryHexDigit(piece[4], out int low))
+            {
+                int value = (high << 4) | low;
+                if (byValue[value] == NullToken)
+                {
+                    byValue[value] = id;
+                }
+            }
+        }
+
+        return byValue;
+    }
+
+    /// <summary>
+    /// Resolves the byte -> codepoint mapping (<c>tokenizer.ggml.byte_to_utf8</c>): exactly 256 entries,
+    /// each a valid non-surrogate codepoint, or the load fails naming the key and the byte index.
+    /// </summary>
+    private static int[] ReadByteToUtf8(GgufMetadata metadata, string key)
+    {
+        int[] map = ReadByteMap(metadata, key);
+        for (int byteValue = 0; byteValue < 256; byteValue++)
+        {
+            int codepoint = map[byteValue];
+            if (codepoint < 0 || codepoint > MaxUnicodeCodepoint || (codepoint >= 0xD800 && codepoint <= 0xDFFF))
+            {
+                throw new GgufException(
+                    $"GGUF metadata key '{key}' entry {byteValue} is {codepoint} (expected a Unicode codepoint in [0, {MaxUnicodeCodepoint}] that is not a surrogate)");
+            }
+        }
+
+        return map;
+    }
+
+    private static int[] ReadByteMap(GgufMetadata metadata, string key)
+    {
+        int[] map = metadata.GetInt32Array(key);
+        if (map.Length != 256)
+        {
+            throw new GgufException($"GGUF metadata key '{key}' has {map.Length} entries (expected 256)");
+        }
+
+        return map;
+    }
+
+    private static void FlushBytes(List<byte> bytes, StringBuilder text)
+    {
+        if (bytes.Count == 0)
+        {
+            return;
+        }
+
+        text.Append(Encoding.UTF8.GetString(CollectionsMarshal.AsSpan(bytes)));
+        bytes.Clear();
     }
 
     private static bool TryHexDigit(char ch, out int value)
@@ -1050,7 +856,8 @@ public sealed class GgufTokenizer
         return false;
     }
 
-    private static int[] BuildByteToEncoded()
+    /// <summary>The GPT-2 byte-encoding map (byte -> visual codepoint): the fallback when a GGUF omits <c>tokenizer.ggml.byte_to_utf8</c>.</summary>
+    private static int[] BuildGpt2ByteToUtf8()
     {
         int[] map = new int[256];
         int n = 0;
@@ -1070,23 +877,23 @@ public sealed class GgufTokenizer
         return map;
     }
 
-    private static int[] BuildEncodedToByte()
+    /// <summary>The inverse byte -> codepoint map (visual codepoint -> byte, -1 when unmapped), sized to cover the map's codepoints.</summary>
+    private static int[] BuildVisualToByte(int[] byteToUtf8)
     {
-        int[] map = new int[0x200];
-        Array.Fill(map, -1);
-        for (int ch = 0; ch < 256; ch++)
+        int maxCodepoint = 0xFF;
+        foreach (int codepoint in byteToUtf8)
         {
-            map[ByteToEncoded[ch]] = ch;
+            maxCodepoint = Math.Max(maxCodepoint, codepoint);
+        }
+
+        int[] map = new int[maxCodepoint + 1];
+        Array.Fill(map, -1);
+        for (int byteValue = 0; byteValue < byteToUtf8.Length; byteValue++)
+        {
+            map[byteToUtf8[byteValue]] = byteValue;
         }
 
         return map;
-    }
-
-    public enum PreRule
-    {
-        LlamaBpe,
-        Gpt2,
-        Smollm,
     }
 
     private readonly record struct Fragment(string Text, int TokenId);
