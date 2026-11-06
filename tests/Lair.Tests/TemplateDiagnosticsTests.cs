@@ -491,9 +491,19 @@ public sealed class TemplateDiagnosticsTests : IDisposable
         + "    {{- '<|start_header_id|>assistant<|end_header_id|>\\n\\n' }}\n"
         + "{%- endif %}";
 
-    private GenerationService OpenSynthetic(string chatTemplate, string modelName, ILogger logger)
+    [Fact]
+    public void DeclaredEotId_IsTheStopSignal_WhileAbsentKeepsEos()
     {
-        string path = WriteSyntheticGguf(chatTemplate);
+        using GenerationService declared = OpenSynthetic(ChatMlTemplate, "eot-model", new CapturingLogger(), eotTokenId: 4);
+        Assert.Equal(4, declared.StopId);
+
+        using GenerationService absent = OpenSynthetic(ChatMlTemplate, "eos-only-model", new CapturingLogger());
+        Assert.Equal(5, absent.StopId);
+    }
+
+    private GenerationService OpenSynthetic(string chatTemplate, string modelName, ILogger logger, int? eotTokenId = null)
+    {
+        string path = WriteSyntheticGguf(chatTemplate, eotTokenId);
         return GenerationService.Open(ConfigFor(path, modelName), logger);
     }
 
@@ -528,7 +538,7 @@ public sealed class TemplateDiagnosticsTests : IDisposable
     // Two-layer llama weights (hidden 4, heads 2, kv-heads 1, ffn 8, vocab 6) with a six-token BPE vocabulary and
     // the requested chat_template, so GenerationService.Open runs the full load path — tokenizer, forward engine,
     // KV pool, scheduler, chat-template parse — against a model the test controls completely.
-    private string WriteSyntheticGguf(string chatTemplate)
+    private string WriteSyntheticGguf(string chatTemplate, int? eotTokenId = null)
     {
         using MemoryStream stream = new();
         using BinaryWriter writer = new(stream, Encoding.UTF8, leaveOpen: true);
@@ -552,7 +562,7 @@ public sealed class TemplateDiagnosticsTests : IDisposable
 
         tensors.Add(new("output_norm.weight", [4]));
 
-        int kvCount = 19;
+        int kvCount = 19 + (eotTokenId is null ? 0 : 1);
 
         writer.Write(0x46554747u); // "GGUF"
         writer.Write(3u); // version
@@ -577,6 +587,10 @@ public sealed class TemplateDiagnosticsTests : IDisposable
         WriteUint32Kv(writer, "tokenizer.ggml.eos_token_id", 5);
         WriteUint32Kv(writer, "tokenizer.ggml.unknown_token_id", 0);
         WriteBoolKv(writer, "tokenizer.ggml.add_bos_token", false);
+        if (eotTokenId is not null)
+        {
+            WriteUint32Kv(writer, "tokenizer.ggml.eot_token_id", (uint)eotTokenId.Value);
+        }
         WriteStringKv(writer, "tokenizer.chat_template", chatTemplate);
 
         long offset = 0;

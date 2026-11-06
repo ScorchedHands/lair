@@ -48,8 +48,6 @@ internal static class TokenizerProfiles
     /// <summary>Profile used when a GGUF omits <c>tokenizer.ggml.pre</c>.</summary>
     public const string DefaultPreKey = "llama-bpe";
 
-    private const int SpecialIdFallback = 11;
-
     private static readonly TokenizerProfile[] Profiles =
     [
         new TokenizerProfile
@@ -59,8 +57,10 @@ internal static class TokenizerProfiles
             IgnoreMerges = true,
             CleanSpaces = true,
             AddBosDefault = true,
-            BosFallbackId = SpecialIdFallback,
-            EosFallbackId = SpecialIdFallback,
+            // llama.cpp's llama-3 vocab places the byte tokens at 1..256 with the specials at 0..10,
+            // so the conventional fallback special ids are 11 (the first byte token).
+            BosFallbackId = 11,
+            EosFallbackId = 11,
         },
         new TokenizerProfile
         {
@@ -69,8 +69,9 @@ internal static class TokenizerProfiles
             IgnoreMerges = false,
             CleanSpaces = true,
             AddBosDefault = false,
-            BosFallbackId = SpecialIdFallback,
-            EosFallbackId = SpecialIdFallback,
+            // GPT-2 family convention (llama.cpp's default vocab layout): BOS 1, EOS 2.
+            BosFallbackId = 1,
+            EosFallbackId = 2,
         },
         new TokenizerProfile
         {
@@ -79,8 +80,9 @@ internal static class TokenizerProfiles
             IgnoreMerges = false,
             CleanSpaces = false,
             AddBosDefault = false,
-            BosFallbackId = SpecialIdFallback,
-            EosFallbackId = SpecialIdFallback,
+            // SmolLM follows the same GPT-2 family convention: BOS 1, EOS 2.
+            BosFallbackId = 1,
+            EosFallbackId = 2,
         },
     ];
 
