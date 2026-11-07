@@ -12,16 +12,19 @@ namespace Lair.Tests;
 /// <summary>
 /// Load-time plan resolution over synthetic GGUF fixtures: profile-registry selection and the rejection
 /// wording it owns, the generic llama-shaped fallback for unknown architectures (exact tensor-table match,
-/// its rejection wording and structured log line), resolved geometry for both supported profiles, the plan's
-/// tensor map (required versus optional roles, per-layer name templates, alias candidates), the strategy
-/// values the forward engine switches on, and tensor lookup through the map at Open.
+/// its rejection wording and structured log line), resolved geometry for both supported profiles including
+/// the head_length head-dimension source, the plan's tensor map (required versus optional roles, per-layer
+/// name templates, alias candidates), the strategy values and declared feature flags the forward engine
+/// switches on, and tensor lookup through the map at Open.
 /// </summary>
 [Trait("Category", "Loader")]
 public sealed class ModelPlanTests : IDisposable
 {
     private const uint GgufMagic = 0x46554747; // "GGUF"
 
-    // Roles a file may omit: attention biases (llama ships none, qwen2 may), the untied output head, and its bias.
+    // Roles a file may omit: attention biases (llama ships none, qwen2 may), the untied output head and its
+    // bias, the per-head QK-norm vectors, and the norm-bias vectors — every one of them exists only for files
+    // that declare the matching feature.
     private static readonly TensorRole[] OptionalRoles =
     [
         TensorRole.AttentionQueryBias,
@@ -30,6 +33,11 @@ public sealed class ModelPlanTests : IDisposable
         TensorRole.AttentionOutputBias,
         TensorRole.OutputHead,
         TensorRole.OutputBias,
+        TensorRole.AttentionQueryNorm,
+        TensorRole.AttentionKeyNorm,
+        TensorRole.AttentionNormBias,
+        TensorRole.FeedForwardNormBias,
+        TensorRole.OutputNormBias,
     ];
 
     private readonly List<string> _tempFiles = [];
@@ -105,9 +113,14 @@ public sealed class ModelPlanTests : IDisposable
 
             Assert.Equal(NormStrategy.RmsNorm, plan.Norm);
             Assert.Equal(ActivationStrategy.SwiGLU, plan.Activation);
-            Assert.Equal(BiasPolicy.ByTensorPresence, plan.Bias);
+            Assert.Equal(BiasPolicy.Declared, plan.Bias);
             Assert.Equal(RopeStrategy.StandardFullHead, plan.Rope);
             Assert.Null(plan.SparseFfn); // dense gate/up/down: no profile declares experts
+
+            // The declared feature flags default to false: these fixtures declare none of the feature keys.
+            Assert.False(plan.UseAttentionBias);
+            Assert.False(plan.UseNormBias);
+            Assert.False(plan.HasQkNorm);
         }
     }
 
@@ -333,6 +346,11 @@ public sealed class ModelPlanTests : IDisposable
             Assert.Equal("output_norm.weight", map[TensorRole.OutputNorm].NameFor(-1));
             Assert.Equal("output.weight", map[TensorRole.OutputHead].NameFor(-1));
             Assert.Equal("output.bias", map[TensorRole.OutputBias].NameFor(-1));
+            Assert.Equal("blk.7.attn_q_norm.weight", map[TensorRole.AttentionQueryNorm].NameFor(7));
+            Assert.Equal("blk.7.attn_k_norm.weight", map[TensorRole.AttentionKeyNorm].NameFor(7));
+            Assert.Equal("blk.7.attn_norm.bias", map[TensorRole.AttentionNormBias].NameFor(7));
+            Assert.Equal("blk.7.ffn_norm.bias", map[TensorRole.FeedForwardNormBias].NameFor(7));
+            Assert.Equal("output_norm.bias", map[TensorRole.OutputNormBias].NameFor(-1));
         }
     }
 
@@ -385,7 +403,12 @@ public sealed class ModelPlanTests : IDisposable
             ("blk.0.attn_output.bias", [4]),
             ("output_norm.weight", [4]),
             ("output.weight", [6, 4]),
-            ("output.bias", [6]));
+            ("output.bias", [6]),
+            ("blk.0.attn_q_norm.weight", [4]),
+            ("blk.0.attn_k_norm.weight", [4]),
+            ("blk.0.attn_norm.bias", [4]),
+            ("blk.0.ffn_norm.bias", [4]),
+            ("output_norm.bias", [4]));
 
         foreach (TensorDescriptor descriptor in map.Descriptors)
         {
@@ -454,6 +477,172 @@ public sealed class ModelPlanTests : IDisposable
         ModelException ex = Assert.Throws<ModelException>(() => TransformerModel.Open(gguf, backend, maxContextTokens: 8));
         Assert.Contains("blk.0.attn_output.weight", ex.Message);
         Assert.Contains("llama", ex.Message);
+    }
+
+    // ---------------------------------------------------------------- declared feature flags and head-dimension sources
+
+    [Fact]
+    public void ModelPlan_UseBiasDeclared_ResolvesTheDeclaredFlag_ForLlamaAndQwen2()
+    {
+        foreach (string architecture in new string[] { "llama", "qwen2" })
+        {
+            foreach (bool declared in new bool[] { true, false })
+            {
+                using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(
+                    [.. Metadata(architecture), ($"{architecture}.attention.use_bias", declared)], [])));
+                ModelPlan plan = ModelPlans.Resolve(gguf);
+
+                Assert.Equal(BiasPolicy.Declared, plan.Bias);
+                Assert.Equal(declared, plan.UseAttentionBias);
+            }
+
+            // An absent key defaults to false: the plan still resolves the declared policy.
+            using GgufFile absent = GgufFile.Open(WriteTemp(BuildGguf(Metadata(architecture), [])));
+            ModelPlan absentPlan = ModelPlans.Resolve(absent);
+            Assert.Equal(BiasPolicy.Declared, absentPlan.Bias);
+            Assert.False(absentPlan.UseAttentionBias);
+        }
+    }
+
+    [Fact]
+    public void ModelPlan_UseBiasDeclaredTrue_MissingBiasTensor_FailsLoadNamingIt_AndTheDeclaringKey()
+    {
+        string path = WriteTemp(BuildGguf(
+            [.. Metadata("qwen2", tiny: true), ("qwen2.attention.use_bias", true)],
+            [.. TinyTensors(withOptional: false)]));
+
+        using CpuBackend backend = new();
+        using GgufFile gguf = GgufFile.Open(path);
+        ModelException ex = Assert.Throws<ModelException>(() => TransformerModel.Open(gguf, backend, maxContextTokens: 8));
+
+        Assert.Contains("blk.0.attn_q.bias", ex.Message);
+        Assert.Contains("qwen2.attention.use_bias", ex.Message);
+    }
+
+    [Fact]
+    public void ModelPlan_UseBiasDeclaredTrue_LoadsEveryDeclaredBiasTensor_AndForwards()
+    {
+        string path = WriteTemp(BuildGguf(
+            [.. Metadata("qwen2", tiny: true), ("qwen2.attention.use_bias", true)],
+            [.. TinyTensors(withOptional: true)]));
+
+        List<string> logLines = [];
+        using CpuBackend backend = new();
+        using GgufFile gguf = GgufFile.Open(path);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8, logLines.Add);
+
+        Assert.True(model.Plan.UseAttentionBias);
+        Assert.Empty(logLines); // nothing declared off, nothing ignored
+
+        using BlockPool pool = new(blockTokens: 4, layerCount: model.Plan.LayerCount, kvHeads: model.Plan.KvHeadCount, headDim: model.Plan.HeadDim, capacityBlocks: 2, backend);
+        using SequenceKv kv = new(pool);
+        Assert.Equal(6, model.DecodeNext(3, kv).Length);
+    }
+
+    [Fact]
+    public void ModelPlan_UseBiasDeclaredFalse_WithBiasTensorsPresent_LogsTheIgnoredTensorsOnce()
+    {
+        List<string> logLines = [];
+        string path = WriteTemp(BuildGguf(
+            [.. Metadata("qwen2", tiny: true), ("general.name", "Declared Off"), ("qwen2.attention.use_bias", false)],
+            [.. TinyTensors(withOptional: true)]));
+
+        using CpuBackend backend = new();
+        using GgufFile gguf = GgufFile.Open(path);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8, logLines.Add);
+
+        Assert.False(model.Plan.UseAttentionBias);
+        Assert.Single(logLines);
+        Assert.StartsWith("bias_ignored ", logLines[0]);
+        Assert.Contains("model='Declared Off'", logLines[0]);
+        Assert.Contains("architecture='qwen2'", logLines[0]);
+        foreach (string tensor in new string[] { "blk.0.attn_q.bias", "blk.0.attn_k.bias", "blk.0.attn_v.bias", "blk.0.attn_output.bias" })
+        {
+            Assert.Contains(tensor, logLines[0]);
+        }
+
+        // Declared false with no bias tensors present: nothing to ignore, so no line.
+        List<string> quietLines = [];
+        using GgufFile quiet = GgufFile.Open(WriteTemp(BuildGguf(
+            [.. Metadata("qwen2", tiny: true), ("qwen2.attention.use_bias", false)],
+            [.. TinyTensors(withOptional: false)])));
+        using TransformerModel quietModel = TransformerModel.Open(quiet, backend, maxContextTokens: 8, quietLines.Add);
+        Assert.False(quietModel.Plan.UseAttentionBias);
+        Assert.Empty(quietLines);
+    }
+
+    [Fact]
+    public void ModelPlan_NormBiasAndQkNormDeclared_ResolveTheirFlags_AndMissingTensorsFailLoadNamingThem()
+    {
+        using (GgufFile flagsGguf = GgufFile.Open(WriteTemp(BuildGguf(
+            [.. Metadata("llama", tiny: true), ("llama.attention.norm_bias", true), ("llama.attention.use_qk_norm", true)], []))))
+        {
+            ModelPlan plan = ModelPlans.Resolve(flagsGguf);
+            Assert.True(plan.UseNormBias);
+            Assert.True(plan.HasQkNorm);
+        }
+
+        string path = WriteTemp(BuildGguf(
+            [.. Metadata("llama", tiny: true), ("llama.attention.norm_bias", true), ("llama.attention.use_qk_norm", true)],
+            [.. TinyTensors(withOptional: false)]));
+
+        using CpuBackend backend = new();
+        using GgufFile gguf = GgufFile.Open(path);
+        ModelException ex = Assert.Throws<ModelException>(() => TransformerModel.Open(gguf, backend, maxContextTokens: 8));
+        Assert.Contains("blk.0.attn_norm.bias", ex.Message);
+
+        // Without the norm-bias tensors but with use_qk_norm declared, the QK-norm tensors are named instead.
+        string qkPath = WriteTemp(BuildGguf(
+            [.. Metadata("llama", tiny: true), ("llama.attention.use_qk_norm", true)],
+            [.. TinyTensors(withOptional: false)]));
+        using GgufFile qkGguf = GgufFile.Open(qkPath);
+        ModelException qkEx = Assert.Throws<ModelException>(() => TransformerModel.Open(qkGguf, backend, maxContextTokens: 8));
+        Assert.Contains("blk.0.attn_q_norm.weight", qkEx.Message);
+
+        // Both keys absent: both flags default to false.
+        using GgufFile absent = GgufFile.Open(WriteTemp(BuildGguf(Metadata("llama", tiny: true), [])));
+        ModelPlan absentPlan = ModelPlans.Resolve(absent);
+        Assert.False(absentPlan.UseNormBias);
+        Assert.False(absentPlan.HasQkNorm);
+    }
+
+    [Fact]
+    public void ModelPlan_HeadLength_ResolvesAnIndependentHeadDim_GemmaShaped()
+    {
+        // A gemma-shaped geometry: head_count x head_dim (8 x 256) differs from embedding_length (2304).
+        List<(string Key, object Value)> gemma =
+        [
+            ("general.architecture", "llama"),
+            ("llama.embedding_length", 2304),
+            ("llama.block_count", 26),
+            ("llama.attention.head_count", 8),
+            ("llama.attention.head_count_kv", 4),
+            ("llama.feed_forward_length", 2304),
+            ("llama.attention.head_length", 256),
+            ("llama.attention.layer_norm_rms_epsilon", 1e-6f),
+            ("llama.vocab_size", 256_000),
+        ];
+
+        using (GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(gemma, []))))
+        {
+            ModelPlan plan = ModelPlans.Resolve(gguf);
+            Assert.Equal(256, plan.HeadDim); // the declared dimension is honored, not hidden / head_count
+            Assert.Equal(2304, plan.HiddenSize);
+            Assert.Equal(8, plan.HeadCount);
+        }
+
+        // head_length is the preferred source and must agree with a declared key_length / value_length.
+        using (GgufFile agree = GgufFile.Open(WriteTemp(BuildGguf(
+            [.. gemma, ("llama.attention.key_length", 256), ("llama.attention.value_length", 256)], []))))
+        {
+            Assert.Equal(256, ModelPlans.Resolve(agree).HeadDim);
+        }
+
+        using GgufFile disagree = GgufFile.Open(WriteTemp(BuildGguf(
+            [.. gemma, ("llama.attention.key_length", 128), ("llama.attention.value_length", 256)], [])));
+        ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(disagree));
+        Assert.Contains("disagree", ex.Message);
+        Assert.Contains("head_length", ex.Message);
     }
 
     // ---------------------------------------------------------------- shared helpers
@@ -574,6 +763,10 @@ public sealed class ModelPlanTests : IDisposable
                 case float f:
                     writer.Write(6u); // FLOAT32
                     writer.Write(f);
+                    break;
+                case bool b:
+                    writer.Write(7u); // BOOL
+                    writer.Write((byte)(b ? 1 : 0));
                     break;
                 default:
                     throw new ArgumentException($"Unsupported fixture value type {value.GetType().Name}.", nameof(kvPairs));

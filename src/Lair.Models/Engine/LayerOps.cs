@@ -33,6 +33,37 @@ internal static class LayerOps
     }
 
     /// <summary>
+    /// RMSNorm applied to each head region of a head-major buffer independently: head h normalizes its own
+    /// <c>headDim</c> slice with the head-dimension weight vector, <c>dst[h * headDim + i] = src[h * headDim + i] /
+    /// sqrt(mean(src_h^2) + eps) * w[i]</c>. Each head's mean accumulates in double. This is the per-head form
+    /// applied to q and k after their projection and before RoPE.
+    /// </summary>
+    internal static void RmsNormWeightedHeads(ReadOnlySpan<float> src, ReadOnlySpan<float> weight, int headDim, float eps, Span<float> dst)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(headDim);
+
+        if (weight.Length != headDim || src.Length % headDim != 0 || dst.Length < src.Length)
+        {
+            throw new ArgumentException("Per-head RMSNorm needs a weight vector covering exactly one head and operands covering whole heads.", nameof(weight));
+        }
+
+        for (int region = 0; region < src.Length; region += headDim)
+        {
+            double sumSq = 0.0;
+            for (int i = 0; i < headDim; i++)
+            {
+                sumSq += (double)src[region + i] * src[region + i];
+            }
+
+            float invRms = (float)(1.0 / Math.Sqrt(sumSq / headDim + eps));
+            for (int i = 0; i < headDim; i++)
+            {
+                dst[region + i] = src[region + i] * invRms * weight[i];
+            }
+        }
+    }
+
+    /// <summary>
     /// LayerNorm with weight and optional bias: dst[i] = (src[i] - mean) / sqrt(var + eps) * w[i] (+ b[i] when a
     /// bias is supplied). Mean and population variance (divided by the element count) accumulate in double, the
     /// convention shared by the reference LayerNorm implementations.

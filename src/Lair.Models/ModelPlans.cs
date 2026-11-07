@@ -18,8 +18,8 @@ public static class ModelPlans
     /// <summary>
     /// Parses the architecture metadata of a GGUF file into its resolved plan. The architecture must name a
     /// registered profile or pass the generic llama-shaped fallback check; an empty or whitespace-only name is
-    /// rejected outright and is never a fallback candidate. The declared dimensions must split the hidden size
-    /// exactly across the heads.
+    /// rejected outright and is never a fallback candidate. Declared head dimensions must agree with each
+    /// other, and the derived one must split the hidden size exactly.
     /// </summary>
     /// <param name="gguf">The GGUF to resolve.</param>
     /// <param name="logLine">Sink for the structured fallback-applied line; hosts may capture instead.</param>
@@ -107,22 +107,44 @@ public static class ModelPlans
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(kvHeads);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(ffn);
 
-        // GGUF stores the per-head dimension explicitly only when it deviates from hidden/heads (key_length /
-        // value_length). When present they must agree with each other and split the hidden size exactly.
+        // The per-head dimension is declared explicitly by head_length (the name the gemma family uses) or by
+        // key_length / value_length; every declared source must agree with the others, and a file declaring one
+        // of key_length / value_length must declare both. With no declaration the dimension is derived from
+        // hidden / head_count, which must divide exactly. The declared dimension no longer has to split the
+        // hidden size: head_count x head_dim may differ from embedding_length.
         int headDim;
+        bool hasHeadLength = metadata.Has(prefix + "attention.head_length");
         bool hasKeyLength = metadata.Has(prefix + "attention.key_length");
-        if (hasKeyLength || metadata.Has(prefix + "attention.value_length"))
+        bool hasValueLength = metadata.Has(prefix + "attention.value_length");
+
+        if (hasHeadLength || hasKeyLength || hasValueLength)
         {
-            int keyLength = RequireInt(metadata, prefix + "attention.key_length");
-            int valueLength = RequireInt(metadata, prefix + "attention.value_length");
-            if (keyLength != valueLength)
+            headDim = hasHeadLength
+                ? RequireInt(metadata, prefix + "attention.head_length")
+                : RequireInt(metadata, prefix + "attention.key_length");
+            string headSource = hasHeadLength ? "head_length" : "key_length";
+
+            if (hasKeyLength)
             {
-                throw new ModelException(
-                    $"{prefix}attention.key_length ({keyLength}) and {prefix}attention.value_length ({valueLength}) disagree; " +
-                    "head dimensions must be equal for this architecture family");
+                int keyLength = RequireInt(metadata, prefix + "attention.key_length");
+                if (keyLength != headDim)
+                {
+                    throw new ModelException(
+                        $"{prefix}attention.{headSource} ({headDim}) and {prefix}attention.key_length ({keyLength}) disagree; " +
+                        "head dimensions must be equal for this architecture family");
+                }
             }
 
-            headDim = keyLength;
+            if (hasValueLength)
+            {
+                int valueLength = RequireInt(metadata, prefix + "attention.value_length");
+                if (valueLength != headDim)
+                {
+                    throw new ModelException(
+                        $"{prefix}attention.{headSource} ({headDim}) and {prefix}attention.value_length ({valueLength}) disagree; " +
+                        "head dimensions must be equal for this architecture family");
+                }
+            }
         }
         else if (hidden % heads != 0)
         {
@@ -136,12 +158,6 @@ public static class ModelPlans
         }
 
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(headDim);
-        if (heads * headDim != hidden)
-        {
-            throw new ModelException(
-                $"{prefix}attention.head_count ({heads}) x head dimension ({headDim}) must equal " +
-                $"{prefix}embedding_length ({hidden})");
-        }
 
         // Standard full-head RoPE only: a declared rotary slice smaller than the head is not supported.
         if (metadata.Has(prefix + "rope.dimension_count"))
@@ -165,6 +181,14 @@ public static class ModelPlans
         }
 
         float eps = (float)metadata.Get(prefix + "attention.layer_norm_rms_epsilon").AsDouble();
+
+        // Declared feature flags: an absent key means false. The declaration, not tensor presence, decides bias
+        // behavior; the forward engine enforces the tensor side of each declaration at Open — required tensors
+        // for a declared true, and one structured log line naming the ignored tensors for a declared false
+        // whose tensors are present.
+        bool useAttentionBias = metadata.GetBool(prefix + "attention.use_bias", fallback: false);
+        bool useNormBias = metadata.GetBool(prefix + "attention.norm_bias", fallback: false);
+        bool useQkNorm = metadata.GetBool(prefix + "attention.use_qk_norm", fallback: false);
 
         int vocab = RequireInt(metadata, prefix + "vocab_size");
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(vocab);
@@ -200,6 +224,9 @@ public static class ModelPlans
             EpsRmsNorm = eps,
             VocabSize = vocab,
             HasOutputWeights = hasOutputWeights,
+            UseAttentionBias = useAttentionBias,
+            UseNormBias = useNormBias,
+            HasQkNorm = useQkNorm,
             Tensors = profile.Tensors,
             Norm = profile.Norm,
             Activation = profile.Activation,

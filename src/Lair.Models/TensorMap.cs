@@ -27,6 +27,11 @@ public enum TensorRole
     OutputNorm,
     OutputHead,
     OutputBias,
+    AttentionQueryNorm,
+    AttentionKeyNorm,
+    AttentionNormBias,
+    FeedForwardNormBias,
+    OutputNormBias,
 }
 
 /// <summary>Whether a tensor name is a single global name or a per-block name carrying a <c>{layer}</c> placeholder.</summary>

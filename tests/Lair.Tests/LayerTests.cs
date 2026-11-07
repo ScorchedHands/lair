@@ -385,13 +385,14 @@ public sealed class LayerTests : IDisposable
     }
 
     [Fact]
-    public void ModelDesc_ExplicitHeadDim_MustSplitHiddenExactly()
+    public void ModelDesc_ExplicitHeadDim_IsHonored_AndTheDerivedDimMustSplitHiddenExactly()
     {
-        List<(string Key, object Value)> mismatch = [.. RequiredLlamaMetadata(), ("llama.attention.key_length", 70), ("llama.attention.value_length", 70)];
+        // A declared explicit head dimension is honored even when head_count x head_dim differs from
+        // embedding_length (the gemma-shaped case): the plan validates the projection shapes at Open instead.
+        List<(string Key, object Value)> independent = [.. RequiredLlamaMetadata(), ("llama.attention.key_length", 70), ("llama.attention.value_length", 70)];
 
-        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf([.. mismatch], [])));
-        ModelException ex = Assert.Throws<ModelException>(() => ModelDesc.FromGguf(gguf));
-        Assert.Contains("must equal", ex.Message); // 9 x 70 != 576
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf([.. independent], [])));
+        Assert.Equal(70, ModelDesc.FromGguf(gguf).HeadDim); // 9 x 70 != 576: the declared dimension wins
 
         List<(string Key, object Value)> disagree = [.. RequiredLlamaMetadata(), ("llama.attention.key_length", 64), ("llama.attention.value_length", 32)];
         using GgufFile ggufBad = GgufFile.Open(WriteTemp(BuildGguf([.. disagree], [])));

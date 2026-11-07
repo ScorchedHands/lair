@@ -20,7 +20,7 @@ public static class ModelProfiles
             Prefix = "llama.",
             Norm = NormStrategy.RmsNorm,
             Activation = ActivationStrategy.SwiGLU,
-            Bias = BiasPolicy.ByTensorPresence,
+            Bias = BiasPolicy.Declared,
             Rope = RopeStrategy.StandardFullHead,
             Tensors = CanonicalTensors(),
         },
@@ -30,7 +30,7 @@ public static class ModelProfiles
             Prefix = "qwen2.",
             Norm = NormStrategy.RmsNorm,
             Activation = ActivationStrategy.SwiGLU,
-            Bias = BiasPolicy.ByTensorPresence,
+            Bias = BiasPolicy.Declared,
             Rope = RopeStrategy.StandardFullHead,
             Tensors = CanonicalTensors(),
         },
@@ -93,6 +93,8 @@ public static class ModelProfiles
 
     // The canonical llama-family tensor names: the llama.cpp GGUF layout both supported profiles ship, with
     // attention biases and the output head optional because llama files carry neither while qwen2 files may.
+    // The per-head QK-norm vectors and the norm-bias vectors are optional too: they exist only for files that
+    // declare the corresponding feature, and the declared flags decide whether they are required or ignored.
     private static TensorMap CanonicalTensors() =>
         new(
         [
@@ -113,5 +115,10 @@ public static class ModelProfiles
             new TensorDescriptor(TensorRole.OutputNorm, TensorScope.Global, "output_norm.weight", Required: true, []),
             new TensorDescriptor(TensorRole.OutputHead, TensorScope.Global, "output.weight", Required: false, []),
             new TensorDescriptor(TensorRole.OutputBias, TensorScope.Global, "output.bias", Required: false, []),
+            new TensorDescriptor(TensorRole.AttentionQueryNorm, TensorScope.PerLayer, "blk.{layer}.attn_q_norm.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.AttentionKeyNorm, TensorScope.PerLayer, "blk.{layer}.attn_k_norm.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.AttentionNormBias, TensorScope.PerLayer, "blk.{layer}.attn_norm.bias", Required: false, []),
+            new TensorDescriptor(TensorRole.FeedForwardNormBias, TensorScope.PerLayer, "blk.{layer}.ffn_norm.bias", Required: false, []),
+            new TensorDescriptor(TensorRole.OutputNormBias, TensorScope.Global, "output_norm.bias", Required: false, []),
         ]);
 }

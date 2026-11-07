@@ -16,7 +16,10 @@ namespace Lair.Models.Engine;
 /// FFN norm is the pre-attention stream value, matching the reference graph's ffn_inp add; rope scaling variants
 /// are not supported. FP32 buffers are allocated once at Open and reused across calls; packed matrix rows are
 /// consumed through <see cref="WeightRef"/> without being materialized, except for embedding lookups and small
-/// norm/bias vectors preloaded at Open.
+/// norm/bias vectors preloaded at Open. Attention-bias tensors follow the plan's declared policy: under
+/// <see cref="BiasPolicy.Declared"/> the declared <c>use_bias</c> flag makes them required or leaves them
+/// unloaded and unapplied, with one structured log line naming the ignored tensors; a declared per-head QK-norm
+/// normalizes each q and k head with its own weight vector after the projection and before RoPE.
 /// </summary>
 public sealed class TransformerModel : IDisposable
 {
@@ -50,6 +53,18 @@ public sealed class TransformerModel : IDisposable
     private readonly float[]?[] _biasK;
     private readonly float[]?[] _biasV;
     private readonly float[]?[] _biasO;
+
+    // Per-head QK-norm weight vectors (one headDim vector per layer, shared by every head of its side),
+    // preloaded only when the plan declares the feature: every head normalizes its own headDim slice.
+    private readonly float[][] _attnQNorm;
+    private readonly float[][] _attnKNorm;
+
+    // Norm-bias vectors preloaded only when the plan declares them: the LayerNorm path adds them after the
+    // weighted normalization. Null entries mean the layer's tensor is absent.
+    private readonly float[]?[] _attnNormBias;
+    private readonly float[]?[] _ffnNormBias;
+    private readonly float[]? _outputNormBias;
+
     private readonly LogicalTensor _tokenEmbd;
     private readonly LogicalTensor? _output;
     private readonly float[] _outputNormWeight;
@@ -160,7 +175,7 @@ public sealed class TransformerModel : IDisposable
         _ffnDown = LoadMatrices(layers, TensorRole.FeedForwardDown);
 
         // Matrix shapes must agree with the declared dimensions: rows are the output side, columns the input side.
-        RequireShape(_wq, Plan.HiddenSize, Plan.HiddenSize);          // q emits headCount * headDim == hidden
+        RequireShape(_wq, (long)Plan.HeadCount * Plan.HeadDim, Plan.HiddenSize); // q emits headCount * head_dim
         RequireShape(_wk, (long)Plan.KvHeadCount * Plan.HeadDim, Plan.HiddenSize);
         RequireShape(_wv, (long)Plan.KvHeadCount * Plan.HeadDim, Plan.HiddenSize);
         RequireShape(_wo, Plan.HiddenSize, (long)Plan.HeadCount * Plan.HeadDim);
@@ -171,10 +186,53 @@ public sealed class TransformerModel : IDisposable
         _attnNormWeight = LoadLayerVectors(layers, TensorRole.AttentionNorm, Plan.HiddenSize);
         _ffnNormWeight = LoadLayerVectors(layers, TensorRole.FeedForwardNorm, Plan.HiddenSize);
 
-        _biasQ = LoadOptionalBias(layers, TensorRole.AttentionQueryBias, (long)Plan.HeadCount * Plan.HeadDim);
-        _biasK = LoadOptionalBias(layers, TensorRole.AttentionKeyBias, (long)Plan.KvHeadCount * Plan.HeadDim);
-        _biasV = LoadOptionalBias(layers, TensorRole.AttentionValueBias, (long)Plan.KvHeadCount * Plan.HeadDim);
-        _biasO = LoadOptionalBias(layers, TensorRole.AttentionOutputBias, Plan.HiddenSize);
+        if (Plan.Bias == BiasPolicy.Declared && !Plan.UseAttentionBias)
+        {
+            // Declared false: present attention-bias tensors are neither loaded nor applied, and the file is
+            // reported once naming them.
+            _biasQ = new float[layers][];
+            _biasK = new float[layers][];
+            _biasV = new float[layers][];
+            _biasO = new float[layers][];
+            ReportIgnoredTensors(
+                logLine,
+                "bias_ignored",
+                file,
+                [TensorRole.AttentionQueryBias, TensorRole.AttentionKeyBias, TensorRole.AttentionValueBias, TensorRole.AttentionOutputBias]);
+        }
+        else
+        {
+            // Declared true makes the tensors required; ByTensorPresence keeps the presence rule.
+            bool required = Plan.Bias == BiasPolicy.Declared;
+            _biasQ = LoadAttentionBias(layers, TensorRole.AttentionQueryBias, (long)Plan.HeadCount * Plan.HeadDim, required);
+            _biasK = LoadAttentionBias(layers, TensorRole.AttentionKeyBias, (long)Plan.KvHeadCount * Plan.HeadDim, required);
+            _biasV = LoadAttentionBias(layers, TensorRole.AttentionValueBias, (long)Plan.KvHeadCount * Plan.HeadDim, required);
+            _biasO = LoadAttentionBias(layers, TensorRole.AttentionOutputBias, Plan.HiddenSize, required);
+        }
+
+        if (Plan.UseNormBias)
+        {
+            _attnNormBias = LoadLayerVectors(layers, TensorRole.AttentionNormBias, Plan.HiddenSize);
+            _ffnNormBias = LoadLayerVectors(layers, TensorRole.FeedForwardNormBias, Plan.HiddenSize);
+        }
+        else
+        {
+            _attnNormBias = new float[layers][];
+            _ffnNormBias = new float[layers][];
+            ReportIgnoredTensors(logLine, "norm_bias_ignored", file, [TensorRole.AttentionNormBias, TensorRole.FeedForwardNormBias]);
+        }
+
+        if (Plan.HasQkNorm)
+        {
+            _attnQNorm = LoadLayerVectors(layers, TensorRole.AttentionQueryNorm, Plan.HeadDim);
+            _attnKNorm = LoadLayerVectors(layers, TensorRole.AttentionKeyNorm, Plan.HeadDim);
+        }
+        else
+        {
+            _attnQNorm = new float[layers][];
+            _attnKNorm = new float[layers][];
+            ReportIgnoredTensors(logLine, "qk_norm_ignored", file, [TensorRole.AttentionQueryNorm, TensorRole.AttentionKeyNorm]);
+        }
 
         LogicalTensor tokenEmbd = RequireTensor(TensorRole.TokenEmbedding);
         RequireSingle(tokenEmbd, Plan.VocabSize, Plan.HiddenSize);
@@ -182,6 +240,9 @@ public sealed class TransformerModel : IDisposable
 
         LogicalTensor outputNorm = RequireTensor(TensorRole.OutputNorm);
         _outputNormWeight = LoadVector(outputNorm, Plan.HiddenSize);
+        _outputNormBias = Plan.UseNormBias
+            ? LoadOptionalVector(Plan.Tensors[TensorRole.OutputNormBias].Resolve(_fileTensors), Plan.HiddenSize)
+            : null;
 
         LogicalTensor? output = Plan.Tensors[TensorRole.OutputHead].Resolve(_fileTensors);
         if (output is not null)
@@ -324,7 +385,7 @@ public sealed class TransformerModel : IDisposable
             // Pre-attention norm per sequence: identical op to the single-token forward.
             for (int s = 0; s < n; s++)
             {
-                ApplyNorm(_batchCur.AsSpan(s * hidden, hidden), _attnNormWeight[l], _batchNormed.AsSpan(s * hidden, hidden));
+                ApplyNorm(_batchCur.AsSpan(s * hidden, hidden), _attnNormWeight[l], _attnNormBias[l], _batchNormed.AsSpan(s * hidden, hidden));
             }
 
             // One weight pass per matrix for the whole batch; each sequence's row result matches its single-vector GEMV.
@@ -342,6 +403,12 @@ public sealed class TransformerModel : IDisposable
                 AddBias(_batchQ.AsSpan(s * qkvRegion, qkvRegion), _biasQ[l]);
                 AddBias(_batchK.AsSpan(s * kvRegion, kvRegion), _biasK[l]);
                 AddBias(_batchV.AsSpan(s * kvRegion, kvRegion), _biasV[l]);
+
+                if (Plan.HasQkNorm)
+                {
+                    LayerOps.RmsNormWeightedHeads(_batchQ.AsSpan(s * qkvRegion, qkvRegion), _attnQNorm[l], Plan.HeadDim, Plan.EpsRmsNorm, _batchQ.AsSpan(s * qkvRegion, qkvRegion));
+                    LayerOps.RmsNormWeightedHeads(_batchK.AsSpan(s * kvRegion, kvRegion), _attnKNorm[l], Plan.HeadDim, Plan.EpsRmsNorm, _batchK.AsSpan(s * kvRegion, kvRegion));
+                }
 
                 ApplyRopeHeads(_batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, positions[s]);
                 ApplyRopeHeads(_batchK.AsSpan(s * kvRegion, kvRegion), Plan.KvHeadCount, positions[s]);
@@ -367,7 +434,7 @@ public sealed class TransformerModel : IDisposable
                     cur[i] += proj[i];
                 }
 
-                ApplyNorm(cur, _ffnNormWeight[l], _batchNormed.AsSpan(s * hidden, hidden));
+                ApplyNorm(cur, _ffnNormWeight[l], _ffnNormBias[l], _batchNormed.AsSpan(s * hidden, hidden));
             }
 
             bytes = _weights.Resolve(_ffnGate[l]);
@@ -399,7 +466,7 @@ public sealed class TransformerModel : IDisposable
 
         for (int s = 0; s < n; s++)
         {
-            ApplyNorm(_batchCur.AsSpan(s * hidden, hidden), _outputNormWeight, _batchNormed.AsSpan(s * hidden, hidden));
+            ApplyNorm(_batchCur.AsSpan(s * hidden, hidden), _outputNormWeight, _outputNormBias, _batchNormed.AsSpan(s * hidden, hidden));
         }
 
         LogicalTensor lmHead = _output ?? _tokenEmbd; // tied weights reuse the token-embedding rows as logits
@@ -520,7 +587,7 @@ public sealed class TransformerModel : IDisposable
 
                     for (int i = 0; i < m; i++)
                     {
-                        ApplyNorm(cur.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden), _attnNormWeight[l], chunkNormed.AsSpan(i * hidden, hidden));
+                        ApplyNorm(cur.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden), _attnNormWeight[l], _attnNormBias[l], chunkNormed.AsSpan(i * hidden, hidden));
                     }
 
                     ReadOnlySpan<byte> bytes = _weights.Resolve(_wq[l]);
@@ -537,6 +604,12 @@ public sealed class TransformerModel : IDisposable
                         AddBias(chunkQ.AsSpan(i * qkvRegion, qkvRegion), _biasQ[l]);
                         AddBias(chunkK.AsSpan(i * kvRegion, kvRegion), _biasK[l]);
                         AddBias(chunkV.AsSpan(i * kvRegion, kvRegion), _biasV[l]);
+
+                        if (Plan.HasQkNorm)
+                        {
+                            LayerOps.RmsNormWeightedHeads(chunkQ.AsSpan(i * qkvRegion, qkvRegion), _attnQNorm[l], Plan.HeadDim, Plan.EpsRmsNorm, chunkQ.AsSpan(i * qkvRegion, qkvRegion));
+                            LayerOps.RmsNormWeightedHeads(chunkK.AsSpan(i * kvRegion, kvRegion), _attnKNorm[l], Plan.HeadDim, Plan.EpsRmsNorm, chunkK.AsSpan(i * kvRegion, kvRegion));
+                        }
 
                         ApplyRopeHeads(chunkQ.AsSpan(i * qkvRegion, qkvRegion), Plan.HeadCount, firstPos + i);
                         ApplyRopeHeads(chunkK.AsSpan(i * kvRegion, kvRegion), Plan.KvHeadCount, firstPos + i);
@@ -589,7 +662,7 @@ public sealed class TransformerModel : IDisposable
                             posCur[x] += proj[x];
                         }
 
-                        ApplyNorm(posCur, _ffnNormWeight[l], normed.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden));
+                        ApplyNorm(posCur, _ffnNormWeight[l], _ffnNormBias[l], normed.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden));
                     }
                 }
 
@@ -628,7 +701,7 @@ public sealed class TransformerModel : IDisposable
             float[] encoded = new float[n * hidden]; // caller-owned result, exact size — pooling helpers consume it row-wise
             for (int i = 0; i < n; i++)
             {
-                ApplyNorm(cur.AsSpan(i * hidden, hidden), _outputNormWeight, encoded.AsSpan(i * hidden, hidden));
+                ApplyNorm(cur.AsSpan(i * hidden, hidden), _outputNormWeight, _outputNormBias, encoded.AsSpan(i * hidden, hidden));
             }
 
             return encoded;
@@ -679,7 +752,7 @@ public sealed class TransformerModel : IDisposable
         for (int l = 0; l < Plan.LayerCount; l++)
         {
             // Pre-attention norm on the stream: normed = rmsnorm(cur) * attn_norm weight.
-            ApplyNorm(_cur.AsSpan(0, hidden), _attnNormWeight[l], _normed);
+            ApplyNorm(_cur.AsSpan(0, hidden), _attnNormWeight[l], _attnNormBias[l], _normed);
 
             ReadOnlySpan<byte> bytes = _weights.Resolve(_wq[l]);
             _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _wq[l].Shape, _wq[l].Format), _q);
@@ -692,6 +765,14 @@ public sealed class TransformerModel : IDisposable
             bytes = _weights.Resolve(_wv[l]);
             _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _wv[l].Shape, _wv[l].Format), _v);
             AddBias(_v, _biasV[l]);
+
+            // Declared QK-norm: each q and k head is RMS-normalized with the head-dimension weight vector,
+            // after the projection and bias and before RoPE.
+            if (Plan.HasQkNorm)
+            {
+                LayerOps.RmsNormWeightedHeads(_q, _attnQNorm[l], Plan.HeadDim, Plan.EpsRmsNorm, _q);
+                LayerOps.RmsNormWeightedHeads(_k, _attnKNorm[l], Plan.HeadDim, Plan.EpsRmsNorm, _k);
+            }
 
             ApplyRopeHeads(_q, Plan.HeadCount, position);
             ApplyRopeHeads(_k, Plan.KvHeadCount, position);
@@ -713,7 +794,7 @@ public sealed class TransformerModel : IDisposable
                 _cur[i] += _proj[i];
             }
 
-            ApplyNorm(_cur.AsSpan(0, hidden), _ffnNormWeight[l], _normed);
+            ApplyNorm(_cur.AsSpan(0, hidden), _ffnNormWeight[l], _ffnNormBias[l], _normed);
 
             bytes = _weights.Resolve(_ffnGate[l]);
             _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _ffnGate[l].Shape, _ffnGate[l].Format), _gateUp);
@@ -733,7 +814,7 @@ public sealed class TransformerModel : IDisposable
             }
         }
 
-        ApplyNorm(_cur.AsSpan(0, hidden), _outputNormWeight, _normed);
+        ApplyNorm(_cur.AsSpan(0, hidden), _outputNormWeight, _outputNormBias, _normed);
 
         LogicalTensor lmHead = _output ?? _tokenEmbd; // tied weights reuse the token-embedding rows as logits
         ReadOnlySpan<byte> headBytes = _weights.Resolve(lmHead);
@@ -773,8 +854,9 @@ public sealed class TransformerModel : IDisposable
 
     // Norm and activation run as a direct call chosen from the plan's strategy values: no interface dispatch and
     // no allocation anywhere in the forward, so every path — single token, batched decode, and encode — applies
-    // the resolved strategy identically.
-    private void ApplyNorm(ReadOnlySpan<float> src, ReadOnlySpan<float> weight, Span<float> dst)
+    // the resolved strategy identically. The bias operand is the layer's declared norm-bias vector when one was
+    // loaded (an empty span otherwise) and is consumed only by the LayerNorm strategy.
+    private void ApplyNorm(ReadOnlySpan<float> src, ReadOnlySpan<float> weight, ReadOnlySpan<float> bias, Span<float> dst)
     {
         switch (Plan.Norm)
         {
@@ -782,7 +864,7 @@ public sealed class TransformerModel : IDisposable
                 LayerOps.RmsNormWeighted(src, weight, Plan.EpsRmsNorm, dst);
                 break;
             case NormStrategy.LayerNorm:
-                LayerOps.LayerNormWeighted(src, weight, ReadOnlySpan<float>.Empty, Plan.EpsRmsNorm, dst);
+                LayerOps.LayerNormWeighted(src, weight, bias, Plan.EpsRmsNorm, dst);
                 break;
             default:
                 throw new ModelException($"norm strategy '{Plan.Norm}' is not implemented by the forward engine");
@@ -900,6 +982,74 @@ public sealed class TransformerModel : IDisposable
         }
 
         return biases;
+    }
+
+    // Attention-bias loading under the plan's bias policy: ByTensorPresence keeps the presence rule, while a
+    // declared use_bias makes every attention-bias tensor required and names the first one the file lacks.
+    private float[]?[] LoadAttentionBias(int layers, TensorRole role, long expectedLength, bool required)
+    {
+        if (!required)
+        {
+            return LoadOptionalBias(layers, role, expectedLength);
+        }
+
+        TensorDescriptor descriptor = Plan.Tensors[role];
+        float[]?[] biases = new float[layers][];
+        for (int l = 0; l < layers; l++)
+        {
+            LogicalTensor? tensor = descriptor.Resolve(_fileTensors, l);
+            if (tensor is null)
+            {
+                throw new ModelException(
+                    $"tensor '{descriptor.NameFor(l)}' is missing: {Plan.Prefix}attention.use_bias declares attention biases required for architecture '{Plan.Architecture}'");
+            }
+
+            biases[l] = LoadVector(tensor, checked((int)expectedLength));
+        }
+
+        return biases;
+    }
+
+    // One structured line naming the model, the architecture, and every tensor of the given roles the file
+    // carries although the plan declares the feature off, in the same style as the tokenizer profile defaults
+    // and the profile substitution line. No line when no such tensor is present.
+    private void ReportIgnoredTensors(Action<string>? logLine, string prefix, GgufFile file, IReadOnlyList<TensorRole> roles)
+    {
+        if (logLine is null)
+        {
+            return;
+        }
+
+        List<string> names = [];
+        foreach (TensorRole role in roles)
+        {
+            TensorDescriptor descriptor = Plan.Tensors[role];
+            if (descriptor.Scope == TensorScope.PerLayer)
+            {
+                for (int l = 0; l < Plan.LayerCount; l++)
+                {
+                    if (descriptor.Resolve(_fileTensors, l) is not null)
+                    {
+                        names.Add(descriptor.NameFor(l));
+                    }
+                }
+            }
+            else if (descriptor.Resolve(_fileTensors) is not null)
+            {
+                names.Add(descriptor.NameFor(-1));
+            }
+        }
+
+        if (names.Count == 0)
+        {
+            return;
+        }
+
+        GgufMetadata metadata = file.Metadata;
+        string modelName = metadata.Has("general.name") ? metadata.Get("general.name").AsString() : "";
+        logLine(
+            $"{prefix} model='{(modelName.Length > 0 ? modelName : file.Path)}' " +
+            $"architecture='{Plan.Architecture}' tensors={string.Join(",", names)}");
     }
 
     private float[]? LoadOptionalVector(LogicalTensor? tensor, int expectedLength) =>

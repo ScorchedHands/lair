@@ -6,12 +6,17 @@ namespace Lair.Models;
 /// Immutable resolved model plan, produced once per load from a <see cref="ModelProfile"/> plus the GGUF
 /// container's KV metadata and one fact from its tensor table (whether an untied output matrix is present).
 /// It carries the resolved profile name and metadata prefix, the concrete geometry, the profile's tensor map,
-/// the strategy values the forward engine switches on, and the sparse-FFN slot. Metadata keys follow the
-/// canonical GGUF naming (<c>&lt;prefix&gt;embedding_length</c>, <c>&lt;prefix&gt;block_count</c>,
-/// <c>&lt;prefix&gt;attention.head_count</c>, <c>&lt;prefix&gt;attention.head_count_kv</c>,
-/// <c>&lt;prefix&gt;feed_forward_length</c>, <c>&lt;prefix&gt;rope.freq_base</c>,
-/// <c>&lt;prefix&gt;attention.layer_norm_rms_epsilon</c>, <c>&lt;prefix&gt;vocab_size</c>), with
-/// <c>&lt;prefix&gt;attention.key_length</c> as the only accepted source for an explicit head dimension.
+/// the strategy values the forward engine switches on, the declared feature flags, and the sparse-FFN slot.
+/// Metadata keys follow the canonical GGUF naming (<c>&lt;prefix&gt;embedding_length</c>,
+/// <c>&lt;prefix&gt;block_count</c>, <c>&lt;prefix&gt;attention.head_count</c>,
+/// <c>&lt;prefix&gt;attention.head_count_kv</c>, <c>&lt;prefix&gt;feed_forward_length</c>,
+/// <c>&lt;prefix&gt;rope.freq_base</c>, <c>&lt;prefix&gt;attention.layer_norm_rms_epsilon</c>,
+/// <c>&lt;prefix&gt;vocab_size</c>), with <c>&lt;prefix&gt;attention.head_length</c> as the preferred source
+/// for an explicit head dimension and <c>&lt;prefix&gt;attention.key_length</c> /
+/// <c>&lt;prefix&gt;attention.value_length</c> accepted as equivalent sources; the head dimension no longer
+/// has to split the hidden size exactly. The declared feature flags read <c>&lt;prefix&gt;attention.use_bias</c>,
+/// <c>&lt;prefix&gt;attention.norm_bias</c>, and <c>&lt;prefix&gt;attention.use_qk_norm</c>, each defaulting
+/// to <c>false</c> when the key is absent.
 /// </summary>
 public sealed record ModelPlan
 {
@@ -47,6 +52,15 @@ public sealed record ModelPlan
 
     /// <summary>Whether the tensor table carries an untied output matrix, i.e. the output head is not tied to the token embedding.</summary>
     public required bool HasOutputWeights { get; init; }
+
+    /// <summary>Declared <c>&lt;prefix&gt;attention.use_bias</c>: whether the q/k/v/o projections carry additive biases.</summary>
+    public required bool UseAttentionBias { get; init; }
+
+    /// <summary>Declared <c>&lt;prefix&gt;attention.norm_bias</c>: whether the norm layers carry additive bias vectors.</summary>
+    public required bool UseNormBias { get; init; }
+
+    /// <summary>Declared <c>&lt;prefix&gt;attention.use_qk_norm</c>: whether q and k heads pass through a per-head RMS norm before RoPE.</summary>
+    public required bool HasQkNorm { get; init; }
 
     /// <summary>The resolved profile's tensor map: the GGUF names behind every logical tensor role.</summary>
     public required TensorMap Tensors { get; init; }

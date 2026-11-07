@@ -39,6 +39,14 @@ public enum BiasPolicy
 {
     /// <summary>A bias is applied exactly when its tensor is present in the file, per layer and per projection.</summary>
     ByTensorPresence,
+
+    /// <summary>
+    /// The file's declaration decides: <c>&lt;prefix&gt;attention.use_bias</c> and
+    /// <c>&lt;prefix&gt;attention.norm_bias</c> (each absent means <c>false</c>) land in the plan. Declared
+    /// <c>true</c> makes the corresponding tensors required at load; declared <c>false</c> ignores present
+    /// tensors with one structured log line naming them.
+    /// </summary>
+    Declared,
 }
 
 /// <summary>
