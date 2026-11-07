@@ -1,0 +1,79 @@
+namespace Lair.Models;
+
+/// <summary>
+/// Registry of the supported model profiles, keyed by <c>general.architecture</c>. It is the single source
+/// for profile selection and for the supported-profile list in the rejection message for an unsupported
+/// architecture. A new profile is a new entry here plus its tensor map and strategy values.
+/// </summary>
+public static class ModelProfiles
+{
+    private static readonly ModelProfile[] Profiles =
+    [
+        new ModelProfile
+        {
+            Architecture = "llama",
+            Prefix = "llama.",
+            Norm = NormStrategy.RmsNorm,
+            Activation = ActivationStrategy.SwiGLU,
+            Bias = BiasPolicy.ByTensorPresence,
+            Rope = RopeStrategy.StandardFullHead,
+            Tensors = CanonicalTensors(),
+        },
+        new ModelProfile
+        {
+            Architecture = "qwen2",
+            Prefix = "qwen2.",
+            Norm = NormStrategy.RmsNorm,
+            Activation = ActivationStrategy.SwiGLU,
+            Bias = BiasPolicy.ByTensorPresence,
+            Rope = RopeStrategy.StandardFullHead,
+            Tensors = CanonicalTensors(),
+        },
+    ];
+
+    private static readonly Dictionary<string, ModelProfile> ByArchitecture =
+        Profiles.ToDictionary(profile => profile.Architecture, StringComparer.Ordinal);
+
+    /// <summary>Supported architecture names, in registry order.</summary>
+    public static IEnumerable<string> SupportedArchitectures => Profiles.Select(profile => profile.Architecture);
+
+    /// <summary>
+    /// Resolves the profile for one <c>general.architecture</c> value. An unsupported name fails at load with
+    /// a <see cref="ModelException"/> naming the value and the registry's supported profiles.
+    /// </summary>
+    public static ModelProfile Resolve(string architecture)
+    {
+        if (ByArchitecture.TryGetValue(architecture, out ModelProfile? profile))
+        {
+            return profile;
+        }
+
+        throw new ModelException(
+            $"model architecture '{architecture}' is not supported (supported architectures: " +
+            $"{string.Join(", ", SupportedArchitectures)})");
+    }
+
+    // The canonical llama-family tensor names: the llama.cpp GGUF layout both supported profiles ship, with
+    // attention biases and the output head optional because llama files carry neither while qwen2 files may.
+    private static TensorMap CanonicalTensors() =>
+        new(
+        [
+            new TensorDescriptor(TensorRole.TokenEmbedding, TensorScope.Global, "token_embd.weight", Required: true, []),
+            new TensorDescriptor(TensorRole.AttentionQuery, TensorScope.PerLayer, "blk.{layer}.attn_q.weight", Required: true, []),
+            new TensorDescriptor(TensorRole.AttentionKey, TensorScope.PerLayer, "blk.{layer}.attn_k.weight", Required: true, []),
+            new TensorDescriptor(TensorRole.AttentionValue, TensorScope.PerLayer, "blk.{layer}.attn_v.weight", Required: true, []),
+            new TensorDescriptor(TensorRole.AttentionOutput, TensorScope.PerLayer, "blk.{layer}.attn_output.weight", Required: true, []),
+            new TensorDescriptor(TensorRole.FeedForwardGate, TensorScope.PerLayer, "blk.{layer}.ffn_gate.weight", Required: true, []),
+            new TensorDescriptor(TensorRole.FeedForwardUp, TensorScope.PerLayer, "blk.{layer}.ffn_up.weight", Required: true, []),
+            new TensorDescriptor(TensorRole.FeedForwardDown, TensorScope.PerLayer, "blk.{layer}.ffn_down.weight", Required: true, []),
+            new TensorDescriptor(TensorRole.AttentionNorm, TensorScope.PerLayer, "blk.{layer}.attn_norm.weight", Required: true, []),
+            new TensorDescriptor(TensorRole.FeedForwardNorm, TensorScope.PerLayer, "blk.{layer}.ffn_norm.weight", Required: true, []),
+            new TensorDescriptor(TensorRole.AttentionQueryBias, TensorScope.PerLayer, "blk.{layer}.attn_q.bias", Required: false, []),
+            new TensorDescriptor(TensorRole.AttentionKeyBias, TensorScope.PerLayer, "blk.{layer}.attn_k.bias", Required: false, []),
+            new TensorDescriptor(TensorRole.AttentionValueBias, TensorScope.PerLayer, "blk.{layer}.attn_v.bias", Required: false, []),
+            new TensorDescriptor(TensorRole.AttentionOutputBias, TensorScope.PerLayer, "blk.{layer}.attn_output.bias", Required: false, []),
+            new TensorDescriptor(TensorRole.OutputNorm, TensorScope.Global, "output_norm.weight", Required: true, []),
+            new TensorDescriptor(TensorRole.OutputHead, TensorScope.Global, "output.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.OutputBias, TensorScope.Global, "output.bias", Required: false, []),
+        ]);
+}

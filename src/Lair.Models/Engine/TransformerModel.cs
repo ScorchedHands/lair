@@ -84,6 +84,10 @@ public sealed class TransformerModel : IDisposable
     private readonly float[] _sin;
     private readonly int _ropeHalf;
 
+    /// <summary>The resolved model plan this engine forwards under: geometry, profile tensor map, and strategy values.</summary>
+    public ModelPlan Plan { get; }
+
+    /// <summary>Flat scalar view of <see cref="Plan"/>, kept as the terse read surface for geometry consumers.</summary>
     public ModelDesc Desc { get; }
 
     /// <summary>Largest sequence length this model can forward: the extent of its precomputed RoPE tables.</summary>
@@ -108,99 +112,91 @@ public sealed class TransformerModel : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxContextTokens);
 
         _backend = backend;
-        Desc = ModelDesc.FromGguf(file);
+        Plan = ModelPlans.Resolve(file);
+        Desc = Plan.ToDesc();
         MaxContextTokens = maxContextTokens;
         _ownsWeights = weights is null;
         _weights = weights ?? new GgufMmapWeightSource(file);
         _fileTensors = file.Tensors;
 
-        if (Desc.HeadDim % 2 != 0)
+        if (Plan.HeadDim % 2 != 0)
         {
-            throw new ModelException($"head dimension {Desc.HeadDim} is odd; RoPE pairs require an even head dimension");
+            throw new ModelException($"head dimension {Plan.HeadDim} is odd; RoPE pairs require an even head dimension");
         }
 
-        int layers = Desc.LayerCount;
-        _wq = LoadMatrices(layers, "attn_q.weight");
-        _wk = LoadMatrices(layers, "attn_k.weight");
-        _wv = LoadMatrices(layers, "attn_v.weight");
-        _wo = LoadMatrices(layers, "attn_output.weight");
-        _ffnGate = LoadMatrices(layers, "ffn_gate.weight");
-        _ffnUp = LoadMatrices(layers, "ffn_up.weight");
-        _ffnDown = LoadMatrices(layers, "ffn_down.weight");
+        int layers = Plan.LayerCount;
+
+        _wq = LoadMatrices(layers, TensorRole.AttentionQuery);
+        _wk = LoadMatrices(layers, TensorRole.AttentionKey);
+        _wv = LoadMatrices(layers, TensorRole.AttentionValue);
+        _wo = LoadMatrices(layers, TensorRole.AttentionOutput);
+        _ffnGate = LoadMatrices(layers, TensorRole.FeedForwardGate);
+        _ffnUp = LoadMatrices(layers, TensorRole.FeedForwardUp);
+        _ffnDown = LoadMatrices(layers, TensorRole.FeedForwardDown);
 
         // Matrix shapes must agree with the declared dimensions: rows are the output side, columns the input side.
-        RequireShape(_wq, Desc.HiddenSize, Desc.HiddenSize);          // q emits headCount * headDim == hidden
-        RequireShape(_wk, (long)Desc.KvHeadCount * Desc.HeadDim, Desc.HiddenSize);
-        RequireShape(_wv, (long)Desc.KvHeadCount * Desc.HeadDim, Desc.HiddenSize);
-        RequireShape(_wo, Desc.HiddenSize, (long)Desc.HeadCount * Desc.HeadDim);
-        RequireShape(_ffnGate, Desc.IntermediateSize, Desc.HiddenSize);
-        RequireShape(_ffnUp, Desc.IntermediateSize, Desc.HiddenSize);
-        RequireShape(_ffnDown, Desc.HiddenSize, Desc.IntermediateSize);
+        RequireShape(_wq, Plan.HiddenSize, Plan.HiddenSize);          // q emits headCount * headDim == hidden
+        RequireShape(_wk, (long)Plan.KvHeadCount * Plan.HeadDim, Plan.HiddenSize);
+        RequireShape(_wv, (long)Plan.KvHeadCount * Plan.HeadDim, Plan.HiddenSize);
+        RequireShape(_wo, Plan.HiddenSize, (long)Plan.HeadCount * Plan.HeadDim);
+        RequireShape(_ffnGate, Plan.IntermediateSize, Plan.HiddenSize);
+        RequireShape(_ffnUp, Plan.IntermediateSize, Plan.HiddenSize);
+        RequireShape(_ffnDown, Plan.HiddenSize, Plan.IntermediateSize);
 
-        _attnNormWeight = LoadLayerVectors(layers, "attn_norm.weight", Desc.HiddenSize);
-        _ffnNormWeight = LoadLayerVectors(layers, "ffn_norm.weight", Desc.HiddenSize);
+        _attnNormWeight = LoadLayerVectors(layers, TensorRole.AttentionNorm, Plan.HiddenSize);
+        _ffnNormWeight = LoadLayerVectors(layers, TensorRole.FeedForwardNorm, Plan.HiddenSize);
 
-        _biasQ = LoadOptionalBias(layers, "attn_q.bias", (long)Desc.HeadCount * Desc.HeadDim);
-        _biasK = LoadOptionalBias(layers, "attn_k.bias", (long)Desc.KvHeadCount * Desc.HeadDim);
-        _biasV = LoadOptionalBias(layers, "attn_v.bias", (long)Desc.KvHeadCount * Desc.HeadDim);
-        _biasO = LoadOptionalBias(layers, "attn_output.bias", Desc.HiddenSize);
+        _biasQ = LoadOptionalBias(layers, TensorRole.AttentionQueryBias, (long)Plan.HeadCount * Plan.HeadDim);
+        _biasK = LoadOptionalBias(layers, TensorRole.AttentionKeyBias, (long)Plan.KvHeadCount * Plan.HeadDim);
+        _biasV = LoadOptionalBias(layers, TensorRole.AttentionValueBias, (long)Plan.KvHeadCount * Plan.HeadDim);
+        _biasO = LoadOptionalBias(layers, TensorRole.AttentionOutputBias, Plan.HiddenSize);
 
-        LogicalTensor? tokenEmbd = file.Tensors.Find("token_embd.weight");
-        if (tokenEmbd is null)
-        {
-            throw new ModelException($"tensor 'token_embd.weight' is missing: required by architecture '{Desc.Architecture}'");
-        }
-
-        RequireSingle(tokenEmbd, Desc.VocabSize, Desc.HiddenSize);
+        LogicalTensor tokenEmbd = RequireTensor(TensorRole.TokenEmbedding);
+        RequireSingle(tokenEmbd, Plan.VocabSize, Plan.HiddenSize);
         _tokenEmbd = tokenEmbd;
 
-        LogicalTensor? outputNorm = file.Tensors.Find("output_norm.weight");
-        if (outputNorm is null)
-        {
-            throw new ModelException($"tensor 'output_norm.weight' is missing: required by architecture '{Desc.Architecture}'");
-        }
+        LogicalTensor outputNorm = RequireTensor(TensorRole.OutputNorm);
+        _outputNormWeight = LoadVector(outputNorm, Plan.HiddenSize);
 
-        _outputNormWeight = LoadVector(outputNorm, Desc.HiddenSize);
-
-        LogicalTensor? output = file.Tensors.Find("output.weight");
+        LogicalTensor? output = Plan.Tensors[TensorRole.OutputHead].Resolve(_fileTensors);
         if (output is not null)
         {
-            RequireSingle(output, Desc.VocabSize, Desc.HiddenSize);
+            RequireSingle(output, Plan.VocabSize, Plan.HiddenSize);
         }
 
         _output = output;
-        _outputBias = LoadOptionalVector(file.Tensors.Find("output.bias"), Desc.VocabSize);
+        _outputBias = LoadOptionalVector(Plan.Tensors[TensorRole.OutputBias].Resolve(_fileTensors), Plan.VocabSize);
 
-        int hidden = Desc.HiddenSize;
+        int hidden = Plan.HiddenSize;
         _cur = new float[hidden];
         _normed = new float[hidden];
-        _q = new float[Desc.HeadCount * Desc.HeadDim];
-        _k = new float[Desc.KvHeadCount * Desc.HeadDim];
-        _v = new float[Desc.KvHeadCount * Desc.HeadDim];
-        _attnOut = new float[Desc.HeadCount * Desc.HeadDim];
+        _q = new float[Plan.HeadCount * Plan.HeadDim];
+        _k = new float[Plan.KvHeadCount * Plan.HeadDim];
+        _v = new float[Plan.KvHeadCount * Plan.HeadDim];
+        _attnOut = new float[Plan.HeadCount * Plan.HeadDim];
         _proj = new float[hidden];
-        _gateUp = new float[Desc.IntermediateSize];
-        _up = new float[Desc.IntermediateSize];
-        _logits = new float[Desc.VocabSize];
+        _gateUp = new float[Plan.IntermediateSize];
+        _up = new float[Plan.IntermediateSize];
+        _logits = new float[Plan.VocabSize];
 
         _batchCur = new float[MaxBatchSequences * hidden];
         _batchNormed = new float[MaxBatchSequences * hidden];
-        _batchQ = new float[MaxBatchSequences * Desc.HeadCount * Desc.HeadDim];
-        _batchK = new float[MaxBatchSequences * Desc.KvHeadCount * Desc.HeadDim];
-        _batchV = new float[MaxBatchSequences * Desc.KvHeadCount * Desc.HeadDim];
-        _batchAttnOut = new float[MaxBatchSequences * Desc.HeadCount * Desc.HeadDim];
+        _batchQ = new float[MaxBatchSequences * Plan.HeadCount * Plan.HeadDim];
+        _batchK = new float[MaxBatchSequences * Plan.KvHeadCount * Plan.HeadDim];
+        _batchV = new float[MaxBatchSequences * Plan.KvHeadCount * Plan.HeadDim];
+        _batchAttnOut = new float[MaxBatchSequences * Plan.HeadCount * Plan.HeadDim];
         _batchProj = new float[MaxBatchSequences * hidden];
-        _batchGateUp = new float[MaxBatchSequences * Desc.IntermediateSize];
-        _batchUp = new float[MaxBatchSequences * Desc.IntermediateSize];
-        _batchLogits = new float[MaxBatchSequences * Desc.VocabSize];
+        _batchGateUp = new float[MaxBatchSequences * Plan.IntermediateSize];
+        _batchUp = new float[MaxBatchSequences * Plan.IntermediateSize];
+        _batchLogits = new float[MaxBatchSequences * Plan.VocabSize];
 
-        _ropeHalf = Desc.HeadDim / 2;
+        _ropeHalf = Plan.HeadDim / 2;
 
         // Precompute cos/sin per position and pair up to the maximum context so decode is table-driven: identical
         // inputs always reproduce bit-identical rotations regardless of call order or buffer reuse.
         _cos = new float[maxContextTokens * _ropeHalf];
         _sin = new float[maxContextTokens * _ropeHalf];
-        LayerOps.BuildRopeTables(Desc.RopeTheta, Desc.HeadDim, maxContextTokens, _cos, _sin);
+        LayerOps.BuildRopeTables(Plan.RopeTheta, Plan.HeadDim, maxContextTokens, _cos, _sin);
     }
 
     /// <summary>Forwards each token in order, appending its K/V to the sequence's paged KV cache.</summary>
@@ -263,9 +259,9 @@ public sealed class TransformerModel : IDisposable
         int[] positions = new int[n];
         for (int s = 0; s < n; s++)
         {
-            if (tokenIds[s] < 0 || tokenIds[s] >= Desc.VocabSize)
+            if (tokenIds[s] < 0 || tokenIds[s] >= Plan.VocabSize)
             {
-                throw new ArgumentException($"token id {tokenIds[s]} at sequence {s} is outside the vocabulary of {Desc.VocabSize}.", nameof(tokenIds));
+                throw new ArgumentException($"token id {tokenIds[s]} at sequence {s} is outside the vocabulary of {Plan.VocabSize}.", nameof(tokenIds));
             }
 
             SequenceKv kv = kvs[s] ?? throw new ArgumentException($"kvs entry {s} is null.", nameof(kvs));
@@ -283,7 +279,7 @@ public sealed class TransformerModel : IDisposable
         WeightRef embRef = new(embBytes, _tokenEmbd.Shape, _tokenEmbd.Format);
         for (int s = 0; s < n; s++)
         {
-            _backend.DequantRow(embRef, tokenIds[s], _batchCur.AsSpan(s * Desc.HiddenSize, Desc.HiddenSize));
+            _backend.DequantRow(embRef, tokenIds[s], _batchCur.AsSpan(s * Plan.HiddenSize, Plan.HiddenSize));
         }
 
         // Reserve this step's slot in every sequence before any layer writes, mirroring ForwardToken's append.
@@ -292,18 +288,18 @@ public sealed class TransformerModel : IDisposable
             kvs[s].Append();
         }
 
-        int hidden = Desc.HiddenSize;
-        int qkvRegion = Desc.HeadCount * Desc.HeadDim;
-        int kvRegion = Desc.KvHeadCount * Desc.HeadDim;
-        int inter = Desc.IntermediateSize;
-        float attnScale = 1f / MathF.Sqrt(Desc.HeadDim);
+        int hidden = Plan.HiddenSize;
+        int qkvRegion = Plan.HeadCount * Plan.HeadDim;
+        int kvRegion = Plan.KvHeadCount * Plan.HeadDim;
+        int inter = Plan.IntermediateSize;
+        float attnScale = 1f / MathF.Sqrt(Plan.HeadDim);
 
-        for (int l = 0; l < Desc.LayerCount; l++)
+        for (int l = 0; l < Plan.LayerCount; l++)
         {
             // Pre-attention norm per sequence: identical op to the single-token forward.
             for (int s = 0; s < n; s++)
             {
-                LayerOps.RmsNormWeighted(_batchCur.AsSpan(s * hidden, hidden), _attnNormWeight[l], Desc.EpsRmsNorm, _batchNormed.AsSpan(s * hidden, hidden));
+                LayerOps.RmsNormWeighted(_batchCur.AsSpan(s * hidden, hidden), _attnNormWeight[l], Plan.EpsRmsNorm, _batchNormed.AsSpan(s * hidden, hidden));
             }
 
             // One weight pass per matrix for the whole batch; each sequence's row result matches its single-vector GEMV.
@@ -322,13 +318,13 @@ public sealed class TransformerModel : IDisposable
                 AddBias(_batchK.AsSpan(s * kvRegion, kvRegion), _biasK[l]);
                 AddBias(_batchV.AsSpan(s * kvRegion, kvRegion), _biasV[l]);
 
-                ApplyRopeHeads(_batchQ.AsSpan(s * qkvRegion, qkvRegion), Desc.HeadCount, positions[s]);
-                ApplyRopeHeads(_batchK.AsSpan(s * kvRegion, kvRegion), Desc.KvHeadCount, positions[s]);
+                ApplyRopeHeads(_batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, positions[s]);
+                ApplyRopeHeads(_batchK.AsSpan(s * kvRegion, kvRegion), Plan.KvHeadCount, positions[s]);
 
                 kvs[s].WriteK(positions[s], l, _batchK.AsSpan(s * kvRegion, kvRegion));
                 kvs[s].WriteV(positions[s], l, _batchV.AsSpan(s * kvRegion, kvRegion));
 
-                LayerOps.CausalAttention(_backend, _batchQ.AsSpan(s * qkvRegion, qkvRegion), Desc.HeadCount, Desc.KvHeadCount, Desc.HeadDim, kvs[s], l, positions[s], attnScale, _batchAttnOut.AsSpan(s * qkvRegion, qkvRegion));
+                LayerOps.CausalAttention(_backend, _batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kvs[s], l, positions[s], attnScale, _batchAttnOut.AsSpan(s * qkvRegion, qkvRegion));
             }
 
             bytes = _weights.Resolve(_wo[l]);
@@ -346,7 +342,7 @@ public sealed class TransformerModel : IDisposable
                     cur[i] += proj[i];
                 }
 
-                LayerOps.RmsNormWeighted(cur, _ffnNormWeight[l], Desc.EpsRmsNorm, _batchNormed.AsSpan(s * hidden, hidden));
+                LayerOps.RmsNormWeighted(cur, _ffnNormWeight[l], Plan.EpsRmsNorm, _batchNormed.AsSpan(s * hidden, hidden));
             }
 
             bytes = _weights.Resolve(_ffnGate[l]);
@@ -383,22 +379,22 @@ public sealed class TransformerModel : IDisposable
 
         for (int s = 0; s < n; s++)
         {
-            LayerOps.RmsNormWeighted(_batchCur.AsSpan(s * hidden, hidden), _outputNormWeight, Desc.EpsRmsNorm, _batchNormed.AsSpan(s * hidden, hidden));
+            LayerOps.RmsNormWeighted(_batchCur.AsSpan(s * hidden, hidden), _outputNormWeight, Plan.EpsRmsNorm, _batchNormed.AsSpan(s * hidden, hidden));
         }
 
         LogicalTensor lmHead = _output ?? _tokenEmbd; // tied weights reuse the token-embedding rows as logits
         ReadOnlySpan<byte> headBytes = _weights.Resolve(lmHead);
-        _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, new WeightRef(headBytes, lmHead.Shape, lmHead.Format), _batchLogits.AsSpan(0, n * Desc.VocabSize));
+        _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, new WeightRef(headBytes, lmHead.Shape, lmHead.Format), _batchLogits.AsSpan(0, n * Plan.VocabSize));
 
         if (_outputBias is not null)
         {
             for (int s = 0; s < n; s++)
             {
-                AddBias(_batchLogits.AsSpan(s * Desc.VocabSize, Desc.VocabSize), _outputBias);
+                AddBias(_batchLogits.AsSpan(s * Plan.VocabSize, Plan.VocabSize), _outputBias);
             }
         }
 
-        return _batchLogits.AsSpan(0, n * Desc.VocabSize);
+        return _batchLogits.AsSpan(0, n * Plan.VocabSize);
     }
 
     /// <summary>Token positions one encoder pass advances through the dense matrices per batched weight traversal.</summary>
@@ -439,7 +435,7 @@ public sealed class TransformerModel : IDisposable
                 $"an encoder forward must hold between 1 and {MaxEncodeTokens} tokens, got {n}.", nameof(tokens));
         }
 
-        int hidden = Desc.HiddenSize;
+        int hidden = Plan.HiddenSize;
         int basePosition = kv.Length;
         if (basePosition + n > MaxContextTokens)
         {
@@ -448,10 +444,10 @@ public sealed class TransformerModel : IDisposable
                 nameof(tokens));
         }
 
-        int qkvRegion = Desc.HeadCount * Desc.HeadDim;
-        int kvRegion = Desc.KvHeadCount * Desc.HeadDim;
-        int inter = Desc.IntermediateSize;
-        float attnScale = 1f / MathF.Sqrt(Desc.HeadDim);
+        int qkvRegion = Plan.HeadCount * Plan.HeadDim;
+        int kvRegion = Plan.KvHeadCount * Plan.HeadDim;
+        int inter = Plan.IntermediateSize;
+        float attnScale = 1f / MathF.Sqrt(Plan.HeadDim);
 
         ArrayPool<float> poolBuffers = ArrayPool<float>.Shared;
 
@@ -476,9 +472,9 @@ public sealed class TransformerModel : IDisposable
             WeightRef embRef = new(embBytes, _tokenEmbd.Shape, _tokenEmbd.Format);
             for (int i = 0; i < n; i++)
             {
-                if ((uint)tokens[i] >= (uint)Desc.VocabSize)
+                if ((uint)tokens[i] >= (uint)Plan.VocabSize)
                 {
-                    throw new ArgumentException($"token id {tokens[i]} at index {i} is outside the vocabulary of {Desc.VocabSize}.", nameof(tokens));
+                    throw new ArgumentException($"token id {tokens[i]} at index {i} is outside the vocabulary of {Plan.VocabSize}.", nameof(tokens));
                 }
 
                 _backend.DequantRow(embRef, tokens[i], cur.AsSpan(i * hidden, hidden));
@@ -492,7 +488,7 @@ public sealed class TransformerModel : IDisposable
 
             int chunkCount = (n + EncodeChunkTokens - 1) / EncodeChunkTokens;
 
-            for (int l = 0; l < Desc.LayerCount; l++)
+            for (int l = 0; l < Plan.LayerCount; l++)
             {
                 // Phase 1: pre-attention norm, QKV GEMVs (+bias), RoPE at absolute positions, and the K/V writes — all
                 // per chunk. Queries stay in qAll so no position's attention runs before every position's K/V exists.
@@ -503,7 +499,7 @@ public sealed class TransformerModel : IDisposable
 
                     for (int i = 0; i < m; i++)
                     {
-                        LayerOps.RmsNormWeighted(cur.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden), _attnNormWeight[l], Desc.EpsRmsNorm, chunkNormed.AsSpan(i * hidden, hidden));
+                        LayerOps.RmsNormWeighted(cur.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden), _attnNormWeight[l], Plan.EpsRmsNorm, chunkNormed.AsSpan(i * hidden, hidden));
                     }
 
                     ReadOnlySpan<byte> bytes = _weights.Resolve(_wq[l]);
@@ -521,8 +517,8 @@ public sealed class TransformerModel : IDisposable
                         AddBias(chunkK.AsSpan(i * kvRegion, kvRegion), _biasK[l]);
                         AddBias(chunkV.AsSpan(i * kvRegion, kvRegion), _biasV[l]);
 
-                        ApplyRopeHeads(chunkQ.AsSpan(i * qkvRegion, qkvRegion), Desc.HeadCount, firstPos + i);
-                        ApplyRopeHeads(chunkK.AsSpan(i * kvRegion, kvRegion), Desc.KvHeadCount, firstPos + i);
+                        ApplyRopeHeads(chunkQ.AsSpan(i * qkvRegion, qkvRegion), Plan.HeadCount, firstPos + i);
+                        ApplyRopeHeads(chunkK.AsSpan(i * kvRegion, kvRegion), Plan.KvHeadCount, firstPos + i);
 
                         int position = c * EncodeChunkTokens + i; // sequence-relative index into the streams
                         kv.WriteK(basePosition + position, l, chunkK.AsSpan(i * kvRegion, kvRegion));
@@ -544,9 +540,9 @@ public sealed class TransformerModel : IDisposable
                         queryCount: m,
                         fromPosition: 0,
                         toPosition: basePosition + n - 1,
-                        Desc.HeadCount,
-                        Desc.KvHeadCount,
-                        Desc.HeadDim,
+                        Plan.HeadCount,
+                        Plan.KvHeadCount,
+                        Plan.HeadDim,
                         kv,
                         l,
                         attnScale,
@@ -572,7 +568,7 @@ public sealed class TransformerModel : IDisposable
                             posCur[x] += proj[x];
                         }
 
-                        LayerOps.RmsNormWeighted(posCur, _ffnNormWeight[l], Desc.EpsRmsNorm, normed.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden));
+                        LayerOps.RmsNormWeighted(posCur, _ffnNormWeight[l], Plan.EpsRmsNorm, normed.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden));
                     }
                 }
 
@@ -616,7 +612,7 @@ public sealed class TransformerModel : IDisposable
             float[] encoded = new float[n * hidden]; // caller-owned result, exact size — pooling helpers consume it row-wise
             for (int i = 0; i < n; i++)
             {
-                LayerOps.RmsNormWeighted(cur.AsSpan(i * hidden, hidden), _outputNormWeight, Desc.EpsRmsNorm, encoded.AsSpan(i * hidden, hidden));
+                LayerOps.RmsNormWeighted(cur.AsSpan(i * hidden, hidden), _outputNormWeight, Plan.EpsRmsNorm, encoded.AsSpan(i * hidden, hidden));
             }
 
             return encoded;
@@ -644,9 +640,9 @@ public sealed class TransformerModel : IDisposable
 
     private void ForwardToken(int tokenId, int position, SequenceKv kv)
     {
-        if ((uint)tokenId >= (uint)Desc.VocabSize)
+        if ((uint)tokenId >= (uint)Plan.VocabSize)
         {
-            throw new ArgumentOutOfRangeException(nameof(tokenId), $"token id {tokenId} is outside the vocabulary of {Desc.VocabSize}.");
+            throw new ArgumentOutOfRangeException(nameof(tokenId), $"token id {tokenId} is outside the vocabulary of {Plan.VocabSize}.");
         }
 
         if (position >= MaxContextTokens)
@@ -657,17 +653,17 @@ public sealed class TransformerModel : IDisposable
 
         // Embedding lookup: one dequantized row of token_embd becomes the layer input stream.
         ReadOnlySpan<byte> embBytes = _weights.Resolve(_tokenEmbd);
-        _backend.DequantRow(new WeightRef(embBytes, _tokenEmbd.Shape, _tokenEmbd.Format), tokenId, _cur.AsSpan(0, Desc.HiddenSize));
+        _backend.DequantRow(new WeightRef(embBytes, _tokenEmbd.Shape, _tokenEmbd.Format), tokenId, _cur.AsSpan(0, Plan.HiddenSize));
 
         kv.Append(); // reserves this position's slot in every layer; WriteK/WriteV address it by logical position
 
-        int hidden = Desc.HiddenSize;
-        float attnScale = 1f / MathF.Sqrt(Desc.HeadDim);
+        int hidden = Plan.HiddenSize;
+        float attnScale = 1f / MathF.Sqrt(Plan.HeadDim);
 
-        for (int l = 0; l < Desc.LayerCount; l++)
+        for (int l = 0; l < Plan.LayerCount; l++)
         {
             // Pre-attention norm on the stream: normed = rmsnorm(cur) * attn_norm weight.
-            LayerOps.RmsNormWeighted(_cur.AsSpan(0, hidden), _attnNormWeight[l], Desc.EpsRmsNorm, _normed);
+            LayerOps.RmsNormWeighted(_cur.AsSpan(0, hidden), _attnNormWeight[l], Plan.EpsRmsNorm, _normed);
 
             ReadOnlySpan<byte> bytes = _weights.Resolve(_wq[l]);
             _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _wq[l].Shape, _wq[l].Format), _q);
@@ -681,19 +677,19 @@ public sealed class TransformerModel : IDisposable
             _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _wv[l].Shape, _wv[l].Format), _v);
             AddBias(_v, _biasV[l]);
 
-            ApplyRopeHeads(_q, Desc.HeadCount, position);
-            ApplyRopeHeads(_k, Desc.KvHeadCount, position);
+            ApplyRopeHeads(_q, Plan.HeadCount, position);
+            ApplyRopeHeads(_k, Plan.KvHeadCount, position);
 
             kv.WriteK(position, l, _k);
             kv.WriteV(position, l, _v);
 
-            LayerOps.CausalAttention(_backend, _q, Desc.HeadCount, Desc.KvHeadCount, Desc.HeadDim, kv, l, position, attnScale, _attnOut);
+            LayerOps.CausalAttention(_backend, _q, Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, position, attnScale, _attnOut);
 
             // Output projection (+bias) into scratch; the residual added before the FFN norm is the pre-attention
             // stream value (ffn_inp = attn_out + inpSA), matching the reference graph. cur held that stream through
             // attention untouched, so adding proj in place turns it into ffn_inp.
             bytes = _weights.Resolve(_wo[l]);
-            _backend.Gemv(_attnOut.AsSpan(0, Desc.HeadCount * Desc.HeadDim), new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _proj);
+            _backend.Gemv(_attnOut.AsSpan(0, Plan.HeadCount * Plan.HeadDim), new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _proj);
             AddBias(_proj, _biasO[l]);
 
             for (int i = 0; i < hidden; i++)
@@ -701,7 +697,7 @@ public sealed class TransformerModel : IDisposable
                 _cur[i] += _proj[i];
             }
 
-            LayerOps.RmsNormWeighted(_cur.AsSpan(0, hidden), _ffnNormWeight[l], Desc.EpsRmsNorm, _normed);
+            LayerOps.RmsNormWeighted(_cur.AsSpan(0, hidden), _ffnNormWeight[l], Plan.EpsRmsNorm, _normed);
 
             bytes = _weights.Resolve(_ffnGate[l]);
             _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _ffnGate[l].Shape, _ffnGate[l].Format), _gateUp);
@@ -710,13 +706,13 @@ public sealed class TransformerModel : IDisposable
             _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _ffnUp[l].Shape, _ffnUp[l].Format), _up);
 
             // act = silu(gate) * up with silu(x) = x / (1 + exp(-x)), applied in place on the gate buffer.
-            for (int i = 0; i < Desc.IntermediateSize; i++)
+            for (int i = 0; i < Plan.IntermediateSize; i++)
             {
                 _gateUp[i] = LayerOps.Silu(_gateUp[i]) * _up[i];
             }
 
             bytes = _weights.Resolve(_ffnDown[l]);
-            _backend.Gemv(_gateUp.AsSpan(0, Desc.IntermediateSize), new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _proj);
+            _backend.Gemv(_gateUp.AsSpan(0, Plan.IntermediateSize), new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _proj);
 
             for (int i = 0; i < hidden; i++)
             {
@@ -724,7 +720,7 @@ public sealed class TransformerModel : IDisposable
             }
         }
 
-        LayerOps.RmsNormWeighted(_cur.AsSpan(0, hidden), _outputNormWeight, Desc.EpsRmsNorm, _normed);
+        LayerOps.RmsNormWeighted(_cur.AsSpan(0, hidden), _outputNormWeight, Plan.EpsRmsNorm, _normed);
 
         LogicalTensor lmHead = _output ?? _tokenEmbd; // tied weights reuse the token-embedding rows as logits
         ReadOnlySpan<byte> headBytes = _weights.Resolve(lmHead);
@@ -745,7 +741,7 @@ public sealed class TransformerModel : IDisposable
         for (int h = 0; h < headCount; h++)
         {
             // Pairs are relative to each head's own region.
-            LayerOps.ApplyRopeToHead(data.Slice(h * Desc.HeadDim, Desc.HeadDim), _ropeHalf, cosAtPosition, sinAtPosition);
+            LayerOps.ApplyRopeToHead(data.Slice(h * Plan.HeadDim, Plan.HeadDim), _ropeHalf, cosAtPosition, sinAtPosition);
         }
     }
 
@@ -762,23 +758,23 @@ public sealed class TransformerModel : IDisposable
         }
     }
 
-    private LogicalTensor[] LoadMatrices(int layers, string suffix)
+    private LogicalTensor[] LoadMatrices(int layers, TensorRole role)
     {
         LogicalTensor[] tensors = new LogicalTensor[layers];
         for (int l = 0; l < layers; l++)
         {
-            tensors[l] = RequireTensor(suffix, $"blk.{l}.{suffix}");
+            tensors[l] = RequireTensor(role, l);
         }
 
         return tensors;
     }
 
-    private float[][] LoadLayerVectors(int layers, string suffix, int expectedLength)
+    private float[][] LoadLayerVectors(int layers, TensorRole role, int expectedLength)
     {
         float[][] vectors = new float[layers][];
         for (int l = 0; l < layers; l++)
         {
-            LogicalTensor tensor = RequireTensor(suffix, $"blk.{l}.{suffix}");
+            LogicalTensor tensor = RequireTensor(role, l);
             vectors[l] = LoadVector(tensor, expectedLength);
         }
 
@@ -829,18 +825,20 @@ public sealed class TransformerModel : IDisposable
         }
     }
 
-    private LogicalTensor RequireTensor(string suffix, string name)
+    private LogicalTensor RequireTensor(TensorRole role, int layer = -1)
     {
-        return _fileTensors.Find(name) ?? throw new ModelException(
-            $"tensor '{name}' is missing: required by architecture '{Desc.Architecture}'");
+        TensorDescriptor descriptor = Plan.Tensors[role];
+        return descriptor.Resolve(_fileTensors, layer) ?? throw new ModelException(
+            $"tensor '{descriptor.NameFor(layer)}' is missing: required by architecture '{Plan.Architecture}'");
     }
 
-    private float[]?[] LoadOptionalBias(int layers, string suffix, long expectedLength)
+    private float[]?[] LoadOptionalBias(int layers, TensorRole role, long expectedLength)
     {
+        TensorDescriptor descriptor = Plan.Tensors[role];
         float[]?[] biases = new float[layers][]; // null entries for absent bias tensors
         for (int l = 0; l < layers; l++)
         {
-            LogicalTensor? tensor = _fileTensors.Find($"blk.{l}.{suffix}");
+            LogicalTensor? tensor = descriptor.Resolve(_fileTensors, l);
             if (tensor is not null)
             {
                 biases[l] = LoadVector(tensor, checked((int)expectedLength));

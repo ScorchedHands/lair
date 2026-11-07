@@ -368,9 +368,9 @@ public sealed class GenerationService : IDisposable
             model = TransformerModel.Open(file, backend, reservedSlots);
             pool = new BlockPool(
                 blockTokens,
-                model.Desc.LayerCount,
-                model.Desc.KvHeadCount,
-                model.Desc.HeadDim,
+                model.Plan.LayerCount,
+                model.Plan.KvHeadCount,
+                model.Plan.HeadDim,
                 modelConfig.KvBlocks,
                 backend);
 
@@ -416,8 +416,8 @@ public sealed class GenerationService : IDisposable
                 maxContext,
                 modelConfig.KvBlocks,
                 DominantQuant(file),
-                model.Desc.Architecture,
-                model.Desc.VocabSize);
+                model.Plan.Architecture,
+                model.Plan.VocabSize);
 
             GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, logger, pool, scheduler, info, config);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses

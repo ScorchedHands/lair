@@ -538,7 +538,7 @@ GGUF tokenizer variants load through load-time tokenizer profiles instead of har
 
 - [✓] Automated Tokenizer: profile selection, per-key metadata coverage, and pinned `/tokenize` oracle parity for every supported profile. Verify: `dotnet test --filter Category=Tokenizer -c Release` — 42/42 passed; full suite 737/737.
 
-### MVP3.4 [v0.3.4] - Refined
+### MVP3.4 [v0.3.4] - In Progress
 
 Dense GGUF architecture families load through a load-time profile registry that produces a concrete model plan, instead of hardcoded `TransformerModel` assumptions.
 
@@ -571,7 +571,8 @@ Dense GGUF architecture families load through a load-time profile registry that 
 
 #### Implementation Items
 
-- [_] Model plan and profile registry — replace `ModelDesc`'s supported-architecture list with a profile registry that produces the resolved plan (tensor map with aliases and optional entries, norm/activation/bias/geometry/RoPE strategies), and re-express `llama` and `qwen2` as profiles with no behavior change (see DN-M34-1, DN-M34-3).
+- [✓] Model plan and profile registry — replace `ModelDesc`'s supported-architecture list with a profile registry that produces the resolved plan (tensor map with aliases and optional entries, norm/activation/bias/geometry/RoPE strategies), and re-express `llama` and `qwen2` as profiles with no behavior change (see DN-M34-1, DN-M34-3).
+  - Verify: `dotnet test --filter Category=Loader|Layers -c Release` — Loader 19 (10 new plan-resolution cases), Layers 23 unchanged. `dotnet test --filter Category=Parity|Serve -c Release` — 30/30 unchanged against the SmolLM and Llama-3.2 goldens. Full suite 747/747. `ModelDesc` survives as a thin view over the plan because 12 test call sites and ~12 test files read `model.Desc.*`.
   - Verify: `dotnet test --filter Category=Loader|Layers -c Release` green with new registry goldens; `dotnet test --filter Category=Parity|Serve -c Release` unchanged against the existing SmolLM and Llama-3.2 goldens.
 - [_] Generic llama-shaped fallback profile — accept an unknown `general.architecture` only when the tensor table matches the llama-shaped map exactly; otherwise reject naming the missing and unexpected tensors (see DN-M34-2).
   - Verify: `dotnet test --filter Category=Loader -c Release` — a synthetic GGUF with an unknown architecture name and a complete llama tensor table loads and produces logits identical to the same tensors declared as `llama`; a near-miss table (one renamed or missing tensor) fails naming that tensor.
@@ -592,15 +593,11 @@ Dense GGUF architecture families load through a load-time profile registry that 
 
 #### Tests
 
-- [_] Automated Model Plan: profile selection per architecture, tensor-map and alias resolution, optional-tensor handling, generic fallback accept and near-miss rejection, unsupported declared-key diagnostics. Verify: `dotnet test --filter Category=Loader -c Release`.
+- [→] Automated Model Plan: profile selection per architecture, tensor-map and alias resolution, optional-tensor handling, generic fallback accept and near-miss rejection, unsupported declared-key diagnostics. Verify: `dotnet test --filter Category=Loader -c Release`. (Profile selection, tensor-map/alias/optional resolution, and registry-sourced rejection landed with the plan item — Loader 19; generic fallback and declared-key diagnostics pending.)
 - [_] Automated Layer Strategies: LayerNorm, GELU, GELU-tanh, GEGLU, QK-norm, head-length independence, and both logit caps against scalar references, with existing RMSNorm/SwiGLU regression unchanged. Verify: `dotnet test --filter Category=Layers -c Release`.
 - [_] Automated Qwen3 Parity: dense Qwen3 output parity vs pinned llama.cpp within documented tolerance. Verify: `dotnet test --filter Category=Parity -c Release`.
 - [_] Automated Gemma-2 Parity: dense Gemma-2 output parity vs pinned llama.cpp within documented tolerance. Verify: `dotnet test --filter Category=Parity -c Release`.
 - [_] Manual Family Serve: serve the pinned Qwen3 and Gemma-2 fixtures through `/v1/chat/completions` and `/ui`, confirm coherent multi-turn output, and confirm the monitor reports the resolved architecture, quant, and working set. Verify: live two-turn exchange per model plus a monitor reading.
-
-#### Open Items
-
-- [_] **Family fixture selection** — exact published Qwen3 and Gemma-2 GGUF files (quant and size) that satisfy the 4 GB budget and are supported by pinned b12032; settle at the start of `/plan-build mvp3.4` before the parity items.
 
 ### MVP3.5 [v0.3.5] - Tentative
 
@@ -996,3 +993,4 @@ Vision input on chat models.
 - **2026-11-06 — Pre-splits classify by Unicode code point, settled by the new `/tokenize` goldens.** The committed oracle harness (`Category=Tokenizer`) failed on astral text: UTF-16 `char` classification treated an emoji's surrogate pair as undefined, so a leading space was not folded into the run (`"a 😀"` → `81,216,10813,242,218` against the reference's `81,40303,218`), and the llama-bpe symbol fold additionally required the space itself to be a symbol, which made space+symbol folding unreachable for `llama-bpe`. Both splits now classify and advance by code point (`CharUnicodeInfo.GetUnicodeCategory(string, int)` plus a surrogate-pair length check — deliberately not grapheme clusters, which could straddle an offset boundary and desynchronize the UTF-16 slicing). Merge logic, byte maps, and decode were untouched: the defect was pre-split only.
 - **2026-11-07 — MVP3.4 refined: hybrid family-plus-metadata resolution, plan-not-switch.** Architecture compatibility resolves at load through a profile registry that produces an immutable plan (tensor map with aliases, norm/activation/bias/geometry/RoPE strategies, caps, sparse-FFN descriptor) — the shipped tokenizer-profile pattern, not llama.cpp's `switch (arch)`. An unknown `general.architecture` is accepted only on an exact llama-shaped tensor-table match; anything else fails naming the tensors. Metadata becomes the contract: `attention.use_bias`, `head_length`, activation and cap keys are honored or rejected at load, replacing today's tensor-presence bias rule and the blanket `rope.scaling.*` rejection. Family order is fixture-driven under the 4 GB budget: `llama`/`qwen2` re-expressed, then `qwen3` (QK-norm, head-length), then `gemma2` (GELU-tanh, two softcaps); Phi waits for MVP3.7's RoPE scaling and Gemma-3/Mistral wait for MVP3.8's windowed attention.
 - **2026-11-07 — MoE execution moves to a new MVP3.8; MVP6 keeps residency.** MVP3.4 makes sparse FFN representable in the plan and rejects MoE at load with an actionable deferred message. MVP3.8 executes dense-resident MoE (router, top-k with renormalize, shared expert, per-expert FFN) and sliding-window/local attention — the two architecture shapes that need new execution patterns rather than new scalar ops. MVP6 keeps Flash-Next residency, prefetch, PLE, MTP, and GDN/QSA, so `IGatherKernel` arrives there as an optimization of an already-proven sparse path. Sequencing 3.4 → 3.5 → 3.6 → 3.7 → 3.8 keeps MoE dependent on the plan (3.4), the quant formats MoE GGUFs ship in (3.6), and the rope variants those models declare (3.7).
+- **2026-11-07 — MVP3.4 family fixtures settled.** Qwen3-0.6B (F16 preferred, Q4_K_M fallback) and Gemma-2-2B-it Q4_K_M: both fit the 4 GB model budget (Gemma-2-2B F16 at ~4.4 GB does not), and the pinned b12032 `llama.dll` carries the `qwen3`, `gemma2`, `gemma3`, `phi3`, and `mistral` architecture names — verified by scanning the shipped binaries — so the oracle can serve every family MVP3.4 through MVP3.8 targets. Gemma-2 stays at Q4_K_M, which puts it under the quantized-parity tolerance rule rather than the F16 band.

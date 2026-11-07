@@ -462,7 +462,7 @@ public sealed class GenerationScheduler : IDisposable
             // pool's limit surfaces here — as the only failure point of the step.
             Span<float> logits = _model.DecodeBatch(_windowTokens, _windowKvs);
 
-            int vocab = _model.Desc.VocabSize;
+            int vocab = _model.Plan.VocabSize;
             for (int i = 0; i < count; i++)
             {
                 Sequence sequence = window[start + i];
