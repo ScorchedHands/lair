@@ -603,37 +603,11 @@ Dense GGUF architecture families load through a load-time profile registry that 
 
 ### MVP3.5 [v0.3.5] - Tentative
 
-Tool-call and model output formats are handled by load-time parser registries instead of the static fenced-JSON detector.
-
-#### Design Notes
-
-- **DN-M35-1** — Output parsing is a registry selected at model load from architecture, chat-template capabilities, and explicit config overrides. Built-in parsers may implement fenced JSON plus native model-family tool formats; selection happens before serving, not per-token in the decode loop.
-  - Rationale: general GGUF compatibility requires recognizing more than LAIR’s MVP2 fenced-JSON fallback. Model families emit different tool/reasoning markup, and parser behavior must be attributable to the loaded model rather than inferred from raw text.
-  - Rejected: a single static detector for all models; per-token parser dispatch during decode; separate libraries per parser family without packaging need.
-  - Contract: `lair.http`/`lair.models` request pipeline consumes a resolved output-parser plan and preserves OpenAI wire shape.
-
-#### Implementation Items
-
-- [_] Tool-call parser registry — define the parser interface and selection path; move current fenced-JSON detection behind a built-in parser implementation.
-  - Verify: `dotnet test --filter Category=Api|ToolCalls` — existing tool wire tests remain green under the registry.
-- [_] Native output parser families — add parser implementations for model-native tool/reasoning formats as templates and fixtures require them.
-  - Verify: `dotnet test --filter Category=ToolCalls` — parser goldens for each supported family; visible text stripping and OpenAI `tool_calls` deltas verified.
-
-#### Tests
-
-- [_] Automated ToolCalls: parser selection, native tool-call goldens, reasoning-tag stripping, streaming delta compatibility.
-
-#### Open Items
-
-- [_] **Parser selection metadata** — whether selection comes from architecture name, template capabilities, GGUF metadata, or explicit config; settle in `/plan-refine mvp3.5`.
-
-### MVP3.6 [v0.3.6] - Tentative
-
 Published GGUF quant families are accepted through a load-time quant descriptor/kernel registry while CPU kernels remain concrete and performance-sensitive.
 
 #### Design Notes
 
-- **DN-M36-1** — Quant compatibility is split into a load-time descriptor/registry and concrete kernel implementations. The registry owns GGML type acceptance, block geometry, row strides, and loader diagnostics; kernels stay concrete in `lair.backends.cpu` or backend-specific code paths.
+- **DN-M35-1** — Quant compatibility is split into a load-time descriptor/registry and concrete kernel implementations. The registry owns GGML type acceptance, block geometry, row strides, and loader diagnostics; kernels stay concrete in `lair.backends.cpu` or backend-specific code paths.
   - Rationale: quant formats are performance-critical and must preserve bit-identity/parity behavior. A registry makes loader support extensible without introducing dynamic interface dispatch in GEMV/GEMM loops.
   - Rejected: per-row `IQuantKernel` dispatch in hot paths; separate libraries per quant format without packaging need; loader acceptance without kernel parity gates.
   - Contract: `lair.loader` and `lair.contracts` resolve quant descriptors at load; backends execute concrete kernels for the selected formats.
@@ -652,7 +626,33 @@ Published GGUF quant families are accepted through a load-time quant descriptor/
 
 #### Open Items
 
-- [_] **Quant priority list** — which common quants enter MVP3.6 versus remaining in MVP5.1/backlog; settle in `/plan-refine mvp3.6`.
+- [_] **Quant priority list** — which common quants enter MVP3.5 versus remaining in MVP5.1/backlog; settle in `/plan-refine mvp3.5`.
+
+### MVP3.6 [v0.3.6] - Tentative
+
+Tool-call and model output formats are handled by load-time parser registries instead of the static fenced-JSON detector.
+
+#### Design Notes
+
+- **DN-M36-1** — Output parsing is a registry selected at model load from architecture, chat-template capabilities, and explicit config overrides. Built-in parsers may implement fenced JSON plus native model-family tool formats; selection happens before serving, not per-token in the decode loop.
+  - Rationale: general GGUF compatibility requires recognizing more than LAIR’s MVP2 fenced-JSON fallback. Model families emit different tool/reasoning markup, and parser behavior must be attributable to the loaded model rather than inferred from raw text.
+  - Rejected: a single static detector for all models; per-token parser dispatch during decode; separate libraries per parser family without packaging need.
+  - Contract: `lair.http`/`lair.models` request pipeline consumes a resolved output-parser plan and preserves OpenAI wire shape.
+
+#### Implementation Items
+
+- [_] Tool-call parser registry — define the parser interface and selection path; move current fenced-JSON detection behind a built-in parser implementation.
+  - Verify: `dotnet test --filter Category=Api|ToolCalls` — existing tool wire tests remain green under the registry.
+- [_] Native output parser families — add parser implementations for model-native tool/reasoning formats as templates and fixtures require them.
+  - Verify: `dotnet test --filter Category=ToolCalls` — parser goldens for each supported family; visible text stripping and OpenAI `tool_calls` deltas verified.
+
+#### Tests
+
+- [_] Automated ToolCalls: parser selection, native tool-call goldens, reasoning-tag stripping, streaming delta compatibility.
+
+#### Open Items
+
+- [_] **Parser selection metadata** — whether selection comes from architecture name, template capabilities, GGUF metadata, or explicit config; settle in `/plan-refine mvp3.6`.
 
 ### MVP3.7 [v0.3.7] - Tentative
 
@@ -996,3 +996,4 @@ Vision input on chat models.
 - **2026-11-07 — MVP3.4 refined: hybrid family-plus-metadata resolution, plan-not-switch.** Architecture compatibility resolves at load through a profile registry that produces an immutable plan (tensor map with aliases, norm/activation/bias/geometry/RoPE strategies, caps, sparse-FFN descriptor) — the shipped tokenizer-profile pattern, not llama.cpp's `switch (arch)`. An unknown `general.architecture` is accepted only on an exact llama-shaped tensor-table match; anything else fails naming the tensors. Metadata becomes the contract: `attention.use_bias`, `head_length`, activation and cap keys are honored or rejected at load, replacing today's tensor-presence bias rule and the blanket `rope.scaling.*` rejection. Family order is fixture-driven under the 4 GB budget: `llama`/`qwen2` re-expressed, then `qwen3` (QK-norm, head-length), then `gemma2` (GELU-tanh, two softcaps); Phi waits for MVP3.7's RoPE scaling and Gemma-3/Mistral wait for MVP3.8's windowed attention.
 - **2026-11-07 — MoE execution moves to a new MVP3.8; MVP6 keeps residency.** MVP3.4 makes sparse FFN representable in the plan and rejects MoE at load with an actionable deferred message. MVP3.8 executes dense-resident MoE (router, top-k with renormalize, shared expert, per-expert FFN) and sliding-window/local attention — the two architecture shapes that need new execution patterns rather than new scalar ops. MVP6 keeps Flash-Next residency, prefetch, PLE, MTP, and GDN/QSA, so `IGatherKernel` arrives there as an optimization of an already-proven sparse path. Sequencing 3.4 → 3.5 → 3.6 → 3.7 → 3.8 keeps MoE dependent on the plan (3.4), the quant formats MoE GGUFs ship in (3.6), and the rope variants those models declare (3.7).
 - **2026-11-07 — MVP3.4 family fixtures settled.** Qwen3-0.6B (F16 preferred, Q4_K_M fallback) and Gemma-2-2B-it Q4_K_M: both fit the 4 GB model budget (Gemma-2-2B F16 at ~4.4 GB does not), and the pinned b12032 `llama.dll` carries the `qwen3`, `gemma2`, `gemma3`, `phi3`, and `mistral` architecture names — verified by scanning the shipped binaries — so the oracle can serve every family MVP3.4 through MVP3.8 targets. Gemma-2 stays at Q4_K_M, which puts it under the quantized-parity tolerance rule rather than the F16 band.
+- **2026-11-07 — MVP3.5 and MVP3.6 swapped: quant formats before output parsers.** The quant descriptor/kernel registry now runs as MVP3.5 and the tool-call parser registry as MVP3.6. Quant formats are the binding constraint on the families MVP3.4 adds (published Qwen3 and Gemma-2 files are consumed at Q4_K_M, and MVP3.8's MoE models ship in IQ-class formats), while output-format parsing is a serving-layer concern that no other MVP3 phase depends on. Design content is unchanged; only the phase numbers and DN ids moved (`DN-M35-1` is now the quant seam, `DN-M36-1` the parser seam).
