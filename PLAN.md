@@ -560,14 +560,18 @@ Dense GGUF architecture families load through a load-time profile registry that 
   - Rationale: the pinned llama.cpp build is the parity oracle (DN-M33-5). Parity requires reading the same keys and failing visibly where LAIR has no implementation yet.
   - Rejected: honoring tensor presence only (current bias behavior mis-states intent and silently accepts a model that declares no bias); ignoring unrecognized keys (silently wrong math); implementing every declared feature before any family is proven against the oracle.
   - Contract: `lair.loader` exposes typed metadata accessors for these keys; plan resolution reports an unsupported declared key as a load failure naming key, value, and family.
-- **DN-M34-5** — Family order is fixture-driven under the 4 GB model budget: `llama` and `qwen2` are re-expressed as profiles with byte-identical behavior, then `qwen3` (per-head QK-norm, `head_length`, declared bias), then Gemma-2 (GELU-tanh FFN, attention and final-logit softcaps, `head_length`). Phi is deferred until RoPE scaling exists (MVP3.7) because its metadata declares it, and Gemma-3 is deferred with sliding-window attention to MVP3.8.
-  - Rationale: each added family must prove a primitive the previous families did not (QK-norm and head-length independence; then a different activation and two caps) and must be verifiable against the pinned oracle on a file this box can actually load.
-  - Rejected: adding families that repeat already-proven primitives; Phi-3 in this phase (needs `phi3.rope.scaling.*`, which is MVP3.7 work); Mistral in this phase (its distinguishing feature is sliding-window attention, deferred to MVP3.8); families with no sub-4 GB published quant.
+- **DN-M34-5** — Family order is fixture-driven under the 4 GB model budget: `llama` and `qwen2` are re-expressed as profiles with byte-identical behavior, then `qwen3` (per-head QK-norm, `head_length`, declared bias), then Gemma-2 (GELU-tanh FFN, attention and final-logit softcaps, `head_length`). Phi is deferred until RoPE scaling exists (MVP3.7) because its metadata declares it, and Gemma-3 stays deferred to MVP3.8 for its per-layer windowed/full attention interleave.
+  - Rationale: each added family must prove a primitive the previous families did not (QK-norm and head-length independence; then a different activation, two caps, and a declared attention window) and must be verifiable against the pinned oracle on a file this box can actually load.
+  - Rejected: adding families that repeat already-proven primitives; Phi-3 in this phase (needs `phi3.rope.scaling.*`, which is MVP3.7 work); Mistral in this phase (its distinguishing feature is window-local KV reads and interleave, deferred to MVP3.8); families with no sub-4 GB published quant.
   - Contract: each family lands with a pinned model file (sha256 recorded in its parity fixture) plus synthetic layer fixtures; `Category=Parity` and `Category=Layers` are the gates.
 - **DN-M34-6** — MoE is representable in MVP3.4 and executable in MVP3.8. The plan carries a sparse-FFN descriptor (expert count, per-expert tensor map, shared expert, router tensors) and the loader recognizes MoE metadata and tensors, but a MoE model fails at load with an actionable message naming sparse execution as deferred.
   - Rationale: retrofitting a sparse-FFN descriptor into a plan that has already shipped three families is expensive; executing MoE before its gather/residency design is measurable is worse. MVP6 keeps Flash-Next residency, prefetch, PLE, and MTP.
   - Rejected: executing MoE in this phase with all experts resident (no gather design, no fixture under the RAM budget); leaving MoE invisible in the plan (retrofit later); pulling Flash-Next residency forward into MVP3.
   - Contract: the plan's sparse-FFN descriptor is present and validated in MVP3.4; `IGatherKernel` and expert residency land in MVP3.8/MVP6.
+- **DN-M34-7** — A declared attention window is honored as a score mask with full KV retention. `<arch>.attention.sliding_window` becomes a plan value; each attention path excludes positions further back than the window, while the KV cache still stores every position. The KV-layout half of windowed attention — bounded KV reads, per-layer windowed/full interleave, and cache-reuse accounting — stays in MVP3.8.
+  - Rationale: the pinned Gemma-2 file declares `gemma2.attention.sliding_window = 4096` and the pinned oracle applies that mask, so loading Gemma-2 in this phase without the mask would silently mis-state the math, which DN-M34-4 forbids. The pinned reference itself keeps full KV and masks scores, so the mask is the part that carries parity; the bounded-read optimization changes memory behavior, not output.
+  - Rejected: rejecting Gemma-2 for declaring a window (blocks a family this phase exists to prove); loading it and ignoring the declaration (silently wrong beyond the window); pulling bounded KV reads and interleave into this phase (a KV-block design concern with no parity requirement at fixture context sizes).
+  - Contract: `lair.models` resolves the window into the plan and applies it in every attention path; `lair.kv` layout consequences land in MVP3.8.
 
 #### Implementation Items
 
@@ -586,12 +590,15 @@ Dense GGUF architecture families load through a load-time profile registry that 
 - [✓] Logit caps — attention-score softcap and final-logit softcap as plan values applied in the attention and output-head paths (see DN-M34-3).
   - Verify: `dotnet test --filter Category=Layers -c Release` — 77/77: softcap scalar goldens against a double-precision `cap * tanh(x / cap)` reference (near-identity, exact `±cap`, saturating magnitudes), a synthetic model whose attention-capped logits differ from uncapped and match a scalar reference forward through decode/batch/`Encode`, a final-capped model with logits provably inside `±cap`, batched vs single-step bit-identical under both caps, and the tied-embedding path honoring the cap. `Category=Loader` 54/54: absent keys resolve disabled, declared values resolve exactly, non-positive/NaN/infinite/out-of-float-range values reject naming key and value; `llama`/`qwen2`/`llama-generic` stay uncapped and `Category=Parity|Serve` stays 30/30. Full suite 836/836. `Encode` returns hidden states, so the final-logit cap applies only in the two paths that produce logits.
   - Verify: `dotnet test --filter Category=Layers -c Release` — softcap goldens against a scalar reference, plus a synthetic model whose capped and uncapped logits differ as expected.
-- [_] Qwen3 dense family — a `qwen3` profile wiring QK-norm, `head_length`, and declared bias behavior, with synthetic layer fixtures and real-model parity (see DN-M34-5).
+- [_] Sliding-window score masking — resolve `<arch>.attention.sliding_window` into the plan and exclude positions beyond the window from every attention path, with full KV retention (see DN-M34-7).
+  - Verify: `dotnet test --filter Category=Layers -c Release` — windowed goldens against a scalar reference showing that positions past the window contribute nothing, a window at or beyond the sequence length matching the unmasked result exactly, and `Category=Parity|Serve` unchanged.
+- [→] Qwen3 dense family — a `qwen3` profile wiring QK-norm, `head_length`, and declared bias behavior, with synthetic layer fixtures and real-model parity (see DN-M34-5).
   - Verify: `dotnet test --filter Category=Layers|Parity -c Release` — Qwen3 layer goldens plus real-model parity against pinned b12032 within the documented tolerance.
 - [_] Gemma-2 dense family — a `gemma2` profile wiring GELU-tanh FFN, attention and final-logit softcaps, and `head_length`, with synthetic layer fixtures and real-model parity (see DN-M34-5).
   - Verify: `dotnet test --filter Category=Layers|Parity -c Release` — Gemma-2 layer goldens plus real-model parity against pinned b12032 within the documented tolerance.
 - [_] Family fixture set — pin one Qwen3 and one Gemma-2 GGUF that fit the 4 GB model budget, record their sha256 in the new parity fixtures, and regenerate goldens with `scripts/generate-parity.ps1` (see DN-M34-5).
   - Verify: `pwsh -File scripts/generate-parity.ps1 -ModelPath models/<qwen3-file> -Out tests/fixtures/parity-qwen3.json` and the Gemma-2 equivalent each write a guarded fixture, and `dotnet test --filter Category=Parity -c Release` passes them.
+  - Pinned: `models/Qwen3-0.6B-Q8_0.gguf` (609,800 KB, sha256 `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`, from `Qwen/Qwen3-0.6B-GGUF`) and `models/gemma-2-2b-it.Q4_K_M.gguf` (1,629,000 KB, sha256 `ff7c35808d3b2fc5c4f955ca931efdec71c0808b9ec89a9878cb771608787058`, from `mradermacher/gemma-2-2b-it-GGUF`). Both load under the pinned b12032 loader and report `qwen3` (28 layers, 1024 hidden, 16/8 heads, 128 key/value length) and `gemma2` (26 layers, 2304 hidden, 8/4 heads, 256 key/value length, caps 50/30, window 4096).
 - [_] MoE descriptor without execution — the plan carries the sparse-FFN descriptor and the loader recognizes MoE metadata and tensor names, failing at load with an actionable deferred-execution message (see DN-M34-6).
   - Verify: `dotnet test --filter Category=Loader -c Release` — a synthetic MoE GGUF resolves its descriptor and fails with a message naming sparse execution as deferred to MVP3.8, rather than failing on a missing dense FFN tensor.
 
@@ -692,8 +699,8 @@ Sparse and windowed architectures execute: dense-resident MoE decoding and slidi
   - Rationale: proving sparse-FFN math against a dense-equivalent reference needs no residency machinery, and doing it before MVP6 turns `IGatherKernel` from a new concept into an optimization of a proven path.
   - Rejected (preliminary): expert streaming or hot/cold tiers here (that is MVP6's measured design); MoE-only gather kernels before a correctness baseline.
   - Contract: `lair.models` executes the sparse-FFN descriptor resolved by the MVP3.4 plan; `Category=Moe` correctness goldens.
-- **DN-M38-2** *(tentative)* — Sliding-window/local attention is a plan value with a KV-layout consequence: windowed layers read a bounded KV range, some families interleave windowed and full-attention layers per layer index, and prompt-cache reuse must stay correct under windowed reads.
-  - Rationale: Mistral and Gemma-3 are unusable without it, and the window interacts with the paged KV block design (DN-M2-4) rather than being an attention-loop constant.
+- **DN-M38-2** *(tentative)* — The KV-layout half of windowed attention: bounded KV reads, per-layer windowed/full interleave, and prompt-cache reuse under windowed reads. The score-mask half — honoring a declared window by excluding out-of-range positions while keeping full KV — already ships in MVP3.4 (DN-M34-7); this note covers what changes once KV stops storing every position.
+  - Rationale: Mistral and Gemma-3 are unusable without bounded reads and interleave, and the window interacts with the paged KV block design (DN-M2-4) rather than being an attention-loop constant.
   - Rejected (preliminary): treating the window as an attention-kernel parameter only (ignores block reuse and KV budget accounting).
   - Contract: plan carries per-layer window and interleave pattern; `lair.kv` block selection honors it.
 
@@ -701,18 +708,45 @@ Sparse and windowed architectures execute: dense-resident MoE decoding and slidi
 
 - [_] MoE execution — router, top-k with renormalize, shared expert, per-expert FFN accumulation (see DN-M38-1)
   - Verify: `dotnet test --filter Category=Moe -c Release` — sparse-FFN output matches a dense-equivalent reference; a real MoE fixture (if a sub-4 GB file exists) matches pinned b12032 within tolerance.
-- [_] Sliding-window attention — per-layer window and windowed/full interleave with correct KV block selection and cache reuse (see DN-M38-2)
-  - Verify: `dotnet test --filter Category=Layers|Cache -c Release` — windowed attention goldens against a scalar reference; prompt-cache reuse stays correct across windowed and full layers.
+- [_] Windowed KV layout — bounded KV reads, per-layer windowed/full interleave, and correct KV block selection and cache reuse on top of the shipped score mask (see DN-M38-2)
+  - Verify: `dotnet test --filter Category=Layers|Cache -c Release` — windowed logits match the full-KV reference while block selection reads only the in-window range, and prompt-cache reuse stays correct across windowed and full layers.
 
 #### Tests
 
 - [_] Automated Moe: router/top-k/shared-expert correctness vs dense-equivalent math.
-- [_] Automated Windowed Attention: window bounds, interleave patterns, KV block selection, and cache-reuse correctness.
+- [_] Automated Windowed KV: interleave patterns, KV block selection, and cache-reuse correctness.
 
 #### Open Items
 
 - [_] **MoE fixture** — no published MoE GGUF currently fits the 4 GB model budget; decide between synthetic-MoE goldens only and a budget exception for one real MoE file.
 - [_] **Family order vs MVP6** — whether Mistral/Gemma-3 land here or wait for the MVP6 measurement gate; settle in `/plan-refine mvp3.8`.
+
+### MVP3.9 [v0.3.9] - Tentative
+
+Token budgets are configured per model: a reasoning budget and a response budget, each overridable per request.
+
+#### Design Notes
+
+- **DN-M39-1** *(tentative)* — Two budgets per model, `max_reasoning_tokens` and `max_response_tokens`, set per model in `lair.yaml` and overridable per request. The scheduler reserves against both, the decode loop stops at the reasoning ceiling while a recognized reasoning region is open, and the visible response is bounded by the response budget.
+  - Rationale: today one `max_tokens` (default 128, clamped to the context) covers every emitted token, so a thinking model can spend the whole budget on reasoning and return nothing visible, and a model with no reasoning path has no way to cap reasoning markup. Budgets belong to the loaded model because the ceiling is a property of the model's output style, not of each request.
+  - Rejected (preliminary): a single combined budget (visible output starves); per-token heuristics that guess reasoning without a resolved parser; a server-wide setting with no per-model override.
+  - Contract: `lair.yaml` model entries and `lair.http` request fields resolve into one budget pair consumed by `lair.models` scheduling; the OpenAI wire shape stays compatible with documented extension fields.
+
+#### Implementation Items
+
+- [_] Per-model budget configuration — model-level `max_reasoning_tokens` and `max_response_tokens` defaults with load-time validation and a documented default when absent.
+  - Verify: `dotnet test --filter Category=Config|Api -c Release` — model entries resolve both budgets, invalid values fail at load naming the model and the key.
+- [_] Budget enforcement in scheduling and decode — the scheduler reserves blocks against both budgets, decode honors the reasoning ceiling, the response budget bounds visible tokens, and a request override clamps to the model ceiling.
+  - Verify: `dotnet test --filter Category=Scheduling|Api -c Release` — reservation math, reasoning-ceiling stop, response-ceiling stop, and override clamping goldens.
+
+#### Tests
+
+- [_] Automated Token Budgets: per-model defaults, request overrides, reasoning and response ceiling behavior, and KV reservation math.
+
+#### Open Items
+
+- [_] **Wire field names** — whether the budgets ride on `max_tokens` plus extension fields or on dedicated request names; settle in `/plan-refine mvp3.9`.
+- [_] **Reasoning-region dependency** — whether MVP3.9 must follow the MVP3.6 parser registry, since a reasoning ceiling needs a resolved reasoning region rather than a guess; settle in `/plan-refine mvp3.9`.
 
 ### MVP4 [v0.4.0] - Refined
 
@@ -999,3 +1033,6 @@ Vision input on chat models.
 - **2026-11-07 — MoE execution moves to a new MVP3.8; MVP6 keeps residency.** MVP3.4 makes sparse FFN representable in the plan and rejects MoE at load with an actionable deferred message. MVP3.8 executes dense-resident MoE (router, top-k with renormalize, shared expert, per-expert FFN) and sliding-window/local attention — the two architecture shapes that need new execution patterns rather than new scalar ops. MVP6 keeps Flash-Next residency, prefetch, PLE, MTP, and GDN/QSA, so `IGatherKernel` arrives there as an optimization of an already-proven sparse path. Sequencing 3.4 → 3.5 → 3.6 → 3.7 → 3.8 keeps MoE dependent on the plan (3.4), the quant formats MoE GGUFs ship in (3.6), and the rope variants those models declare (3.7).
 - **2026-11-07 — MVP3.4 family fixtures settled.** Qwen3-0.6B (F16 preferred, Q4_K_M fallback) and Gemma-2-2B-it Q4_K_M: both fit the 4 GB model budget (Gemma-2-2B F16 at ~4.4 GB does not), and the pinned b12032 `llama.dll` carries the `qwen3`, `gemma2`, `gemma3`, `phi3`, and `mistral` architecture names — verified by scanning the shipped binaries — so the oracle can serve every family MVP3.4 through MVP3.8 targets. Gemma-2 stays at Q4_K_M, which puts it under the quantized-parity tolerance rule rather than the F16 band.
 - **2026-11-07 — MVP3.5 and MVP3.6 swapped: quant formats before output parsers.** The quant descriptor/kernel registry now runs as MVP3.5 and the tool-call parser registry as MVP3.6. Quant formats are the binding constraint on the families MVP3.4 adds (published Qwen3 and Gemma-2 files are consumed at Q4_K_M, and MVP3.8's MoE models ship in IQ-class formats), while output-format parsing is a serving-layer concern that no other MVP3 phase depends on. Design content is unchanged; only the phase numbers and DN ids moved (`DN-M35-1` is now the quant seam, `DN-M36-1` the parser seam).
+- **2026-11-07 — Sliding-window score masking moves into MVP3.4; the KV-layout half stays in MVP3.8.** The pinned Gemma-2 fixture declares `gemma2.attention.sliding_window = 4096` and the pinned b12032 oracle applies that mask, so honoring the metadata contract (DN-M34-4) means LAIR must mask scores before Gemma-2 can be claimed as supported. The mask is the part that carries parity — the reference itself keeps full KV — so MVP3.4 resolves the window into the plan and masks out-of-range positions, while bounded KV reads, per-layer windowed/full interleave, and cache-reuse accounting remain MVP3.8 (DN-M34-7, DN-M38-2). Rejected instead: rejecting Gemma-2 for declaring a window, or loading it and ignoring the declaration.
+- **2026-11-07 — MVP3.9 added: per-model reasoning and response token budgets.** No phase covered token budgets and nothing is implemented beyond a single per-request `max_tokens` (default 128, clamped to the context). MVP3.9 makes `max_reasoning_tokens` and `max_response_tokens` per-model settings with per-request overrides, enforced by the scheduler and the decode loop. Its reasoning ceiling depends on a resolved reasoning region, so it is sequenced after the MVP3.6 parser registry.
+- **2026-11-07 — MVP3.4 family fixtures pinned as downloaded.** `models/Qwen3-0.6B-Q8_0.gguf` (609,800 KB, sha256 `9465e63a…3bb031`) from `Qwen/Qwen3-0.6B-GGUF`, and `models/gemma-2-2b-it.Q4_K_M.gguf` (1,629,000 KB, sha256 `ff7c3580…8787058`) from `mradermacher/gemma-2-2b-it-GGUF`. Qwen3 lands at Q8_0 rather than F16 because the upstream GGUF repo publishes only Q8_0 for 0.6B, and the Gemma-2 mirror is ungated where the `google/`, `unsloth/`, and `ggml-org/` Gemma-2 GGUF repos require license acceptance. Both load under the pinned b12032 loader and report the expected architecture and geometry.
