@@ -465,6 +465,8 @@ public sealed class LayerTests : IDisposable
             using CpuBackend backendA = new(threads: 2, allowAvx2: true);
             using TransformerModel model = TransformerModel.Open(ggufA, backendA, maxContextTokens: 8);
 
+            Assert.Equal(NormStrategy.RmsNorm, model.Plan.Norm);
+            Assert.Equal(ActivationStrategy.SwiGLU, model.Plan.Activation);
             Assert.False(model.Desc.HasOutputWeights); // tied path selected from the tensor table
 
             using BlockPool pool = new(blockTokens: 4, layerCount: model.Desc.LayerCount, kvHeads: model.Desc.KvHeadCount, headDim: model.Desc.HeadDim, capacityBlocks: 8, backendA);

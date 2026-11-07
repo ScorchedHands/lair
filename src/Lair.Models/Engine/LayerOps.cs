@@ -6,8 +6,8 @@ namespace Lair.Models.Engine;
 /// <summary>
 /// The pure numeric operations of the transformer forward pass, isolated so each can be verified against
 /// hand-computed values independently of any model file. RoPE uses GGUF/llama-style adjacent pairs (2i, 2i + 1)
-/// with theta_i = base^(-2i/headDim); RMSNorm accumulates in double; attention runs an online softmax over the paged
-/// KV cache so no score row is ever materialized.
+/// with theta_i = base^(-2i/headDim); RMSNorm and LayerNorm accumulate in double; attention runs an online softmax
+/// over the paged KV cache so no score row is ever materialized.
 /// </summary>
 internal static class LayerOps
 {
@@ -32,8 +32,140 @@ internal static class LayerOps
         }
     }
 
+    /// <summary>
+    /// LayerNorm with weight and optional bias: dst[i] = (src[i] - mean) / sqrt(var + eps) * w[i] (+ b[i] when a
+    /// bias is supplied). Mean and population variance (divided by the element count) accumulate in double, the
+    /// convention shared by the reference LayerNorm implementations.
+    /// </summary>
+    internal static void LayerNormWeighted(ReadOnlySpan<float> src, ReadOnlySpan<float> weight, ReadOnlySpan<float> bias, float eps, Span<float> dst)
+    {
+        if (weight.Length != src.Length || dst.Length < src.Length)
+        {
+            throw new ArgumentException("LayerNorm operands must all cover the same element count.", nameof(weight));
+        }
+
+        if (!bias.IsEmpty && bias.Length != src.Length)
+        {
+            throw new ArgumentException("LayerNorm bias must cover the same element count as the input.", nameof(bias));
+        }
+
+        double sum = 0.0;
+        for (int i = 0; i < src.Length; i++)
+        {
+            sum += src[i];
+        }
+
+        double mean = sum / src.Length;
+
+        double sumSqDev = 0.0;
+        for (int i = 0; i < src.Length; i++)
+        {
+            double deviation = src[i] - mean;
+            sumSqDev += deviation * deviation;
+        }
+
+        double invStd = 1.0 / Math.Sqrt(sumSqDev / src.Length + eps);
+        for (int i = 0; i < src.Length; i++)
+        {
+            double value = (src[i] - mean) * invStd * weight[i];
+            if (!bias.IsEmpty)
+            {
+                value += bias[i];
+            }
+
+            dst[i] = (float)value;
+        }
+    }
+
     /// <summary>SiLU activation: x / (1 + exp(-x)).</summary>
     internal static float Silu(float x) => x / (1f + MathF.Exp(-x));
+
+    /// <summary>
+    /// Exact GELU: 0.5 * x * (1 + erf(x / sqrt(2))), evaluated in double and rounded once to float.
+    /// </summary>
+    internal static float Gelu(float x) => (float)(0.5 * (double)x * (1.0 + Erf((double)x / Math.Sqrt(2.0))));
+
+    /// <summary>
+    /// Tanh-approximated GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))), evaluated in double and
+    /// rounded once to float — the approximation the dense families pair with <c>gelu_tanh</c> gated feed-forward blocks.
+    /// </summary>
+    internal static float GeluTanh(float x)
+    {
+        double d = x;
+        return (float)(0.5 * d * (1.0 + Math.Tanh(Math.Sqrt(2.0 / Math.PI) * (d + 0.044715 * d * d * d))));
+    }
+
+    /// <summary>
+    /// Error function in double precision: Cephes rational poles — a quartic-over-quintic pole for |x| <= 1, an
+    /// eighth-degree pole times exp(-x^2) for 1 &lt; |x| &lt; 8, and a fifth-degree pole beyond 8 — with absolute
+    /// error at the ~1e-15 level across the whole real line (|x| >= 26 saturates to ±1, where the true value is
+    /// within 1e-300 of it).
+    /// </summary>
+    internal static double Erf(double x)
+    {
+        if (Math.Abs(x) > 1.0)
+        {
+            return 1.0 - ErfComplement(x);
+        }
+
+        double z = x * x;
+        double numerator = PolynomialEvaluate(z, ErfSmallT);
+        double denominator = MonicPolynomialEvaluate(z, ErfSmallU);
+        return x * (numerator / denominator);
+    }
+
+    // Cephes erf pole for |x| <= 1: T(z) / U(z) * x with z = x^2, U monic.
+    private static readonly double[] ErfSmallT = [9.60497373987051638749E0, 9.00260197203842689217E1, 2.23200534594684319226E3, 7.00332514112805075473E3, 5.55923013010394962768E4];
+    private static readonly double[] ErfSmallU = [3.35617141647503099647E1, 5.21357949780152679795E2, 4.59432382970980127987E3, 2.26290000613890934246E4, 4.92673942608635921086E4];
+
+    // Cephes erfc poles for |x| > 1: exp(-x^2) * P(x)/Q(x) below 8 and R(x)/S(x) from 8 up, Q and S monic.
+    private static readonly double[] ErfComplementP = [2.46196981473530512524E-10, 5.64189564831068821977E-1, 7.46321056442269912687E0, 4.86371970985681366614E1, 1.96520832956077098242E2, 5.26445194995477358631E2, 9.34528527171957607540E2, 1.02755188689515710272E3, 5.57535335369399327526E2];
+    private static readonly double[] ErfComplementQ = [1.32281951154744992508E1, 8.67072140885989742329E1, 3.54937778887819891062E2, 9.75708501743205489753E2, 1.82390916687909736289E3, 2.24633760818710981792E3, 1.65666309194161350182E3, 5.57535340817727675546E2];
+    private static readonly double[] ErfComplementR = [5.64189583547755073984E-1, 1.27536670759978104416E0, 5.01905042251180477414E0, 6.16021097993053585195E0, 7.40974269950448939160E0, 2.97886665372100240670E0];
+    private static readonly double[] ErfComplementS = [2.26052863220117276590E0, 9.39603524938001434673E0, 1.20489539808096656605E1, 1.70814450747565897222E1, 9.60896809063285878198E0, 3.36907645100081516050E0];
+
+    // |x| at which erfc underflows the double range: erf is 1 to within 1e-300 well before this point.
+    private const double ErfComplementSaturation = 26.0;
+
+    private static double ErfComplement(double x)
+    {
+        double magnitude = Math.Abs(x);
+        if (magnitude >= ErfComplementSaturation)
+        {
+            return x >= 0.0 ? 0.0 : 2.0;
+        }
+
+        double ratio = magnitude < 8.0
+            ? PolynomialEvaluate(magnitude, ErfComplementP) / MonicPolynomialEvaluate(magnitude, ErfComplementQ)
+            : PolynomialEvaluate(magnitude, ErfComplementR) / MonicPolynomialEvaluate(magnitude, ErfComplementS);
+
+        double value = ratio * Math.Exp(-magnitude * magnitude);
+        return x >= 0.0 ? value : 2.0 - value;
+    }
+
+    // Horner evaluation of c[0] * x^degree + c[1] * x^(degree-1) + ... + c[degree].
+    private static double PolynomialEvaluate(double x, double[] coefficients)
+    {
+        double accumulator = coefficients[0];
+        for (int i = 1; i < coefficients.Length; i++)
+        {
+            accumulator = accumulator * x + coefficients[i];
+        }
+
+        return accumulator;
+    }
+
+    // Horner evaluation of the monic polynomial x^degree + c[0] * x^(degree-1) + ... + c[degree-1].
+    private static double MonicPolynomialEvaluate(double x, double[] coefficients)
+    {
+        double accumulator = x + coefficients[0];
+        for (int i = 1; i < coefficients.Length; i++)
+        {
+            accumulator = accumulator * x + coefficients[i];
+        }
+
+        return accumulator;
+    }
 
     /// <summary>
     /// Fills position-major cos/sin tables for standard full-head RoPE up to maxPositions. Each position stores

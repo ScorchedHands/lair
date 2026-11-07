@@ -57,6 +57,32 @@ public static class ModelPlans
             ValidateLlamaShapedTable(profile.Tensors, architecture, gguf.Tensors);
         }
 
+        return ResolveWithProfile(gguf, profile, architecture, fallback, logLine);
+    }
+
+    /// <summary>
+    /// Resolves a GGUF file against an explicitly supplied profile instead of the registry selection: the
+    /// profile's prefix supplies every metadata key and its strategy values land in the plan. No fallback gate
+    /// or architecture-name check runs; the declared <c>general.architecture</c> value is recorded as-is.
+    /// </summary>
+    internal static ModelPlan Resolve(GgufFile gguf, ModelProfile profile, Action<string>? logLine = null)
+    {
+        ArgumentNullException.ThrowIfNull(gguf);
+        ArgumentNullException.ThrowIfNull(profile);
+
+        if (!gguf.Metadata.Has("general.architecture"))
+        {
+            throw new ModelException("GGUF metadata key 'general.architecture' is not present");
+        }
+
+        return ResolveWithProfile(gguf, profile, gguf.Metadata.Get("general.architecture").AsString(), fallback: false, logLine);
+    }
+
+    // Shared resolution body: geometry under the profile's prefix, the standard-RoPE-only gates, and the plan's
+    // strategy values straight from the profile.
+    private static ModelPlan ResolveWithProfile(GgufFile gguf, ModelProfile profile, string architecture, bool fallback, Action<string>? logLine)
+    {
+        GgufMetadata metadata = gguf.Metadata;
         string prefix = profile.Prefix;
 
         foreach (string key in metadata.Keys)

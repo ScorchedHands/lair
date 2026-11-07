@@ -7,15 +7,16 @@ using Lair.Loader;
 namespace Lair.Models.Engine;
 
 /// <summary>
-/// Forward engine for supported GGUF architectures (llama, qwen2): embedding lookup, per-layer RMSNorm / GQA
-/// attention with RoPE and paged KV via <see cref="SequenceKv"/>, SwiGLU feed-forward, final norm, and an untied
+/// Forward engine for supported GGUF architectures (llama, qwen2): embedding lookup, per-layer norm / GQA
+/// attention with RoPE and paged KV via <see cref="SequenceKv"/>, gated feed-forward, final norm, and an untied
 /// output matrix or tied token-embedding rows for logits. The graph mirrors the reference structure: each layer
-/// normalizes its input stream (rmsnorm x weight) before the QKV GEMVs; RoPE rotates q/k adjacent pairs (2i, 2i+1) at
-/// the absolute position with theta_i = base^(-2i/headDim); attention scores scale by 1/sqrt(headDim) and softmax
-/// runs online over positions 0..pos. The residual added before the FFN norm is the pre-attention stream value,
-/// matching the reference graph's ffn_inp add; rope scaling variants are not supported. FP32 buffers are allocated
-/// once at Open and reused across calls; packed matrix rows are consumed through <see cref="WeightRef"/> without
-/// being materialized, except for embedding lookups and small norm/bias vectors preloaded at Open.
+/// normalizes its input stream (norm x weight under the plan's resolved norm strategy) before the QKV GEMVs; RoPE
+/// rotates q/k adjacent pairs (2i, 2i+1) at the absolute position with theta_i = base^(-2i/headDim); attention
+/// scores scale by 1/sqrt(headDim) and softmax runs online over positions 0..pos. The residual added before the
+/// FFN norm is the pre-attention stream value, matching the reference graph's ffn_inp add; rope scaling variants
+/// are not supported. FP32 buffers are allocated once at Open and reused across calls; packed matrix rows are
+/// consumed through <see cref="WeightRef"/> without being materialized, except for embedding lookups and small
+/// norm/bias vectors preloaded at Open.
 /// </summary>
 public sealed class TransformerModel : IDisposable
 {
@@ -56,13 +57,13 @@ public sealed class TransformerModel : IDisposable
 
     // FP32 buffers reused across every forward call.
     private readonly float[] _cur;     // hidden: layer input stream (residual carrier) and FFN output accumulator
-    private readonly float[] _normed;  // hidden: weighted rmsnorm before the QKV / FFN GEMVs
+    private readonly float[] _normed;  // hidden: weighted norm before the QKV / FFN GEMVs
     private readonly float[] _q;       // headCount * headDim
     private readonly float[] _k;       // kvHeads * headDim (also the KV slot write source)
     private readonly float[] _v;       // kvHeads * headDim
     private readonly float[] _attnOut; // headCount * headDim: heads concatenated in order for wo GEMV
     private readonly float[] _proj;    // hidden: attn_output / ffn_down GEMV target before the residual add
-    private readonly float[] _gateUp;  // intermediateSize: gate result, then silu(gate) * up written back into it
+    private readonly float[] _gateUp;  // intermediateSize: gate result, then activation(gate) * up written back into it
     private readonly float[] _up;      // intermediateSize: up GEMV result
     private readonly float[] _logits;  // vocabSize
 
@@ -121,14 +122,22 @@ public sealed class TransformerModel : IDisposable
     public static TransformerModel Open(GgufFile file, IWeightSource weights, IBackend backend, int maxContextTokens, Action<string>? logLine) =>
         new(file, backend, maxContextTokens, weights, logLine);
 
-    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null)
+    /// <summary>
+    /// Opens the engine with an explicitly supplied <see cref="ModelProfile"/> resolving the plan instead of the
+    /// registry selection: the profile's prefix supplies every metadata key and its strategy values drive the
+    /// forward. Assembly-internal so no host configuration path can reach it.
+    /// </summary>
+    internal static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens, ModelProfile profile) =>
+        new(file, backend, maxContextTokens, weights: null, logLine: null, profile);
+
+    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(backend);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxContextTokens);
 
         _backend = backend;
-        Plan = ModelPlans.Resolve(file, logLine);
+        Plan = profileOverride is null ? ModelPlans.Resolve(file, logLine) : ModelPlans.Resolve(file, profileOverride, logLine);
         Desc = Plan.ToDesc();
         MaxContextTokens = maxContextTokens;
         _ownsWeights = weights is null;
@@ -245,8 +254,8 @@ public sealed class TransformerModel : IDisposable
     /// <summary>
     /// Advances up to <see cref="MaxBatchSequences"/> sequences by one token each in a single step: every dense
     /// weight matrix (attention q/k/v/o, feed-forward gate/up/down, lm_head) is traversed once for the whole batch
-    /// through <see cref="IBackend.GemvBatch"/>, while norms, RoPE, causal attention, and SwiGLU stay per-sequence
-    /// because each sequence attends over its own KV history. Each sequence appends at its own <see cref="SequenceKv.Length"/>
+    /// through <see cref="IBackend.GemvBatch"/>, while norms, RoPE, causal attention, and the gated activation stay
+    /// per-sequence because each sequence attends over its own KV history. Each sequence appends at its own <see cref="SequenceKv.Length"/>
     /// position, exactly as <see cref="DecodeNext"/> would, and every batched result is bit-identical to stepping that
     /// sequence alone. Sequences must belong to the paged KV pool this engine's forwards write into. The returned
     /// logits are owned by the model — valid until the next forward call — laid out as
@@ -315,7 +324,7 @@ public sealed class TransformerModel : IDisposable
             // Pre-attention norm per sequence: identical op to the single-token forward.
             for (int s = 0; s < n; s++)
             {
-                LayerOps.RmsNormWeighted(_batchCur.AsSpan(s * hidden, hidden), _attnNormWeight[l], Plan.EpsRmsNorm, _batchNormed.AsSpan(s * hidden, hidden));
+                ApplyNorm(_batchCur.AsSpan(s * hidden, hidden), _attnNormWeight[l], _batchNormed.AsSpan(s * hidden, hidden));
             }
 
             // One weight pass per matrix for the whole batch; each sequence's row result matches its single-vector GEMV.
@@ -358,7 +367,7 @@ public sealed class TransformerModel : IDisposable
                     cur[i] += proj[i];
                 }
 
-                LayerOps.RmsNormWeighted(cur, _ffnNormWeight[l], Plan.EpsRmsNorm, _batchNormed.AsSpan(s * hidden, hidden));
+                ApplyNorm(cur, _ffnNormWeight[l], _batchNormed.AsSpan(s * hidden, hidden));
             }
 
             bytes = _weights.Resolve(_ffnGate[l]);
@@ -367,15 +376,10 @@ public sealed class TransformerModel : IDisposable
             bytes = _weights.Resolve(_ffnUp[l]);
             _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, new WeightRef(bytes, _ffnUp[l].Shape, _ffnUp[l].Format), _batchUp.AsSpan(0, n * inter));
 
-            // act = silu(gate) * up in place on each sequence's gate buffer.
+            // act = activation(gate) * up in place on each sequence's gate buffer.
             for (int s = 0; s < n; s++)
             {
-                Span<float> gateUp = _batchGateUp.AsSpan(s * inter, inter);
-                ReadOnlySpan<float> up = _batchUp.AsSpan(s * inter, inter);
-                for (int i = 0; i < inter; i++)
-                {
-                    gateUp[i] = LayerOps.Silu(gateUp[i]) * up[i];
-                }
+                ApplyActivation(_batchGateUp.AsSpan(s * inter, inter), _batchUp.AsSpan(s * inter, inter));
             }
 
             bytes = _weights.Resolve(_ffnDown[l]);
@@ -395,7 +399,7 @@ public sealed class TransformerModel : IDisposable
 
         for (int s = 0; s < n; s++)
         {
-            LayerOps.RmsNormWeighted(_batchCur.AsSpan(s * hidden, hidden), _outputNormWeight, Plan.EpsRmsNorm, _batchNormed.AsSpan(s * hidden, hidden));
+            ApplyNorm(_batchCur.AsSpan(s * hidden, hidden), _outputNormWeight, _batchNormed.AsSpan(s * hidden, hidden));
         }
 
         LogicalTensor lmHead = _output ?? _tokenEmbd; // tied weights reuse the token-embedding rows as logits
@@ -423,7 +427,8 @@ public sealed class TransformerModel : IDisposable
     /// Encoder-only forward: runs the whole token sequence through every layer with full-sequence (bidirectional)
     /// attention — each query position scores against all positions of its own sequence's KV contents instead of a
     /// causal prefix — and returns the final hidden states after the output norm, without lm_head logits. Per-position
-    /// norms, RoPE at absolute positions, biases, residuals, and SwiGLU are exactly the decode-path operations; K/V for
+    /// norms, RoPE at absolute positions, biases, residuals, and the gated activation are exactly the decode-path
+    /// operations; K/V for
     /// every position is appended to <paramref name="kv"/> as usual (positions start at <see cref="SequenceKv.Length"/>,
     /// so encoding a fresh sequence keeps each token attending only to its own sequence). Dense matrices are traversed
     /// once per chunk of up to <see cref="EncodeChunkTokens"/> positions via <see cref="IBackend.GemvBatch"/>; every
@@ -515,7 +520,7 @@ public sealed class TransformerModel : IDisposable
 
                     for (int i = 0; i < m; i++)
                     {
-                        LayerOps.RmsNormWeighted(cur.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden), _attnNormWeight[l], Plan.EpsRmsNorm, chunkNormed.AsSpan(i * hidden, hidden));
+                        ApplyNorm(cur.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden), _attnNormWeight[l], chunkNormed.AsSpan(i * hidden, hidden));
                     }
 
                     ReadOnlySpan<byte> bytes = _weights.Resolve(_wq[l]);
@@ -584,11 +589,11 @@ public sealed class TransformerModel : IDisposable
                             posCur[x] += proj[x];
                         }
 
-                        LayerOps.RmsNormWeighted(posCur, _ffnNormWeight[l], Plan.EpsRmsNorm, normed.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden));
+                        ApplyNorm(posCur, _ffnNormWeight[l], normed.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden));
                     }
                 }
 
-                // Phase 4: gate/up GEMVs and SwiGLU per chunk.
+                // Phase 4: gate/up GEMVs and the gated activation per chunk.
                 for (int c = 0; c < chunkCount; c++)
                 {
                     int m = Math.Min(EncodeChunkTokens, n - c * EncodeChunkTokens);
@@ -601,12 +606,7 @@ public sealed class TransformerModel : IDisposable
 
                     for (int i = 0; i < m; i++)
                     {
-                        Span<float> gateUp = chunkGateUp.AsSpan(i * inter, inter);
-                        ReadOnlySpan<float> up = chunkUp.AsSpan(i * inter, inter);
-                        for (int x = 0; x < inter; x++)
-                        {
-                            gateUp[x] = LayerOps.Silu(gateUp[x]) * up[x];
-                        }
+                        ApplyActivation(chunkGateUp.AsSpan(i * inter, inter), chunkUp.AsSpan(i * inter, inter));
                     }
 
                     // Phase 5: down GEMV and the ffn_out residual add, completing this layer for every position.
@@ -628,7 +628,7 @@ public sealed class TransformerModel : IDisposable
             float[] encoded = new float[n * hidden]; // caller-owned result, exact size — pooling helpers consume it row-wise
             for (int i = 0; i < n; i++)
             {
-                LayerOps.RmsNormWeighted(cur.AsSpan(i * hidden, hidden), _outputNormWeight, Plan.EpsRmsNorm, encoded.AsSpan(i * hidden, hidden));
+                ApplyNorm(cur.AsSpan(i * hidden, hidden), _outputNormWeight, encoded.AsSpan(i * hidden, hidden));
             }
 
             return encoded;
@@ -679,7 +679,7 @@ public sealed class TransformerModel : IDisposable
         for (int l = 0; l < Plan.LayerCount; l++)
         {
             // Pre-attention norm on the stream: normed = rmsnorm(cur) * attn_norm weight.
-            LayerOps.RmsNormWeighted(_cur.AsSpan(0, hidden), _attnNormWeight[l], Plan.EpsRmsNorm, _normed);
+            ApplyNorm(_cur.AsSpan(0, hidden), _attnNormWeight[l], _normed);
 
             ReadOnlySpan<byte> bytes = _weights.Resolve(_wq[l]);
             _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _wq[l].Shape, _wq[l].Format), _q);
@@ -713,7 +713,7 @@ public sealed class TransformerModel : IDisposable
                 _cur[i] += _proj[i];
             }
 
-            LayerOps.RmsNormWeighted(_cur.AsSpan(0, hidden), _ffnNormWeight[l], Plan.EpsRmsNorm, _normed);
+            ApplyNorm(_cur.AsSpan(0, hidden), _ffnNormWeight[l], _normed);
 
             bytes = _weights.Resolve(_ffnGate[l]);
             _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _ffnGate[l].Shape, _ffnGate[l].Format), _gateUp);
@@ -721,11 +721,8 @@ public sealed class TransformerModel : IDisposable
             bytes = _weights.Resolve(_ffnUp[l]);
             _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _ffnUp[l].Shape, _ffnUp[l].Format), _up);
 
-            // act = silu(gate) * up with silu(x) = x / (1 + exp(-x)), applied in place on the gate buffer.
-            for (int i = 0; i < Plan.IntermediateSize; i++)
-            {
-                _gateUp[i] = LayerOps.Silu(_gateUp[i]) * _up[i];
-            }
+            // act = activation(gate) * up with the plan's resolved activation, applied in place on the gate buffer.
+            ApplyActivation(_gateUp.AsSpan(0, Plan.IntermediateSize), _up.AsSpan(0, Plan.IntermediateSize));
 
             bytes = _weights.Resolve(_ffnDown[l]);
             _backend.Gemv(_gateUp.AsSpan(0, Plan.IntermediateSize), new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _proj);
@@ -736,7 +733,7 @@ public sealed class TransformerModel : IDisposable
             }
         }
 
-        LayerOps.RmsNormWeighted(_cur.AsSpan(0, hidden), _outputNormWeight, Plan.EpsRmsNorm, _normed);
+        ApplyNorm(_cur.AsSpan(0, hidden), _outputNormWeight, _normed);
 
         LogicalTensor lmHead = _output ?? _tokenEmbd; // tied weights reuse the token-embedding rows as logits
         ReadOnlySpan<byte> headBytes = _weights.Resolve(lmHead);
@@ -771,6 +768,47 @@ public sealed class TransformerModel : IDisposable
         for (int i = 0; i < values.Length; i++)
         {
             values[i] += bias[i];
+        }
+    }
+
+    // Norm and activation run as a direct call chosen from the plan's strategy values: no interface dispatch and
+    // no allocation anywhere in the forward, so every path — single token, batched decode, and encode — applies
+    // the resolved strategy identically.
+    private void ApplyNorm(ReadOnlySpan<float> src, ReadOnlySpan<float> weight, Span<float> dst)
+    {
+        switch (Plan.Norm)
+        {
+            case NormStrategy.RmsNorm:
+                LayerOps.RmsNormWeighted(src, weight, Plan.EpsRmsNorm, dst);
+                break;
+            case NormStrategy.LayerNorm:
+                LayerOps.LayerNormWeighted(src, weight, ReadOnlySpan<float>.Empty, Plan.EpsRmsNorm, dst);
+                break;
+            default:
+                throw new ModelException($"norm strategy '{Plan.Norm}' is not implemented by the forward engine");
+        }
+    }
+
+    private void ApplyActivation(Span<float> gate, ReadOnlySpan<float> up)
+    {
+        switch (Plan.Activation)
+        {
+            case ActivationStrategy.SwiGLU:
+                for (int i = 0; i < gate.Length; i++)
+                {
+                    gate[i] = LayerOps.Silu(gate[i]) * up[i];
+                }
+
+                break;
+            case ActivationStrategy.GeGlu:
+                for (int i = 0; i < gate.Length; i++)
+                {
+                    gate[i] = LayerOps.GeluTanh(gate[i]) * up[i];
+                }
+
+                break;
+            default:
+                throw new ModelException($"activation strategy '{Plan.Activation}' is not implemented by the forward engine");
         }
     }
 

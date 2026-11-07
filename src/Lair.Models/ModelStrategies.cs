@@ -7,8 +7,14 @@ namespace Lair.Models;
 /// </summary>
 public enum NormStrategy
 {
-    /// <summary>RMSNorm scaled by a per-layer weight vector: the only norm implemented today.</summary>
+    /// <summary>RMSNorm scaled by a per-layer weight vector: <c>src / sqrt(mean(src^2) + eps) * weight</c>.</summary>
     RmsNorm,
+
+    /// <summary>
+    /// LayerNorm scaled by a per-layer weight vector and shifted by its bias when one is present:
+    /// <c>(src - mean) / sqrt(var + eps) * weight + bias</c> with population variance over the vector.
+    /// </summary>
+    LayerNorm,
 }
 
 /// <summary>
@@ -18,8 +24,11 @@ public enum NormStrategy
 /// </summary>
 public enum ActivationStrategy
 {
-    /// <summary><c>silu(gate) * up</c>: the only activation implemented today.</summary>
+    /// <summary><c>silu(gate) * up</c>.</summary>
     SwiGLU,
+
+    /// <summary><c>gelu_tanh(gate) * up</c>: the tanh-approximated GELU gate over the same gate/up/down tensor block.</summary>
+    GeGlu,
 }
 
 /// <summary>
