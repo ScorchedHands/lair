@@ -18,7 +18,9 @@ public sealed record ModelDesc(
     float EpsRmsNorm,
     int VocabSize,
     bool HasOutputWeights,
-    string Architecture)
+    string Architecture,
+    float AttentionSoftcap,
+    float FinalLogitSoftcap)
 {
     /// <summary>Supported architecture names, straight from the profile registry.</summary>
     public static IReadOnlyList<string> SupportedArchitectures => [.. ModelProfiles.SupportedArchitectures];

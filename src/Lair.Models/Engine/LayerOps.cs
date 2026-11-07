@@ -112,6 +112,13 @@ internal static class LayerOps
     internal static float Silu(float x) => x / (1f + MathF.Exp(-x));
 
     /// <summary>
+    /// Logit softcap: cap * tanh(x / cap), evaluated in double and rounded once to float. The result stays
+    /// inside [-cap, cap]: the identity for small magnitudes, saturating toward ±cap for large ones. Callers
+    /// branch on a resolved cap and use this only when a cap is enabled.
+    /// </summary>
+    internal static float Softcap(float x, float cap) => (float)((double)cap * Math.Tanh((double)x / (double)cap));
+
+    /// <summary>
     /// Exact GELU: 0.5 * x * (1 + erf(x / sqrt(2))), evaluated in double and rounded once to float.
     /// </summary>
     internal static float Gelu(float x) => (float)(0.5 * (double)x * (1.0 + Erf((double)x / Math.Sqrt(2.0))));
@@ -266,8 +273,10 @@ internal static class LayerOps
 
     /// <summary>
     /// Causal attention for one layer at the current position: head h reads kv-head (h * kvHeadCount / headCount),
-    /// scores are q·k multiplied by attnScale over logical positions 0..position, and softmax runs online with a running
-    /// max/sum. The weighted V accumulation is normalized in place into outConcat (head-major layout).
+    /// scores are q·k multiplied by attnScale — then capped by <see cref="Softcap"/> when softcap is positive —
+    /// over logical positions 0..position, and softmax runs online with a running max/sum. The weighted V
+    /// accumulation is normalized in place into outConcat (head-major layout). A non-positive softcap disables
+    /// the cap: the score path is then exactly the uncapped one.
     /// </summary>
     internal static void CausalAttention(
         IBackend backend,
@@ -279,6 +288,7 @@ internal static class LayerOps
         int layer,
         int position,
         float attnScale,
+        float softcap, // positive enables the score softcap; non-positive disables it
         Span<float> outConcat) // headCount * headDim
     {
         ArgumentNullException.ThrowIfNull(backend);
@@ -303,6 +313,10 @@ internal static class LayerOps
             {
                 ReadOnlySpan<float> kt = kv.ReadK(t, layer).Slice(kvHead * headDim, headDim);
                 float score = backend.Dot(qh, kt) * attnScale;
+                if (softcap > 0f)
+                {
+                    score = Softcap(score, softcap); // after scaling, before the online softmax sees it
+                }
 
                 if (score > runningMax)
                 {
@@ -343,7 +357,8 @@ internal static class LayerOps
     /// Full-sequence attention over one layer's KV contents: every query position attends to all logical positions in
     /// the window instead of just a causal prefix. Queries are given position-major (queryCount * headCount * headDim)
     /// so a whole batch is processed in one pass; each head maps to kv-head (h * kvHeadCount / headCount) and runs the
-    /// same online softmax as <see cref="CausalAttention"/> with its score window widened from [0, position] to
+    /// same online softmax as <see cref="CausalAttention"/>, including its scaled-then-capped score path when
+    /// softcap is positive, with its score window widened from [0, position] to
     /// [fromPosition, toPosition], which must lie inside the sequence's existing KV (<see cref="SequenceKv.Length"/>).
     /// Restricting that window yields a block-local variant used when long sequences are processed in chunks: every
     /// query then sees exactly one contiguous range of positions. With fromPosition == 0 and toPosition == p over a
@@ -362,6 +377,7 @@ internal static class LayerOps
         SequenceKv kv,
         int layer,
         float attnScale,
+        float softcap, // positive enables the score softcap; non-positive disables it
         Span<float> outConcat) // queryCount * headCount * headDim, position-major
     {
         ArgumentNullException.ThrowIfNull(backend);
@@ -401,6 +417,10 @@ internal static class LayerOps
                 {
                     ReadOnlySpan<float> kt = kv.ReadK(t, layer).Slice(kvHead * headDim, headDim);
                     float score = backend.Dot(qh, kt) * attnScale;
+                    if (softcap > 0f)
+                    {
+                        score = Softcap(score, softcap); // after scaling, before the online softmax sees it
+                    }
 
                     if (score > runningMax)
                     {

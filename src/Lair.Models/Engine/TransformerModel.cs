@@ -12,14 +12,17 @@ namespace Lair.Models.Engine;
 /// output matrix or tied token-embedding rows for logits. The graph mirrors the reference structure: each layer
 /// normalizes its input stream (norm x weight under the plan's resolved norm strategy) before the QKV GEMVs; RoPE
 /// rotates q/k adjacent pairs (2i, 2i+1) at the absolute position with theta_i = base^(-2i/headDim); attention
-/// scores scale by 1/sqrt(headDim) and softmax runs online over positions 0..pos. The residual added before the
+/// scores scale by 1/sqrt(headDim), pass through the plan's attention-score softcap when one is resolved, and
+/// softmax runs online over positions 0..pos. The residual added before the
 /// FFN norm is the pre-attention stream value, matching the reference graph's ffn_inp add; rope scaling variants
 /// are not supported. FP32 buffers are allocated once at Open and reused across calls; packed matrix rows are
 /// consumed through <see cref="WeightRef"/> without being materialized, except for embedding lookups and small
 /// norm/bias vectors preloaded at Open. Attention-bias tensors follow the plan's declared policy: under
 /// <see cref="BiasPolicy.Declared"/> the declared <c>use_bias</c> flag makes them required or leaves them
 /// unloaded and unapplied, with one structured log line naming the ignored tensors; a declared per-head QK-norm
-/// normalizes each q and k head with its own weight vector after the projection and before RoPE.
+/// normalizes each q and k head with its own weight vector after the projection and before RoPE. A resolved
+/// final-logit softcap saturates every logit vector — untied output head or tied token-embedding rows — after
+/// the full vector is computed and before any softmax, sampling, or copy-out.
 /// </summary>
 public sealed class TransformerModel : IDisposable
 {
@@ -416,7 +419,7 @@ public sealed class TransformerModel : IDisposable
                 kvs[s].WriteK(positions[s], l, _batchK.AsSpan(s * kvRegion, kvRegion));
                 kvs[s].WriteV(positions[s], l, _batchV.AsSpan(s * kvRegion, kvRegion));
 
-                LayerOps.CausalAttention(_backend, _batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kvs[s], l, positions[s], attnScale, _batchAttnOut.AsSpan(s * qkvRegion, qkvRegion));
+                LayerOps.CausalAttention(_backend, _batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kvs[s], l, positions[s], attnScale, Plan.AttentionSoftcap, _batchAttnOut.AsSpan(s * qkvRegion, qkvRegion));
             }
 
             bytes = _weights.Resolve(_wo[l]);
@@ -480,6 +483,8 @@ public sealed class TransformerModel : IDisposable
                 AddBias(_batchLogits.AsSpan(s * Plan.VocabSize, Plan.VocabSize), _outputBias);
             }
         }
+
+        ApplyFinalLogitSoftcap(_batchLogits.AsSpan(0, n * Plan.VocabSize));
 
         return _batchLogits.AsSpan(0, n * Plan.VocabSize);
     }
@@ -640,6 +645,7 @@ public sealed class TransformerModel : IDisposable
                         kv,
                         l,
                         attnScale,
+                        Plan.AttentionSoftcap,
                         attnOut.AsSpan(c * EncodeChunkTokens * qkvRegion, m * qkvRegion));
                 }
 
@@ -780,7 +786,7 @@ public sealed class TransformerModel : IDisposable
             kv.WriteK(position, l, _k);
             kv.WriteV(position, l, _v);
 
-            LayerOps.CausalAttention(_backend, _q, Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, position, attnScale, _attnOut);
+            LayerOps.CausalAttention(_backend, _q, Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, position, attnScale, Plan.AttentionSoftcap, _attnOut);
 
             // Output projection (+bias) into scratch; the residual added before the FFN norm is the pre-attention
             // stream value (ffn_inp = attn_out + inpSA), matching the reference graph. cur held that stream through
@@ -824,6 +830,8 @@ public sealed class TransformerModel : IDisposable
         {
             AddBias(_logits, _outputBias);
         }
+
+        ApplyFinalLogitSoftcap(_logits);
     }
 
     /// <summary>Rotates every head region of data in place at the given position using the precomputed tables.</summary>
@@ -891,6 +899,24 @@ public sealed class TransformerModel : IDisposable
                 break;
             default:
                 throw new ModelException($"activation strategy '{Plan.Activation}' is not implemented by the forward engine");
+        }
+    }
+
+    // The final-logit softcap runs as a direct branch on the plan's resolved value, the same way the norm and
+    // activation strategies do: a resolved cap of zero is disabled and leaves the vector untouched. It is applied
+    // to every produced logit vector — untied output head or tied token-embedding rows, single-token or batched —
+    // after the full vector including any output bias is computed and before any softmax, sampling, or copy-out.
+    private void ApplyFinalLogitSoftcap(Span<float> logits)
+    {
+        float cap = Plan.FinalLogitSoftcap;
+        if (cap <= 0f)
+        {
+            return;
+        }
+
+        for (int i = 0; i < logits.Length; i++)
+        {
+            logits[i] = LayerOps.Softcap(logits[i], cap);
         }
     }
 

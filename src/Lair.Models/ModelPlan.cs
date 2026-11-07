@@ -16,7 +16,9 @@ namespace Lair.Models;
 /// <c>&lt;prefix&gt;attention.value_length</c> accepted as equivalent sources; the head dimension no longer
 /// has to split the hidden size exactly. The declared feature flags read <c>&lt;prefix&gt;attention.use_bias</c>,
 /// <c>&lt;prefix&gt;attention.norm_bias</c>, and <c>&lt;prefix&gt;attention.use_qk_norm</c>, each defaulting
-/// to <c>false</c> when the key is absent.
+/// to <c>false</c> when the key is absent. The declared softcaps read
+/// <c>&lt;prefix&gt;attn_logit_softcapping</c> and <c>&lt;prefix&gt;final_logit_softcapping</c>, each
+/// resolving to <c>0f</c> (disabled) when the key is absent and to a positive finite number otherwise.
 /// </summary>
 public sealed record ModelPlan
 {
@@ -62,6 +64,12 @@ public sealed record ModelPlan
     /// <summary>Declared <c>&lt;prefix&gt;attention.use_qk_norm</c>: whether q and k heads pass through a per-head RMS norm before RoPE.</summary>
     public required bool HasQkNorm { get; init; }
 
+    /// <summary>Declared <c>&lt;prefix&gt;attn_logit_softcapping</c>: the attention-score softcap applied after scaling and before the softmax, or <c>0f</c> when the key is absent (disabled).</summary>
+    public float AttentionSoftcap { get; init; }
+
+    /// <summary>Declared <c>&lt;prefix&gt;final_logit_softcapping</c>: the final-logit softcap applied after the output-head product and before any softmax or sampling, or <c>0f</c> when the key is absent (disabled).</summary>
+    public float FinalLogitSoftcap { get; init; }
+
     /// <summary>The resolved profile's tensor map: the GGUF names behind every logical tensor role.</summary>
     public required TensorMap Tensors { get; init; }
 
@@ -89,5 +97,7 @@ public sealed record ModelPlan
             EpsRmsNorm,
             VocabSize,
             HasOutputWeights,
-            Architecture);
+            Architecture,
+            AttentionSoftcap,
+            FinalLogitSoftcap);
 }

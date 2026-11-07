@@ -190,6 +190,11 @@ public static class ModelPlans
         bool useNormBias = metadata.GetBool(prefix + "attention.norm_bias", fallback: false);
         bool useQkNorm = metadata.GetBool(prefix + "attention.use_qk_norm", fallback: false);
 
+        // Declared softcaps: an absent key means the cap is disabled (zero). A declared value must land in the
+        // float range as a positive finite number; anything else is a load failure naming the key and value.
+        float attentionSoftcap = ResolveSoftcap(metadata, prefix + "attn_logit_softcapping");
+        float finalLogitSoftcap = ResolveSoftcap(metadata, prefix + "final_logit_softcapping");
+
         int vocab = RequireInt(metadata, prefix + "vocab_size");
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(vocab);
 
@@ -227,6 +232,8 @@ public static class ModelPlans
             UseAttentionBias = useAttentionBias,
             UseNormBias = useNormBias,
             HasQkNorm = useQkNorm,
+            AttentionSoftcap = attentionSoftcap,
+            FinalLogitSoftcap = finalLogitSoftcap,
             Tensors = profile.Tensors,
             Norm = profile.Norm,
             Activation = profile.Activation,
@@ -311,5 +318,36 @@ public static class ModelPlans
         {
             throw new ModelException($"GGUF metadata key '{key}' must be an integer", ex);
         }
+    }
+
+    // Shared softcap resolution: an absent key means disabled (zero). A declared key is read as a double and
+    // must land in the float range as a positive finite number — a non-positive, NaN, infinite, or out-of-range
+    // declaration fails the load with a message naming the key and the declared value.
+    private static float ResolveSoftcap(GgufMetadata metadata, string key)
+    {
+        if (!metadata.Has(key))
+        {
+            return 0f;
+        }
+
+        double declared;
+        try
+        {
+            declared = metadata.Get(key).AsDouble();
+        }
+        catch (GgufException ex)
+        {
+            throw new ModelException($"GGUF metadata key '{key}' must be a number", ex);
+        }
+
+        float cap = (float)declared;
+        if (!float.IsFinite(cap) || cap <= 0f)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declared.ToString(CultureInfo.InvariantCulture)}; " +
+                "softcap values must be positive finite numbers");
+        }
+
+        return cap;
     }
 }
