@@ -538,33 +538,69 @@ GGUF tokenizer variants load through load-time tokenizer profiles instead of har
 
 - [✓] Automated Tokenizer: profile selection, per-key metadata coverage, and pinned `/tokenize` oracle parity for every supported profile. Verify: `dotnet test --filter Category=Tokenizer -c Release` — 42/42 passed; full suite 737/737.
 
-### MVP3.4 [v0.3.4] - Tentative
+### MVP3.4 [v0.3.4] - Refined
 
-Dense GGUF architecture families load through architecture adapters and concrete model-graph plans instead of hardcoded `TransformerModel` assumptions.
+Dense GGUF architecture families load through a load-time profile registry that produces a concrete model plan, instead of hardcoded `TransformerModel` assumptions.
 
 #### Design Notes
 
-- **DN-M34-1** — Architecture support is resolved at model load/plan time. An architecture adapter maps GGUF metadata and tensor names to a concrete execution plan: tensor layout, norm behavior, activation function, attention bias behavior, RoPE strategy, KV shape, and layer graph. Hot-path execution uses the resolved concrete plan, not per-token architecture interface dispatch.
+- **DN-M34-1** — Architecture support is resolved at model load/plan time. A profile maps GGUF metadata and tensor names to a concrete execution plan: tensor map, norm behavior, activation function, attention bias behavior, RoPE strategy, KV shape, and layer graph. Hot-path execution consumes the resolved plan, never an architecture name.
   - Rationale: Qwen3, Gemma, Phi, Mistral, and later MoE variants share dense transformer machinery but differ in tensor naming, norm/activation details, attention variants, and positional encoding. Adapters keep `TransformerModel` from accumulating architecture-specific branches.
-  - Rejected: hardcoded architecture branches in `TransformerModel`; runtime architecture plugins during decode; separate libraries per architecture family without packaging need.
-  - Contract: `lair.models` exposes architecture adapters and produces a concrete model plan consumed by the engine.
+  - Rejected: hardcoded architecture branches in `TransformerModel`; runtime architecture plugins during decode; separate libraries per architecture family without packaging need; llama.cpp's `switch (arch)` in `load_hparams` (same hardcoded-branch posture, and llama.cpp already owns the word "adapter" for LoRA).
+  - Contract: `lair.models` exposes a profile registry and produces a concrete model plan consumed by the engine.
+- **DN-M34-2** — Resolution posture is hybrid: the family profile supplies tensor-name aliases and feature defaults, declared metadata keys override those values, and an unknown `general.architecture` falls back to a generic llama-shaped profile **only** when the tensor table matches exactly. Otherwise the load fails naming the missing or unexpected tensors and keys.
+  - Rationale: family-first alone rejects llama-shaped GGUFs published under unknown or renamed architecture strings; feature-first alone makes tensor presence the contract and lets a missing optional tensor silently change the math. The hybrid keeps actionable failures while widening acceptance.
+  - Rejected: family-first-only (unnecessarily rejects compatible files); feature-first-only (silent mis-detection, no actionable errors); accepting an unknown architecture with a partial tensor match (produces wrong output rather than a clear failure).
+  - Contract: `lair.models` resolves profiles from `general.architecture` with a named generic fallback selected only on exact tensor-table match; the registry is the single source of the rejection message's supported-profile list.
+- **DN-M34-3** — The plan is a resolved immutable value set, not a graph object and not a set of interfaces: tensor map (names, aliases, optional entries), norm strategy (kind, weighting, placement, epsilon source), activation strategy, bias policy, head/KV geometry, RoPE strategy id plus parameters, cap/window values, and a sparse-FFN descriptor. Strategies are enum/struct values resolved once at load, so the forward path stays concrete and dispatch-free.
+  - Rationale: mirrors the shipped tokenizer profile pattern (DN-M33-3) — profiles are load-time factories. LAIR executes forward imperatively, so a ggml-style per-family build graph would be a foreign shape that adds allocation and indirection without benefit.
+  - Rejected: per-token `INorm`/`IActivation` interface dispatch in the hot path; a per-family computation-graph builder (llama.cpp-shaped); growing `ModelDesc` in place (it is a flat scalar record whose unsupported cases are rejections, not values).
+  - Contract: the plan replaces `ModelDesc` as the load product consumed by `TransformerModel.Open` and by `BlockPool` construction.
+- **DN-M34-4** — Metadata is the contract, not tensor presence. Every feature flag the pinned reference honors for a family is read and either honored or rejected at load: `attention.use_bias`, `attention.head_length`/`key_length`/`value_length`, `attention.relax_norms`, activation keys, `rope.type` and `rope.dimension_count`, and cap keys. Today bias behavior is decided purely by tensor presence and `rope.scaling.*` is a blanket rejection; both change here.
+  - Rationale: the pinned llama.cpp build is the parity oracle (DN-M33-5). Parity requires reading the same keys and failing visibly where LAIR has no implementation yet.
+  - Rejected: honoring tensor presence only (current bias behavior mis-states intent and silently accepts a model that declares no bias); ignoring unrecognized keys (silently wrong math); implementing every declared feature before any family is proven against the oracle.
+  - Contract: `lair.loader` exposes typed metadata accessors for these keys; plan resolution reports an unsupported declared key as a load failure naming key, value, and family.
+- **DN-M34-5** — Family order is fixture-driven under the 4 GB model budget: `llama` and `qwen2` are re-expressed as profiles with byte-identical behavior, then `qwen3` (per-head QK-norm, `head_length`, declared bias), then Gemma-2 (GELU-tanh FFN, attention and final-logit softcaps, `head_length`). Phi is deferred until RoPE scaling exists (MVP3.7) because its metadata declares it, and Gemma-3 is deferred with sliding-window attention to MVP3.8.
+  - Rationale: each added family must prove a primitive the previous families did not (QK-norm and head-length independence; then a different activation and two caps) and must be verifiable against the pinned oracle on a file this box can actually load.
+  - Rejected: adding families that repeat already-proven primitives; Phi-3 in this phase (needs `phi3.rope.scaling.*`, which is MVP3.7 work); Mistral in this phase (its distinguishing feature is sliding-window attention, deferred to MVP3.8); families with no sub-4 GB published quant.
+  - Contract: each family lands with a pinned model file (sha256 recorded in its parity fixture) plus synthetic layer fixtures; `Category=Parity` and `Category=Layers` are the gates.
+- **DN-M34-6** — MoE is representable in MVP3.4 and executable in MVP3.8. The plan carries a sparse-FFN descriptor (expert count, per-expert tensor map, shared expert, router tensors) and the loader recognizes MoE metadata and tensors, but a MoE model fails at load with an actionable message naming sparse execution as deferred.
+  - Rationale: retrofitting a sparse-FFN descriptor into a plan that has already shipped three families is expensive; executing MoE before its gather/residency design is measurable is worse. MVP6 keeps Flash-Next residency, prefetch, PLE, and MTP.
+  - Rejected: executing MoE in this phase with all experts resident (no gather design, no fixture under the RAM budget); leaving MoE invisible in the plan (retrofit later); pulling Flash-Next residency forward into MVP3.
+  - Contract: the plan's sparse-FFN descriptor is present and validated in MVP3.4; `IGatherKernel` and expert residency land in MVP3.8/MVP6.
 
 #### Implementation Items
 
-- [_] Architecture adapter registry — replace hardcoded supported-architecture handling with load-time adapters and clearer unsupported-architecture errors.
-  - Verify: `dotnet test --filter Category=Loader|Layers` — supported architecture selection plus unsupported-architecture rejection naming the adapter gap.
-- [_] Qwen3 dense coverage — add Qwen3 dense GGUF support through the adapter model, including head-dim, bias, activation, and RoPE metadata differences.
-  - Verify: `dotnet test --filter Category=Layers|Parity` — Qwen3 layer fixtures and real-model parity within documented tolerance.
+- [_] Model plan and profile registry — replace `ModelDesc`'s supported-architecture list with a profile registry that produces the resolved plan (tensor map with aliases and optional entries, norm/activation/bias/geometry/RoPE strategies), and re-express `llama` and `qwen2` as profiles with no behavior change (see DN-M34-1, DN-M34-3).
+  - Verify: `dotnet test --filter Category=Loader|Layers -c Release` green with new registry goldens; `dotnet test --filter Category=Parity|Serve -c Release` unchanged against the existing SmolLM and Llama-3.2 goldens.
+- [_] Generic llama-shaped fallback profile — accept an unknown `general.architecture` only when the tensor table matches the llama-shaped map exactly; otherwise reject naming the missing and unexpected tensors (see DN-M34-2).
+  - Verify: `dotnet test --filter Category=Loader -c Release` — a synthetic GGUF with an unknown architecture name and a complete llama tensor table loads and produces logits identical to the same tensors declared as `llama`; a near-miss table (one renamed or missing tensor) fails naming that tensor.
+- [_] Norm and activation strategies — resolve norm kind (RMSNorm, LayerNorm) with weighting and epsilon source, and activation kind (SwiGLU/SiLU, GELU, GELU-tanh, GEGLU) in the plan, replacing the hardcoded RMSNorm+SwiGLU pair (see DN-M34-3, DN-M34-4).
+  - Verify: `dotnet test --filter Category=Layers -c Release` — scalar-reference goldens for LayerNorm, GELU, GELU-tanh, and GEGLU against independent double-precision implementations, with existing RMSNorm/SwiGLU goldens unchanged.
+- [_] Geometry, bias policy, and QK-norm — honor `attention.use_bias` and declared norm-bias flags instead of tensor presence, support `attention.head_length` where head dim ≠ `embedding_length / head_count`, and resolve per-head QK-norm tensors (see DN-M34-4).
+  - Verify: `dotnet test --filter Category=Layers -c Release` — synthetic fixtures with head dim independent of hidden/heads and with QK-norm tensors, each asserted against a scalar reference; `Category=Loader` cases assert a declared `use_bias=false` with bias tensors present is honored as declared.
+- [_] Logit caps — attention-score softcap and final-logit softcap as plan values applied in the attention and output-head paths (see DN-M34-3).
+  - Verify: `dotnet test --filter Category=Layers -c Release` — softcap goldens against a scalar reference, plus a synthetic model whose capped and uncapped logits differ as expected.
+- [_] Qwen3 dense family — a `qwen3` profile wiring QK-norm, `head_length`, and declared bias behavior, with synthetic layer fixtures and real-model parity (see DN-M34-5).
+  - Verify: `dotnet test --filter Category=Layers|Parity -c Release` — Qwen3 layer goldens plus real-model parity against pinned b12032 within the documented tolerance.
+- [_] Gemma-2 dense family — a `gemma2` profile wiring GELU-tanh FFN, attention and final-logit softcaps, and `head_length`, with synthetic layer fixtures and real-model parity (see DN-M34-5).
+  - Verify: `dotnet test --filter Category=Layers|Parity -c Release` — Gemma-2 layer goldens plus real-model parity against pinned b12032 within the documented tolerance.
+- [_] Family fixture set — pin one Qwen3 and one Gemma-2 GGUF that fit the 4 GB model budget, record their sha256 in the new parity fixtures, and regenerate goldens with `scripts/generate-parity.ps1` (see DN-M34-5).
+  - Verify: `pwsh -File scripts/generate-parity.ps1 -ModelPath models/<qwen3-file> -Out tests/fixtures/parity-qwen3.json` and the Gemma-2 equivalent each write a guarded fixture, and `dotnet test --filter Category=Parity -c Release` passes them.
+- [_] MoE descriptor without execution — the plan carries the sparse-FFN descriptor and the loader recognizes MoE metadata and tensor names, failing at load with an actionable deferred-execution message (see DN-M34-6).
+  - Verify: `dotnet test --filter Category=Loader -c Release` — a synthetic MoE GGUF resolves its descriptor and fails with a message naming sparse execution as deferred to MVP3.8, rather than failing on a missing dense FFN tensor.
 
 #### Tests
 
-- [_] Automated Architecture Adapters: tensor mapping, graph plan selection, unsupported architecture rejection.
-- [_] Automated Qwen3 Parity: dense Qwen3 output parity vs pinned llama.cpp within documented tolerance.
+- [_] Automated Model Plan: profile selection per architecture, tensor-map and alias resolution, optional-tensor handling, generic fallback accept and near-miss rejection, unsupported declared-key diagnostics. Verify: `dotnet test --filter Category=Loader -c Release`.
+- [_] Automated Layer Strategies: LayerNorm, GELU, GELU-tanh, GEGLU, QK-norm, head-length independence, and both logit caps against scalar references, with existing RMSNorm/SwiGLU regression unchanged. Verify: `dotnet test --filter Category=Layers -c Release`.
+- [_] Automated Qwen3 Parity: dense Qwen3 output parity vs pinned llama.cpp within documented tolerance. Verify: `dotnet test --filter Category=Parity -c Release`.
+- [_] Automated Gemma-2 Parity: dense Gemma-2 output parity vs pinned llama.cpp within documented tolerance. Verify: `dotnet test --filter Category=Parity -c Release`.
+- [_] Manual Family Serve: serve the pinned Qwen3 and Gemma-2 fixtures through `/v1/chat/completions` and `/ui`, confirm coherent multi-turn output, and confirm the monitor reports the resolved architecture, quant, and working set. Verify: live two-turn exchange per model plus a monitor reading.
 
 #### Open Items
 
-- [_] **Adapter API shape** — how architecture adapters describe tensor maps, norm/activation behavior, attention variants, and RoPE strategy without hot-path virtual dispatch; settle in `/plan-refine mvp3.4`.
-- [_] **Family inclusion order** — Qwen3 first; Gemma/Phi/Mistral only as owner demand or fixture evidence justifies them; settle in `/plan-refine mvp3.4`.
+- [_] **Family fixture selection** — exact published Qwen3 and Gemma-2 GGUF files (quant and size) that satisfy the 4 GB budget and are supported by pinned b12032; settle at the start of `/plan-build mvp3.4` before the parity items.
 
 ### MVP3.5 [v0.3.5] - Tentative
 
@@ -644,6 +680,38 @@ RoPE scaling and positional-encoding variants load through RoPE strategy adapter
 #### Open Items
 
 - [_] **YaRN fixture set** — which GGUF models and rope metadata variants become golden fixtures; settle in `/plan-refine mvp3.7`.
+
+### MVP3.8 [v0.3.8] - Tentative
+
+Sparse and windowed architectures execute: dense-resident MoE decoding and sliding-window/local attention, both through the MVP3.4 model plan.
+
+#### Design Notes
+
+- **DN-M38-1** *(tentative)* — MoE executes with all experts resident in RAM: router scoring, top-k selection with renormalization, shared expert, and per-expert gate/up/down GEMVs accumulated into the residual. Gather and residency optimization stay in MVP6, where the Flash-Next measurement gate and tier design live.
+  - Rationale: proving sparse-FFN math against a dense-equivalent reference needs no residency machinery, and doing it before MVP6 turns `IGatherKernel` from a new concept into an optimization of a proven path.
+  - Rejected (preliminary): expert streaming or hot/cold tiers here (that is MVP6's measured design); MoE-only gather kernels before a correctness baseline.
+  - Contract: `lair.models` executes the sparse-FFN descriptor resolved by the MVP3.4 plan; `Category=Moe` correctness goldens.
+- **DN-M38-2** *(tentative)* — Sliding-window/local attention is a plan value with a KV-layout consequence: windowed layers read a bounded KV range, some families interleave windowed and full-attention layers per layer index, and prompt-cache reuse must stay correct under windowed reads.
+  - Rationale: Mistral and Gemma-3 are unusable without it, and the window interacts with the paged KV block design (DN-M2-4) rather than being an attention-loop constant.
+  - Rejected (preliminary): treating the window as an attention-kernel parameter only (ignores block reuse and KV budget accounting).
+  - Contract: plan carries per-layer window and interleave pattern; `lair.kv` block selection honors it.
+
+#### Implementation Items
+
+- [_] MoE execution — router, top-k with renormalize, shared expert, per-expert FFN accumulation (see DN-M38-1)
+  - Verify: `dotnet test --filter Category=Moe -c Release` — sparse-FFN output matches a dense-equivalent reference; a real MoE fixture (if a sub-4 GB file exists) matches pinned b12032 within tolerance.
+- [_] Sliding-window attention — per-layer window and windowed/full interleave with correct KV block selection and cache reuse (see DN-M38-2)
+  - Verify: `dotnet test --filter Category=Layers|Cache -c Release` — windowed attention goldens against a scalar reference; prompt-cache reuse stays correct across windowed and full layers.
+
+#### Tests
+
+- [_] Automated Moe: router/top-k/shared-expert correctness vs dense-equivalent math.
+- [_] Automated Windowed Attention: window bounds, interleave patterns, KV block selection, and cache-reuse correctness.
+
+#### Open Items
+
+- [_] **MoE fixture** — no published MoE GGUF currently fits the 4 GB model budget; decide between synthetic-MoE goldens only and a budget exception for one real MoE file.
+- [_] **Family order vs MVP6** — whether Mistral/Gemma-3 land here or wait for the MVP6 measurement gate; settle in `/plan-refine mvp3.8`.
 
 ### MVP4 [v0.4.0] - Refined
 
@@ -926,3 +994,5 @@ Vision input on chat models.
 - **2026-11-06 — MVP3.3 refined: tokenizer profile taxonomy settled.** Profiles are keyed by `tokenizer.ggml.pre` and MVP3.3 formalizes only the three behaviors already implemented (`llama-bpe`, `gpt2`, `smollm`) — the two real fixtures on this machine declare exactly those. A profile is a load-time factory (split strategy resolved once, no hot-path switch, public `GgufTokenizer` surface unchanged), unknown `pre`/`model` stays an actionable load rejection naming the value and the supported list, metadata coverage follows llama.cpp's actual keys (`byte_fallback`, `byte_to_token`, `byte_to_utf8`, `add_space_prefix`, `eot_token_id`, `utf8_flush_between_controls`) with profile-scoped BOS/EOS defaults, and a committed `/tokenize` parity harness replaces the ad-hoc 2026-11-04 proof. Speculative profiles move to Backlog until fixture + oracle evidence exists.
 - **2026-11-06 — `add_space_prefix` is read, not stripped — oracle overrides the inferred behavior.** SmolLM-135M-Instruct-F16 declares `tokenizer.ggml.add_space_prefix=false`, and the in-flight metadata implementation initially stripped the folded leading space from every pre-token; that dropped the final pre-token's tail (`"Hello, world!"` encoded without `"!"`) and broke round-trip. A direct b12032 `/tokenize` capture on the same fixture settles it: `" world!"` → `[905, 17]` and `"Hello, world!"` → `[19556, 28, 905, 17]` — the reference keeps the space. LAIR reads and exposes the key but does not alter the pre-split for the supported profiles. After the strip is removed, LAIR encodes `"Hello, world!"` as `[19556, 28, 905, 17]` — id-for-id with the reference — so the `smollm` merge path already reaches the reference's `905` (`" world"`) piece and the divergence was purely the strip.
 - **2026-11-06 — Pre-splits classify by Unicode code point, settled by the new `/tokenize` goldens.** The committed oracle harness (`Category=Tokenizer`) failed on astral text: UTF-16 `char` classification treated an emoji's surrogate pair as undefined, so a leading space was not folded into the run (`"a 😀"` → `81,216,10813,242,218` against the reference's `81,40303,218`), and the llama-bpe symbol fold additionally required the space itself to be a symbol, which made space+symbol folding unreachable for `llama-bpe`. Both splits now classify and advance by code point (`CharUnicodeInfo.GetUnicodeCategory(string, int)` plus a surrogate-pair length check — deliberately not grapheme clusters, which could straddle an offset boundary and desynchronize the UTF-16 slicing). Merge logic, byte maps, and decode were untouched: the defect was pre-split only.
+- **2026-11-07 — MVP3.4 refined: hybrid family-plus-metadata resolution, plan-not-switch.** Architecture compatibility resolves at load through a profile registry that produces an immutable plan (tensor map with aliases, norm/activation/bias/geometry/RoPE strategies, caps, sparse-FFN descriptor) — the shipped tokenizer-profile pattern, not llama.cpp's `switch (arch)`. An unknown `general.architecture` is accepted only on an exact llama-shaped tensor-table match; anything else fails naming the tensors. Metadata becomes the contract: `attention.use_bias`, `head_length`, activation and cap keys are honored or rejected at load, replacing today's tensor-presence bias rule and the blanket `rope.scaling.*` rejection. Family order is fixture-driven under the 4 GB budget: `llama`/`qwen2` re-expressed, then `qwen3` (QK-norm, head-length), then `gemma2` (GELU-tanh, two softcaps); Phi waits for MVP3.7's RoPE scaling and Gemma-3/Mistral wait for MVP3.8's windowed attention.
+- **2026-11-07 — MoE execution moves to a new MVP3.8; MVP6 keeps residency.** MVP3.4 makes sparse FFN representable in the plan and rejects MoE at load with an actionable deferred message. MVP3.8 executes dense-resident MoE (router, top-k with renormalize, shared expert, per-expert FFN) and sliding-window/local attention — the two architecture shapes that need new execution patterns rather than new scalar ops. MVP6 keeps Flash-Next residency, prefetch, PLE, MTP, and GDN/QSA, so `IGatherKernel` arrives there as an optimization of an already-proven sparse path. Sequencing 3.4 → 3.5 → 3.6 → 3.7 → 3.8 keeps MoE dependent on the plan (3.4), the quant formats MoE GGUFs ship in (3.6), and the rope variants those models declare (3.7).
