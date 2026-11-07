@@ -1,3 +1,6 @@
+using System.Globalization;
+
+using Lair.Contracts;
 using Lair.Loader;
 
 namespace Lair.Models;
@@ -6,15 +9,21 @@ namespace Lair.Models;
 /// Resolves a GGUF file into a <see cref="ModelPlan"/>: the architecture is looked up in
 /// <see cref="ModelProfiles"/>, the geometry is read from the profile's metadata prefix, and the tensor map
 /// comes from the profile. Only standard RoPE over the full head dimension is accepted: any rope-scaling
-/// variant or partial-rotary declaration fails at load.
+/// variant or partial-rotary declaration fails at load. An unregistered architecture is accepted only
+/// through the generic llama-shaped fallback profile, which requires the file's tensor table to match the
+/// llama map exactly and reports the substitution as one structured log line when applied.
 /// </summary>
 public static class ModelPlans
 {
     /// <summary>
     /// Parses the architecture metadata of a GGUF file into its resolved plan. The architecture must name a
-    /// registered profile; the declared dimensions must split the hidden size exactly across the heads.
+    /// registered profile or pass the generic llama-shaped fallback check; an empty or whitespace-only name is
+    /// rejected outright and is never a fallback candidate. The declared dimensions must split the hidden size
+    /// exactly across the heads.
     /// </summary>
-    public static ModelPlan Resolve(GgufFile gguf)
+    /// <param name="gguf">The GGUF to resolve.</param>
+    /// <param name="logLine">Sink for the structured fallback-applied line; hosts may capture instead.</param>
+    public static ModelPlan Resolve(GgufFile gguf, Action<string>? logLine = null)
     {
         ArgumentNullException.ThrowIfNull(gguf);
 
@@ -28,7 +37,25 @@ public static class ModelPlans
         }
 
         string architecture = metadata.Get("general.architecture").AsString();
-        ModelProfile profile = ModelProfiles.Resolve(architecture);
+
+        // An empty or whitespace-only architecture name is a load failure in its own right. It must not reach
+        // the generic fallback, where it would re-prefix the llama-shaped profile to a degenerate '.' and read
+        // the file's geometry under that prefix.
+        if (string.IsNullOrWhiteSpace(architecture))
+        {
+            throw new ModelException("GGUF metadata key 'general.architecture' is present but empty");
+        }
+
+        ModelProfile profile = ModelProfiles.ResolveOrFallback(architecture);
+        bool fallback = profile.Architecture != architecture;
+
+        // The fallback is only ever a disguise for a llama-shaped file, so its tensor-table match is verified
+        // before any metadata read: a table the map cannot match is rejected with the registry wording, which
+        // also carries the supported-profile list.
+        if (fallback)
+        {
+            ValidateLlamaShapedTable(profile.Tensors, architecture, gguf.Tensors);
+        }
 
         string prefix = profile.Prefix;
 
@@ -116,11 +143,26 @@ public static class ModelPlans
         int vocab = RequireInt(metadata, prefix + "vocab_size");
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(vocab);
 
-        bool hasOutputWeights = profile.Tensors[TensorRole.OutputHead].Resolve(gguf.Tensors) is not null;
+        LogicalTensorTable tensors = gguf.Tensors;
+        bool hasOutputWeights = profile.Tensors[TensorRole.OutputHead].Resolve(tensors) is not null;
+
+        if (fallback)
+        {
+            // The fallback was accepted: one structured line naming the model, the declared architecture,
+            // and the profile actually applied, in the same style as the tokenizer profile defaults.
+            if (logLine is not null)
+            {
+                string modelName = metadata.Has("general.name") ? metadata.Get("general.name").AsString() : "";
+                logLine(
+                    $"model_profile model='{(modelName.Length > 0 ? modelName : gguf.Path)}' " +
+                    $"architecture='{architecture}' profile={profile.Architecture}");
+            }
+        }
 
         return new ModelPlan
         {
             Architecture = architecture,
+            Profile = profile.Architecture,
             Prefix = prefix,
             LayerCount = layers,
             HiddenSize = hidden,
@@ -140,6 +182,66 @@ public static class ModelPlans
             SparseFfn = profile.SparseFfn,
         };
     }
+
+    // The generic fallback accepts a tensor table only when it matches the llama-shaped map exactly: every
+    // required descriptor resolves, and every tensor in the table is named by some descriptor's primary or
+    // alias name (the optional ones included). A tensor no descriptor can name is unexpected; the rejection
+    // carries the registry wording with its supported-profile list, names both sides of the mismatch, and
+    // states that the llama-shaped fallback was attempted. The block extent is derived from the table itself,
+    // so this gate needs no metadata: it runs before any metadata read.
+    private static void ValidateLlamaShapedTable(TensorMap map, string architecture, LogicalTensorTable tensors)
+    {
+        int layers = 1;
+        while (map[TensorRole.AttentionQuery].Resolve(tensors, layers) is not null)
+        {
+            layers++;
+        }
+
+        HashSet<string> nameable = new(StringComparer.Ordinal);
+        List<string> missing = [];
+
+        foreach (TensorDescriptor descriptor in map.Descriptors)
+        {
+            bool perLayer = descriptor.Scope == TensorScope.PerLayer;
+            int slots = perLayer ? layers : 1;
+
+            for (int slot = 0; slot < slots; slot++)
+            {
+                int layer = perLayer ? slot : -1;
+                nameable.Add(descriptor.NameFor(layer));
+                foreach (string alias in descriptor.Aliases)
+                {
+                    nameable.Add(perLayer ? AliasName(alias, layer) : alias);
+                }
+
+                if (descriptor.Required && descriptor.Resolve(tensors, layer) is null)
+                {
+                    missing.Add(descriptor.NameFor(layer));
+                }
+            }
+        }
+
+        List<string> unexpected = [];
+        foreach (LogicalTensor tensor in tensors.Tensors)
+        {
+            if (!nameable.Contains(tensor.Name))
+            {
+                unexpected.Add(tensor.Name);
+            }
+        }
+
+        if (missing.Count > 0 || unexpected.Count > 0)
+        {
+            throw new ModelException(
+                $"model architecture '{architecture}' is not supported (supported architectures: " +
+                $"{string.Join(", ", ModelProfiles.SupportedArchitectures)}): the llama-shaped fallback profile " +
+                $"was attempted but the tensor table does not match it (missing tensors: " +
+                $"{string.Join(", ", missing)}; unexpected tensors: {string.Join(", ", unexpected)})");
+        }
+    }
+
+    private static string AliasName(string alias, int layer) =>
+        alias.Replace("{layer}", layer.ToString(CultureInfo.InvariantCulture));
 
     private static int RequireInt(GgufMetadata metadata, string key)
     {

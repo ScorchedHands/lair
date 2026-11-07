@@ -3,10 +3,15 @@ namespace Lair.Models;
 /// <summary>
 /// Registry of the supported model profiles, keyed by <c>general.architecture</c>. It is the single source
 /// for profile selection and for the supported-profile list in the rejection message for an unsupported
-/// architecture. A new profile is a new entry here plus its tensor map and strategy values.
+/// architecture. A new profile is a new entry here plus its tensor map and strategy values. The generic
+/// fallback profile lives outside the registry: it is never selectable by name and is applied only when a
+/// file declares an unregistered architecture and its tensor table matches the llama-shaped map exactly.
 /// </summary>
 public static class ModelProfiles
 {
+    /// <summary>Identity of the generic llama-shaped fallback profile, recorded by the plan of a file accepted through it.</summary>
+    public const string GenericArchitecture = "llama-generic";
+
     private static readonly ModelProfile[] Profiles =
     [
         new ModelProfile
@@ -34,6 +39,20 @@ public static class ModelProfiles
     private static readonly Dictionary<string, ModelProfile> ByArchitecture =
         Profiles.ToDictionary(profile => profile.Architecture, StringComparer.Ordinal);
 
+    // The generic fallback profile: the llama strategy values and tensor map, re-prefixed to the declared
+    // architecture when applied. It is deliberately absent from the registry array, so it is never selectable
+    // by name and never appears in the supported-architecture list.
+    private static readonly ModelProfile GenericProfile = new()
+    {
+        Architecture = GenericArchitecture,
+        Prefix = GenericArchitecture + ".",
+        Norm = NormStrategy.RmsNorm,
+        Activation = ActivationStrategy.SwiGLU,
+        Bias = BiasPolicy.ByTensorPresence,
+        Rope = RopeStrategy.StandardFullHead,
+        Tensors = CanonicalTensors(),
+    };
+
     /// <summary>Supported architecture names, in registry order.</summary>
     public static IEnumerable<string> SupportedArchitectures => Profiles.Select(profile => profile.Architecture);
 
@@ -51,6 +70,25 @@ public static class ModelProfiles
         throw new ModelException(
             $"model architecture '{architecture}' is not supported (supported architectures: " +
             $"{string.Join(", ", SupportedArchitectures)})");
+    }
+
+    /// <summary>
+    /// Resolves the profile for one <c>general.architecture</c> value: the registered profile when the name is
+    /// in the registry, otherwise the generic llama-shaped fallback profile re-prefixed to the declared
+    /// architecture, whose metadata keys are read under <c>&lt;architecture&gt;.</c>. The fallback is accepted
+    /// only after its exact tensor-table match is verified; the registry rejection stays available through
+    /// <see cref="Resolve"/>.
+    /// </summary>
+    public static ModelProfile ResolveOrFallback(string architecture)
+    {
+        ArgumentNullException.ThrowIfNull(architecture);
+
+        if (ByArchitecture.TryGetValue(architecture, out ModelProfile? profile))
+        {
+            return profile;
+        }
+
+        return GenericProfile with { Prefix = architecture + "." };
     }
 
     // The canonical llama-family tensor names: the llama.cpp GGUF layout both supported profiles ship, with

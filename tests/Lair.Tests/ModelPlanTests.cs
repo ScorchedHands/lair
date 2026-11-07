@@ -11,9 +11,10 @@ namespace Lair.Tests;
 
 /// <summary>
 /// Load-time plan resolution over synthetic GGUF fixtures: profile-registry selection and the rejection
-/// wording it owns, resolved geometry for both supported profiles, the plan's tensor map (required versus
-/// optional roles, per-layer name templates, alias candidates), the strategy values the forward engine
-/// switches on, and tensor lookup through the map at Open.
+/// wording it owns, the generic llama-shaped fallback for unknown architectures (exact tensor-table match,
+/// its rejection wording and structured log line), resolved geometry for both supported profiles, the plan's
+/// tensor map (required versus optional roles, per-layer name templates, alias candidates), the strategy
+/// values the forward engine switches on, and tensor lookup through the map at Open.
 /// </summary>
 [Trait("Category", "Loader")]
 public sealed class ModelPlanTests : IDisposable
@@ -115,23 +116,189 @@ public sealed class ModelPlanTests : IDisposable
     {
         string registryList = string.Join(", ", ModelProfiles.SupportedArchitectures);
 
+        // Zero tensors: the table matches no descriptor of the llama-shaped map, so the generic fallback is
+        // rejected and the registry rejection wording surfaces, extended with the attempted-fallback detail.
         using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf([("general.architecture", "bert")], [])));
         ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(gguf));
 
-        // The supported list in the rejection is the registry's own list, in registry order.
-        Assert.Equal(
+        // The supported list in the rejection is the registry's own list, in registry order, and the plan's
+        // rejection extends the profile lookup's registry wording with the attempted-fallback detail.
+        Assert.Contains(
             $"model architecture 'bert' is not supported (supported architectures: {registryList})",
             ex.Message);
-
-        // The profile lookup carries the same wording, and the flat view's list is the registry's list.
-        Assert.Equal(ex.Message, Assert.Throws<ModelException>(() => ModelProfiles.Resolve("bert")).Message);
+        Assert.Contains("llama-shaped fallback", ex.Message);
         Assert.True(ModelDesc.SupportedArchitectures.SequenceEqual(ModelProfiles.SupportedArchitectures));
+
+        // The profile lookup keeps the plain registry wording; the plan's rejection carries it as its opening.
+        Assert.StartsWith(Assert.Throws<ModelException>(() => ModelProfiles.Resolve("bert")).Message, ex.Message);
 
         // A missing architecture key names the key and the same registry list.
         using GgufFile missing = GgufFile.Open(WriteTemp(BuildGguf([("general.name", "mystery")], [])));
         ModelException missingEx = Assert.Throws<ModelException>(() => ModelPlans.Resolve(missing));
         Assert.Contains("general.architecture", missingEx.Message);
         Assert.Contains(registryList, missingEx.Message);
+    }
+
+    // ---------------------------------------------------------------- generic llama-shaped fallback
+
+    [Fact]
+    public void ModelPlan_UnknownArchitecture_LlamaShapedTable_ResolvesAsGenericFallback()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(Metadata("myarch", tiny: true), [.. TinyTensors(withOptional: false)])));
+        ModelPlan plan = ModelPlans.Resolve(gguf);
+
+        Assert.Equal("myarch", plan.Architecture); // the declared name is recorded, not the fallback identity
+        Assert.Equal(ModelProfiles.GenericArchitecture, plan.Profile);
+        Assert.Equal("myarch.", plan.Prefix); // every key was read under the declared prefix
+        Assert.Equal(1, plan.LayerCount);
+        Assert.Equal(4, plan.HiddenSize);
+        Assert.Equal(2, plan.HeadCount);
+        Assert.Equal(2, plan.KvHeadCount);
+        Assert.Equal(2, plan.HeadDim);
+        Assert.Equal(8, plan.IntermediateSize);
+        Assert.Equal(6, plan.VocabSize);
+        Assert.Equal(10_000f, plan.RopeTheta);
+        Assert.True(Math.Abs(plan.EpsRmsNorm - 1e-5f) < 1e-7f, $"rms epsilon {plan.EpsRmsNorm:G9}");
+        Assert.False(plan.HasOutputWeights);
+
+        Assert.Equal(NormStrategy.RmsNorm, plan.Norm);
+        Assert.Equal(ActivationStrategy.SwiGLU, plan.Activation);
+        Assert.Equal(BiasPolicy.ByTensorPresence, plan.Bias);
+        Assert.Equal(RopeStrategy.StandardFullHead, plan.Rope);
+        Assert.Null(plan.SparseFfn);
+
+        // The fallback profile is never selectable by name and never joins the supported-architecture list.
+        Assert.DoesNotContain(ModelProfiles.GenericArchitecture, ModelProfiles.SupportedArchitectures);
+        Assert.Throws<ModelException>(() => ModelProfiles.Resolve(ModelProfiles.GenericArchitecture));
+    }
+
+    [Fact]
+    public void ModelPlan_UnknownArchitecture_ForwardIsIdenticalToTheSameTensorsDeclaredAsLlama()
+    {
+        byte[] unknownImage = BuildGguf(Metadata("myarch", tiny: true), [.. TinyTensors(withOptional: false)]);
+        byte[] llamaImage = BuildGguf(Metadata("llama", tiny: true), [.. TinyTensors(withOptional: false)]);
+
+        using CpuBackend backend = new();
+
+        float[] unknownLogits;
+        {
+            using GgufFile gguf = GgufFile.Open(WriteTemp(unknownImage));
+            using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
+
+            Assert.Equal("myarch", model.Plan.Architecture);
+            Assert.Equal(ModelProfiles.GenericArchitecture, model.Plan.Profile);
+
+            using BlockPool pool = new(blockTokens: 4, layerCount: model.Plan.LayerCount, kvHeads: model.Plan.KvHeadCount, headDim: model.Plan.HeadDim, capacityBlocks: 2, backend);
+            using SequenceKv kv = new(pool);
+            unknownLogits = model.DecodeNext(3, kv).ToArray();
+        }
+
+        float[] llamaLogits;
+        {
+            using GgufFile gguf = GgufFile.Open(WriteTemp(llamaImage));
+            using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
+
+            using BlockPool pool = new(blockTokens: 4, layerCount: model.Plan.LayerCount, kvHeads: model.Plan.KvHeadCount, headDim: model.Plan.HeadDim, capacityBlocks: 2, backend);
+            using SequenceKv kv = new(pool);
+            llamaLogits = model.DecodeNext(3, kv).ToArray();
+        }
+
+        Assert.Equal(llamaLogits.Length, unknownLogits.Length);
+        Assert.True(
+            unknownLogits.AsSpan().SequenceEqual(llamaLogits.AsSpan()),
+            "fallback forward must be bit-identical to the same tensors and prefix declared as llama");
+        foreach (float v in unknownLogits)
+        {
+            Assert.True(float.IsFinite(v), $"logit {v} is not finite");
+        }
+    }
+
+    [Fact]
+    public void ModelPlan_UnknownArchitecture_RenamedRequiredTensor_RejectsNamingIt_AndTheAttemptedFallback()
+    {
+        List<TensorDef> tensors = [.. TinyTensors(withOptional: false)];
+        tensors.RemoveAll(t => t.Name == "blk.0.attn_q.weight"); // rename it: the map can no longer name it
+
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(
+            Metadata("myarch", tiny: true),
+            [.. tensors, new TensorDef("blk.0.attn_query.weight", [4, 4])])));
+        ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(gguf));
+
+        Assert.Contains("model architecture 'myarch' is not supported", ex.Message);
+        Assert.Contains("llama-shaped fallback profile was attempted", ex.Message);
+        Assert.Contains("missing tensors: blk.0.attn_q.weight", ex.Message);
+        Assert.Contains("unexpected tensors: blk.0.attn_query.weight", ex.Message);
+    }
+
+    [Fact]
+    public void ModelPlan_UnknownArchitecture_UnexpectedTensor_RejectsNamingIt()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(
+            Metadata("myarch", tiny: true),
+            [.. TinyTensors(withOptional: false), new TensorDef("blk.0.attn_qkv.weight", [4, 4])])));
+        ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(gguf));
+
+        Assert.Contains("model architecture 'myarch' is not supported", ex.Message);
+        Assert.Contains("llama-shaped fallback profile was attempted", ex.Message);
+        Assert.Contains("unexpected tensors: blk.0.attn_qkv.weight", ex.Message);
+    }
+
+    [Fact]
+    public void ModelPlan_UnknownArchitecture_MissingRequiredMetadataKey_RejectsNamingTheKey()
+    {
+        List<(string Key, object Value)> pairs = [.. Metadata("myarch", tiny: true)];
+        pairs.RemoveAll(p => p.Key == "myarch.block_count"); // a llama-shaped table cannot rescue missing geometry
+
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf([.. pairs], [.. TinyTensors(withOptional: false)])));
+        ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(gguf));
+        Assert.Contains("GGUF metadata key 'myarch.block_count' is not present", ex.Message);
+    }
+
+    [Fact]
+    public void ModelPlan_EmptyOrWhitespaceArchitecture_RejectsOutright_AndNeverReachesTheFallback()
+    {
+        foreach (string architecture in new string[] { "", "   " })
+        {
+            // A fully llama-shaped file whose declared architecture is blank: without the outright rejection it
+            // would pass the fallback gate, resolve its geometry under the degenerate '.' prefix, and report the
+            // fallback log line. It must fail with its own message before any of that happens.
+            List<string> fallbackLines = [];
+            using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(
+                Metadata(architecture, tiny: true),
+                [.. TinyTensors(withOptional: false)])));
+
+            ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(gguf, fallbackLines.Add));
+
+            Assert.Equal("GGUF metadata key 'general.architecture' is present but empty", ex.Message);
+            Assert.DoesNotContain("is not present", ex.Message);        // distinct from the missing-key wording
+            Assert.DoesNotContain("is not supported", ex.Message);      // distinct from the registry wording
+            Assert.DoesNotContain("llama-shaped fallback", ex.Message); // the fallback gate never ran
+            Assert.Empty(fallbackLines);                                // no model_profile line was emitted
+        }
+    }
+
+    [Fact]
+    public void ModelPlan_FallbackLogLine_IsEmittedWhenApplied_AndNeverForRegisteredProfiles()
+    {
+        List<string> fallbackLines = [];
+
+        using (GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(
+            [.. Metadata("myarch", tiny: true), ("general.name", "Mystery Model")],
+            [.. TinyTensors(withOptional: false)]))))
+        {
+            ModelPlans.Resolve(gguf, fallbackLines.Add);
+        }
+
+        Assert.Single(fallbackLines);
+        Assert.Equal("model_profile model='Mystery Model' architecture='myarch' profile=llama-generic", fallbackLines[0]);
+
+        foreach (string architecture in new string[] { "llama", "qwen2" })
+        {
+            List<string> registeredLines = [];
+            using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(Metadata(architecture, tiny: true), [.. TinyTensors(withOptional: false)])));
+            ModelPlans.Resolve(gguf, registeredLines.Add);
+            Assert.Empty(registeredLines); // a registered profile never reports the fallback
+        }
     }
 
     // ---------------------------------------------------------------- tensor map

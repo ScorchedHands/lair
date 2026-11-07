@@ -17,6 +17,13 @@ public sealed record ModelPlan
 {
     public required string Architecture { get; init; }
 
+    /// <summary>
+    /// Identity of the resolved profile: the architecture name itself for a registered profile, or the
+    /// generic llama-shaped fallback identity when an unregistered architecture was accepted through the
+    /// exact tensor-table match.
+    /// </summary>
+    public required string Profile { get; init; }
+
     /// <summary>Prefix the resolved profile's metadata keys use, e.g. <c>"llama."</c>.</summary>
     public required string Prefix { get; init; }
 

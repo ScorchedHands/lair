@@ -94,7 +94,16 @@ public sealed class TransformerModel : IDisposable
     public int MaxContextTokens { get; }
 
     /// <summary>Opens the engine over a memory-mapped view of the file's own tensor payloads.</summary>
-    public static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens) => new(file, backend, maxContextTokens, null);
+    public static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens) =>
+        Open(file, backend, maxContextTokens, logLine: null);
+
+    /// <summary>
+    /// Opens the engine over a memory-mapped view of the file's own tensor payloads and reports profile-
+    /// resolution events (the generic llama-shaped fallback applied to an unknown architecture) through
+    /// <paramref name="logLine"/>.
+    /// </summary>
+    public static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens, Action<string>? logLine) =>
+        new(file, backend, maxContextTokens, null, logLine);
 
     /// <summary>
     /// Opens the engine with weight payloads supplied by an alternate <see cref="IWeightSource"/>: every tensor read
@@ -103,16 +112,23 @@ public sealed class TransformerModel : IDisposable
     /// disposed by the caller, not here.
     /// </summary>
     public static TransformerModel Open(GgufFile file, IWeightSource weights, IBackend backend, int maxContextTokens) =>
-        new(file, backend, maxContextTokens, weights);
+        Open(file, weights, backend, maxContextTokens, logLine: null);
 
-    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null)
+    /// <summary>
+    /// Opens the engine with an alternate <see cref="IWeightSource"/> and reports profile-resolution events (the
+    /// generic llama-shaped fallback applied to an unknown architecture) through <paramref name="logLine"/>.
+    /// </summary>
+    public static TransformerModel Open(GgufFile file, IWeightSource weights, IBackend backend, int maxContextTokens, Action<string>? logLine) =>
+        new(file, backend, maxContextTokens, weights, logLine);
+
+    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(backend);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxContextTokens);
 
         _backend = backend;
-        Plan = ModelPlans.Resolve(file);
+        Plan = ModelPlans.Resolve(file, logLine);
         Desc = Plan.ToDesc();
         MaxContextTokens = maxContextTokens;
         _ownsWeights = weights is null;

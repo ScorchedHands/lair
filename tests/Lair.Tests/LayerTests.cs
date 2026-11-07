@@ -322,12 +322,16 @@ public sealed class LayerTests : IDisposable
     [Fact]
     public void ModelDesc_UnsupportedArchitecture_NamesSupportedArchitectures()
     {
-        byte[] image = BuildGguf([("general.architecture", "bert")], []); // zero tensors: the architecture gate fires first
+        // The tensor table carries a name the llama-shaped map cannot name, so the generic fallback is
+        // genuinely rejected and the registry wording — with its supported-profile list — surfaces.
+        byte[] image = BuildGguf([("general.architecture", "bert")], [new TensorDef("layers.0.attention.query.weight", [4, 4])]);
 
         using GgufFile gguf = GgufFile.Open(WriteTemp(image));
         ModelException ex = Assert.Throws<ModelException>(() => ModelDesc.FromGguf(gguf));
         Assert.Contains("'bert' is not supported", ex.Message);
         Assert.Contains("llama, qwen2", ex.Message);
+        Assert.Contains("llama-shaped fallback", ex.Message);
+        Assert.Contains("layers.0.attention.query.weight", ex.Message);
 
         // Missing architecture key entirely must also name the supported set.
         using GgufFile ggufNoArch = GgufFile.Open(WriteTemp(BuildGguf([("general.name", "mystery")], [])));
