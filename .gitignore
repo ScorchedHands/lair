@@ -8,3 +8,4 @@ tools/
 src/Lair.Host/ClientApp/node_modules/
 src/Lair.Host/ClientApp/dist/
 src/Lair.Host/wwwroot/ui/
+lair.yaml
