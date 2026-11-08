@@ -27,7 +27,9 @@ namespace Lair.Models;
 /// <c>&lt;prefix&gt;attn_logit_softcapping</c> and <c>&lt;prefix&gt;final_logit_softcapping</c>, each
 /// resolving to <c>0f</c> (disabled) when the key is absent and to a positive finite number otherwise. The
 /// declared attention window reads <c>&lt;prefix&gt;attention.sliding_window</c>, resolving to <c>0</c>
-/// (unbounded) when the key is absent and to a positive integer otherwise.
+/// (unbounded) when the key is absent and to a positive integer otherwise. Which layers that window masks comes
+/// from the resolved profile alone, like the norm placement and the input-embedding gain: no metadata key decides
+/// it today.
 /// </summary>
 public sealed record ModelPlan
 {
@@ -93,10 +95,18 @@ public sealed record ModelPlan
     /// Declared <c>&lt;prefix&gt;attention.sliding_window</c>: the attention score window in positions. At query
     /// position <c>i</c> the causal range narrows to <c>[max(0, i - window + 1), i]</c>, and the bidirectional
     /// range to <c>[max(0, i - window + 1), i + window]</c> clamped to the sequence. <c>0</c> when the key is
-    /// absent means unbounded. The value masks scores only: every position is still written to and readable
-    /// from the KV cache.
+    /// absent means unbounded, and <see cref="WindowInterleave"/> decides which layers the declared value narrows.
+    /// The value masks scores only: every position is still written to and readable from the KV cache.
     /// </summary>
     public int AttentionWindow { get; init; }
+
+    /// <summary>
+    /// The resolved profile's window interleave: whether the declared attention window narrows the score range of
+    /// every layer or only the even-indexed layers, leaving the odd-indexed layers unbounded. No metadata key
+    /// decides it. A resolved <see cref="AttentionWindow"/> of <c>0</c> leaves every layer unbounded whatever the
+    /// pattern.
+    /// </summary>
+    public WindowInterleave WindowInterleave { get; init; } = WindowInterleave.AllLayers;
 
     /// <summary>
     /// The resolved profile's input-embedding gain: <c>sqrt(hidden size)</c> on a profile whose reference graph

@@ -80,6 +80,9 @@ public static class ModelProfiles
             // The reference scales the token-embedding row by sqrt(hidden size) before the first layer; the
             // conversion leaves that gain out of the weights, so the engine applies it.
             ScaleInputEmbeddingsBySqrtHidden = true,
+            // The reference applies its sliding window to alternating blocks — local attention on the even-indexed
+            // layers, full attention on the odd-indexed ones — so the declared window masks only the even side here.
+            WindowInterleave = WindowInterleave.AlternatingLocalFirst,
             Tensors = CanonicalTensors(),
         },
     ];

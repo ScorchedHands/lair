@@ -9,8 +9,9 @@ namespace Lair.Models;
 /// Resolves a GGUF file into a <see cref="ModelPlan"/>: the architecture is looked up in
 /// <see cref="ModelProfiles"/>, the geometry is read from the profile's metadata prefix, the vocabulary size
 /// comes from the declared key or the tokenizer vocabulary length, the attention score window comes from the
-/// declared <c>&lt;prefix&gt;attention.sliding_window</c> (unbounded when the key is absent), and the tensor
-/// map comes from the profile. Only standard RoPE over the full head dimension is accepted: any rope-scaling
+/// declared <c>&lt;prefix&gt;attention.sliding_window</c> (unbounded when the key is absent), and the tensor map
+/// comes from the profile together with the window interleave that decides which layers that window masks. Only
+/// standard RoPE over the full head dimension is accepted: any rope-scaling
 /// variant or partial-rotary declaration fails at load. The per-head QK-norm mode resolves the declared
 /// <c>&lt;prefix&gt;attention.use_qk_norm</c> against the profile's default, the attention-bias flag resolves the
 /// declared <c>&lt;prefix&gt;attention.use_bias</c> against the profile's default, and the norm placement comes from
@@ -218,7 +219,8 @@ public static class ModelPlans
 
         // Declared attention window: an absent key means the attention is unbounded (zero). A declared value
         // must be a positive integer that fits the int range; anything else is a load failure naming the key
-        // and the declared value. The resolved value masks scores in every attention path and bounds no KV.
+        // and the declared value. The resolved value masks scores in every attention path and bounds no KV, and
+        // which layers it masks has no declaration: it comes straight from the resolved profile.
         int attentionWindow = ResolveWindow(metadata, prefix + "attention.sliding_window");
 
         // Vocabulary size: the declared key wins when present. Without it the size is the length of the
@@ -266,6 +268,7 @@ public static class ModelPlans
             AttentionSoftcap = attentionSoftcap,
             FinalLogitSoftcap = finalLogitSoftcap,
             AttentionWindow = attentionWindow,
+            WindowInterleave = profile.WindowInterleave,
             InputEmbeddingScale = profile.ScaleInputEmbeddingsBySqrtHidden ? MathF.Sqrt(hidden) : 0f,
             Tensors = profile.Tensors,
             Norm = profile.Norm,

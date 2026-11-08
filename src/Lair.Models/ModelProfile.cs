@@ -59,4 +59,14 @@ public sealed record ModelProfile
     /// conversion leaves the gain out of the weights. A profile defaults this to <c>false</c>.
     /// </summary>
     public bool ScaleInputEmbeddingsBySqrtHidden { get; init; }
+
+    /// <summary>
+    /// Which layers this architecture's forward masks with its declared attention window: a profile defaults to
+    /// <see cref="Lair.Models.WindowInterleave.AllLayers"/>, and
+    /// <see cref="Lair.Models.WindowInterleave.AlternatingLocalFirst"/> narrows the mask to the even-indexed layers
+    /// and leaves the odd-indexed ones unbounded, which is how the gemma2 reference graph applies its window. No
+    /// metadata key selects it: the profile decides, and a declared window of <c>0</c> is unbounded whatever the
+    /// pattern.
+    /// </summary>
+    public WindowInterleave WindowInterleave { get; init; } = WindowInterleave.AllLayers;
 }

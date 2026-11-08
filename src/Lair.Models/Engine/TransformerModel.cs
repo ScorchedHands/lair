@@ -15,9 +15,9 @@ namespace Lair.Models.Engine;
     /// rotates q/k pairs at the absolute position with theta_i = base^(-2i/headDim), pairing adjacent dimensions
     /// (2i, 2i + 1) under the llama-family strategy or the head halves (i, i + headDim/2) under the qwen3 strategy;
     /// attention scores scale by 1/sqrt(headDim), pass through the plan's attention-score softcap when one is resolved, and
-/// softmax runs online over positions 0..pos, narrowed to <c>[max(0, pos - window + 1), pos]</c> when the plan
-/// resolves an attention window. The window masks scores only: every position's K/V is still written and stays
-/// readable. The residual added before the
+/// softmax runs online over positions 0..pos, narrowed per layer to <c>[max(0, pos - window + 1), pos]</c> on the
+/// layers the plan's resolved window interleave masks and left unbounded on the layers it leaves alone. The window
+/// masks scores only: every position's K/V is still written and stays readable. The residual added before the
 /// FFN norm is the pre-attention stream value, or that stream plus a normalized attention output under a placement that
 /// norms sublayer outputs — either way matching the reference graph's ffn_inp add; rope scaling variants
 /// are not supported. FP32 buffers are allocated once at Open and reused across calls; packed matrix rows are
@@ -455,6 +455,8 @@ public sealed class TransformerModel : IDisposable
 
         for (int l = 0; l < Plan.LayerCount; l++)
         {
+            int layerWindow = LayerAttentionWindow(l);
+
             // Pre-attention norm per sequence: identical op to the single-token forward.
             for (int s = 0; s < n; s++)
             {
@@ -486,7 +488,7 @@ public sealed class TransformerModel : IDisposable
                 kvs[s].WriteK(positions[s], l, _batchK.AsSpan(s * kvRegion, kvRegion));
                 kvs[s].WriteV(positions[s], l, _batchV.AsSpan(s * kvRegion, kvRegion));
 
-                LayerOps.CausalAttention(_backend, _batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kvs[s], l, positions[s], attnScale, Plan.AttentionSoftcap, Plan.AttentionWindow, _batchAttnOut.AsSpan(s * qkvRegion, qkvRegion));
+                LayerOps.CausalAttention(_backend, _batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kvs[s], l, positions[s], attnScale, Plan.AttentionSoftcap, layerWindow, _batchAttnOut.AsSpan(s * qkvRegion, qkvRegion));
             }
 
             bytes = _weights.Resolve(_wo[l]);
@@ -571,9 +573,10 @@ public sealed class TransformerModel : IDisposable
     /// <summary>
     /// Encoder-only forward: runs the whole token sequence through every layer with full-sequence (bidirectional)
     /// attention — each query position scores against all positions of its own sequence's KV contents instead of a
-    /// causal prefix, narrowed to the plan's resolved attention window around the query's own position when one is
-    /// declared — and returns the final hidden states after the output norm, without lm_head logits. Per-position
-    /// norms, RoPE at absolute positions, biases, residuals, and the gated activation are exactly the decode-path
+    /// causal prefix, narrowed per layer to the plan's resolved attention window around the query's own position on
+    /// the layers its resolved window interleave masks — and returns the final hidden states after the output norm,
+    /// without lm_head logits. Per-position norms, RoPE at absolute positions, biases, residuals, and the gated
+    /// activation are exactly the decode-path
     /// operations; K/V for
     /// every position is appended to <paramref name="kv"/> as usual (positions start at <see cref="SequenceKv.Length"/>,
     /// so encoding a fresh sequence keeps each token attending only to its own sequence). Dense matrices are traversed
@@ -660,6 +663,8 @@ public sealed class TransformerModel : IDisposable
 
             for (int l = 0; l < Plan.LayerCount; l++)
             {
+                int layerWindow = LayerAttentionWindow(l);
+
                 // Phase 1: pre-attention norm, QKV GEMVs (+bias), RoPE at absolute positions, and the K/V writes — all
                 // per chunk. Queries stay in qAll so no position's attention runs before every position's K/V exists.
                 for (int c = 0; c < chunkCount; c++)
@@ -721,7 +726,7 @@ public sealed class TransformerModel : IDisposable
                         l,
                         attnScale,
                         Plan.AttentionSoftcap,
-                        Plan.AttentionWindow,
+                        layerWindow,
                         attnOut.AsSpan(c * EncodeChunkTokens * qkvRegion, m * qkvRegion));
                 }
 
@@ -841,6 +846,8 @@ public sealed class TransformerModel : IDisposable
 
         for (int l = 0; l < Plan.LayerCount; l++)
         {
+            int layerWindow = LayerAttentionWindow(l);
+
             // Pre-attention norm on the stream: normed = rmsnorm(cur) * attn_norm weight.
             ApplyNorm(_cur.AsSpan(0, hidden), _attnNormWeight[l], _attnNormBias[l], _normed);
 
@@ -867,7 +874,7 @@ public sealed class TransformerModel : IDisposable
             kv.WriteK(position, l, _k);
             kv.WriteV(position, l, _v);
 
-            LayerOps.CausalAttention(_backend, _q, Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, position, attnScale, Plan.AttentionSoftcap, Plan.AttentionWindow, _attnOut);
+            LayerOps.CausalAttention(_backend, _q, Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, position, attnScale, Plan.AttentionSoftcap, layerWindow, _attnOut);
 
             // Output projection (+bias) into scratch; the residual added before the FFN norm is the pre-attention
             // stream value (ffn_inp = attn_out + inpSA), matching the reference graph. cur held that stream through
@@ -1041,6 +1048,26 @@ public sealed class TransformerModel : IDisposable
 
             default:
                 throw new ModelException($"norm placement '{Plan.NormPlacement}' is not implemented by the forward engine");
+        }
+    }
+
+    // The score window one layer narrows to runs as a direct branch on the plan's resolved interleave, the way the
+    // norm, activation, and softcap switches do: the declared window masks every layer under AllLayers, and only the
+    // even-indexed layers under AlternatingLocalFirst, where the odd-indexed layers attend the whole range. A
+    // declared window of zero is unbounded whatever the pattern. The value is resolved once per layer — never per
+    // token or per head — and bounds scores only: every position's K/V is still written and stays readable.
+    private int LayerAttentionWindow(int layer)
+    {
+        switch (Plan.WindowInterleave)
+        {
+            case WindowInterleave.AllLayers:
+                return Plan.AttentionWindow;
+
+            case WindowInterleave.AlternatingLocalFirst:
+                return layer % 2 == 0 ? Plan.AttentionWindow : 0;
+
+            default:
+                throw new ModelException($"window interleave '{Plan.WindowInterleave}' is not implemented by the forward engine");
         }
     }
 

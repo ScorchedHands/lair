@@ -121,3 +121,21 @@ public enum RopeStrategy
     /// </summary>
     RotateHalfFullHead,
 }
+
+/// <summary>
+/// Which layers a model's declared attention window masks. Resolved once per model from its
+/// <see cref="ModelProfile"/>; no metadata key decides it today, and the forward path switches on the value and
+/// never dispatches through a per-token interface.
+/// </summary>
+public enum WindowInterleave
+{
+    /// <summary>Every layer's attention narrows its score range to the declared window.</summary>
+    AllLayers,
+
+    /// <summary>
+    /// Even-indexed layers narrow their score ranges to the declared window and odd-indexed layers attend the whole
+    /// range, which is how the gemma2 reference graph applies its window. A declared window of <c>0</c> leaves every
+    /// layer unbounded whatever the pattern.
+    /// </summary>
+    AlternatingLocalFirst,
+}
