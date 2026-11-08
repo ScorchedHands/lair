@@ -18,13 +18,18 @@ namespace Lair.Models.Engine;
 /// softmax runs online over positions 0..pos, narrowed to <c>[max(0, pos - window + 1), pos]</c> when the plan
 /// resolves an attention window. The window masks scores only: every position's K/V is still written and stays
 /// readable. The residual added before the
-/// FFN norm is the pre-attention stream value, matching the reference graph's ffn_inp add; rope scaling variants
+/// FFN norm is the pre-attention stream value, or that stream plus a normalized attention output under a placement that
+/// norms sublayer outputs — either way matching the reference graph's ffn_inp add; rope scaling variants
 /// are not supported. FP32 buffers are allocated once at Open and reused across calls; packed matrix rows are
 /// consumed through <see cref="WeightRef"/> without being materialized, except for embedding lookups and small
 /// norm/bias vectors preloaded at Open. Attention-bias tensors follow the plan's declared policy: under
 /// <see cref="BiasPolicy.Declared"/> the declared <c>use_bias</c> flag makes them required or leaves them
-/// unloaded and unapplied, with one structured log line naming the ignored tensors; a declared per-head QK-norm
-/// normalizes each q and k head with its own weight vector after the projection and before RoPE. A resolved
+/// unloaded and unapplied, with one structured log line naming the ignored tensors; the plan's resolved
+/// <see cref="QkNormMode"/> normalizes each q and k head between its projection (plus any bias) and its rotation — scaled
+/// by the layer's per-head vector, normalized with the epsilon alone, or not at all. Under
+/// <see cref="NormPlacement.PostSublayerOutputs"/> every sublayer output is normalized once more with its own vector before
+/// it joins the residual stream, which makes each layer's post-sublayer norm tensors required; a pre-only placement reads
+/// none and rejects a file that carries one. A resolved
 /// final-logit softcap saturates every logit vector — untied output head or tied token-embedding rows — after
 /// the full vector is computed and before any softmax, sampling, or copy-out.
 /// </summary>
@@ -67,9 +72,15 @@ public sealed class TransformerModel : IDisposable
     private readonly float[]?[] _biasO;
 
     // Per-head QK-norm weight vectors (one headDim vector per layer, shared by every head of its side),
-    // preloaded only when the plan declares the feature: every head normalizes its own headDim slice.
+    // preloaded only when the plan resolves a weighted mode: every head normalizes its own headDim slice.
     private readonly float[][] _attnQNorm;
     private readonly float[][] _attnKNorm;
+
+    // Post-sublayer norm weight vectors, preloaded only when the plan places norms on sublayer outputs: each holds one
+    // hidden-sized vector per layer and normalizes that sublayer's own output before its residual add. A pre-only
+    // placement loads neither and rejects a file carrying either tensor.
+    private readonly float[][] _postAttnNorm;
+    private readonly float[][] _postFfnNorm;
 
     // Norm-bias vectors preloaded only when the plan declares them: the LayerNorm path adds them after the
     // weighted normalization. Null entries mean the layer's tensor is absent.
@@ -152,10 +163,11 @@ public sealed class TransformerModel : IDisposable
     /// <summary>
     /// Opens the engine with an explicitly supplied <see cref="ModelProfile"/> resolving the plan instead of the
     /// registry selection: the profile's prefix supplies every metadata key and its strategy values drive the
-    /// forward. Assembly-internal so no host configuration path can reach it.
+    /// forward, with profile- and tensor-resolution events reported through <paramref name="logLine"/>. Assembly-internal
+    /// so no host configuration path can reach it.
     /// </summary>
-    internal static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens, ModelProfile profile) =>
-        new(file, backend, maxContextTokens, weights: null, logLine: null, profile);
+    internal static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens, ModelProfile profile, Action<string>? logLine = null) =>
+        new(file, backend, maxContextTokens, weights: null, logLine, profile);
 
     private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null)
     {
@@ -247,16 +259,44 @@ public sealed class TransformerModel : IDisposable
             ReportIgnoredTensors(logLine, "norm_bias_ignored", file, [TensorRole.AttentionNormBias, TensorRole.FeedForwardNormBias]);
         }
 
-        if (Plan.HasQkNorm)
+        switch (Plan.QkNorm)
         {
-            _attnQNorm = LoadLayerVectors(layers, TensorRole.AttentionQueryNorm, Plan.HeadDim);
-            _attnKNorm = LoadLayerVectors(layers, TensorRole.AttentionKeyNorm, Plan.HeadDim);
+            case QkNormMode.PerHeadWeighted:
+                _attnQNorm = LoadLayerVectors(layers, TensorRole.AttentionQueryNorm, Plan.HeadDim);
+                _attnKNorm = LoadLayerVectors(layers, TensorRole.AttentionKeyNorm, Plan.HeadDim);
+                break;
+
+            case QkNormMode.Off:
+                // Resolved off: present per-head vectors are neither loaded nor applied, and the file is reported once naming them.
+                _attnQNorm = new float[layers][];
+                _attnKNorm = new float[layers][];
+                ReportIgnoredTensors(logLine, "qk_norm_ignored", file, [TensorRole.AttentionQueryNorm, TensorRole.AttentionKeyNorm]);
+                break;
+
+            case QkNormMode.PerHeadUnweighted:
+                // The unweighted form normalizes with the plan epsilon alone and demands no tensor at all. Present
+                // per-head vectors are reported as unused rather than mistaken for a requirement this mode cannot express.
+                _attnQNorm = new float[layers][];
+                _attnKNorm = new float[layers][];
+                ReportIgnoredTensors(logLine, "qk_norm_vectors_unused", file, [TensorRole.AttentionQueryNorm, TensorRole.AttentionKeyNorm]);
+                break;
+
+            default:
+                throw new ModelException($"per-head QK-norm mode '{Plan.QkNorm}' is not implemented by the forward engine");
+        }
+
+        if (Plan.NormPlacement == NormPlacement.PostSublayerOutputs)
+        {
+            _postAttnNorm = LoadPostOutputNorms(layers, TensorRole.PostAttentionNorm);
+            _postFfnNorm = LoadPostOutputNorms(layers, TensorRole.PostFeedForwardNorm);
         }
         else
         {
-            _attnQNorm = new float[layers][];
-            _attnKNorm = new float[layers][];
-            ReportIgnoredTensors(logLine, "qk_norm_ignored", file, [TensorRole.AttentionQueryNorm, TensorRole.AttentionKeyNorm]);
+            // A pre-only placement reads no post-sublayer norm vector: a file carrying one describes a graph this
+            // profile does not implement, so it fails naming every such tensor instead of leaving them unread.
+            RejectUnconsumedPostNorms(layers);
+            _postAttnNorm = new float[layers][];
+            _postFfnNorm = new float[layers][];
         }
 
         LogicalTensor tokenEmbd = RequireTensor(TensorRole.TokenEmbedding);
@@ -429,11 +469,8 @@ public sealed class TransformerModel : IDisposable
                 AddBias(_batchK.AsSpan(s * kvRegion, kvRegion), _biasK[l]);
                 AddBias(_batchV.AsSpan(s * kvRegion, kvRegion), _biasV[l]);
 
-                if (Plan.HasQkNorm)
-                {
-                    LayerOps.RmsNormWeightedHeads(_batchQ.AsSpan(s * qkvRegion, qkvRegion), _attnQNorm[l], Plan.HeadDim, Plan.EpsRmsNorm, _batchQ.AsSpan(s * qkvRegion, qkvRegion));
-                    LayerOps.RmsNormWeightedHeads(_batchK.AsSpan(s * kvRegion, kvRegion), _attnKNorm[l], Plan.HeadDim, Plan.EpsRmsNorm, _batchK.AsSpan(s * kvRegion, kvRegion));
-                }
+                ApplyQkNorm(_batchQ.AsSpan(s * qkvRegion, qkvRegion), _attnQNorm[l]);
+                ApplyQkNorm(_batchK.AsSpan(s * kvRegion, kvRegion), _attnKNorm[l]);
 
                 ApplyRopeHeads(_batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, positions[s]);
                 ApplyRopeHeads(_batchK.AsSpan(s * kvRegion, kvRegion), Plan.KvHeadCount, positions[s]);
@@ -450,6 +487,9 @@ public sealed class TransformerModel : IDisposable
             for (int s = 0; s < n; s++)
             {
                 AddBias(_batchProj.AsSpan(s * hidden, hidden), _biasO[l]);
+
+                // Post-sublayer placement: this sequence's attention output joins its stream only after the post-attention norm.
+                ApplyPostSublayerNorm(_batchProj.AsSpan(s * hidden, hidden), _postAttnNorm[l]);
 
                 // ffn_inp add on the sequence's own stream, same order as the single-token forward.
                 Span<float> cur = _batchCur.AsSpan(s * hidden, hidden);
@@ -479,6 +519,9 @@ public sealed class TransformerModel : IDisposable
 
             for (int s = 0; s < n; s++)
             {
+                // Post-sublayer placement: this sequence's feed-forward output joins its stream only after the post-feed-forward norm.
+                ApplyPostSublayerNorm(_batchProj.AsSpan(s * hidden, hidden), _postFfnNorm[l]);
+
                 // ffn_out + ffn_inp: the input stream for this sequence's next layer.
                 Span<float> cur = _batchCur.AsSpan(s * hidden, hidden);
                 ReadOnlySpan<float> proj = _batchProj.AsSpan(s * hidden, hidden);
@@ -634,11 +677,8 @@ public sealed class TransformerModel : IDisposable
                         AddBias(chunkK.AsSpan(i * kvRegion, kvRegion), _biasK[l]);
                         AddBias(chunkV.AsSpan(i * kvRegion, kvRegion), _biasV[l]);
 
-                        if (Plan.HasQkNorm)
-                        {
-                            LayerOps.RmsNormWeightedHeads(chunkQ.AsSpan(i * qkvRegion, qkvRegion), _attnQNorm[l], Plan.HeadDim, Plan.EpsRmsNorm, chunkQ.AsSpan(i * qkvRegion, qkvRegion));
-                            LayerOps.RmsNormWeightedHeads(chunkK.AsSpan(i * kvRegion, kvRegion), _attnKNorm[l], Plan.HeadDim, Plan.EpsRmsNorm, chunkK.AsSpan(i * kvRegion, kvRegion));
-                        }
+                        ApplyQkNorm(chunkQ.AsSpan(i * qkvRegion, qkvRegion), _attnQNorm[l]);
+                        ApplyQkNorm(chunkK.AsSpan(i * kvRegion, kvRegion), _attnKNorm[l]);
 
                         ApplyRopeHeads(chunkQ.AsSpan(i * qkvRegion, qkvRegion), Plan.HeadCount, firstPos + i);
                         ApplyRopeHeads(chunkK.AsSpan(i * kvRegion, kvRegion), Plan.KvHeadCount, firstPos + i);
@@ -687,6 +727,9 @@ public sealed class TransformerModel : IDisposable
                     {
                         AddBias(chunkProj.AsSpan(i * hidden, hidden), _biasO[l]);
 
+                        // Post-sublayer placement: this position's attention output joins its stream only after the post-attention norm.
+                        ApplyPostSublayerNorm(chunkProj.AsSpan(i * hidden, hidden), _postAttnNorm[l]);
+
                         Span<float> posCur = cur.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden);
                         ReadOnlySpan<float> proj = chunkProj.AsSpan(i * hidden, hidden);
                         for (int x = 0; x < hidden; x++)
@@ -720,6 +763,9 @@ public sealed class TransformerModel : IDisposable
 
                     for (int i = 0; i < m; i++)
                     {
+                        // Post-sublayer placement: this position's feed-forward output joins its stream only after the post-feed-forward norm.
+                        ApplyPostSublayerNorm(chunkProj.AsSpan(i * hidden, hidden), _postFfnNorm[l]);
+
                         Span<float> posCur = cur.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden);
                         ReadOnlySpan<float> proj = chunkProj.AsSpan(i * hidden, hidden);
                         for (int x = 0; x < hidden; x++)
@@ -798,13 +844,10 @@ public sealed class TransformerModel : IDisposable
             _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _wv[l].Shape, _wv[l].Format), _v);
             AddBias(_v, _biasV[l]);
 
-            // Declared QK-norm: each q and k head is RMS-normalized with the head-dimension weight vector,
-            // after the projection and bias and before RoPE.
-            if (Plan.HasQkNorm)
-            {
-                LayerOps.RmsNormWeightedHeads(_q, _attnQNorm[l], Plan.HeadDim, Plan.EpsRmsNorm, _q);
-                LayerOps.RmsNormWeightedHeads(_k, _attnKNorm[l], Plan.HeadDim, Plan.EpsRmsNorm, _k);
-            }
+            // Resolved QK-norm mode: each q and k head is normalized in its own head-dimension slice, after the
+            // projection and bias and before RoPE.
+            ApplyQkNorm(_q, _attnQNorm[l]);
+            ApplyQkNorm(_k, _attnKNorm[l]);
 
             ApplyRopeHeads(_q, Plan.HeadCount, position);
             ApplyRopeHeads(_k, Plan.KvHeadCount, position);
@@ -816,10 +859,13 @@ public sealed class TransformerModel : IDisposable
 
             // Output projection (+bias) into scratch; the residual added before the FFN norm is the pre-attention
             // stream value (ffn_inp = attn_out + inpSA), matching the reference graph. cur held that stream through
-            // attention untouched, so adding proj in place turns it into ffn_inp.
+            // attention untouched, so adding proj in place turns it into ffn_inp. Under a post-sublayer-output
+            // placement the attention output — including any output bias — is normalized with its own vector first.
             bytes = _weights.Resolve(_wo[l]);
             _backend.Gemv(_attnOut.AsSpan(0, Plan.HeadCount * Plan.HeadDim), new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _proj);
             AddBias(_proj, _biasO[l]);
+
+            ApplyPostSublayerNorm(_proj, _postAttnNorm[l]);
 
             for (int i = 0; i < hidden; i++)
             {
@@ -839,6 +885,8 @@ public sealed class TransformerModel : IDisposable
 
             bytes = _weights.Resolve(_ffnDown[l]);
             _backend.Gemv(_gateUp.AsSpan(0, Plan.IntermediateSize), new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _proj);
+
+            ApplyPostSublayerNorm(_proj, _postFfnNorm[l]);
 
             for (int i = 0; i < hidden; i++)
             {
@@ -913,6 +961,54 @@ public sealed class TransformerModel : IDisposable
                 break;
             default:
                 throw new ModelException($"norm strategy '{Plan.Norm}' is not implemented by the forward engine");
+        }
+    }
+
+    // Per-head QK-norm runs as a direct call chosen from the plan's resolved mode, exactly as the norm and activation
+    // strategies do: no interface dispatch and no allocation anywhere in the forward, so every path — single token,
+    // batched decode, and encode — applies the resolved form identically between each head's projection (plus any bias)
+    // and its rotation. The weighted variant consumes the layer's per-head vector; the unweighted variant normalizes with
+    // the plan epsilon alone, which is numerically identical to a weight of ones and reads nothing from the file; off
+    // leaves every head region untouched. Each form normalizes in place: it finishes reading a value before writing back at that index.
+    private void ApplyQkNorm(Span<float> heads, ReadOnlySpan<float> weight)
+    {
+        switch (Plan.QkNorm)
+        {
+            case QkNormMode.PerHeadWeighted:
+                LayerOps.RmsNormWeightedHeads(heads, weight, Plan.HeadDim, Plan.EpsRmsNorm, heads);
+                break;
+
+            case QkNormMode.PerHeadUnweighted:
+                LayerOps.RmsNormUnweightedHeads(heads, Plan.HeadDim, Plan.EpsRmsNorm, heads);
+                break;
+
+            case QkNormMode.Off:
+                return;
+
+            default:
+                throw new ModelException($"per-head QK-norm mode '{Plan.QkNorm}' is not implemented by the forward engine");
+        }
+    }
+
+    // The second norm a sublayer output may receive runs as a direct branch on the plan's resolved placement, the way the
+    // softcaps do. Under PreOnly nothing here reads anything and each output joins the residual stream unchanged; under
+    // PostSublayerOutputs that sublayer's own norm vector normalizes its output in place — the attention output after its
+    // projection and any output bias, or the feed-forward output after the down GEMV — before its residual add, through
+    // the family's resolved norm kind with no bias operand, since no post-sublayer bias tensor exists in the canonical map.
+    // In place is safe for both norm kinds: each finishes reading a value before writing back at that index.
+    private void ApplyPostSublayerNorm(Span<float> output, ReadOnlySpan<float> weight)
+    {
+        switch (Plan.NormPlacement)
+        {
+            case NormPlacement.PreOnly:
+                return;
+
+            case NormPlacement.PostSublayerOutputs:
+                ApplyNorm(output, weight, ReadOnlySpan<float>.Empty, output);
+                break;
+
+            default:
+                throw new ModelException($"norm placement '{Plan.NormPlacement}' is not implemented by the forward engine");
         }
     }
 
@@ -1197,8 +1293,59 @@ public sealed class TransformerModel : IDisposable
         return biases;
     }
 
+    // Post-sublayer norm vectors under a placement that consumes them: every layer needs both, and the failure names the
+    // first one the file lacks together with the resolved placement. The map declares these roles optional because a
+    // pre-only profile must accept files without them; only the plan decides which side of that rule applies.
+    private float[][] LoadPostOutputNorms(int layers, TensorRole role)
+    {
+        TensorDescriptor descriptor = Plan.Tensors[role];
+        float[][] vectors = new float[layers][];
+        for (int l = 0; l < layers; l++)
+        {
+            LogicalTensor? tensor = descriptor.Resolve(_fileTensors, l);
+            if (tensor is null)
+            {
+                throw new ModelException(
+                    $"tensor '{descriptor.NameFor(l)}' is missing: norm placement '{Plan.NormPlacement}' needs a post-sublayer output norm in every layer of architecture '{Plan.Architecture}'");
+            }
+
+            vectors[l] = LoadVector(tensor, Plan.HiddenSize);
+        }
+
+        return vectors;
+    }
+
+    // The other side of the same rule: a pre-only placement reads no post-sublayer norm vector at all, and those tensors
+    // are not ignorable material — carrying one describes a graph this profile does not implement. Every such tensor in
+    // the table is named before the load fails.
+    private void RejectUnconsumedPostNorms(int layers)
+    {
+        List<string> present = [];
+        foreach (TensorRole role in new TensorRole[] { TensorRole.PostAttentionNorm, TensorRole.PostFeedForwardNorm })
+        {
+            TensorDescriptor descriptor = Plan.Tensors[role];
+            for (int l = 0; l < layers; l++)
+            {
+                if (descriptor.Resolve(_fileTensors, l) is not null)
+                {
+                    present.Add(descriptor.NameFor(l));
+                }
+            }
+        }
+
+        if (present.Count == 0)
+        {
+            return;
+        }
+
+        throw new ModelException(
+            $"tensor{(present.Count > 1 ? "s" : "")} '{string.Join("', '", present)}' " +
+            $"{(present.Count > 1 ? "are" : "is")} present but norm placement '{Plan.NormPlacement}' reads no " +
+            $"post-sublayer output norms for architecture '{Plan.Architecture}'");
+    }
+
     // One structured line naming the model, the architecture, and every tensor of the given roles the file
-    // carries although the plan declares the feature off, in the same style as the tokenizer profile defaults
+    // carries although the resolved plan consumes none of them, in the same style as the tokenizer profile defaults
     // and the profile substitution line. No line when no such tensor is present.
     private void ReportIgnoredTensors(Action<string>? logLine, string prefix, GgufFile file, IReadOnlyList<TensorRole> roles)
     {

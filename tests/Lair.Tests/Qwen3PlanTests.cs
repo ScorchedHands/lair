@@ -66,8 +66,10 @@ public sealed class Qwen3PlanTests : IDisposable
         Assert.Equal(BiasPolicy.Declared, plan.Bias); // bias stays declared-only for qwen3
         Assert.Equal(RopeStrategy.RotateHalfFullHead, plan.Rope); // qwen3 rotary rows pair the head halves
 
-        // The profile default turns QK-norm on without any declaration; attention bias still defaults false.
-        Assert.True(plan.HasQkNorm);
+        // The profile default turns QK-norm on without any declaration; attention bias still defaults false, and no
+        // registered profile places norms on sublayer outputs.
+        Assert.Equal(QkNormMode.PerHeadWeighted, plan.QkNorm);
+        Assert.Equal(NormPlacement.PreOnly, plan.NormPlacement);
         Assert.False(plan.UseAttentionBias);
         Assert.False(plan.UseNormBias);
     }
@@ -81,7 +83,7 @@ public sealed class Qwen3PlanTests : IDisposable
                 [.. Metadata("qwen3"), ("qwen3.attention.use_qk_norm", declared)], [])));
             ModelPlan plan = ModelPlans.Resolve(gguf);
 
-            Assert.Equal(declared, plan.HasQkNorm); // the declaration wins over the profile default in both directions
+            Assert.Equal(declared ? QkNormMode.PerHeadWeighted : QkNormMode.Off, plan.QkNorm); // the declaration wins over the profile default in both directions
         }
     }
 
@@ -91,17 +93,18 @@ public sealed class Qwen3PlanTests : IDisposable
         foreach (string architecture in new string[] { "llama", "qwen2" })
         {
             using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(Metadata(architecture, tiny: true), [])));
-            Assert.False(ModelPlans.Resolve(gguf).HasQkNorm); // unchanged behavior for the existing profiles
+            Assert.Equal(QkNormMode.Off, ModelPlans.Resolve(gguf).QkNorm); // unchanged behavior for the existing profiles
+            Assert.Equal(NormPlacement.PreOnly, ModelPlans.Resolve(gguf).NormPlacement); // and their pre-block-only norms
             Assert.Equal(RopeStrategy.StandardFullHead, ModelPlans.Resolve(gguf).Rope); // adjacent-pair RoPE stays theirs
 
             using GgufFile declared = GgufFile.Open(WriteTemp(BuildGguf(
                 [.. Metadata(architecture, tiny: true), ($"{architecture}.attention.use_qk_norm", true)], [])));
-            Assert.True(ModelPlans.Resolve(declared).HasQkNorm); // a declaration still turns it on there too
+            Assert.Equal(QkNormMode.PerHeadWeighted, ModelPlans.Resolve(declared).QkNorm); // a declaration still turns it on there too
         }
 
         using GgufFile fallback = GgufFile.Open(WriteTemp(BuildGguf(
             Metadata("myarch", tiny: true), [.. TinyTensors()])));
-        Assert.False(ModelPlans.Resolve(fallback).HasQkNorm); // the generic llama-shaped profile keeps its current defaults
+        Assert.Equal(QkNormMode.Off, ModelPlans.Resolve(fallback).QkNorm); // the generic llama-shaped profile keeps its current defaults
         Assert.Equal(RopeStrategy.StandardFullHead, ModelPlans.Resolve(fallback).Rope); // and its adjacent-pair RoPE
     }
 
@@ -130,7 +133,7 @@ public sealed class Qwen3PlanTests : IDisposable
         using GgufFile gguf = GgufFile.Open(path);
         using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8, logLines.Add);
 
-        Assert.False(model.Plan.HasQkNorm);
+        Assert.Equal(QkNormMode.Off, model.Plan.QkNorm);
         Assert.Single(logLines);
         Assert.StartsWith("qk_norm_ignored ", logLines[0]);
         Assert.Contains("model='No Norm'", logLines[0]);

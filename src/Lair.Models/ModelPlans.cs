@@ -11,7 +11,9 @@ namespace Lair.Models;
 /// comes from the declared key or the tokenizer vocabulary length, the attention score window comes from the
 /// declared <c>&lt;prefix&gt;attention.sliding_window</c> (unbounded when the key is absent), and the tensor
 /// map comes from the profile. Only standard RoPE over the full head dimension is accepted: any rope-scaling
-/// variant or partial-rotary declaration fails at load. An unregistered architecture is accepted only
+/// variant or partial-rotary declaration fails at load. The per-head QK-norm mode resolves the declared
+/// <c>&lt;prefix&gt;attention.use_qk_norm</c> against the profile's default, and the norm placement comes from the
+/// profile alone — no metadata key selects it. An unregistered architecture is accepted only
 /// through the generic llama-shaped fallback profile, which requires the file's tensor table to match the
 /// llama map exactly and reports the substitution as one structured log line when applied.
 /// </summary>
@@ -185,14 +187,16 @@ public static class ModelPlans
         float eps = (float)metadata.Get(prefix + "attention.layer_norm_rms_epsilon").AsDouble();
 
         // Declared feature flags: an absent key means the profile's feature default for it. Bias and norm-bias
-        // default false for every profile today; the per-head QK-norm default is true only for profiles whose
-        // architecture always carries the norm vectors. The declaration, not tensor presence, decides the
-        // behavior; the forward engine enforces the tensor side of each resolved flag at Open — required
-        // tensors for a resolved true, and one structured log line naming the ignored tensors for a resolved
-        // false whose tensors are present.
+        // default false for every profile today; a declared use_qk_norm=false forces the per-head mode off whatever
+        // the profile defaults to, while an absent declaration keeps that mode. The declaration, not tensor presence,
+        // decides the behavior; the forward engine enforces the tensor side of each resolved value at Open — required
+        // tensors for a weighted mode, one structured log line naming the ignored tensors for a resolved off whose
+        // vectors are present, and no demand at all from an unweighted mode. Norm placement has no declaration: it
+        // comes straight from the profile, which also decides whether each layer's post-sublayer norm tensors are
+        // required or must be absent.
         bool useAttentionBias = metadata.GetBool(prefix + "attention.use_bias", fallback: false);
         bool useNormBias = metadata.GetBool(prefix + "attention.norm_bias", fallback: false);
-        bool useQkNorm = metadata.GetBool(prefix + "attention.use_qk_norm", fallback: profile.DefaultQkNorm);
+        QkNormMode qkNorm = ResolveQkNorm(metadata, prefix, profile.DefaultQkNorm);
 
         // Declared softcaps: an absent key means the cap is disabled (zero). A declared value must land in the
         // float range as a positive finite number; anything else is a load failure naming the key and value.
@@ -243,7 +247,8 @@ public static class ModelPlans
             HasOutputWeights = hasOutputWeights,
             UseAttentionBias = useAttentionBias,
             UseNormBias = useNormBias,
-            HasQkNorm = useQkNorm,
+            QkNorm = qkNorm,
+            NormPlacement = profile.NormPlacement,
             AttentionSoftcap = attentionSoftcap,
             FinalLogitSoftcap = finalLogitSoftcap,
             AttentionWindow = attentionWindow,
@@ -440,6 +445,25 @@ public static class ModelPlans
         }
 
         return cap;
+    }
+
+    // Shared per-head QK-norm resolution: an absent declaration keeps the resolved profile's mode. A declared false
+    // forces Off whatever that default is, and a declared true requests the norm — which no metadata key can express
+    // as unweighted, so it lands on the weighted form unless the profile already resolves the unweighted one. The
+    // tensor side of every mode is enforced by the forward engine at Open.
+    private static QkNormMode ResolveQkNorm(GgufMetadata metadata, string prefix, QkNormMode profileDefault)
+    {
+        if (!metadata.Has(prefix + "attention.use_qk_norm"))
+        {
+            return profileDefault;
+        }
+
+        if (!metadata.GetBool(prefix + "attention.use_qk_norm", fallback: false))
+        {
+            return QkNormMode.Off;
+        }
+
+        return profileDefault == QkNormMode.PerHeadUnweighted ? QkNormMode.PerHeadUnweighted : QkNormMode.PerHeadWeighted;
     }
 
     // Shared attention-window resolution: an absent key means unbounded (zero). A declared key must read as an

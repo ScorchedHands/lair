@@ -22,6 +22,7 @@ public static class ModelProfiles
             Activation = ActivationStrategy.SwiGLU,
             Bias = BiasPolicy.Declared,
             Rope = RopeStrategy.StandardFullHead,
+            NormPlacement = NormPlacement.PreOnly,
             Tensors = CanonicalTensors(),
         },
         new ModelProfile
@@ -32,6 +33,7 @@ public static class ModelProfiles
             Activation = ActivationStrategy.SwiGLU,
             Bias = BiasPolicy.Declared,
             Rope = RopeStrategy.StandardFullHead,
+            NormPlacement = NormPlacement.PreOnly,
             Tensors = CanonicalTensors(),
         },
         new ModelProfile
@@ -45,10 +47,11 @@ public static class ModelProfiles
             // halves (i with i + headDim/2) instead of adjacent dimensions; the llama-family profiles keep the
             // adjacent pairing their checkpoints lay their rows in.
             Rope = RopeStrategy.RotateHalfFullHead,
-            // The qwen3 block always carries the per-head q/k norm vectors, so the feature defaults on when the
-            // file declares no attention.use_qk_norm; a declaration overrides either way. Attention biases stay
-            // declared-only: qwen3 conversion ships them only in some variants and the file must say so.
-            DefaultQkNorm = true,
+            // The qwen3 block always carries the per-head q/k norm vectors, so the feature defaults to the weighted
+            // mode when the file declares no attention.use_qk_norm; a declared false overrides it either way. Attention
+            // biases stay declared-only: qwen3 conversion ships them only in some variants and the file must say so.
+            DefaultQkNorm = QkNormMode.PerHeadWeighted,
+            NormPlacement = NormPlacement.PreOnly,
             Tensors = CanonicalTensors(),
         },
     ];
@@ -110,9 +113,12 @@ public static class ModelProfiles
 
     // The canonical llama-family tensor names: the llama.cpp GGUF layout all three supported profiles ship, with
     // attention biases and the output head optional because llama files carry neither while qwen2 and qwen3
-    // files may. The per-head QK-norm vectors and the norm-bias vectors are optional in the map: the resolved
-    // feature flag decides at load whether they are required or ignored, and a qwen3 file that defaults the flag
-    // on but lacks the vectors fails naming them.
+    // files may. The per-head QK-norm vectors are optional in the map: the resolved mode decides at load whether they
+    // are required or ignored, and a file whose profile defaults them on but lacks the vectors fails naming them. The
+    // post-sublayer norm vectors are declared here too because every family names them the same way; no profile in the
+    // registry or the generic fallback consumes them today, since each resolves NormPlacement.PreOnly, which makes their
+    // presence a layout failure rather than ignorable material. The norm-bias vectors are optional for the same reason
+    // the QK-norm ones are: the declared flag decides.
     private static TensorMap CanonicalTensors() =>
         new(
         [
@@ -138,5 +144,7 @@ public static class ModelProfiles
             new TensorDescriptor(TensorRole.AttentionNormBias, TensorScope.PerLayer, "blk.{layer}.attn_norm.bias", Required: false, []),
             new TensorDescriptor(TensorRole.FeedForwardNormBias, TensorScope.PerLayer, "blk.{layer}.ffn_norm.bias", Required: false, []),
             new TensorDescriptor(TensorRole.OutputNormBias, TensorScope.Global, "output_norm.bias", Required: false, []),
+            new TensorDescriptor(TensorRole.PostAttentionNorm, TensorScope.PerLayer, "blk.{layer}.post_attention_norm.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.PostFeedForwardNorm, TensorScope.PerLayer, "blk.{layer}.post_ffw_norm.weight", Required: false, []),
         ]);
 }

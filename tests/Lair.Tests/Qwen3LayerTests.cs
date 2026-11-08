@@ -53,7 +53,7 @@ public sealed class Qwen3LayerTests : IDisposable
 
         // Nothing declares the feature: the qwen3 profile default resolved it on, and the head dimension came
         // from key_length / value_length (2 x 4 != 6) with grouped-query attention.
-        Assert.True(model.Plan.HasQkNorm);
+        Assert.Equal(QkNormMode.PerHeadWeighted, model.Plan.QkNorm);
         Assert.Equal(4, model.Plan.HeadDim);
         Assert.Equal(6, model.Plan.HiddenSize);
         Assert.Equal(1, model.Plan.KvHeadCount);
@@ -138,7 +138,7 @@ public sealed class Qwen3LayerTests : IDisposable
         using GgufFile gguf = GgufFile.Open(path);
         using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
 
-        Assert.False(model.Plan.HasQkNorm); // the declaration overrides the profile default
+        Assert.Equal(QkNormMode.Off, model.Plan.QkNorm); // the declaration overrides the profile default
 
         Qwen3Reference reference = new(spec);
 

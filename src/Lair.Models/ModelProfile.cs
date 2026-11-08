@@ -28,8 +28,19 @@ public sealed record ModelProfile
 
     /// <summary>
     /// Feature default for per-head QK-norm, applied when the file declares no
-    /// <c>&lt;prefix&gt;attention.use_qk_norm</c>: the declaration wins in either direction, and a default of
-    /// <c>true</c> makes the per-head norm vectors required at load for a file that declares nothing.
+    /// <c>&lt;prefix&gt;attention.use_qk_norm</c>: a declared false overrides it to <see cref="QkNormMode.Off"/>
+    /// whatever the profile defaults to, and a profile defaulting to a weighted mode makes the per-head norm vectors
+    /// required at load for a file that declares nothing. A profile defaults this to
+    /// <see cref="Lair.Models.QkNormMode.Off"/>.
     /// </summary>
-    public bool DefaultQkNorm { get; init; }
+    public QkNormMode DefaultQkNorm { get; init; } = QkNormMode.Off;
+
+    /// <summary>
+    /// Where this architecture's forward places its norm vectors relative to the residual add: a profile defaults to
+    /// <see cref="Lair.Models.NormPlacement.PreOnly"/>, and
+    /// <see cref="Lair.Models.NormPlacement.PostSublayerOutputs"/> makes every layer's post-sublayer norm tensors
+    /// required at load. No metadata key selects it: the profile decides, so a file carrying those tensors under a
+    /// pre-only placement is a layout failure rather than ignored material.
+    /// </summary>
+    public NormPlacement NormPlacement { get; init; } = NormPlacement.PreOnly;
 }

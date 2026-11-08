@@ -23,8 +23,9 @@ public sealed class ModelPlanTests : IDisposable
     private const uint GgufMagic = 0x46554747; // "GGUF"
 
     // Roles a file may omit: attention biases (llama ships none, qwen2 may), the untied output head and its
-    // bias, the per-head QK-norm vectors, and the norm-bias vectors — every one of them exists only for files
-    // that declare the matching feature.
+    // bias, the per-head QK-norm vectors, the norm-bias vectors, and the post-sublayer norm vectors (no registered
+    // profile places norms on sublayer outputs today) — every one of them exists only for files whose plan consumes
+    // the matching feature.
     private static readonly TensorRole[] OptionalRoles =
     [
         TensorRole.AttentionQueryBias,
@@ -38,6 +39,8 @@ public sealed class ModelPlanTests : IDisposable
         TensorRole.AttentionNormBias,
         TensorRole.FeedForwardNormBias,
         TensorRole.OutputNormBias,
+        TensorRole.PostAttentionNorm,
+        TensorRole.PostFeedForwardNorm,
     ];
 
     private readonly List<string> _tempFiles = [];
@@ -120,7 +123,8 @@ public sealed class ModelPlanTests : IDisposable
             // The declared feature flags default to false: these fixtures declare none of the feature keys.
             Assert.False(plan.UseAttentionBias);
             Assert.False(plan.UseNormBias);
-            Assert.False(plan.HasQkNorm);
+            Assert.Equal(QkNormMode.Off, plan.QkNorm);
+            Assert.Equal(NormPlacement.PreOnly, plan.NormPlacement); // no registered profile norms sublayer outputs today
         }
     }
 
@@ -351,6 +355,8 @@ public sealed class ModelPlanTests : IDisposable
             Assert.Equal("blk.7.attn_norm.bias", map[TensorRole.AttentionNormBias].NameFor(7));
             Assert.Equal("blk.7.ffn_norm.bias", map[TensorRole.FeedForwardNormBias].NameFor(7));
             Assert.Equal("output_norm.bias", map[TensorRole.OutputNormBias].NameFor(-1));
+            Assert.Equal("blk.7.post_attention_norm.weight", map[TensorRole.PostAttentionNorm].NameFor(7));
+            Assert.Equal("blk.7.post_ffw_norm.weight", map[TensorRole.PostFeedForwardNorm].NameFor(7));
         }
     }
 
@@ -408,7 +414,9 @@ public sealed class ModelPlanTests : IDisposable
             ("blk.0.attn_k_norm.weight", [4]),
             ("blk.0.attn_norm.bias", [4]),
             ("blk.0.ffn_norm.bias", [4]),
-            ("output_norm.bias", [4]));
+            ("output_norm.bias", [4]),
+            ("blk.0.post_attention_norm.weight", [4]),
+            ("blk.0.post_ffw_norm.weight", [4]));
 
         foreach (TensorDescriptor descriptor in map.Descriptors)
         {
@@ -579,7 +587,7 @@ public sealed class ModelPlanTests : IDisposable
         {
             ModelPlan plan = ModelPlans.Resolve(flagsGguf);
             Assert.True(plan.UseNormBias);
-            Assert.True(plan.HasQkNorm);
+            Assert.Equal(QkNormMode.PerHeadWeighted, plan.QkNorm);
         }
 
         string path = WriteTemp(BuildGguf(
@@ -603,7 +611,7 @@ public sealed class ModelPlanTests : IDisposable
         using GgufFile absent = GgufFile.Open(WriteTemp(BuildGguf(Metadata("llama", tiny: true), [])));
         ModelPlan absentPlan = ModelPlans.Resolve(absent);
         Assert.False(absentPlan.UseNormBias);
-        Assert.False(absentPlan.HasQkNorm);
+        Assert.Equal(QkNormMode.Off, absentPlan.QkNorm);
     }
 
     [Fact]

@@ -50,6 +50,54 @@ public enum BiasPolicy
 }
 
 /// <summary>
+/// Where each layer applies its norm vectors relative to the residual add. Resolved once per model from its
+/// <see cref="ModelProfile"/>; no metadata key decides it today, and the forward path switches on the value and
+/// never dispatches through a per-token interface.
+/// </summary>
+public enum NormPlacement
+{
+    /// <summary>
+    /// Each sublayer consumes only the norm that precedes it: the attention input stream before the QKV GEMVs and
+    /// the feed-forward input stream before the gate/up GEMVs, each added to unchanged afterwards. No tensor after a
+    /// sublayer is normalized again before its residual add.
+    /// </summary>
+    PreOnly,
+
+    /// <summary>
+    /// Each sublayer output is normalized once more with its own norm vector before it joins the residual stream:
+    /// the attention output after the output projection and before the first residual add, and the feed-forward
+    /// output after the down projection and before the second. The pre-sublayer norms still apply exactly as under
+    /// <see cref="PreOnly"/>; this adds a second norm on each output rather than replacing the first.
+    /// </summary>
+    PostSublayerOutputs,
+}
+
+/// <summary>
+/// Per-head normalization applied to the q and k heads after their projection (and any bias) and before RoPE.
+/// Resolved once per model from its <see cref="ModelProfile"/> default and the file's declared
+/// <c>&lt;prefix&gt;attention.use_qk_norm</c>; the forward path switches on the value and never dispatches through a
+/// per-token interface.
+/// </summary>
+public enum QkNormMode
+{
+    /// <summary>No per-head normalization: q and k go from their projection straight to RoPE.</summary>
+    Off,
+
+    /// <summary>
+    /// RMS norm over each head's own <c>headDim</c> slice scaled by the layer's per-head weight vector, which the
+    /// file must carry for every layer: <c>src / sqrt(mean(src_h^2) + eps) * w[i]</c>.
+    /// </summary>
+    PerHeadWeighted,
+
+    /// <summary>
+    /// RMS norm over each head's own <c>headDim</c> slice with the plan epsilon alone and no weight vector:
+    /// <c>src / sqrt(mean(src_h^2) + eps)</c>, numerically identical to a weight of ones. It consumes no tensor, so
+    /// it demands none and ignores any per-head norm vectors the file carries.
+    /// </summary>
+    PerHeadUnweighted,
+}
+
+/// <summary>
 /// Rotary position embedding applied to the q and k heads. Resolved once per model from its
 /// <see cref="ModelProfile"/>; scaling variants and partial rotary slices are outside the implemented set.
 /// </summary>

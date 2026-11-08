@@ -32,6 +32,8 @@ public enum TensorRole
     AttentionNormBias,
     FeedForwardNormBias,
     OutputNormBias,
+    PostAttentionNorm,
+    PostFeedForwardNorm,
 }
 
 /// <summary>Whether a tensor name is a single global name or a per-block name carrying a <c>{layer}</c> placeholder.</summary>

@@ -139,7 +139,7 @@ public sealed class DeclaredFeatureLayerTests : IDisposable
             using GgufFile gguf = GgufFile.Open(onPath);
             using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
 
-            Assert.True(model.Plan.HasQkNorm);
+            Assert.Equal(QkNormMode.PerHeadWeighted, model.Plan.QkNorm);
 
             using BlockPool pool = new(blockTokens: 4, layerCount: model.Plan.LayerCount, kvHeads: model.Plan.KvHeadCount, headDim: model.Plan.HeadDim, capacityBlocks: 4, backend);
             using SequenceKv kv = new(pool);
@@ -207,7 +207,7 @@ public sealed class DeclaredFeatureLayerTests : IDisposable
             using GgufFile gguf = GgufFile.Open(offPath);
             using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
 
-            Assert.False(model.Plan.HasQkNorm);
+            Assert.Equal(QkNormMode.Off, model.Plan.QkNorm);
 
             using BlockPool pool = new(blockTokens: 4, layerCount: model.Plan.LayerCount, kvHeads: model.Plan.KvHeadCount, headDim: model.Plan.HeadDim, capacityBlocks: 4, backend);
             using SequenceKv kv = new(pool);

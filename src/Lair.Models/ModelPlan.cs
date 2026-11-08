@@ -18,7 +18,9 @@ namespace Lair.Models;
 /// is the length of <c>tokenizer.ggml.tokens</c>. The declared feature flags read
 /// <c>&lt;prefix&gt;attention.use_bias</c>, <c>&lt;prefix&gt;attention.norm_bias</c>, and
 /// <c>&lt;prefix&gt;attention.use_qk_norm</c>; the first two default to <c>false</c> when the key is absent,
-/// and QK-norm defaults to the resolved profile's feature default. The declared softcaps read
+/// a declared false forces per-head QK-norm off, and an absent or true declaration keeps the resolved
+/// profile's QK-norm mode. The norm placement comes from the resolved profile alone: no metadata key selects
+/// it today. The declared softcaps read
 /// <c>&lt;prefix&gt;attn_logit_softcapping</c> and <c>&lt;prefix&gt;final_logit_softcapping</c>, each
 /// resolving to <c>0f</c> (disabled) when the key is absent and to a positive finite number otherwise. The
 /// declared attention window reads <c>&lt;prefix&gt;attention.sliding_window</c>, resolving to <c>0</c>
@@ -65,8 +67,11 @@ public sealed record ModelPlan
     /// <summary>Declared <c>&lt;prefix&gt;attention.norm_bias</c>: whether the norm layers carry additive bias vectors.</summary>
     public required bool UseNormBias { get; init; }
 
-    /// <summary>Resolved per-head QK-norm: <c>&lt;prefix&gt;attention.use_qk_norm</c> when declared, otherwise the resolved profile's feature default — whether q and k heads pass through a per-head RMS norm before RoPE.</summary>
-    public required bool HasQkNorm { get; init; }
+    /// <summary>Resolved per-head QK-norm mode: a declared <c>&lt;prefix&gt;attention.use_qk_norm=false</c> forces <see cref="QkNormMode.Off"/>; absent the key resolves to the resolved profile's mode, and a declaration of <c>true</c> selects the weighted form on an architecture whose profile defaults it off.</summary>
+    public required QkNormMode QkNorm { get; init; }
+
+    /// <summary>The resolved profile's norm placement: whether each sublayer output is normalized again with its own vector before joining the residual stream, or only the streams feeding each sublayer are normalized. No metadata key decides it.</summary>
+    public required NormPlacement NormPlacement { get; init; }
 
     /// <summary>Declared <c>&lt;prefix&gt;attn_logit_softcapping</c>: the attention-score softcap applied after scaling and before the softmax, or <c>0f</c> when the key is absent (disabled).</summary>
     public float AttentionSoftcap { get; init; }
