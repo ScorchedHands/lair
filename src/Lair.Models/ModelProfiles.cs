@@ -34,6 +34,23 @@ public static class ModelProfiles
             Rope = RopeStrategy.StandardFullHead,
             Tensors = CanonicalTensors(),
         },
+        new ModelProfile
+        {
+            Architecture = "qwen3",
+            Prefix = "qwen3.",
+            Norm = NormStrategy.RmsNorm,
+            Activation = ActivationStrategy.SwiGLU,
+            Bias = BiasPolicy.Declared,
+            // The qwen3 block carries its rotary q/k rows in rotate-half order, so the engine pairs each head's
+            // halves (i with i + headDim/2) instead of adjacent dimensions; the llama-family profiles keep the
+            // adjacent pairing their checkpoints lay their rows in.
+            Rope = RopeStrategy.RotateHalfFullHead,
+            // The qwen3 block always carries the per-head q/k norm vectors, so the feature defaults on when the
+            // file declares no attention.use_qk_norm; a declaration overrides either way. Attention biases stay
+            // declared-only: qwen3 conversion ships them only in some variants and the file must say so.
+            DefaultQkNorm = true,
+            Tensors = CanonicalTensors(),
+        },
     ];
 
     private static readonly Dictionary<string, ModelProfile> ByArchitecture =
@@ -91,10 +108,11 @@ public static class ModelProfiles
         return GenericProfile with { Prefix = architecture + "." };
     }
 
-    // The canonical llama-family tensor names: the llama.cpp GGUF layout both supported profiles ship, with
-    // attention biases and the output head optional because llama files carry neither while qwen2 files may.
-    // The per-head QK-norm vectors and the norm-bias vectors are optional too: they exist only for files that
-    // declare the corresponding feature, and the declared flags decide whether they are required or ignored.
+    // The canonical llama-family tensor names: the llama.cpp GGUF layout all three supported profiles ship, with
+    // attention biases and the output head optional because llama files carry neither while qwen2 and qwen3
+    // files may. The per-head QK-norm vectors and the norm-bias vectors are optional in the map: the resolved
+    // feature flag decides at load whether they are required or ignored, and a qwen3 file that defaults the flag
+    // on but lacks the vectors fails naming them.
     private static TensorMap CanonicalTensors() =>
         new(
         [

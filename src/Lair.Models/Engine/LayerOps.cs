@@ -5,8 +5,9 @@ namespace Lair.Models.Engine;
 
 /// <summary>
 /// The pure numeric operations of the transformer forward pass, isolated so each can be verified against
-/// hand-computed values independently of any model file. RoPE uses GGUF/llama-style adjacent pairs (2i, 2i + 1)
-/// with theta_i = base^(-2i/headDim); RMSNorm and LayerNorm accumulate in double; attention runs an online softmax
+/// hand-computed values independently of any model file. RoPE rotates q/k adjacent pairs (2i, 2i + 1) for the
+/// llama-family pairing or rotate-half pairs (i, i + headDim/2) for the qwen3 pairing, each with
+/// theta_i = base^(-2i/headDim); RMSNorm and LayerNorm accumulate in double; attention runs an online softmax
 /// over the paged KV cache so no score row is ever materialized.
 /// </summary>
 internal static class LayerOps
@@ -246,7 +247,7 @@ internal static class LayerOps
     /// <summary>
     /// Rotates one head region in place with GGUF/llama-style adjacent pairs: out[2i] = x[2i]*cos_i - x[2i+1]*sin_i,
     /// out[2i + 1] = x[2i + 1]*cos_i + x[2i]*sin_i. Table entry i is the angle of the pair occupying adjacent head
-    /// dimensions 2i and 2i + 1, which is how rotary q/k rows are laid out in converted GGUF checkpoints.
+    /// dimensions 2i and 2i + 1, which is how rotary q/k rows are laid out in converted llama-family GGUF checkpoints.
     /// </summary>
     internal static void ApplyRopeToHead(Span<float> headRegion, int ropeHalf, ReadOnlySpan<float> cosAtPosition, ReadOnlySpan<float> sinAtPosition)
     {
@@ -262,6 +263,35 @@ internal static class LayerOps
 
             int lowIndex = 2 * i;
             int highIndex = 2 * i + 1;
+
+            float lo = headRegion[lowIndex];
+            float hi = headRegion[highIndex];
+
+            headRegion[lowIndex] = lo * c - hi * s;
+            headRegion[highIndex] = hi * c + lo * s;
+        }
+    }
+
+    /// <summary>
+    /// Rotates one head region in place with rotate-half (non-adjacent) pairs: out[i] = x[i]*cos_i - x[i + ropeHalf]*sin_i,
+    /// out[i + ropeHalf] = x[i + ropeHalf]*cos_i + x[i]*sin_i. Table entry i is the angle of the pair occupying head
+    /// dimensions i and i + ropeHalf, which is how rotary q/k rows are laid out in converted qwen3 GGUF checkpoints.
+    /// The angle table is the same one <see cref="BuildRopeTables"/> produces for the adjacent pairing.
+    /// </summary>
+    internal static void ApplyRopeToSplitHalfHead(Span<float> headRegion, int ropeHalf, ReadOnlySpan<float> cosAtPosition, ReadOnlySpan<float> sinAtPosition)
+    {
+        if (headRegion.Length < 2 * ropeHalf || cosAtPosition.Length < ropeHalf || sinAtPosition.Length < ropeHalf)
+        {
+            throw new ArgumentException("RoPE operands must cover a full head region and half-dimension tables.", nameof(headRegion));
+        }
+
+        for (int i = 0; i < ropeHalf; i++)
+        {
+            float c = cosAtPosition[i];
+            float s = sinAtPosition[i];
+
+            int lowIndex = i;
+            int highIndex = i + ropeHalf;
 
             float lo = headRegion[lowIndex];
             float hi = headRegion[highIndex];

@@ -14,9 +14,11 @@ namespace Lair.Models;
 /// <c>&lt;prefix&gt;vocab_size</c>), with <c>&lt;prefix&gt;attention.head_length</c> as the preferred source
 /// for an explicit head dimension and <c>&lt;prefix&gt;attention.key_length</c> /
 /// <c>&lt;prefix&gt;attention.value_length</c> accepted as equivalent sources; the head dimension no longer
-/// has to split the hidden size exactly. The declared feature flags read <c>&lt;prefix&gt;attention.use_bias</c>,
-/// <c>&lt;prefix&gt;attention.norm_bias</c>, and <c>&lt;prefix&gt;attention.use_qk_norm</c>, each defaulting
-/// to <c>false</c> when the key is absent. The declared softcaps read
+/// has to split the hidden size exactly. A declared <c>&lt;prefix&gt;vocab_size</c> wins; without it the size
+/// is the length of <c>tokenizer.ggml.tokens</c>. The declared feature flags read
+/// <c>&lt;prefix&gt;attention.use_bias</c>, <c>&lt;prefix&gt;attention.norm_bias</c>, and
+/// <c>&lt;prefix&gt;attention.use_qk_norm</c>; the first two default to <c>false</c> when the key is absent,
+/// and QK-norm defaults to the resolved profile's feature default. The declared softcaps read
 /// <c>&lt;prefix&gt;attn_logit_softcapping</c> and <c>&lt;prefix&gt;final_logit_softcapping</c>, each
 /// resolving to <c>0f</c> (disabled) when the key is absent and to a positive finite number otherwise.
 /// </summary>
@@ -61,7 +63,7 @@ public sealed record ModelPlan
     /// <summary>Declared <c>&lt;prefix&gt;attention.norm_bias</c>: whether the norm layers carry additive bias vectors.</summary>
     public required bool UseNormBias { get; init; }
 
-    /// <summary>Declared <c>&lt;prefix&gt;attention.use_qk_norm</c>: whether q and k heads pass through a per-head RMS norm before RoPE.</summary>
+    /// <summary>Resolved per-head QK-norm: <c>&lt;prefix&gt;attention.use_qk_norm</c> when declared, otherwise the resolved profile's feature default — whether q and k heads pass through a per-head RMS norm before RoPE.</summary>
     public required bool HasQkNorm { get; init; }
 
     /// <summary>Declared <c>&lt;prefix&gt;attn_logit_softcapping</c>: the attention-score softcap applied after scaling and before the softmax, or <c>0f</c> when the key is absent (disabled).</summary>

@@ -35,6 +35,10 @@ public sealed class ParityTests
     // calibrated logprobs reproduce exactly, which is what these gates actually verify.
     private const string Q4KMFixture = "tests/fixtures/parity-smollm-q4km.json";
 
+    // The Qwen3 Q8_0 fixture: a real qwen3 load (per-head QK-norm by profile default, 16 x 128 attention over a
+    // 1024-hidden model, tied output head) against the same pinned reference and the same quantized-file band.
+    private const string Qwen3Fixture = "tests/fixtures/parity-qwen3.json";
+
     /// <summary>Ranking window whose reproduction the fixtures calibrate.</summary>
     private const int CalibrationWindow = 16;
 
@@ -50,7 +54,7 @@ public sealed class ParityTests
     public static TheoryData<string, int> PromptCases()
     {
         TheoryData<string, int> cases = [];
-        foreach (string fixture in new[] { F16Fixture, Q8Fixture, Q4KMFixture })
+        foreach (string fixture in new[] { F16Fixture, Q8Fixture, Q4KMFixture, Qwen3Fixture })
         {
             string? path = ModelFixture.ResolveRepoRelative(fixture);
             if (path is null)

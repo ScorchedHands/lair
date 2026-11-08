@@ -25,4 +25,11 @@ public sealed record ModelProfile
 
     /// <summary>Declared sparse-FFN shape, or <c>null</c> for a dense gate/up/down block.</summary>
     public SparseFfnDescriptor? SparseFfn { get; init; }
+
+    /// <summary>
+    /// Feature default for per-head QK-norm, applied when the file declares no
+    /// <c>&lt;prefix&gt;attention.use_qk_norm</c>: the declaration wins in either direction, and a default of
+    /// <c>true</c> makes the per-head norm vectors required at load for a file that declares nothing.
+    /// </summary>
+    public bool DefaultQkNorm { get; init; }
 }

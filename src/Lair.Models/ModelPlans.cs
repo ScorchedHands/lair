@@ -7,8 +7,9 @@ namespace Lair.Models;
 
 /// <summary>
 /// Resolves a GGUF file into a <see cref="ModelPlan"/>: the architecture is looked up in
-/// <see cref="ModelProfiles"/>, the geometry is read from the profile's metadata prefix, and the tensor map
-/// comes from the profile. Only standard RoPE over the full head dimension is accepted: any rope-scaling
+/// <see cref="ModelProfiles"/>, the geometry is read from the profile's metadata prefix, the vocabulary size
+/// comes from the declared key or the tokenizer vocabulary length, and the tensor map comes from the profile.
+/// Only standard RoPE over the full head dimension is accepted: any rope-scaling
 /// variant or partial-rotary declaration fails at load. An unregistered architecture is accepted only
 /// through the generic llama-shaped fallback profile, which requires the file's tensor table to match the
 /// llama map exactly and reports the substitution as one structured log line when applied.
@@ -182,20 +183,26 @@ public static class ModelPlans
 
         float eps = (float)metadata.Get(prefix + "attention.layer_norm_rms_epsilon").AsDouble();
 
-        // Declared feature flags: an absent key means false. The declaration, not tensor presence, decides bias
-        // behavior; the forward engine enforces the tensor side of each declaration at Open — required tensors
-        // for a declared true, and one structured log line naming the ignored tensors for a declared false
-        // whose tensors are present.
+        // Declared feature flags: an absent key means the profile's feature default for it. Bias and norm-bias
+        // default false for every profile today; the per-head QK-norm default is true only for profiles whose
+        // architecture always carries the norm vectors. The declaration, not tensor presence, decides the
+        // behavior; the forward engine enforces the tensor side of each resolved flag at Open — required
+        // tensors for a resolved true, and one structured log line naming the ignored tensors for a resolved
+        // false whose tensors are present.
         bool useAttentionBias = metadata.GetBool(prefix + "attention.use_bias", fallback: false);
         bool useNormBias = metadata.GetBool(prefix + "attention.norm_bias", fallback: false);
-        bool useQkNorm = metadata.GetBool(prefix + "attention.use_qk_norm", fallback: false);
+        bool useQkNorm = metadata.GetBool(prefix + "attention.use_qk_norm", fallback: profile.DefaultQkNorm);
 
         // Declared softcaps: an absent key means the cap is disabled (zero). A declared value must land in the
         // float range as a positive finite number; anything else is a load failure naming the key and value.
         float attentionSoftcap = ResolveSoftcap(metadata, prefix + "attn_logit_softcapping");
         float finalLogitSoftcap = ResolveSoftcap(metadata, prefix + "final_logit_softcapping");
 
-        int vocab = RequireInt(metadata, prefix + "vocab_size");
+        // Vocabulary size: the declared key wins when present. Without it the size is the length of the
+        // tokenizer vocabulary; a file carrying neither fails with a message naming both keys. The fallback
+        // and a declared/tokenizer disagreement are each reported as one structured line in the style of the
+        // profile-default lines.
+        int vocab = ResolveVocab(metadata, prefix, gguf, logLine);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(vocab);
 
         LogicalTensorTable tensors = gguf.Tensors;
@@ -207,9 +214,8 @@ public static class ModelPlans
             // and the profile actually applied, in the same style as the tokenizer profile defaults.
             if (logLine is not null)
             {
-                string modelName = metadata.Has("general.name") ? metadata.Get("general.name").AsString() : "";
                 logLine(
-                    $"model_profile model='{(modelName.Length > 0 ? modelName : gguf.Path)}' " +
+                    $"model_profile model='{ModelName(metadata, gguf)}' " +
                     $"architecture='{architecture}' profile={profile.Architecture}");
             }
         }
@@ -284,7 +290,7 @@ public static class ModelPlans
         List<string> unexpected = [];
         foreach (LogicalTensor tensor in tensors.Tensors)
         {
-            if (!nameable.Contains(tensor.Name))
+            if (!nameable.Contains(tensor.Name) && !IsCompanionOfNameable(tensor.Name, nameable))
             {
                 unexpected.Add(tensor.Name);
             }
@@ -303,6 +309,22 @@ public static class ModelPlans
     private static string AliasName(string alias, int layer) =>
         alias.Replace("{layer}", layer.ToString(CultureInfo.InvariantCulture));
 
+    // A quantization companion entry — a <tensor>.scale block or a <tensor>.input_scale scalar — of a tensor the
+    // llama-shaped map can name is known-optional: the forward never reads it, so the fallback gate must not
+    // mistake it for a layout mismatch.
+    private static bool IsCompanionOfNameable(string name, HashSet<string> nameable)
+    {
+        foreach (string suffix in new string[] { ".input_scale", ".scale" })
+        {
+            if (name.EndsWith(suffix, StringComparison.Ordinal) && nameable.Contains(name[..^suffix.Length]))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private static int RequireInt(GgufMetadata metadata, string key)
     {
         if (!metadata.Has(key))
@@ -318,6 +340,68 @@ public static class ModelPlans
         {
             throw new ModelException($"GGUF metadata key '{key}' must be an integer", ex);
         }
+    }
+
+    // Shared vocabulary resolution: the declared <prefix>vocab_size wins when present; otherwise the size is
+    // the length of tokenizer.ggml.tokens; a file carrying neither fails naming both keys. When the fallback
+    // is applied, or when both sources are present and disagree (the declared key still wins), one structured
+    // line names the model and the token count, in the style of the tokenizer profile-default lines.
+    private static int ResolveVocab(GgufMetadata metadata, string prefix, GgufFile gguf, Action<string>? logLine)
+    {
+        bool declared = metadata.Has(prefix + "vocab_size");
+        bool tokensDeclared = metadata.Has("tokenizer.ggml.tokens");
+
+        if (!declared && !tokensDeclared)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{prefix}vocab_size' is not present and 'tokenizer.ggml.tokens' is not " +
+                "present: the vocabulary size must be declared or derivable from the tokenizer vocabulary");
+        }
+
+        int tokenCount = -1;
+        if (tokensDeclared)
+        {
+            try
+            {
+                tokenCount = metadata.Get("tokenizer.ggml.tokens").AsArray().Count;
+            }
+            catch (GgufException ex)
+            {
+                throw new ModelException("GGUF metadata key 'tokenizer.ggml.tokens' must be an array", ex);
+            }
+        }
+
+        if (!declared)
+        {
+            if (logLine is not null)
+            {
+                logLine(
+                    $"vocab_fallback model='{ModelName(metadata, gguf)}' " +
+                    $"source=tokenizer.ggml.tokens count={tokenCount.ToString(CultureInfo.InvariantCulture)}");
+            }
+
+            return tokenCount;
+        }
+
+        int vocab = RequireInt(metadata, prefix + "vocab_size");
+
+        if (tokenCount >= 0 && tokenCount != vocab && logLine is not null)
+        {
+            logLine(
+                $"vocab_disagree model='{ModelName(metadata, gguf)}' " +
+                $"declared={vocab.ToString(CultureInfo.InvariantCulture)} source=tokenizer.ggml.tokens " +
+                $"count={tokenCount.ToString(CultureInfo.InvariantCulture)}");
+        }
+
+        return vocab;
+    }
+
+    // Display name shared by the structured load-time log lines: general.name when declared and non-empty,
+    // the file path otherwise.
+    private static string ModelName(GgufMetadata metadata, GgufFile gguf)
+    {
+        string name = metadata.Has("general.name") ? metadata.Get("general.name").AsString() : "";
+        return name.Length > 0 ? name : gguf.Path;
     }
 
     // Shared softcap resolution: an absent key means disabled (zero). A declared key is read as a double and

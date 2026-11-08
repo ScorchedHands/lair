@@ -146,6 +146,70 @@ public sealed class LayerTests : IDisposable
         Assert.Throws<ArgumentException>(() => LayerOps.BuildRopeTables(Base, 7, maxPositions: 1, new float[4], new float[4])); // odd head dim
     }
 
+    [Fact]
+    public void SplitHalfRoPE_MatchesManualPairMath_AndKeepsHeadNorm()
+    {
+        const int HeadDim = 8; // rotate-half pairs (i, i + headDim/2); theta_i = base^(-2i/headDim)
+        const double Base = 10_000.0;
+
+        float[] cos = new float[2 * (HeadDim / 2)];
+        float[] sin = new float[2 * (HeadDim / 2)];
+        LayerOps.BuildRopeTables(Base, HeadDim, maxPositions: 2, cos, sin); // the same angle table the adjacent pairing uses
+
+        const int half = HeadDim / 2;
+
+        // Position 0 is the identity rotation for this pairing too.
+        float[] head = [3f, -1f, 4f, 1f, 5f, 9f, 2f, 6f];
+        float[] identity = [.. head];
+        LayerOps.ApplyRopeToSplitHalfHead(identity, half, cos.AsSpan(0), sin.AsSpan(0));
+        Assert.True(identity.AsSpan().SequenceEqual(head.AsSpan()), "position-0 rotate-half RoPE must be the exact identity");
+
+        double normBefore = 0;
+        foreach (float v in head)
+        {
+            normBefore += (double)v * v;
+        }
+
+        float[] rotated = [.. head];
+        LayerOps.ApplyRopeToSplitHalfHead(rotated, half, cos.AsSpan(half), sin.AsSpan(half)); // position 1
+
+        for (int i = 0; i < half; i++)
+        {
+            double invFreq = Math.Pow(Base, -2.0 * i / HeadDim);
+            float c = (float)Math.Cos(invFreq); // pos == 1: the angle equals the inverse frequency itself
+            float s = (float)Math.Sin(invFreq);
+
+            // Pair i occupies head dimensions i and i + half — the halves of the head, not adjacent dimensions.
+            int lowIndex = i;
+            int highIndex = i + half;
+
+            double loExpected = head[lowIndex] * (double)c - head[highIndex] * s;
+            double hiExpected = head[highIndex] * (double)c + head[lowIndex] * s;
+
+            Assert.True(
+                Math.Abs(rotated[lowIndex] - loExpected) <= 1e-6 * Math.Max(1.0, Math.Abs(loExpected)),
+                $"rotate-half rope pair [{i}] low: expected {loExpected:G9}, got {rotated[lowIndex]:G9}");
+            Assert.True(
+                Math.Abs(rotated[highIndex] - hiExpected) <= 1e-6 * Math.Max(1.0, Math.Abs(hiExpected)),
+                $"rotate-half rope pair [{i}] high: expected {hiExpected:G9}, got {rotated[highIndex]:G9}");
+        }
+
+        // The pairing differs from adjacent dimensions on this vector at position 1: the two rotations are not equal.
+        float[] adjacent = [.. head];
+        LayerOps.ApplyRopeToHead(adjacent, half, cos.AsSpan(half), sin.AsSpan(half));
+        Assert.False(rotated.AsSpan().SequenceEqual(adjacent.AsSpan()), "rotate-half and adjacent-dimension pairing must differ");
+
+        double normAfter = 0;
+        foreach (float v in rotated)
+        {
+            normAfter += (double)v * v;
+        }
+
+        Assert.True(Math.Abs(normAfter - normBefore) <= 1e-4, $"rotate-half RoPE must preserve head norm: before {normBefore:G9}, after {normAfter:G9}");
+
+        Assert.Throws<ArgumentException>(() => LayerOps.ApplyRopeToSplitHalfHead(new float[3], half, cos.AsSpan(half), sin.AsSpan(half)));
+    }
+
     [Theory]
     [InlineData(-3f)]
     [InlineData(-1f)]

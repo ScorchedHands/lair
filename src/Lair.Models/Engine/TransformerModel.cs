@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Globalization;
 
 using Lair.Contracts;
 using Lair.Kv;
@@ -10,9 +11,10 @@ namespace Lair.Models.Engine;
 /// Forward engine for supported GGUF architectures (llama, qwen2): embedding lookup, per-layer norm / GQA
 /// attention with RoPE and paged KV via <see cref="SequenceKv"/>, gated feed-forward, final norm, and an untied
 /// output matrix or tied token-embedding rows for logits. The graph mirrors the reference structure: each layer
-/// normalizes its input stream (norm x weight under the plan's resolved norm strategy) before the QKV GEMVs; RoPE
-/// rotates q/k adjacent pairs (2i, 2i+1) at the absolute position with theta_i = base^(-2i/headDim); attention
-/// scores scale by 1/sqrt(headDim), pass through the plan's attention-score softcap when one is resolved, and
+    /// normalizes its input stream (norm x weight under the plan's resolved norm strategy) before the QKV GEMVs; RoPE
+    /// rotates q/k pairs at the absolute position with theta_i = base^(-2i/headDim), pairing adjacent dimensions
+    /// (2i, 2i + 1) under the llama-family strategy or the head halves (i, i + headDim/2) under the qwen3 strategy;
+    /// attention scores scale by 1/sqrt(headDim), pass through the plan's attention-score softcap when one is resolved, and
 /// softmax runs online over positions 0..pos. The residual added before the
 /// FFN norm is the pre-attention stream value, matching the reference graph's ffn_inp add; rope scaling variants
 /// are not supported. FP32 buffers are allocated once at Open and reused across calls; packed matrix rows are
@@ -38,6 +40,11 @@ public sealed class TransformerModel : IDisposable
 
     // Kept for tensor name lookups only: the mmap source owns payload access.
     private readonly LogicalTensorTable _fileTensors;
+
+    // Fused qkv tensors the split role map resolved past, and the companion scales of nameable tensors, are
+    // recorded at Open: the fused ones are reported as one structured line, the companion ones validated.
+    private readonly List<string> _ignoredFusedTensors = [];
+    private HashSet<string>? _nameableTensors;
 
     // Per-layer packed matrix tensors, resolved from the mmap view on each use so no dequantized copy is kept.
     private readonly LogicalTensor[] _wq;
@@ -169,9 +176,9 @@ public sealed class TransformerModel : IDisposable
 
         int layers = Plan.LayerCount;
 
-        _wq = LoadMatrices(layers, TensorRole.AttentionQuery);
-        _wk = LoadMatrices(layers, TensorRole.AttentionKey);
-        _wv = LoadMatrices(layers, TensorRole.AttentionValue);
+        _wq = LoadMatrices(layers, TensorRole.AttentionQuery, FusedQkvName(TensorRole.AttentionQuery));
+        _wk = LoadMatrices(layers, TensorRole.AttentionKey, FusedQkvName(TensorRole.AttentionKey));
+        _wv = LoadMatrices(layers, TensorRole.AttentionValue, FusedQkvName(TensorRole.AttentionValue));
         _wo = LoadMatrices(layers, TensorRole.AttentionOutput);
         _ffnGate = LoadMatrices(layers, TensorRole.FeedForwardGate);
         _ffnUp = LoadMatrices(layers, TensorRole.FeedForwardUp);
@@ -185,6 +192,19 @@ public sealed class TransformerModel : IDisposable
         RequireShape(_ffnGate, Plan.IntermediateSize, Plan.HiddenSize);
         RequireShape(_ffnUp, Plan.IntermediateSize, Plan.HiddenSize);
         RequireShape(_ffnDown, Plan.HiddenSize, Plan.IntermediateSize);
+
+        // Quantization companions of nameable tensors are validated before anything loads, and fused qkv
+        // tensors the split map resolved past are reported once, in the style of the ignored-tensor lines.
+        ValidateCompanionTensors();
+
+        if (logLine is not null && _ignoredFusedTensors.Count > 0)
+        {
+            GgufMetadata metadata = file.Metadata;
+            string modelName = metadata.Has("general.name") ? metadata.Get("general.name").AsString() : "";
+            logLine(
+                $"tensors_ignored model='{(modelName.Length > 0 ? modelName : file.Path)}' " +
+                $"architecture='{Plan.Architecture}' tensors={string.Join(",", _ignoredFusedTensors)}");
+        }
 
         _attnNormWeight = LoadLayerVectors(layers, TensorRole.AttentionNorm, Plan.HiddenSize);
         _ffnNormWeight = LoadLayerVectors(layers, TensorRole.FeedForwardNorm, Plan.HiddenSize);
@@ -834,7 +854,7 @@ public sealed class TransformerModel : IDisposable
         ApplyFinalLogitSoftcap(_logits);
     }
 
-    /// <summary>Rotates every head region of data in place at the given position using the precomputed tables.</summary>
+    /// <summary>Rotates every head region of data in place at the given position using the precomputed tables, with the pairing the plan's resolved RoPE strategy selects.</summary>
     private void ApplyRopeHeads(Span<float> data, int headCount, int position)
     {
         ReadOnlySpan<float> cosAtPosition = _cos.AsSpan(position * _ropeHalf, _ropeHalf);
@@ -843,7 +863,18 @@ public sealed class TransformerModel : IDisposable
         for (int h = 0; h < headCount; h++)
         {
             // Pairs are relative to each head's own region.
-            LayerOps.ApplyRopeToHead(data.Slice(h * Plan.HeadDim, Plan.HeadDim), _ropeHalf, cosAtPosition, sinAtPosition);
+            Span<float> region = data.Slice(h * Plan.HeadDim, Plan.HeadDim);
+            switch (Plan.Rope)
+            {
+                case RopeStrategy.StandardFullHead:
+                    LayerOps.ApplyRopeToHead(region, _ropeHalf, cosAtPosition, sinAtPosition);
+                    break;
+                case RopeStrategy.RotateHalfFullHead:
+                    LayerOps.ApplyRopeToSplitHalfHead(region, _ropeHalf, cosAtPosition, sinAtPosition);
+                    break;
+                default:
+                    throw new ModelException($"rope strategy '{Plan.Rope}' is not implemented by the forward engine");
+            }
         }
     }
 
@@ -920,12 +951,24 @@ public sealed class TransformerModel : IDisposable
         }
     }
 
-    private LogicalTensor[] LoadMatrices(int layers, TensorRole role)
+    // Loads one per-layer matrix role. When a fused qkv template is given for a q/k/v role and the layer
+    // carries the fused tensor alongside the resolved split tensor, the fused layout is not consumed — the
+    // split map already fills the role — and the name is recorded for the one structured tensors_ignored line.
+    private LogicalTensor[] LoadMatrices(int layers, TensorRole role, string? fusedTemplate = null)
     {
         LogicalTensor[] tensors = new LogicalTensor[layers];
         for (int l = 0; l < layers; l++)
         {
             tensors[l] = RequireTensor(role, l);
+
+            if (fusedTemplate is not null)
+            {
+                string fused = FusedName(fusedTemplate, l);
+                if (_fileTensors.Find(fused) is not null)
+                {
+                    _ignoredFusedTensors.Add(fused);
+                }
+            }
         }
 
         return tensors;
@@ -990,8 +1033,120 @@ public sealed class TransformerModel : IDisposable
     private LogicalTensor RequireTensor(TensorRole role, int layer = -1)
     {
         TensorDescriptor descriptor = Plan.Tensors[role];
-        return descriptor.Resolve(_fileTensors, layer) ?? throw new ModelException(
+        LogicalTensor? hit = descriptor.Resolve(_fileTensors, layer);
+        if (hit is not null)
+        {
+            return hit;
+        }
+
+        // A required split role tensor absent while its fused qkv sibling is present: the file ships the fused
+        // layout, which this engine does not de-interleave. The failure names both sides instead of only the
+        // missing name.
+        if (FusedQkvName(role) is string fusedTemplate)
+        {
+            string fused = FusedName(fusedTemplate, layer);
+            if (_fileTensors.Find(fused) is not null)
+            {
+                throw new ModelException(
+                    $"tensor '{descriptor.NameFor(layer)}' is missing and '{fused}' is present: the fused qkv " +
+                    $"layout is not de-interleaved for architecture '{Plan.Architecture}'");
+            }
+        }
+
+        throw new ModelException(
             $"tensor '{descriptor.NameFor(layer)}' is missing: required by architecture '{Plan.Architecture}'");
+    }
+
+    // The fused qkv name template behind a q/k/v role, or null for any other role. The tensor map resolves the
+    // split names; the fused layout is recognized only to report it (alongside the split tensors) or to reject
+    // a file that carries it as the only source of a role.
+    private static string? FusedQkvName(TensorRole role) =>
+        role is TensorRole.AttentionQuery or TensorRole.AttentionKey or TensorRole.AttentionValue
+            ? "blk.{layer}.attn_qkv.weight"
+            : null;
+
+    private static string FusedName(string template, int layer) =>
+        template.Replace("{layer}", layer.ToString(CultureInfo.InvariantCulture));
+
+    // Quantization companion entries — a <tensor>.scale block or a <tensor>.input_scale scalar — of a tensor
+    // the plan's map can name are known-optional: every format the dequantizers implement today carries its
+    // own scales inside the block, so a companion carries no meaning for this engine and never triggers a
+    // table rejection. A companion that is not a plain float scale would have to be decoded to be interpreted,
+    // which is a load failure naming it rather than a guess. A companion of a tensor the map does not name is
+    // simply not part of the forward.
+    private void ValidateCompanionTensors()
+    {
+        foreach (LogicalTensor tensor in _fileTensors.Tensors)
+        {
+            if (!TryCompanionBase(tensor.Name, out string baseName) || !IsNameableTensorName(baseName))
+            {
+                continue;
+            }
+
+            if (tensor.Format is not (QuantFormat.F32 or QuantFormat.F16))
+            {
+                throw new ModelException(
+                    $"tensor '{tensor.Name}' is a quantization companion of '{baseName}' in format {tensor.Format}: " +
+                    $"companion-carried scales are not decoded for architecture '{Plan.Architecture}'");
+            }
+        }
+    }
+
+    // Splits a companion tensor name into the name of the tensor it accompanies: the recognized companion
+    // suffixes are .scale (a per-block scale array) and .input_scale (a tensor-wide scalar).
+    private static bool TryCompanionBase(string name, out string baseName)
+    {
+        if (name.EndsWith(".input_scale", StringComparison.Ordinal))
+        {
+            baseName = name[..^".input_scale".Length];
+            return true;
+        }
+
+        if (name.EndsWith(".scale", StringComparison.Ordinal))
+        {
+            baseName = name[..^".scale".Length];
+            return true;
+        }
+
+        baseName = string.Empty;
+        return false;
+    }
+
+    // Whether the plan's tensor map can name this tensor: a primary or alias name of any descriptor, for a
+    // global role or for any layer the plan covers. Built once and cached.
+    private bool IsNameableTensorName(string name)
+    {
+        _nameableTensors ??= BuildNameableTensorNames();
+        return _nameableTensors.Contains(name);
+    }
+
+    private HashSet<string> BuildNameableTensorNames()
+    {
+        HashSet<string> names = new(StringComparer.Ordinal);
+        foreach (TensorDescriptor descriptor in Plan.Tensors.Descriptors)
+        {
+            if (descriptor.Scope == TensorScope.PerLayer)
+            {
+                for (int l = 0; l < Plan.LayerCount; l++)
+                {
+                    names.Add(descriptor.NameFor(l));
+                    foreach (string alias in descriptor.Aliases)
+                    {
+                        names.Add(alias.Replace("{layer}", l.ToString(CultureInfo.InvariantCulture)));
+                    }
+                }
+            }
+            else
+            {
+                names.Add(descriptor.Name);
+                foreach (string alias in descriptor.Aliases)
+                {
+                    names.Add(alias);
+                }
+            }
+        }
+
+        return names;
     }
 
     private float[]?[] LoadOptionalBias(int layers, TensorRole role, long expectedLength)

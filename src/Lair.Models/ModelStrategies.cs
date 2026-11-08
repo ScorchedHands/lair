@@ -55,6 +55,17 @@ public enum BiasPolicy
 /// </summary>
 public enum RopeStrategy
 {
-    /// <summary>Adjacent-pair rotation over the full head dimension with no scaling variant: the only RoPE implemented today.</summary>
+    /// <summary>
+    /// Adjacent-pair rotation over the full head dimension with no scaling variant: pair <c>i</c> occupies head
+    /// dimensions <c>2i</c> and <c>2i + 1</c>. This is the pairing the llama-family checkpoints lay their rotary
+    /// rows in, and the pairing the reference applies to them.
+    /// </summary>
     StandardFullHead,
+
+    /// <summary>
+    /// Rotate-half (non-adjacent) pairing over the full head dimension with no scaling variant: pair <c>i</c>
+    /// occupies head dimensions <c>i</c> and <c>i + headDim/2</c>. The qwen3 checkpoints lay their rotary rows in
+    /// this order, so the engine must pair the head halves rather than adjacent dimensions to reproduce them.
+    /// </summary>
+    RotateHalfFullHead,
 }
