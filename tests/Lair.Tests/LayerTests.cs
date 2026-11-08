@@ -271,7 +271,7 @@ public sealed class LayerTests : IDisposable
         float scale = 1f / MathF.Sqrt(HeadDim);
 
         float[] outConcat = new float[Heads * HeadDim];
-        LayerOps.CausalAttention(backend, q, Heads, KvHeads, HeadDim, kv, layer: 0, position: positions - 1, scale, softcap: 0f, outConcat);
+        LayerOps.CausalAttention(backend, q, Heads, KvHeads, HeadDim, kv, layer: 0, position: positions - 1, scale, softcap: 0f, window: 0, outConcat);
 
         for (int h = 0; h < Heads; h++)
         {
@@ -342,7 +342,7 @@ public sealed class LayerTests : IDisposable
         float scale = 1f / MathF.Sqrt(HeadDim);
 
         float[] outConcat = new float[Heads * HeadDim];
-        LayerOps.CausalAttention(backend, q, Heads, KvHeads, HeadDim, kv, layer: 0, position: 0, scale, softcap: 0f, outConcat);
+        LayerOps.CausalAttention(backend, q, Heads, KvHeads, HeadDim, kv, layer: 0, position: 0, scale, softcap: 0f, window: 0, outConcat);
 
         for (int h = 0; h < Heads; h++)
         {

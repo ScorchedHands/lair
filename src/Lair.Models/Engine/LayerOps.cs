@@ -304,9 +304,12 @@ internal static class LayerOps
     /// <summary>
     /// Causal attention for one layer at the current position: head h reads kv-head (h * kvHeadCount / headCount),
     /// scores are q·k multiplied by attnScale — then capped by <see cref="Softcap"/> when softcap is positive —
-    /// over logical positions 0..position, and softmax runs online with a running max/sum. The weighted V
-    /// accumulation is normalized in place into outConcat (head-major layout). A non-positive softcap disables
-    /// the cap: the score path is then exactly the uncapped one.
+    /// over logical positions 0..position, and softmax runs online with a running max/sum. A positive window
+    /// narrows that causal range to <c>[max(0, position - window + 1), position]</c>: keys further back than the
+    /// window are never scored, so they contribute nothing to the softmax. The narrowing happens before the online
+    /// max, so the running max and sum stay exact over the positions that do contribute. A non-positive window
+    /// leaves the range unbounded. The weighted V accumulation is normalized in place into outConcat (head-major
+    /// layout). A non-positive softcap disables the cap: the score path is then exactly the uncapped one.
     /// </summary>
     internal static void CausalAttention(
         IBackend backend,
@@ -319,6 +322,7 @@ internal static class LayerOps
         int position,
         float attnScale,
         float softcap, // positive enables the score softcap; non-positive disables it
+        int window, // positive narrows the causal range to the window; non-positive leaves it unbounded
         Span<float> outConcat) // headCount * headDim
     {
         ArgumentNullException.ThrowIfNull(backend);
@@ -328,6 +332,8 @@ internal static class LayerOps
         {
             throw new ArgumentException("Attention operands must cover every head's full region.", nameof(qHeads));
         }
+
+        int firstVisible = window > 0 ? Math.Max(0, position - window + 1) : 0;
 
         for (int h = 0; h < headCount; h++)
         {
@@ -339,7 +345,7 @@ internal static class LayerOps
             float sumExp = 0f;
             outHead.Clear();
 
-            for (int t = 0; t <= position; t++)
+            for (int t = firstVisible; t <= position; t++)
             {
                 ReadOnlySpan<float> kt = kv.ReadK(t, layer).Slice(kvHead * headDim, headDim);
                 float score = backend.Dot(qh, kt) * attnScale;
@@ -390,6 +396,12 @@ internal static class LayerOps
     /// same online softmax as <see cref="CausalAttention"/>, including its scaled-then-capped score path when
     /// softcap is positive, with its score window widened from [0, position] to
     /// [fromPosition, toPosition], which must lie inside the sequence's existing KV (<see cref="SequenceKv.Length"/>).
+    /// The queries' own absolute positions start at <paramref name="queryPositionOffset"/>, so a positive window
+    /// narrows each query's range symmetrically to <c>[max(fromPosition, q - window + 1), min(toPosition, q + window)]</c>
+    /// around its own position <c>q</c>: positions further away than the window on either side are never scored. The
+    /// narrowing happens before the online max, so the running max and sum stay exact over the positions that do
+    /// contribute; a query whose windowed range does not intersect the given KV range is a failure. A non-positive
+    /// window leaves the given range untouched.
     /// Restricting that window yields a block-local variant used when long sequences are processed in chunks: every
     /// query then sees exactly one contiguous range of positions. With fromPosition == 0 and toPosition == p over a
     /// sequence of length p + 1 the numeric path is identical to <see cref="CausalAttention"/> at position p, which
@@ -399,6 +411,7 @@ internal static class LayerOps
         IBackend backend,
         ReadOnlySpan<float> qPositions, // queryCount * headCount * headDim, position-major
         int queryCount,
+        int queryPositionOffset, // absolute position of the first query
         int fromPosition,
         int toPosition,
         int headCount,
@@ -408,12 +421,14 @@ internal static class LayerOps
         int layer,
         float attnScale,
         float softcap, // positive enables the score softcap; non-positive disables it
+        int window, // positive narrows each query's range to the window around its own position; non-positive leaves it as given
         Span<float> outConcat) // queryCount * headCount * headDim, position-major
     {
         ArgumentNullException.ThrowIfNull(backend);
         ArgumentNullException.ThrowIfNull(kv);
 
         ArgumentOutOfRangeException.ThrowIfNegative(queryCount);
+        ArgumentOutOfRangeException.ThrowIfNegative(queryPositionOffset);
         ArgumentOutOfRangeException.ThrowIfNegative(fromPosition);
         if (toPosition < fromPosition || toPosition >= kv.Length)
         {
@@ -430,6 +445,22 @@ internal static class LayerOps
 
         for (int p = 0; p < queryCount; p++)
         {
+            int queryPosition = queryPositionOffset + p;
+            int firstVisible = fromPosition;
+            int lastVisible = toPosition;
+            if (window > 0)
+            {
+                firstVisible = Math.Max(firstVisible, queryPosition - window + 1);
+                lastVisible = Math.Min(lastVisible, queryPosition + window);
+
+                if (firstVisible > lastVisible)
+                {
+                    throw new ArgumentException(
+                        $"query at position {queryPosition} has no position inside [{fromPosition}..{toPosition}] within its window of {window}.",
+                        nameof(window));
+                }
+            }
+
             ReadOnlySpan<float> qAtPosition = qPositions.Slice(p * region, region);
             Span<float> outAtPosition = outConcat.Slice(p * region, region);
 
@@ -443,7 +474,7 @@ internal static class LayerOps
                 float sumExp = 0f;
                 outHead.Clear();
 
-                for (int t = fromPosition; t <= toPosition; t++)
+                for (int t = firstVisible; t <= lastVisible; t++)
                 {
                     ReadOnlySpan<float> kt = kv.ReadK(t, layer).Slice(kvHead * headDim, headDim);
                     float score = backend.Dot(qh, kt) * attnScale;

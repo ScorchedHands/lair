@@ -20,7 +20,9 @@ namespace Lair.Models;
 /// <c>&lt;prefix&gt;attention.use_qk_norm</c>; the first two default to <c>false</c> when the key is absent,
 /// and QK-norm defaults to the resolved profile's feature default. The declared softcaps read
 /// <c>&lt;prefix&gt;attn_logit_softcapping</c> and <c>&lt;prefix&gt;final_logit_softcapping</c>, each
-/// resolving to <c>0f</c> (disabled) when the key is absent and to a positive finite number otherwise.
+/// resolving to <c>0f</c> (disabled) when the key is absent and to a positive finite number otherwise. The
+/// declared attention window reads <c>&lt;prefix&gt;attention.sliding_window</c>, resolving to <c>0</c>
+/// (unbounded) when the key is absent and to a positive integer otherwise.
 /// </summary>
 public sealed record ModelPlan
 {
@@ -71,6 +73,15 @@ public sealed record ModelPlan
 
     /// <summary>Declared <c>&lt;prefix&gt;final_logit_softcapping</c>: the final-logit softcap applied after the output-head product and before any softmax or sampling, or <c>0f</c> when the key is absent (disabled).</summary>
     public float FinalLogitSoftcap { get; init; }
+
+    /// <summary>
+    /// Declared <c>&lt;prefix&gt;attention.sliding_window</c>: the attention score window in positions. At query
+    /// position <c>i</c> the causal range narrows to <c>[max(0, i - window + 1), i]</c>, and the bidirectional
+    /// range to <c>[max(0, i - window + 1), i + window]</c> clamped to the sequence. <c>0</c> when the key is
+    /// absent means unbounded. The value masks scores only: every position is still written to and readable
+    /// from the KV cache.
+    /// </summary>
+    public int AttentionWindow { get; init; }
 
     /// <summary>The resolved profile's tensor map: the GGUF names behind every logical tensor role.</summary>
     public required TensorMap Tensors { get; init; }

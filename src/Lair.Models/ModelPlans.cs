@@ -8,8 +8,9 @@ namespace Lair.Models;
 /// <summary>
 /// Resolves a GGUF file into a <see cref="ModelPlan"/>: the architecture is looked up in
 /// <see cref="ModelProfiles"/>, the geometry is read from the profile's metadata prefix, the vocabulary size
-/// comes from the declared key or the tokenizer vocabulary length, and the tensor map comes from the profile.
-/// Only standard RoPE over the full head dimension is accepted: any rope-scaling
+/// comes from the declared key or the tokenizer vocabulary length, the attention score window comes from the
+/// declared <c>&lt;prefix&gt;attention.sliding_window</c> (unbounded when the key is absent), and the tensor
+/// map comes from the profile. Only standard RoPE over the full head dimension is accepted: any rope-scaling
 /// variant or partial-rotary declaration fails at load. An unregistered architecture is accepted only
 /// through the generic llama-shaped fallback profile, which requires the file's tensor table to match the
 /// llama map exactly and reports the substitution as one structured log line when applied.
@@ -198,6 +199,11 @@ public static class ModelPlans
         float attentionSoftcap = ResolveSoftcap(metadata, prefix + "attn_logit_softcapping");
         float finalLogitSoftcap = ResolveSoftcap(metadata, prefix + "final_logit_softcapping");
 
+        // Declared attention window: an absent key means the attention is unbounded (zero). A declared value
+        // must be a positive integer that fits the int range; anything else is a load failure naming the key
+        // and the declared value. The resolved value masks scores in every attention path and bounds no KV.
+        int attentionWindow = ResolveWindow(metadata, prefix + "attention.sliding_window");
+
         // Vocabulary size: the declared key wins when present. Without it the size is the length of the
         // tokenizer vocabulary; a file carrying neither fails with a message naming both keys. The fallback
         // and a declared/tokenizer disagreement are each reported as one structured line in the style of the
@@ -240,6 +246,7 @@ public static class ModelPlans
             HasQkNorm = useQkNorm,
             AttentionSoftcap = attentionSoftcap,
             FinalLogitSoftcap = finalLogitSoftcap,
+            AttentionWindow = attentionWindow,
             Tensors = profile.Tensors,
             Norm = profile.Norm,
             Activation = profile.Activation,
@@ -433,5 +440,38 @@ public static class ModelPlans
         }
 
         return cap;
+    }
+
+    // Shared attention-window resolution: an absent key means unbounded (zero). A declared key must read as an
+    // integer that fits the int range and is strictly positive — a fractional, text, zero, negative, or
+    // out-of-int-range declaration fails the load with a message naming the key and the declared value.
+    private static int ResolveWindow(GgufMetadata metadata, string key)
+    {
+        if (!metadata.Has(key))
+        {
+            return 0;
+        }
+
+        GgufValue declared = metadata.Get(key);
+
+        long declaredValue;
+        try
+        {
+            declaredValue = declared.AsLong();
+        }
+        catch (GgufException ex)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declared}; attention window values must be positive integers", ex);
+        }
+
+        if (declaredValue <= 0 || declaredValue > int.MaxValue)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declaredValue.ToString(CultureInfo.InvariantCulture)}; " +
+                "attention window values must be positive integers");
+        }
+
+        return (int)declaredValue;
     }
 }

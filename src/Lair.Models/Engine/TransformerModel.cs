@@ -15,7 +15,9 @@ namespace Lair.Models.Engine;
     /// rotates q/k pairs at the absolute position with theta_i = base^(-2i/headDim), pairing adjacent dimensions
     /// (2i, 2i + 1) under the llama-family strategy or the head halves (i, i + headDim/2) under the qwen3 strategy;
     /// attention scores scale by 1/sqrt(headDim), pass through the plan's attention-score softcap when one is resolved, and
-/// softmax runs online over positions 0..pos. The residual added before the
+/// softmax runs online over positions 0..pos, narrowed to <c>[max(0, pos - window + 1), pos]</c> when the plan
+/// resolves an attention window. The window masks scores only: every position's K/V is still written and stays
+/// readable. The residual added before the
 /// FFN norm is the pre-attention stream value, matching the reference graph's ffn_inp add; rope scaling variants
 /// are not supported. FP32 buffers are allocated once at Open and reused across calls; packed matrix rows are
 /// consumed through <see cref="WeightRef"/> without being materialized, except for embedding lookups and small
@@ -439,7 +441,7 @@ public sealed class TransformerModel : IDisposable
                 kvs[s].WriteK(positions[s], l, _batchK.AsSpan(s * kvRegion, kvRegion));
                 kvs[s].WriteV(positions[s], l, _batchV.AsSpan(s * kvRegion, kvRegion));
 
-                LayerOps.CausalAttention(_backend, _batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kvs[s], l, positions[s], attnScale, Plan.AttentionSoftcap, _batchAttnOut.AsSpan(s * qkvRegion, qkvRegion));
+                LayerOps.CausalAttention(_backend, _batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kvs[s], l, positions[s], attnScale, Plan.AttentionSoftcap, Plan.AttentionWindow, _batchAttnOut.AsSpan(s * qkvRegion, qkvRegion));
             }
 
             bytes = _weights.Resolve(_wo[l]);
@@ -518,7 +520,8 @@ public sealed class TransformerModel : IDisposable
     /// <summary>
     /// Encoder-only forward: runs the whole token sequence through every layer with full-sequence (bidirectional)
     /// attention — each query position scores against all positions of its own sequence's KV contents instead of a
-    /// causal prefix — and returns the final hidden states after the output norm, without lm_head logits. Per-position
+    /// causal prefix, narrowed to the plan's resolved attention window around the query's own position when one is
+    /// declared — and returns the final hidden states after the output norm, without lm_head logits. Per-position
     /// norms, RoPE at absolute positions, biases, residuals, and the gated activation are exactly the decode-path
     /// operations; K/V for
     /// every position is appended to <paramref name="kv"/> as usual (positions start at <see cref="SequenceKv.Length"/>,
@@ -526,7 +529,8 @@ public sealed class TransformerModel : IDisposable
     /// once per chunk of up to <see cref="EncodeChunkTokens"/> positions via <see cref="IBackend.GemvBatch"/>; every
     /// position then attends over the whole finished KV span, which is what distinguishes this path from incremental
     /// causal decode. All queries — whichever chunk they belong to — see exactly every position of their sequence after
-    /// appending (0..<see cref="SequenceKv.Length"/>) in ascending order, so results are independent of chunking.
+    /// appending (0..<see cref="SequenceKv.Length"/>) in ascending order — within the resolved window around its own
+    /// position when one is declared — so results are independent of chunking.
     /// This establishes the dense-LLM architecture running in encoder mode as groundwork for embedding extraction;
     /// dedicated encoder-native architectures (ModernBERT-class) require their own tensor layouts and arrive with the
     /// embeddings endpoint itself. The returned array is caller-owned: <c>hidden[position * HiddenSize + i]</c>, length
@@ -657,6 +661,7 @@ public sealed class TransformerModel : IDisposable
                         _backend,
                         qAll.AsSpan(c * EncodeChunkTokens * qkvRegion, m * qkvRegion),
                         queryCount: m,
+                        queryPositionOffset: basePosition + c * EncodeChunkTokens,
                         fromPosition: 0,
                         toPosition: basePosition + n - 1,
                         Plan.HeadCount,
@@ -666,6 +671,7 @@ public sealed class TransformerModel : IDisposable
                         l,
                         attnScale,
                         Plan.AttentionSoftcap,
+                        Plan.AttentionWindow,
                         attnOut.AsSpan(c * EncodeChunkTokens * qkvRegion, m * qkvRegion));
                 }
 
@@ -806,7 +812,7 @@ public sealed class TransformerModel : IDisposable
             kv.WriteK(position, l, _k);
             kv.WriteV(position, l, _v);
 
-            LayerOps.CausalAttention(_backend, _q, Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, position, attnScale, Plan.AttentionSoftcap, _attnOut);
+            LayerOps.CausalAttention(_backend, _q, Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, position, attnScale, Plan.AttentionSoftcap, Plan.AttentionWindow, _attnOut);
 
             // Output projection (+bias) into scratch; the residual added before the FFN norm is the pre-attention
             // stream value (ffn_inp = attn_out + inpSA), matching the reference graph. cur held that stream through
