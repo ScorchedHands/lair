@@ -22,16 +22,19 @@ namespace Lair.Models.Engine;
 /// norms sublayer outputs — either way matching the reference graph's ffn_inp add; rope scaling variants
 /// are not supported. FP32 buffers are allocated once at Open and reused across calls; packed matrix rows are
 /// consumed through <see cref="WeightRef"/> without being materialized, except for embedding lookups and small
-/// norm/bias vectors preloaded at Open. Attention-bias tensors follow the plan's declared policy: under
-/// <see cref="BiasPolicy.Declared"/> the declared <c>use_bias</c> flag makes them required or leaves them
-/// unloaded and unapplied, with one structured log line naming the ignored tensors; the plan's resolved
+/// norm/bias vectors preloaded at Open. Attention-bias tensors follow the plan's resolved policy: under
+/// <see cref="BiasPolicy.Declared"/> the resolved <c>use_bias</c> flag — a declaration or the profile's feature
+/// default — makes the q/k/v bias vectors required or leaves every attention bias unloaded and unapplied, with one
+/// structured log line naming the ignored tensors, while an output-projection bias is loaded whenever the file
+/// carries one; the plan's resolved
 /// <see cref="QkNormMode"/> normalizes each q and k head between its projection (plus any bias) and its rotation — scaled
 /// by the layer's per-head vector, normalized with the epsilon alone, or not at all. Under
 /// <see cref="NormPlacement.PostSublayerOutputs"/> every sublayer output is normalized once more with its own vector before
 /// it joins the residual stream, which makes each layer's post-sublayer norm tensors required; a pre-only placement reads
 /// none and rejects a file that carries one. A resolved
 /// final-logit softcap saturates every logit vector — untied output head or tied token-embedding rows — after
-/// the full vector is computed and before any softmax, sampling, or copy-out.
+/// the full vector is computed and before any softmax, sampling, or copy-out. A resolved input-embedding gain
+/// multiplies every freshly dequantized embedding row by its value before the first layer on every forward path.
 /// </summary>
 public sealed class TransformerModel : IDisposable
 {
@@ -239,12 +242,15 @@ public sealed class TransformerModel : IDisposable
         }
         else
         {
-            // Declared true makes the tensors required; ByTensorPresence keeps the presence rule.
+            // Resolved on: the q/k/v bias vectors are required — a declared use_bias or a profile default that
+            // turns the feature on makes them part of the file's graph, and the failure names the first one the
+            // file lacks. The output-projection bias is used when present but demanded by no resolved value:
+            // only some conversions ship one. ByTensorPresence keeps the presence rule for the q/k/v side too.
             bool required = Plan.Bias == BiasPolicy.Declared;
             _biasQ = LoadAttentionBias(layers, TensorRole.AttentionQueryBias, (long)Plan.HeadCount * Plan.HeadDim, required);
             _biasK = LoadAttentionBias(layers, TensorRole.AttentionKeyBias, (long)Plan.KvHeadCount * Plan.HeadDim, required);
             _biasV = LoadAttentionBias(layers, TensorRole.AttentionValueBias, (long)Plan.KvHeadCount * Plan.HeadDim, required);
-            _biasO = LoadAttentionBias(layers, TensorRole.AttentionOutputBias, Plan.HiddenSize, required);
+            _biasO = LoadAttentionBias(layers, TensorRole.AttentionOutputBias, Plan.HiddenSize, required: false);
         }
 
         if (Plan.UseNormBias)
@@ -432,6 +438,8 @@ public sealed class TransformerModel : IDisposable
         {
             _backend.DequantRow(embRef, tokenIds[s], _batchCur.AsSpan(s * Plan.HiddenSize, Plan.HiddenSize));
         }
+
+        ApplyInputEmbeddingScale(_batchCur.AsSpan(0, n * Plan.HiddenSize));
 
         // Reserve this step's slot in every sequence before any layer writes, mirroring ForwardToken's append.
         for (int s = 0; s < n; s++)
@@ -640,6 +648,8 @@ public sealed class TransformerModel : IDisposable
                 _backend.DequantRow(embRef, tokens[i], cur.AsSpan(i * hidden, hidden));
             }
 
+            ApplyInputEmbeddingScale(cur.AsSpan(0, n * hidden));
+
             // Reserve every position's KV slot up front so later layer passes address them by absolute position.
             for (int i = 0; i < n; i++)
             {
@@ -822,6 +832,8 @@ public sealed class TransformerModel : IDisposable
         ReadOnlySpan<byte> embBytes = _weights.Resolve(_tokenEmbd);
         _backend.DequantRow(new WeightRef(embBytes, _tokenEmbd.Shape, _tokenEmbd.Format), tokenId, _cur.AsSpan(0, Plan.HiddenSize));
 
+        ApplyInputEmbeddingScale(_cur.AsSpan(0, Plan.HiddenSize));
+
         kv.Append(); // reserves this position's slot in every layer; WriteK/WriteV address it by logical position
 
         int hidden = Plan.HiddenSize;
@@ -948,7 +960,8 @@ public sealed class TransformerModel : IDisposable
     // Norm and activation run as a direct call chosen from the plan's strategy values: no interface dispatch and
     // no allocation anywhere in the forward, so every path — single token, batched decode, and encode — applies
     // the resolved strategy identically. The bias operand is the layer's declared norm-bias vector when one was
-    // loaded (an empty span otherwise) and is consumed only by the LayerNorm strategy.
+    // loaded (an empty span otherwise) and is consumed only by the LayerNorm strategy, which takes its epsilon from
+    // the plan's block-norm epsilon while the RMS strategy keeps the plan's RMS epsilon.
     private void ApplyNorm(ReadOnlySpan<float> src, ReadOnlySpan<float> weight, ReadOnlySpan<float> bias, Span<float> dst)
     {
         switch (Plan.Norm)
@@ -957,7 +970,7 @@ public sealed class TransformerModel : IDisposable
                 LayerOps.RmsNormWeighted(src, weight, Plan.EpsRmsNorm, dst);
                 break;
             case NormStrategy.LayerNorm:
-                LayerOps.LayerNormWeighted(src, weight, bias, Plan.EpsRmsNorm, dst);
+                LayerOps.LayerNormWeighted(src, weight, bias, Plan.EpsLayerNorm, dst);
                 break;
             default:
                 throw new ModelException($"norm strategy '{Plan.Norm}' is not implemented by the forward engine");
@@ -996,6 +1009,25 @@ public sealed class TransformerModel : IDisposable
     // projection and any output bias, or the feed-forward output after the down GEMV — before its residual add, through
     // the family's resolved norm kind with no bias operand, since no post-sublayer bias tensor exists in the canonical map.
     // In place is safe for both norm kinds: each finishes reading a value before writing back at that index.
+    // The input-embedding gain runs as a direct branch on the plan's resolved value, the same way the norm and
+    // activation strategies do: a resolved gain of zero leaves every embedding row untouched. A non-zero gain is
+    // the sqrt(hidden size) the gemma-family reference graphs multiply each embedding row by before the first
+    // layer, applied in place to the freshly dequantized rows on every forward path — single token, batched
+    // decode, and encode — so each path seeds its residual stream identically.
+    private void ApplyInputEmbeddingScale(Span<float> embeddings)
+    {
+        float scale = Plan.InputEmbeddingScale;
+        if (scale == 0f)
+        {
+            return;
+        }
+
+        for (int i = 0; i < embeddings.Length; i++)
+        {
+            embeddings[i] *= scale;
+        }
+    }
+
     private void ApplyPostSublayerNorm(Span<float> output, ReadOnlySpan<float> weight)
     {
         switch (Plan.NormPlacement)
@@ -1027,6 +1059,13 @@ public sealed class TransformerModel : IDisposable
                 for (int i = 0; i < gate.Length; i++)
                 {
                     gate[i] = LayerOps.GeluTanh(gate[i]) * up[i];
+                }
+
+                break;
+            case ActivationStrategy.GeGluExact:
+                for (int i = 0; i < gate.Length; i++)
+                {
+                    gate[i] = LayerOps.Gelu(gate[i]) * up[i];
                 }
 
                 break;
@@ -1268,7 +1307,9 @@ public sealed class TransformerModel : IDisposable
     }
 
     // Attention-bias loading under the plan's bias policy: ByTensorPresence keeps the presence rule, while a
-    // declared use_bias makes every attention-bias tensor required and names the first one the file lacks.
+    // resolved-on attention bias makes every layer's q/k/v bias tensors required and names the first one the file
+    // lacks — whether the resolution came from a declared use_bias or from the profile's feature default. The
+    // output-projection bias is never demanded: it loads when present, under any policy.
     private float[]?[] LoadAttentionBias(int layers, TensorRole role, long expectedLength, bool required)
     {
         if (!required)
@@ -1284,7 +1325,9 @@ public sealed class TransformerModel : IDisposable
             if (tensor is null)
             {
                 throw new ModelException(
-                    $"tensor '{descriptor.NameFor(l)}' is missing: {Plan.Prefix}attention.use_bias declares attention biases required for architecture '{Plan.Architecture}'");
+                    $"tensor '{descriptor.NameFor(l)}' is missing: attention biases are resolved on for architecture " +
+                    $"'{Plan.Architecture}' (a declared {Plan.Prefix}attention.use_bias or the profile default) and " +
+                    "this tensor is required in every layer");
             }
 
             biases[l] = LoadVector(tensor, checked((int)expectedLength));

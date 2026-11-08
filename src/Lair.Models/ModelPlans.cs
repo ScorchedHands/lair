@@ -12,10 +12,15 @@ namespace Lair.Models;
 /// declared <c>&lt;prefix&gt;attention.sliding_window</c> (unbounded when the key is absent), and the tensor
 /// map comes from the profile. Only standard RoPE over the full head dimension is accepted: any rope-scaling
 /// variant or partial-rotary declaration fails at load. The per-head QK-norm mode resolves the declared
-/// <c>&lt;prefix&gt;attention.use_qk_norm</c> against the profile's default, and the norm placement comes from the
-/// profile alone — no metadata key selects it. An unregistered architecture is accepted only
-/// through the generic llama-shaped fallback profile, which requires the file's tensor table to match the
-/// llama map exactly and reports the substitution as one structured log line when applied.
+/// <c>&lt;prefix&gt;attention.use_qk_norm</c> against the profile's default, the attention-bias flag resolves the
+/// declared <c>&lt;prefix&gt;attention.use_bias</c> against the profile's default, and the norm placement comes from
+/// the profile alone — no metadata key selects it. The block-norm epsilon read from
+/// <c>&lt;prefix&gt;attention.layer_norm_epsilon</c> (zero when the key is absent) feeds the LayerNorm block norms;
+    /// the RMS epsilon from <c>&lt;prefix&gt;attention.layer_norm_rms_epsilon</c> feeds the RMS norms and the per-head
+    /// QK-norm. The input-embedding gain comes from the profile alone: a profile that scales embeddings resolves
+    /// <c>sqrt(hidden size)</c> in the plan, every other profile resolves zero. An unregistered architecture is accepted only through the generic llama-shaped fallback profile, which
+/// requires the file's tensor table to match the llama map exactly and reports the substitution as one structured
+/// log line when applied.
 /// </summary>
 public static class ModelPlans
 {
@@ -186,15 +191,23 @@ public static class ModelPlans
 
         float eps = (float)metadata.Get(prefix + "attention.layer_norm_rms_epsilon").AsDouble();
 
-        // Declared feature flags: an absent key means the profile's feature default for it. Bias and norm-bias
-        // default false for every profile today; a declared use_qk_norm=false forces the per-head mode off whatever
-        // the profile defaults to, while an absent declaration keeps that mode. The declaration, not tensor presence,
-        // decides the behavior; the forward engine enforces the tensor side of each resolved value at Open — required
-        // tensors for a weighted mode, one structured log line naming the ignored tensors for a resolved off whose
-        // vectors are present, and no demand at all from an unweighted mode. Norm placement has no declaration: it
-        // comes straight from the profile, which also decides whether each layer's post-sublayer norm tensors are
-        // required or must be absent.
-        bool useAttentionBias = metadata.GetBool(prefix + "attention.use_bias", fallback: false);
+        // Block-norm epsilon: the LayerNorm block norms run with this value, zero unless the file declares
+        // <prefix>attention.layer_norm_epsilon. The RMS epsilon above stays the operand for the RMS norms and for
+        // the per-head QK-norm whatever this resolves to.
+        float epsLayerNorm = ResolveNormEpsilon(metadata, prefix + "attention.layer_norm_epsilon");
+
+        // Declared feature flags: an absent key means the profile's feature default for it. Norm-bias defaults false
+        // for every profile today; attention bias defaults false except where a profile defaults it on, and a
+        // declaration overrides either direction. A declared use_qk_norm=false forces the per-head mode off whatever
+        // the profile defaults to, while an absent declaration keeps that mode. The declaration or profile default,
+        // not tensor presence, decides the behavior; the forward engine enforces the tensor side of each resolved
+        // value at Open — required tensors for a weighted mode, one structured log line naming the ignored tensors for
+        // a resolved off whose vectors are present, and no demand at all from an unweighted mode. Norm placement has
+        // no declaration: it comes straight from the profile, which also decides whether each layer's post-sublayer
+        // norm tensors are required or must be absent.
+        bool useAttentionBias = metadata.Has(prefix + "attention.use_bias")
+            ? metadata.GetBool(prefix + "attention.use_bias", fallback: false)
+            : profile.DefaultAttentionBias;
         bool useNormBias = metadata.GetBool(prefix + "attention.norm_bias", fallback: false);
         QkNormMode qkNorm = ResolveQkNorm(metadata, prefix, profile.DefaultQkNorm);
 
@@ -243,6 +256,7 @@ public static class ModelPlans
             IntermediateSize = ffn,
             RopeTheta = ropeTheta,
             EpsRmsNorm = eps,
+            EpsLayerNorm = epsLayerNorm,
             VocabSize = vocab,
             HasOutputWeights = hasOutputWeights,
             UseAttentionBias = useAttentionBias,
@@ -252,6 +266,7 @@ public static class ModelPlans
             AttentionSoftcap = attentionSoftcap,
             FinalLogitSoftcap = finalLogitSoftcap,
             AttentionWindow = attentionWindow,
+            InputEmbeddingScale = profile.ScaleInputEmbeddingsBySqrtHidden ? MathF.Sqrt(hidden) : 0f,
             Tensors = profile.Tensors,
             Norm = profile.Norm,
             Activation = profile.Activation,
@@ -445,6 +460,37 @@ public static class ModelPlans
         }
 
         return cap;
+    }
+
+    // Shared block-norm epsilon resolution: an absent key means zero. A declared key is read as a double and must
+    // land in the float range as a non-negative finite number — a negative, NaN, infinite, or out-of-range
+    // declaration fails the load with a message naming the key and the declared value.
+    private static float ResolveNormEpsilon(GgufMetadata metadata, string key)
+    {
+        if (!metadata.Has(key))
+        {
+            return 0f;
+        }
+
+        double declared;
+        try
+        {
+            declared = metadata.Get(key).AsDouble();
+        }
+        catch (GgufException ex)
+        {
+            throw new ModelException($"GGUF metadata key '{key}' must be a number", ex);
+        }
+
+        float eps = (float)declared;
+        if (!float.IsFinite(eps) || eps < 0f)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declared.ToString(CultureInfo.InvariantCulture)}; " +
+                "norm epsilon values must be non-negative finite numbers");
+        }
+
+        return eps;
     }
 
     // Shared per-head QK-norm resolution: an absent declaration keeps the resolved profile's mode. A declared false

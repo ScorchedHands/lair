@@ -381,6 +381,7 @@ public sealed class DeclaredFeatureLayerTests : IDisposable
             ("llama.feed_forward_length", Intermediate),
             ("llama.attention.head_length", HeadDim),
             ("llama.attention.layer_norm_rms_epsilon", Eps),
+            ("llama.attention.layer_norm_epsilon", Eps),
             ("llama.vocab_size", Vocab),
         ];
 

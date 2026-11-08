@@ -16,11 +16,13 @@ public sealed record ModelDesc(
     int IntermediateSize,
     float RopeTheta,
     float EpsRmsNorm,
+    float EpsLayerNorm,
     int VocabSize,
     bool HasOutputWeights,
     string Architecture,
     float AttentionSoftcap,
-    float FinalLogitSoftcap)
+    float FinalLogitSoftcap,
+    float InputEmbeddingScale)
 {
     /// <summary>Supported architecture names, straight from the profile registry.</summary>
     public static IReadOnlyList<string> SupportedArchitectures => [.. ModelProfiles.SupportedArchitectures];

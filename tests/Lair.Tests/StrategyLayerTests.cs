@@ -385,6 +385,7 @@ public sealed class StrategyLayerTests : IDisposable
             ("llama.attention.head_count_kv", KvHeads),
             ("llama.feed_forward_length", Intermediate),
             ("llama.attention.layer_norm_rms_epsilon", Eps),
+            ("llama.attention.layer_norm_epsilon", Eps),
             ("llama.vocab_size", Vocab),
         ];
 

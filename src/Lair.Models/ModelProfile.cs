@@ -36,6 +36,14 @@ public sealed record ModelProfile
     public QkNormMode DefaultQkNorm { get; init; } = QkNormMode.Off;
 
     /// <summary>
+    /// Feature default for the attention biases, applied when the file declares no
+    /// <c>&lt;prefix&gt;attention.use_bias</c>: a declaration overrides it in either direction, and a profile
+    /// defaulting to <c>true</c> makes every layer's q/k/v bias tensors required at load for a file that declares
+    /// nothing. A profile defaults this to <c>false</c>.
+    /// </summary>
+    public bool DefaultAttentionBias { get; init; }
+
+    /// <summary>
     /// Where this architecture's forward places its norm vectors relative to the residual add: a profile defaults to
     /// <see cref="Lair.Models.NormPlacement.PreOnly"/>, and
     /// <see cref="Lair.Models.NormPlacement.PostSublayerOutputs"/> makes every layer's post-sublayer norm tensors
@@ -43,4 +51,12 @@ public sealed record ModelProfile
     /// pre-only placement is a layout failure rather than ignored material.
     /// </summary>
     public NormPlacement NormPlacement { get; init; } = NormPlacement.PreOnly;
+
+    /// <summary>
+    /// Feature default for the input-embedding gain: when true the plan resolves a gain of
+    /// <c>sqrt(hidden size)</c> that the engine multiplies every token-embedding row by before the first layer,
+    /// the way the gemma-family reference graphs scale their embedding input. No metadata key selects it; the
+    /// conversion leaves the gain out of the weights. A profile defaults this to <c>false</c>.
+    /// </summary>
+    public bool ScaleInputEmbeddingsBySqrtHidden { get; init; }
 }

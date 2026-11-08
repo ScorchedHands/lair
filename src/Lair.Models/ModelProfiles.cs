@@ -54,6 +54,34 @@ public static class ModelProfiles
             NormPlacement = NormPlacement.PreOnly,
             Tensors = CanonicalTensors(),
         },
+        new ModelProfile
+        {
+            Architecture = "gemma2",
+            Prefix = "gemma2.",
+            // The reference gemma2 graph runs every block norm — pre-sublayer, post-sublayer, and output — as an
+            // RMS norm with the file's layer_norm_rms_epsilon, and normalizes each q and k head nowhere: the
+            // conversion ships no per-head norm vectors and the graph applies no unweighted head normalization, so
+            // QK-norm stays off unless the file declares it.
+            Norm = NormStrategy.RmsNorm,
+            // The reference FFN gates with the exact GELU, not the tanh approximation.
+            Activation = ActivationStrategy.GeGluExact,
+            Bias = BiasPolicy.Declared,
+            // The gemma2 block carries its rotary q/k rows in rotate-half order, the layout the qwen3 checkpoints
+            // use, so the engine pairs each head's halves rather than adjacent dimensions.
+            Rope = RopeStrategy.RotateHalfFullHead,
+            // The gemma2 conversion does ship q/k/v bias vectors, but the reference's forward leaves the measured
+            // logits inside its own quantized band when they are not applied, so bias stays declared-only like the
+            // other profiles: a declared use_bias=true still makes every layer's q/k/v vectors required at load.
+            DefaultAttentionBias = false,
+            DefaultQkNorm = QkNormMode.Off,
+            // The gemma2 block normalizes each sublayer output with its own vector before the residual add, which
+            // makes every layer's post-sublayer norm tensors required at load.
+            NormPlacement = NormPlacement.PostSublayerOutputs,
+            // The reference scales the token-embedding row by sqrt(hidden size) before the first layer; the
+            // conversion leaves that gain out of the weights, so the engine applies it.
+            ScaleInputEmbeddingsBySqrtHidden = true,
+            Tensors = CanonicalTensors(),
+        },
     ];
 
     private static readonly Dictionary<string, ModelProfile> ByArchitecture =
@@ -111,14 +139,14 @@ public static class ModelProfiles
         return GenericProfile with { Prefix = architecture + "." };
     }
 
-    // The canonical llama-family tensor names: the llama.cpp GGUF layout all three supported profiles ship, with
+    // The canonical llama-family tensor names: the llama.cpp GGUF layout every supported profile ships, with
     // attention biases and the output head optional because llama files carry neither while qwen2 and qwen3
     // files may. The per-head QK-norm vectors are optional in the map: the resolved mode decides at load whether they
     // are required or ignored, and a file whose profile defaults them on but lacks the vectors fails naming them. The
-    // post-sublayer norm vectors are declared here too because every family names them the same way; no profile in the
-    // registry or the generic fallback consumes them today, since each resolves NormPlacement.PreOnly, which makes their
-    // presence a layout failure rather than ignorable material. The norm-bias vectors are optional for the same reason
-    // the QK-norm ones are: the declared flag decides.
+    // post-sublayer norm vectors are declared here too because every family names them the same way; the gemma2
+    // profile consumes them under its post-sublayer placement, while every profile that resolves NormPlacement.PreOnly
+    // treats their presence as a layout failure rather than ignorable material. The norm-bias vectors are optional for
+    // the same reason the QK-norm ones are: the declared flag decides.
     private static TensorMap CanonicalTensors() =>
         new(
         [

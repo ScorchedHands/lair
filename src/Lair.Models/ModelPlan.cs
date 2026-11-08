@@ -17,10 +17,13 @@ namespace Lair.Models;
 /// has to split the hidden size exactly. A declared <c>&lt;prefix&gt;vocab_size</c> wins; without it the size
 /// is the length of <c>tokenizer.ggml.tokens</c>. The declared feature flags read
 /// <c>&lt;prefix&gt;attention.use_bias</c>, <c>&lt;prefix&gt;attention.norm_bias</c>, and
-/// <c>&lt;prefix&gt;attention.use_qk_norm</c>; the first two default to <c>false</c> when the key is absent,
-/// a declared false forces per-head QK-norm off, and an absent or true declaration keeps the resolved
+/// <c>&lt;prefix&gt;attention.use_qk_norm</c>; a declaration overrides the resolved profile's feature default for
+/// the first and third in either direction, <c>attention.norm_bias</c> defaults to <c>false</c> when the key is
+/// absent, a declared false forces per-head QK-norm off, and an absent or true declaration keeps the resolved
 /// profile's QK-norm mode. The norm placement comes from the resolved profile alone: no metadata key selects
-/// it today. The declared softcaps read
+/// it today. The block-norm epsilon reads <c>&lt;prefix&gt;attention.layer_norm_epsilon</c>, resolving to
+/// <c>0f</c> when the key is absent, and feeds only the LayerNorm block norms; the RMS epsilon from
+/// <c>&lt;prefix&gt;attention.layer_norm_rms_epsilon</c> keeps feeding the RMS norms and the per-head QK-norm. The declared softcaps read
 /// <c>&lt;prefix&gt;attn_logit_softcapping</c> and <c>&lt;prefix&gt;final_logit_softcapping</c>, each
 /// resolving to <c>0f</c> (disabled) when the key is absent and to a positive finite number otherwise. The
 /// declared attention window reads <c>&lt;prefix&gt;attention.sliding_window</c>, resolving to <c>0</c>
@@ -56,12 +59,19 @@ public sealed record ModelPlan
 
     public required float EpsRmsNorm { get; init; }
 
+    /// <summary>
+    /// The epsilon under the root of the LayerNorm block norms: <c>0f</c> unless the file declares
+    /// <c>&lt;prefix&gt;attention.layer_norm_epsilon</c>. The RMS norms and the per-head QK-norm keep
+    /// <see cref="EpsRmsNorm"/> whatever this resolves to.
+    /// </summary>
+    public float EpsLayerNorm { get; init; }
+
     public required int VocabSize { get; init; }
 
     /// <summary>Whether the tensor table carries an untied output matrix, i.e. the output head is not tied to the token embedding.</summary>
     public required bool HasOutputWeights { get; init; }
 
-    /// <summary>Declared <c>&lt;prefix&gt;attention.use_bias</c>: whether the q/k/v/o projections carry additive biases.</summary>
+    /// <summary>Resolved attention bias: the declared <c>&lt;prefix&gt;attention.use_bias</c>, or the resolved profile's default when that key is absent — whether each layer's attention projections carry additive biases: the q/k/v bias vectors are required at load, and an output-projection bias is used when the file carries one.</summary>
     public required bool UseAttentionBias { get; init; }
 
     /// <summary>Declared <c>&lt;prefix&gt;attention.norm_bias</c>: whether the norm layers carry additive bias vectors.</summary>
@@ -88,6 +98,13 @@ public sealed record ModelPlan
     /// </summary>
     public int AttentionWindow { get; init; }
 
+    /// <summary>
+    /// The resolved profile's input-embedding gain: <c>sqrt(hidden size)</c> on a profile whose reference graph
+    /// scales the token-embedding row before the first layer, <c>0f</c> everywhere else. No metadata key decides
+    /// it, and the conversion leaves the gain out of the weights.
+    /// </summary>
+    public float InputEmbeddingScale { get; init; }
+
     /// <summary>The resolved profile's tensor map: the GGUF names behind every logical tensor role.</summary>
     public required TensorMap Tensors { get; init; }
 
@@ -113,9 +130,11 @@ public sealed record ModelPlan
             IntermediateSize,
             RopeTheta,
             EpsRmsNorm,
+            EpsLayerNorm,
             VocabSize,
             HasOutputWeights,
             Architecture,
             AttentionSoftcap,
-            FinalLogitSoftcap);
+            FinalLogitSoftcap,
+            InputEmbeddingScale);
 }

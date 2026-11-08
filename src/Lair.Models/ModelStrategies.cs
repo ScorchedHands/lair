@@ -29,6 +29,9 @@ public enum ActivationStrategy
 
     /// <summary><c>gelu_tanh(gate) * up</c>: the tanh-approximated GELU gate over the same gate/up/down tensor block.</summary>
     GeGlu,
+
+    /// <summary><c>gelu(gate) * up</c>: the exact GELU gate over the same gate/up/down tensor block.</summary>
+    GeGluExact,
 }
 
 /// <summary>
@@ -41,10 +44,11 @@ public enum BiasPolicy
     ByTensorPresence,
 
     /// <summary>
-    /// The file's declaration decides: <c>&lt;prefix&gt;attention.use_bias</c> and
-    /// <c>&lt;prefix&gt;attention.norm_bias</c> (each absent means <c>false</c>) land in the plan. Declared
-    /// <c>true</c> makes the corresponding tensors required at load; declared <c>false</c> ignores present
-    /// tensors with one structured log line naming them.
+    /// The resolved plan decides: <c>&lt;prefix&gt;attention.use_bias</c> overrides the profile's feature default for
+    /// the attention biases (absent the key, a profile that defaults the feature on resolves it on), and
+    /// <c>&lt;prefix&gt;attention.norm_bias</c> (absent means <c>false</c>) lands in the plan. A resolved-on attention
+    /// bias makes every layer's q/k/v bias vectors required at load; a resolved-off one ignores present tensors with
+    /// one structured log line naming them.
     /// </summary>
     Declared,
 }

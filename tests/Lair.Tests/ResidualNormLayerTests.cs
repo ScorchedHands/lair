@@ -446,6 +446,7 @@ public sealed class ResidualNormLayerTests : IDisposable
             ("llama.attention.key_length", HeadDim),
             ("llama.attention.value_length", HeadDim),
             ("llama.attention.layer_norm_rms_epsilon", Eps),
+            ("llama.attention.layer_norm_epsilon", Eps),
             ("llama.vocab_size", Vocab),
         ];
 
