@@ -33,7 +33,7 @@ dotnet run --project src/Lair.Host -- chat -c lair.yaml
 
 Any OpenAI SDK works by pointing `base_url` at `http://127.0.0.1:8080/v1`. Errors use the OpenAI error shape with codes `invalid_request`, `model_not_found`, `context_length_exceeded`, `engine_overloaded`, `internal`. Every response carries `x-lair-request-id`.
 
-Requests run concurrently through shared batch steps; `503 engine_overloaded` surfaces only when engine capacity is exhausted. Chat requests that declare tools get exactly one tool surface: a model whose chat template renders tools itself receives them through the template, while a toolless template receives LAIR's schema injection and fenced-JSON tool-call detector; `force_fenced_tools: true` in the model config forces the injected form. Recognized calls appear as `tool_calls` (execution is client-side).
+Requests run concurrently through shared batch steps; `503 engine_overloaded` surfaces only when engine capacity is exhausted. Chat requests that declare tools get exactly one tool surface, resolved when the model loads: a model whose chat template renders tools itself gets them through the template and its own call shape is read out of the decoded text, a toolless template gets LAIR's schema injection plus the fenced-JSON detector, and `tool_parser: auto | template | fenced | none` pins the choice (`force_fenced_tools: true` still forces the injected form). A model that emits reasoning markup (`<think>` … `</think>`) streams it into visible content by default; `reasoning: strip` withholds recognized regions from visible output while their boundaries stay recorded, and a flip applies to requests admitted after it. Recognized calls appear as `tool_calls` (execution is client-side), and `/v1/models` reports the resolved parser and reasoning policy.
 
 ## REPL
 
@@ -54,6 +54,6 @@ Live table per model: tok/s, step time, batch occupancy, cache-hit rate, KV util
 
 ## Configuration
 
-One YAML file (`lair.example.yaml` shows every knob): server bind/port, engine `threads` and `max_batch_tokens`, block size, exactly one model with path, name, type, `max_context_tokens`, `kv_blocks`, optional `force_fenced_tools`, optional placement policy (`core_set`, `thread_quota`), and the UI ring size `ui.recent_requests`.
+One YAML file (`lair.example.yaml` shows every knob): server bind/port, engine `threads` and `max_batch_tokens`, block size, exactly one model with path, name, type, `max_context_tokens`, `kv_blocks`, optional `force_fenced_tools`, optional `tool_parser` and `reasoning`, optional placement policy (`core_set`, `thread_quota`), and the UI ring size `ui.recent_requests`.
 
 A running server watches the config file and applies edits automatically: batch width, thread quota, and KV budget take effect live; context length applies to new requests; block size, model path, and quant geometry are refused with a message telling you to restart. Invalid edits are rejected without touching the running engine.

@@ -4,6 +4,19 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-11-09
+
+### Added
+
+- Tool-call output parsing resolved per model at load through a parser plan (`OutputParserRegistry` / `IToolOutputParser`): the fenced-JSON detector behind the plan, a template-native reader for the call shape a tool-capable chat template instructs its own model to emit (`{name, parameters}` objects, arguments compacted onto the wire), and an inert `none` plan that never reads decoded text. `models[].tool_parser: auto | template | fenced | none` (default `auto`, preserving the existing capability precedence) with load-time validation, a new-requests-only hot-reload class, a `tool_parser model='<name>' choice=<choice>` load line, and the resolved choice reported by `/v1/models`.
+- Reasoning-region recognition from the markup a generation emits (`<think>` … `</think>`): closed regions, several regions in document order, markup inside a region treated as content, a close with no open left as ordinary text, and an open that never closes recorded to the end of generation. Recognition also runs over streamed output piece by piece, holding a boundary marker split across pieces until the next piece settles it, so no part of a region reaches the wire. `models[].reasoning: keep | strip` (default `keep`, new-requests-only class, `reasoning model='<name>' policy=<policy>` load line, reported by `/v1/models`); under `strip` the region leaves visible content while `GenerationResult.ReasoningRegions` records its span, and prompt tokens, completion tokens, and finish reasons are unchanged.
+- `Category=ToolCalls` goldens for both parser families plus reasoning recognition and streaming-piece cases; a pinned-Qwen3 serve suite (`Category=Serve`) proving `keep` carries the model's own thinking block, `strip` removes it at identical token counts, and a policy flip landing mid-generation leaves the admitted sequence on the policy it started with.
+
+### Changed
+
+- A sequence runs on the output-parser plan it was admitted on: the plan is captured when generation starts and travels on the result, so a `tool_parser` or `reasoning` reload re-plans later requests only. Streaming content filters follow the policy on the result rather than whatever is current when generation ends.
+- `/v1/models` now also reports the resolved reasoning policy alongside `tool_parser`, `architecture`, and `quant`.
+
 ## [0.3.5] - 2026-11-09
 
 ### Added
