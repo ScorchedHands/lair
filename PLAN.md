@@ -642,7 +642,7 @@ Dense GGUF architecture families load through a load-time profile registry that 
 - [X] **Window interleave** — whether the alternating local/full pattern belongs in the plan as a family property or as metadata once a declaration exists for it.
   - Decision: it ships as a family property (`WindowInterleave` resolved by the profile), which is what MVP3.4 built and measured. If a GGUF ever declares the pattern, the declared key overrides the profile default in either direction — the same posture DN-M34-4 already defines for every other feature default. The KV-read half is MVP3.9's item.
 
-### MVP3.5 [v0.3.5] - In Progress
+### MVP3.5 [v0.3.5] - Shipped
 
 Published GGUF quant families are accepted through a load-time quant descriptor/kernel registry while CPU kernels remain concrete and performance-sensitive.
 

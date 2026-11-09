@@ -23,7 +23,7 @@ dotnet test Lair.sln --filter Category=Kernel # kernel oracle comparisons
 
 Test categories: `Loader`, `Tokenizer`, `Template`, `TemplateDiagnostics`, `TemplateParity`, `Serve`, `MinjaSyntax`, `MinjaEval`, `MinjaStatements`, `MinjaFilters`, `MinjaChat`, `MinjaLimits`, `Kernel`, `Layers`, `Kv`, `Sampling`, `Api`, `Cli`, `Config`, `Parity`, `Calib`, `Concurrency`, `Prefill`, `Cache`, `Cancel`, `HotReload`, `Metrics`, `Embeddings`, `Affinity`, `MonitorUi`, `WebUi`.
 
-Performance gates (inter-token latency budgets in `ConcurrencyTests`/`PrefillTests`) are only meaningful under `-c Release` — Debug JIT inflates kernels ~4.6× and the absolute budgets cannot reproduce there. Correctness suites pass in both configurations.
+Performance gates (inter-token latency budgets in `ConcurrencyTests`/`PrefillTests`) are only meaningful under `-c Release` — Debug JIT inflates kernels ~4.6× and the absolute budgets cannot reproduce there. Correctness suites pass in both configurations. The real-model suites (`ConcurrencyTests`, `ParityTests`) share one serialized xunit collection, `model-loaded`, so two engines never load side by side — a second engine loading alongside the latency-budget suite starves its inter-token budgets.
 
 Model fixtures live in `models/` (gitignored). Tests locate them via `ModelFixture.Resolve()` / `ModelFixture.ResolveRepoRelative(path)` and skip gracefully when a file is absent — so on a fresh clone the real-model cases (including Parity) no-op until models are placed. The model budget is a 4 GB peak working set per loaded engine: a loaded engine adds roughly 360–395 MB of runtime overhead on top of weights and KV, so keep fixture weights under about 3.6 GB and serve profiles as tight as the case needs (`max_context_tokens`, `kv_blocks`, `thread_quota`). Never run two model-loaded processes at once.
 
@@ -40,7 +40,7 @@ pwsh -File scripts/generate-parity.ps1 -Out tests/fixtures/parity-smollm-f16.jso
 pwsh -File scripts/generate-parity.ps1 -ModelPath models/smollm-135m-instruct-q8_0.gguf -Out tests/fixtures/parity-smollm-q8.json
 ```
 
-Parity gate: model-file sha256 guard; LAIR argmax must appear in the reference top-5; LAIR's calibrated distribution must reproduce within |Δlogprob| ≤ 0.2 (calibrated-missing tokens must stay outside LAIR's top-16). Cross-tool exact string equality is not asserted — llama.cpp CLI and server modes disagree on identical greedy runs (see the pinned `reference_mode` field in each fixture).
+Parity gate: model-file sha256 guard; LAIR argmax must appear in the reference top-5; LAIR's calibrated distribution must reproduce within |Δlogprob| ≤ 0.2 (calibrated-missing tokens must stay outside LAIR's top-16). The cross-tool logprob band applies only to candidates within 6 nats of the reference's own top-1; deeper tail candidates are gated on membership in LAIR's calibrated window and reproduction of LAIR's calibrated value instead of absolute agreement. Cross-tool exact string equality is not asserted — llama.cpp CLI and server modes disagree on identical greedy runs (see the pinned `reference_mode` field in each fixture).
 
 Template parity is a separate gate: `tests/fixtures/parity-templates-llama32.json` pins byte-exact `/apply-template` renders for `models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` (model + chat_template sha256 guards, pinned `date_string`), asserted by `Category=TemplateParity`. Regenerate with:
 

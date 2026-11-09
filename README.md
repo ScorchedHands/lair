@@ -5,7 +5,7 @@ A C#/.NET inference runtime that serves GGUF LLMs locally behind an OpenAI-compa
 ## Requirements
 
 - .NET SDK 10.0.400+ (x64)
-- A GGUF model file (F16, Q8_0, or Q4_K quants), e.g. from Hugging Face
+- A GGUF model file (F32, F16, Q8_0, Q4_K, Q5_0, Q5_K, Q6_K, Q3_K, or Q2_K quants), e.g. from Hugging Face
 
 ## Quick start
 

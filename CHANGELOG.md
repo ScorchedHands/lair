@@ -4,6 +4,19 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-11-09
+
+### Added
+
+- `Q2_K` and `Q3_K` quant support end to end on CPU: loader acceptance plus scalar and AVX2 fused-dequant GEMV kernels in single and batched decode (llama.cpp `ggml-common.h` block geometry from the pinned b12032 tag — 256 elements per block, 84 bytes for `Q2_K`, 110 for `Q3_K`), so published low-bit K-quant files load and serve as-is.
+- `tests/fixtures/parity-llama32-q3ks.json` and `tests/fixtures/parity-llama32-q2k.json`: pinned b12032 output parity for `models/Llama-3.2-1B-Instruct-Q3_K_S.gguf` and `models/Llama-3.2-1B-Instruct-Q2_K.gguf` (`Category=Parity`), regenerated with `scripts/generate-parity.ps1`.
+
+### Changed
+
+- GGML type acceptance resolved at load through a descriptor registry (`GgmlTypeRegistry.TryResolve` / `QuantDescriptor`) instead of a hardcoded switch: membership in the registry is the acceptance rule, and block geometry plus row-stride/byte-length validation are computed from the descriptor. Currently accepted tensor types: F32, F16, Q8_0, Q4_K, Q5_0, Q5_K, Q6_K, Q2_K, Q3_K.
+- Parity cross-tool logprob band applies only to candidates within 6 nats of the reference's own top-1, where a candidate carries sampling weight; deeper tail candidates are gated on membership in LAIR's calibrated window and reproduction of LAIR's calibrated value instead of absolute agreement, since sub-nat logit differences legitimately reorder the deep tail. Argmax-membership and reproduction gates are unchanged.
+- `ConcurrencyTests` and `ParityTests` share one serialized xunit collection (`model-loaded`), so real-model suites never load engines beside the latency-budget suite — a second engine loading at once starves the inter-token budgets that suite measures.
+
 ## [0.3.4] - 2026-11-08
 
 ### Added
