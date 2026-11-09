@@ -683,7 +683,7 @@ Published GGUF quant families are accepted through a load-time quant descriptor/
 - [✓] Automated Quant Parity: real-fixture decode parity for the new sub-4-bit Llama-3.2 quants against pinned b12032 inside the documented quantized band. Verify: `dotnet test --filter Category=Parity -c Release` — 29/29, both new fixtures green on all four prompts; the Q3_K_S chat-template case is green because its argmax matches the reference top-1 to 0.0008 nats and only tail candidates 8 nats below the leader diverge (see the cross-tool window decision).
 - [✓] Manual Budget Serve: serve the re-pinned Llama fixture and confirm the monitor-reported working set is under the ceiling. Verify: live two-turn exchanges on `:8181` at the **default** profile (`max_context_tokens: 4096`, `kv_blocks: 256`, `thread_quota: 8`) plus `/monitor/stream` snapshot frames. Q3_K_S: `/v1/models` reported `architecture: llama`, `quant: Q3_K`; two-turn exchange coherent (`2 + 2` → `2 + 2 = 4` → `4 × 3 = 12`, both `finish_reason: eos`); OS peak working set 1,068,924,928 B with the monitor reporting 949.2 MB peak and a 256 MB KV pool. Q2_K: OS peak 1,129,283,584 B, monitor peak 1,026.7 MB. Both under the 4 GB ceiling with no profile tightening. Decode throughput on this box measured ~1 tok/s for both (step time 720–1050 ms), and the Q2_K exchange produced wrong arithmetic twice (`4 × 4 = 16`, then `8 × 3 = 24`) — a model-quality limit of a 2.6 bpw file on a 1B model, not a runtime failure: parity gates green, serving quality is not.
 
-### MVP3.6 [v0.3.6] - Refined
+### MVP3.6 [v0.3.6] - In Progress
 
 Tool-call and model output formats are handled by load-time parser registries instead of the static fenced-JSON detector.
 
@@ -708,10 +708,10 @@ Tool-call and model output formats are handled by load-time parser registries in
 
 #### Implementation Items
 
-- [_] Tool-call parser registry — define the parser interface and the load-time selection path, and move fenced-JSON detection behind a built-in parser (see DN-M36-1, DN-M36-2).
-  - Verify: `dotnet test --filter Category=Api -c Release` — existing tool wire and streaming-delta cases green unchanged; a load-time log line names the resolved parser for the loaded model.
-- [_] `tool_parser` config key — `auto | template | fenced | none` per model with load-time validation, a new-requests-only hot-reload class, and `/v1/models` reporting the resolved choice.
-  - Verify: `dotnet test --filter Category=Config|Api -c Release` — invalid values fail naming the model and key; `none` produces byte-identical content with no `tool_calls`; the hot-reload path applies to new requests only.
+- [✓] Tool-call parser registry — define the parser interface and the load-time selection path, and move fenced-JSON detection behind a built-in parser (see DN-M36-1, DN-M36-2).
+  - Verify: `dotnet test --filter Category=Api -c Release` — 60/60: existing tool wire and streaming-delta cases green unchanged, `auto` reproduces the existing capability precedence, `fenced` forces the fenced path, `none` returns byte-identical content with no `tool_calls`, and the load path logs `tool_parser model='<name>' choice=<choice>`.
+- [✓] `tool_parser` config key — `auto | template | fenced | none` per model with load-time validation, a new-requests-only hot-reload class, and `/v1/models` reporting the resolved choice.
+  - Verify: `dotnet test --filter Category=Config|Api -c Release` — 110/110: an invalid value fails naming the model entry and the key, the key is classified new-requests-only in the mutation table, and `/v1/models` reports the resolved parser alongside `architecture` and `quant`.
 - [_] Template-native tool parser — recognize calls produced by the model's own template rendering and emit them as OpenAI `tool_calls` deltas (see DN-M36-4).
   - Verify: `dotnet test --filter Category=ToolCalls -c Release` — goldens for the pinned Llama-3.2 template's tool format, with the fenced path proven inactive for the same model.
 - [_] Reasoning-region recognizer and `reasoning: keep | strip` — resolve region boundaries from the loaded model's markup and apply the visibility choice (see DN-M36-3).

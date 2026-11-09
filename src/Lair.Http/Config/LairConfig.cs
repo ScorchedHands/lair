@@ -64,6 +64,15 @@ public sealed record ModelConfig
     /// </summary>
     public bool ForceFencedTools { get; init; }
 
+    /// <summary>
+    /// Which tool output parser the model resolves to at load: <c>auto</c> (default — the loaded template's detected
+    /// capabilities decide, with LAIR's fenced block as fallback), <c>template</c> (the model's own chat-template
+    /// rendering is authoritative and no fenced injection happens), <c>fenced</c> (LAIR's fenced tool block for every
+    /// declared-tool request regardless of the template), or <c>none</c> (inert: no tool surface reaches the model,
+    /// content stays byte-for-byte what was generated, and no <c>tool_calls</c> are reported).
+    /// </summary>
+    public string ToolParser { get; init; } = "auto";
+
     public PlacementConfig Placement { get; init; } = new();
 }
 

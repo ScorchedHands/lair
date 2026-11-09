@@ -109,7 +109,8 @@ public static class ApiApp
                     gen.Model.ContextLength,
                     gen.Model.Quant,
                     gen.Model.Architecture,
-                    gen.ModelType)]);
+                    gen.ModelType,
+                    gen.Model.ToolParser)]);
 
             return Results.Json(models, statusCode: 200);
         });

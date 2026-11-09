@@ -29,6 +29,10 @@ public sealed class GenerationService : IDisposable
     private readonly GgufTokenizer _tokenizer;
     private readonly MinjaChatTemplate? _chatTemplate;
     private readonly TemplateCapabilities? _chatTemplateCapabilities;
+
+    // The output-parser plan resolved once at model load (reference-swapped under the reload gate when a
+    // new-requests-only tool key changes): request behavior consumes this resolved value instead of re-deciding.
+    private OutputParserPlan _outputParser;
     private readonly ILogger? _logger;
     private readonly BlockPool _pool;
     private readonly GenerationScheduler _scheduler;
@@ -58,6 +62,7 @@ public sealed class GenerationService : IDisposable
         GgufTokenizer tokenizer,
         MinjaChatTemplate? chatTemplate,
         TemplateCapabilities? chatTemplateCapabilities,
+        OutputParserPlan outputParser,
         ILogger? logger,
         BlockPool pool,
         GenerationScheduler scheduler,
@@ -70,6 +75,7 @@ public sealed class GenerationService : IDisposable
         _tokenizer = tokenizer;
         _chatTemplate = chatTemplate;
         _chatTemplateCapabilities = chatTemplateCapabilities;
+        _outputParser = outputParser;
         _logger = logger;
         _pool = pool;
         _scheduler = scheduler;
@@ -87,6 +93,13 @@ public sealed class GenerationService : IDisposable
     /// truth on the loaded-model path.
     /// </summary>
     public TemplateCapabilities? ChatTemplateCapabilities => _chatTemplateCapabilities;
+
+    /// <summary>
+    /// The output-parser plan resolved for the loaded model at load (re-resolved only when a new-requests-only tool
+    /// key is reloaded). Its <c>ToolParser</c> choice decides which tool surface a chat request gets and whether its
+    /// decoded text is read for calls; its reasoning-region slot stays inert until the separate recognizer fills it.
+    /// </summary>
+    internal OutputParserPlan ResolvedOutputParser => Volatile.Read(ref _outputParser);
 
     /// <summary>The id that ends a generation: the model's declared EOT id (<c>tokenizer.ggml.eot_token_id</c>) when it has one, otherwise the EOS id.</summary>
     internal int StopId => _tokenizer.EotId >= 0 ? _tokenizer.EotId : _tokenizer.EosId;
@@ -239,6 +252,10 @@ public sealed class GenerationService : IDisposable
             List<FieldResult> results = [];
             LairConfig effective = _current;
 
+            // The plan re-resolved when a new-requests-only tool key lands, so later requests follow the candidate's
+            // value while sequences already in flight stay on their resolved limits.
+            OutputParserPlan replanned;
+
             foreach (FieldChange change in ConfigMutationTable.Diff(effective, candidate))
             {
                 switch (change.Field)
@@ -275,8 +292,20 @@ public sealed class GenerationService : IDisposable
 
                     case "models[0].force_fenced_tools":
                         effective = effective with { Models = [effective.Models[0] with { ForceFencedTools = candidate.Models[0].ForceFencedTools }] };
+                        replanned = ResolvePlanFor(effective);
+                        Volatile.Write(ref _outputParser, replanned);
+                        RefreshAdvertisedModel(effective);
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
                             $"chat requests admitted from now on {(candidate.Models[0].ForceFencedTools ? "inject LAIR's fenced tool block even for a tool-capable template" : "follow the loaded template's tool capabilities")}; sequences already in flight are unaffected"));
+                        break;
+
+                    case "models[0].tool_parser":
+                        effective = effective with { Models = [effective.Models[0] with { ToolParser = candidate.Models[0].ToolParser }] };
+                        replanned = ResolvePlanFor(effective);
+                        Volatile.Write(ref _outputParser, replanned);
+                        RefreshAdvertisedModel(effective);
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"chat requests admitted from now on resolve to the {ToolParserNames.Of(replanned.ToolParser)} tool parser; sequences already in flight are unaffected"));
                         break;
 
                     case "ui.recent_requests":
@@ -309,14 +338,20 @@ public sealed class GenerationService : IDisposable
     // Advertised model facts recomputed from the effective configuration and live pool state: the window admission
     // validates against is the smallest of configured max context, what the forward engine can actually address
     // (its precomputed RoPE extent), and the token slots the current KV budget can back. A raise beyond the engine's
-    // addressed extent clamps there — re-cutting those tables belongs to a model reload, not to a hot edit.
+    // addressed extent clamps there — re-cutting those tables belongs to a model reload, not to a hot edit. The tool
+    // parser rides on the same swap so /v1/models always reports what requests admitted now follow.
     private void RefreshAdvertisedModel(LairConfig effective)
     {
         long backed = Math.Min((long)_pool.EffectiveBudgetBlocks * _pool.BlockTokens, _model.MaxContextTokens);
         int context = (int)Math.Min(effective.Models[0].MaxContextTokens, backed);
 
-        Volatile.Write(ref _modelInfo, _modelInfo with { ContextLength = context, KvBlocks = _pool.EffectiveBudgetBlocks });
+        Volatile.Write(ref _modelInfo, _modelInfo with { ContextLength = context, KvBlocks = _pool.EffectiveBudgetBlocks, ToolParser = ToolParserNames.Of(_outputParser.ToolParser) });
     }
+
+    // The plan the configuration in force resolves to: same registry decision as model load, against the capabilities
+    // probed once for this template. Only a new-requests-only reload calls it; generation never re-decides.
+    private OutputParserPlan ResolvePlanFor(LairConfig effective) =>
+        OutputParserRegistry.Resolve(effective.Models[0].ToolParser, effective.Models[0].ForceFencedTools, _chatTemplateCapabilities);
 
     private static string RefusalDetail(FieldChange change) => change.Field switch
     {
@@ -413,15 +448,26 @@ public sealed class GenerationService : IDisposable
                 chatTemplateCapabilities = chatTemplate.DetectCapabilities();
             }
 
+            // The output-parser plan is resolved once here, from the load-probed capabilities plus the model's tool
+            // configuration: every later chat request consumes this plan instead of re-deciding which tool surface it
+            // gets, and the resolved choice is announced on the host's load log in the style of the tokenizer-default
+            // and profile-resolution lines.
+            OutputParserPlan outputParser = OutputParserRegistry.Resolve(modelConfig.ToolParser, modelConfig.ForceFencedTools, chatTemplateCapabilities);
+            logger?.LogInformation(
+                "tool_parser model='{Model}' choice={Choice}",
+                modelConfig.Name,
+                ToolParserNames.Of(outputParser.ToolParser));
+
             ModelInfo info = new(
                 modelConfig.Name,
                 maxContext,
                 modelConfig.KvBlocks,
                 DominantQuant(file),
                 model.Plan.Architecture,
-                model.Plan.VocabSize);
+                model.Plan.VocabSize,
+                ToolParserNames.Of(outputParser.ToolParser));
 
-            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, logger, pool, scheduler, info, config);
+            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, logger, pool, scheduler, info, config);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
             file = null;
             model = null;
@@ -651,11 +697,13 @@ public sealed class GenerationService : IDisposable
         // Recognized fences take over the result: the fences vanish from the visible text, the calls ride along as data,
         // and the finish reason becomes tool_calls no matter how decoding ended. Detection is unchanged by which tool
         // surface the prompt used: it reads fenced-JSON calls out of the decoded text whenever the pipeline is active,
-        // whether LAIR injected the contract or the template rendered the tools itself.
+        // whether LAIR injected the contract or the template rendered the tools itself. An inert plan has no parser,
+        // so its decoded text is never read and its content stays byte-for-byte what the model generated.
         IReadOnlyList<ToolCall>? toolCalls = null;
-        if (tools.Active)
+        IToolOutputParser? outputParser = Volatile.Read(ref _outputParser).Parser;
+        if (tools.Active && outputParser is not null)
         {
-            ToolDetection detection = ToolCallDetector.Detect(text, callableNames);
+            ToolDetection detection = outputParser.ReadCalls(text, callableNames);
             if (detection.Calls.Count > 0)
             {
                 text = detection.VisibleText;
@@ -817,21 +865,17 @@ public sealed class GenerationService : IDisposable
         ToolChoiceSelection choice = ResolveToolChoice(request.ToolChoice, declaredTools);
 
         // ToolChoiceMode.None closes the pipeline before any precedence decision: no template tools, no injection.
-        if (!request.IsChat || declaredTools is not { Count: > 0 } || choice.Mode == ToolChoiceMode.None)
+        // An inert plan closes it the same way for every request: the model gets no tool surface at all.
+        OutputParserPlan outputParser = Volatile.Read(ref _outputParser);
+        if (!request.IsChat || declaredTools is not { Count: > 0 } || choice.Mode == ToolChoiceMode.None || outputParser.ToolParser == ToolParser.None)
         {
             return new ToolPipeline(declaredTools, choice, false, null, null);
         }
 
-        return ShouldInjectFencedTools(_chatTemplateCapabilities, Volatile.Read(ref _current).Models[0].ForceFencedTools)
+        return outputParser.ToolParser == ToolParser.Fenced
             ? new ToolPipeline(declaredTools, choice, true, null, declaredTools)
             : new ToolPipeline(declaredTools, choice, true, declaredTools, null);
     }
-
-    // DN-M32-7 tool precedence: a loaded template that renders tools owns the tool surface for that request. LAIR's
-    // fenced block is the fallback for a template without tool support (and for a model with no chat template at all),
-    // and the model's force_fenced_tools override selects it even for a tool-capable template.
-    private static bool ShouldInjectFencedTools(TemplateCapabilities? capabilities, bool forceOverride) =>
-        forceOverride || capabilities is null || !capabilities.SupportsTools;
 
     private static ChatMessage MapChatMessage(Lair.Tokenizer.Templating.ChatMessage message) =>
         new() { Role = message.Role, Content = MinjaValue.Of(message.Content) };
