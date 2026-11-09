@@ -25,7 +25,7 @@ Test categories: `Loader`, `Tokenizer`, `Template`, `TemplateDiagnostics`, `Temp
 
 Performance gates (inter-token latency budgets in `ConcurrencyTests`/`PrefillTests`) are only meaningful under `-c Release` — Debug JIT inflates kernels ~4.6× and the absolute budgets cannot reproduce there. Correctness suites pass in both configurations.
 
-Model fixtures live in `models/` (gitignored). Tests locate them via `ModelFixture.Resolve()` / `ModelFixture.ResolveRepoRelative(path)` and skip gracefully when a file is absent — so on a fresh clone the real-model cases (including Parity) no-op until models are placed.
+Model fixtures live in `models/` (gitignored). Tests locate them via `ModelFixture.Resolve()` / `ModelFixture.ResolveRepoRelative(path)` and skip gracefully when a file is absent — so on a fresh clone the real-model cases (including Parity) no-op until models are placed. The model budget is 512 MB–1 GB of working set: keep fixture weights small and serve profiles tight (`max_context_tokens`, `kv_blocks`, `thread_quota`), since each loaded engine adds roughly 360–395 MB of runtime overhead on top of weights and KV. Never run two model-loaded processes at once.
 
 ## Parity harness
 
