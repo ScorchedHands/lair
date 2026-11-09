@@ -9,4 +9,6 @@ public enum QuantFormat
     Q5_0,
     Q5_K,
     Q6_K,
+    Q2_K,
+    Q3_K,
 }

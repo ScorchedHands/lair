@@ -21,6 +21,8 @@ internal static class GgmlType
     public const uint F16 = 1;
     public const uint Q5_0 = 6;
     public const uint Q8_0 = 8;
+    public const uint Q2_K = 10;
+    public const uint Q3_K = 11;
     public const uint Q4_K = 12;
     public const uint Q5_K = 13;
     public const uint Q6_K = 14;
@@ -39,11 +41,11 @@ internal static class GgmlType
             7 => "Q5_1",
             Q8_0 => "Q8_0",
             9 => "Q8_1",
-            10 => "Q2_K",
-            11 => "Q3_K",
+            Q2_K => "Q2_K",
+            Q3_K => "Q3_K",
             Q4_K => "Q4_K",
-            13 => "Q5_K",
-            14 => "Q6_K",
+            Q5_K => "Q5_K",
+            Q6_K => "Q6_K",
             15 => "Q8_K",
             16 => "IQ2_XXS",
             17 => "IQ2_XS",

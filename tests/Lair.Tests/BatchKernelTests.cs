@@ -24,6 +24,8 @@ public class BatchKernelTests
     [InlineData(QuantFormat.Q5_0)]
     [InlineData(QuantFormat.Q5_K)]
     [InlineData(QuantFormat.Q6_K)]
+    [InlineData(QuantFormat.Q2_K)]
+    [InlineData(QuantFormat.Q3_K)]
     public void GemvBatch_IsBitIdenticalToIndependentSingleVectorCalls(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -57,6 +59,8 @@ public class BatchKernelTests
     [InlineData(QuantFormat.Q5_0)]
     [InlineData(QuantFormat.Q5_K)]
     [InlineData(QuantFormat.Q6_K)]
+    [InlineData(QuantFormat.Q2_K)]
+    [InlineData(QuantFormat.Q3_K)]
     public void GemvBatch_ScalarPath_IsBitIdenticalToScalarSingleVectorCalls(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -90,6 +94,8 @@ public class BatchKernelTests
     [InlineData(QuantFormat.Q5_0)]
     [InlineData(QuantFormat.Q5_K)]
     [InlineData(QuantFormat.Q6_K)]
+    [InlineData(QuantFormat.Q2_K)]
+    [InlineData(QuantFormat.Q3_K)]
     public void GemvBatch_Threaded_IsBitIdenticalToSingleThreaded(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -115,6 +121,8 @@ public class BatchKernelTests
     [InlineData(QuantFormat.Q5_0)]
     [InlineData(QuantFormat.Q5_K)]
     [InlineData(QuantFormat.Q6_K)]
+    [InlineData(QuantFormat.Q2_K)]
+    [InlineData(QuantFormat.Q3_K)]
     public void GemvBatch_BadCountOrSpanLengths_ThrowsClearMessage(QuantFormat format)
     {
         TensorShape shape = MatrixShape(4, 70);
@@ -190,6 +198,12 @@ public class BatchKernelTests
                     break;
                 case QuantFormat.Q6_K:
                     QuantizeQ6K(src, dst);
+                    break;
+                case QuantFormat.Q2_K:
+                    QuantizeQ2K(src, dst);
+                    break;
+                case QuantFormat.Q3_K:
+                    QuantizeQ3K(src, dst);
                     break;
                 default:
                     QuantizeQ4K(src, dst);
@@ -472,6 +486,173 @@ public class BatchKernelTests
 
                     // The high 2 bits live at bit 2*quarter of qh byte 128 + 32h + 16*(k&1) + e.
                     dst[b * 210 + 128 + 32 * h + 16 * (k & 1) + e] |= (byte)((six >> 4) << (2 * quarter));
+                }
+            }
+        }
+    }
+
+    // Test-only Q2_K writer mirroring the reference layout: sixteen 16-element groups per 256-element block, each
+    // with amax/3 scale and max(0, -min) offset; block d/dmin = group-max / 15 stored as half-floats at bytes 80
+    // and 82. Scale byte g packs the four-bit group scale into its low nibble and the four-bit min into its high
+    // nibble; two-bit codes live in the 64-byte qs region at block+16, window byte 32h + 16*(k&1) read at bit
+    // shift 2*(k>>1), so four group-pairs share one window byte. Padded elements produce zero blocks.
+    private static void QuantizeQ2K(ReadOnlySpan<float> src, Span<byte> dst)
+    {
+        int blocks = (src.Length + 255) / 256;
+        for (int b = 0; b < blocks; b++)
+        {
+            ReadOnlySpan<float> srcBlock = src.Slice(b * 256, Math.Min(256, src.Length - b * 256));
+
+            float[] scales = new float[16];
+            float[] mins = new float[16]; // positive offsets subtracted from weights: w = d*sc*q - dmin*m
+            for (int g = 0; g < 16; g++)
+            {
+                int start = g * 16;
+                if (start >= srcBlock.Length)
+                {
+                    break; // padded region contributes nothing
+                }
+
+                ReadOnlySpan<float> group = srcBlock.Slice(start, Math.Min(16, srcBlock.Length - start));
+                float amax = 0f;
+                float vmin = 0f;
+                foreach (float v in group)
+                {
+                    amax = Math.Max(amax, Math.Abs(v));
+                    vmin = Math.Min(vmin, v);
+                }
+
+                scales[g] = amax / 3f;
+                mins[g] = Math.Max(0f, -vmin);
+            }
+
+            float dBlock = 0f;
+            float mBlock = 0f;
+            for (int g = 0; g < 16; g++)
+            {
+                dBlock = Math.Max(dBlock, scales[g]);
+                mBlock = Math.Max(mBlock, mins[g]);
+            }
+
+            Half dHalf = (Half)(dBlock / 15f);
+            Half mHalf = (Half)(mBlock / 15f);
+            WriteLE(dst, b * 84 + 80, (ushort)BitConverter.HalfToInt16Bits(dHalf));
+            WriteLE(dst, b * 84 + 82, (ushort)BitConverter.HalfToInt16Bits(mHalf));
+
+            // Quantize group codes against the half-floats exactly as they will be read back.
+            float dBack = (float)dHalf;
+            float mBack = (float)mHalf;
+            byte[] scBits = new byte[16];
+            byte[] minBits = new byte[16];
+            for (int g = 0; g < 16; g++)
+            {
+                scBits[g] = dBack > 0f ? (byte)Math.Clamp((int)Math.Round(scales[g] / dBack, MidpointRounding.AwayFromZero), 0, 15) : (byte)0;
+                minBits[g] = mBack > 0f ? (byte)Math.Clamp((int)Math.Round(mins[g] / mBack, MidpointRounding.AwayFromZero), 0, 15) : (byte)0;
+                dst[b * 84 + g] = (byte)(scBits[g] | (minBits[g] << 4));
+            }
+
+            for (int e = 0; e < srcBlock.Length; e++)
+            {
+                int g = e / 16;
+                float dGroup = dBack * scBits[g];
+                if (dGroup == 0f)
+                {
+                    continue; // all-zero group: quants stay zero, matching the reference behavior
+                }
+
+                float dmGroup = mBack * minBits[g];
+                int two = Math.Clamp((int)Math.Round(((double)srcBlock[e] + dmGroup) / dGroup, MidpointRounding.AwayFromZero), 0, 3);
+
+                int h = g >> 3; // 128-element half of the super-block
+                int k = g & 7; // 16-element group inside the half
+                ref byte target = ref dst[b * 84 + 16 + 32 * h + 16 * (k & 1) + (e % 16)];
+                target = (byte)(target | (two << (2 * (k >> 1)))); // groups k, k+2, k+4, k+6 share one window byte
+            }
+        }
+    }
+
+    // Test-only Q3_K writer mirroring the reference layout: sixteen 16-element groups per 256-element block with
+    // amax/4 group scales; block d = group-max / 32 stored as a half-float at byte 108, and each group's six-bit
+    // scale code sc in [32, 63] is read back as (sc - 32) >= 0. Packing: groups 0..7 keep the low nibble of sc in
+    // scales[g], groups 8..15 in the high nibble of scales[g-8], and the two high bits of every scale in
+    // scales[8 + g%4] at bit 2*(g/4). Three-bit codes live as the low 2 bits at qs window byte 32 + 32h + 16*(k&1),
+    // bit 2*(k>>1), plus the high bit at hmask byte 16*(k&1) + e, bit 4h + (k>>1). Padded elements produce zero blocks.
+    private static void QuantizeQ3K(ReadOnlySpan<float> src, Span<byte> dst)
+    {
+        int blocks = (src.Length + 255) / 256;
+        for (int b = 0; b < blocks; b++)
+        {
+            ReadOnlySpan<float> srcBlock = src.Slice(b * 256, Math.Min(256, src.Length - b * 256));
+
+            float[] scales = new float[16];
+            for (int g = 0; g < 16; g++)
+            {
+                int start = g * 16;
+                if (start >= srcBlock.Length)
+                {
+                    break; // padded region contributes nothing
+                }
+
+                ReadOnlySpan<float> group = srcBlock.Slice(start, Math.Min(16, srcBlock.Length - start));
+                float amax = 0f;
+                foreach (float v in group)
+                {
+                    amax = Math.Max(amax, Math.Abs(v));
+                }
+
+                scales[g] = amax / 4f;
+            }
+
+            float dBlock = 0f;
+            for (int g = 0; g < 16; g++)
+            {
+                dBlock = Math.Max(dBlock, scales[g]);
+            }
+
+            Half dHalf = (Half)(dBlock / 32f);
+            WriteLE(dst, b * 110 + 108, (ushort)BitConverter.HalfToInt16Bits(dHalf));
+
+            // Quantize group codes against the half-floats exactly as they will be read back.
+            float dBack = (float)dHalf;
+            int[] scBits = new int[16];
+            for (int g = 0; g < 16; g++)
+            {
+                scBits[g] = dBack > 0f ? Math.Clamp((int)Math.Round(scales[g] / dBack, MidpointRounding.AwayFromZero), 0, 31) + 32 : 32;
+                int low = scBits[g] & 0xF;
+                int high = (scBits[g] >> 4) & 0x3; // the two bits above the stored nibble
+
+                if (g < 8)
+                {
+                    dst[b * 110 + 96 + g] |= (byte)low;
+                }
+                else
+                {
+                    dst[b * 110 + 96 + (g - 8)] |= (byte)(low << 4);
+                }
+
+                dst[b * 110 + 96 + 8 + (g & 3)] |= (byte)(high << (2 * (g >> 2))); // groups g and g+8 share a bit field
+            }
+
+            for (int e = 0; e < srcBlock.Length; e++)
+            {
+                int g = e / 16;
+                float dGroup = dBack * (scBits[g] - 32);
+                if (dGroup == 0f)
+                {
+                    continue; // all-zero group: quants stay zero, matching the reference behavior
+                }
+
+                int three = Math.Clamp((int)Math.Round((double)srcBlock[e] / dGroup, MidpointRounding.AwayFromZero), -4, 3) + 4; // stored code in [0, 7]
+
+                int h = g >> 3; // 128-element half of the super-block
+                int k = g & 7; // 16-element group inside the half
+                ref byte q = ref dst[b * 110 + 32 + 32 * h + 16 * (k & 1) + (e % 16)];
+                q = (byte)(q | ((three & 3) << (2 * (k >> 1)))); // low 2 bits: groups k, k+2, k+4, k+6 share one byte
+
+                if (three > 3)
+                {
+                    // The high bit of the 3-bit code lives at hmask byte 16*(k&1) + e, bit 4h + (k>>1).
+                    dst[b * 110 + 16 * (k & 1) + (e % 16)] |= (byte)(1 << (4 * h + (k >> 1)));
                 }
             }
         }

@@ -18,9 +18,11 @@ public sealed class GgufLoaderTests : IDisposable
     private const uint GgmlQ5_0 = 6;
     private const uint GgmlQ8_0 = 8;
     private const uint GgmlQ2_K = 10;
+    private const uint GgmlQ3_K = 11;
     private const uint GgmlQ4_K = 12;
     private const uint GgmlQ5_K = 13;
     private const uint GgmlQ6_K = 14;
+    private const uint GgmlQ8_K = 15;
     private const uint GgmlIQ2_XXS = 16;
 
     private const int EmbedCols = 4;
@@ -219,13 +221,52 @@ public sealed class GgufLoaderTests : IDisposable
     }
 
     [Fact]
+    public void Open_AcceptsQ2_KQ3_KTensorsWithCorrectRowStrides()
+    {
+        byte[] image = BuildQ2Q3Fixture();
+        string path = WriteTemp(image);
+
+        using GgufFile gguf = GgufFile.Open(path);
+        Assert.Equal(2, gguf.Tensors.Tensors.Count);
+
+        LogicalTensor q2k = Assert.IsType<LogicalTensor>(gguf.Tensors.Find("blk.0.attn_q.weight"));
+        Assert.Equal(QuantFormat.Q2_K, q2k.Format);
+        Assert.Equal([2, 256], q2k.Shape.Dims); // ggml stores [cols, rows]: stored [256, 2] reverses to logical [rows, cols]
+        Assert.Equal(84L, q2k.Shape.RowStrideBytes(QuantFormat.Q2_K)); // ceil(256/256) * 84
+        Assert.Equal(0L, q2k.Offset);
+        Assert.Equal(168L, q2k.SizeBytes);
+
+        LogicalTensor q3k = Assert.IsType<LogicalTensor>(gguf.Tensors.Find("blk.0.attn_k.weight"));
+        Assert.Equal(QuantFormat.Q3_K, q3k.Format);
+        Assert.Equal([3, 256], q3k.Shape.Dims);
+        Assert.Equal(110L, q3k.Shape.RowStrideBytes(QuantFormat.Q3_K)); // ceil(256/256) * 110
+        Assert.Equal(224L, q3k.Offset); // next offset after 168 bytes, aligned to general.alignment (32)
+        Assert.Equal(330L, q3k.SizeBytes);
+
+        using GgufMmapWeightSource source = new(gguf);
+        ReadOnlySpan<byte> q2kSpan = source.Resolve(q2k);
+        ReadOnlySpan<byte> q3kSpan = source.Resolve(q3k);
+
+        Assert.Equal(168, q2kSpan.Length);
+        Assert.Equal(330, q3kSpan.Length);
+
+        Assert.True(q2kSpan.SequenceEqual(new ReadOnlySpan<byte>(image, (int)gguf.DataStart, 168)));
+        Assert.True(q3kSpan.SequenceEqual(new ReadOnlySpan<byte>(image, (int)gguf.DataStart + 224, 330)));
+
+        Assert.Equal(QuantPattern(0), q2kSpan[0]);
+        Assert.Equal(QuantPattern(168 - 1), q2kSpan[^1]);
+        Assert.Equal(QuantPattern(224), q3kSpan[0]);
+        Assert.Equal(QuantPattern(224 + 330 - 1), q3kSpan[^1]);
+    }
+
+    [Fact]
     public void Open_UnsupportedTensorType_ThrowsWithTypeIdAndName()
     {
-        byte[] image = BuildFixture(q8GgmlType: GgmlQ2_K);
+        byte[] image = BuildFixture(q8GgmlType: GgmlQ8_K);
         string path = WriteTemp(image);
 
         GgufException ex = Assert.Throws<GgufException>(() => GgufFile.Open(path));
-        Assert.Contains("unsupported ggml type 10 (Q2_K)", ex.Message);
+        Assert.Contains("unsupported ggml type 15 (Q8_K)", ex.Message);
     }
 
     [Theory]
@@ -233,6 +274,8 @@ public sealed class GgufLoaderTests : IDisposable
     [InlineData(1u, "F16", QuantFormat.F16, 1, 2)]
     [InlineData(6u, "Q5_0", QuantFormat.Q5_0, 32, 22)]
     [InlineData(8u, "Q8_0", QuantFormat.Q8_0, 32, 34)]
+    [InlineData(10u, "Q2_K", QuantFormat.Q2_K, 256, 84)]
+    [InlineData(11u, "Q3_K", QuantFormat.Q3_K, 256, 110)]
     [InlineData(12u, "Q4_K", QuantFormat.Q4_K, 256, 144)]
     [InlineData(13u, "Q5_K", QuantFormat.Q5_K, 256, 176)]
     [InlineData(14u, "Q6_K", QuantFormat.Q6_K, 256, 210)]
@@ -249,7 +292,7 @@ public sealed class GgufLoaderTests : IDisposable
 
     [Theory]
     [InlineData(2u, "Q4_0")]
-    [InlineData(10u, "Q2_K")]
+    [InlineData(15u, "Q8_K")]
     [InlineData(16u, "IQ2_XXS")]
     public void GgmlTypeRegistry_RejectsUnsupportedIdsButNamesThem(uint id, string ggmlName)
     {
@@ -402,6 +445,52 @@ public sealed class GgufLoaderTests : IDisposable
         // Payload region: 0..95 = Q5_0 (88 bytes + 8 alignment pad), 96..639 = Q5_K (528 bytes + 112 pad to
         // offset 640), 640..2319 = Q6_K (1680 bytes).
         for (int i = 0; i < 640 + 1680; i++)
+        {
+            writer.Write(QuantPattern(i));
+        }
+
+        writer.Flush();
+        return stream.ToArray();
+    }
+
+    // Two quantized tensors exercising the Q2_K/Q3_K acceptance path: ggml-stored dims, offsets aligned to
+    // general.alignment (32), and payload bytes filled to each aligned offset so Resolve spans can be compared
+    // against the fixture image.
+    private static byte[] BuildQ2Q3Fixture()
+    {
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+
+        writer.Write(GgufMagic);
+        writer.Write(3u); // version
+        writer.Write(2ul); // n_tensors
+        writer.Write(12ul); // n_kv — must match the number of KV pairs written below
+
+        WriteKvString(writer, "general.architecture", "llama");
+        WriteKvString(writer, "general.name", "lair-23k-fixture");
+        WriteKvUint32(writer, "general.alignment", 32);
+        WriteKvString(writer, "tokenizer.ggml.model", "gpt2");
+        WriteKvStringArray(writer, "tokenizer.ggml.tokens", ["<unk>", "hello", "world", "!"]);
+        WriteKvInt32Array(writer, "tokenizer.ggml.token_type", [1, 1, 1, 3]);
+        WriteKvStringArray(writer, "tokenizer.ggml.merges", ["h e", "e l", "l o"]);
+        WriteKvUint32(writer, "tokenizer.ggml.bos_token_id", 151643);
+        WriteKvUint32(writer, "tokenizer.ggml.eos_token_id", 151645);
+        WriteKvString(writer, "tokenizer.chat_template", "chatml");
+        WriteKvInt32Array(writer, "test.array_int32", [10, 20, 30]);
+        WriteKvBool(writer, "test.flag", true);
+
+        WriteTensorInfo(writer, "blk.0.attn_q.weight", [256, 2], GgmlQ2_K, 0);
+        WriteTensorInfo(writer, "blk.0.attn_k.weight", [256, 3], GgmlQ3_K, 224);
+
+        long headerLength = stream.Position;
+        long dataStart = (headerLength + 31) / 32 * 32;
+        for (long i = headerLength; i < dataStart; i++)
+        {
+            writer.Write((byte)0);
+        }
+
+        // Payload region: 0..167 = Q2_K (168 bytes + 56 alignment pad to offset 224), 224..553 = Q3_K (330 bytes).
+        for (int i = 0; i < 224 + 330; i++)
         {
             writer.Write(QuantPattern(i));
         }
