@@ -560,9 +560,9 @@ Dense GGUF architecture families load through a load-time profile registry that 
   - Rationale: the pinned llama.cpp build is the parity oracle (DN-M33-5). Parity requires reading the same keys and failing visibly where LAIR has no implementation yet. The pinned Qwen3 GGUF carries `blk.N.attn_q_norm.weight`/`attn_k_norm.weight` and applies them without declaring `attention.use_qk_norm`, so a declared-only rule would load that file with the norm silently missing — the exact failure mode this note exists to prevent.
   - Rejected: honoring tensor presence only (current bias behavior mis-states intent and silently accepts a model that declares no bias); ignoring unrecognized keys (silently wrong math); implementing every declared feature before any family is proven against the oracle; resolving QK-norm from a declared key alone (the reference applies it on tensor presence for these families).
   - Contract: `lair.loader` exposes typed metadata accessors for these keys; plan resolution reports an unsupported declared key as a load failure naming key, value, and family.
-- **DN-M34-5** — Family order is fixture-driven under the 512 MB–1 GB model budget: `llama` and `qwen2` are re-expressed as profiles with byte-identical behavior, then `qwen3` (per-head QK-norm, `head_length`, declared bias), then Gemma-2 (GELU-tanh FFN, attention and final-logit softcaps, `head_length`). Phi is deferred until RoPE scaling exists (MVP3.7) because its metadata declares it, and Gemma-3 stays deferred to MVP3.9 for its per-layer windowed/full attention interleave.
+- **DN-M34-5** — Family order is fixture-driven under the 4 GB peak-working-set model budget: `llama` and `qwen2` are re-expressed as profiles with byte-identical behavior, then `qwen3` (per-head QK-norm, `head_length`, declared bias), then Gemma-2 (GELU-tanh FFN, attention and final-logit softcaps, `head_length`). Phi is deferred until RoPE scaling exists (MVP3.7) because its metadata declares it, and Gemma-3 stays deferred to MVP3.9 for its per-layer windowed/full attention interleave.
   - Rationale: each added family must prove a primitive the previous families did not (QK-norm and head-length independence; then a different activation, two caps, and a declared attention window) and must be verifiable against the pinned oracle on a file this box can actually load.
-  - Rejected: adding families that repeat already-proven primitives; Phi-3 in this phase (needs `phi3.rope.scaling.*`, which is MVP3.7 work); Mistral in this phase (its distinguishing feature is window-local KV reads and interleave, deferred to MVP3.9); families with no published quant under the 1 GB ceiling.
+  - Rejected: adding families that repeat already-proven primitives; Phi-3 in this phase (needs `phi3.rope.scaling.*`, which is MVP3.7 work); Mistral in this phase (its distinguishing feature is window-local KV reads and interleave, deferred to MVP3.9); families with no published quant loadable under the ceiling.
   - Contract: each family lands with a pinned model file (sha256 recorded in its parity fixture) plus synthetic layer fixtures; `Category=Parity` and `Category=Layers` are the gates.
 - **DN-M34-6** — MoE is representable in MVP3.4 and executable in MVP3.9. The plan carries a sparse-FFN descriptor (expert count, per-expert tensor map, shared expert, router tensors) and the loader recognizes MoE metadata and tensors, but a MoE model fails at load with an actionable message naming sparse execution as deferred.
   - Rationale: retrofitting a sparse-FFN descriptor into a plan that has already shipped three families is expensive; executing MoE before its gather/residency design is measurable is worse. MVP6 keeps Flash-Next residency, prefetch, PLE, and MTP.
@@ -605,7 +605,7 @@ Dense GGUF architecture families load through a load-time profile registry that 
   - Real-model parity fixture is blocked, not failed: `tokenizer.ggml.model=llama` is a SentencePiece vocabulary and LAIR supports only GGUF BPE profiles, so `scripts/generate-parity.ps1` cannot calibrate this file. The forward was proven by driving LAIR's engine with reference-supplied token ids instead. Serving Gemma-2 needs the MVP3.11 SPM tokenizer profile.
 - [✓] Window interleave — the pinned reference applies the Gemma-2 window to alternating layers (local on even indices, full on odd), while LAIR applies a declared window to every layer, which masks attention in layers the reference leaves unmasked beyond the window length. Resolve a per-family interleave pattern in the plan and apply it in the score mask only; bounded KV reads stay deferred (see DN-M34-7).
   - Verify: `dotnet test --filter Category=Layers -c Release` — 99/99: an alternating multi-layer model matches a double-precision scalar reference that masks only even-index layers and differs from masking every layer, `AllLayers` stays bit-identical to the explicit all-layers plan, batched decode equals single-token under alternation, the `Encode` golden holds across chunks, and an alternating pattern with no declared window is bit-identical to having no pattern. `Category=Loader` 95/95: `gemma2` resolves `AlternatingLocalFirst` with or without a declared window while `llama`/`qwen2`/`qwen3`/generic resolve `AllLayers`. `Category=Parity|Serve` stays 34/34; full suite 904/904.
-- [✓] Family fixture set — pin one Qwen3 GGUF inside the 512 MB–1 GB model budget, record its sha256 in the new parity fixture, and regenerate goldens with `scripts/generate-parity.ps1` (see DN-M34-5). The Gemma-2 half is deferred: no published quant is under 1 GB (smallest Q2_K at 1,173 MB) and its SentencePiece vocabulary blocks the harness, so its pinning belongs to MVP3.11.
+- [✓] Family fixture set — pin one Qwen3 GGUF loadable under the 4 GB peak-working-set budget, record its sha256 in the new parity fixture, and regenerate goldens with `scripts/generate-parity.ps1` (see DN-M34-5). The Gemma-2 half is deferred: its SentencePiece vocabulary blocks the harness, so its pinning belongs to MVP3.11.
   - Verify: `pwsh -File scripts/generate-parity.ps1 -ModelPath models/Qwen3-0.6B-Q8_0.gguf -Out tests/fixtures/parity-qwen3.json` writes a guarded fixture and `dotnet test --filter Category=Parity -c Release` passes it.
   - Pinned: `models/Qwen3-0.6B-Q8_0.gguf` (609,800 KB, sha256 `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`, from `Qwen/Qwen3-0.6B-GGUF`) loads under the pinned b12032 loader and reports `qwen3` (28 layers, 1024 hidden, 16/8 heads, 128 key/value length). `models/gemma-2-2b-it.Q4_K_M.gguf` (1,629,000 KB, sha256 `ff7c35808d3b2fc5c4f955ca931efdec71c0808b9ec89a9878cb771608787058`, from `mradermacher/gemma-2-2b-it-GGUF`) is kept only as the oracle-measurement file for the forward graph — it reports `gemma2` (26 layers, 2304 hidden, 8/4 heads, 256 key/value length, caps 50/30, window 4096) and is out of budget.
   - Status: `tests/fixtures/parity-qwen3.json` is generated, sha256-guarded, and green, and `models/Qwen3-0.6B-Q8_0.gguf` at 610 MB sits inside the revised band. The Gemma-2 fixture cannot be generated: its `tokenizer.ggml.model=llama` vocabulary is SentencePiece and the harness calibrates through LAIR's tokenizer, which supports BPE only.
@@ -624,9 +624,12 @@ Dense GGUF architecture families load through a load-time profile registry that 
 
 - [✓] **Fixture budget conformance** — `models/Llama-3.2-1B-Instruct-Q8_0.gguf` (1,260 MB) is replaced by `models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` (770 MB, sha256 `3f5a22426976ab26cfe84dba63c1d08391717abb1af893e10f1b2968d862dcc1`, from `unsloth/Llama-3.2-1B-Instruct-GGUF`); the serve, tokenizer-parity and template-parity references, the `scripts/generate-template-parity.ps1` default, and `DEVELOP.md` all point at it, and both llama goldens were regenerated from it.
   - Verify: `Category=Tokenizer` 43/43, `Category=TemplateParity` 14/14, `Category=Parity|Serve` 34/34, full suite 924/924. The regenerated goldens are byte-identical except `model_file`, `model_sha256`, `generated_utc`, and the fixture-pinned `date_string` (`06 Nov 2026` → `08 Nov 2026`) that the 12 `expected_prompt` values embed — quant-independence of ids and template rendering is proven by the diff, not assumed.
-- [_] **Serve working set under the new ceiling** — measured, not estimated: a 770 MB-weight fixture peaks at 1,102–1,174 MB (≈360–395 MB of runtime overhead per engine: worker compute buffers, JIT, vocab tables) and stays over 1,024 MB even with `kv_blocks: 32` and `thread_quota: 4`. Qwen3-0.6B (610 MB weights) fits the ceiling at 1,000 MB peak with the same tight profile, so the ceiling is reachable only for fixtures under ≈640 MB of weights. `Q2_K` (554 MB) and `Q3_K_S` (612 MB) are published for Llama-3.2 and both are formats MVP3.5 adds; re-pin the llama serve fixture to `Q3_K_S` after MVP3.5 and re-measure.
-- [_] **Gemma-2 serving** — real-model parity and live serve for the pinned Gemma-2 fixture need a SentencePiece tokenizer profile; decide whether that lands as MVP3.11 or merges into an earlier tokenizer phase.
-- [_] **Window interleave** — whether the alternating local/full pattern belongs in the plan as a family property or as metadata once a declaration exists for it; the score-mask half is an MVP3.4 item and the KV-read half is MVP3.9.
+- [X] **Serve working set under the revised ceiling** — measured: a 770 MB-weight fixture peaks at 1,102–1,174 MB (≈360–395 MB of runtime overhead per engine: worker compute buffers, JIT, vocab tables), and Qwen3-0.6B (610 MB weights) peaks at 1,726 MB on the default `4096`/`256`/`8` profile.
+  - Decision: the owner restored a 4 GB peak-working-set ceiling, which both fixtures clear with no re-pin and no profile change. The measurements stay recorded because they define what a fixture costs — a loaded engine adds roughly 360–395 MB on top of weights and KV, so the ceiling is a working-set limit rather than a file-size limit.
+- [X] **Gemma-2 serving** — real-model parity and live serve for the pinned Gemma-2 fixture need a SentencePiece tokenizer profile.
+  - Decision: it lands as MVP3.11, whose fixtures and gates are now written there (DN-M311-3). It does not merge into an earlier tokenizer phase: MVP3.3 is shipped, and the vocabulary-type seam MVP3.11 adds is a different axis from the `pre` profiles that phase built.
+- [X] **Window interleave** — whether the alternating local/full pattern belongs in the plan as a family property or as metadata once a declaration exists for it.
+  - Decision: it ships as a family property (`WindowInterleave` resolved by the profile), which is what MVP3.4 built and measured. If a GGUF ever declares the pattern, the declared key overrides the profile default in either direction — the same posture DN-M34-4 already defines for every other feature default. The KV-read half is MVP3.9's item.
 
 ### MVP3.5 [v0.3.5] - Refined
 
@@ -643,7 +646,7 @@ Published GGUF quant families are accepted through a load-time quant descriptor/
   - Rejected: config-driven format tables (no compile-time pairing to a kernel, so a typo becomes a runtime crash); deriving geometry from file size (silent mis-parse of a truncated file); accepting unknown ids with a best-effort dequant (produces wrong output instead of a named failure).
   - Contract: `GgmlType`'s switch becomes `GgmlTypeRegistry.TryResolve(uint id, out QuantDescriptor)`; `QuantDescriptor { TypeId, Name, Format, BlockSize, TypeSize }`; `QuantFormat` stays the enum the kernels switch on.
 - **DN-M35-3** — Format priority is fixture-driven: `Q3_K` and `Q2_K` enter this phase, nothing else. `Q4_0`/`Q5_0`/`Q5_1`/`Q8_1`/`Q8_K`, the IQ family, and TQ formats stay out until a published fixture demands them.
-  - Rationale: MVP3.4 shipped an open item that only these two formats can close — the Llama-3.2 serve fixture needs about 640 MB of weights or less, and `Q3_K_S` (612 MB) and `Q2_K` (554 MB) are the only published sub-640 MB files that are not IQ-class. Every format added carries a kernel, an oracle parity gate, and a real fixture, so formats no target model ships in are dead weight.
+  - Rationale: these are the formats the later phases' fixtures actually need — MVP3.9's MoE fixture is `OLMoE-1B-7B-0924-Instruct` at `Q2_K` (2,444 MB, loads at roughly 2.8 GB against the 4 GB ceiling) and MVP3.11's Gemma-2 fixture is `Q3_K_S` (1,298 MB, roughly 1.7 GB). Every format added carries a kernel, an oracle parity gate, and a real fixture, so formats no target model ships in are dead weight.
   - Rejected: `IQ4_NL`/`IQ4_XS`/`IQ3_XXS` (they get their own phase at MVP3.8, where the fixture and measurement gates for them live); `Q4_0` (superseded by `Q4_K` for every model LAIR serves); `Q8_K` (no published GGUF ships it as a standard file); implementing every GGML type for completeness (untestable formats with no demand).
   - Contract: `QuantFormat` gains `Q2_K` and `Q3_K`; GGML ids 10 and 11 become accepted; `Category=Kernel` and `Category=Parity` gate both.
 - **DN-M35-4** — `Q2_K` and `Q3_K` are super-block formats with per-sub-block scales and asymmetric min-based quantization, so their definition is the pinned reference's `dqK` layout, not a LAIR-authored scalar golden. Parity is asserted against pinned b12032 on a real file in the quantized band.
@@ -659,8 +662,8 @@ Published GGUF quant families are accepted through a load-time quant descriptor/
   - Verify: `dotnet test --filter Category=Kernel -c Release` — synthetic-block scalar-vs-AVX2 bit-identity across a full super-block including the sub-scale packing, batched-vs-single decode equivalence, and dequant against a double-precision reference implementing `min + q * scale`.
 - [_] `Q2_K` format — descriptor plus scalar and AVX2 kernels reproducing the reference super-block layout (see DN-M35-3, DN-M35-4).
   - Verify: `dotnet test --filter Category=Kernel -c Release` — same gate as `Q3_K`, including the 4-bit sub-scale packing and the asymmetric min handling that distinguishes it from `Q4_K`.
-- [_] Budget-conforming Llama fixture — re-pin the Llama-3.2 fixture to a `Q3_K_S` or `Q2_K` file and re-measure its serve working set against the 1 GB ceiling (closes the MVP3.4 open item; see DN-M35-3).
-  - Verify: `dotnet test --filter Category=Serve -c Release` green with the re-pinned file and a recorded peak working set under 1,024 MB; `dotnet test --filter Category=Parity -c Release` green on a fixture generated from the same file inside the quantized band.
+- [_] Small-K-quant real fixtures — pin `Q3_K_S` and `Q2_K` copies of the Llama-3.2 fixture family and generate parity goldens from them, so both new formats are gated against the pinned reference on real files rather than synthetic blocks only (see DN-M35-3, DN-M35-4).
+  - Verify: `dotnet test --filter Category=Parity -c Release` green on fixtures generated from `models/Llama-3.2-1B-Instruct-Q3_K_S.gguf` (612 MB) and `models/Llama-3.2-1B-Instruct-Q2_K.gguf` (554 MB); `Category=Serve` green on the existing Q4_K_M fixture with its peak working set recorded against the 4 GB ceiling.
 
 #### Tests
 
@@ -669,33 +672,47 @@ Published GGUF quant families are accepted through a load-time quant descriptor/
 - [_] Automated Quant Parity: real-fixture decode parity for the re-pinned sub-1 GB Llama-3.2 quant against pinned b12032 inside the documented quantized band. Verify: `dotnet test --filter Category=Parity -c Release`.
 - [_] Manual Budget Serve: serve the re-pinned Llama fixture and confirm the monitor-reported working set is under the ceiling. Verify: live two-turn exchange on `:8181` with a tight profile (`max_context_tokens`, `kv_blocks`, `thread_quota`), plus a `/monitor/stream` snapshot frame read.
 
-### MVP3.6 [v0.3.6] - Tentative
+### MVP3.6 [v0.3.6] - Refined
 
 Tool-call and model output formats are handled by load-time parser registries instead of the static fenced-JSON detector.
 
 #### Design Notes
 
 - **DN-M36-1** — Output parsing is a registry selected at model load from architecture, chat-template capabilities, and explicit config overrides. Built-in parsers may implement fenced JSON plus native model-family tool formats; selection happens before serving, not per-token in the decode loop.
-  - Rationale: general GGUF compatibility requires recognizing more than LAIR’s MVP2 fenced-JSON fallback. Model families emit different tool/reasoning markup, and parser behavior must be attributable to the loaded model rather than inferred from raw text.
+  - Rationale: general GGUF compatibility requires recognizing more than LAIR's MVP2 fenced-JSON fallback. Model families emit different tool/reasoning markup, and parser behavior must be attributable to the loaded model rather than inferred from raw text.
   - Rejected: a single static detector for all models; per-token parser dispatch during decode; separate libraries per parser family without packaging need.
   - Contract: `lair.http`/`lair.models` request pipeline consumes a resolved output-parser plan and preserves OpenAI wire shape.
+- **DN-M36-2** — Selection keys are the chat-template capability probes plus a config override, never the architecture name alone: `models[].tool_parser: auto | template | fenced | none`, default `auto` resolving to today's precedence rule. The resolved choice is logged at load and reported by `/v1/models`.
+  - Rationale: precedence is already capability-driven (`TemplateCapabilities` feeding `ShouldInjectFencedTools` in `GenerationService.cs:825-832`), so the registry formalizes what exists. Architecture name is a weak key because a fine-tune can change tool markup without changing `general.architecture`, and none of the pinned fixtures carries a GGUF metadata key that states a tool format.
+  - Rejected: architecture-name-only selection (wrong for fine-tunes); inventing a GGUF tool-format key read (no such key exists on the fixtures LAIR actually loads); sniffing raw text to decide (the posture DN-M36-1 rejects).
+  - Contract: load resolves an `OutputParserPlan { ToolParser, ReasoningRegion }`; `lair.yaml` gains `models[].tool_parser` with a new-requests-only hot-reload class.
+- **DN-M36-3** — Reasoning-region recognition belongs to this phase; stripping is a separate config choice. The recognizer resolves the open/close markup of a reasoning region (the `<think>` … `</think>` shape Qwen3 emits today) and reports boundaries to the decode loop; `models[].reasoning: keep | strip` decides visibility, defaulting to `keep`.
+  - Rationale: nothing in `src` recognizes reasoning markup today — Qwen3's `<think>` block streams raw into response content, which is why a 128-token request can spend its whole budget on reasoning and return no answer. MVP3.10's reasoning ceiling is unimplementable without a resolved region, and a default of `keep` keeps this phase's change observable rather than silently altering output.
+  - Rejected: stripping reasoning unconditionally (destroys the evidence the budget gates need); guessing region boundaries heuristically per token; a standalone reasoning library.
+  - Contract: `OutputParserPlan.ReasoningRegion` exposes boundaries to the decode loop and to MVP3.10; default wire content is byte-identical to today.
+- **DN-M36-4** — Parser families in scope are exactly three: the existing fenced-JSON detector moved behind the registry, template-native tool rendering (the path the pinned Llama-3.2 template already exercises), and reasoning-region recognition. No model-specific native tool parser lands without a fixture emitting it.
+  - Rationale: the pinned fixtures and templates LAIR already renders cover these three and nothing else; adding parsers with no emitting fixture repeats the demand rule DN-M35-3 applies to quant formats.
+  - Rejected (as of this refinement): a Hermes-style `<tool_call>` XML parser (no pinned fixture emits it), a Gemma tool parser (its template renders no tools today), multi-format auto-detection (ambiguous precedence, no fixture to arbitrate).
+  - Contract: built-in parsers implement one `IToolOutputParser` shape resolved by the registry; `Category=ToolCalls` goldens per parser.
 
 #### Implementation Items
 
-- [_] Tool-call parser registry — define the parser interface and selection path; move current fenced-JSON detection behind a built-in parser implementation.
-  - Verify: `dotnet test --filter Category=Api|ToolCalls` — existing tool wire tests remain green under the registry.
-- [_] Native output parser families — add parser implementations for model-native tool/reasoning formats as templates and fixtures require them.
-  - Verify: `dotnet test --filter Category=ToolCalls` — parser goldens for each supported family; visible text stripping and OpenAI `tool_calls` deltas verified.
+- [_] Tool-call parser registry — define the parser interface and the load-time selection path, and move fenced-JSON detection behind a built-in parser (see DN-M36-1, DN-M36-2).
+  - Verify: `dotnet test --filter Category=Api -c Release` — existing tool wire and streaming-delta cases green unchanged; a load-time log line names the resolved parser for the loaded model.
+- [_] `tool_parser` config key — `auto | template | fenced | none` per model with load-time validation, a new-requests-only hot-reload class, and `/v1/models` reporting the resolved choice.
+  - Verify: `dotnet test --filter Category=Config|Api -c Release` — invalid values fail naming the model and key; `none` produces byte-identical content with no `tool_calls`; the hot-reload path applies to new requests only.
+- [_] Template-native tool parser — recognize calls produced by the model's own template rendering and emit them as OpenAI `tool_calls` deltas (see DN-M36-4).
+  - Verify: `dotnet test --filter Category=ToolCalls -c Release` — goldens for the pinned Llama-3.2 template's tool format, with the fenced path proven inactive for the same model.
+- [_] Reasoning-region recognizer and `reasoning: keep | strip` — resolve region boundaries from the loaded model's markup and apply the visibility choice (see DN-M36-3).
+  - Verify: `dotnet test --filter Category=ToolCalls|Serve -c Release` — region boundaries detected on the Qwen3 serve fixture's `<think>` markup; `strip` removes the region from visible content while `keep` is byte-identical to today; finish reasons still report `length` versus `eos` unchanged.
 
 #### Tests
 
-- [_] Automated ToolCalls: parser selection, native tool-call goldens, reasoning-tag stripping, streaming delta compatibility.
+- [_] Automated ToolCalls: parser selection per model, fenced and template-native goldens, streaming-delta compatibility, and `tool_parser: none` inertness. Verify: `dotnet test --filter Category=ToolCalls|Api -c Release`.
+- [_] Automated Reasoning Region: boundary detection on pinned-style markup, `keep` versus `strip` content equality, and config validation failures. Verify: `dotnet test --filter Category=ToolCalls -c Release`.
+- [_] Manual Parser Proof: serve the pinned Qwen3 fixture with tools declared and confirm the response separates reasoning from visible answer text, then flip `reasoning: strip` in the live config and confirm the next request differs while the one in flight does not. Verify: live two-request sequence plus the hot-reload log line.
 
-#### Open Items
-
-- [_] **Parser selection metadata** — whether selection comes from architecture name, template capabilities, GGUF metadata, or explicit config; settle in `/plan-refine mvp3.6`.
-
-### MVP3.7 [v0.3.7] - Tentative
+### MVP3.7 [v0.3.7] - Refined
 
 RoPE scaling and positional-encoding variants load through RoPE strategy adapters, including YaRN/LongRoPE/partial rotary where GGUF metadata declares them.
 
@@ -705,29 +722,37 @@ RoPE scaling and positional-encoding variants load through RoPE strategy adapter
   - Rationale: YaRN and related rope-scaling schemes are not just theta adjustments; they affect rotary table construction, attention scaling, and sometimes partial rotary handling. They should not be folded into MVP3.2 or hidden inside architecture branches.
   - Rejected: treating rope scaling as a metadata-only tweak; implementing YaRN before template/tokenizer compatibility is stable; per-token rope strategy dispatch during decode.
   - Contract: `lair.models` resolves a concrete RoPE plan at load and feeds the layer executor through table-driven operations.
+- **DN-M37-2** — Scaling variants become plan values resolved from the declared metadata, and the blanket rejection goes away: today every `<arch>.rope.scaling.*` key fails at load (`ModelPlans.cs:101-108`) and every `rope.dimension_count` that differs from the head dimension fails as unsupported partial rotary (`ModelPlans.cs:176-184`). Both become resolved values — a precomputed rotary table, an attention-logit scaling factor, and a rotary slice width — with unsupported *variant names* still failing actionably.
+  - Rationale: the rejection is what stands between LAIR and the Phi family, and the fix is the same shape as every other MVP3.4 resolution: read the keys, resolve them once, fail on what is genuinely unimplemented rather than on the category.
+  - Rejected: keeping the blanket rejection and special-casing one model; computing scaled rotary values inside the decode loop (allocation and dispatch in the hot path); resolving scaling from file names or architecture guesses instead of declared keys.
+  - Contract: `ModelPlan` carries `RopeScaling { Variant, Multiplier, OriginalContextLength, AttentionFactor, CorrectionScale }` plus `RotarySlice`; `Category=Loader` asserts each declared key resolves or fails naming key and value.
+- **DN-M37-3** — YaRN is the only variant implemented in this phase, gated on `bartowski/Phi-3-mini-4k-instruct-GGUF` at `Q2_K` (1,351 MB, loads near 1.75 GB against the 4 GB ceiling) plus double-precision scalar goldens for the rotary table and the attention-factor application.
+  - Rationale: Phi-3-mini is the smallest published model that actually declares rope scaling, its tensors are llama-shaped so the existing profile machinery carries it, and `Q2_K` is a format MVP3.5 lands — so the fixture needs no new format work. LongRoPE, linear, and dynamic scaling stay out because no fixture declares them.
+  - Rejected: gating YaRN on synthetic GGUFs only (proves LAIR against itself); using Phi-3's IQ2/IQ1 quants (worse quality makes parity tolerance meaningless); implementing three scaling variants with one fixture.
+  - Contract: a `phi3` profile registers the family's tensor map and its declared scaling defaults; `Category=Layers` asserts the scaled table differs from unscaled RoPE and matches a scalar reference; `Category=Parity` asserts real-model parity inside the quantized band.
 
 #### Implementation Items
 
-- [_] RoPE strategy adapter — separate standard RoPE from rope-scaling/partial-rotary variants and make unsupported rope metadata actionable.
-  - Verify: `dotnet test --filter Category=Layers` — standard RoPE goldens remain green; unsupported rope scaling metadata names the unsupported variant.
-- [_] YaRN support — implement YaRN/LongRoPE-style scaling once the adapter shape is refined and real model fixtures exist.
-  - Verify: `dotnet test --filter Category=Layers|Parity` — rope table/activation fixtures plus real-model parity within documented tolerance.
+- [_] RoPE strategy adapter — resolve declared scaling keys and partial-rotary slices into plan values, and keep unsupported variant names actionable (see DN-M37-2).
+  - Verify: `dotnet test --filter Category=Loader -c Release` — standard RoPE cases unchanged; a declared `rope.scaling.name` of an unimplemented variant fails naming the variant; `rope.dimension_count` below the head dimension resolves to a rotary slice instead of rejecting.
+- [_] YaRN table and attention scaling — build the scaled rotary table and apply the attention factor in both attention paths (see DN-M37-3).
+  - Verify: `dotnet test --filter Category=Layers -c Release` — scalar-reference goldens for the table at positions beyond the original context length, a scaled model provably differing from the unscaled one, and batched decode equal to single-token.
+- [_] Phi-3 family profile and parity — register `phi3` on the profile registry and prove the family against the pinned reference on the `Q2_K` fixture (see DN-M37-3).
+  - Verify: `dotnet test --filter Category=Parity -c Release` green on a fixture generated from `models/Phi-3-mini-4k-instruct-Q2_K.gguf`, with the fixture's sha256 recorded and the RoPE pairing resolved by measurement rather than assumption.
 
 #### Tests
 
-- [_] Automated RoPE Strategies: standard RoPE regression, partial rotary handling, YaRN/LongRoPE fixtures.
+- [_] Automated RoPE Strategies: standard RoPE regression, declared-key resolution and variant rejection, partial rotary slice behavior, YaRN table and attention-factor goldens. Verify: `dotnet test --filter Category=Loader|Layers -c Release`.
+- [_] Automated Phi-3 Parity: real-model output parity for the pinned Phi-3-mini `Q2_K` fixture against pinned b12032 inside the documented band. Verify: `dotnet test --filter Category=Parity -c Release`.
+- [_] Manual Long-Context Serve: serve the Phi-3 fixture and confirm output stays coherent past the model's original context length, where unscaled RoPE would degrade. Verify: live three-turn exchange with a long synthetic prompt plus a monitor reading showing the resolved scaling values.
 
-#### Open Items
-
-- [_] **YaRN fixture set** — which GGUF models and rope metadata variants become golden fixtures; settle in `/plan-refine mvp3.7`.
-
-### MVP3.8 [v0.3.8] - Tentative
+### MVP3.8 [v0.3.8] - Refined
 
 Dense IQ quantization loads, decodes, and serves on the CPU engine at two tiers — `IQ4_NL`/`IQ4_XS` for quality under the budget and `IQ3_XXS` as the owner's target quant — landed before MoE execution so the sparse path can reuse them.
 
 #### Design Notes
 
-- **DN-M38-1** *(tentative)* — Three registry entries on the MVP3.5 descriptor seam, not a generic IQ kernel: ggml ids 20 `IQ4_NL`, 23 `IQ4_XS`, and 18 `IQ3_XXS`, each with block geometry verified against `ggml.h` and its own scalar-oracle plus AVX2 dequant/GEMV/GemvBatch paths in the shape DN-M31-1 established.
+- **DN-M38-1** — Three registry entries on the MVP3.5 descriptor seam, not a generic IQ kernel: ggml ids 20 `IQ4_NL`, 23 `IQ4_XS`, and 18 `IQ3_XXS`, each with block geometry verified against `ggml.h` and its own scalar-oracle plus AVX2 dequant/GEMV/GemvBatch paths in the shape DN-M31-1 established.
   - Rationale: the owner's runs target IQ3_XXS, MVP6's expert slabs (DN-M6-2) assume that format, and `IQ4_XS` is already published for a fixture family at budget size (`unsloth/Llama-3.2-1B-Instruct-GGUF` ships `IQ4_XS` at 709 MB, inside the ceiling and better quality per byte than the 770 MB Q4_K_M currently pinned). Landing both tiers together shares one fixture set, one oracle harness, and one registry change instead of repeating them in a later phase.
   - Rejected (preliminary): `IQ2_XXS`/`IQ2_XS`/`IQ2_S`, `IQ1_S`/`IQ1_M`, and `TQ1_0`/`TQ2_0` — sub-3-bit quality with the hardest packing in the family and no fixture demand anywhere in this plan; a single "generic IQ" kernel (the formats do not share block layout or table structure); leaving dense coverage in the MVP5 series, which puts an unbuilt dependency behind MoE execution.
   - Contract: `GgmlTypeRegistry`/`QuantDescriptor` accept ids 18, 20, and 23; `QuantFormat` gains `IQ4_NL`, `IQ4_XS`, and `IQ3_XXS`; `TensorShape` row stride and `CpuBackend` dequant/GEMV/GemvBatch paths follow DN-M31-1.
@@ -735,120 +760,153 @@ Dense IQ quantization loads, decodes, and serves on the CPU engine at two tiers 
   - Rationale: IQ formats dequant through lookup tables whose exact values the reference owns, so a hand-written golden would only prove LAIR agrees with itself; and the family's known weakness is shuffle-heavy unpacking on AVX2, which has to be measured per format rather than assumed from the K-quant results.
   - Rejected (preliminary): synthetic-only gating; accepting "close enough" decode differences; shipping a recommended default quant from paper sizes instead of measured tok/s; porting llama.cpp's table structures without measuring the managed AVX2 path.
   - Contract: `Category=Kernel` asserts per-format scalar-vs-AVX2 and 1T-vs-4T bit-identity with `GemvBatch` equal to solo `Gemv`; `Category=Parity` asserts decode parity on real fixtures inside the quantized band; bench records each format's GEMV cost against Q4_K_M.
+- **DN-M38-3** — Kernel strategy is decided per format family rather than shared: `IQ4_NL` and `IQ4_XS` get fused dequant-GEMV on AVX2 (their unpacking is arithmetic, no lookup tables), while `IQ3_XXS` dequantizes through the reference's asymmetric sub-block tables into a staging buffer before the fused GEMV, and the bench gate decides whether that staging survives.
+  - Rationale: the 4-bit pair is the cheapest IQ work LAIR has ever done and the safest proof of the registry seam; `IQ3_XXS` is where table-driven unpacking could genuinely cost more than it saves, which is exactly the measurement DN-M38-2 demands rather than a guess.
+  - Rejected: one shared IQ kernel shape (the 3-bit path needs tables the 4-bit path does not); porting llama.cpp's table structures wholesale into managed code before measuring; shipping `IQ3_XXS` as a recommendation on paper sizes alone.
+  - Contract: `CpuBackend` keeps one fused-GEMV entry shape per format; staging-buffer dequant is permitted only where a format's tables require it, and bench records its cost.
 
 #### Implementation Items
 
-- [_] IQ registry entries and geometry — ids 18 `IQ3_XXS`, 20 `IQ4_NL`, and 23 `IQ4_XS` accepted through the MVP3.5 descriptor registry with correct block size, type size, and row stride (see DN-M38-1).
-  - Verify: `dotnet test --filter Category=Loader -c Release` — synthetic tensors for all three ids accepted with correct stride; a truncated or mis-strided tensor fails naming the tensor, the id, and expected geometry; an out-of-scope id such as 22 `IQ2_S` still rejects naming its name and id, proving the scope boundary.
-- [_] `IQ4_NL` and `IQ4_XS` kernels — scalar oracle plus AVX2 fused dequant and batch path per the settled kernel strategy (see DN-M38-1, DN-M38-2).
+- [_] IQ registry entries and geometry — ids 18 `IQ3_XXS`, 20 `IQ4_NL`, and 23 `IQ4_XS` accepted through the MVP3.5 descriptor registry with correct block size, type size, and row stride, and per-tensor type resolution proven inside a single file (see DN-M38-1).
+  - Verify: `dotnet test --filter Category=Loader -c Release` — synthetic tensors for all three ids accepted with correct stride; a truncated or mis-strided tensor fails naming the tensor, the id, and expected geometry; a file whose tensors carry different GGML ids resolves each independently; an out-of-scope id such as 22 `IQ2_S` still rejects naming its name and id, proving the scope boundary.
+- [_] `IQ4_NL` and `IQ4_XS` kernels — scalar oracle plus AVX2 fused dequant and batch path per the settled strategy (see DN-M38-1, DN-M38-3).
   - Verify: `dotnet test --filter Category=Kernel -c Release` — synthetic-block scalar-vs-AVX2 and 1T-vs-4T bit-identity for each format, `GemvBatch` equals solo `Gemv`.
-- [_] `IQ3_XXS` kernel — scalar oracle plus AVX2 fused dequant and batch path per the settled kernel strategy (see DN-M38-1, DN-M38-2).
-  - Verify: `dotnet test --filter Category=Kernel -c Release` — same gate as the 4-bit pair on a full super-block including its sub-scale packing.
-- [_] IQ fixture set and end-to-end serve — real fixtures inside the model budget load, decode, and serve at both tiers (see DN-M38-2).
-  - Verify: automated real-fixture decode sanity (skip-if-absent) plus manual `lair serve` chat through the API and `/ui`, with `/v1/models` reporting `quant: IQ4_XS` and `quant: IQ3_XXS`.
-- [_] Format cost measurement — GEMV throughput for each new format against the Q4_K_M baseline, recorded rather than assumed (see DN-M38-2).
-  - Verify: `dotnet run --project bench/Lair.Bench -- <args>` records a per-format GEMV and decode tok/s table on the reference fixture model at equal context.
+- [_] `IQ3_XXS` kernel — scalar oracle mirroring the reference tables, plus the AVX2 staging-then-fused-GEMV path (see DN-M38-1, DN-M38-3).
+  - Verify: `dotnet test --filter Category=Kernel -c Release` — same gate as the 4-bit pair on a full super-block including its sub-scale packing and asymmetric table values.
+- [_] IQ fixture set and end-to-end serve — pin `IQ4_XS` at 709 MB (`bartowski/Llama-3.2-1B-Instruct-GGUF`) and `UD-IQ3_XXS` at 549 MB (`unsloth/Llama-3.2-1B-Instruct-GGUF`), load, decode, and serve both (see DN-M38-2).
+  - Verify: automated real-fixture decode sanity (skip-if-absent) plus manual `lair serve` chat through the API and `/ui`, with `/v1/models` reporting `quant: IQ4_XS` and `quant: IQ3_XXS`; the `UD-` file's mixed per-layer types load through the same registry path.
+- [_] Format cost measurement and documented recommendation — GEMV and decode throughput for each new format against the `Q4_K_M` baseline, with the measured winner recorded in the user-facing docs (see DN-M38-2).
+  - Verify: `dotnet run --project bench/Lair.Bench -- <args>` records a per-format GEMV and decode tok/s table on the same fixture model at equal context, and `README.md` names the recommended quant only for the format that actually wins.
 
 #### Tests
 
-- [_] Automated Registry: acceptance for ids 18/20/23, geometry and stride validation, out-of-scope id rejection naming name and id.
-- [_] Automated Kernel: per-format scalar-vs-AVX2 bit-identity, batch equivalence, and real-fixture decode sanity.
+- [_] Automated Registry: acceptance for ids 18/20/23, geometry and stride validation, mixed-type file resolution, out-of-scope id rejection naming name and id. Verify: `dotnet test --filter Category=Loader -c Release`.
+- [_] Automated Kernel: per-format scalar-vs-AVX2 bit-identity, batch equivalence, and real-fixture decode sanity. Verify: `dotnet test --filter Category=Kernel|Parity -c Release`.
 - [_] Manual IQ Serve: both tiers served; chat via API and `/ui`; monitor live with the quant reported.
+- [_] Manual Quant Recommendation: read the bench table and confirm the documented recommendation matches the measured fastest format rather than the smallest file.
 
-#### Open Items
-
-- [_] **Kernel strategy** — fused dequant-GEMV (the repo pattern) versus llama.cpp's dot-vec lookup-table approach on AVX2, decided separately for the 4-bit and 3-bit paths; settle in `/plan-refine mvp3.8` before build.
-- [_] **Fixture choice** — plain published files versus unsloth dynamic (`UD-`) variants: `unsloth/Llama-3.2-1B-Instruct-GGUF` publishes `IQ4_XS` at 709 MB and `UD-IQ3_XXS` at 549 MB, both inside the budget; decide which files the gates pin and whether an IQ fixture replaces the pinned Q4_K_M llama fixture.
-- [_] **Recommended quant policy** — whether measurement makes `IQ4_XS` the documented default over `Q4_K_M` for quality-per-byte work; settle on measured tok/s, not file size.
-
-### MVP3.9 [v0.3.9] - Tentative
+### MVP3.9 [v0.3.9] - Refined
 
 Sparse and windowed architectures execute: dense-resident MoE decoding and sliding-window/local attention, both through the MVP3.4 model plan.
 
 #### Design Notes
 
-- **DN-M39-1** *(tentative)* — MoE executes with all experts resident in RAM: router scoring, top-k selection with renormalization, shared expert, and per-expert gate/up/down GEMVs accumulated into the residual. Gather and residency optimization stay in MVP6, where the Flash-Next measurement gate and tier design live.
+- **DN-M39-1** — MoE executes with all experts resident in RAM: router scoring, top-k selection with renormalization, shared expert, and per-expert gate/up/down GEMVs accumulated into the residual. Gather and residency optimization stay in MVP6, where the Flash-Next measurement gate and tier design live.
   - Rationale: proving sparse-FFN math against a dense-equivalent reference needs no residency machinery, and doing it before MVP6 turns `IGatherKernel` from a new concept into an optimization of a proven path.
-  - Rejected (preliminary): expert streaming or hot/cold tiers here (that is MVP6's measured design); MoE-only gather kernels before a correctness baseline.
+  - Rejected: expert streaming or hot/cold tiers here (that is MVP6's measured design); MoE-only gather kernels before a correctness baseline.
   - Contract: `lair.models` executes the sparse-FFN descriptor resolved by the MVP3.4 plan; `Category=Moe` correctness goldens.
-- **DN-M39-2** *(tentative)* — The KV-layout half of windowed attention: bounded KV reads, per-layer windowed/full interleave, and prompt-cache reuse under windowed reads. The score-mask half — honoring a declared window by excluding out-of-range positions while keeping full KV — already ships in MVP3.4 (DN-M34-7); this note covers what changes once KV stops storing every position.
+- **DN-M39-2** — The KV-layout half of windowed attention: bounded KV reads, per-layer windowed/full interleave, and prompt-cache reuse under windowed reads. The score-mask half — honoring a declared window by excluding out-of-range positions while keeping full KV — already ships in MVP3.4 (DN-M34-7); this note covers what changes once KV stops storing every position.
   - Rationale: Mistral and Gemma-3 are unusable without bounded reads and interleave, and the window interacts with the paged KV block design (DN-M2-4) rather than being an attention-loop constant.
-  - Rejected (preliminary): treating the window as an attention-kernel parameter only (ignores block reuse and KV budget accounting).
+  - Rejected: treating the window as an attention-kernel parameter only (ignores block reuse and KV budget accounting).
   - Contract: plan carries per-layer window and interleave pattern; `lair.kv` block selection honors it.
+- **DN-M39-3** — The MoE fixture is `bartowski/OLMoE-1B-7B-0924-Instruct-GGUF` at `Q2_K` (2,444 MB, loads near 2.8 GB against the 4 GB ceiling), reached through a new `olmoe` profile whose tensor naming is measured against the pinned reference rather than assumed. Routing math is gated by dense-equivalent synthetic goldens first and real-model parity second.
+  - Rationale: it is the smallest published MoE GGUF that loads under the ceiling in a format MVP3.5 lands — its `IQ2_M` file (2,220 MB) is smaller but needs an out-of-scope IQ2 format, and no published `qwen2moe` or `qwen3moe` file is small enough to load at all. OLMoE has no shared expert, so the descriptor's shared-expert slot must be provably optional rather than assumed present.
+  - Rejected: a `qwen2moe`/`qwen3moe` fixture (none published under the ceiling); synthetic-only MoE gating (leaves the family's tensor naming and router semantics unproven); assuming the qwen-moe tensor names for OLMoE (the reference names experts per-expert, not as one stacked tensor).
+  - Contract: `ModelProfiles` gains `olmoe`; `Category=Moe` asserts router/top-k/renormalize against a dense-equivalent reference and `Category=Parity` asserts decode parity on the pinned `Q2_K` fixture inside the quantized band.
+- **DN-M39-4** — Windowed-KV correctness is proven on the already-pinned Gemma-2 fixture driven with reference-supplied token ids, the technique MVP3.4 used for the forward graph; the small Gemma-3 file (`unsloth/gemma-3-1b-it-GGUF` `Q3_K_S`, 657 MB) becomes the *served* fixture only after MVP3.11's SPM profile exists.
+  - Rationale: bounded KV reads and cache accounting are a memory-behavior change measurable on a file already in the repo, and blocking it behind a tokenizer phase would invert the dependency. Gemma-3-1B is the right serving fixture because it is the only windowed model published small enough to serve comfortably, but its SentencePiece vocabulary is exactly what MVP3.11 has to build first.
+  - Rejected: waiting on Gemma-3 for all windowed-KV work (delays a memory change behind tokenization); synthetic-only gating (block selection and cache reuse are precisely what synthetic logits will not catch); using a Mistral file (no published Mistral is loadable under the ceiling).
+  - Contract: `Category=Layers|Cache` asserts windowed logits match the full-KV reference while block selection reads only the in-window range across alternating layers; `Category=Serve` for the Gemma-3 fixture lands in MVP3.11.
+- **DN-M39-5** — Encoder parity follows the reference's backward-only masking for a windowed model: LAIR's `Encode` path keeps its symmetric range only where no window is declared, and applies the same backward-only window the causal path uses when one is.
+  - Rationale: the pinned reference exposes only backward-only masking on a windowed file, so a symmetric encoder range would produce embeddings no oracle can corroborate; avoiding an unprovable convention is cheaper than unwinding it in an embedding fixture.
+  - Rejected: keeping the symmetric range for windowed models (unprovable against any reference); dropping embeddings for windowed models (a feature loss with no measurement behind it).
+  - Contract: `Encode` honors `LayerAttentionWindow` backward-only when a window is declared; `Category=Embeddings` asserts windowed-model embeddings against a reference-supplied-token-id run.
 
 #### Implementation Items
 
-- [_] MoE execution — router, top-k with renormalize, shared expert, per-expert FFN accumulation (see DN-M39-1)
-  - Verify: `dotnet test --filter Category=Moe -c Release` — sparse-FFN output matches a dense-equivalent reference; a real MoE fixture (if a published file lands under the 1 GB ceiling) matches pinned b12032 within tolerance.
-- [_] Windowed KV layout — bounded KV reads, per-layer windowed/full interleave, and correct KV block selection and cache reuse on top of the shipped score mask (see DN-M39-2)
-  - Verify: `dotnet test --filter Category=Layers|Cache -c Release` — windowed logits match the full-KV reference while block selection reads only the in-window range, and prompt-cache reuse stays correct across windowed and full layers.
+- [_] MoE execution — router scoring, top-k with renormalize, optional shared expert, and per-expert FFN accumulation into the residual (see DN-M39-1, DN-M39-3).
+  - Verify: `dotnet test --filter Category=Moe -c Release` — sparse-FFN output matches a dense-equivalent reference across router tie-breaking, renormalization, and a model with no shared expert.
+- [_] `olmoe` profile and MoE fixture parity — register the family, resolve its expert tensor naming from the pinned file, and prove decode parity (see DN-M39-3).
+  - Verify: `dotnet test --filter Category=Loader|Parity -c Release` — the pinned `Q2_K` OLMoE file resolves its descriptor with the reference's own tensor names and reports `olmoe`; parity green inside the quantized band with the fixture sha256 recorded.
+- [_] Windowed KV layout — bounded KV reads, per-layer windowed/full interleave, and correct block selection and prompt-cache reuse on top of the shipped score mask (see DN-M39-2, DN-M39-4).
+  - Verify: `dotnet test --filter Category=Layers|Cache -c Release` — windowed logits match the full-KV reference while block selection reads only the in-window range, cache reuse stays correct across windowed and full layers, and a full-attention layer's reads are provably unbounded.
+- [_] Windowed KV budget accounting — KV block pools and the monitor report the reduced read footprint so the memory behavior is observable rather than implied (see DN-M39-2).
+  - Verify: `dotnet test --filter Category=Cache|Metrics -c Release` — a windowed model's reported KV usage differs from the same model unwindowed, and the monitor snapshot carries the numbers.
+
+- [_] Windowed encoder masking — `Encode` applies the declared window backward-only, matching the reference's only observable behavior (see DN-M39-5).
+  - Verify: `dotnet test --filter Category=Embeddings|Layers -c Release` — a windowed model's embeddings differ from the same model with the window removed and match a backward-only scalar reference; a model with no declared window stays bit-identical to today's symmetric path.
 
 #### Tests
 
-- [_] Automated Moe: router/top-k/shared-expert correctness vs dense-equivalent math.
-- [_] Automated Windowed KV: interleave patterns, KV block selection, and cache-reuse correctness.
+- [_] Automated Moe: router/top-k/shared-expert correctness vs dense-equivalent math, plus real-model parity on the pinned OLMoE `Q2_K` fixture. Verify: `dotnet test --filter Category=Moe|Parity -c Release`.
+- [_] Automated Windowed KV: interleave patterns, KV block selection bounds, cache-reuse correctness across windowed and full layers, and backward-only encoder masking. Verify: `dotnet test --filter Category=Layers|Cache|Embeddings -c Release`.
+- [_] Manual MoE Serve: serve the pinned OLMoE fixture and confirm coherent multi-turn output with the monitor showing expert weights resident and no gather machinery involved. Verify: live two-turn exchange on `:8181` plus a `/monitor/stream` snapshot frame read.
 
-#### Open Items
-
-- [_] **MoE fixture** — no published MoE GGUF fits the 512 MB–1 GB model budget; decide between synthetic-MoE goldens only and a budget exception for one real MoE file.
-- [_] **Family order vs MVP6** — whether Mistral/Gemma-3 land here or wait for the MVP6 measurement gate; settle in `/plan-refine mvp3.9`.
-- [_] **Bidirectional window semantics** — the pinned reference exposes only causal (backward-only) masking for a windowed file, while LAIR's `Encode` path applies a symmetric range; decide whether encoder parity should match backward-only before any embedding fixture runs against a windowed model.
-
-### MVP3.10 [v0.3.10] - Tentative
+### MVP3.10 [v0.3.10] - Refined
 
 Token budgets are configured per model: a reasoning budget and a response budget, each overridable per request.
 
 #### Design Notes
 
-- **DN-M310-1** *(tentative)* — Two budgets per model, `max_reasoning_tokens` and `max_response_tokens`, set per model in `lair.yaml` and overridable per request. The scheduler reserves against both, the decode loop stops at the reasoning ceiling while a recognized reasoning region is open, and the visible response is bounded by the response budget.
-  - Rationale: today one `max_tokens` (default 128, clamped to the context) covers every emitted token, so a thinking model can spend the whole budget on reasoning and return nothing visible, and a model with no reasoning path has no way to cap reasoning markup. Budgets belong to the loaded model because the ceiling is a property of the model's output style, not of each request.
-  - Rejected (preliminary): a single combined budget (visible output starves); per-token heuristics that guess reasoning without a resolved parser; a server-wide setting with no per-model override.
+- **DN-M310-1** — Two budgets per model, `max_reasoning_tokens` and `max_response_tokens`, set per model in `lair.yaml` and overridable per request. The scheduler reserves against both, the decode loop stops at the reasoning ceiling while a recognized reasoning region is open, and the visible response is bounded by the response budget.
+  - Rationale: today one `max_tokens` (default 128 at `ApiApp.cs:245`/`ApiApp.cs:282`, clamped at `GenerationService.cs:500`) covers every emitted token, so a thinking model can spend the whole budget on reasoning and return nothing visible — measured live this phase, where a 128-token Qwen3 request finished `length` with no answer. Budgets belong to the loaded model because the ceiling is a property of the model's output style, not of each request.
+  - Rejected: a single combined budget (visible output starves); per-token heuristics that guess reasoning without a resolved parser; a server-wide setting with no per-model override.
   - Contract: `lair.yaml` model entries and `lair.http` request fields resolve into one budget pair consumed by `lair.models` scheduling; the OpenAI wire shape stays compatible with documented extension fields.
+- **DN-M310-2** — Budgets ride on dedicated request fields, `max_reasoning_tokens` and `max_response_tokens`, never on `max_tokens`. Absent model configuration means today's behavior exactly: no reasoning budget, and `max_tokens` bounds the whole generation.
+  - Rationale: `max_tokens` is already consumed by OpenAI clients with a fixed meaning, so overloading it breaks clients for no gain, and a default of "no budget" keeps this phase observable as an opt-in feature rather than a silent behavior change for every existing user.
+  - Rejected: overloading `max_tokens` (client-visible semantic break); making budgets mandatory (changes serving behavior for models with no reasoning region); a single `thinking_budget` field with no response ceiling.
+  - Contract: `ApiContracts` request bodies gain two optional ints validated against the model ceiling; `YamlConfigLoader` model keys gain `max_reasoning_tokens` and `max_response_tokens` with a new-requests-only hot-reload class.
+- **DN-M310-3** — The reasoning ceiling closes the region rather than truncating mid-region: when the reasoning budget is reached with a region open, the recognizer closes it and decoding continues into the response budget. Which ceiling fired is reported, so a truncated answer is attributable.
+  - Rationale: truncating inside a reasoning region leaves an unclosed block in visible content and no answer at all, which is the failure this phase exists to prevent. Reporting which ceiling fired turns `finish_reason: length` into an actionable reading instead of a guess.
+  - Rejected: hard stop mid-region (unterminated markup, no answer); silently extending the budget when reasoning runs long (defeats the point of a budget); reporting only `length` as today.
+  - Contract: decode honors the region close at the ceiling; the monitor and response metadata distinguish `reasoning` versus `response` budget exhaustion while `finish_reason` stays `length`.
+- **DN-M310-4** — Sequencing is fixed by dependency, not convention: this phase follows MVP3.6 because a reasoning ceiling needs `OutputParserPlan.ReasoningRegion` resolved at load (DN-M36-3), and it follows MVP3.9 in plan order only because that keeps execution work ahead of serving policy.
+  - Rationale: without a resolved region the ceiling is a guess, which DN-M36-1 and DN-M36-3 both refuse.
+  - Rejected: implementing budgets before the parser registry (guessed regions); making budgets part of MVP3.6 (different concern: parsing recognizes markup, budgets bound work).
+  - Contract: scheduler KV reservation math consumes both budgets from the resolved model plan; `Category=Scheduling|Api` gates the math.
 
 #### Implementation Items
 
-- [_] Per-model budget configuration — model-level `max_reasoning_tokens` and `max_response_tokens` defaults with load-time validation and a documented default when absent.
-  - Verify: `dotnet test --filter Category=Config|Api -c Release` — model entries resolve both budgets, invalid values fail at load naming the model and the key.
-- [_] Budget enforcement in scheduling and decode — the scheduler reserves blocks against both budgets, decode honors the reasoning ceiling, the response budget bounds visible tokens, and a request override clamps to the model ceiling.
-  - Verify: `dotnet test --filter Category=Scheduling|Api -c Release` — reservation math, reasoning-ceiling stop, response-ceiling stop, and override clamping goldens.
+- [_] Per-model budget configuration — model-level `max_reasoning_tokens` and `max_response_tokens` defaults with load-time validation, absent meaning unbudgeted (see DN-M310-1, DN-M310-2).
+  - Verify: `dotnet test --filter Category=Config -c Release` — model entries resolve both budgets, invalid or negative values fail at load naming the model and the key, and the hot-reload class reports them as new-requests-only.
+- [_] Request overrides and wire fields — `max_reasoning_tokens` and `max_response_tokens` on chat and completion bodies, clamped to the model ceiling (see DN-M310-2).
+  - Verify: `dotnet test --filter Category=Api -c Release` — an override above the model ceiling clamps and reports the clamp; an override on a model with no resolved reasoning region is refused naming the model.
+- [_] Budget enforcement in scheduling and decode — KV reservation against both budgets, region close at the reasoning ceiling, response ceiling on visible tokens (see DN-M310-1, DN-M310-3).
+  - Verify: `dotnet test --filter Category=Scheduling -c Release` — reservation math, reasoning-ceiling region close, response-ceiling stop, and batched decode equal to single-token under both ceilings.
+- [_] Budget attribution in responses and monitor — which ceiling fired is reported without changing `finish_reason` values (see DN-M310-3).
+  - Verify: `dotnet test --filter Category=Api|Metrics -c Release` — a reasoning-capped exchange reports the reasoning budget, a response-capped one reports the response budget, and `/monitor/stream` carries the attribution field.
 
 #### Tests
 
-- [_] Automated Token Budgets: per-model defaults, request overrides, reasoning and response ceiling behavior, and KV reservation math.
+- [_] Automated Token Budgets: per-model defaults, request overrides and clamping, reasoning region close at the ceiling, response ceiling behavior, and KV reservation math. Verify: `dotnet test --filter Category=Config|Api|Scheduling -c Release`.
+- [_] Automated Budget Attribution: monitor and response reporting distinguishing which ceiling fired. Verify: `dotnet test --filter Category=Api|Metrics -c Release`.
+- [_] Manual Budget Proof: serve the pinned Qwen3 fixture with `max_reasoning_tokens: 128` and `max_response_tokens: 64` and confirm the answer appears where today a 128-token request returns only reasoning, then hot-edit the budgets and confirm the next request differs while the one in flight does not. Verify: live two-request sequence plus monitor readings.
 
-#### Open Items
-
-- [_] **Wire field names** — whether the budgets ride on `max_tokens` plus extension fields or on dedicated request names; settle in `/plan-refine mvp3.10`.
-- [_] **Reasoning-region dependency** — whether MVP3.10 must follow the MVP3.6 parser registry, since a reasoning ceiling needs a resolved reasoning region rather than a guess; settle in `/plan-refine mvp3.10`.
-
-### MVP3.11 [v0.3.11] - Tentative
+### MVP3.11 [v0.3.11] - Refined
 
 SentencePiece (SPM) vocabularies load through a tokenizer profile, unlocking the published families that ship them.
 
 #### Design Notes
 
-- **DN-M311-1** *(tentative)* — SPM is one more profile in the existing tokenizer registry, not a second tokenizer. `tokenizer.ggml.model=llama` resolves to an SPM profile that reads the GGUF's `tokenizer.ggml.tokens`, `token_type`, and `scores` arrays with the metadata coverage the registry already handles, encodes by greedy longest-match over the piece vocabulary with byte fallback for unrepresentable UTF-8, and decodes by joining pieces with the `▁` word-start marker.
-  - Rationale: Gemma-1/2/3 and older Mistral and Phi GGUFs publish SentencePiece vocabularies, and the pinned reference tokenizes them. LAIR's BPE-only registry rejects them at load, which is exactly why the pinned Gemma-2 fixture can be loaded into the engine but neither calibrated against the oracle nor served. The shipped profile pattern already carries split strategy, defaults, and metadata coverage, so SPM is a profile rather than a parallel implementation.
-  - Rejected (preliminary): offline conversion of SPM vocabularies to BPE; requiring a community re-conversion per model; a separate tokenizer library per vocabulary type.
-  - Contract: `lair.tokenizer` resolves `tokenizer.ggml.model` to a profile; `Category=Tokenizer` asserts id-for-id `/tokenize` goldens against pinned b12032 for at least one SPM model.
+- **DN-M311-1** — Selection splits on a second axis: vocabulary type from `tokenizer.ggml.model`, which is orthogonal to the pre-tokenizer key the existing profiles are keyed on. `lair.tokenizer` gains a vocabulary-type seam with two implementations — the current BPE pipeline (pre-split, byte-encode, merges) and SPM — while `TokenizerProfiles` stays exactly what it is for `pre`.
+  - Rationale: today the registry maps `tokenizer.ggml.pre` to a factory of BPE merge state (`TokenizerProfiles.cs:46-112`), and SPM has no merge stage at all — it encodes by greedy longest-match over a piece vocabulary. Registering SPM as another `pre` value would mis-key a different concept and force merge machinery to run where there is nothing to merge.
+  - Rejected: SPM as another `pre` profile (wrong axis, assumes merges); offline conversion of SPM vocabularies to BPE (needs a conversion tool and produces a vocabulary the reference no longer agrees with); a separate tokenizer library per vocabulary type (two places to keep in sync with the oracle).
+  - Contract: `GgufTokenizer` resolves a vocabulary implementation from `tokenizer.ggml.model` at load, defaulting to the BPE implementation when the key is absent, and an unknown value fails naming the value and the supported list.
+- **DN-M311-2** — SPM encode is greedy longest-match over the piece vocabulary preferring the higher `tokenizer.ggml.scores` entry on ties, with `▁` treated as the word-start marker, byte fallback through the `<0xNN>` byte pieces the vocabulary already carries, and special-token ids taken from `tokenizer.ggml.token_type`. Decode joins pieces and maps `▁` back to a space except at the start of a sequence.
+  - Rationale: those are the keys the pinned Gemma-2 file actually carries, and they are the same metadata-coverage posture MVP3.3 settled for BPE — read what exists, apply defaults visibly, fail on what is missing.
+  - Rejected: greedy shortest-match or first-match strategies (the reference scores pieces for a reason); synthesizing byte fallback from UTF-8 escapes instead of the vocabulary's byte pieces (diverges from the reference on unrepresentable text); ignoring `token_type` and treating every piece as ordinary text (special tokens then leak into content).
+  - Contract: `Category=Tokenizer` asserts id-for-id `/tokenize` goldens against pinned b12032 on an SPM fixture, and `Category=Serve` asserts a two-turn exchange through the model's own chat template.
+- **DN-M311-3** — Fixtures are the already-pinned Gemma-2 file at `Q4_K_M` (1,629 MB, loads near 2.0 GB against the 4 GB ceiling) for tokenize parity, parity goldens, and serve, plus a new `unsloth/gemma-3-1b-it-GGUF` `Q3_K_S` fixture (657 MB) as the second SPM file and MVP3.9's deferred windowed-serve fixture.
+  - Rationale: Gemma-2 is already in the repo with a recorded sha256 and a forward graph already proven against reference-supplied token ids, so unblocking it needs no new download; Gemma-3-1B is the smallest published windowed model, so it is the only file that can prove MVP3.9's bounded-KV behavior end to end.
+  - Rejected: re-pinning Gemma-2 at a smaller quant (no gate gains anything from it); using Gemma-1 (no longer a parity target anywhere in this plan); proving SPM on synthetic vocabularies only (the whole phase exists because a real file was blocked).
+  - Contract: both fixtures sha256-pinned in their fixtures; `Category=Tokenizer|Serve` green on both; MVP3.9's `Category=Serve` windowed gate lands here rather than there.
 
 #### Implementation Items
 
-- [_] SPM tokenizer profile — piece vocabulary with scores, greedy longest-match encoding, byte fallback, `▁` join on decode, and special-token ids from the keys the registry already reads.
-  - Verify: `dotnet test --filter Category=Tokenizer -c Release` — synthetic SPM encode/decode round-trip goldens plus id-for-id `/tokenize` parity against the pinned reference on the pinned Gemma-2 fixture.
-- [_] Load and serve coverage — the model load path selects the SPM profile without a default guess, and the chat template renders against it end to end.
+- [_] Vocabulary-type seam and SPM profile — resolve `tokenizer.ggml.model` at load, implement SPM piece selection with scores, byte fallback, `▁` handling, and special-token ids, and keep the BPE path byte-identical (see DN-M311-1, DN-M311-2).
+  - Verify: `dotnet test --filter Category=Tokenizer -c Release` — synthetic SPM encode/decode round-trip goldens, tie-breaking on `scores`, byte-fallback on unrepresentable text, and existing BPE profile cases unchanged; an unknown `tokenizer.ggml.model` value fails naming the value and the supported list.
+- [_] Load and serve coverage — the model load path selects the SPM implementation without a default guess, and the chat template renders against it end to end (see DN-M311-2).
   - Verify: `dotnet test --filter Category=Tokenizer|Serve -c Release` — the pinned Gemma-2 file loads, tokenizes, and completes a two-turn exchange.
+- [_] Gemma-2 parity unblocked — generate the deferred MVP3.4 parity fixture from the pinned file and hold it inside the quantized band (see DN-M311-3).
+  - Verify: `dotnet test --filter Category=Parity -c Release` green on `tests/fixtures/parity-gemma2.json` with the fixture sha256 recorded.
+- [_] Gemma-3-1B windowed serve — pin the `Q3_K_S` fixture and land MVP3.9's deferred windowed serving gate (see DN-M311-3, DN-M39-4).
+  - Verify: `dotnet test --filter Category=Serve|Cache -c Release` — the fixture serves a two-turn exchange past its local-attention window length with block selection staying bounded, and `Category=Loader` reports `gemma3` with its per-layer window pattern resolved.
 
 #### Tests
 
-- [_] Automated SPM Tokenizer: piece selection, byte fallback, special ids, round-trip stability, and `/tokenize` oracle parity.
-- [_] Gemma-2 Parity Unblocked: the deferred MVP3.4 fixture generates and passes inside the documented quantized band.
-
-#### Open Items
-
-- [_] **Metadata differences** — whether SPM files need different handling of `add_space_prefix`, `byte_fallback`, and proto metadata than the BPE profiles; settle in `/plan-refine mvp3.11`.
-- [_] **Sequencing** — MVP3.11 unblocks the pinned Gemma-2 parity fixture and any Gemma-3 work in MVP3.9; confirm the order at refine time.
-- [_] **Gemma-2 fixture size** — no published Gemma-2-2B quant is under the 1 GB ceiling (smallest Q2_K at 1,173 MB), so the parity fixture MVP3.11 unlocks has to either take a budget exception or use a smaller Gemma-2 variant (1.3B is not published as a Gemma-2 GGUF family with the same tokenizer shape). Decide at refine time; MVP3.4 ships the family engine-only.
+- [_] Automated SPM Tokenizer: piece selection, score tie-breaking, byte fallback, special ids, round-trip stability, and `/tokenize` oracle parity on a real SPM fixture. Verify: `dotnet test --filter Category=Tokenizer -c Release`.
+- [_] Gemma-2 Parity Unblocked: the deferred MVP3.4 fixture generates and passes inside the documented quantized band. Verify: `dotnet test --filter Category=Parity -c Release`.
+- [_] Manual SPM Serve: serve the pinned Gemma-2 fixture and the Gemma-3-1B fixture, confirm coherent multi-turn output on both, and confirm `/v1/models` reports their architectures and quants. Verify: two live two-turn exchanges on `:8181` plus monitor readings.
 
 ### MVP4 [v0.4.0] - Refined
 
@@ -1121,5 +1179,7 @@ Vision input on chat models.
 - **2026-11-08 — Llama-3.2 fixture re-pinned to Q4_K_M; the ceiling is a working-set ceiling, not only a file-size ceiling.** The Q8_0 file was deleted and everything that referenced it (serve fixture, tokenizer probe, both llama goldens, the template-generator default, `DEVELOP.md`) was repointed at the 770 MB Q4_K_M file. Regenerating both goldens from the new file changed only `model_file`, `model_sha256`, `generated_utc` and the fixture-pinned `date_string` — every tokenizer id and every rendered prompt body is byte-identical, which confirms the quant cannot affect those gates. The finding worth keeping: the file fits the band but the live serve peaks at 1,135–1,174 MB, so a fixture that satisfies the budget has to be chosen against measured working set, not file size. Every published quant small enough to fit at runtime (`Q2_K` 554 MB, `Q3_K_S` 612 MB) is a format the engine cannot yet load, so the fix is sequenced behind MVP3.5's quant registry rather than solved by shrinking context or re-tuning a gate. Gemma-2's smallest published quant is Q2_K at 1,173 MB, so the family stays engine-only regardless of the tokenizer gap.
 - **2026-11-08 — The model budget is a serving-profile ceiling, not only a file-size ceiling.** Live serve measurements settle it: Qwen3-0.6B Q8_0 (610 MB weights) peaks at 1,726 MB on the default `4096`/`256`/`8` profile and at 1,000 MB on `512`/`32`/`4`, while Llama-3.2 Q4_K_M (770 MB weights) measures 1,102 MB even with the tight profile. Each engine carries roughly 360–395 MB of runtime overhead beyond weights and KV, so a fixture under the 1 GB ceiling needs about 640 MB of weights or less. Two consequences: the family-serve gate now records its compliant profile rather than a bare "served", and the llama fixture's compliance is genuinely blocked on MVP3.5 — the smaller published quants that fit are formats the engine cannot load yet. Rejected instead: shrinking the ceiling per-fixture, or counting a 770 MB file as budget-compliant because the file is small.
 - **2026-11-08 — MVP3.4 ships with two gates deferred, not closed.** The phase is Shipped on the strength of 924/924 and a live Qwen3 family serve, but it does not carry everything it originally promised. Gemma-2's real-model parity fixture and live serve are deferred to MVP3.10 because the file's SentencePiece vocabulary cannot be calibrated or tokenized — the family ships engine-only, proven against reference-supplied token ids. The Llama-3.2 serve fixture stays over the 1 GB ceiling until MVP3.5 adds the quant formats small enough to fit. Both are recorded as open items rather than quietly dropped, and the Gemma-2 parity test item moved out of MVP3.4's Tests into MVP3.11, which already owned it.
-- **2026-11-09 — Dense IQ coverage moves from the MVP5 series into MVP3.8; MoE, token budgets, and SPM shift one slot.** The phase that was MVP5.1 becomes new MVP3.8 covering `IQ4_NL`, `IQ4_XS`, and `IQ3_XXS`; dense-resident MoE plus windowed KV becomes MVP3.9, per-model token budgets become MVP3.10, and the SentencePiece tokenizer profile becomes MVP3.11. Two things drive it: MVP6's gather kernel (DN-M6-2) reuses the dense IQ kernels, so a format phase cannot sit after the execution phase that depends on it; and both tiers now have fixtures inside the 512 MB–1 GB budget (`IQ4_XS` at 709 MB and `UD-IQ3_XXS` at 549 MB for Llama-3.2), so they can be gated against the pinned oracle in MVP3 discipline rather than deferred. The format set stops at 3-bit: `IQ2_*`, `IQ1_*`, and TQ formats stay out because their packing is the hardest in the family, their quality is the worst, and no fixture in this plan demands them. Each format carries its own kernel gate plus a measured GEMV cost against Q4_K_M before it can be recommended as a default — the Backlog's "measure before committing" caveat became an item rather than disappearing.
+- **2026-11-09 — Dense IQ coverage moves from the MVP5 series into MVP3.8; MoE, token budgets, and SPM shift one slot.** The phase that was MVP5.1 becomes new MVP3.8 covering `IQ4_NL`, `IQ4_XS`, and `IQ3_XXS`; dense-resident MoE plus windowed KV becomes MVP3.9, per-model token budgets become MVP3.10, and the SentencePiece tokenizer profile becomes MVP3.11. Two things drive it: MVP6's gather kernel (DN-M6-2) reuses the dense IQ kernels, so a format phase cannot sit after the execution phase that depends on it; and both IQ tiers have published fixtures loadable on this box, so they can be gated in MVP3 discipline rather than deferred. The format set stops at 3-bit: `IQ2_*`, `IQ1_*`, and TQ formats stay out because their packing is the hardest in the family, their quality is the worst, and no fixture in this plan demands them. Each format carries its own kernel gate plus a measured GEMV cost against Q4_K_M before it can be recommended as a default — the Backlog's "measure before committing" caveat became an item rather than disappearing.
+- **2026-11-09 — Model budget returns to 4 GB, measured as peak working set, and it changes what each pending phase can prove.** Owner restored the ceiling after the 512 MB–1 GB revision made three gates unprovable. The number is a working-set limit, not a file-size limit, because a loaded engine costs about 360–395 MB beyond weights and KV. Consequences are concrete: MVP3.4's blocked serve fixture closes with no re-pin (1,102–1,174 MB measured); MVP3.7 gets a real YaRN fixture (`Phi-3-mini-4k-instruct` `Q2_K`, 1,351 MB → ~1.75 GB); MVP3.9 gets a real MoE fixture (`OLMoE-1B-7B-0924-Instruct` `Q2_K`, 2,444 MB → ~2.8 GB) where the smaller `IQ2_M` file would have needed an out-of-scope format; MVP3.11 unblocks Gemma-2 parity and serve on the already-pinned file (1,629 MB → ~2.0 GB) and adds `gemma-3-1b` `Q3_K_S` (657 MB) as the windowed serving fixture. MVP3.5's `Q2_K`/`Q3_K` formats are load-bearing for that MoE and Gemma fixture selection rather than nice-to-have.
+- **2026-11-09 — MVP3.6 through MVP3.11 refined on measured code and fixture facts, not on the tentative sketches.** Five decisions carry the phases. Parser selection keys on chat-template capability plus a `tool_parser` config override, never architecture name, because fine-tunes change tool markup without changing `general.architecture` and no pinned fixture carries a tool-format metadata key. Reasoning-region recognition moves into MVP3.6 because nothing in `src` recognizes reasoning markup today and MVP3.10's reasoning ceiling is unimplementable without a resolved region. RoPE scaling stops being a blanket rejection: `rope.scaling.*` and `rope.dimension_count` become plan values with unimplemented variant names still failing. IQ kernels are decided per format family — fused GEMV for the 4-bit pair, table-driven staging for `IQ3_XXS` — with a bench gate deciding whether the staging survives. SPM splits on a new axis: `tokenizer.ggml.model` selects a vocabulary implementation, while `tokenizer.ggml.pre` profiles stay as MVP3.3 built them, because SPM has no merge stage to key a pre-profile against.
 - **2026-11-08 — MVP3.5 refined: the quant registry is a descriptor registry, and its first two formats are chosen by the budget.** `GgmlType`'s switch becomes a registry resolving type ids to descriptors (`TypeId`, `Name`, `Format`, `BlockSize`, `TypeSize`) with geometry failures at load, and `Q3_K` plus `Q2_K` are the only formats entering the phase. The choice is not a completeness argument: they are the published formats that close MVP3.4's blocked fixture, and the only ones small enough to fit a 1 GB working set. `Q2_K`/`Q3_K` are also the first super-block formats with asymmetric min-based sub-block scales, so their definition is the pinned reference's `dqK` layout and a LAIR-authored scalar golden cannot gate them. IQ, TQ, `Q4_0`, `Q5_0`/`Q5_1`, `Q8_1`, and `Q8_K` stay out until a published fixture demands one. The Quant priority list open item is resolved by this decision.
