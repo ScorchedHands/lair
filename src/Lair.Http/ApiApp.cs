@@ -110,7 +110,8 @@ public static class ApiApp
                     gen.Model.Quant,
                     gen.Model.Architecture,
                     gen.ModelType,
-                    gen.Model.ToolParser)]);
+                    gen.Model.ToolParser,
+                    gen.Model.Reasoning)]);
 
             return Results.Json(models, statusCode: 200);
         });
@@ -353,12 +354,37 @@ public static class ApiApp
 
         if (request.LogProbs && result.LogProbs is { Count: > 0 } entries)
         {
-            // With logprobs on, every generated token gets its own content chunk carrying its logprob entry.
+            // With logprobs on, every generated token gets its own content chunk carrying its logprob entry. That path keeps
+            // the one-chunk-per-token contract it promises and carries the generated markup as generated: withholding a token's
+            // text would strand its logprob entry, so the strip policy is applied where it can be — over streamed content.
             foreach (TokenLogprob entry in entries)
             {
                 await WriteChunkAsync(stream, new ChunkPayload(
                     completionId, "chat.completion.chunk", created, model,
                     [new ChunkChoice(0, new ChunkDelta(Content: gen.DecodeToken(entry.TokenId), Logprobs: WireEntry(gen, entry)), null)]), http);
+            }
+        }
+        else if (gen.ResolvedOutputParser.Reasoning == ReasoningPolicy.Strip)
+        {
+            // A strip policy withholds the recognized reasoning regions from streamed content exactly as they settle: a
+            // boundary marker split across pieces stays pending until the next piece settles it, so no part of a region ever
+            // reaches the wire and every delta is ordinary visible text. Boundaries are recorded on the result itself.
+            ReasoningRegionFilter filter = new();
+            foreach (string piece in pieces)
+            {
+                foreach (string visible in filter.Feed(piece))
+                {
+                    await WriteChunkAsync(stream, new ChunkPayload(
+                        completionId, "chat.completion.chunk", created, model,
+                        [new ChunkChoice(0, new ChunkDelta(Content: visible), null)]), http);
+                }
+            }
+
+            foreach (string visible in filter.Finish())
+            {
+                await WriteChunkAsync(stream, new ChunkPayload(
+                    completionId, "chat.completion.chunk", created, model,
+                    [new ChunkChoice(0, new ChunkDelta(Content: visible), null)]), http);
             }
         }
         else

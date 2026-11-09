@@ -73,6 +73,14 @@ public sealed record ModelConfig
     /// </summary>
     public string ToolParser { get; init; } = "auto";
 
+    /// <summary>
+    /// How a recognized reasoning region reaches the wire: <c>keep</c> (default — the region streams through as ordinary
+    /// visible content, byte-for-byte as generated) or <c>strip</c> (the region is withheld from visible content while its
+    /// boundaries stay recorded for the request). Recognition itself keys on the markup a generation contains, not on this
+    /// key: with neither marker present nothing is recognized and either value leaves output untouched.
+    /// </summary>
+    public string Reasoning { get; init; } = "keep";
+
     public PlacementConfig Placement { get; init; } = new();
 }
 

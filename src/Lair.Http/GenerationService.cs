@@ -308,6 +308,15 @@ public sealed class GenerationService : IDisposable
                             $"chat requests admitted from now on resolve to the {ToolParserNames.Of(replanned.ToolParser)} tool parser; sequences already in flight are unaffected"));
                         break;
 
+                    case "models[0].reasoning":
+                        effective = effective with { Models = [effective.Models[0] with { Reasoning = candidate.Models[0].Reasoning }] };
+                        replanned = ResolvePlanFor(effective);
+                        Volatile.Write(ref _outputParser, replanned);
+                        RefreshAdvertisedModel(effective);
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"chat requests admitted from now on carry recognized reasoning regions as {ReasoningPolicyNames.Of(replanned.Reasoning)}; sequences already in flight are unaffected"));
+                        break;
+
                     case "ui.recent_requests":
                         _metrics?.SetRecentRequestCapacity(candidate.Ui.RecentRequests);
                         effective = effective with { Ui = candidate.Ui };
@@ -345,13 +354,13 @@ public sealed class GenerationService : IDisposable
         long backed = Math.Min((long)_pool.EffectiveBudgetBlocks * _pool.BlockTokens, _model.MaxContextTokens);
         int context = (int)Math.Min(effective.Models[0].MaxContextTokens, backed);
 
-        Volatile.Write(ref _modelInfo, _modelInfo with { ContextLength = context, KvBlocks = _pool.EffectiveBudgetBlocks, ToolParser = ToolParserNames.Of(_outputParser.ToolParser) });
+        Volatile.Write(ref _modelInfo, _modelInfo with { ContextLength = context, KvBlocks = _pool.EffectiveBudgetBlocks, ToolParser = ToolParserNames.Of(_outputParser.ToolParser), Reasoning = ReasoningPolicyNames.Of(_outputParser.Reasoning) });
     }
 
     // The plan the configuration in force resolves to: same registry decision as model load, against the capabilities
     // probed once for this template. Only a new-requests-only reload calls it; generation never re-decides.
     private OutputParserPlan ResolvePlanFor(LairConfig effective) =>
-        OutputParserRegistry.Resolve(effective.Models[0].ToolParser, effective.Models[0].ForceFencedTools, _chatTemplateCapabilities);
+        OutputParserRegistry.Resolve(effective.Models[0].ToolParser, effective.Models[0].ForceFencedTools, _chatTemplateCapabilities, effective.Models[0].Reasoning);
 
     private static string RefusalDetail(FieldChange change) => change.Field switch
     {
@@ -452,11 +461,15 @@ public sealed class GenerationService : IDisposable
             // configuration: every later chat request consumes this plan instead of re-deciding which tool surface it
             // gets, and the resolved choice is announced on the host's load log in the style of the tokenizer-default
             // and profile-resolution lines.
-            OutputParserPlan outputParser = OutputParserRegistry.Resolve(modelConfig.ToolParser, modelConfig.ForceFencedTools, chatTemplateCapabilities);
+            OutputParserPlan outputParser = OutputParserRegistry.Resolve(modelConfig.ToolParser, modelConfig.ForceFencedTools, chatTemplateCapabilities, modelConfig.Reasoning);
             logger?.LogInformation(
                 "tool_parser model='{Model}' choice={Choice}",
                 modelConfig.Name,
                 ToolParserNames.Of(outputParser.ToolParser));
+            logger?.LogInformation(
+                "reasoning model='{Model}' policy={Policy}",
+                modelConfig.Name,
+                ReasoningPolicyNames.Of(outputParser.Reasoning));
 
             ModelInfo info = new(
                 modelConfig.Name,
@@ -465,7 +478,8 @@ public sealed class GenerationService : IDisposable
                 DominantQuant(file),
                 model.Plan.Architecture,
                 model.Plan.VocabSize,
-                ToolParserNames.Of(outputParser.ToolParser));
+                ToolParserNames.Of(outputParser.ToolParser),
+                ReasoningPolicyNames.Of(outputParser.Reasoning));
 
             GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, logger, pool, scheduler, info, config);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
@@ -699,8 +713,21 @@ public sealed class GenerationService : IDisposable
         // parser — fenced blocks for an injected contract, the template's own object shape when the template rendered the
         // tools — so each surface is read only by its matching reader; an inert plan has no parser, so its decoded text is
         // never read and its content stays byte-for-byte what the model generated.
+        // Reasoning regions are recognized from the markup this generation actually contains, whichever model produced it:
+        // boundaries are recorded either way, and only a strip policy withholds them from visible content. A keep policy
+        // leaves the text byte-for-byte as generated, which is what every model serves today. Recognition runs before call
+        // reading so a call markup inside reasoning that gets stripped never reaches the parser as a call.
+        OutputParserPlan plan = Volatile.Read(ref _outputParser);
+        ReasoningDetection reasoning = plan.Reasoning == ReasoningPolicy.Strip
+            ? ReasoningRecognition.Strip(text)
+            : new ReasoningDetection(ReasoningRecognition.FindRegions(text), text);
+        if (plan.Reasoning == ReasoningPolicy.Strip)
+        {
+            text = reasoning.VisibleText;
+        }
+
         IReadOnlyList<ToolCall>? toolCalls = null;
-        IToolOutputParser? outputParser = Volatile.Read(ref _outputParser).Parser;
+        IToolOutputParser? outputParser = plan.Parser;
         if (tools.Active && outputParser is not null)
         {
             ToolDetection detection = outputParser.ReadCalls(text, callableNames);
@@ -719,7 +746,8 @@ public sealed class GenerationService : IDisposable
             finishReason,
             outcome.PrefillCachedTokens,
             request.LogProbs ? outcome.LogProbs : null,
-            toolCalls);
+            toolCalls,
+            reasoning.Regions.Count > 0 ? reasoning.Regions : null);
     }
 
     public void Dispose()

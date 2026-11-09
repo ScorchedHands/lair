@@ -17,7 +17,7 @@ public static class YamlConfigLoader
     private static readonly string[] ServerKeys = ["bind", "port"];
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens"];
     private static readonly string[] UiKeys = ["recent_requests"];
-    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser"];
+    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota"];
 
     /// <summary>Loads and validates <paramref name="filePath"/>; no file watching.</summary>
@@ -233,6 +233,15 @@ public static class YamlConfigLoader
                 $"models[{index}].tool_parser '{toolParser}' is invalid: 'tool_parser' accepts only 'auto', 'template', 'fenced', or 'none'.");
         }
 
+        // Reasoning visibility policy: keep (default) or strip. An unrecognized value fails naming the model entry and
+        // the key with the accepted set, exactly as the tool parser choice does.
+        string reasoning = TryText(keys, "reasoning", $"models[{index}].reasoning") ?? "keep";
+        if (reasoning is not ("keep" or "strip"))
+        {
+            throw new ConfigException(
+                $"models[{index}].reasoning '{reasoning}' is invalid: 'reasoning' accepts only 'keep' or 'strip'.");
+        }
+
         return new ModelConfig
         {
             Name = name,
@@ -242,6 +251,7 @@ public static class YamlConfigLoader
             KvBlocks = kvBlocks,
             ForceFencedTools = forceFencedTools,
             ToolParser = toolParser,
+            Reasoning = reasoning,
             Placement = ParsePlacement(keys, index),
         };
     }

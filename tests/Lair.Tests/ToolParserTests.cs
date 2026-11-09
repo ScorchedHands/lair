@@ -38,7 +38,7 @@ public sealed class ToolParserTests : IDisposable
         Assert.Equal("template", engine.Model.ToolParser);
         Assert.Equal(ToolParser.Template, engine.ResolvedOutputParser.ToolParser);
         Assert.NotNull(engine.ResolvedOutputParser.Parser); // the template-native reader stays wired for a template-rendered model
-        Assert.Null(engine.ResolvedOutputParser.Reasoning); // the reasoning slot is inert for every plan resolved today
+        Assert.Equal(ReasoningPolicy.Keep, engine.ResolvedOutputParser.Reasoning); // no reasoning key configured: today's visible behavior is the resolved policy
 
         GenerationRequest request = ToolRequest("auto-capable-model");
         string prompt = engine.BuildChatPrompt(request);

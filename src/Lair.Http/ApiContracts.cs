@@ -129,7 +129,8 @@ internal sealed record ModelEntry(
     string Quant,
     string Architecture,
     string Type = "chat",
-    string ToolParser = "auto");
+    string ToolParser = "auto",
+    string Reasoning = "keep");
 
 /// <summary><c>/healthz</c> body.</summary>
 internal sealed record HealthResponse(string Status, bool ModelReady);

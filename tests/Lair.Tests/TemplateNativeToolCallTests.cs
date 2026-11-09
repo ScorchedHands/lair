@@ -201,7 +201,7 @@ public sealed class TemplateNativeToolCallPlanTests : IDisposable
         Assert.Equal("template", engine.Model.ToolParser);
         Assert.Equal(ToolParser.Template, engine.ResolvedOutputParser.ToolParser);
         Assert.IsType<TemplateNativeToolOutputParser>(engine.ResolvedOutputParser.Parser);
-        Assert.Null(engine.ResolvedOutputParser.Reasoning);
+        Assert.Equal(ReasoningPolicy.Keep, engine.ResolvedOutputParser.Reasoning);
     }
 
     [Fact]
