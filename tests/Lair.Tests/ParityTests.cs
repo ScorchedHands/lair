@@ -48,6 +48,11 @@ public sealed class ParityTests
     // is a ranking flip — LAIR's argmax is '<' and the reference's is 'Hello', mutual top-5 members.
     private const string Llama32Q2KFixture = "tests/fixtures/parity-llama32-q2k.json";
 
+    // The YaRN fixture: the pinned Qwen3 Q8_0 file with qwen3.rope.scaling.type = yarn, .factor = 2 and
+    // .original_context_length = 512 declared on a copy produced by scripts/patch-gguf-rope-scaling.ps1, so both
+    // engines read the same declared keys and the scaled rotary tables and attention factor run inside the band.
+    private const string Qwen3YaRNFixture = "tests/fixtures/parity-qwen3-yarn.json";
+
     /// <summary>Ranking window whose reproduction the fixtures calibrate.</summary>
     private const int CalibrationWindow = 16;
 
@@ -70,7 +75,7 @@ public sealed class ParityTests
     public static TheoryData<string, int> PromptCases()
     {
         TheoryData<string, int> cases = [];
-        foreach (string fixture in new[] { F16Fixture, Q8Fixture, Q4KMFixture, Qwen3Fixture, Llama32Q3KFixture, Llama32Q2KFixture })
+        foreach (string fixture in new[] { F16Fixture, Q8Fixture, Q4KMFixture, Qwen3Fixture, Llama32Q3KFixture, Llama32Q2KFixture, Qwen3YaRNFixture })
         {
             string? path = ModelFixture.ResolveRepoRelative(fixture);
             if (path is null)
