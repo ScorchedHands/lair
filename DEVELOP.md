@@ -25,7 +25,7 @@ Test categories: `Loader`, `Tokenizer`, `Template`, `TemplateDiagnostics`, `Temp
 
 Performance gates (inter-token latency budgets in `ConcurrencyTests`/`PrefillTests`) are only meaningful under `-c Release` — Debug JIT inflates kernels ~4.6× and the absolute budgets cannot reproduce there. Correctness suites pass in both configurations.
 
-Model fixtures live in `models/` (gitignored). Tests locate them via `ModelFixture.Resolve()` / `ModelFixture.ResolveRepoRelative(path)` and skip gracefully when a file is absent — so on a fresh clone the real-model cases (including Parity) no-op until models are placed.
+Model fixtures live in `models/` (gitignored). Tests locate them via `ModelFixture.Resolve()` / `ModelFixture.ResolveRepoRelative(path)` and skip gracefully when a file is absent — so on a fresh clone the real-model cases (including Parity) no-op until models are placed. The model budget is 512 MB–1 GB of working set: keep fixture weights small and serve profiles tight (`max_context_tokens`, `kv_blocks`, `thread_quota`), since each loaded engine adds roughly 360–395 MB of runtime overhead on top of weights and KV. Never run two model-loaded processes at once.
 
 ## Parity harness
 
@@ -42,7 +42,7 @@ pwsh -File scripts/generate-parity.ps1 -ModelPath models/smollm-135m-instruct-q8
 
 Parity gate: model-file sha256 guard; LAIR argmax must appear in the reference top-5; LAIR's calibrated distribution must reproduce within |Δlogprob| ≤ 0.2 (calibrated-missing tokens must stay outside LAIR's top-16). Cross-tool exact string equality is not asserted — llama.cpp CLI and server modes disagree on identical greedy runs (see the pinned `reference_mode` field in each fixture).
 
-Template parity is a separate gate: `tests/fixtures/parity-templates-llama32.json` pins byte-exact `/apply-template` renders for `models/Llama-3.2-1B-Instruct-Q8_0.gguf` (model + chat_template sha256 guards, pinned `date_string`), asserted by `Category=TemplateParity`. Regenerate with:
+Template parity is a separate gate: `tests/fixtures/parity-templates-llama32.json` pins byte-exact `/apply-template` renders for `models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` (model + chat_template sha256 guards, pinned `date_string`), asserted by `Category=TemplateParity`. Regenerate with:
 
 ```powershell
 pwsh -File scripts/generate-template-parity.ps1
@@ -52,7 +52,7 @@ Tokenizer parity is a third gate: `tests/fixtures/parity-tokenizer-smollm.json` 
 
 ```powershell
 pwsh -File scripts/generate-tokenizer-parity.ps1
-pwsh -File scripts/generate-tokenizer-parity.ps1 -ModelPath models/Llama-3.2-1B-Instruct-Q8_0.gguf -Out tests/fixtures/parity-tokenizer-llama32.json
+pwsh -File scripts/generate-tokenizer-parity.ps1 -ModelPath models/Llama-3.2-1B-Instruct-Q4_K_M.gguf -Out tests/fixtures/parity-tokenizer-llama32.json
 ```
 
 `CalibrationProbeTests` (Category `Calib`) are silent unless `LAIR_CALIB_MODEL` and `LAIR_CALIB_OUT` are set; the generator script uses them to embed calibration data.

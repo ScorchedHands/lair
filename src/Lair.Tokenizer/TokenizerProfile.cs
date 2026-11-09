@@ -75,6 +75,18 @@ internal static class TokenizerProfiles
         },
         new TokenizerProfile
         {
+            PreKey = "qwen2",
+            // llama.cpp resolves pre=qwen2 to the same byte-level GPT-2 pre-split and merge pipeline.
+            Split = SplitGpt2,
+            IgnoreMerges = false,
+            CleanSpaces = true,
+            AddBosDefault = false,
+            // The qwen2 vocabularies follow the same GPT-2 family convention: BOS 1, EOS 2.
+            BosFallbackId = 1,
+            EosFallbackId = 2,
+        },
+        new TokenizerProfile
+        {
             PreKey = "smollm",
             Split = SplitSmollm,
             IgnoreMerges = false,

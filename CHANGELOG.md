@@ -4,6 +4,27 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-11-08
+
+### Added
+
+- Architecture support resolved at load through a profile registry: `llama`, `qwen2`, `qwen3`, `gemma2`, `qwen2moe`, and `qwen3moe` profiles plus a generic llama-shaped fallback that accepts an unknown `general.architecture` only when the tensor table matches exactly, otherwise failing and naming the missing or unexpected tensors. Profiles produce an immutable model plan (tensor map with aliases, norm/activation/bias/geometry/RoPE strategies, caps, window, sparse-FFN descriptor) that the forward path consumes instead of architecture names.
+- `qwen3` and `gemma2` dense families: per-head QK-norm, `attention.head_length` independence, GELU-exact GEGLU gating, attention-score and final-logit softcaps (`attn_logit_softcapping`, `final_logit_softcapping`), a `sqrt(hidden)` input-embedding gain, and post-sublayer output norms (`blk.N.post_attention_norm.weight`, `blk.N.post_ffw_norm.weight`). Each shape was measured against pinned llama.cpp b12032 rather than assumed from the architecture write-up.
+- Sliding-window attention: `<arch>.attention.sliding_window` resolves into the plan and masks out-of-window scores in every attention path while the KV cache keeps every position, with per-family interleave (`AlternatingLocalFirst` for `gemma2`, `AllLayers` elsewhere).
+- Vocabulary resolution falls back to the `tokenizer.ggml.tokens` length when `<arch>.vocab_size` is absent, reporting `vocab_fallback` and `vocab_disagree`.
+- Sparse-FFN descriptors: MoE metadata (`expert_count`, `expert_used_count`, `expert_shared_count`, `expert_weights_scale`, `expert_weights_norm`) and the reference's expert tensor names resolve into the plan, and an MoE model fails at engine open with a message naming sparse-FFN execution as not yet implemented.
+- `tests/fixtures/parity-qwen3.json`: pinned b12032 output parity for `models/Qwen3-0.6B-Q8_0.gguf` (`Category=Parity`), regenerated with `scripts/generate-parity.ps1`.
+
+### Changed
+
+- Attention bias behavior follows the declaration (`attention.use_bias`, `attention.use_norm_bias`) instead of tensor presence; declared-false with tensors present logs `bias_ignored` and loads as if the tensors were absent.
+- RoPE dimension pairing is a per-family plan value: adjacent `(2i, 2i+1)` for `llama`/`qwen2`/generic, rotate-half `(i, i + head_dim/2)` for `qwen3` and `gemma2`.
+- The Llama-3.2 test fixture is now `models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` (770 MB) and its template and tokenizer goldens were regenerated from it; the model test budget is 512 MB–1 GB of working set.
+
+### Fixed
+
+- `qwen3` logits no longer drift from the reference: LAIR applied llama-family adjacent-dimension RoPE to a rotate-half vocabulary, which moved argmax choices and cost 1.1–2.3 nats per token. Parity against pinned b12032 now holds within ~0.001 nats on the fixture prompts.
+
 ## [0.3.3] - 2026-11-06
 
 ### Added

@@ -1,0 +1,162 @@
+{
+  "model_file": "models/Qwen3-0.6B-Q8_0.gguf",
+  "model_sha256": "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
+  "decode": {
+    "temperature": 0.0,
+    "context": 1024
+  },
+  "generated_utc": "2026-11-08T06:22:29Z",
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "max_tokens": 48,
+      "output": " Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital of the European Union. The capital of France is also the capital of the United States. The capital of France is also",
+      "top_logprobs": [
+        {
+          "id": 12095,
+          "token": " Paris",
+          "logprob": -0.43386825919151306,
+          "lair_logprob": -0.4327
+        },
+        {
+          "id": 7407,
+          "token": " located",
+          "logprob": -3.5699336528778076,
+          "lair_logprob": -3.6365
+        },
+        {
+          "id": 279,
+          "token": " the",
+          "logprob": -3.7269856929779053,
+          "lair_logprob": -3.6317
+        },
+        {
+          "id": 1112,
+          "token": "...",
+          "logprob": -4.125744819641113,
+          "lair_logprob": -4.1293
+        },
+        {
+          "id": 32671,
+          "token": " ______",
+          "logprob": -4.278830528259277,
+          "lair_logprob": -4.3687
+        }
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "max_tokens": 48,
+      "output": ", there were 3000 people in a town. The number of people who were born in the same town as their parents was 1000. How many people were born in the same town as their parents? ",
+      "top_logprobs": [
+        {
+          "id": 11,
+          "token": ",",
+          "logprob": -0.12345188856124878,
+          "lair_logprob": -0.1202
+        },
+        {
+          "id": 1052,
+          "token": " there",
+          "logprob": -3.027203321456909,
+          "lair_logprob": -3.1484
+        },
+        {
+          "id": 304,
+          "token": " in",
+          "logprob": -3.916346311569214,
+          "lair_logprob": -3.9053
+        },
+        {
+          "id": 3837,
+          "token": "，",
+          "logprob": -4.477285385131836,
+          "lair_logprob": -4.4374
+        },
+        {
+          "id": 264,
+          "token": " a",
+          "logprob": -4.953506946563721,
+          "lair_logprob": -4.9101
+        }
+      ]
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "max_tokens": 48,
+      "output": "    if n == 0:\n        return 0\n    elif n == 1:\n        return 1\n    else:\n        return fibonacci(n-1) + fibonacci(n-2)\n\nprint(fibonacci(5))\n\n#",
+      "top_logprobs": [
+        {
+          "id": 262,
+          "token": "   ",
+          "logprob": -0.01516796462237835,
+          "lair_logprob": -0.0143
+        },
+        {
+          "id": 256,
+          "token": "  ",
+          "logprob": -5.173412799835205,
+          "lair_logprob": -5.3613
+        },
+        {
+          "id": 220,
+          "token": " ",
+          "logprob": -5.675728797912598,
+          "lair_logprob": -5.5371
+        },
+        {
+          "id": 421,
+          "token": " if",
+          "logprob": -6.427765846252441,
+          "lair_logprob": -6.8532
+        },
+        {
+          "id": 257,
+          "token": "    ",
+          "logprob": -6.946800708770752,
+          "lair_logprob": -6.9867
+        }
+      ]
+    },
+    {
+      "prompt": "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n",
+      "max_tokens": 48,
+      "output": "<think>\nOkay, the user just said \"Hello\". I need to respond appropriately. Since they didn't ask a question, I should acknowledge their greeting. Maybe say \"Hello!\" and offer help. Let me check if there's any specific",
+      "top_logprobs": [
+        {
+          "id": 151667,
+          "token": "<think>",
+          "logprob": -0.000212513143196702,
+          "lair_logprob": -0.0003
+        },
+        {
+          "id": 151644,
+          "token": "",
+          "logprob": -9.437994956970215,
+          "lair_logprob": -9.3943
+        },
+        {
+          "id": 151668,
+          "token": "</think>",
+          "logprob": -10.33088207244873,
+          "lair_logprob": -10.3634
+        },
+        {
+          "id": 80135,
+          "token": "iquement",
+          "logprob": -11.316800117492676,
+          "lair_logprob": -11.3899
+        },
+        {
+          "id": 151645,
+          "token": "",
+          "logprob": -11.4516019821167,
+          "lair_logprob": -11.4465
+        }
+      ]
+    }
+  ]
+}

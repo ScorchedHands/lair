@@ -91,7 +91,7 @@ public sealed class EmbeddingsTests : IDisposable
 
         float scale = 1f / MathF.Sqrt(HeadDim);
         float[] outConcat = new float[Positions * Region];
-        LayerOps.BidirectionalAttention(backend, qPositions, Positions, fromPosition: 0, toPosition: Positions - 1, Heads, KvHeads, HeadDim, kv, layer: 0, scale, outConcat);
+        LayerOps.BidirectionalAttention(backend, qPositions, Positions, queryPositionOffset: 0, fromPosition: 0, toPosition: Positions - 1, Heads, KvHeads, HeadDim, kv, layer: 0, scale, softcap: 0f, window: 0, outConcat);
 
         for (int p = 0; p < Positions; p++)
         {
@@ -136,11 +136,11 @@ public sealed class EmbeddingsTests : IDisposable
         }
 
         // A query window must be ordered and must stay inside the KV the sequence actually holds.
-        Assert.Throws<ArgumentException>(() => LayerOps.BidirectionalAttention(backend, qPositions, Positions, fromPosition: 2, toPosition: 1, Heads, KvHeads, HeadDim, kv, 0, scale, outConcat));
-        Assert.Throws<ArgumentException>(() => LayerOps.BidirectionalAttention(backend, qPositions, Positions, fromPosition: 0, toPosition: Positions, Heads, KvHeads, HeadDim, kv, 0, scale, outConcat));
+        Assert.Throws<ArgumentException>(() => LayerOps.BidirectionalAttention(backend, qPositions, Positions, queryPositionOffset: 0, fromPosition: 2, toPosition: 1, Heads, KvHeads, HeadDim, kv, 0, scale, softcap: 0f, window: 0, outConcat));
+        Assert.Throws<ArgumentException>(() => LayerOps.BidirectionalAttention(backend, qPositions, Positions, queryPositionOffset: 0, fromPosition: 0, toPosition: Positions, Heads, KvHeads, HeadDim, kv, 0, scale, softcap: 0f, window: 0, outConcat));
 
         // Operands must cover every query's full set of heads.
-        Assert.Throws<ArgumentException>(() => LayerOps.BidirectionalAttention(backend, qPositions, Positions, fromPosition: 0, toPosition: Positions - 1, Heads, KvHeads, HeadDim, kv, 0, scale, new float[Positions * Region - HeadDim])); // short output buffer
+        Assert.Throws<ArgumentException>(() => LayerOps.BidirectionalAttention(backend, qPositions, Positions, queryPositionOffset: 0, fromPosition: 0, toPosition: Positions - 1, Heads, KvHeads, HeadDim, kv, 0, scale, softcap: 0f, window: 0, new float[Positions * Region - HeadDim])); // short output buffer
     }
 
     [Fact]
@@ -169,17 +169,17 @@ public sealed class EmbeddingsTests : IDisposable
         }
 
         float[] fullOut = new float[Positions * Region];
-        LayerOps.BidirectionalAttention(backend, qPositions, Positions, fromPosition: 0, toPosition: Positions - 1, Heads, KvHeads, HeadDim, kv, layer: 0, scale, fullOut);
+        LayerOps.BidirectionalAttention(backend, qPositions, Positions, queryPositionOffset: 0, fromPosition: 0, toPosition: Positions - 1, Heads, KvHeads, HeadDim, kv, layer: 0, scale, softcap: 0f, window: 0, fullOut);
 
         for (int p = 0; p < Positions; p++)
         {
             float[] causalOut = new float[Region];
-            LayerOps.CausalAttention(backend, qPositions.AsSpan(p * Region, Region), Heads, KvHeads, HeadDim, kv, layer: 0, position: p, scale, causalOut);
+            LayerOps.CausalAttention(backend, qPositions.AsSpan(p * Region, Region), Heads, KvHeads, HeadDim, kv, layer: 0, position: p, scale, softcap: 0f, window: 0, causalOut);
 
             // Restricting the bidirectional window to exactly the causal prefix must reproduce CausalAttention bit-for-bit
             // — this proves the widened loop is a genuine superset of the decode kernel's numeric path.
             float[] windowedOut = new float[Positions * Region];
-            LayerOps.BidirectionalAttention(backend, qPositions, Positions, fromPosition: 0, toPosition: p, Heads, KvHeads, HeadDim, kv, layer: 0, scale, windowedOut);
+            LayerOps.BidirectionalAttention(backend, qPositions, Positions, queryPositionOffset: 0, fromPosition: 0, toPosition: p, Heads, KvHeads, HeadDim, kv, layer: 0, scale, softcap: 0f, window: 0, windowedOut);
 
             AssertBitsEqual(causalOut, windowedOut.AsSpan(p * Region, Region), $"window [0..{p}] vs causal at position {p}");
 
@@ -193,14 +193,14 @@ public sealed class EmbeddingsTests : IDisposable
 
         // The final position's causal window already covers every row: there its full-window run must coincide bit-for-bit.
         float[] lastCausalOut = new float[Region];
-        LayerOps.CausalAttention(backend, qPositions.AsSpan((Positions - 1) * Region, Region), Heads, KvHeads, HeadDim, kv, layer: 0, position: Positions - 1, scale, lastCausalOut);
+        LayerOps.CausalAttention(backend, qPositions.AsSpan((Positions - 1) * Region, Region), Heads, KvHeads, HeadDim, kv, layer: 0, position: Positions - 1, scale, softcap: 0f, window: 0, lastCausalOut);
 
         AssertBitsEqual(fullOut.AsSpan((Positions - 1) * Region, Region), lastCausalOut, "full window vs causal at the final position (identical windows)");
 
         // A mid-sequence block-local window (chunking shape) sees exactly its own range: distinct from both the full
         // window and the causal prefix, confirming windows are honored literally.
         float[] blockedOut = new float[Positions * Region];
-        LayerOps.BidirectionalAttention(backend, qPositions, Positions, fromPosition: 1, toPosition: 2, Heads, KvHeads, HeadDim, kv, layer: 0, scale, blockedOut);
+        LayerOps.BidirectionalAttention(backend, qPositions, Positions, queryPositionOffset: 0, fromPosition: 1, toPosition: 2, Heads, KvHeads, HeadDim, kv, layer: 0, scale, softcap: 0f, window: 0, blockedOut);
 
         for (int p = 0; p < Positions; p++)
         {

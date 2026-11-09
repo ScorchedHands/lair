@@ -179,19 +179,19 @@ public sealed class GgufTokenizerTests : IDisposable
     [Fact]
     public void FromGguf_UnsupportedPreTokenizer_ThrowsWithItsName()
     {
-        byte[] image = BuildSyntheticImage(pre: "qwen2");
+        byte[] image = BuildSyntheticImage(pre: "nova2");
         GgufException ex = Assert.Throws<GgufException>(() => GgufTokenizer.FromGguf(GgufFile.Open(WriteTemp(image))));
-        Assert.Contains("unsupported pre-tokenizer 'qwen2'", ex.Message);
+        Assert.Contains("unsupported pre-tokenizer 'nova2'", ex.Message);
     }
 
     [Fact]
     public void FromGguf_UnsupportedPreTokenizer_ListsSupportedProfiles()
     {
-        byte[] image = BuildSyntheticImage(pre: "qwen2");
+        byte[] image = BuildSyntheticImage(pre: "nova2");
         GgufException ex = Assert.Throws<GgufException>(() => GgufTokenizer.FromGguf(GgufFile.Open(WriteTemp(image))));
 
         // The supported list is sourced from the profile registry itself.
-        Assert.Contains("(supported: 'llama-bpe', 'gpt2', 'smollm')", ex.Message);
+        Assert.Contains("(supported: 'llama-bpe', 'gpt2', 'qwen2', 'smollm')", ex.Message);
     }
 
     [Fact]
@@ -249,9 +249,25 @@ public sealed class GgufTokenizerTests : IDisposable
     }
 
     [Fact]
+    public void ProfileSelection_Qwen2Pre_UsesTheGpt2FamilySplit_AndBosDefaultsOff()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteSyntheticVocab("qwen2"));
+        GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
+
+        // pre=qwen2 resolves to the byte-level GPT-2 family pipeline: same case-sensitive contractions,
+        // no merge shortcut, whole digit runs — identical to the gpt2 profile above.
+        Assert.Equal([16], tokenizer.Encode("'s"));
+        Assert.Equal([14, 24 + 0x53], tokenizer.Encode("'S"));
+        Assert.Equal([7], tokenizer.Encode("abc"));
+        Assert.Equal([22, 23], tokenizer.Encode("1234"));
+
+        Assert.False(tokenizer.AddBosToken);
+    }
+
+    [Fact]
     public void ProfileSelection_AllSupportedPreKeys_LoadSuccessfully()
     {
-        foreach (string pre in new[] { "llama-bpe", "gpt2", "smollm" })
+        foreach (string pre in new[] { "llama-bpe", "gpt2", "qwen2", "smollm" })
         {
             using GgufFile gguf = GgufFile.Open(WriteSyntheticVocab(pre));
             GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
@@ -670,7 +686,7 @@ public sealed class GgufTokenizerTests : IDisposable
     [Fact]
     public void RealModel_Llama32_DeclaresBosEosAndAddBos()
     {
-        string? modelPath = ModelFixture.ResolveRepoRelative("models/Llama-3.2-1B-Instruct-Q8_0.gguf");
+        string? modelPath = ModelFixture.ResolveRepoRelative("models/Llama-3.2-1B-Instruct-Q4_K_M.gguf");
         if (modelPath is null)
         {
             return; // real-model tests skip when the fixture is absent (xunit 2.9 has no dynamic Assert.Skip)

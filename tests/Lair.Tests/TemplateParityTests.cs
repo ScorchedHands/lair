@@ -9,7 +9,7 @@ namespace Lair.Tests;
 
 /// <summary>
 /// Byte-exact template parity against the pinned llama.cpp b12032 build: golden prompts captured from
-/// <c>llama-server /apply-template</c> for the real Llama-3.2-1B-Instruct-Q8_0 <c>tokenizer.chat_template</c>
+/// <c>llama-server /apply-template</c> for the real Llama-3.2-1B-Instruct-Q4_K_M <c>tokenizer.chat_template</c>
 /// (see scripts/generate-template-parity.ps1) are compared against LAIR's adapter-path render — the same
 /// <see cref="MinjaChatTemplate"/> the loaded-model adapter runs, with the model's literal BOS/EOS bound and the
 /// reference's captured <c>date_string</c> pinned so the render is clock-free. Guards: the model file's sha256

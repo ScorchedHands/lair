@@ -146,6 +146,70 @@ public sealed class LayerTests : IDisposable
         Assert.Throws<ArgumentException>(() => LayerOps.BuildRopeTables(Base, 7, maxPositions: 1, new float[4], new float[4])); // odd head dim
     }
 
+    [Fact]
+    public void SplitHalfRoPE_MatchesManualPairMath_AndKeepsHeadNorm()
+    {
+        const int HeadDim = 8; // rotate-half pairs (i, i + headDim/2); theta_i = base^(-2i/headDim)
+        const double Base = 10_000.0;
+
+        float[] cos = new float[2 * (HeadDim / 2)];
+        float[] sin = new float[2 * (HeadDim / 2)];
+        LayerOps.BuildRopeTables(Base, HeadDim, maxPositions: 2, cos, sin); // the same angle table the adjacent pairing uses
+
+        const int half = HeadDim / 2;
+
+        // Position 0 is the identity rotation for this pairing too.
+        float[] head = [3f, -1f, 4f, 1f, 5f, 9f, 2f, 6f];
+        float[] identity = [.. head];
+        LayerOps.ApplyRopeToSplitHalfHead(identity, half, cos.AsSpan(0), sin.AsSpan(0));
+        Assert.True(identity.AsSpan().SequenceEqual(head.AsSpan()), "position-0 rotate-half RoPE must be the exact identity");
+
+        double normBefore = 0;
+        foreach (float v in head)
+        {
+            normBefore += (double)v * v;
+        }
+
+        float[] rotated = [.. head];
+        LayerOps.ApplyRopeToSplitHalfHead(rotated, half, cos.AsSpan(half), sin.AsSpan(half)); // position 1
+
+        for (int i = 0; i < half; i++)
+        {
+            double invFreq = Math.Pow(Base, -2.0 * i / HeadDim);
+            float c = (float)Math.Cos(invFreq); // pos == 1: the angle equals the inverse frequency itself
+            float s = (float)Math.Sin(invFreq);
+
+            // Pair i occupies head dimensions i and i + half — the halves of the head, not adjacent dimensions.
+            int lowIndex = i;
+            int highIndex = i + half;
+
+            double loExpected = head[lowIndex] * (double)c - head[highIndex] * s;
+            double hiExpected = head[highIndex] * (double)c + head[lowIndex] * s;
+
+            Assert.True(
+                Math.Abs(rotated[lowIndex] - loExpected) <= 1e-6 * Math.Max(1.0, Math.Abs(loExpected)),
+                $"rotate-half rope pair [{i}] low: expected {loExpected:G9}, got {rotated[lowIndex]:G9}");
+            Assert.True(
+                Math.Abs(rotated[highIndex] - hiExpected) <= 1e-6 * Math.Max(1.0, Math.Abs(hiExpected)),
+                $"rotate-half rope pair [{i}] high: expected {hiExpected:G9}, got {rotated[highIndex]:G9}");
+        }
+
+        // The pairing differs from adjacent dimensions on this vector at position 1: the two rotations are not equal.
+        float[] adjacent = [.. head];
+        LayerOps.ApplyRopeToHead(adjacent, half, cos.AsSpan(half), sin.AsSpan(half));
+        Assert.False(rotated.AsSpan().SequenceEqual(adjacent.AsSpan()), "rotate-half and adjacent-dimension pairing must differ");
+
+        double normAfter = 0;
+        foreach (float v in rotated)
+        {
+            normAfter += (double)v * v;
+        }
+
+        Assert.True(Math.Abs(normAfter - normBefore) <= 1e-4, $"rotate-half RoPE must preserve head norm: before {normBefore:G9}, after {normAfter:G9}");
+
+        Assert.Throws<ArgumentException>(() => LayerOps.ApplyRopeToSplitHalfHead(new float[3], half, cos.AsSpan(half), sin.AsSpan(half)));
+    }
+
     [Theory]
     [InlineData(-3f)]
     [InlineData(-1f)]
@@ -207,7 +271,7 @@ public sealed class LayerTests : IDisposable
         float scale = 1f / MathF.Sqrt(HeadDim);
 
         float[] outConcat = new float[Heads * HeadDim];
-        LayerOps.CausalAttention(backend, q, Heads, KvHeads, HeadDim, kv, layer: 0, position: positions - 1, scale, outConcat);
+        LayerOps.CausalAttention(backend, q, Heads, KvHeads, HeadDim, kv, layer: 0, position: positions - 1, scale, softcap: 0f, window: 0, outConcat);
 
         for (int h = 0; h < Heads; h++)
         {
@@ -278,7 +342,7 @@ public sealed class LayerTests : IDisposable
         float scale = 1f / MathF.Sqrt(HeadDim);
 
         float[] outConcat = new float[Heads * HeadDim];
-        LayerOps.CausalAttention(backend, q, Heads, KvHeads, HeadDim, kv, layer: 0, position: 0, scale, outConcat);
+        LayerOps.CausalAttention(backend, q, Heads, KvHeads, HeadDim, kv, layer: 0, position: 0, scale, softcap: 0f, window: 0, outConcat);
 
         for (int h = 0; h < Heads; h++)
         {
@@ -322,12 +386,16 @@ public sealed class LayerTests : IDisposable
     [Fact]
     public void ModelDesc_UnsupportedArchitecture_NamesSupportedArchitectures()
     {
-        byte[] image = BuildGguf([("general.architecture", "bert")], []); // zero tensors: the architecture gate fires first
+        // The tensor table carries a name the llama-shaped map cannot name, so the generic fallback is
+        // genuinely rejected and the registry wording — with its supported-profile list — surfaces.
+        byte[] image = BuildGguf([("general.architecture", "bert")], [new TensorDef("layers.0.attention.query.weight", [4, 4])]);
 
         using GgufFile gguf = GgufFile.Open(WriteTemp(image));
         ModelException ex = Assert.Throws<ModelException>(() => ModelDesc.FromGguf(gguf));
         Assert.Contains("'bert' is not supported", ex.Message);
         Assert.Contains("llama, qwen2", ex.Message);
+        Assert.Contains("llama-shaped fallback", ex.Message);
+        Assert.Contains("layers.0.attention.query.weight", ex.Message);
 
         // Missing architecture key entirely must also name the supported set.
         using GgufFile ggufNoArch = GgufFile.Open(WriteTemp(BuildGguf([("general.name", "mystery")], [])));
@@ -381,13 +449,14 @@ public sealed class LayerTests : IDisposable
     }
 
     [Fact]
-    public void ModelDesc_ExplicitHeadDim_MustSplitHiddenExactly()
+    public void ModelDesc_ExplicitHeadDim_IsHonored_AndTheDerivedDimMustSplitHiddenExactly()
     {
-        List<(string Key, object Value)> mismatch = [.. RequiredLlamaMetadata(), ("llama.attention.key_length", 70), ("llama.attention.value_length", 70)];
+        // A declared explicit head dimension is honored even when head_count x head_dim differs from
+        // embedding_length (the gemma-shaped case): the plan validates the projection shapes at Open instead.
+        List<(string Key, object Value)> independent = [.. RequiredLlamaMetadata(), ("llama.attention.key_length", 70), ("llama.attention.value_length", 70)];
 
-        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf([.. mismatch], [])));
-        ModelException ex = Assert.Throws<ModelException>(() => ModelDesc.FromGguf(gguf));
-        Assert.Contains("must equal", ex.Message); // 9 x 70 != 576
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf([.. independent], [])));
+        Assert.Equal(70, ModelDesc.FromGguf(gguf).HeadDim); // 9 x 70 != 576: the declared dimension wins
 
         List<(string Key, object Value)> disagree = [.. RequiredLlamaMetadata(), ("llama.attention.key_length", 64), ("llama.attention.value_length", 32)];
         using GgufFile ggufBad = GgufFile.Open(WriteTemp(BuildGguf([.. disagree], [])));
@@ -461,6 +530,8 @@ public sealed class LayerTests : IDisposable
             using CpuBackend backendA = new(threads: 2, allowAvx2: true);
             using TransformerModel model = TransformerModel.Open(ggufA, backendA, maxContextTokens: 8);
 
+            Assert.Equal(NormStrategy.RmsNorm, model.Plan.Norm);
+            Assert.Equal(ActivationStrategy.SwiGLU, model.Plan.Activation);
             Assert.False(model.Desc.HasOutputWeights); // tied path selected from the tensor table
 
             using BlockPool pool = new(blockTokens: 4, layerCount: model.Desc.LayerCount, kvHeads: model.Desc.KvHeadCount, headDim: model.Desc.HeadDim, capacityBlocks: 8, backendA);

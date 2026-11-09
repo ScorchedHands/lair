@@ -365,12 +365,14 @@ public sealed class GenerationService : IDisposable
             // Profile-scoped tokenizer defaults applied at load (absent BOS/EOS keys) surface as structured
             // log lines on the host logger.
             GgufTokenizer tokenizer = GgufTokenizer.FromGguf(file, line => logger?.LogInformation("{TokenizerLog}", line));
-            model = TransformerModel.Open(file, backend, reservedSlots);
+            // Profile resolution events (the generic llama-shaped fallback applied to an unknown architecture)
+            // surface as structured log lines the same way.
+            model = TransformerModel.Open(file, backend, reservedSlots, line => logger?.LogInformation("{ProfileLog}", line));
             pool = new BlockPool(
                 blockTokens,
-                model.Desc.LayerCount,
-                model.Desc.KvHeadCount,
-                model.Desc.HeadDim,
+                model.Plan.LayerCount,
+                model.Plan.KvHeadCount,
+                model.Plan.HeadDim,
                 modelConfig.KvBlocks,
                 backend);
 
@@ -416,8 +418,8 @@ public sealed class GenerationService : IDisposable
                 maxContext,
                 modelConfig.KvBlocks,
                 DominantQuant(file),
-                model.Desc.Architecture,
-                model.Desc.VocabSize);
+                model.Plan.Architecture,
+                model.Plan.VocabSize);
 
             GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, logger, pool, scheduler, info, config);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
