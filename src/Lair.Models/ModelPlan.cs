@@ -32,7 +32,14 @@ namespace Lair.Models;
 /// it today. The sparse-FFN slot reads <c>&lt;prefix&gt;expert_count</c>, <c>&lt;prefix&gt;expert_used_count</c>,
 /// <c>&lt;prefix&gt;expert_shared_count</c>, <c>&lt;prefix&gt;expert_weights_scale</c>, and
 /// <c>&lt;prefix&gt;expert_weights_norm</c>: a declared expert count resolves the descriptor against the resolved
-/// profile's declared shape, and a file declaring no expert count keeps the dense gate/up/down block.
+/// profile's declared shape, and a file declaring no expert count keeps the dense gate/up/down block. The rope
+/// scaling reads <c>&lt;prefix&gt;rope.scaling.type</c>, <c>&lt;prefix&gt;rope.scaling.factor</c>,
+/// <c>&lt;prefix&gt;rope.scaling.original_context_length</c>, <c>&lt;prefix&gt;rope.scaling.attn_factor</c>, and the
+/// YaRN operands <c>&lt;prefix&gt;rope.scaling.yarn_log_multiplier</c>, <c>&lt;prefix&gt;rope.scaling.yarn_ext_factor</c>,
+/// <c>&lt;prefix&gt;rope.scaling.yarn_beta_fast</c>, and <c>&lt;prefix&gt;rope.scaling.yarn_beta_slow</c>: an absent
+/// variant declaration keeps the standard unscaled rotation and the declared <c>yarn</c> variant resolves the
+/// scaling plan. The rotary slice reads <c>&lt;prefix&gt;rope.dimension_count</c>, resolving to the full head
+/// dimension when the key is absent and to a declared positive even count not exceeding it otherwise.
 /// </summary>
 public sealed record ModelPlan
 {
@@ -128,6 +135,21 @@ public sealed record ModelPlan
     public required BiasPolicy Bias { get; init; }
 
     public required RopeStrategy Rope { get; init; }
+
+    /// <summary>
+    /// The rope-scaling shape resolved from the file's declared <c>&lt;prefix&gt;rope.scaling.*</c> metadata, or
+    /// <c>null</c> when the file declares no scaling variant: the engine then rotates the full head with the
+    /// unscaled angles. A resolved plan names the variant, the multiplier, the original context length, the
+    /// attention factor the score path applies, and the correction scale and beta pair the angle tables blend.
+    /// </summary>
+    public RopeScalingPlan? RopeScaling { get; init; }
+
+    /// <summary>
+    /// Declared <c>&lt;prefix&gt;rope.dimension_count</c>: the leading head dimensions the rotation covers, with
+    /// the remaining dimensions passed through unchanged. <c>0</c> when the key is absent means the full head
+    /// dimension, and a declared value must be an even count not exceeding the head dimension.
+    /// </summary>
+    public int RopeRotaryDimensions { get; init; }
 
     /// <summary>
     /// The sparse-FFN shape resolved from the file's declared expert metadata (<c>&lt;prefix&gt;expert_count</c>,

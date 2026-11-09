@@ -278,6 +278,91 @@ internal static class LayerOps
     }
 
     /// <summary>
+    /// Fills position-major cos/sin tables for the YaRN scaling variant up to maxPositions, over the leading
+    /// <c>ropeDimensions</c> head dimensions. Each position stores <c>ropeDimensions / 2</c> entries. Pair i of
+    /// position p starts from the unscaled angle <c>p * base^(-2i/headDim)</c>: the table angle interpolates it
+    /// toward <c>angle / multiplier</c> and blends the two back toward the unscaled angle across the correction
+    /// band <c>[corrLow, corrHigh]</c> with weight <c>correctionScale * (1 - clamp((i - corrLow) / (corrHigh - corrLow)))</c>,
+    /// where the band ends are the pair indices whose unscaled frequency reaches <c>betaFast</c> and
+    /// <c>betaSlow</c> at the original context — <c>i(x) = headDim * ln(originalContext / (x * 2 * pi)) / (2 * ln(base))</c>,
+    /// clamped to <c>[0, headDim - 1]</c>. Every entry is then multiplied by <c>attentionFactor</c>, which gains
+    /// <c>1 + 0.1 * ln(multiplier)</c> when the correction scale is non-zero. Angles and scales are computed in
+    /// double and stored as float, so the same inputs always produce bit-identical rotations.
+    /// </summary>
+    internal static void BuildRopeScalingTables(
+        double thetaBase,
+        int headDim,
+        int ropeDimensions,
+        int maxPositions,
+        double multiplier,
+        double originalContext,
+        double attentionFactor,
+        double correctionScale,
+        double betaFast,
+        double betaSlow,
+        Span<float> cos,
+        Span<float> sin)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(headDim);
+        if (headDim % 2 != 0)
+        {
+            throw new ArgumentException($"RoPE pairs require an even head dimension, got {headDim}.", nameof(headDim));
+        }
+
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(ropeDimensions);
+        if (ropeDimensions > headDim || ropeDimensions % 2 != 0)
+        {
+            throw new ArgumentException(
+                $"the rotary slice must be an even count of head dimensions not exceeding {headDim}, got {ropeDimensions}.",
+                nameof(ropeDimensions));
+        }
+
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxPositions);
+
+        int half = ropeDimensions / 2;
+        if (cos.Length < maxPositions * half || sin.Length < maxPositions * half)
+        {
+            throw new ArgumentException("Cos/sin tables must cover maxPositions * ropeDimensions/2 entries each.", nameof(cos));
+        }
+
+        double freqScale = 1.0 / multiplier;
+
+        // Band ends in pair indices, from the reference's solved correction dimensions.
+        static double CorrDim(double beta, int headDim, double originalContext, double thetaBase) =>
+            headDim * Math.Log(originalContext / (beta * 2.0 * Math.PI)) / (2.0 * Math.Log(thetaBase));
+
+        double corrLow = Math.Max(0.0, Math.Floor(CorrDim(betaFast, headDim, originalContext, thetaBase)));
+        double corrHigh = Math.Min(headDim - 1.0, Math.Ceiling(CorrDim(betaSlow, headDim, originalContext, thetaBase)));
+        double bandWidth = Math.Max(0.001, corrHigh - corrLow);
+
+        double magnitude = attentionFactor;
+        if (correctionScale != 0.0)
+        {
+            magnitude *= 1.0 + 0.1 * Math.Log(multiplier); // 1 / freqScale == multiplier
+        }
+
+        for (int pos = 0; pos < maxPositions; pos++)
+        {
+            int tableBase = pos * half;
+            for (int i = 0; i < half; i++)
+            {
+                double unscaled = pos * Math.Pow(thetaBase, -2.0 * i / headDim);
+                double angle = unscaled * freqScale;
+
+                if (correctionScale != 0.0)
+                {
+                    double ramp = 1.0 - Math.Min(1.0, Math.Max(0.0, (i - corrLow) / bandWidth));
+                    double mix = ramp * correctionScale;
+                    angle = angle * (1.0 - mix) + unscaled * mix;
+                }
+
+                cos[tableBase + i] = (float)(Math.Cos(angle) * magnitude);
+                sin[tableBase + i] = (float)(Math.Sin(angle) * magnitude);
+            }
+        }
+    }
+
+    /// <summary>
     /// Rotates one head region in place with GGUF/llama-style adjacent pairs: out[2i] = x[2i]*cos_i - x[2i+1]*sin_i,
     /// out[2i + 1] = x[2i + 1]*cos_i + x[2i]*sin_i. Table entry i is the angle of the pair occupying adjacent head
     /// dimensions 2i and 2i + 1, which is how rotary q/k rows are laid out in converted llama-family GGUF checkpoints.

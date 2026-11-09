@@ -726,7 +726,7 @@ Tool-call and model output formats are handled by load-time parser registries in
 - [✓] Manual Parser Proof: serve the pinned Qwen3 fixture with tools declared and confirm the response separates reasoning from visible answer text, then flip `reasoning: strip` in the live config and confirm the next request differs while the one in flight does not. Verify: live two-request sequence plus the hot-reload log line.
   - Measured on a running host (`serve -c lair.yaml`, port 8181) with `get_weather` declared, greedy seed 0-temperature requests at `max_tokens: 320`. Request admitted under `keep`: content began `<think>\nOkay, the user is asking for the capital of France…\n</think>\n\nThe capital of France is Paris. …`, finish `eos`, 119 completion tokens. The live edit landed while that sequence was still decoding — `config_reload field=models[0].reasoning class=new-requests outcome=applied old="keep" new="strip"` with the snapshot showing one active sequence, and that request's response unchanged as above. The next identical request came back with no `<think>` or `</think>` anywhere in content (`content` began `\n\nThe capital of France is Paris. …`) at the same 119 completion tokens and the same finish reason: reasoning withheld, decoding untouched.
 
-### MVP3.7 [v0.3.7] - Refined
+### MVP3.7 [v0.3.7] - In Progress
 
 RoPE scaling and positional-encoding variants load through RoPE strategy adapters, including YaRN/LongRoPE/partial rotary where GGUF metadata declares them.
 
@@ -747,10 +747,10 @@ RoPE scaling and positional-encoding variants load through RoPE strategy adapter
 
 #### Implementation Items
 
-- [_] RoPE strategy adapter — resolve declared scaling keys and partial-rotary slices into plan values, and keep unsupported variant names actionable (see DN-M37-2).
-  - Verify: `dotnet test --filter Category=Loader -c Release` — standard RoPE cases unchanged; a declared `rope.scaling.name` of an unimplemented variant fails naming the variant; `rope.dimension_count` below the head dimension resolves to a rotary slice instead of rejecting.
-- [_] YaRN table and attention scaling — build the scaled rotary table and apply the attention factor in both attention paths (see DN-M37-3).
-  - Verify: `dotnet test --filter Category=Layers -c Release` — scalar-reference goldens for the table at positions beyond the original context length, a scaled model provably differing from the unscaled one, and batched decode equal to single-token.
+- [✓] RoPE strategy adapter — resolve declared scaling keys and partial-rotary slices into plan values, and keep unsupported variant names actionable (see DN-M37-2).
+  - Verify: `dotnet test --filter Category=Loader -c Release` — 154/154. Standard RoPE cases unchanged; `<arch>.rope.scaling.type` absent or `none` leaves the plan unscaled, `yarn` resolves to a scaling value carrying multiplier, original context length, attention factor, correction scale and both beta bounds, while `linear`, `longrope`, `dynamic` and any unknown name fail naming key and declared value; `<arch>.rope.dimension_count` below the head dimension now resolves to a rotary slice instead of rejecting, and an odd, zero, negative or over-large value fails naming key and value. A scaling operand declared without a type also fails naming the operand.
+- [✓] YaRN table and attention scaling — build the scaled rotary table and apply the attention factor in both attention paths (see DN-M37-3).
+  - Verify: `dotnet test --filter Category=Layers -c Release` — 104/104. Double-precision scalar goldens reproduce the YaRN angle at positions past the original context length (correction band from the beta bounds, ramp mixing interpolated and unscaled angles) plus the table magnitude on `cos`/`sin`; a YaRN forward provably differs from the same model unscaled; batched decode equals single-token decode under YaRN; the partial slice rotates only dimensions inside it in both the adjacent-pair and rotate-half layouts, leaving the rest bit-identical. Math ported from the pinned b12032 reference (`ggml_rope_cache_init`, `rope_yarn`, `rope_yarn_ramp`, `ggml_rope_yarn_corr_dims` in `ggml/src/ggml-cpu/ops.cpp` and `ggml/src/ggml.c`, the `get_mscale` attention-factor block in `src/llama-context.cpp`), not from memory.
 - [_] Phi-3 family profile and parity — register `phi3` on the profile registry and prove the family against the pinned reference on the `Q2_K` fixture (see DN-M37-3).
   - Verify: `dotnet test --filter Category=Parity -c Release` green on a fixture generated from `models/Phi-3-mini-4k-instruct-Q2_K.gguf`, with the fixture's sha256 recorded and the RoPE pairing resolved by measurement rather than assumption.
 

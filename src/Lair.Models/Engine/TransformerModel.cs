@@ -124,9 +124,10 @@ public sealed class TransformerModel : IDisposable
     private readonly float[] _batchUp;      // MaxBatchSequences * intermediateSize
     private readonly float[] _batchLogits;  // MaxBatchSequences * vocabSize
 
-    private readonly float[] _cos;          // maxContext * (headDim / 2)
+    private readonly float[] _cos;          // maxContext * rope pair count
     private readonly float[] _sin;
-    private readonly int _ropeHalf;
+    private readonly int _ropeHalf;         // pairs the rotation covers: the declared slice, or the full head
+    private readonly float _attnScale;      // head-dimension score gain times the variant's attention factor
 
     /// <summary>The resolved model plan this engine forwards under: geometry, profile tensor map, and strategy values.</summary>
     public ModelPlan Plan { get; }
@@ -361,13 +362,39 @@ public sealed class TransformerModel : IDisposable
         _batchUp = new float[MaxBatchSequences * Plan.IntermediateSize];
         _batchLogits = new float[MaxBatchSequences * Plan.VocabSize];
 
-        _ropeHalf = Plan.HeadDim / 2;
+        // The rotation covers the declared rotary slice, or the full head dimension when the file declares none.
+        _ropeHalf = (Plan.RopeRotaryDimensions > 0 ? Plan.RopeRotaryDimensions : Plan.HeadDim) / 2;
+
+        // The score gain is the head-dimension scale times the variant's attention factor: the scaled angle
+        // tables carry their own magnitude, so the score path carries the factor exactly once. An unscaled plan
+        // multiplies by one and the gain is the plain head-dimension scale.
+        _attnScale = (Plan.RopeScaling?.AttentionFactor ?? 1f) / MathF.Sqrt(Plan.HeadDim);
 
         // Precompute cos/sin per position and pair up to the maximum context so decode is table-driven: identical
-        // inputs always reproduce bit-identical rotations regardless of call order or buffer reuse.
+        // inputs always reproduce bit-identical rotations regardless of call order or buffer reuse. A resolved
+        // scaling plan builds the variant's tables over the slice instead of the unscaled full-head tables.
         _cos = new float[maxContextTokens * _ropeHalf];
         _sin = new float[maxContextTokens * _ropeHalf];
-        LayerOps.BuildRopeTables(Plan.RopeTheta, Plan.HeadDim, maxContextTokens, _cos, _sin);
+        if (Plan.RopeScaling is { } scaling)
+        {
+            LayerOps.BuildRopeScalingTables(
+                Plan.RopeTheta,
+                Plan.HeadDim,
+                2 * _ropeHalf,
+                maxContextTokens,
+                scaling.Multiplier,
+                scaling.OriginalContextLength,
+                scaling.AttentionFactor,
+                scaling.CorrectionScale,
+                scaling.BetaFast,
+                scaling.BetaSlow,
+                _cos,
+                _sin);
+        }
+        else
+        {
+            LayerOps.BuildRopeTables(Plan.RopeTheta, Plan.HeadDim, maxContextTokens, _cos, _sin);
+        }
     }
 
     /// <summary>Forwards each token in order, appending its K/V to the sequence's paged KV cache.</summary>
@@ -465,7 +492,7 @@ public sealed class TransformerModel : IDisposable
         int qkvRegion = Plan.HeadCount * Plan.HeadDim;
         int kvRegion = Plan.KvHeadCount * Plan.HeadDim;
         int inter = Plan.IntermediateSize;
-        float attnScale = 1f / MathF.Sqrt(Plan.HeadDim);
+        float attnScale = _attnScale;
 
         for (int l = 0; l < Plan.LayerCount; l++)
         {
@@ -632,7 +659,7 @@ public sealed class TransformerModel : IDisposable
         int qkvRegion = Plan.HeadCount * Plan.HeadDim;
         int kvRegion = Plan.KvHeadCount * Plan.HeadDim;
         int inter = Plan.IntermediateSize;
-        float attnScale = 1f / MathF.Sqrt(Plan.HeadDim);
+        float attnScale = _attnScale;
 
         ArrayPool<float> poolBuffers = ArrayPool<float>.Shared;
 
@@ -856,7 +883,7 @@ public sealed class TransformerModel : IDisposable
         kv.Append(); // reserves this position's slot in every layer; WriteK/WriteV address it by logical position
 
         int hidden = Plan.HiddenSize;
-        float attnScale = 1f / MathF.Sqrt(Plan.HeadDim);
+        float attnScale = _attnScale;
 
         for (int l = 0; l < Plan.LayerCount; l++)
         {

@@ -10,9 +10,14 @@ namespace Lair.Models;
 /// <see cref="ModelProfiles"/>, the geometry is read from the profile's metadata prefix, the vocabulary size
 /// comes from the declared key or the tokenizer vocabulary length, the attention score window comes from the
 /// declared <c>&lt;prefix&gt;attention.sliding_window</c> (unbounded when the key is absent), and the tensor map
-/// comes from the profile together with the window interleave that decides which layers that window masks. Only
-/// standard RoPE over the full head dimension is accepted: any rope-scaling
-/// variant or partial-rotary declaration fails at load. The per-head QK-norm mode resolves the declared
+/// comes from the profile together with the window interleave that decides which layers that window masks. The
+/// rope scaling resolves the declared <c>&lt;prefix&gt;rope.scaling.*</c> metadata into a scaling plan: an absent
+/// variant declaration keeps the standard unscaled rotation, the declared <c>yarn</c> variant resolves the
+/// multiplier, original context length, attention factor, correction scale, and beta pair, and any other variant
+/// declaration fails at load naming the key and the value. The rotary slice resolves the declared
+/// <c>&lt;prefix&gt;rope.dimension_count</c>: an absent key rotates the full head dimension, a declared even count
+/// not exceeding it narrows the rotation to that leading slice, and any other declaration fails at load naming
+/// the key and the value. The per-head QK-norm mode resolves the declared
 /// <c>&lt;prefix&gt;attention.use_qk_norm</c> against the profile's default, the attention-bias flag resolves the
 /// declared <c>&lt;prefix&gt;attention.use_bias</c> against the profile's default, and the norm placement comes from
 /// the profile alone — no metadata key selects it. The block-norm epsilon read from
@@ -98,15 +103,11 @@ public static class ModelPlans
         GgufMetadata metadata = gguf.Metadata;
         string prefix = profile.Prefix;
 
-        foreach (string key in metadata.Keys)
-        {
-            if (key.StartsWith(prefix + "rope.scaling.", StringComparison.Ordinal))
-            {
-                throw new ModelException(
-                    $"model architecture '{architecture}' declares rope scaling via GGUF key '{key}'; " +
-                    "only standard RoPE without scaling variants is supported");
-            }
-        }
+        // Declared rope scaling: an absent <prefix>rope.scaling.type keeps the standard rotation, the declared
+        // "yarn" variant resolves the scaling plan, and any other variant declaration — or any scaling operand
+        // declared without a variant name, which is the reference's linear default — fails the load naming the
+        // key and the declared value.
+        RopeScalingPlan? ropeScaling = ResolveRopeScaling(metadata, prefix);
 
         int hidden = RequireInt(metadata, prefix + "embedding_length");
         int layers = RequireInt(metadata, prefix + "block_count");
@@ -172,17 +173,10 @@ public static class ModelPlans
 
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(headDim);
 
-        // Standard full-head RoPE only: a declared rotary slice smaller than the head is not supported.
-        if (metadata.Has(prefix + "rope.dimension_count"))
-        {
-            int rot = RequireInt(metadata, prefix + "rope.dimension_count");
-            if (rot != headDim)
-            {
-                throw new ModelException(
-                    $"{prefix}rope.dimension_count ({rot}) differs from the head dimension ({headDim}); " +
-                    "partial rotary embeddings are not supported");
-            }
-        }
+        // The declared rotary slice: an absent key means the full head dimension. A declared slice must be an
+        // even count of head dimensions not exceeding the head dimension; the rotation then covers the leading
+        // slice and leaves the remaining dimensions unchanged.
+        int ropeRotaryDimensions = ResolveRotarySlice(metadata, prefix, headDim);
 
         float ropeTheta = metadata.Has(prefix + "rope.freq_base")
             ? (float)metadata.Get(prefix + "rope.freq_base").AsDouble()
@@ -278,6 +272,8 @@ public static class ModelPlans
             Activation = profile.Activation,
             Bias = profile.Bias,
             Rope = profile.Rope,
+            RopeScaling = ropeScaling,
+            RopeRotaryDimensions = ropeRotaryDimensions,
             SparseFfn = ResolveSparseFfn(metadata, prefix, profile.SparseFfn),
         };
     }
@@ -554,6 +550,208 @@ public static class ModelPlans
             throw new ModelException(
                 $"GGUF metadata key '{key}' declares {declaredValue.ToString(CultureInfo.InvariantCulture)}; " +
                 "attention window values must be positive integers");
+        }
+
+        return (int)declaredValue;
+    }
+
+    // Shared rope-scaling resolution: an absent <prefix>rope.scaling.type keeps the standard rotation (null).
+    // A declared type resolves "none" to the same unscaled path and "yarn" to the YaRN plan; any other variant
+    // name fails the load naming the key and the declared value, as does any scaling operand declared without
+    // a variant name — the reference's linear default — which the rejection names by the key the file carries.
+    // The YaRN plan reads the multiplier from <prefix>rope.scaling.factor (1f when absent), requires the
+    // original context length under <prefix>rope.scaling.original_context_length, and reads the attention
+    // factor, the correction scale, and the beta pair from <prefix>rope.scaling.attn_factor,
+    // <prefix>rope.scaling.yarn_ext_factor, <prefix>rope.scaling.yarn_beta_fast, and
+    // <prefix>rope.scaling.yarn_beta_slow against the reference's defaults (1f, 1f, 32f, 1f), with the
+    // declared <prefix>rope.scaling.yarn_log_multiplier (0f when absent) selecting the reference's
+    // all-dimensions magnitude divisor inside the attention factor.
+    private static RopeScalingPlan? ResolveRopeScaling(GgufMetadata metadata, string prefix)
+    {
+        string typeKey = prefix + "rope.scaling.type";
+
+        if (!metadata.Has(typeKey))
+        {
+            foreach (string key in metadata.Keys)
+            {
+                if (key.StartsWith(prefix + "rope.scaling.", StringComparison.Ordinal))
+                {
+                    throw new ModelException(
+                        $"GGUF metadata key '{key}' declares rope scaling without a {typeKey} variant; " +
+                        "only the 'yarn' variant is supported");
+                }
+            }
+
+            return null;
+        }
+
+        string variant;
+        try
+        {
+            variant = metadata.Get(typeKey).AsString();
+        }
+        catch (GgufException ex)
+        {
+            throw new ModelException($"GGUF metadata key '{typeKey}' must be a string", ex);
+        }
+
+        if (variant == "none")
+        {
+            return null;
+        }
+
+        if (variant != "yarn")
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{typeKey}' declares rope scaling variant '{variant}'; " +
+                "only the 'yarn' variant is supported");
+        }
+
+        float multiplier = ResolveScalingFactor(metadata, prefix + "rope.scaling.factor");
+
+        int originalContext = RequireInt(metadata, prefix + "rope.scaling.original_context_length");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(originalContext);
+
+        float declaredAttention = ResolveScalingMagnitude(metadata, prefix + "rope.scaling.attn_factor", fallback: 1f);
+        float logMultiplier = ResolveScalingMagnitude(metadata, prefix + "rope.scaling.yarn_log_multiplier", fallback: 0f);
+        float correctionScale = ResolveScalingMagnitude(metadata, prefix + "rope.scaling.yarn_ext_factor", fallback: 1f);
+        float betaFast = ResolveScalingMagnitude(metadata, prefix + "rope.scaling.yarn_beta_fast", fallback: 32f);
+        float betaSlow = ResolveScalingMagnitude(metadata, prefix + "rope.scaling.yarn_beta_slow", fallback: 1f);
+
+        return new RopeScalingPlan(
+            Variant: "yarn",
+            Multiplier: multiplier,
+            OriginalContextLength: originalContext,
+            AttentionFactor: ResolveAttentionFactor(multiplier, declaredAttention, logMultiplier, correctionScale),
+            CorrectionScale: correctionScale,
+            BetaFast: betaFast,
+            BetaSlow: betaSlow);
+    }
+
+    // The variant's score-side attention factor. With a non-zero correction scale the reference rebuilds it from
+    // the multiplier's magnitude scale — getMscale(m, 1) alone, or getMscale(m, 1) divided by getMscale(m, s)
+    // when an all-dimensions log multiplier is declared — and divides out that same magnitude scale, because the
+    // angle tables fold it into their own entries; with the correction scale disabled the declared factor stands
+    // alone. The declared attention factor then multiplies whatever the variant resolved. getMscale(m, s) is 1
+    // for a multiplier not above 1 and 0.1 * s * ln(m) + 1 above it.
+    private static float ResolveAttentionFactor(float multiplier, float declaredAttention, float logMultiplier, float correctionScale)
+    {
+        if (correctionScale == 0f)
+        {
+            return declaredAttention;
+        }
+
+        double resolved = logMultiplier != 0f
+            ? Mscale(multiplier, 1.0) / Mscale(multiplier, logMultiplier)
+            : Mscale(multiplier, 1.0);
+
+        resolved *= 1.0 / (1.0 + 0.1 * Math.Log(multiplier));
+
+        return (float)(resolved * declaredAttention);
+    }
+
+    private static double Mscale(double scale, double magnitude) =>
+        scale <= 1.0 ? 1.0 : 0.1 * magnitude * Math.Log(scale) + 1.0;
+
+    // Shared scaling-factor resolution: an absent key means the unscaled multiplier (one). A declared key is
+    // read as a double and must land in the float range as a positive finite number — a non-positive, NaN,
+    // infinite, or out-of-range declaration fails the load with a message naming the key and the declared value.
+    private static float ResolveScalingFactor(GgufMetadata metadata, string key)
+    {
+        if (!metadata.Has(key))
+        {
+            return 1f;
+        }
+
+        GgufValue declared = metadata.Get(key);
+
+        double declaredValue;
+        try
+        {
+            declaredValue = declared.AsDouble();
+        }
+        catch (GgufException ex)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declared}; rope scaling factor values must be positive finite numbers", ex);
+        }
+
+        float value = (float)declaredValue;
+        if (!float.IsFinite(value) || value <= 0f)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declaredValue.ToString(CultureInfo.InvariantCulture)}; " +
+                "rope scaling factor values must be positive finite numbers");
+        }
+
+        return value;
+    }
+
+    // Shared rope-magnitude resolution in the style of the block-norm epsilon: an absent key takes the fallback.
+    // A declared key is read as a double and must land in the float range as a non-negative finite number — a
+    // negative, NaN, infinite, or out-of-range declaration fails the load with a message naming the key and the
+    // declared value.
+    private static float ResolveScalingMagnitude(GgufMetadata metadata, string key, float fallback)
+    {
+        if (!metadata.Has(key))
+        {
+            return fallback;
+        }
+
+        GgufValue declared = metadata.Get(key);
+
+        double declaredValue;
+        try
+        {
+            declaredValue = declared.AsDouble();
+        }
+        catch (GgufException ex)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declared}; rope scaling magnitude values must be non-negative finite numbers", ex);
+        }
+
+        float value = (float)declaredValue;
+        if (!float.IsFinite(value) || value < 0f)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declaredValue.ToString(CultureInfo.InvariantCulture)}; " +
+                "rope scaling magnitude values must be non-negative finite numbers");
+        }
+
+        return value;
+    }
+
+    // Shared rotary-slice resolution: an absent <prefix>rope.dimension_count means the full head dimension (zero).
+    // A declared slice must read as an integer that fits the int range and is a positive even count not exceeding
+    // the head dimension — a fractional, text, zero, negative, odd, or out-of-range declaration fails the load
+    // with a message naming the key and the declared value.
+    private static int ResolveRotarySlice(GgufMetadata metadata, string prefix, int headDim)
+    {
+        string key = prefix + "rope.dimension_count";
+        if (!metadata.Has(key))
+        {
+            return 0;
+        }
+
+        GgufValue declared = metadata.Get(key);
+
+        long declaredValue;
+        try
+        {
+            declaredValue = declared.AsLong();
+        }
+        catch (GgufException ex)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declared}; rope dimension count values must be positive even integers", ex);
+        }
+
+        if (declaredValue <= 0 || declaredValue > headDim || declaredValue % 2 != 0)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declaredValue.ToString(CultureInfo.InvariantCulture)}; " +
+                $"the rope dimension count must be a positive even integer not exceeding the head dimension ({headDim})");
         }
 
         return (int)declaredValue;

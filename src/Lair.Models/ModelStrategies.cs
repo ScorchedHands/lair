@@ -102,8 +102,9 @@ public enum QkNormMode
 }
 
 /// <summary>
-/// Rotary position embedding applied to the q and k heads. Resolved once per model from its
-/// <see cref="ModelProfile"/>; scaling variants and partial rotary slices are outside the implemented set.
+/// Rotary position embedding pairing applied to the q and k heads. Resolved once per model from its
+/// <see cref="ModelProfile"/>; the pair layout is the profile's, while the file's declared metadata can narrow
+/// the rotation to a leading slice of the head and select a scaling variant for the angle tables.
 /// </summary>
 public enum RopeStrategy
 {
