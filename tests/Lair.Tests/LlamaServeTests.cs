@@ -8,15 +8,15 @@ using Xunit.Abstractions;
 namespace Lair.Tests;
 
 /// <summary>
-/// End-to-end serve fixture for the real <c>models/Llama-3.2-1B-Instruct-Q8_0.gguf</c>: the GGUF is opened
+/// End-to-end serve fixture for the real <c>models/Llama-3.2-1B-Instruct-Q4_K_M.gguf</c>: the GGUF is opened
 /// through the production load path (<see cref="GenerationService.Open"/>), a multi-turn conversation is
 /// rendered through the model's own <c>tokenizer.chat_template</c> by the adapter's load-time parse, the
 /// rendered prompt is byte-compared against the pinned llama.cpp parity golden, and a greedy continuation
 /// produces a finite, deterministic first-token continuation with finite per-step logit distributions.
 /// The whole category skips cleanly when the pinned model file is absent. Memory budget: exactly one model
 /// instance for the whole collection (one <see cref="LlamaServeFixture"/> engine, collection-serialized
-/// tests), a modest context/KV pool, and at most 32 generated tokens per request, so the peak stays far
-/// under the 4 GB model-testing budget.
+/// tests), a modest context/KV pool, and at most 32 generated tokens per request, so the resident set is the
+/// pinned weights plus a small pool and nothing else.
 /// </summary>
 [CollectionDefinition("Llama Serve")]
 public sealed class LlamaServeCollection : ICollectionFixture<LlamaServeFixture>;
@@ -24,11 +24,11 @@ public sealed class LlamaServeCollection : ICollectionFixture<LlamaServeFixture>
 /// <summary>
 /// The single loaded Llama-3.2-1B engine shared by every test in the collection. The open is lazy so the
 /// category skips cleanly when the pinned model file is absent, and the engine is disposed once when the
-/// collection finishes — no second copy of the 1.3 GB model is ever resident.
+/// collection finishes — no second copy of the 770 MB model is ever resident.
 /// </summary>
 public sealed class LlamaServeFixture : IDisposable
 {
-    private const string ModelRelativePath = "models/Llama-3.2-1B-Instruct-Q8_0.gguf";
+    private const string ModelRelativePath = "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf";
     private const string ModelName = "llama-3.2-serve";
 
     private GenerationService? _engine;
@@ -56,7 +56,7 @@ public sealed class LlamaServeFixture : IDisposable
             }
 
             // Modest pool: 2 048-token context and 64 KV blocks (about 32 MB of KV for this model) alongside
-            // the 1.3 GB Q8_0 weights — far inside the 4 GB budget.
+            // the 770 MB Q4_K_M weights.
             _engine = GenerationService.Open(new LairConfig
             {
                 Server = new ServerConfig { Bind = "127.0.0.1", Port = 0 },
@@ -223,10 +223,10 @@ public sealed class LlamaServeTests
 
     private ParityContext? ResolveParity()
     {
-        string? modelPath = ModelFixture.ResolveRepoRelative("models/Llama-3.2-1B-Instruct-Q8_0.gguf");
+        string? modelPath = ModelFixture.ResolveRepoRelative("models/Llama-3.2-1B-Instruct-Q4_K_M.gguf");
         if (modelPath is null)
         {
-            Output.WriteLine("SKIP Serve: models/Llama-3.2-1B-Instruct-Q8_0.gguf not found walking up from the test assembly directory; the llama serve fixture needs the pinned model file.");
+            Output.WriteLine("SKIP Serve: models/Llama-3.2-1B-Instruct-Q4_K_M.gguf not found walking up from the test assembly directory; the llama serve fixture needs the pinned model file.");
             return null;
         }
 
@@ -276,7 +276,7 @@ public sealed class LlamaServeTests
         if (modelSha != root.GetProperty("model_sha256").GetString())
         {
             throw new InvalidOperationException(
-                $"serve parity guard: models/Llama-3.2-1B-Instruct-Q8_0.gguf hashes to {modelSha} but the fixture was captured against {root.GetProperty("model_sha256").GetString()}; " +
+                $"serve parity guard: models/Llama-3.2-1B-Instruct-Q4_K_M.gguf hashes to {modelSha} but the fixture was captured against {root.GetProperty("model_sha256").GetString()}; " +
                 "regenerate the fixture with scripts/generate-template-parity.ps1 against the pinned model.");
         }
 

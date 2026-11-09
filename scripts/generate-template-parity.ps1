@@ -1,6 +1,6 @@
 param(
     [string]$Tag = "b12032",
-    [string]$ModelPath = "models/Llama-3.2-1B-Instruct-Q8_0.gguf",
+    [string]$ModelPath = "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
     [string]$Out = "tests/fixtures/parity-templates-llama32.json",
     [int]$Threads = 4,
     [int]$Port = 0

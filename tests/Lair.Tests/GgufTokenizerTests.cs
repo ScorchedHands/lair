@@ -686,7 +686,7 @@ public sealed class GgufTokenizerTests : IDisposable
     [Fact]
     public void RealModel_Llama32_DeclaresBosEosAndAddBos()
     {
-        string? modelPath = ModelFixture.ResolveRepoRelative("models/Llama-3.2-1B-Instruct-Q8_0.gguf");
+        string? modelPath = ModelFixture.ResolveRepoRelative("models/Llama-3.2-1B-Instruct-Q4_K_M.gguf");
         if (modelPath is null)
         {
             return; // real-model tests skip when the fixture is absent (xunit 2.9 has no dynamic Assert.Skip)

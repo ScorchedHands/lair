@@ -1,13 +1,13 @@
 {
-  "model_file": "models/Llama-3.2-1B-Instruct-Q8_0.gguf",
-  "model_sha256": "432f310a77f4650a88d0fd59ecdd7cebed8d684bafea53cbff0473542964f0c3",
+  "model_file": "models/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+  "model_sha256": "3f5a22426976ab26cfe84dba63c1d08391717abb1af893e10f1b2968d862dcc1",
   "pre": "llama-bpe",
   "add_bos": true,
   "add_space_prefix": true,
   "llama_cpp_tag": "b12032",
   "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
   "reference_mode": "llama-server /tokenize with add_special=false and parse_special=false — the same surface LAIR's GgufTokenizer.Encode exposes (no BOS, no special-token parsing). tokens are the reference id sequence and tokens_str the pieces the reference resolved them to; the parity tests assert LAIR's Encode matches id-for-id. Cases are plain text so a mismatch is a tokenizer mismatch, not a special-token one.",
-  "generated_utc": "2026-11-06T22:07:53Z",
+  "generated_utc": "2026-11-09T01:43:20Z",
   "cases": [
     {
       "name": "hello_world",
