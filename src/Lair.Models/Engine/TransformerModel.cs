@@ -395,6 +395,24 @@ public sealed class TransformerModel : IDisposable
         {
             LayerOps.BuildRopeTables(Plan.RopeTheta, Plan.HeadDim, maxContextTokens, _cos, _sin);
         }
+
+        // A positional plan that is not the plain full-head rotation is announced once at Open, in the style of the
+        // tensor and profile lines: the variant, its multiplier and original context length, the attention factor
+        // carried into the score path, and the dimension count the rotation actually covers. The plain shape stays
+        // unannounced so the line means the same thing on every host.
+        if (logLine is not null && (Plan.RopeScaling is not null || Plan.RopeRotaryDimensions > 0))
+        {
+            GgufMetadata metadata = file.Metadata;
+            string modelName = metadata.Has("general.name") ? metadata.Get("general.name").AsString() : "";
+            RopeScalingPlan? plan = Plan.RopeScaling;
+            logLine(
+                $"rope_scaling model='{(modelName.Length > 0 ? modelName : file.Path)}' " +
+                $"architecture='{Plan.Architecture}' variant={(plan?.Variant ?? "none")} " +
+                $"multiplier={(plan?.Multiplier ?? 1f).ToString(CultureInfo.InvariantCulture)} " +
+                $"original_context_length={(plan?.OriginalContextLength ?? 0)} " +
+                $"attention_factor={(plan?.AttentionFactor ?? 1f).ToString(CultureInfo.InvariantCulture)} " +
+                $"rotary_dimensions={(Plan.RopeRotaryDimensions > 0 ? Plan.RopeRotaryDimensions : Plan.HeadDim)}");
+        }
     }
 
     /// <summary>Forwards each token in order, appending its K/V to the sequence's paged KV cache.</summary>

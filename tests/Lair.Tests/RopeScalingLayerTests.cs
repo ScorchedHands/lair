@@ -192,6 +192,39 @@ public sealed class RopeScalingLayerTests : IDisposable
         AssertEntry("split pair 1 high", split[3], -0.6 * cos[1] + (-0.25) * sin[1]);
     }
 
+    // ---------------------------------------------------------------- load announcement
+
+    [Fact]
+    public void Open_DeclaredVariantAndSlice_AnnouncesTheResolvedPlanOnce_AndPlainModelStaysSilent()
+    {
+        RopeModelSpec spec = new();
+        string yarnPath = WriteTemp(BuildGguf(
+            [.. spec.MetadataPairs(), ("llama.rope.scaling.type", "yarn"), ("llama.rope.scaling.factor", (float)YarnMultiplier), ("llama.rope.scaling.original_context_length", OriginalContextLength), ("llama.rope.dimension_count", 2)],
+            spec.Tensors()));
+        string plainPath = WriteTemp(BuildGguf(spec.MetadataPairs(), spec.Tensors()));
+
+        using CpuBackend backend = new(threads: 1, allowAvx2: true);
+        using GgufFile yarnGguf = GgufFile.Open(yarnPath);
+        using GgufFile plainGguf = GgufFile.Open(plainPath);
+
+        List<string> yarnLines = [];
+        using TransformerModel yarnModel = TransformerModel.Open(yarnGguf, backend, maxContextTokens: 8, logLine: yarnLines.Add);
+
+        List<string> plainLines = [];
+        using TransformerModel plainModel = TransformerModel.Open(plainGguf, backend, maxContextTokens: 8, logLine: plainLines.Add);
+
+        string? line = yarnLines.Find(entry => entry.StartsWith("rope_scaling ", StringComparison.Ordinal));
+        Assert.NotNull(line);
+        Assert.Contains("variant=yarn", line, StringComparison.Ordinal);
+        Assert.Contains("multiplier=2 ", line, StringComparison.Ordinal);
+        Assert.Contains($"original_context_length={OriginalContextLength}", line, StringComparison.Ordinal);
+        Assert.Contains("attention_factor=1 ", line, StringComparison.Ordinal);
+        Assert.Contains("rotary_dimensions=2", line, StringComparison.Ordinal);
+        Assert.Contains("architecture='llama'", line, StringComparison.Ordinal);
+
+        Assert.Null(plainLines.Find(entry => entry.StartsWith("rope_scaling ", StringComparison.Ordinal)));
+    }
+
     // ---------------------------------------------------------------- forward goldens
 
     [Fact]
