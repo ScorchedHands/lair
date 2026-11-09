@@ -14,11 +14,14 @@ public sealed class GgufLoaderTests : IDisposable
 {
     private const uint GgufMagic = 0x46554747; // "GGUF"
     private const uint GgmlF16 = 1;
+    private const uint GgmlQ4_0 = 2;
     private const uint GgmlQ5_0 = 6;
     private const uint GgmlQ8_0 = 8;
     private const uint GgmlQ2_K = 10;
+    private const uint GgmlQ4_K = 12;
     private const uint GgmlQ5_K = 13;
     private const uint GgmlQ6_K = 14;
+    private const uint GgmlIQ2_XXS = 16;
 
     private const int EmbedCols = 4;
     private const int EmbedRows = 3;
@@ -225,6 +228,78 @@ public sealed class GgufLoaderTests : IDisposable
         Assert.Contains("unsupported ggml type 10 (Q2_K)", ex.Message);
     }
 
+    [Theory]
+    [InlineData(0u, "F32", QuantFormat.F32, 1, 4)]
+    [InlineData(1u, "F16", QuantFormat.F16, 1, 2)]
+    [InlineData(6u, "Q5_0", QuantFormat.Q5_0, 32, 22)]
+    [InlineData(8u, "Q8_0", QuantFormat.Q8_0, 32, 34)]
+    [InlineData(12u, "Q4_K", QuantFormat.Q4_K, 256, 144)]
+    [InlineData(13u, "Q5_K", QuantFormat.Q5_K, 256, 176)]
+    [InlineData(14u, "Q6_K", QuantFormat.Q6_K, 256, 210)]
+    public void GgmlTypeRegistry_ResolvesEverySupportedIdWithExactGeometry(
+        uint id, string name, QuantFormat format, int blockSize, int typeSize)
+    {
+        Assert.True(GgmlTypeRegistry.TryResolve(id, out QuantDescriptor descriptor));
+        Assert.Equal(id, descriptor.TypeId);
+        Assert.Equal(name, descriptor.Name);
+        Assert.Equal(format, descriptor.Format);
+        Assert.Equal(blockSize, descriptor.BlockSize);
+        Assert.Equal(typeSize, descriptor.TypeSize);
+    }
+
+    [Theory]
+    [InlineData(2u, "Q4_0")]
+    [InlineData(10u, "Q2_K")]
+    [InlineData(16u, "IQ2_XXS")]
+    public void GgmlTypeRegistry_RejectsUnsupportedIdsButNamesThem(uint id, string ggmlName)
+    {
+        Assert.False(GgmlTypeRegistry.TryResolve(id, out QuantDescriptor descriptor));
+        Assert.Equal(default, descriptor);
+        Assert.Equal(ggmlName, GgmlType.Name(id));
+    }
+
+    [Theory]
+    [InlineData(GgmlQ4_0, "Q4_0")]
+    [InlineData(GgmlIQ2_XXS, "IQ2_XXS")]
+    public void Open_UnsupportedTensorType_RejectsWithGgmlIdAndName(uint ggmlType, string ggmlName)
+    {
+        byte[] image = BuildFixture(q8GgmlType: ggmlType);
+        string path = WriteTemp(image);
+
+        GgufException ex = Assert.Throws<GgufException>(() => GgufFile.Open(path));
+        Assert.Contains($"unsupported ggml type {ggmlType} ({ggmlName})", ex.Message);
+    }
+
+    [Fact]
+    public void Open_FastestDimensionNotBlockMultiple_RejectsNamingTensorIdAndGeometry()
+    {
+        // 96 is not a multiple of the Q4_K block size 256.
+        byte[] image = BuildTensorFixture("blk.0.attn_q.weight", [96, 2], GgmlQ4_K, 0, 0);
+        string path = WriteTemp(image);
+
+        GgufException ex = Assert.Throws<GgufException>(() => GgufFile.Open(path));
+        Assert.Contains("tensor 'blk.0.attn_q.weight'", ex.Message);
+        Assert.Contains("ggml type 12 (Q4_K)", ex.Message);
+        Assert.Contains("fastest dimension 96", ex.Message);
+        Assert.Contains("not a multiple of the Q4_K block size 256", ex.Message);
+    }
+
+    [Fact]
+    public void Open_PayloadPastEndOfFile_RejectsNamingTensorIdAndGeometry()
+    {
+        // A Q8_0 tensor stored [64, 2] needs 2 * ceil(64 / 32) * 34 = 136 payload
+        // bytes; the declared offset puts the payload beyond the end of the file.
+        byte[] image = BuildTensorFixture("blk.0.attn_q.weight", [64, 2], GgmlQ8_0, 65_536, 0);
+        string path = WriteTemp(image);
+
+        GgufException ex = Assert.Throws<GgufException>(() => GgufFile.Open(path));
+        Assert.Contains("tensor 'blk.0.attn_q.weight'", ex.Message);
+        Assert.Contains("ggml type 8 (Q8_0)", ex.Message);
+        Assert.Contains("136 payload bytes", ex.Message);
+        Assert.Contains("runs past the end", ex.Message);
+        Assert.Contains("34 bytes per 32-element block", ex.Message);
+    }
+
     [Fact]
     public void Open_TruncatedFile_ThrowsGgufException()
     {
@@ -381,6 +456,41 @@ public sealed class GgufLoaderTests : IDisposable
         for (int i = 0; i < Q8Rows * Q8Cols / 32 * 34; i++)
         {
             writer.Write(Q8Pattern(i));
+        }
+
+        writer.Flush();
+        return stream.ToArray();
+    }
+
+    // Single-tensor fixture with a minimal header: one tensor info, alignment 16,
+    // and a payload region of the given size so a byte-length rejection can be
+    // aimed at one tensor without writing a full model image.
+    private static byte[] BuildTensorFixture(string tensorName, int[] storedDims, uint ggmlType, long offset, long payloadBytes)
+    {
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+
+        writer.Write(GgufMagic);
+        writer.Write(3u); // version
+        writer.Write(1ul); // n_tensors
+        writer.Write(3ul); // n_kv — must match the number of KV pairs written below
+
+        WriteKvString(writer, "general.architecture", "llama");
+        WriteKvString(writer, "general.name", "lair-tensor-fixture");
+        WriteKvUint32(writer, "general.alignment", 16);
+
+        WriteTensorInfo(writer, tensorName, storedDims, ggmlType, offset);
+
+        long headerLength = stream.Position;
+        long dataStart = (headerLength + 15) / 16 * 16;
+        for (long i = headerLength; i < dataStart; i++)
+        {
+            writer.Write((byte)0);
+        }
+
+        for (long i = 0; i < payloadBytes; i++)
+        {
+            writer.Write(QuantPattern((int)i));
         }
 
         writer.Flush();

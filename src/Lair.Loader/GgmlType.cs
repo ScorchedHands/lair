@@ -1,9 +1,10 @@
-using Lair.Contracts;
-
 namespace Lair.Loader;
 
 /// <summary>
-/// ggml tensor type ids and block geometry for the GGUF container.
+/// ggml tensor type ids and their reference names for the GGUF container. The
+/// accepted types and their block geometry live in <see cref="GgmlTypeRegistry"/>;
+/// this name table covers every known id so rejection diagnostics can name the
+/// ggml type even when the loader does not support it.
 ///
 /// Format facts verified against llama.cpp master
 /// (https://raw.githubusercontent.com/ggml-org/llama.cpp/master/ggml/include/ggml.h,
@@ -13,19 +14,6 @@ namespace Lair.Loader;
 ///   17=IQ2_XS, 18=IQ3_XXS, 19=IQ1_S, 20=IQ4_NL, 21=IQ3_S, 22=IQ2_S, 23=IQ4_XS,
 ///   24=I8, 25=I16, 26=I32, 27=I64, 28=F64, 29=IQ1_M, 30=BF16, 34=TQ1_0, 35=TQ2_0,
 ///   39=MXFP4, 40=NVFP4, 41=Q1_0, 42=Q2_0, 43=F8_E4M3.
-///
-/// Block geometry verified against
-/// https://raw.githubusercontent.com/ggml-org/llama.cpp/master/ggml/src/ggml-common.h
-/// and the ggml_type_traits table in ggml/src/ggml.c:
-///   F32: blck_size 1,   type_size 4   (sizeof(float))
-///   F16: blck_size 1,   type_size 2   (sizeof(ggml_fp16_t))
-///   Q8_0: blck_size 32,  type_size 34  (QK8_0 = 32; block_q8_0 = half d + int8 qs[32])
-///   Q4_K: blck_size 256, type_size 144 (QK_K = 256, K_SCALE_SIZE = 12;
-///         block_q4_K = 2*half dm + 12 scale bytes + 128 nibble bytes)
-///   Q5_0: blck_size 32,  type_size 22  (QK5_0 = 32; block_q5_0 = half d + uint8 qh[4] + 16 nibble bytes)
-///   Q5_K: blck_size 256, type_size 176 (block_q5_K = 2*half dm + 12 scale bytes + uint8 qh[32] + 128 nibble bytes)
-///   Q6_K: blck_size 256, type_size 210 (block_q6_K = uint8 ql[128] + uint8 qh[64] + int8 scales[16] + half d)
-/// ggml_row_size(type, ne) = type_size * ne / blck_size.
 /// </summary>
 internal static class GgmlType
 {
@@ -36,53 +24,6 @@ internal static class GgmlType
     public const uint Q4_K = 12;
     public const uint Q5_K = 13;
     public const uint Q6_K = 14;
-
-    public static bool TryGetSupported(uint id, out QuantFormat format, out int blockElements, out int blockBytes)
-    {
-        switch (id)
-        {
-            case F32:
-                format = QuantFormat.F32;
-                blockElements = 1;
-                blockBytes = 4;
-                return true;
-            case F16:
-                format = QuantFormat.F16;
-                blockElements = 1;
-                blockBytes = 2;
-                return true;
-            case Q5_0:
-                format = QuantFormat.Q5_0;
-                blockElements = 32;
-                blockBytes = 22;
-                return true;
-            case Q8_0:
-                format = QuantFormat.Q8_0;
-                blockElements = 32;
-                blockBytes = 34;
-                return true;
-            case Q4_K:
-                format = QuantFormat.Q4_K;
-                blockElements = 256;
-                blockBytes = 144;
-                return true;
-            case Q5_K:
-                format = QuantFormat.Q5_K;
-                blockElements = 256;
-                blockBytes = 176;
-                return true;
-            case Q6_K:
-                format = QuantFormat.Q6_K;
-                blockElements = 256;
-                blockBytes = 210;
-                return true;
-            default:
-                format = default;
-                blockElements = 0;
-                blockBytes = 0;
-                return false;
-        }
-    }
 
     public static string Name(uint id)
     {

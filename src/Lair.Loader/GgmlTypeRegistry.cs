@@ -1,0 +1,38 @@
+using Lair.Contracts;
+
+namespace Lair.Loader;
+
+/// <summary>
+/// Registry of the ggml tensor types this loader accepts; membership in this
+/// registry is the acceptance rule. Each entry carries the block geometry the
+/// container reader uses to compute tensor payload sizes.
+///
+/// Block geometry verified against
+/// https://raw.githubusercontent.com/ggml-org/llama.cpp/master/ggml/src/ggml-common.h
+/// and the ggml_type_traits table in ggml/src/ggml.c:
+///   F32: blck_size 1,   type_size 4   (sizeof(float))
+///   F16: blck_size 1,   type_size 2   (sizeof(ggml_fp16_t))
+///   Q8_0: blck_size 32,  type_size 34  (QK8_0 = 32; block_q8_0 = half d + int8 qs[32])
+///   Q4_K: blck_size 256, type_size 144 (QK_K = 256, K_SCALE_SIZE = 12;
+///         block_q4_K = 2*half dm + 12 scale bytes + 128 nibble bytes)
+///   Q5_0: blck_size 32,  type_size 22  (QK5_0 = 32; block_q5_0 = half d + uint8 qh[4] + 16 nibble bytes)
+///   Q5_K: blck_size 256, type_size 176 (block_q5_K = 2*half dm + 12 scale bytes + uint8 qh[32] + 128 nibble bytes)
+///   Q6_K: blck_size 256, type_size 210 (block_q6_K = uint8 ql[128] + uint8 qh[64] + int8 scales[16] + half d)
+/// ggml_row_size(type, ne) = type_size * ne / blck_size.
+/// </summary>
+internal static class GgmlTypeRegistry
+{
+    private static readonly Dictionary<uint, QuantDescriptor> Supported = new()
+    {
+        [GgmlType.F32] = new(GgmlType.F32, "F32", QuantFormat.F32, 1, 4),
+        [GgmlType.F16] = new(GgmlType.F16, "F16", QuantFormat.F16, 1, 2),
+        [GgmlType.Q5_0] = new(GgmlType.Q5_0, "Q5_0", QuantFormat.Q5_0, 32, 22),
+        [GgmlType.Q8_0] = new(GgmlType.Q8_0, "Q8_0", QuantFormat.Q8_0, 32, 34),
+        [GgmlType.Q4_K] = new(GgmlType.Q4_K, "Q4_K", QuantFormat.Q4_K, 256, 144),
+        [GgmlType.Q5_K] = new(GgmlType.Q5_K, "Q5_K", QuantFormat.Q5_K, 256, 176),
+        [GgmlType.Q6_K] = new(GgmlType.Q6_K, "Q6_K", QuantFormat.Q6_K, 256, 210),
+    };
+
+    public static bool TryResolve(uint id, out QuantDescriptor descriptor) =>
+        Supported.TryGetValue(id, out descriptor);
+}

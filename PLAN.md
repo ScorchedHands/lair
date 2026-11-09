@@ -642,7 +642,7 @@ Dense GGUF architecture families load through a load-time profile registry that 
 - [X] **Window interleave** — whether the alternating local/full pattern belongs in the plan as a family property or as metadata once a declaration exists for it.
   - Decision: it ships as a family property (`WindowInterleave` resolved by the profile), which is what MVP3.4 built and measured. If a GGUF ever declares the pattern, the declared key overrides the profile default in either direction — the same posture DN-M34-4 already defines for every other feature default. The KV-read half is MVP3.9's item.
 
-### MVP3.5 [v0.3.5] - Refined
+### MVP3.5 [v0.3.5] - In Progress
 
 Published GGUF quant families are accepted through a load-time quant descriptor/kernel registry while CPU kernels remain concrete and performance-sensitive.
 
@@ -667,8 +667,8 @@ Published GGUF quant families are accepted through a load-time quant descriptor/
 
 #### Implementation Items
 
-- [_] Quant descriptor registry — move GGML type acceptance, block geometry, and row-stride validation behind a descriptor registry while preserving current F16/Q8_0/Q4_K/Q5_0/Q6_K behavior bit-identically (see DN-M35-1, DN-M35-2).
-  - Verify: `dotnet test --filter Category=Loader|Kernel -c Release` — existing quant geometry and kernel cases unchanged; an unsupported GGML id rejects naming the id and its GGML name; a tensor whose element count is not a multiple of the descriptor's `blck_size`, or whose byte length does not match `type_size` arithmetic, fails at load naming tensor, id, and expected geometry.
+- [✓] Quant descriptor registry — move GGML type acceptance, block geometry, and row-stride validation behind a descriptor registry while preserving current F16/Q8_0/Q4_K/Q5_0/Q6_K behavior bit-identically (see DN-M35-1, DN-M35-2).
+  - Verify: `dotnet test --filter Category=Loader|Kernel -c Release` — 197/197: existing quant geometry and kernel cases unchanged; unsupported GGML ids (Q4_0, Q2_K, IQ2_XXS) reject naming the id and its GGML name; a tensor whose fastest dimension is not a multiple of the descriptor's `BlockSize`, or whose byte length does not match `TypeSize` arithmetic (including running past the end of the file), fails at load naming tensor, id, and expected geometry.
 - [_] `Q3_K` format — descriptor plus scalar and AVX2 kernels reproducing the reference super-block layout (see DN-M35-3, DN-M35-4).
   - Verify: `dotnet test --filter Category=Kernel -c Release` — synthetic-block scalar-vs-AVX2 bit-identity across a full super-block including the sub-scale packing, batched-vs-single decode equivalence, and dequant against a double-precision reference implementing `min + q * scale`.
 - [_] `Q2_K` format — descriptor plus scalar and AVX2 kernels reproducing the reference super-block layout (see DN-M35-3, DN-M35-4).
@@ -678,7 +678,7 @@ Published GGUF quant families are accepted through a load-time quant descriptor/
 
 #### Tests
 
-- [_] Automated Quant Registry: GGML id acceptance, descriptor geometry, stride and byte-length validation, unsupported-id diagnostics naming id and name. Verify: `dotnet test --filter Category=Loader -c Release`.
+- [✓] Automated Quant Registry: GGML id acceptance, descriptor geometry, stride and byte-length validation, unsupported-id diagnostics naming id and name. Verify: `dotnet test --filter Category=Loader -c Release` — 129/129.
 - [_] Automated Quant Kernel: `Q2_K` and `Q3_K` synthetic-block scalar-vs-AVX2 bit-identity, batch equivalence, and dequant against a double-precision reference. Verify: `dotnet test --filter Category=Kernel -c Release`.
 - [_] Automated Quant Parity: real-fixture decode parity for the re-pinned sub-1 GB Llama-3.2 quant against pinned b12032 inside the documented quantized band. Verify: `dotnet test --filter Category=Parity -c Release`.
 - [_] Manual Budget Serve: serve the re-pinned Llama fixture and confirm the monitor-reported working set is under the ceiling. Verify: live two-turn exchange on `:8181` with a tight profile (`max_context_tokens`, `kv_blocks`, `thread_quota`), plus a `/monitor/stream` snapshot frame read.
