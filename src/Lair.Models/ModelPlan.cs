@@ -29,7 +29,10 @@ namespace Lair.Models;
 /// declared attention window reads <c>&lt;prefix&gt;attention.sliding_window</c>, resolving to <c>0</c>
 /// (unbounded) when the key is absent and to a positive integer otherwise. Which layers that window masks comes
 /// from the resolved profile alone, like the norm placement and the input-embedding gain: no metadata key decides
-/// it today.
+/// it today. The sparse-FFN slot reads <c>&lt;prefix&gt;expert_count</c>, <c>&lt;prefix&gt;expert_used_count</c>,
+/// <c>&lt;prefix&gt;expert_shared_count</c>, <c>&lt;prefix&gt;expert_weights_scale</c>, and
+/// <c>&lt;prefix&gt;expert_weights_norm</c>: a declared expert count resolves the descriptor against the resolved
+/// profile's declared shape, and a file declaring no expert count keeps the dense gate/up/down block.
 /// </summary>
 public sealed record ModelPlan
 {
@@ -126,7 +129,14 @@ public sealed record ModelPlan
 
     public required RopeStrategy Rope { get; init; }
 
-    /// <summary>Declared sparse-FFN shape, or <c>null</c> for the dense gate/up/down block every supported profile declares today.</summary>
+    /// <summary>
+    /// The sparse-FFN shape resolved from the file's declared expert metadata (<c>&lt;prefix&gt;expert_count</c>,
+    /// <c>&lt;prefix&gt;expert_used_count</c>, <c>&lt;prefix&gt;expert_shared_count</c>,
+    /// <c>&lt;prefix&gt;expert_weights_scale</c>, and <c>&lt;prefix&gt;expert_weights_norm</c>) against the
+    /// resolved profile's sparse-FFN shape, or <c>null</c> when the file declares no expert count and the dense
+    /// gate/up/down block runs. A resolved descriptor names the router and expert tensor roles the forward
+    /// engine refuses to execute today.
+    /// </summary>
     public SparseFfnDescriptor? SparseFfn { get; init; }
 
     /// <summary>The flat scalar view of this plan's resolved geometry.</summary>

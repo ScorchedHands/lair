@@ -19,7 +19,10 @@ namespace Lair.Models;
 /// <c>&lt;prefix&gt;attention.layer_norm_epsilon</c> (zero when the key is absent) feeds the LayerNorm block norms;
     /// the RMS epsilon from <c>&lt;prefix&gt;attention.layer_norm_rms_epsilon</c> feeds the RMS norms and the per-head
     /// QK-norm. The input-embedding gain comes from the profile alone: a profile that scales embeddings resolves
-    /// <c>sqrt(hidden size)</c> in the plan, every other profile resolves zero. An unregistered architecture is accepted only through the generic llama-shaped fallback profile, which
+    /// <c>sqrt(hidden size)</c> in the plan, every other profile resolves zero. The sparse-FFN slot resolves the
+    /// declared <c>&lt;prefix&gt;expert_count</c> together with its routing, shared-expert, weight-scale, and
+    /// weight-normalization keys against the resolved profile's declared shape; a file that declares no expert
+    /// count keeps the dense gate/up/down block. An unregistered architecture is accepted only through the generic llama-shaped fallback profile, which
 /// requires the file's tensor table to match the llama map exactly and reports the substitution as one structured
 /// log line when applied.
 /// </summary>
@@ -275,7 +278,7 @@ public static class ModelPlans
             Activation = profile.Activation,
             Bias = profile.Bias,
             Rope = profile.Rope,
-            SparseFfn = profile.SparseFfn,
+            SparseFfn = ResolveSparseFfn(metadata, prefix, profile.SparseFfn),
         };
     }
 
@@ -284,7 +287,10 @@ public static class ModelPlans
     // alias name (the optional ones included). A tensor no descriptor can name is unexpected; the rejection
     // carries the registry wording with its supported-profile list, names both sides of the mismatch, and
     // states that the llama-shaped fallback was attempted. The block extent is derived from the table itself,
-    // so this gate needs no metadata: it runs before any metadata read.
+    // so this gate needs no metadata: it runs before any metadata read. Sparse-FFN roles stay out of the
+    // nameable set even though the map declares them: a dense-shaped fallback cannot consume an expert-routed
+    // block, so a tensor under a sparse name is unexpected material and the file is rejected with the names
+    // it carries rather than accepted as a dense model with extra tensors.
     private static void ValidateLlamaShapedTable(TensorMap map, string architecture, LogicalTensorTable tensors)
     {
         int layers = 1;
@@ -298,6 +304,11 @@ public static class ModelPlans
 
         foreach (TensorDescriptor descriptor in map.Descriptors)
         {
+            if (TensorMap.IsSparseRole(descriptor.Role))
+            {
+                continue;
+            }
+
             bool perLayer = descriptor.Scope == TensorScope.PerLayer;
             int slots = perLayer ? layers : 1;
 
@@ -546,5 +557,117 @@ public static class ModelPlans
         }
 
         return (int)declaredValue;
+    }
+
+    // Shared sparse-FFN resolution: the declared <prefix>expert_count decides whether the block is expert-routed
+    // — absent means the dense gate/up/down block. A declared count must read as a positive integer that fits
+    // the int range; a fractional, text, zero, negative, or out-of-int-range declaration fails the load with a
+    // message naming the key and the declared value, in the style of the attention window. The routing count
+    // reads <prefix>expert_used_count, defaults to the expert count when the key is absent, must be a positive
+    // integer, and must not exceed the expert count. The shared expert reads <prefix>expert_shared_count,
+    // absent or zero meaning none. The routing-weight operands
+    // read <prefix>expert_weights_scale — a non-negative finite number, zero (the reference's disabled default)
+    // when the key is absent — and <prefix>expert_weights_norm, false when the key is absent. The roles come
+    // from the resolved profile's declared sparse-FFN shape, or from the map's sparse names when the profile
+    // declares no shape of its own; the shared-expert roles are carried only when the file declares a shared
+    // expert and the resolved profile names them.
+    private static SparseFfnDescriptor? ResolveSparseFfn(GgufMetadata metadata, string prefix, SparseFfnDescriptor? shape)
+    {
+        int expertCount = ResolveMoECount(metadata, prefix + "expert_count", fallback: 0, positive: true);
+        if (expertCount == 0)
+        {
+            return null;
+        }
+
+        int routed = ResolveMoECount(metadata, prefix + "expert_used_count", fallback: expertCount, positive: true);
+        if (routed > expertCount)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{prefix}expert_used_count' declares {routed.ToString(CultureInfo.InvariantCulture)}; " +
+                $"a sparse-FFN block cannot route more experts than its {prefix}expert_count ({expertCount})");
+        }
+
+        bool hasSharedExpert = ResolveMoECount(metadata, prefix + "expert_shared_count", fallback: 0, positive: false) > 0;
+
+        return new SparseFfnDescriptor(
+            ExpertCount: expertCount,
+            RoutedExpertsPerToken: routed,
+            HasSharedExpert: hasSharedExpert,
+            RouterRole: shape?.RouterRole ?? TensorRole.MoeRouter,
+            ExpertGateRole: shape?.ExpertGateRole ?? TensorRole.MoeExpertGate,
+            ExpertUpRole: shape?.ExpertUpRole ?? TensorRole.MoeExpertUp,
+            ExpertDownRole: shape?.ExpertDownRole ?? TensorRole.MoeExpertDown,
+            SharedGateRole: hasSharedExpert ? shape?.SharedGateRole ?? TensorRole.MoeSharedExpertGate : null,
+            SharedUpRole: hasSharedExpert ? shape?.SharedUpRole ?? TensorRole.MoeSharedExpertUp : null,
+            SharedDownRole: hasSharedExpert ? shape?.SharedDownRole ?? TensorRole.MoeSharedExpertDown : null,
+            ExpertWeightsScale: ResolveMoEScale(metadata, prefix + "expert_weights_scale"),
+            NormalizeExpertWeights: metadata.GetBool(prefix + "expert_weights_norm", fallback: false));
+    }
+
+    // Shared MoE count resolution in the style of the attention window: an absent key takes the fallback. A
+    // declared key must read as an integer that fits the int range and is positive when it names the expert
+    // count or the routing count, non-negative when it names the shared-expert count — a fractional, text,
+    // zero-for-a-routed-count, negative, or out-of-int-range declaration fails the load with a message naming
+    // the key and the declared value.
+    private static int ResolveMoECount(GgufMetadata metadata, string key, int fallback, bool positive)
+    {
+        if (!metadata.Has(key))
+        {
+            return fallback;
+        }
+
+        GgufValue declared = metadata.Get(key);
+
+        long declaredValue;
+        try
+        {
+            declaredValue = declared.AsLong();
+        }
+        catch (GgufException ex)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declared}; sparse-FFN count values must be {(positive ? "positive" : "non-negative")} integers", ex);
+        }
+
+        if (declaredValue < (positive ? 1 : 0) || declaredValue > int.MaxValue)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declaredValue.ToString(CultureInfo.InvariantCulture)}; " +
+                $"sparse-FFN count values must be {(positive ? "positive" : "non-negative")} integers");
+        }
+
+        return (int)declaredValue;
+    }
+
+    // Shared MoE weight-scale resolution in the style of the block-norm epsilon: an absent key means the
+    // reference's disabled default (zero). A declared key is read as a double and must land in the float range
+    // as a non-negative finite number — a negative, NaN, infinite, or out-of-range declaration fails the load
+    // with a message naming the key and the declared value.
+    private static float ResolveMoEScale(GgufMetadata metadata, string key)
+    {
+        if (!metadata.Has(key))
+        {
+            return 0f;
+        }
+
+        double declared;
+        try
+        {
+            declared = metadata.Get(key).AsDouble();
+        }
+        catch (GgufException ex)
+        {
+            throw new ModelException($"GGUF metadata key '{key}' must be a number", ex);
+        }
+
+        float scale = (float)declared;
+        if (!float.IsFinite(scale) || scale < 0f)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declared.ToString(CultureInfo.InvariantCulture)}; " +
+                "sparse-FFN weight scale values must be non-negative finite numbers");
+        }
+
+        return scale;
     }
 }

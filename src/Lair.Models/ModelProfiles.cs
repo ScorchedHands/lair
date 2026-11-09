@@ -12,6 +12,37 @@ public static class ModelProfiles
     /// <summary>Identity of the generic llama-shaped fallback profile, recorded by the plan of a file accepted through it.</summary>
     public const string GenericArchitecture = "llama-generic";
 
+    // The sparse-FFN shape each MoE profile declares: the router and expert roles its tensor map names, and
+    // whether its reference block adds a shared expert. The counts the plan carries come from the file's
+    // declared expert metadata, never from the profile, so these shapes carry zero counts.
+    private static readonly SparseFfnDescriptor Qwen2MoeSparseFfn = new(
+        ExpertCount: 0,
+        RoutedExpertsPerToken: 0,
+        HasSharedExpert: true,
+        RouterRole: TensorRole.MoeRouter,
+        ExpertGateRole: TensorRole.MoeExpertGate,
+        ExpertUpRole: TensorRole.MoeExpertUp,
+        ExpertDownRole: TensorRole.MoeExpertDown,
+        SharedGateRole: TensorRole.MoeSharedExpertGate,
+        SharedUpRole: TensorRole.MoeSharedExpertUp,
+        SharedDownRole: TensorRole.MoeSharedExpertDown,
+        ExpertWeightsScale: 0f,
+        NormalizeExpertWeights: false);
+
+    private static readonly SparseFfnDescriptor Qwen3MoeSparseFfn = new(
+        ExpertCount: 0,
+        RoutedExpertsPerToken: 0,
+        HasSharedExpert: false,
+        RouterRole: TensorRole.MoeRouter,
+        ExpertGateRole: TensorRole.MoeExpertGate,
+        ExpertUpRole: TensorRole.MoeExpertUp,
+        ExpertDownRole: TensorRole.MoeExpertDown,
+        SharedGateRole: null,
+        SharedUpRole: null,
+        SharedDownRole: null,
+        ExpertWeightsScale: 0f,
+        NormalizeExpertWeights: false);
+
     private static readonly ModelProfile[] Profiles =
     [
         new ModelProfile
@@ -85,6 +116,39 @@ public static class ModelProfiles
             WindowInterleave = WindowInterleave.AlternatingLocalFirst,
             Tensors = CanonicalTensors(),
         },
+        new ModelProfile
+        {
+            Architecture = "qwen2moe",
+            Prefix = "qwen2moe.",
+            // The reference qwen2moe block routes every token through a per-layer router matrix over its experts,
+            // sums the routed expert outputs with the routing weights, and adds one shared-expert block to that —
+            // the profile names those tensors and declares the sparse-FFN shape, while the forward engine refuses
+            // the block until sparse execution exists. The shared-expert gate vector the conversion ships is
+            // nameable through the shared gate role's alias.
+            SparseFfn = Qwen2MoeSparseFfn,
+            Norm = NormStrategy.RmsNorm,
+            Activation = ActivationStrategy.SwiGLU,
+            Bias = BiasPolicy.Declared,
+            Rope = RopeStrategy.StandardFullHead,
+            NormPlacement = NormPlacement.PreOnly,
+            Tensors = MoeTensors(),
+        },
+        new ModelProfile
+        {
+            Architecture = "qwen3moe",
+            Prefix = "qwen3moe.",
+            // The reference qwen3moe block carries the same router-and-experts layout as qwen2moe without a
+            // shared expert, and always ships the per-head q/k norm vectors like the dense qwen3 profile does:
+            // the feature defaults to the weighted mode when the file declares no attention.use_qk_norm.
+            SparseFfn = Qwen3MoeSparseFfn,
+            Norm = NormStrategy.RmsNorm,
+            Activation = ActivationStrategy.SwiGLU,
+            Bias = BiasPolicy.Declared,
+            Rope = RopeStrategy.RotateHalfFullHead,
+            DefaultQkNorm = QkNormMode.PerHeadWeighted,
+            NormPlacement = NormPlacement.PreOnly,
+            Tensors = MoeTensors(),
+        },
     ];
 
     private static readonly Dictionary<string, ModelProfile> ByArchitecture =
@@ -150,8 +214,9 @@ public static class ModelProfiles
     // profile consumes them under its post-sublayer placement, while every profile that resolves NormPlacement.PreOnly
     // treats their presence as a layout failure rather than ignorable material. The norm-bias vectors are optional for
     // the same reason the QK-norm ones are: the declared flag decides.
-    private static TensorMap CanonicalTensors() =>
-        new(
+    private static TensorMap CanonicalTensors() => new(CanonicalDescriptors());
+
+    private static TensorDescriptor[] CanonicalDescriptors() =>
         [
             new TensorDescriptor(TensorRole.TokenEmbedding, TensorScope.Global, "token_embd.weight", Required: true, []),
             new TensorDescriptor(TensorRole.AttentionQuery, TensorScope.PerLayer, "blk.{layer}.attn_q.weight", Required: true, []),
@@ -177,5 +242,31 @@ public static class ModelProfiles
             new TensorDescriptor(TensorRole.OutputNormBias, TensorScope.Global, "output_norm.bias", Required: false, []),
             new TensorDescriptor(TensorRole.PostAttentionNorm, TensorScope.PerLayer, "blk.{layer}.post_attention_norm.weight", Required: false, []),
             new TensorDescriptor(TensorRole.PostFeedForwardNorm, TensorScope.PerLayer, "blk.{layer}.post_ffw_norm.weight", Required: false, []),
+        ];
+
+    // The MoE tensor map: the canonical map with the dense gate/up/down roles relaxed to optional — an
+    // expert-routed block ships its gate/up/down triplets per expert instead of a dense triplet, so a MoE
+    // file carries none of the dense names — plus the sparse-FFN roles under the names the reference uses:
+    // the router matrix, the stacked per-expert gate/up/down triplets, and the shared expert's gate/up/down
+    // triplets. Every sparse role is optional: the map names a MoE file's table so the load can report the
+    // file instead of rejecting its material, and the forward engine refuses a resolved sparse block before
+    // any of these tensors is consumed. The shared gate role also names the gate vector the qwen2moe
+    // conversion ships alongside the shared gate matrix. Dense profiles carry no sparse roles at all: their
+    // forward consumes none, and the generic llama-shaped fallback treats a tensor under a sparse name as
+    // material its map cannot match.
+    private static TensorMap MoeTensors() =>
+        new(
+        [
+            .. CanonicalDescriptors().Select(descriptor =>
+                descriptor.Role is TensorRole.FeedForwardGate or TensorRole.FeedForwardUp or TensorRole.FeedForwardDown
+                    ? descriptor with { Required = false }
+                    : descriptor),
+            new TensorDescriptor(TensorRole.MoeRouter, TensorScope.PerLayer, "blk.{layer}.ffn_gate_inp.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.MoeExpertGate, TensorScope.PerLayer, "blk.{layer}.ffn_gate_exps.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.MoeExpertUp, TensorScope.PerLayer, "blk.{layer}.ffn_up_exps.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.MoeExpertDown, TensorScope.PerLayer, "blk.{layer}.ffn_down_exps.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.MoeSharedExpertGate, TensorScope.PerLayer, "blk.{layer}.ffn_gate_shexp.weight", Required: false, ["blk.{layer}.ffn_gate_inp_shexp.weight"]),
+            new TensorDescriptor(TensorRole.MoeSharedExpertUp, TensorScope.PerLayer, "blk.{layer}.ffn_up_shexp.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.MoeSharedExpertDown, TensorScope.PerLayer, "blk.{layer}.ffn_down_shexp.weight", Required: false, []),
         ]);
 }

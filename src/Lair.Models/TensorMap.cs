@@ -34,6 +34,13 @@ public enum TensorRole
     OutputNormBias,
     PostAttentionNorm,
     PostFeedForwardNorm,
+    MoeRouter,
+    MoeExpertGate,
+    MoeExpertUp,
+    MoeExpertDown,
+    MoeSharedExpertGate,
+    MoeSharedExpertUp,
+    MoeSharedExpertDown,
 }
 
 /// <summary>Whether a tensor name is a single global name or a per-block name carrying a <c>{layer}</c> placeholder.</summary>
@@ -90,9 +97,10 @@ public sealed record TensorDescriptor(
 }
 
 /// <summary>
-/// A profile's complete tensor map: exactly one <see cref="TensorDescriptor"/> per <see cref="TensorRole"/>,
-/// resolved once at load and carried immutably by the <see cref="ModelPlan"/>. The forward engine looks
-/// tensors up through this map instead of through hardcoded name suffixes.
+/// A profile's complete tensor map: exactly one <see cref="TensorDescriptor"/> per <see cref="TensorRole"/>
+/// except the sparse-FFN roles, which a dense profile leaves out of its map entirely, resolved once at load
+/// and carried immutably by the <see cref="ModelPlan"/>. The forward engine looks tensors up through this map
+/// instead of through hardcoded name suffixes.
 /// </summary>
 public sealed class TensorMap
 {
@@ -115,13 +123,25 @@ public sealed class TensorMap
 
         foreach (TensorRole role in Enum.GetValues<TensorRole>())
         {
-            if (_byRole[(int)role] is null)
+            if (_byRole[(int)role] is null && !IsSparseRole(role))
             {
                 throw new ModelException($"tensor map is missing a descriptor for role '{role}'");
             }
         }
 
-        Descriptors = [.. _byRole];
+        // Sparse roles stay absent from a dense profile's map: the map names only the tensors its forward can
+        // consume, so a dense map carries no router or expert descriptors and a tensor under a sparse name is
+        // material its map cannot match.
+        List<TensorDescriptor> declared = [];
+        foreach (TensorDescriptor descriptor in _byRole)
+        {
+            if (descriptor is not null)
+            {
+                declared.Add(descriptor);
+            }
+        }
+
+        Descriptors = declared;
     }
 
     /// <summary>Every descriptor, in role order.</summary>
@@ -129,4 +149,19 @@ public sealed class TensorMap
 
     /// <summary>The descriptor for one role.</summary>
     public TensorDescriptor this[TensorRole role] => _byRole[(int)role];
+
+    /// <summary>
+    /// Whether a role belongs to the sparse-FFN block: the router and the expert matrices, dense or shared.
+    /// A dense profile names these roles for the load-time report only — its forward consumes none of them,
+    /// and the generic llama-shaped fallback treats a tensor under a sparse name as material its map cannot
+    /// match rather than as a matchable optional role.
+    /// </summary>
+    public static bool IsSparseRole(TensorRole role) =>
+        role is TensorRole.MoeRouter
+            or TensorRole.MoeExpertGate
+            or TensorRole.MoeExpertUp
+            or TensorRole.MoeExpertDown
+            or TensorRole.MoeSharedExpertGate
+            or TensorRole.MoeSharedExpertUp
+            or TensorRole.MoeSharedExpertDown;
 }

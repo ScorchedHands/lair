@@ -35,6 +35,8 @@ namespace Lair.Models.Engine;
 /// final-logit softcap saturates every logit vector — untied output head or tied token-embedding rows — after
 /// the full vector is computed and before any softmax, sampling, or copy-out. A resolved input-embedding gain
 /// multiplies every freshly dequantized embedding row by its value before the first layer on every forward path.
+/// A resolved sparse-FFN descriptor fails Open with a deferral naming the architecture and the declared expert
+/// count: the engine forwards dense gate/up/down blocks only.
 /// </summary>
 public sealed class TransformerModel : IDisposable
 {
@@ -189,6 +191,18 @@ public sealed class TransformerModel : IDisposable
         if (Plan.HeadDim % 2 != 0)
         {
             throw new ModelException($"head dimension {Plan.HeadDim} is odd; RoPE pairs require an even head dimension");
+        }
+
+        // A resolved sparse-FFN descriptor names an expert-routed feed-forward block this engine cannot run: the
+        // failure is the deferral itself — it names the architecture and the declared expert count and is not a
+        // missing-tensor complaint — and it lands before any tensor loads, so no partial load can make it
+        // misleading.
+        SparseFfnDescriptor? sparseFfn = Plan.SparseFfn;
+        if (sparseFfn is not null)
+        {
+            throw new ModelException(
+                $"architecture '{Plan.Architecture}' declares a sparse-FFN block with {sparseFfn.ExpertCount} experts " +
+                $"routing {sparseFfn.RoutedExpertsPerToken} per token: sparse FFN execution is not implemented by the forward engine");
         }
 
         int layers = Plan.LayerCount;

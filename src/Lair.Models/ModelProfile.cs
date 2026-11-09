@@ -23,7 +23,12 @@ public sealed record ModelProfile
 
     public required TensorMap Tensors { get; init; }
 
-    /// <summary>Declared sparse-FFN shape, or <c>null</c> for a dense gate/up/down block.</summary>
+    /// <summary>
+    /// The sparse-FFN shape the profile's reference block names — the router and expert roles its tensor map
+    /// declares and whether its reference graph routes through a shared expert — or <c>null</c> for a dense
+    /// gate/up/down block. The counts the plan carries come from the file's declared expert metadata, never
+    /// from the profile.
+    /// </summary>
     public SparseFfnDescriptor? SparseFfn { get; init; }
 
     /// <summary>
