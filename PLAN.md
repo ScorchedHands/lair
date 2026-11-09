@@ -18,11 +18,12 @@ LAIR is a C#/.NET inference runtime for local LLMs on x64 hardware, serving CPU/
 - Concurrent requests batched into shared decode steps (continuous batching), with chunked prefill interleaved into the same batch steps
 - Prompt caching: prefix KV reuse across requests; conversation caching: idle conversation state retained in RAM or persisted to disk and restored
 - Multiple models resident and served concurrently against per-device budgets
-- Per-model placement policy: device (`cpu` | `cuda` | `hybrid` with layer split), prefill target, KV residency (`dram` | `vram` | `split`), VRAM budget, CPU thread quota
+- Per-model placement policy: compute device (`cpu` | `cuda` | `hybrid` with layer split), prefill target, weight tier (`dram` | `vram` | `nvme`), KV residency (`dram` | `vram` | `split`), VRAM budget, CPU core/thread quota, prefill lane, and a per-model concurrency cap — compute device and weight tier are independent axes
 - Config-file hot-reload for every runtime knob; no admin API
 - CUDA backend with Strata-style hybrid CPU/GPU inference
 - MoE residency for Qwen3.8-Flash-Next: router, expert gather, RAM hot tier, pageable PLE with indexed disk gather, MTP drafting
 - Tiered residency: NVMe cold expert tier, VRAM hot expert tier
+- PCIe-frac compute: DRAM-resident expert slabs executed on the GPU (Strata's `pcie-frac`) — GPU compute without spending VRAM on weights, streamed over PCIe with double-buffered prefetch
 - Knobs-first principle: every placement/residency combination is implemented and testable; defaults reflect measured-optimal tuning; users may deliberately choose suboptimal combinations (e.g. lower speed for lower DRAM/VRAM footprint)
 - Modular weight supply: kernels receive all weights through a swappable provider, so byte-reduction experiments (layer skipping, expert pruning, dynamic quant switching, early-exit vocab) plug in without kernel rewrites
 - Observability: per-model tok/s, cache hit rates, tier utilization, PCIe transfer costs — structured logs plus a CLI monitor, and a real-time Web UI showing in-flight requests with per-request stats, engine/machine usage (CPU, memory, GPU, PCIe, disk I/O) portioned by model/role, CPU and GPU power draw where obtainable, CPU/GPU/RAM temperatures where exposed by the platform, cache usage with location breakdown, and the most recent X requests; monitor is read-only — no admin API
@@ -81,7 +82,17 @@ graph TD
 **Continuous batching** — sequences share decode steps; a unified token batch is the only lever that raises arithmetic intensity on CPU decode.
 - Rationale: batch-1 GEMV has zero weight reuse; batching converts GEMV toward GEMM.
 - Rejected: one thread per request (bandwidth thrash, no weight sharing).
-- Contract: prefill chunks interleave with decode tokens in the same batch step, so a long prompt never stalls decode latency for other sequences.
+- Contract: prefill chunks interleave with decode tokens in the same batch step by default, so a long prompt never stalls decode latency for other sequences; an opt-in dedicated prefill lane removes the sharing entirely (see MVP3.13).
+
+**Request pipelines and device routes** — every request is an independent pipeline (transform → prefill → decode → finish) with its own quota, advanced independently up to the model's concurrency cap; a *step* is a merged batch over the pipelines one device route can serve, and a route is an ordered set of device segments each carrying its own compute device, weight tier, and quota.
+- Rationale: the pipeline is the control plane and must not assume a device; merging is the execution plane's optimization for bandwidth-bound work and is optional where weight reuse is already free (prefill, GPU-resident decode). Keeping the two separate is what stops a CPU-decode performance decision from becoming the scheduler's identity.
+- Rejected: one thread per request each traversing weights (bandwidth thrash, no weight sharing — unchanged); the current single global step loop as the only scheduling shape (cannot express a hybrid route or a dedicated prefill lane); device identity as the merge key (a hybrid model's sequences share one route and must still merge).
+- Contract: a pipeline's token stream is bit-identical whether merged or run alone; the arbiter admits a step on route cost (CPU core quota and GPU stream/SM quota held for the step's duration), and lane priority applies per segment.
+
+**Compute device and weight tier are separate axes** — a route segment states where the math runs and where the bytes live; GPU compute over DRAM-resident weights (PCIe-frac) is a first-class combination, not a fallback.
+- Rationale: Strata's `pcie-frac` runs expert FFNs on the GPU while the expert slabs stay in DRAM, which is the mode that makes GPU compute useful when VRAM — not compute — is the scarce resource; conflating the axes in `device: hybrid` forecloses it, and any later accelerator is just another value on the same axis.
+- Rejected: weight-offload-only hybrid (spends scarce VRAM on weights that KV wants); frac as a default anywhere (PCIe and DRAM bandwidth are comparable, so the win is situational and must be measured); streaming weights to GPU then copying them back per token.
+- Contract: `PlacementPolicy` expresses compute device and weight tier per segment; frac is bench-gated before becoming a default, consistent with the PCIe-tax posture below.
 
 **Device-agnostic weight arena** — mmap'd GGUF tensors placed per `PlacementPolicy`; NUMA-aware first-touch; never mlock'd.
 - Rationale: archive measurement shows mlock at −5%; page-cache residency is the legitimate alternative.
@@ -908,9 +919,111 @@ SentencePiece (SPM) vocabularies load through a tokenizer profile, unlocking the
 - [_] Gemma-2 Parity Unblocked: the deferred MVP3.4 fixture generates and passes inside the documented quantized band. Verify: `dotnet test --filter Category=Parity -c Release`.
 - [_] Manual SPM Serve: serve the pinned Gemma-2 fixture and the Gemma-3-1B fixture, confirm coherent multi-turn output on both, and confirm `/v1/models` reports their architectures and quants. Verify: two live two-turn exchanges on `:8181` plus monitor readings.
 
+### MVP3.12 [v0.3.12] - Refined
+
+Prefill forwards batched rows instead of one token at a time, and the measurement decides whether a GEMM path is worth building. Scheduler-side work — step budgeting and prefill lanes — deliberately lives in MVP3.13, so the scheduler is rewritten once rather than twice.
+
+#### Design Notes
+
+- **DN-M312-1** — Batched prefill reuses the batch shape already shipped: chunk positions forward in sub-batches of up to `MaxBatchSequences` (16) rows through `GemvBatch`, with causal-within-chunk attention over the growing KV exactly as the embedding path already performs it. A 512-token chunk becomes 32 weight traversals instead of 512. The phase changes no scheduling behavior: chunk width, decode priority, and step composition are untouched.
+  - Rationale: the engine already carries 16-row batch buffers and the encode path already proves causal-within-chunk attention against a growing KV; prefill is the only hot path not using them, and prompt cost is weight-read bound. Keeping the change engine-local is also what keeps it testable before the arbiter exists.
+  - Rejected: GEMM-first (register-pressure wall plus native kernel work before measuring what batched GEMV delivers); widening the batch cap past 16 in this phase (buffer memory and register pressure, unmeasured); retaining per-token prefill as a safety path (batched decode and encode already prove bit-identical batched equivalence); doing the step-time budget and prefill lane here (both are arbiter decisions over MVP3.13's pipelines, and editing `GenerationScheduler` twice buys no gate anything).
+  - Contract: `TransformerModel.Prefill` takes a row window and returns logits for the final row only; `Category=Prefill` asserts chunked-prefill logits and resulting KV bytes bit-identical to per-token prefill.
+- **DN-M312-2** — The placement vocabulary stays device-neutral from the first commit: prefill carries the same shape as decode — compute device, weight tier, lane, quota — so CPU prefill and GPU prefill are the same design expressed as values, and neither is privileged.
+  - Rationale: the device split must be data, not a code path, or the runtime grows a second scheduler; MVP4 lands the CUDA side against this seam instead of inventing a prefill design of its own.
+  - Rejected: a CPU-only prefill design with GPU deferred to a separate mechanism; inventing `prefill: hybrid` layer semantics here (layer split is DN-M4-2's decision); per-device scheduler branches.
+  - Contract: `PlacementPolicy.prefill` is read as a route request, and the CPU implementation rejects an unsupported device value naming it rather than silently falling back, consistent with DN-M4-3.
+- **DN-M312-3** — GEMM prefill is a measured follow-up, not this phase's delivery: a `[LibraryImport]` GEMM spike opens only if the bench shows batched GEMV leaving ≥30% headroom against the pinned reference on the same fixture.
+  - Rationale: the plan already states CPU prefill parity needs microkernels, but the register-pressure wall is the unknown; measuring batched GEMV first costs less than building a GEMM path speculatively.
+  - Rejected: shipping GEMM in this phase (unmeasured cost); leaving it in Backlog with no trigger (it then never gets decided).
+  - Contract: bench records batched-GEMV prefill tok/s against the llama.cpp reference, and the 30% threshold is the recorded gate for opening the GEMM item.
+
+#### Implementation Items
+
+- [_] Batched prefill in the engine — row-window forward through `GemvBatch` with causal-within-chunk attention over the growing KV (see DN-M312-1).
+  - Verify: `dotnet test --filter Category=Prefill -c Release` — chunked-prefill logits, KV bytes, and the first sampled token are identical to per-token prefill across the pinned fixtures, and `Category=Parity` stays green.
+- [_] Prefill bench record — batched-GEMV prefill tok/s against the pinned reference, before and after batching, with the 30% headroom threshold evaluated (see DN-M312-3).
+  - Verify: `bench/` report committed with prefill tok/s for both paths and the GEMM decision written into the Decision Log. *(bench deferred per the 2026-11-02 owner decision — the gate stays open at ship time as a recorded deferred gate, and the GEMM spike cannot be opened until it closes.)*
+
+#### Tests
+
+- [_] Automated Prefill Identity: batched prefill bit-identical to per-token prefill in logits, KV bytes, and sampled tokens. Verify: `dotnet test --filter Category=Prefill|Parity -c Release`.
+- [_] Manual Prefill Speed: serve the pinned fixture and confirm a long prompt reaches first output token measurably earlier than before batching, with decode tok/s for a second model unchanged. Verify: live monitor readings for both models plus the bench record.
+
+### MVP3.13 [v0.3.13] - Refined
+
+Requests become independent pipelines advanced by a route-aware arbiter, so concurrency, device assignment, and batching are configured per model rather than fixed by the scheduler's shape.
+
+#### Design Notes
+
+- **DN-M313-1** — Control plane and execution plane are separated: `RequestPipeline` owns a request's state machine (admit → transform → prefill → decode → finish), its sampler, and its quota; the step executor decides how a pipeline's step math runs. Pipelines are logical state machines advanced by the arbiter, not OS threads.
+  - Rationale: the pipeline model is device-neutral and matches how GPU serving already works, while CPU decode still needs merged batches for weight reuse; conflating them is what currently makes one global step loop the scheduler's whole identity.
+  - Rejected: one OS thread per request (bandwidth thrash, no weight sharing); keeping the single loop and bolting a lane onto it (cannot express a hybrid route); making batching a request-level option (batching is a device-cost decision, not a user knob).
+  - Contract: `GenerationScheduler` exposes pipeline admission and step composition as distinct seams; a pipeline's token stream is bit-identical merged or alone (`Category=Scheduling` identity assertions carried over from MVP2).
+- **DN-M313-2** — The merge key is route identity, not device identity: pipelines merge into a step when they share a model plan, share that model's route, have compatible KV residency for the segment, fit the segment's batch cap, and leave quota headroom for the pipelines already in the step.
+  - Rationale: a hybrid model's sequences all ride one route (layer split and expert tier map are plan values), so they must merge even though the step crosses devices; merging on device alone would split them and pay the boundary tax per sequence.
+  - Rejected: per-device merge groups (splits a hybrid model's batch); merging across models (no shared weights to reuse, and it breaks per-model quotas); merging regardless of KV residency (a `vram` sequence cannot ride a `dram` batch).
+  - Contract: `Category=Scheduling|Parity-Hybrid` asserts a hybrid route's merged step is token-identical to the same sequences stepped alone, and that a split point changes speed, not results.
+- **DN-M313-3** — A route is an ordered list of device segments, and each segment carries compute device, weight tier, batch cap, and quota; admission cost is route cost.
+  - Rationale: a hybrid step holds a CPU quota and a GPU quota simultaneously for its duration, so admission on a single device cost is wrong; the route is also the seam a later accelerator plugs into without redesign.
+  - Rejected: a single `device` label carrying the whole model (cannot express frac or a hybrid route); per-sequence device choice (routing is per token, not per sequence); implicit device selection.
+  - Contract: `PlacementPolicy` resolves to a route value set in the model plan; the arbiter reports per-segment quota use and the monitor attributes utilization per segment.
+- **DN-M313-4** — Admission is a three-way check owned by the arbiter: KV block capacity (MVP2 math), the resolved token budgets (MVP3.10's reservation), and the model's concurrency slot with its per-segment quota. Quota is per pipeline within `models[].max_concurrent_requests`: CPU segments take core-set shares, GPU segments take stream priority and SM share, and the sum a step needs is what admission checks.
+  - Rationale: the user-facing requirement is "parallel up to a limit for that model" on every device class, and a request that wins a concurrency slot but cannot fit its KV or its budgets is a rejection nobody can act on. Making the arbiter the single admission point is what keeps three independently-built limits from each assuming the others; MVP3.10's reservation math and MVP5's device ledger become inputs rather than competing gates.
+  - Rejected: unbounded concurrency with best-effort thread pools (unmeasurable ITL claims); per-request dedicated cores on CPU decode (multiplies bandwidth traffic); a global concurrency number shared across models (breaks per-model budgets); checking the cap in the HTTP layer and the budgets in the scheduler (three rejections with three different shapes).
+  - Contract: `models[].max_concurrent_requests` and per-segment quota keys validate at load and hot-reload as new-request-only; admission rejection names which of the three limits blocked and the model it belongs to; `Category=Scheduling|Api` gates the three-way reporting.
+- **DN-M313-5** — MVP3.13 lands the arbiter and route vocabulary on CPU only, and declares the CUDA seam rather than implementing it: a route naming a GPU segment is rejected naming the missing backend until MVP4 lands it.
+  - Rationale: GPU concurrency is unserviceable without the pipeline and route seams, so they must exist before CUDA work starts — but building a GPU path with no device present is untestable, and DN-M4-3 already forbids silent fallback.
+  - Rejected: doing this rearchitecture inside MVP4 (CPU-only deployment loses the benefit); shipping speculative GPU code paths unmeasured.
+  - Contract: `Category=Scheduling` green on CPU routes; a GPU-segment route on a device-less box fails with the backend named, and MVP4's parity gate exercises the same route values.
+- **DN-M313-6** — A route resolves to a **backend set**, not one backend: each segment names an `IBackend` implementation and its weight tier, and a step calls them in route order over the *same* merged batch. Two distinct concurrency modes follow from it — segment-parallel (one batch, several backends along the layer/tensor order, as in a layer split or frac) and request-parallel (several batches on several backends at once, as in two models on different devices).
+  - Rationale: model-level concurrency already has this shape — each model instance binds its own `IBackend` at `TransformerModel.Open` and its pool at `BlockPool` — but both accept exactly one backend today, so a hybrid or frac step requires the engine to hold one per segment before MVP4 can name a split point. Keeping the batch whole across segments is what makes the crossing cheap: the handoff carries `batch width × hidden` once, not per sequence.
+  - Rejected: hybrid emulated inside `CpuBackend` (device branching inside the CPU kernel path); splitting one merged batch's rows across backends for the same segment (destroys the weight reuse batching exists to create); a per-sequence backend choice (routing is per token, not per sequence); one backend process per device pair (duplicates weights and plans).
+  - Contract: `TransformerModel` and `BlockPool` resolve a backend set from the route at load; activation handoff is a backend-allocated staging buffer; `Category=Scheduling` asserts a multi-backend step is token-identical to the single-backend step over the same fixtures.
+- **DN-M313-7** — A step-time budget sizes each prefill step: the arbiter chooses how many *tokens* a step forwards from measured per-row cost so the step stays inside `engine.prefill_step_budget_ms`, hot-reloadable, floor 1 token, ceiling `max_batch_tokens`, executed as sub-batches of at most `MaxBatchSequences` rows. Chunk width and row width stay separate numbers in config and in the stats.
+  - Rationale: MVP3.12's batching makes a chunk shorter in total but longer per step, so isolation is a measured bound rather than a fixed chunk width — it converts many uncapped stalls into a few capped ones and leaves decode-first priority untouched. Chunk width is a scheduling number and row width is a kernel number; conflating them makes one knob serve two jobs. It is an arbiter decision because the thing being bounded is a step the arbiter composes.
+  - Rejected: fixed chunk width (starves decode or prefill); splitting one chunk across a step boundary (breaks the "identical to running alone" guarantee); a static row count (cost is model- and device-dependent); letting the budget raise row width past the batch cap (buffer memory and register pressure, unmeasured).
+  - Contract: arbiter stats report tokens per chunk, sub-batch rows, and measured prefill step time; `Category=Prefill|Concurrency` asserts decode ITL p95 holds with an 8K-token prompt in flight.
+- **DN-M313-8** — Dedicated prefill lane is opt-in per model: `prefill_lane: shared | dedicated` (default `shared`), where `dedicated` runs a pipeline's prefill on its own lane with its own activation buffers and its own quota, so decode steps never contain prefill work. Weights stay shared and read-only.
+  - Rationale: a 30K-token prompt on shared cores lengthens a step however the budget is tuned; spatial isolation is the only mechanism that removes it, and its cost is bounded — activation buffers per lane, not duplicated weights. It needs pipelines to exist first, which is why it lands here rather than in MVP3.12: a lane is a property of a pipeline's progress, not of the engine.
+  - Rejected: always-on dedicated lanes (buffer cost for models that never prefill long); a separate engine instance per lane (duplicate weights, breaks the shared-plan posture); treating the budget as sufficient for this case.
+  - Contract: `PlacementPolicy` gains `prefill_lane` and a prefill quota (CPU core set, CUDA stream priority); lane buffers count in the model's load-time footprint and the monitor working-set reading; `Category=Concurrency|Affinity` asserts a dedicated-lane model's decode ITL is unaffected by its own in-flight prefill.
+
+#### Implementation Items
+
+- [_] Request pipeline control plane — pipeline state machine, per-pipeline sampler and quota, and admission independent of step composition (see DN-M313-1).
+  - Verify: `dotnet test --filter Category=Scheduling -c Release` — pipelines advance independently up to the cap, and each pipeline's token stream is identical to the same sequence run alone.
+- [_] Route value set in the model plan — ordered device segments with compute device, weight tier, batch cap, and quota, resolved at load (see DN-M313-3).
+  - Verify: `dotnet test --filter Category=Loader|Config -c Release` — routes resolve for `cpu`, `cuda`, and `hybrid` model entries; an unresolvable segment fails naming the model and the segment.
+- [_] Route-aware arbiter — merge predicate on route identity, KV-residency compatibility, batch cap, and quota headroom (see DN-M313-2).
+  - Verify: `dotnet test --filter Category=Scheduling|Concurrency -c Release` — merged steps equal unmerged results, hybrid-shaped routes merge rather than split, and a step that cannot fit is refused with the blocking quota named.
+- [_] Concurrency cap and per-segment quota keys — `max_concurrent_requests` plus CPU core-set and GPU stream-priority fields with load-time validation and hot-reload classes (see DN-M313-4).
+  - Verify: `dotnet test --filter Category=Config|Api -c Release` — the cap admits and rejects the expected request counts, and a rejection names which of KV capacity, token budget, or quota blocked and the model it belongs to.
+- [_] Step-time budget and adaptive token count — `engine.prefill_step_budget_ms` sizing tokens per step from measured per-row cost, executed as sub-batches within the batch cap, with floor and ceiling validation (see DN-M313-7).
+  - Verify: `dotnet test --filter Category=Prefill|Concurrency -c Release` — a chosen budget produces token counts inside the floor/ceiling with sub-batch rows never exceeding the cap, the hot-reload class reports it as next-chunk, and ITL p95 holds with an 8K-token prompt in flight.
+- [_] Dedicated prefill lane and quota — `prefill_lane` with its own activation buffers, core set, and stream-priority field, plus load-time footprint accounting (see DN-M313-8).
+  - Verify: `dotnet test --filter Category=Concurrency|Affinity|Config -c Release` — a dedicated lane leaves decode ITL unchanged under its own prefill load, core-set collision rules extend to the new set, and an invalid lane value fails at load naming the model.
+- [_] Quota and lane reporting — per-segment quota use, lane state, and admission rejections surfaced on `/v1/models` and `/monitor/stream` (see DN-M313-3, DN-M313-4).
+  - Verify: `dotnet test --filter Category=Api|Metrics -c Release` — the monitor snapshot carries per-segment quota and lane state per model, and `/v1/models` reports the configured cap and route.
+- [_] CUDA seam declaration — GPU-segment routes rejected naming the missing backend, with the seam exercised by a synthetic route in tests (see DN-M313-5).
+  - Verify: `dotnet test --filter Category=Scheduling|Budget -c Release` — a GPU-segment route on a device-less host fails naming `lair.backends.cuda`, and MVP4 inherits the same route values unchanged.
+- [_] Backend set from the route — engine and KV pool hold one `IBackend` per segment instead of one per model, with a staging buffer at each handoff (see DN-M313-6).
+  - Verify: `dotnet test --filter Category=Scheduling|Loader -c Release` — a two-segment route executes a merged step over the same batch and produces token-identical output to the single-backend step; the handoff buffer is backend-allocated, and `Category=Parity` stays green.
+
+#### Tests
+
+- [_] Automated Pipeline Identity: independent pipeline advancement with token streams bit-identical merged and unmerged. Verify: `dotnet test --filter Category=Scheduling -c Release`.
+- [_] Automated Route Admission: route resolution, merge predicate, three-way admission reporting, and concurrency cap behavior. Verify: `dotnet test --filter Category=Loader|Config|Scheduling|Concurrency -c Release`.
+- [_] Automated Prefill Isolation: step-time budget bounds prefill steps and decode ITL p95 holds with a long prompt in flight. Verify: `dotnet test --filter Category=Prefill|Concurrency -c Release`.
+- [_] Automated Lane Affinity: dedicated-lane isolation, quota validation, core-set collision handling, and per-segment reporting on the monitor stream. Verify: `dotnet test --filter Category=Concurrency|Affinity|Config|Metrics -c Release`.
+- [_] Automated CPU/GPU Neutrality: GPU-segment routes rejected naming the backend, with no CPU-only assumption reachable from the scheduler. Verify: `dotnet test --filter Category=Scheduling|Budget -c Release`.
+- [_] Manual Concurrency Proof (CPU half): serve one model on a CPU route with a concurrency cap and submit requests past it, confirming admitted requests advance at their configured quota and rejections name the blocking limit. Verify: live monitor readings per model and per segment.
+- [_] Manual Long-Prompt Proof: serve two models concurrently, submit a 30K-token prompt on one, and confirm the other model's decode latency is unchanged on a dedicated lane and degraded-but-bounded on a shared lane. Verify: live monitor readings for both models plus a prefill tok/s record.
+- [_] Manual Split-Route Proof: the same concurrency and long-prompt proof on a CPU+GPU-split route. *(deferred to MVP4 — the route cannot exist before the CUDA backend lands; recorded as a deferred gate at ship time, not closed here.)*
+
 ### MVP4 [v0.4.0] - Refined
 
-CUDA joins the engine; hybrid CPU/GPU inference on the 4090.
+CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the PCIe-frac seam where GPU compute runs over DRAM-resident weights.
 
 #### Design Notes
 
@@ -921,7 +1034,7 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090.
 - **DN-M4-2** — Contiguous layer split: first N transformer layers resident in VRAM, remainder on CPU; LM head defaults to CPU.
   - Rationale: exactly one PCIe activation crossing per token at the split boundary; activations are ≤32 KB. GPU LM head would spend scarce VRAM on the 248K-vocab head for marginal gain.
   - Rejected: interleaved layer split (crossing every layer); GPU LM head default.
-  - Contract: `PlacementPolicy.gpu_layers`, engine executor split point.
+  - Contract: `PlacementPolicy.gpu_layers`, engine executor split point. This is one route shape, not the only one — a segment may also compute on CUDA over DRAM-resident weights (see DN-M4-7).
 - **DN-M4-3** — Device policy is fail-fast: `device: cuda` or `hybrid` requires the device; no silent CPU fallback.
   - Rationale: silent fallback hides misconfiguration and produces unmeasurable performance claims. An `auto` fallback mode is a backlog candidate, not a default.
   - Contract: host startup validation, consistent with DN-M1-9.
@@ -932,6 +1045,10 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090.
   - Contract: scheduler step composition per model policy.
 - **DN-M4-6** — Pinned host staging buffers for activations crossing the split; transfers overlapped with compute where measurement justifies it.
   - Contract: weight arena / device arena staging.
+- **DN-M4-7** — PCIe-frac execution seam: a route segment may compute on CUDA while its weights stay in DRAM, streamed through pinned double-buffered staging so transfer overlaps compute; VRAM holds activations and KV only. MVP4 proves the seam on a dense model resident entirely in RAM; expert-shaped frac lands with the gather path in MVP6.
+  - Rationale: Strata's `pcie-frac` is the mode where GPU compute helps when VRAM rather than compute is scarce, and MoE makes it pay off because only the batch's union active-expert set streams rather than the whole weight set. The seam has to exist before MoE residency is designed, or MVP6 invents its own device story.
+  - Rejected: treating VRAM offload as the only hybrid MoE path (spends the budget frac exists to avoid); unpipelined frac (PCIe latency serialized against compute — the archive's offload tax in a new costume); a frac-only hybrid mode (layer split stays the default hybrid shape until measured otherwise).
+  - Contract: an `IWeightSource` slab provider feeding CUDA compute over host-resident blocks; bench records frac tok/s and bytes/token against CPU-resident and VRAM-resident variants of the same model before any default changes. The MVP4 dense-model measurement is a seam proof with an expected loss — PCIe bandwidth is lower than this box's DRAM bandwidth, so a bandwidth-bound dense decode should not beat the CPU route, and a loss there is not a failure. The win is only claimed for expert-shaped frac, where the bytes crossed are the batch's active slabs rather than the whole weight set (DN-M6-8).
 
 #### Implementation Items
 
@@ -943,6 +1060,8 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090.
   - Verify: bench records ≥2× prefill tok/s on the 4090 vs CPU for the reference model. *(bench deferred — see Open Items)*
 - [_] Layer split — `gpu_layers` placement policy (see DN-M4-2)
   - Verify: split-point sweep (0..N) on Qwen2-1.5B; parity holds at every split point; bench records decode tok/s curve. *(parity gate active; bench deferred)*
+- [_] Frac spike — a CUDA segment computing over DRAM-resident weights on a model fully resident in RAM (see DN-M4-7, DN-M313-6)
+  - Verify: `dotnet test --filter Category=Parity|Scheduling` — the frac route decodes token-identical to the CPU-resident route with the model's weights never copied into VRAM. Exit criterion is identity plus a recorded measurement, not a speed claim: `bench/` logs frac vs CPU-resident vs VRAM-resident tok/s and bytes/token, and an expected loss on a bandwidth-bound dense model does not fail the item. *(bench gate active; the residency decision is MVP6's, see DN-M6-8)*
 - [_] VRAM residency — models fitting 24 GB resident on device
   - Verify: full-VRAM Q4_K_M 1.5B run; over-budget load rejected with ledger breakdown in the error.
 - [_] KV device pools — `dram` | `vram` | `split` residency policies (see DN-M4-4)
@@ -952,6 +1071,7 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090.
 
 - [_] Automated Parity-Hybrid: token match across cpu / cuda / hybrid configurations
 - [_] Automated Budget: VRAM admission rejection with actionable error
+- [_] Automated Frac Identity: a CUDA segment over DRAM-resident weights decodes token-identical to the CPU-resident route with no weight copy into VRAM. Verify: `dotnet test --filter Category=Parity|Scheduling -c Release`.
 - [_] Automated Kernel: CUDA fused dequant GEMV vs scalar reference
 - [_] Manual Hybrid Serve: monitor shows GPU utilization and PCIe transfer counters during hybrid decode *(GPU tiles arrive with MVP3's UI; counters require the CUDA phase)*
 
@@ -1015,7 +1135,7 @@ Qwen3.8-Flash-Next runs: sparse MoE with residency management.
 - **DN-M6-3** — Expert-aware batching: the residency cost function is the batch's union active-expert set, not per-sequence expert sets.
   - Rationale: shared decode steps (MVP2) make expert reads amortized across sequences — this is the engine-level MoE win.
   - Rejected: per-sequence expert scheduling (re-reads shared experts per sequence).
-  - Contract: scheduler batch composition + `IGatherKernel`.
+  - Contract: scheduler batch composition + `IGatherKernel`. The same union set is what a PCIe-frac segment streams, so it is also the device-axis cost: the union decides which tiers a step touches (see DN-M6-8).
 - **DN-M6-4** — Contiguous expert slabs via `IWeightSource` providers: experts stored as contiguous slabs, gathered through `IGatherKernel`, prefetched on top-K router pointers before the GEMV.
   - Rationale: ik_llama.cpp proves prefetch; slabs make gather a pointer chase plus prefetch, not a scatter.
   - Rejected: expert-major interleaved layout (kills slab prefetch).
@@ -1030,6 +1150,10 @@ Qwen3.8-Flash-Next runs: sparse MoE with residency management.
   - Rationale: archive's top lever (12→25 tok/s on copy/code); verification batch amortizes expert reads.
   - Rejected: self/n-gram drafting at this phase (deferred to backlog); free-running draft without verification (quality risk).
   - Contract: `lair.sampling` drafter + scheduler verify step.
+- **DN-M6-8** — Frac expert residency: DRAM-resident expert slabs computed on CUDA through the PCIe-frac seam (DN-M4-7), streamed per the batch's union active-expert set with double-buffered prefetch so transfer overlaps compute. It is a residency option alongside the VRAM hot tier, chosen per model, not a replacement for it.
+  - Rationale: the 4090 cannot hold Flash-Next's expert set and its KV at once, and the mode that spends GPU compute without spending VRAM on weights is the one Strata ships; gather makes it viable because only the slabs a step actually routes to cross PCIe.
+  - Rejected: VRAM hot tier as the only hybrid MoE option (spends the budget frac exists to avoid); streaming whole expert sets per step (union-set streaming is the entire point); unpipelined transfer (PCIe latency serialized against compute).
+  - Contract: `IResidencyTier` DRAM tier feeding the CUDA gather path through the route's segment; bench records frac vs VRAM-hot vs CPU-resident on the same fixture before either becomes a default.
 
 #### Implementation Items
 
@@ -1039,6 +1163,8 @@ Qwen3.8-Flash-Next runs: sparse MoE with residency management.
   - Verify: `dotnet test --filter Category=Moe` — gathered expert output matches dense reference math; `bench/` reports gather tok/s vs dense-equivalent.
 - [_] RAM hot tier — capacity/cost-model expert residency (see DN-M6-5)
   - Verify: bench — hit-rate and tok/s improve over prefetch-only baseline on a replayed workload trace.
+- [_] Frac expert gather — DRAM-resident slabs computed on CUDA through the route's segment (see DN-M6-8, DN-M4-7)
+  - Verify: `dotnet test --filter Category=Moe` — frac gather output matches the dense-equivalent reference; `bench/` records frac vs VRAM-hot vs CPU-resident tok/s and bytes/token on the same fixture. *(bench gate active — residency default changes only on measured evidence)*
 - [_] PLE — pageable n-gram table, huge-page backed; indexed disk gather (row-offset addressing; sidecar index if the quant format doesn't align rows) (see DN-M6-6)
   - Verify: `dotnet test --filter Category=Ple` — indexed gather matches in-memory reference; `bench/` reports disk-gather latency distribution.
 - [_] GDN/QSA — recurrent state budgets, sparse attention semantics
@@ -1060,6 +1186,7 @@ Qwen3.8-Flash-Next runs: sparse MoE with residency management.
 #### Open Items
 
 - [_] **qwen4exp GGUF layout** — exact tensor naming/shaping for router, experts, PLE, GDN state, and MTP head in target GGUF files; resolved by a loader spike at the start of MVP6 build, feeding DN-M6-4/5/6 contracts.
+- [_] **Frac viability decision** — whether PCIe-frac expert residency (DN-M6-8) is worth building at all depends on Flash-Next's real expert geometry measured under DN-M6-1: if the hot expert set plus KV fits VRAM comfortably, the VRAM hot tier is the default and frac stays a seam; if it does not fit, frac is the mode that decides. MVP4's dense-model measurement (DN-M4-7) is a seam proof and does not settle this. Resolve before the MVP6 residency items are built.
 
 ### MVP7 [v0.7.0] - Tentative
 
@@ -1183,3 +1310,10 @@ Vision input on chat models.
 - **2026-11-09 — Model budget returns to 4 GB, measured as peak working set, and it changes what each pending phase can prove.** Owner restored the ceiling after the 512 MB–1 GB revision made three gates unprovable. The number is a working-set limit, not a file-size limit, because a loaded engine costs about 360–395 MB beyond weights and KV. Consequences are concrete: MVP3.4's blocked serve fixture closes with no re-pin (1,102–1,174 MB measured); MVP3.7 gets a real YaRN fixture (`Phi-3-mini-4k-instruct` `Q2_K`, 1,351 MB → ~1.75 GB); MVP3.9 gets a real MoE fixture (`OLMoE-1B-7B-0924-Instruct` `Q2_K`, 2,444 MB → ~2.8 GB) where the smaller `IQ2_M` file would have needed an out-of-scope format; MVP3.11 unblocks Gemma-2 parity and serve on the already-pinned file (1,629 MB → ~2.0 GB) and adds `gemma-3-1b` `Q3_K_S` (657 MB) as the windowed serving fixture. MVP3.5's `Q2_K`/`Q3_K` formats are load-bearing for that MoE and Gemma fixture selection rather than nice-to-have.
 - **2026-11-09 — MVP3.6 through MVP3.11 refined on measured code and fixture facts, not on the tentative sketches.** Five decisions carry the phases. Parser selection keys on chat-template capability plus a `tool_parser` config override, never architecture name, because fine-tunes change tool markup without changing `general.architecture` and no pinned fixture carries a tool-format metadata key. Reasoning-region recognition moves into MVP3.6 because nothing in `src` recognizes reasoning markup today and MVP3.10's reasoning ceiling is unimplementable without a resolved region. RoPE scaling stops being a blanket rejection: `rope.scaling.*` and `rope.dimension_count` become plan values with unimplemented variant names still failing. IQ kernels are decided per format family — fused GEMV for the 4-bit pair, table-driven staging for `IQ3_XXS` — with a bench gate deciding whether the staging survives. SPM splits on a new axis: `tokenizer.ggml.model` selects a vocabulary implementation, while `tokenizer.ggml.pre` profiles stay as MVP3.3 built them, because SPM has no merge stage to key a pre-profile against.
 - **2026-11-08 — MVP3.5 refined: the quant registry is a descriptor registry, and its first two formats are chosen by the budget.** `GgmlType`'s switch becomes a registry resolving type ids to descriptors (`TypeId`, `Name`, `Format`, `BlockSize`, `TypeSize`) with geometry failures at load, and `Q3_K` plus `Q2_K` are the only formats entering the phase. The choice is not a completeness argument: they are the published formats that close MVP3.4's blocked fixture, and the only ones small enough to fit a 1 GB working set. `Q2_K`/`Q3_K` are also the first super-block formats with asymmetric min-based sub-block scales, so their definition is the pinned reference's `dqK` layout and a LAIR-authored scalar golden cannot gate them. IQ, TQ, `Q4_0`, `Q5_0`/`Q5_1`, `Q8_1`, and `Q8_K` stay out until a published fixture demands one. The Quant priority list open item is resolved by this decision.
+- **2026-11-09 — MVP3.12 adds batched prefill under a step-time budget, with an opt-in dedicated prefill lane.** Prefill is the only hot path not using the batch machinery the engine already ships: `Prefill` forwards one token at a time while `GemvBatch` already traverses each weight once for 16 rows and the encode path already does causal-within-chunk attention over a growing KV. Batched prefill makes a chunk shorter in total but longer per step, so isolation is a measured step-time budget (`engine.prefill_step_budget_ms`) rather than a fixed chunk width, and a 30K-token prompt on shared cores still needs spatial isolation — hence `prefill_lane: shared | dedicated`, costing activation buffers rather than duplicated weights. Rejected instead: GEMM-first prefill (the register-pressure wall is unmeasured, so a GEMM spike is a bench-gated follow-up with a 30%-headroom trigger), widening the batch cap past 16, and splitting one chunk across a step boundary (it breaks the "identical to running alone" guarantee).
+- **2026-11-09 — Requests become independent pipelines advanced by a route-aware arbiter; new MVP3.13 sits before MVP4.** The owner's model — each request owning its own transform/prefill/decode loop up to a per-model concurrency limit — is adopted as the control plane, while merged batch steps stay the execution plane's optimization, because on CPU a per-request weight traversal is exactly the rejected bandwidth-thrash shape: a single GEMV already saturates DRAM bandwidth, so N pipelines means N× weight traffic. Splitting the two layers is what makes the model device-neutral: prefill and GPU-resident decode get per-pipeline lanes for free, CPU decode keeps merging. The merge key becomes route identity rather than device identity, so a hybrid model's sequences still merge and pay the boundary tax once per step instead of once per sequence. Rejected instead: one OS thread per request, bolting a lane onto the existing single global step loop, and merging across models (no shared weights, and it breaks per-model quotas).
+- **2026-11-09 — Compute device and weight tier become independent axes, and Strata's `pcie-frac` enters Scope.** `device: cpu | cuda | hybrid` conflates where the math runs with where the bytes live, which forecloses the mode where GPU compute helps while VRAM is the scarce resource: expert slabs resident in DRAM computed on CUDA, streamed per the batch's union active-expert set with double-buffered prefetch. MVP4 carries the seam (DN-M4-7, proved on a dense model fully resident in RAM) and MVP6 carries the expert-shaped version (DN-M6-8) beside the VRAM hot tier rather than replacing it. Rejected instead: VRAM offload as the only hybrid MoE path, frac as a default anywhere (PCIe and DRAM bandwidth are comparable, so the win is situational and must be measured), and unpipelined frac (PCIe latency serialized against compute — the archive's offload tax in a new costume).
+- **2026-11-09 — A route resolves to a backend set, and a merged batch crosses segments whole.** `TransformerModel` and `BlockPool` accept exactly one `IBackend` today, so a hybrid or frac step needs the engine holding one backend per segment before MVP4 can name a split point; model-level concurrency already has the multi-backend shape because each model instance binds its own. The batch is not divided across backends — each segment runs the whole merged batch for its own layers, which is what makes the handoff `batch width × hidden` once instead of per sequence. Rejected instead: hybrid emulated inside `CpuBackend` (device branching in the CPU kernel path), splitting one batch's rows across backends for the same segment (destroys the weight reuse batching exists to create), and a per-sequence backend choice (routing is per token).
+- **2026-11-09 — MVP3.12 is engine-only, and the step-time budget and prefill lane move into MVP3.13.** Both moved items edit `GenerationScheduler`, which MVP3.13 replaces outright: a lane is a property of a pipeline's progress and a token budget bounds a step the arbiter composes, so neither is expressible before pipelines exist. Building them in MVP3.12 would rewrite the scheduler twice for no additional gate. MVP3.12 therefore ships batched prefill, its bench record, and the GEMM decision trigger only.
+- **2026-11-09 — Admission becomes a single three-way check owned by the arbiter.** A request must fit KV block capacity, the resolved token budgets (MVP3.10), and the model's concurrency slot with its per-segment quota, and a rejection names which of the three blocked. Splitting these across the HTTP layer, the scheduler, and the ledger produced three rejections with three different shapes that no user could act on; MVP3.10's reservation math and MVP5's device ledger become inputs to one admission point rather than competing gates.
+- **2026-11-09 — MVP4's frac work is a spike with an identity exit criterion, and the residency decision is MVP6's.** PCIe bandwidth is lower than this box's DRAM bandwidth, so a bandwidth-bound dense decode is not expected to beat the CPU route; the MVP4 item proves the route shape and records the measurement, and an expected loss does not fail it. Whether frac is built at all is settled by Flash-Next's measured expert geometry under DN-M6-1, recorded as an MVP6 open item rather than assumed by this plan.
