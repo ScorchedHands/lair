@@ -23,6 +23,7 @@ namespace Lair.Tests;
 /// test during scripts/generate-parity.ps1 regeneration.
 /// </summary>
 [Trait("Category", "Parity")]
+[Collection("model-loaded")] // shares one serialized lane with the latency-budget suite so a large fixture loading alongside it cannot starve that measurement
 public sealed class ParityTests
 {
     private const string F16Fixture = "tests/fixtures/parity-smollm-f16.json";
@@ -39,6 +40,14 @@ public sealed class ParityTests
     // 1024-hidden model, tied output head) against the same pinned reference and the same quantized-file band.
     private const string Qwen3Fixture = "tests/fixtures/parity-qwen3.json";
 
+    // The Llama-3.2 Q3_K_S fixture: a real llama load (32 x 8 GQA at head_dim 64 over a 2048-hidden, 16-layer model)
+    // against the same pinned reference and the same quantized-file band.
+    private const string Llama32Q3KFixture = "tests/fixtures/parity-llama32-q3ks.json";
+
+    // The Llama-3.2 Q2_K fixture: the same architecture at 2-bit weights, where the chat-template prompt's first step
+    // is a ranking flip — LAIR's argmax is '<' and the reference's is 'Hello', mutual top-5 members.
+    private const string Llama32Q2KFixture = "tests/fixtures/parity-llama32-q2k.json";
+
     /// <summary>Ranking window whose reproduction the fixtures calibrate.</summary>
     private const int CalibrationWindow = 16;
 
@@ -51,10 +60,17 @@ public sealed class ParityTests
     private static double CrossToolTolerance(string fixturePath) =>
         fixturePath == F16Fixture ? 0.05 : 1.0;
 
+    // The band applies to candidates carrying sampling weight: within this many nats of the reference's own top-1,
+    // a candidate's softmax weight is at least ~0.25% of the leader's, so its absolute logprob is a decision-relevant
+    // quantity and both pipelines must agree on it. Deeper candidates are compared only on membership in LAIR's
+    // calibrated window and on reproduction of LAIR's own calibrated value, because their absolute cross-entropy is
+    // dominated by tail shape, where sub-nat logit differences reorder the tail wholesale.
+    private const double CrossToolWindowNats = 6.0;
+
     public static TheoryData<string, int> PromptCases()
     {
         TheoryData<string, int> cases = [];
-        foreach (string fixture in new[] { F16Fixture, Q8Fixture, Q4KMFixture, Qwen3Fixture })
+        foreach (string fixture in new[] { F16Fixture, Q8Fixture, Q4KMFixture, Qwen3Fixture, Llama32Q3KFixture, Llama32Q2KFixture })
         {
             string? path = ModelFixture.ResolveRepoRelative(fixture);
             if (path is null)
@@ -140,11 +156,14 @@ public sealed class ParityTests
                 $"beyond the {ReproductionTolerance:F2} reproduction tolerance.\nlair: [{Format(top)}]");
 
             double crossToolDelta = Math.Abs(top[slot].Logprob - reference.Logprob);
+            double belowLeader = reference.Logprob - entry.TopLogprobs[0].Logprob;
             Assert.True(
-                crossToolDelta <= CrossToolTolerance(fixturePath),
+                belowLeader < -CrossToolWindowNats || crossToolDelta <= CrossToolTolerance(fixturePath),
                 $"prompt '{entry.Prompt.Trim()}' token {reference.Id}('{reference.Token}') sits {crossToolDelta:F4} nats " +
                 $"from the pinned llama.cpp logprob {reference.Logprob:F4} (LAIR now {top[slot].Logprob:F4}), beyond the " +
-                $"{CrossToolTolerance(fixturePath):F2} cross-tool band for this fixture.\nlair: [{Format(top)}]");
+                $"{CrossToolTolerance(fixturePath):F2} cross-tool band, and it is only {-belowLeader:F4} nats below the " +
+                $"reference's top-1 — inside the {-CrossToolWindowNats:F1}-nat window where a candidate carries " +
+                $"sampling weight.\nlair: [{Format(top)}]");
         }
     }
 
