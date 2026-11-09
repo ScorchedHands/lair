@@ -525,7 +525,7 @@ public sealed class GenerationService : IDisposable
         // Tool declarations and the choice are validated here too so programmatic callers meet the same rules as HTTP ones.
         // The pipeline is active only for chat requests that declare tools under a mode other than none: which tool surface
         // the request gets — the template's own rendering or LAIR's fenced block — is resolved once by capability
-        // precedence, and detection reads fences out of the decoded text against the names this choice allows.
+        // precedence, and detection reads recognized calls out of the decoded text against the names this choice allows.
         ToolPipeline tools = ResolveToolPipeline(request);
 
         IReadOnlyCollection<string> callableNames = tools.Active
@@ -694,11 +694,11 @@ public sealed class GenerationService : IDisposable
             throw new OperationCanceledException(cancellationToken);
         }
 
-        // Recognized fences take over the result: the fences vanish from the visible text, the calls ride along as data,
-        // and the finish reason becomes tool_calls no matter how decoding ended. Detection is unchanged by which tool
-        // surface the prompt used: it reads fenced-JSON calls out of the decoded text whenever the pipeline is active,
-        // whether LAIR injected the contract or the template rendered the tools itself. An inert plan has no parser,
-        // so its decoded text is never read and its content stays byte-for-byte what the model generated.
+        // A recognized call takes over the result: its markup vanishes from the visible text, the calls ride along as data,
+        // and the finish reason becomes tool_calls no matter how decoding ended. What counts as a call follows the plan's
+        // parser — fenced blocks for an injected contract, the template's own object shape when the template rendered the
+        // tools — so each surface is read only by its matching reader; an inert plan has no parser, so its decoded text is
+        // never read and its content stays byte-for-byte what the model generated.
         IReadOnlyList<ToolCall>? toolCalls = null;
         IToolOutputParser? outputParser = Volatile.Read(ref _outputParser).Parser;
         if (tools.Active && outputParser is not null)
@@ -997,7 +997,7 @@ public sealed class GenerationService : IDisposable
         return tools;
     }
 
-    // A null choice means auto. A forced function must name one of the declared tools: its fences are then the only ones detection accepts.
+    // A null choice means auto. A forced function must name one of the declared tools: only calls naming it are then accepted.
     private static ToolChoiceSelection ResolveToolChoice(ToolChoiceSelection? choice, IReadOnlyList<ToolDefinition>? declaredTools)
     {
         if (choice is null || choice.Mode == ToolChoiceMode.Auto)

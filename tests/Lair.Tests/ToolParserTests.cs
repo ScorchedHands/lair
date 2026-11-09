@@ -37,7 +37,7 @@ public sealed class ToolParserTests : IDisposable
 
         Assert.Equal("template", engine.Model.ToolParser);
         Assert.Equal(ToolParser.Template, engine.ResolvedOutputParser.ToolParser);
-        Assert.NotNull(engine.ResolvedOutputParser.Parser); // the fenced detector stays wired for a template-rendered model
+        Assert.NotNull(engine.ResolvedOutputParser.Parser); // the template-native reader stays wired for a template-rendered model
         Assert.Null(engine.ResolvedOutputParser.Reasoning); // the reasoning slot is inert for every plan resolved today
 
         GenerationRequest request = ToolRequest("auto-capable-model");
