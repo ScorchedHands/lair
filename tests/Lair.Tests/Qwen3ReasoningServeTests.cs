@@ -38,6 +38,8 @@ public sealed class Qwen3ReasoningServeTests
             return; // pinned model absent: nothing to serve
         }
 
+        IReadOnlyList<FieldResult> baseline = engine.ApplyConfiguration(ConfigFor("keep")); // explicit baseline: whichever policy an earlier case in this class left behind
+
         Assert.Equal(ReasoningPolicy.Keep, engine.ResolvedOutputParser.Reasoning);
         Assert.Equal("keep", engine.Model.Reasoning);
 
@@ -66,6 +68,8 @@ public sealed class Qwen3ReasoningServeTests
             return; // pinned model absent: nothing to serve
         }
 
+        engine.ApplyConfiguration(ConfigFor("keep")); // explicit baseline before the flip being measured
+
         GenerationResult kept = await engine.GenerateAsync(Request(), CancellationToken.None);
         Assert.NotNull(kept.ReasoningRegions);
 
@@ -92,6 +96,40 @@ public sealed class Qwen3ReasoningServeTests
         string visibleSpan = kept.Text[region.Start..region.End];
         Assert.Contains("<think>", visibleSpan, StringComparison.Ordinal); // the withheld span is exactly what keep put on the wire
         Assert.NotEqual(kept.Text, stripped.Text);
+    }
+
+    [Fact]
+    public async Task Serve_PolicyFlipLandingMidGeneration_LeavesTheAdmittedSequenceOnThePolicyItStartedWith()
+    {
+        GenerationService? engine = OpenEngine();
+        if (engine is null)
+        {
+            return; // pinned model absent: nothing to serve
+        }
+
+        IReadOnlyList<FieldResult> baseline = engine.ApplyConfiguration(ConfigFor("keep")); // a flip by an earlier case, if any, is undone here
+
+        Task<GenerationResult> admitted = engine.GenerateAsync(Request(), CancellationToken.None);
+
+        // The flip lands on the same thread while that sequence is still decoding: its plan was captured when it was admitted.
+        FieldResult flipped = Assert.Single(engine.ApplyConfiguration(ConfigFor("strip")));
+        Assert.Equal("models[0].reasoning", flipped.Change.Field);
+        Assert.Equal(ConfigApplyOutcome.Applied, flipped.Outcome);
+
+        GenerationResult inFlightRun = await admitted;
+        _output.WriteLine($"serve mid-flight: policy={inFlightRun.Reasoning} finish={inFlightRun.FinishReason} completion={inFlightRun.CompletionTokens} regions={inFlightRun.ReasoningRegions?.Count ?? 0}");
+        Assert.Equal(ReasoningPolicy.Keep, inFlightRun.Reasoning); // new-requests-only: the sequence already running keeps what it started with
+        Assert.Contains("<think>", inFlightRun.Text, StringComparison.Ordinal);
+
+        GenerationResult next = await engine.GenerateAsync(Request(), CancellationToken.None);
+        _output.WriteLine($"serve after flip: policy={next.Reasoning} finish={next.FinishReason} completion={next.CompletionTokens} regions={next.ReasoningRegions?.Count ?? 0}");
+        Assert.Equal(ReasoningPolicy.Strip, next.Reasoning);
+        Assert.DoesNotContain("<think>", next.Text, StringComparison.Ordinal);
+
+        foreach (FieldResult result in baseline)
+        {
+            _output.WriteLine($"serve baseline: {result.Change.Field} -> {result.Outcome}");
+        }
     }
 
     private static GenerationRequest Request() => new()

@@ -540,7 +540,12 @@ public sealed class GenerationService : IDisposable
         // The pipeline is active only for chat requests that declare tools under a mode other than none: which tool surface
         // the request gets — the template's own rendering or LAIR's fenced block — is resolved once by capability
         // precedence, and detection reads recognized calls out of the decoded text against the names this choice allows.
-        ToolPipeline tools = ResolveToolPipeline(request);
+        // The plan this request runs on is the one resolved when it was admitted, captured once here: a new-requests-only
+        // reload re-resolves the shared plan for later requests and leaves an already-admitted sequence on what it started
+        // with — its tool surface, its reasoning policy, everything else about its output follows the same one value.
+        OutputParserPlan plan = Volatile.Read(ref _outputParser);
+
+        ToolPipeline tools = ResolveToolPipeline(request, plan);
 
         IReadOnlyCollection<string> callableNames = tools.Active
             ? tools.Choice.Mode == ToolChoiceMode.Function
@@ -716,8 +721,8 @@ public sealed class GenerationService : IDisposable
         // Reasoning regions are recognized from the markup this generation actually contains, whichever model produced it:
         // boundaries are recorded either way, and only a strip policy withholds them from visible content. A keep policy
         // leaves the text byte-for-byte as generated, which is what every model serves today. Recognition runs before call
-        // reading so a call markup inside reasoning that gets stripped never reaches the parser as a call.
-        OutputParserPlan plan = Volatile.Read(ref _outputParser);
+        // reading so a call markup inside reasoning that gets stripped never reaches the parser as a call. The plan in force
+        // is the one this sequence was admitted on, not whatever a reload has since resolved.
         ReasoningDetection reasoning = plan.Reasoning == ReasoningPolicy.Strip
             ? ReasoningRecognition.Strip(text)
             : new ReasoningDetection(ReasoningRecognition.FindRegions(text), text);
@@ -747,7 +752,8 @@ public sealed class GenerationService : IDisposable
             outcome.PrefillCachedTokens,
             request.LogProbs ? outcome.LogProbs : null,
             toolCalls,
-            reasoning.Regions.Count > 0 ? reasoning.Regions : null);
+            reasoning.Regions.Count > 0 ? reasoning.Regions : null,
+            plan.Reasoning);
     }
 
     public void Dispose()
@@ -872,7 +878,7 @@ public sealed class GenerationService : IDisposable
     internal string BuildChatPrompt(GenerationRequest request, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return BuildChatPrompt(request, ResolveToolPipeline(request), cancellationToken).Text;
+        return BuildChatPrompt(request, ResolveToolPipeline(request, Volatile.Read(ref _outputParser)), cancellationToken).Text;
     }
 
     /// <summary>
@@ -887,14 +893,13 @@ public sealed class GenerationService : IDisposable
         IReadOnlyList<ToolDefinition>? TemplateTools,
         IReadOnlyList<ToolDefinition>? InjectedTools);
 
-    private ToolPipeline ResolveToolPipeline(GenerationRequest request)
+    private ToolPipeline ResolveToolPipeline(GenerationRequest request, OutputParserPlan outputParser)
     {
         IReadOnlyList<ToolDefinition>? declaredTools = ValidateToolDeclarations(request.Tools);
         ToolChoiceSelection choice = ResolveToolChoice(request.ToolChoice, declaredTools);
 
         // ToolChoiceMode.None closes the pipeline before any precedence decision: no template tools, no injection.
         // An inert plan closes it the same way for every request: the model gets no tool surface at all.
-        OutputParserPlan outputParser = Volatile.Read(ref _outputParser);
         if (!request.IsChat || declaredTools is not { Count: > 0 } || choice.Mode == ToolChoiceMode.None || outputParser.ToolParser == ToolParser.None)
         {
             return new ToolPipeline(declaredTools, choice, false, null, null);

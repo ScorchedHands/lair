@@ -364,11 +364,12 @@ public static class ApiApp
                     [new ChunkChoice(0, new ChunkDelta(Content: gen.DecodeToken(entry.TokenId), Logprobs: WireEntry(gen, entry)), null)]), http);
             }
         }
-        else if (gen.ResolvedOutputParser.Reasoning == ReasoningPolicy.Strip)
+        else if (result.Reasoning == ReasoningPolicy.Strip)
         {
             // A strip policy withholds the recognized reasoning regions from streamed content exactly as they settle: a
             // boundary marker split across pieces stays pending until the next piece settles it, so no part of a region ever
-            // reaches the wire and every delta is ordinary visible text. Boundaries are recorded on the result itself.
+            // reaches the wire and every delta is ordinary visible text. The filter follows the policy this sequence was
+            // admitted on — carried on its result — not whatever reload has since resolved. Boundaries are recorded there too.
             ReasoningRegionFilter filter = new();
             foreach (string piece in pieces)
             {
