@@ -560,18 +560,18 @@ Dense GGUF architecture families load through a load-time profile registry that 
   - Rationale: the pinned llama.cpp build is the parity oracle (DN-M33-5). Parity requires reading the same keys and failing visibly where LAIR has no implementation yet. The pinned Qwen3 GGUF carries `blk.N.attn_q_norm.weight`/`attn_k_norm.weight` and applies them without declaring `attention.use_qk_norm`, so a declared-only rule would load that file with the norm silently missing — the exact failure mode this note exists to prevent.
   - Rejected: honoring tensor presence only (current bias behavior mis-states intent and silently accepts a model that declares no bias); ignoring unrecognized keys (silently wrong math); implementing every declared feature before any family is proven against the oracle; resolving QK-norm from a declared key alone (the reference applies it on tensor presence for these families).
   - Contract: `lair.loader` exposes typed metadata accessors for these keys; plan resolution reports an unsupported declared key as a load failure naming key, value, and family.
-- **DN-M34-5** — Family order is fixture-driven under the 512 MB–1 GB model budget: `llama` and `qwen2` are re-expressed as profiles with byte-identical behavior, then `qwen3` (per-head QK-norm, `head_length`, declared bias), then Gemma-2 (GELU-tanh FFN, attention and final-logit softcaps, `head_length`). Phi is deferred until RoPE scaling exists (MVP3.7) because its metadata declares it, and Gemma-3 stays deferred to MVP3.8 for its per-layer windowed/full attention interleave.
+- **DN-M34-5** — Family order is fixture-driven under the 512 MB–1 GB model budget: `llama` and `qwen2` are re-expressed as profiles with byte-identical behavior, then `qwen3` (per-head QK-norm, `head_length`, declared bias), then Gemma-2 (GELU-tanh FFN, attention and final-logit softcaps, `head_length`). Phi is deferred until RoPE scaling exists (MVP3.7) because its metadata declares it, and Gemma-3 stays deferred to MVP3.9 for its per-layer windowed/full attention interleave.
   - Rationale: each added family must prove a primitive the previous families did not (QK-norm and head-length independence; then a different activation, two caps, and a declared attention window) and must be verifiable against the pinned oracle on a file this box can actually load.
-  - Rejected: adding families that repeat already-proven primitives; Phi-3 in this phase (needs `phi3.rope.scaling.*`, which is MVP3.7 work); Mistral in this phase (its distinguishing feature is window-local KV reads and interleave, deferred to MVP3.8); families with no published quant under the 1 GB ceiling.
+  - Rejected: adding families that repeat already-proven primitives; Phi-3 in this phase (needs `phi3.rope.scaling.*`, which is MVP3.7 work); Mistral in this phase (its distinguishing feature is window-local KV reads and interleave, deferred to MVP3.9); families with no published quant under the 1 GB ceiling.
   - Contract: each family lands with a pinned model file (sha256 recorded in its parity fixture) plus synthetic layer fixtures; `Category=Parity` and `Category=Layers` are the gates.
-- **DN-M34-6** — MoE is representable in MVP3.4 and executable in MVP3.8. The plan carries a sparse-FFN descriptor (expert count, per-expert tensor map, shared expert, router tensors) and the loader recognizes MoE metadata and tensors, but a MoE model fails at load with an actionable message naming sparse execution as deferred.
+- **DN-M34-6** — MoE is representable in MVP3.4 and executable in MVP3.9. The plan carries a sparse-FFN descriptor (expert count, per-expert tensor map, shared expert, router tensors) and the loader recognizes MoE metadata and tensors, but a MoE model fails at load with an actionable message naming sparse execution as deferred.
   - Rationale: retrofitting a sparse-FFN descriptor into a plan that has already shipped three families is expensive; executing MoE before its gather/residency design is measurable is worse. MVP6 keeps Flash-Next residency, prefetch, PLE, and MTP.
   - Rejected: executing MoE in this phase with all experts resident (no gather design, no fixture under the RAM budget); leaving MoE invisible in the plan (retrofit later); pulling Flash-Next residency forward into MVP3.
-  - Contract: the plan's sparse-FFN descriptor is present and validated in MVP3.4; `IGatherKernel` and expert residency land in MVP3.8/MVP6.
-- **DN-M34-7** — A declared attention window is honored as a score mask with full KV retention. `<arch>.attention.sliding_window` becomes a plan value; each attention path excludes positions further back than the window, while the KV cache still stores every position. The KV-layout half of windowed attention — bounded KV reads, per-layer windowed/full interleave, and cache-reuse accounting — stays in MVP3.8.
+  - Contract: the plan's sparse-FFN descriptor is present and validated in MVP3.4; `IGatherKernel` and expert residency land in MVP3.9/MVP6.
+- **DN-M34-7** — A declared attention window is honored as a score mask with full KV retention. `<arch>.attention.sliding_window` becomes a plan value; each attention path excludes positions further back than the window, while the KV cache still stores every position. The KV-layout half of windowed attention — bounded KV reads, per-layer windowed/full interleave, and cache-reuse accounting — stays in MVP3.9.
   - Rationale: the pinned Gemma-2 file declares `gemma2.attention.sliding_window = 4096` and the pinned oracle applies that mask, so loading Gemma-2 in this phase without the mask would silently mis-state the math, which DN-M34-4 forbids. The pinned reference itself keeps full KV and masks scores, so the mask is the part that carries parity; the bounded-read optimization changes memory behavior, not output.
   - Rejected: rejecting Gemma-2 for declaring a window (blocks a family this phase exists to prove); loading it and ignoring the declaration (silently wrong beyond the window); pulling bounded KV reads and interleave into this phase (a KV-block design concern with no parity requirement at fixture context sizes).
-  - Contract: `lair.models` resolves the window into the plan and applies it in every attention path; `lair.kv` layout consequences land in MVP3.8. Measured against the pinned reference on the Gemma-2 fixture, its masking is backward-only — a position at sequence start has zero forward visibility even when the whole sequence fits the declared window — so LAIR's symmetric range for the bidirectional path is a convention with no oracle counterpart yet (MVP3.8 open item).
+   - Contract: `lair.models` resolves the window into the plan and applies it in every attention path; `lair.kv` layout consequences land in MVP3.9. Measured against the pinned reference on the Gemma-2 fixture, its masking is backward-only — a position at sequence start has zero forward visibility even when the whole sequence fits the declared window — so LAIR's symmetric range for the bidirectional path is a convention with no oracle counterpart yet (MVP3.9 open item).
 - **DN-M34-8** — Residual-norm placement and QK-norm weighting are resolved plan values, not engine assumptions. The plan carries where block norms apply (pre-block only, or pre-block plus an extra norm on each sublayer output before the residual add), and per-head QK-norm resolves to one of three modes — off, weighted from tensors, or unweighted — because the pinned Gemma-2 file ships no `attn_q_norm`/`attn_k_norm` tensors while its reference applies a per-head normalization.
   - Rationale: today's forward graph is fixed RMSNorm-before-sublayer with weights read from tensors. That shape cannot express Gemma-2, which normalizes each attention and feed-forward output again before the residual add using `blk.N.post_attention_norm.weight` and `blk.N.post_ffw_norm.weight`, and it cannot express a normalization that has no weight tensor at all. Both are structural facts about the family's graph rather than new scalar operations, so they belong in the plan next to norm kind and activation.
   - Rejected: hardcoding post-norm behavior for Gemma inside `TransformerModel` (the architecture-branch posture DN-M34-1 rejects); treating missing QK-norm tensors as a load failure for every family (Gemma-2 legitimately has none); an optional per-role norm interface list resolved at runtime.
@@ -602,10 +602,10 @@ Dense GGUF architecture families load through a load-time profile registry that 
 - [✓] Gemma-2 dense family — a `gemma2` profile wiring the block graph the pinned reference actually runs, with synthetic layer fixtures and oracle-measured forward parity (see DN-M34-5, DN-M34-8).
   - Verify: `dotnet test --filter Category=Loader -c Release` — 93/93: `gemma2` resolves RmsNorm block norms, `GeGluExact`, rotate-half RoPE, post-sublayer output placement, the sqrt(hidden) input-embedding gain, QK-norm off with a declared true demanding the vectors, bias declared-only with present-but-unconsumed vectors reported through the ignore path, caps 50/30, window 4096, head dim 256 over hidden 2304 with GQA 8/4. `dotnet test --filter Category=Layers -c Release` — 94/94: the forward matches a double-precision scalar reference of the reference graph through decode, batched decode, and `Encode`, with each feature pinned by a counterfactual reference that demonstrably differs (no embedding gain, QK-normed, tanh GELU, pre-only placement, uncapped scores, uncapped logits). `Category=Parity|Serve` stays 34/34; full suite 897/897.
   - What the oracle overturned: the family was designed as LayerNorm with GELU-tanh, dense attention biases, and an unweighted per-head QK norm. Measured against the pinned reference it is RMSNorm everywhere including the output norm, exact GELU in the gate, no per-head QK normalization at all, an input-embedding gain of `sqrt(hidden)` that the conversion leaves out of the weights, and attention biases that its forward does not consume. Each choice ships with the measured delta that forced it (0.18–0.53 nats against the reference's own top-5), not with the design guess.
-  - Real-model parity fixture is blocked, not failed: `tokenizer.ggml.model=llama` is a SentencePiece vocabulary and LAIR supports only GGUF BPE profiles, so `scripts/generate-parity.ps1` cannot calibrate this file. The forward was proven by driving LAIR's engine with reference-supplied token ids instead. Serving Gemma-2 needs the MVP3.10 SPM tokenizer profile.
+  - Real-model parity fixture is blocked, not failed: `tokenizer.ggml.model=llama` is a SentencePiece vocabulary and LAIR supports only GGUF BPE profiles, so `scripts/generate-parity.ps1` cannot calibrate this file. The forward was proven by driving LAIR's engine with reference-supplied token ids instead. Serving Gemma-2 needs the MVP3.11 SPM tokenizer profile.
 - [✓] Window interleave — the pinned reference applies the Gemma-2 window to alternating layers (local on even indices, full on odd), while LAIR applies a declared window to every layer, which masks attention in layers the reference leaves unmasked beyond the window length. Resolve a per-family interleave pattern in the plan and apply it in the score mask only; bounded KV reads stay deferred (see DN-M34-7).
   - Verify: `dotnet test --filter Category=Layers -c Release` — 99/99: an alternating multi-layer model matches a double-precision scalar reference that masks only even-index layers and differs from masking every layer, `AllLayers` stays bit-identical to the explicit all-layers plan, batched decode equals single-token under alternation, the `Encode` golden holds across chunks, and an alternating pattern with no declared window is bit-identical to having no pattern. `Category=Loader` 95/95: `gemma2` resolves `AlternatingLocalFirst` with or without a declared window while `llama`/`qwen2`/`qwen3`/generic resolve `AllLayers`. `Category=Parity|Serve` stays 34/34; full suite 904/904.
-- [✓] Family fixture set — pin one Qwen3 GGUF inside the 512 MB–1 GB model budget, record its sha256 in the new parity fixture, and regenerate goldens with `scripts/generate-parity.ps1` (see DN-M34-5). The Gemma-2 half is deferred: no published quant is under 1 GB (smallest Q2_K at 1,173 MB) and its SentencePiece vocabulary blocks the harness, so its pinning belongs to MVP3.10.
+- [✓] Family fixture set — pin one Qwen3 GGUF inside the 512 MB–1 GB model budget, record its sha256 in the new parity fixture, and regenerate goldens with `scripts/generate-parity.ps1` (see DN-M34-5). The Gemma-2 half is deferred: no published quant is under 1 GB (smallest Q2_K at 1,173 MB) and its SentencePiece vocabulary blocks the harness, so its pinning belongs to MVP3.11.
   - Verify: `pwsh -File scripts/generate-parity.ps1 -ModelPath models/Qwen3-0.6B-Q8_0.gguf -Out tests/fixtures/parity-qwen3.json` writes a guarded fixture and `dotnet test --filter Category=Parity -c Release` passes it.
   - Pinned: `models/Qwen3-0.6B-Q8_0.gguf` (609,800 KB, sha256 `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`, from `Qwen/Qwen3-0.6B-GGUF`) loads under the pinned b12032 loader and reports `qwen3` (28 layers, 1024 hidden, 16/8 heads, 128 key/value length). `models/gemma-2-2b-it.Q4_K_M.gguf` (1,629,000 KB, sha256 `ff7c35808d3b2fc5c4f955ca931efdec71c0808b9ec89a9878cb771608787058`, from `mradermacher/gemma-2-2b-it-GGUF`) is kept only as the oracle-measurement file for the forward graph — it reports `gemma2` (26 layers, 2304 hidden, 8/4 heads, 256 key/value length, caps 50/30, window 4096) and is out of budget.
   - Status: `tests/fixtures/parity-qwen3.json` is generated, sha256-guarded, and green, and `models/Qwen3-0.6B-Q8_0.gguf` at 610 MB sits inside the revised band. The Gemma-2 fixture cannot be generated: its `tokenizer.ggml.model=llama` vocabulary is SentencePiece and the harness calibrates through LAIR's tokenizer, which supports BPE only.
@@ -618,15 +618,15 @@ Dense GGUF architecture families load through a load-time profile registry that 
 - [✓] Automated Layer Strategies: LayerNorm, GELU, GELU-tanh, GEGLU, QK-norm, head-length independence, and both logit caps against scalar references, with existing RMSNorm/SwiGLU regression unchanged. Verify: `dotnet test --filter Category=Layers -c Release` — 77/77 across all five items, with `Category=Parity|Serve` unchanged at 30/30.
 - [✓] Automated Window Mask: declared-window resolution and rejection diagnostics, out-of-window positions contributing nothing against a masked scalar reference, window-at-or-beyond-length equivalence through decode and encode, batch/single equality, composition with softcap, and KV retention under masking. Verify: `dotnet test --filter Category=Loader|Layers -c Release` — Loader 77, Layers 86.
 - [✓] Automated Qwen3 Parity: dense Qwen3 output parity vs pinned llama.cpp within documented tolerance. Verify: `dotnet test --filter Category=Parity -c Release` — 4 prompts against `tests/fixtures/parity-qwen3.json` (`models/Qwen3-0.6B-Q8_0.gguf`, sha256 recorded in the fixture), passing inside the quantized-file band with LAIR's calibration reproduced exactly.
-- [✓] Manual Family Serve: `models/Qwen3-0.6B-Q8_0.gguf` served on `:8181`; two-turn exchange coherent (`2 + 2` → assistant `4` → `multiply by 3` answered `12`, `finish_reason: eos`), `/ui/` serving (HTTP 200), resolved architecture and quant read from `/v1/models` (`architecture: qwen3`, `quant: Q8_0`), and the monitor stream reported the working set, KV capacity/usage, devices and thread quota. Verify: live two-turn exchange plus `/monitor/stream` snapshot frames. Serving profile that satisfies the model budget: `max_context_tokens: 512`, `kv_blocks: 32`, `thread_quota: 4` — peak 1,000 MB, steady 977 MB. The default `4096`/`256`/`8` profile measured 1,726–1,740 MB, so the budget is a profile constraint, not just a file-size one. Gemma-2 is excluded until its tokenizer exists (MVP3.10).
+- [✓] Manual Family Serve: `models/Qwen3-0.6B-Q8_0.gguf` served on `:8181`; two-turn exchange coherent (`2 + 2` → assistant `4` → `multiply by 3` answered `12`, `finish_reason: eos`), `/ui/` serving (HTTP 200), resolved architecture and quant read from `/v1/models` (`architecture: qwen3`, `quant: Q8_0`), and the monitor stream reported the working set, KV capacity/usage, devices and thread quota. Verify: live two-turn exchange plus `/monitor/stream` snapshot frames. Serving profile that satisfies the model budget: `max_context_tokens: 512`, `kv_blocks: 32`, `thread_quota: 4` — peak 1,000 MB, steady 977 MB. The default `4096`/`256`/`8` profile measured 1,726–1,740 MB, so the budget is a profile constraint, not just a file-size one. Gemma-2 is excluded until its tokenizer exists (MVP3.11).
 
 #### Open Items
 
 - [✓] **Fixture budget conformance** — `models/Llama-3.2-1B-Instruct-Q8_0.gguf` (1,260 MB) is replaced by `models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` (770 MB, sha256 `3f5a22426976ab26cfe84dba63c1d08391717abb1af893e10f1b2968d862dcc1`, from `unsloth/Llama-3.2-1B-Instruct-GGUF`); the serve, tokenizer-parity and template-parity references, the `scripts/generate-template-parity.ps1` default, and `DEVELOP.md` all point at it, and both llama goldens were regenerated from it.
   - Verify: `Category=Tokenizer` 43/43, `Category=TemplateParity` 14/14, `Category=Parity|Serve` 34/34, full suite 924/924. The regenerated goldens are byte-identical except `model_file`, `model_sha256`, `generated_utc`, and the fixture-pinned `date_string` (`06 Nov 2026` → `08 Nov 2026`) that the 12 `expected_prompt` values embed — quant-independence of ids and template rendering is proven by the diff, not assumed.
 - [_] **Serve working set under the new ceiling** — measured, not estimated: a 770 MB-weight fixture peaks at 1,102–1,174 MB (≈360–395 MB of runtime overhead per engine: worker compute buffers, JIT, vocab tables) and stays over 1,024 MB even with `kv_blocks: 32` and `thread_quota: 4`. Qwen3-0.6B (610 MB weights) fits the ceiling at 1,000 MB peak with the same tight profile, so the ceiling is reachable only for fixtures under ≈640 MB of weights. `Q2_K` (554 MB) and `Q3_K_S` (612 MB) are published for Llama-3.2 and both are formats MVP3.5 adds; re-pin the llama serve fixture to `Q3_K_S` after MVP3.5 and re-measure.
-- [_] **Gemma-2 serving** — real-model parity and live serve for the pinned Gemma-2 fixture need a SentencePiece tokenizer profile; decide whether that lands as MVP3.10 or merges into an earlier tokenizer phase.
-- [_] **Window interleave** — whether the alternating local/full pattern belongs in the plan as a family property or as metadata once a declaration exists for it; the score-mask half is an MVP3.4 item and the KV-read half is MVP3.8.
+- [_] **Gemma-2 serving** — real-model parity and live serve for the pinned Gemma-2 fixture need a SentencePiece tokenizer profile; decide whether that lands as MVP3.11 or merges into an earlier tokenizer phase.
+- [_] **Window interleave** — whether the alternating local/full pattern belongs in the plan as a family property or as metadata once a declaration exists for it; the score-mask half is an MVP3.4 item and the KV-read half is MVP3.9.
 
 ### MVP3.5 [v0.3.5] - Refined
 
@@ -644,7 +644,7 @@ Published GGUF quant families are accepted through a load-time quant descriptor/
   - Contract: `GgmlType`'s switch becomes `GgmlTypeRegistry.TryResolve(uint id, out QuantDescriptor)`; `QuantDescriptor { TypeId, Name, Format, BlockSize, TypeSize }`; `QuantFormat` stays the enum the kernels switch on.
 - **DN-M35-3** — Format priority is fixture-driven: `Q3_K` and `Q2_K` enter this phase, nothing else. `Q4_0`/`Q5_0`/`Q5_1`/`Q8_1`/`Q8_K`, the IQ family, and TQ formats stay out until a published fixture demands them.
   - Rationale: MVP3.4 shipped an open item that only these two formats can close — the Llama-3.2 serve fixture needs about 640 MB of weights or less, and `Q3_K_S` (612 MB) and `Q2_K` (554 MB) are the only published sub-640 MB files that are not IQ-class. Every format added carries a kernel, an oracle parity gate, and a real fixture, so formats no target model ships in are dead weight.
-  - Rejected: IQ2/IQ3 (needs the code-sharing machinery, and no published file under the budget needs them yet); `Q4_0` (superseded by `Q4_K` for every model LAIR serves); `Q8_K` (no published GGUF ships it as a standard file); implementing every GGML type for completeness (untestable formats with no demand).
+  - Rejected: `IQ4_NL`/`IQ4_XS`/`IQ3_XXS` (they get their own phase at MVP3.8, where the fixture and measurement gates for them live); `Q4_0` (superseded by `Q4_K` for every model LAIR serves); `Q8_K` (no published GGUF ships it as a standard file); implementing every GGML type for completeness (untestable formats with no demand).
   - Contract: `QuantFormat` gains `Q2_K` and `Q3_K`; GGML ids 10 and 11 become accepted; `Category=Kernel` and `Category=Parity` gate both.
 - **DN-M35-4** — `Q2_K` and `Q3_K` are super-block formats with per-sub-block scales and asymmetric min-based quantization, so their definition is the pinned reference's `dqK` layout, not a LAIR-authored scalar golden. Parity is asserted against pinned b12032 on a real file in the quantized band.
   - Rationale: these are the first formats LAIR sees where scales are per-32-element sub-block inside a 256-element super-block and where the value is `min + q * scale` rather than `q * scale`. A hand-written golden that disagrees with the reference is worthless, because the reference defines the format.
@@ -723,24 +723,64 @@ RoPE scaling and positional-encoding variants load through RoPE strategy adapter
 
 ### MVP3.8 [v0.3.8] - Tentative
 
+Dense IQ quantization loads, decodes, and serves on the CPU engine at two tiers — `IQ4_NL`/`IQ4_XS` for quality under the budget and `IQ3_XXS` as the owner's target quant — landed before MoE execution so the sparse path can reuse them.
+
+#### Design Notes
+
+- **DN-M38-1** *(tentative)* — Three registry entries on the MVP3.5 descriptor seam, not a generic IQ kernel: ggml ids 20 `IQ4_NL`, 23 `IQ4_XS`, and 18 `IQ3_XXS`, each with block geometry verified against `ggml.h` and its own scalar-oracle plus AVX2 dequant/GEMV/GemvBatch paths in the shape DN-M31-1 established.
+  - Rationale: the owner's runs target IQ3_XXS, MVP6's expert slabs (DN-M6-2) assume that format, and `IQ4_XS` is already published for a fixture family at budget size (`unsloth/Llama-3.2-1B-Instruct-GGUF` ships `IQ4_XS` at 709 MB, inside the ceiling and better quality per byte than the 770 MB Q4_K_M currently pinned). Landing both tiers together shares one fixture set, one oracle harness, and one registry change instead of repeating them in a later phase.
+  - Rejected (preliminary): `IQ2_XXS`/`IQ2_XS`/`IQ2_S`, `IQ1_S`/`IQ1_M`, and `TQ1_0`/`TQ2_0` — sub-3-bit quality with the hardest packing in the family and no fixture demand anywhere in this plan; a single "generic IQ" kernel (the formats do not share block layout or table structure); leaving dense coverage in the MVP5 series, which puts an unbuilt dependency behind MoE execution.
+  - Contract: `GgmlTypeRegistry`/`QuantDescriptor` accept ids 18, 20, and 23; `QuantFormat` gains `IQ4_NL`, `IQ4_XS`, and `IQ3_XXS`; `TensorShape` row stride and `CpuBackend` dequant/GEMV/GemvBatch paths follow DN-M31-1.
+- **DN-M38-2** *(tentative)* — Every format in this phase is defined by the pinned reference's own dequant tables, not by a LAIR-authored golden: `IQ4_NL`/`IQ4_XS` through the reference's 4-bit IQ path and `IQ3_XXS` through its 3-bit one. Each gate is scalar-vs-AVX2 bit-identity plus real-fixture parity against pinned b12032, and each format must also record measured GEMV cost against the Q4_K_M baseline before it can be recommended rather than merely supported.
+  - Rationale: IQ formats dequant through lookup tables whose exact values the reference owns, so a hand-written golden would only prove LAIR agrees with itself; and the family's known weakness is shuffle-heavy unpacking on AVX2, which has to be measured per format rather than assumed from the K-quant results.
+  - Rejected (preliminary): synthetic-only gating; accepting "close enough" decode differences; shipping a recommended default quant from paper sizes instead of measured tok/s; porting llama.cpp's table structures without measuring the managed AVX2 path.
+  - Contract: `Category=Kernel` asserts per-format scalar-vs-AVX2 and 1T-vs-4T bit-identity with `GemvBatch` equal to solo `Gemv`; `Category=Parity` asserts decode parity on real fixtures inside the quantized band; bench records each format's GEMV cost against Q4_K_M.
+
+#### Implementation Items
+
+- [_] IQ registry entries and geometry — ids 18 `IQ3_XXS`, 20 `IQ4_NL`, and 23 `IQ4_XS` accepted through the MVP3.5 descriptor registry with correct block size, type size, and row stride (see DN-M38-1).
+  - Verify: `dotnet test --filter Category=Loader -c Release` — synthetic tensors for all three ids accepted with correct stride; a truncated or mis-strided tensor fails naming the tensor, the id, and expected geometry; an out-of-scope id such as 22 `IQ2_S` still rejects naming its name and id, proving the scope boundary.
+- [_] `IQ4_NL` and `IQ4_XS` kernels — scalar oracle plus AVX2 fused dequant and batch path per the settled kernel strategy (see DN-M38-1, DN-M38-2).
+  - Verify: `dotnet test --filter Category=Kernel -c Release` — synthetic-block scalar-vs-AVX2 and 1T-vs-4T bit-identity for each format, `GemvBatch` equals solo `Gemv`.
+- [_] `IQ3_XXS` kernel — scalar oracle plus AVX2 fused dequant and batch path per the settled kernel strategy (see DN-M38-1, DN-M38-2).
+  - Verify: `dotnet test --filter Category=Kernel -c Release` — same gate as the 4-bit pair on a full super-block including its sub-scale packing.
+- [_] IQ fixture set and end-to-end serve — real fixtures inside the model budget load, decode, and serve at both tiers (see DN-M38-2).
+  - Verify: automated real-fixture decode sanity (skip-if-absent) plus manual `lair serve` chat through the API and `/ui`, with `/v1/models` reporting `quant: IQ4_XS` and `quant: IQ3_XXS`.
+- [_] Format cost measurement — GEMV throughput for each new format against the Q4_K_M baseline, recorded rather than assumed (see DN-M38-2).
+  - Verify: `dotnet run --project bench/Lair.Bench -- <args>` records a per-format GEMV and decode tok/s table on the reference fixture model at equal context.
+
+#### Tests
+
+- [_] Automated Registry: acceptance for ids 18/20/23, geometry and stride validation, out-of-scope id rejection naming name and id.
+- [_] Automated Kernel: per-format scalar-vs-AVX2 bit-identity, batch equivalence, and real-fixture decode sanity.
+- [_] Manual IQ Serve: both tiers served; chat via API and `/ui`; monitor live with the quant reported.
+
+#### Open Items
+
+- [_] **Kernel strategy** — fused dequant-GEMV (the repo pattern) versus llama.cpp's dot-vec lookup-table approach on AVX2, decided separately for the 4-bit and 3-bit paths; settle in `/plan-refine mvp3.8` before build.
+- [_] **Fixture choice** — plain published files versus unsloth dynamic (`UD-`) variants: `unsloth/Llama-3.2-1B-Instruct-GGUF` publishes `IQ4_XS` at 709 MB and `UD-IQ3_XXS` at 549 MB, both inside the budget; decide which files the gates pin and whether an IQ fixture replaces the pinned Q4_K_M llama fixture.
+- [_] **Recommended quant policy** — whether measurement makes `IQ4_XS` the documented default over `Q4_K_M` for quality-per-byte work; settle on measured tok/s, not file size.
+
+### MVP3.9 [v0.3.9] - Tentative
+
 Sparse and windowed architectures execute: dense-resident MoE decoding and sliding-window/local attention, both through the MVP3.4 model plan.
 
 #### Design Notes
 
-- **DN-M38-1** *(tentative)* — MoE executes with all experts resident in RAM: router scoring, top-k selection with renormalization, shared expert, and per-expert gate/up/down GEMVs accumulated into the residual. Gather and residency optimization stay in MVP6, where the Flash-Next measurement gate and tier design live.
+- **DN-M39-1** *(tentative)* — MoE executes with all experts resident in RAM: router scoring, top-k selection with renormalization, shared expert, and per-expert gate/up/down GEMVs accumulated into the residual. Gather and residency optimization stay in MVP6, where the Flash-Next measurement gate and tier design live.
   - Rationale: proving sparse-FFN math against a dense-equivalent reference needs no residency machinery, and doing it before MVP6 turns `IGatherKernel` from a new concept into an optimization of a proven path.
   - Rejected (preliminary): expert streaming or hot/cold tiers here (that is MVP6's measured design); MoE-only gather kernels before a correctness baseline.
   - Contract: `lair.models` executes the sparse-FFN descriptor resolved by the MVP3.4 plan; `Category=Moe` correctness goldens.
-- **DN-M38-2** *(tentative)* — The KV-layout half of windowed attention: bounded KV reads, per-layer windowed/full interleave, and prompt-cache reuse under windowed reads. The score-mask half — honoring a declared window by excluding out-of-range positions while keeping full KV — already ships in MVP3.4 (DN-M34-7); this note covers what changes once KV stops storing every position.
+- **DN-M39-2** *(tentative)* — The KV-layout half of windowed attention: bounded KV reads, per-layer windowed/full interleave, and prompt-cache reuse under windowed reads. The score-mask half — honoring a declared window by excluding out-of-range positions while keeping full KV — already ships in MVP3.4 (DN-M34-7); this note covers what changes once KV stops storing every position.
   - Rationale: Mistral and Gemma-3 are unusable without bounded reads and interleave, and the window interacts with the paged KV block design (DN-M2-4) rather than being an attention-loop constant.
   - Rejected (preliminary): treating the window as an attention-kernel parameter only (ignores block reuse and KV budget accounting).
   - Contract: plan carries per-layer window and interleave pattern; `lair.kv` block selection honors it.
 
 #### Implementation Items
 
-- [_] MoE execution — router, top-k with renormalize, shared expert, per-expert FFN accumulation (see DN-M38-1)
+- [_] MoE execution — router, top-k with renormalize, shared expert, per-expert FFN accumulation (see DN-M39-1)
   - Verify: `dotnet test --filter Category=Moe -c Release` — sparse-FFN output matches a dense-equivalent reference; a real MoE fixture (if a published file lands under the 1 GB ceiling) matches pinned b12032 within tolerance.
-- [_] Windowed KV layout — bounded KV reads, per-layer windowed/full interleave, and correct KV block selection and cache reuse on top of the shipped score mask (see DN-M38-2)
+- [_] Windowed KV layout — bounded KV reads, per-layer windowed/full interleave, and correct KV block selection and cache reuse on top of the shipped score mask (see DN-M39-2)
   - Verify: `dotnet test --filter Category=Layers|Cache -c Release` — windowed logits match the full-KV reference while block selection reads only the in-window range, and prompt-cache reuse stays correct across windowed and full layers.
 
 #### Tests
@@ -751,16 +791,16 @@ Sparse and windowed architectures execute: dense-resident MoE decoding and slidi
 #### Open Items
 
 - [_] **MoE fixture** — no published MoE GGUF fits the 512 MB–1 GB model budget; decide between synthetic-MoE goldens only and a budget exception for one real MoE file.
-- [_] **Family order vs MVP6** — whether Mistral/Gemma-3 land here or wait for the MVP6 measurement gate; settle in `/plan-refine mvp3.8`.
+- [_] **Family order vs MVP6** — whether Mistral/Gemma-3 land here or wait for the MVP6 measurement gate; settle in `/plan-refine mvp3.9`.
 - [_] **Bidirectional window semantics** — the pinned reference exposes only causal (backward-only) masking for a windowed file, while LAIR's `Encode` path applies a symmetric range; decide whether encoder parity should match backward-only before any embedding fixture runs against a windowed model.
 
-### MVP3.9 [v0.3.9] - Tentative
+### MVP3.10 [v0.3.10] - Tentative
 
 Token budgets are configured per model: a reasoning budget and a response budget, each overridable per request.
 
 #### Design Notes
 
-- **DN-M39-1** *(tentative)* — Two budgets per model, `max_reasoning_tokens` and `max_response_tokens`, set per model in `lair.yaml` and overridable per request. The scheduler reserves against both, the decode loop stops at the reasoning ceiling while a recognized reasoning region is open, and the visible response is bounded by the response budget.
+- **DN-M310-1** *(tentative)* — Two budgets per model, `max_reasoning_tokens` and `max_response_tokens`, set per model in `lair.yaml` and overridable per request. The scheduler reserves against both, the decode loop stops at the reasoning ceiling while a recognized reasoning region is open, and the visible response is bounded by the response budget.
   - Rationale: today one `max_tokens` (default 128, clamped to the context) covers every emitted token, so a thinking model can spend the whole budget on reasoning and return nothing visible, and a model with no reasoning path has no way to cap reasoning markup. Budgets belong to the loaded model because the ceiling is a property of the model's output style, not of each request.
   - Rejected (preliminary): a single combined budget (visible output starves); per-token heuristics that guess reasoning without a resolved parser; a server-wide setting with no per-model override.
   - Contract: `lair.yaml` model entries and `lair.http` request fields resolve into one budget pair consumed by `lair.models` scheduling; the OpenAI wire shape stays compatible with documented extension fields.
@@ -778,16 +818,16 @@ Token budgets are configured per model: a reasoning budget and a response budget
 
 #### Open Items
 
-- [_] **Wire field names** — whether the budgets ride on `max_tokens` plus extension fields or on dedicated request names; settle in `/plan-refine mvp3.9`.
-- [_] **Reasoning-region dependency** — whether MVP3.9 must follow the MVP3.6 parser registry, since a reasoning ceiling needs a resolved reasoning region rather than a guess; settle in `/plan-refine mvp3.9`.
+- [_] **Wire field names** — whether the budgets ride on `max_tokens` plus extension fields or on dedicated request names; settle in `/plan-refine mvp3.10`.
+- [_] **Reasoning-region dependency** — whether MVP3.10 must follow the MVP3.6 parser registry, since a reasoning ceiling needs a resolved reasoning region rather than a guess; settle in `/plan-refine mvp3.10`.
 
-### MVP3.10 [v0.3.10] - Tentative
+### MVP3.11 [v0.3.11] - Tentative
 
 SentencePiece (SPM) vocabularies load through a tokenizer profile, unlocking the published families that ship them.
 
 #### Design Notes
 
-- **DN-M310-1** *(tentative)* — SPM is one more profile in the existing tokenizer registry, not a second tokenizer. `tokenizer.ggml.model=llama` resolves to an SPM profile that reads the GGUF's `tokenizer.ggml.tokens`, `token_type`, and `scores` arrays with the metadata coverage the registry already handles, encodes by greedy longest-match over the piece vocabulary with byte fallback for unrepresentable UTF-8, and decodes by joining pieces with the `▁` word-start marker.
+- **DN-M311-1** *(tentative)* — SPM is one more profile in the existing tokenizer registry, not a second tokenizer. `tokenizer.ggml.model=llama` resolves to an SPM profile that reads the GGUF's `tokenizer.ggml.tokens`, `token_type`, and `scores` arrays with the metadata coverage the registry already handles, encodes by greedy longest-match over the piece vocabulary with byte fallback for unrepresentable UTF-8, and decodes by joining pieces with the `▁` word-start marker.
   - Rationale: Gemma-1/2/3 and older Mistral and Phi GGUFs publish SentencePiece vocabularies, and the pinned reference tokenizes them. LAIR's BPE-only registry rejects them at load, which is exactly why the pinned Gemma-2 fixture can be loaded into the engine but neither calibrated against the oracle nor served. The shipped profile pattern already carries split strategy, defaults, and metadata coverage, so SPM is a profile rather than a parallel implementation.
   - Rejected (preliminary): offline conversion of SPM vocabularies to BPE; requiring a community re-conversion per model; a separate tokenizer library per vocabulary type.
   - Contract: `lair.tokenizer` resolves `tokenizer.ggml.model` to a profile; `Category=Tokenizer` asserts id-for-id `/tokenize` goldens against pinned b12032 for at least one SPM model.
@@ -806,9 +846,9 @@ SentencePiece (SPM) vocabularies load through a tokenizer profile, unlocking the
 
 #### Open Items
 
-- [_] **Metadata differences** — whether SPM files need different handling of `add_space_prefix`, `byte_fallback`, and proto metadata than the BPE profiles; settle in `/plan-refine mvp3.10`.
-- [_] **Sequencing** — MVP3.10 unblocks the pinned Gemma-2 parity fixture and any Gemma-3 work in MVP3.8; confirm the order at refine time.
-- [_] **Gemma-2 fixture size** — no published Gemma-2-2B quant is under the 1 GB ceiling (smallest Q2_K at 1,173 MB), so the parity fixture MVP3.10 unlocks has to either take a budget exception or use a smaller Gemma-2 variant (1.3B is not published as a Gemma-2 GGUF family with the same tokenizer shape). Decide at refine time; MVP3.4 ships the family engine-only.
+- [_] **Metadata differences** — whether SPM files need different handling of `add_space_prefix`, `byte_fallback`, and proto metadata than the BPE profiles; settle in `/plan-refine mvp3.11`.
+- [_] **Sequencing** — MVP3.11 unblocks the pinned Gemma-2 parity fixture and any Gemma-3 work in MVP3.9; confirm the order at refine time.
+- [_] **Gemma-2 fixture size** — no published Gemma-2-2B quant is under the 1 GB ceiling (smallest Q2_K at 1,173 MB), so the parity fixture MVP3.11 unlocks has to either take a budget exception or use a smaller Gemma-2 variant (1.3B is not published as a Gemma-2 GGUF family with the same tokenizer shape). Decide at refine time; MVP3.4 ships the family engine-only.
 
 ### MVP4 [v0.4.0] - Refined
 
@@ -901,34 +941,6 @@ Many models at once, each with its own placement policy.
 - [_] Automated Fairness: cross-model ITL isolation
 - [_] Automated Embeddings: pooling parity vs reference fixtures
 
-### MVP5.1 [v0.5.1] - Tentative
-
-Published IQ3_XXS models load and serve on the CPU engine — dense coverage ahead of Flash-Next.
-
-#### Design Notes
-
-- **DN-M51-1** — Dense IQ3_XXS coverage is its own phase, gated ahead of MVP6: the owner's target quant for their own runs is IQ3_XXS, and MVP6's expert slabs (DN-M6-2) assume the same format. Loader acceptance + block geometry per llama.cpp (`block_iq3_xxs`; ggml type id and type_size verified against `ggml.h` at build time), scalar oracle + AVX2 paths, engine end-to-end serve of a real IQ3_XXS fixture.
-  - Rationale: the Q5_0/Q5_K/Q6_K batch (MVP3.1) proved the mirror-llama.cpp pattern; IQ3_XXS is 3-bit super-block packing — the kernel strategy (fused dequant-GEMV vs llama.cpp's dot-vec lookup tables) is a real design decision, not a mechanical mirror.
-  - Contract: `GgmlType`/`TensorShape` row stride + `CpuBackend` dequant/GEMV/GemvBatch paths, same shape as DN-M31-1.
-
-#### Implementation Items
-
-- [_] Loader acceptance + IQ3_XXS geometry — `GgmlType`/`QuantFormat`/`TensorShape` (see DN-M51-1)
-  - Verify: `dotnet test --filter Category=Loader` — synthetic IQ3_XXS tensor accepted with correct row stride.
-- [_] IQ3_XXS kernels — scalar oracle + AVX2 fused dequant + batch path per the refined strategy (see DN-M51-1)
-  - Verify: `dotnet test --filter Category=Kernel` — synthetic-block scalar-vs-AVX2 and 1T-vs-4T bit-identity, `GemvBatch` equals solo `Gemv`.
-- [_] End-to-end IQ3_XXS serve — real IQ3_XXS fixture loads, decodes, serves
-  - Verify: automated real-fixture decode sanity (skip-if-absent) + manual `lair serve` chat via API and `/ui`.
-
-#### Tests
-
-- [_] Automated Kernel: IQ3_XXS scalar-vs-AVX2 bit-identity + batch equivalence + real-fixture decode sanity
-- [_] Manual IQ3_XXS Serve: model served; chat via API + `/ui`; monitor live
-
-#### Open Items
-
-- [_] **IQ3_XXS kernel strategy** — fused dequant-GEMV (repo pattern) vs llama.cpp dot-vec lookup-table approach on AVX2; settle in `/plan-refine mvp5.1` before build.
-
 ### MVP6 [v0.6.0] - Refined
 
 Qwen3.8-Flash-Next runs: sparse MoE with residency management.
@@ -941,7 +953,7 @@ Qwen3.8-Flash-Next runs: sparse MoE with residency management.
 - **DN-M6-2** — Quant scope: IQ3_XXS primary (Strata's recommended consumer quant), Q4_K_M as the measured baseline; other formats added only as residency experiments.
   - Rationale: smaller quants shrink the expert hot set, but IQ3 dequant is shuffle-heavy on AVX2 — the gate decides whether the residency win survives the kernel cost.
   - Rejected: FP8 native containers (breaks the GGUF-first commitment); low-bit-only with no baseline (unmeasurable claims).
-  - Contract: `IWeightSource` format descriptors for IQ3_XXS/Q4_K_M expert slabs. Dense IQ3_XXS kernels land first in MVP5.1 and are reused by the gather path.
+  - Contract: `IWeightSource` format descriptors for IQ3_XXS/Q4_K_M expert slabs. Dense IQ kernels land first in MVP3.8 and are reused by the gather path.
 - **DN-M6-3** — Expert-aware batching: the residency cost function is the batch's union active-expert set, not per-sequence expert sets.
   - Rationale: shared decode steps (MVP2) make expert reads amortized across sequences — this is the engine-level MoE win.
   - Rejected: per-sequence expert scheduling (re-reads shared experts per sequence).
@@ -1020,7 +1032,6 @@ Vision input on chat models.
 | idea | AVX-512 dispatch path | +10–30% decode, 2–4× prefill on capable CPUs |
 | idea | Native AOT packaging | ~50 ms vs ~500 ms startup |
 | idea | Early-exit argmax | skip vocab rows; ~5–8% on 248K-vocab LM head |
-| idea | IQ4_XS kernel | shuffle-heavy on AVX2 — measure before committing |
 | idea | NUMA pinning | dual-Xeon production boxes |
 | idea | Quant conversion tooling | only if the published-quant story breaks |
 | idea | Vulkan/Metal backends | deferred; LAIR commits to CPU + CUDA |
@@ -1109,5 +1120,6 @@ Vision input on chat models.
 - **2026-11-08 — Model test budget moves from 4 GB to 512 MB–1 GB.** Owner revised the ceiling for model-loaded test work. Consequences are concrete rather than cosmetic: `models/Llama-3.2-1B-Instruct-Q8_0.gguf` (1,260 MB) and `models/gemma-2-2b-it.Q4_K_M.gguf` (1,629 MB) are now out of band, `models/Qwen3-0.6B-Q8_0.gguf` (610 MB) is inside it, and the SmolLM fixtures (101–258 MB) stay valid as small-fixture cases. The Llama-3.2 fixture has to be re-pinned at a sub-1 GB quant with its template and tokenizer goldens regenerated, and its live-serve working set re-measured against the new ceiling. Gemma-2 has no published quant under 1 GB (smallest is Q2_K at 1,173 MB, then Q3_K_S 1,298 MB), so the family stays engine-only — which is already its status, blocked on the SentencePiece tokenizer. MoE still has no published file under any ceiling, so MVP3.8's MoE gate stays synthetic-until-exception.
 - **2026-11-08 — Llama-3.2 fixture re-pinned to Q4_K_M; the ceiling is a working-set ceiling, not only a file-size ceiling.** The Q8_0 file was deleted and everything that referenced it (serve fixture, tokenizer probe, both llama goldens, the template-generator default, `DEVELOP.md`) was repointed at the 770 MB Q4_K_M file. Regenerating both goldens from the new file changed only `model_file`, `model_sha256`, `generated_utc` and the fixture-pinned `date_string` — every tokenizer id and every rendered prompt body is byte-identical, which confirms the quant cannot affect those gates. The finding worth keeping: the file fits the band but the live serve peaks at 1,135–1,174 MB, so a fixture that satisfies the budget has to be chosen against measured working set, not file size. Every published quant small enough to fit at runtime (`Q2_K` 554 MB, `Q3_K_S` 612 MB) is a format the engine cannot yet load, so the fix is sequenced behind MVP3.5's quant registry rather than solved by shrinking context or re-tuning a gate. Gemma-2's smallest published quant is Q2_K at 1,173 MB, so the family stays engine-only regardless of the tokenizer gap.
 - **2026-11-08 — The model budget is a serving-profile ceiling, not only a file-size ceiling.** Live serve measurements settle it: Qwen3-0.6B Q8_0 (610 MB weights) peaks at 1,726 MB on the default `4096`/`256`/`8` profile and at 1,000 MB on `512`/`32`/`4`, while Llama-3.2 Q4_K_M (770 MB weights) measures 1,102 MB even with the tight profile. Each engine carries roughly 360–395 MB of runtime overhead beyond weights and KV, so a fixture under the 1 GB ceiling needs about 640 MB of weights or less. Two consequences: the family-serve gate now records its compliant profile rather than a bare "served", and the llama fixture's compliance is genuinely blocked on MVP3.5 — the smaller published quants that fit are formats the engine cannot load yet. Rejected instead: shrinking the ceiling per-fixture, or counting a 770 MB file as budget-compliant because the file is small.
-- **2026-11-08 — MVP3.4 ships with two gates deferred, not closed.** The phase is Shipped on the strength of 924/924 and a live Qwen3 family serve, but it does not carry everything it originally promised. Gemma-2's real-model parity fixture and live serve are deferred to MVP3.10 because the file's SentencePiece vocabulary cannot be calibrated or tokenized — the family ships engine-only, proven against reference-supplied token ids. The Llama-3.2 serve fixture stays over the 1 GB ceiling until MVP3.5 adds the quant formats small enough to fit. Both are recorded as open items rather than quietly dropped, and the Gemma-2 parity test item moved out of MVP3.4's Tests into MVP3.10, which already owned it.
+- **2026-11-08 — MVP3.4 ships with two gates deferred, not closed.** The phase is Shipped on the strength of 924/924 and a live Qwen3 family serve, but it does not carry everything it originally promised. Gemma-2's real-model parity fixture and live serve are deferred to MVP3.10 because the file's SentencePiece vocabulary cannot be calibrated or tokenized — the family ships engine-only, proven against reference-supplied token ids. The Llama-3.2 serve fixture stays over the 1 GB ceiling until MVP3.5 adds the quant formats small enough to fit. Both are recorded as open items rather than quietly dropped, and the Gemma-2 parity test item moved out of MVP3.4's Tests into MVP3.11, which already owned it.
+- **2026-11-09 — Dense IQ coverage moves from the MVP5 series into MVP3.8; MoE, token budgets, and SPM shift one slot.** The phase that was MVP5.1 becomes new MVP3.8 covering `IQ4_NL`, `IQ4_XS`, and `IQ3_XXS`; dense-resident MoE plus windowed KV becomes MVP3.9, per-model token budgets become MVP3.10, and the SentencePiece tokenizer profile becomes MVP3.11. Two things drive it: MVP6's gather kernel (DN-M6-2) reuses the dense IQ kernels, so a format phase cannot sit after the execution phase that depends on it; and both tiers now have fixtures inside the 512 MB–1 GB budget (`IQ4_XS` at 709 MB and `UD-IQ3_XXS` at 549 MB for Llama-3.2), so they can be gated against the pinned oracle in MVP3 discipline rather than deferred. The format set stops at 3-bit: `IQ2_*`, `IQ1_*`, and TQ formats stay out because their packing is the hardest in the family, their quality is the worst, and no fixture in this plan demands them. Each format carries its own kernel gate plus a measured GEMV cost against Q4_K_M before it can be recommended as a default — the Backlog's "measure before committing" caveat became an item rather than disappearing.
 - **2026-11-08 — MVP3.5 refined: the quant registry is a descriptor registry, and its first two formats are chosen by the budget.** `GgmlType`'s switch becomes a registry resolving type ids to descriptors (`TypeId`, `Name`, `Format`, `BlockSize`, `TypeSize`) with geometry failures at load, and `Q3_K` plus `Q2_K` are the only formats entering the phase. The choice is not a completeness argument: they are the published formats that close MVP3.4's blocked fixture, and the only ones small enough to fit a 1 GB working set. `Q2_K`/`Q3_K` are also the first super-block formats with asymmetric min-based sub-block scales, so their definition is the pinned reference's `dqK` layout and a LAIR-authored scalar golden cannot gate them. IQ, TQ, `Q4_0`, `Q5_0`/`Q5_1`, `Q8_1`, and `Q8_K` stay out until a published fixture demands one. The Quant priority list open item is resolved by this decision.
