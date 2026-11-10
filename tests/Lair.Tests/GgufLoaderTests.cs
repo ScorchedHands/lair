@@ -24,10 +24,17 @@ public sealed class GgufLoaderTests : IDisposable
     private const uint GgmlQ6_K = 14;
     private const uint GgmlQ8_K = 15;
     private const uint GgmlIQ2_XXS = 16;
+    private const uint GgmlIQ2_XS = 17;
     private const uint GgmlIQ3_XXS = 18;
+    private const uint GgmlIQ1_S = 19;
     private const uint GgmlIQ4_NL = 20;
+    private const uint GgmlIQ3_S = 21;
     private const uint GgmlIQ2_S = 22;
     private const uint GgmlIQ4_XS = 23;
+    private const uint GgmlIQ1_M = 29;
+    private const uint GgmlBF16 = 30;
+    private const uint GgmlQ1_0 = 41;
+    private const uint GgmlQ2_0 = 42;
 
     private const int EmbedCols = 4;
     private const int EmbedRows = 3;
@@ -315,6 +322,93 @@ public sealed class GgufLoaderTests : IDisposable
     }
 
     [Fact]
+    public void Open_AcceptsIQ2IQ3_SQ2_0BF16TensorsWithCorrectRowStrides()
+    {
+        byte[] image = BuildIq2Fixture();
+        string path = WriteTemp(image);
+
+        using GgufFile gguf = GgufFile.Open(path);
+        Assert.Equal(6, gguf.Tensors.Tensors.Count);
+
+        LogicalTensor iq2xxs = Assert.IsType<LogicalTensor>(gguf.Tensors.Find("blk.0.attn_q.weight"));
+        Assert.Equal(QuantFormat.IQ2_XXS, iq2xxs.Format);
+        Assert.Equal([2, 256], iq2xxs.Shape.Dims); // ggml stores [cols, rows]: stored [256, 2] reverses to logical [rows, cols]
+        Assert.Equal(66L, iq2xxs.Shape.RowStrideBytes(QuantFormat.IQ2_XXS)); // ceil(256/256) * 66
+        Assert.Equal(0L, iq2xxs.Offset);
+        Assert.Equal(132L, iq2xxs.SizeBytes);
+
+        LogicalTensor iq2s = Assert.IsType<LogicalTensor>(gguf.Tensors.Find("blk.0.attn_k.weight"));
+        Assert.Equal(QuantFormat.IQ2_S, iq2s.Format);
+        Assert.Equal([3, 256], iq2s.Shape.Dims);
+        Assert.Equal(82L, iq2s.Shape.RowStrideBytes(QuantFormat.IQ2_S)); // ceil(256/256) * 82
+        Assert.Equal(160L, iq2s.Offset); // next offset after 132 bytes, aligned to general.alignment (32)
+        Assert.Equal(246L, iq2s.SizeBytes);
+
+        LogicalTensor q2_0 = Assert.IsType<LogicalTensor>(gguf.Tensors.Find("blk.0.attn_v.weight"));
+        Assert.Equal(QuantFormat.Q2_0, q2_0.Format);
+        Assert.Equal([4, 64], q2_0.Shape.Dims);
+        Assert.Equal(18L, q2_0.Shape.RowStrideBytes(QuantFormat.Q2_0)); // ceil(64/64) * 18 — Q2_0 blocks are 64 elements, not 256
+        Assert.Equal(416L, q2_0.Offset); // next offset after 406 bytes, aligned to general.alignment (32)
+        Assert.Equal(72L, q2_0.SizeBytes);
+
+        LogicalTensor bf16 = Assert.IsType<LogicalTensor>(gguf.Tensors.Find("blk.0.attn_output.weight"));
+        Assert.Equal(QuantFormat.BF16, bf16.Format);
+        Assert.Equal([2, 8], bf16.Shape.Dims);
+        Assert.Equal(16L, bf16.Shape.RowStrideBytes(QuantFormat.BF16)); // 2 bytes per element, no blocks
+        Assert.Equal(512L, bf16.Offset); // next offset after 488 bytes, aligned to general.alignment (32)
+        Assert.Equal(32L, bf16.SizeBytes);
+
+        LogicalTensor iq2xs = Assert.IsType<LogicalTensor>(gguf.Tensors.Find("blk.0.ffn_up.weight"));
+        Assert.Equal(QuantFormat.IQ2_XS, iq2xs.Format);
+        Assert.Equal([2, 256], iq2xs.Shape.Dims);
+        Assert.Equal(74L, iq2xs.Shape.RowStrideBytes(QuantFormat.IQ2_XS)); // ceil(256/256) * 74
+        Assert.Equal(544L, iq2xs.Offset); // next offset after 544 bytes, already aligned to general.alignment (32)
+        Assert.Equal(148L, iq2xs.SizeBytes);
+
+        LogicalTensor iq3s = Assert.IsType<LogicalTensor>(gguf.Tensors.Find("blk.0.ffn_down.weight"));
+        Assert.Equal(QuantFormat.IQ3_S, iq3s.Format);
+        Assert.Equal([2, 256], iq3s.Shape.Dims);
+        Assert.Equal(110L, iq3s.Shape.RowStrideBytes(QuantFormat.IQ3_S)); // ceil(256/256) * 110
+        Assert.Equal(704L, iq3s.Offset); // next offset after 692 bytes, aligned to general.alignment (32)
+        Assert.Equal(220L, iq3s.SizeBytes);
+
+        using GgufMmapWeightSource source = new(gguf);
+        ReadOnlySpan<byte> iq2xxsSpan = source.Resolve(iq2xxs);
+        ReadOnlySpan<byte> iq2sSpan = source.Resolve(iq2s);
+        ReadOnlySpan<byte> q2_0Span = source.Resolve(q2_0);
+        ReadOnlySpan<byte> bf16Span = source.Resolve(bf16);
+        ReadOnlySpan<byte> iq2xsSpan = source.Resolve(iq2xs);
+        ReadOnlySpan<byte> iq3sSpan = source.Resolve(iq3s);
+
+        Assert.Equal(132, iq2xxsSpan.Length);
+        Assert.Equal(246, iq2sSpan.Length);
+        Assert.Equal(72, q2_0Span.Length);
+        Assert.Equal(32, bf16Span.Length);
+        Assert.Equal(148, iq2xsSpan.Length);
+        Assert.Equal(220, iq3sSpan.Length);
+
+        Assert.True(iq2xxsSpan.SequenceEqual(new ReadOnlySpan<byte>(image, (int)gguf.DataStart, 132)));
+        Assert.True(iq2sSpan.SequenceEqual(new ReadOnlySpan<byte>(image, (int)gguf.DataStart + 160, 246)));
+        Assert.True(q2_0Span.SequenceEqual(new ReadOnlySpan<byte>(image, (int)gguf.DataStart + 416, 72)));
+        Assert.True(bf16Span.SequenceEqual(new ReadOnlySpan<byte>(image, (int)gguf.DataStart + 512, 32)));
+        Assert.True(iq2xsSpan.SequenceEqual(new ReadOnlySpan<byte>(image, (int)gguf.DataStart + 544, 148)));
+        Assert.True(iq3sSpan.SequenceEqual(new ReadOnlySpan<byte>(image, (int)gguf.DataStart + 704, 220)));
+
+        Assert.Equal(QuantPattern(0), iq2xxsSpan[0]);
+        Assert.Equal(QuantPattern(132 - 1), iq2xxsSpan[^1]);
+        Assert.Equal(QuantPattern(160), iq2sSpan[0]);
+        Assert.Equal(QuantPattern(160 + 246 - 1), iq2sSpan[^1]);
+        Assert.Equal(QuantPattern(416), q2_0Span[0]);
+        Assert.Equal(QuantPattern(416 + 72 - 1), q2_0Span[^1]);
+        Assert.Equal(QuantPattern(512), bf16Span[0]);
+        Assert.Equal(QuantPattern(512 + 32 - 1), bf16Span[^1]);
+        Assert.Equal(QuantPattern(544), iq2xsSpan[0]);
+        Assert.Equal(QuantPattern(544 + 148 - 1), iq2xsSpan[^1]);
+        Assert.Equal(QuantPattern(704), iq3sSpan[0]);
+        Assert.Equal(QuantPattern(704 + 220 - 1), iq3sSpan[^1]);
+    }
+
+    [Fact]
     public void Open_MixedGgmlTypesInOneFile_ResolvesEachTensorWithOwnGeometry()
     {
         byte[] image = BuildMixedFixture();
@@ -385,9 +479,15 @@ public sealed class GgufLoaderTests : IDisposable
     [InlineData(12u, "Q4_K", QuantFormat.Q4_K, 256, 144)]
     [InlineData(13u, "Q5_K", QuantFormat.Q5_K, 256, 176)]
     [InlineData(14u, "Q6_K", QuantFormat.Q6_K, 256, 210)]
+    [InlineData(16u, "IQ2_XXS", QuantFormat.IQ2_XXS, 256, 66)]
+    [InlineData(17u, "IQ2_XS", QuantFormat.IQ2_XS, 256, 74)]
     [InlineData(18u, "IQ3_XXS", QuantFormat.IQ3_XXS, 256, 98)]
     [InlineData(20u, "IQ4_NL", QuantFormat.IQ4_NL, 32, 18)]
+    [InlineData(21u, "IQ3_S", QuantFormat.IQ3_S, 256, 110)]
+    [InlineData(22u, "IQ2_S", QuantFormat.IQ2_S, 256, 82)]
     [InlineData(23u, "IQ4_XS", QuantFormat.IQ4_XS, 256, 136)]
+    [InlineData(30u, "BF16", QuantFormat.BF16, 1, 2)]
+    [InlineData(42u, "Q2_0", QuantFormat.Q2_0, 64, 18)]
     public void GgmlTypeRegistry_ResolvesEverySupportedIdWithExactGeometry(
         uint id, string name, QuantFormat format, int blockSize, int typeSize)
     {
@@ -402,8 +502,9 @@ public sealed class GgufLoaderTests : IDisposable
     [Theory]
     [InlineData(2u, "Q4_0")]
     [InlineData(15u, "Q8_K")]
-    [InlineData(16u, "IQ2_XXS")]
-    [InlineData(22u, "IQ2_S")]
+    [InlineData(19u, "IQ1_S")]
+    [InlineData(29u, "IQ1_M")]
+    [InlineData(41u, "Q1_0")]
     public void GgmlTypeRegistry_RejectsUnsupportedIdsButNamesThem(uint id, string ggmlName)
     {
         Assert.False(GgmlTypeRegistry.TryResolve(id, out QuantDescriptor descriptor));
@@ -413,8 +514,9 @@ public sealed class GgufLoaderTests : IDisposable
 
     [Theory]
     [InlineData(GgmlQ4_0, "Q4_0")]
-    [InlineData(GgmlIQ2_XXS, "IQ2_XXS")]
-    [InlineData(GgmlIQ2_S, "IQ2_S")]
+    [InlineData(GgmlIQ1_S, "IQ1_S")]
+    [InlineData(GgmlIQ1_M, "IQ1_M")]
+    [InlineData(GgmlQ1_0, "Q1_0")]
     public void Open_UnsupportedTensorType_RejectsWithGgmlIdAndName(uint ggmlType, string ggmlName)
     {
         byte[] image = BuildFixture(q8GgmlType: ggmlType);
@@ -450,6 +552,20 @@ public sealed class GgufLoaderTests : IDisposable
         Assert.Contains("ggml type 20 (IQ4_NL)", ex.Message);
         Assert.Contains("fastest dimension 30", ex.Message);
         Assert.Contains("not a multiple of the IQ4_NL block size 32", ex.Message);
+    }
+
+    [Fact]
+    public void Open_FastestDimensionNotBlockMultiple_Q2_0_RejectsNamingTensorIdAndGeometry()
+    {
+        // 60 is not a multiple of the Q2_0 block size 64.
+        byte[] image = BuildTensorFixture("blk.0.attn_q.weight", [60, 2], GgmlQ2_0, 0, 0);
+        string path = WriteTemp(image);
+
+        GgufException ex = Assert.Throws<GgufException>(() => GgufFile.Open(path));
+        Assert.Contains("tensor 'blk.0.attn_q.weight'", ex.Message);
+        Assert.Contains("ggml type 42 (Q2_0)", ex.Message);
+        Assert.Contains("fastest dimension 60", ex.Message);
+        Assert.Contains("not a multiple of the Q2_0 block size 64", ex.Message);
     }
 
     [Fact]
@@ -664,6 +780,59 @@ public sealed class GgufLoaderTests : IDisposable
         // Payload region: 0..35 = IQ4_NL (36 bytes + 28 alignment pad to offset 64), 64..335 = IQ4_XS (272 bytes +
         // 16 alignment pad to offset 352), 352..645 = IQ3_XXS (294 bytes).
         for (int i = 0; i < 352 + 294; i++)
+        {
+            writer.Write(QuantPattern(i));
+        }
+
+        writer.Flush();
+        return stream.ToArray();
+    }
+
+    // Six quantized tensors exercising the IQ2_XXS/IQ2_XS/IQ2_S/IQ3_S/Q2_0/BF16 acceptance path: ggml-stored
+    // dims, offsets aligned to general.alignment (32), and payload bytes filled to each aligned offset so Resolve
+    // spans can be compared against the fixture image. Q2_0 uses its 64-element block size, and BF16 has no
+    // block structure at all.
+    private static byte[] BuildIq2Fixture()
+    {
+        using var stream = new MemoryStream();
+        using var writer = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true);
+
+        writer.Write(GgufMagic);
+        writer.Write(3u); // version
+        writer.Write(6ul); // n_tensors
+        writer.Write(12ul); // n_kv — must match the number of KV pairs written below
+
+        WriteKvString(writer, "general.architecture", "llama");
+        WriteKvString(writer, "general.name", "lair-iq2-fixture");
+        WriteKvUint32(writer, "general.alignment", 32);
+        WriteKvString(writer, "tokenizer.ggml.model", "gpt2");
+        WriteKvStringArray(writer, "tokenizer.ggml.tokens", ["<unk>", "hello", "world", "!"]);
+        WriteKvInt32Array(writer, "tokenizer.ggml.token_type", [1, 1, 1, 3]);
+        WriteKvStringArray(writer, "tokenizer.ggml.merges", ["h e", "e l", "l o"]);
+        WriteKvUint32(writer, "tokenizer.ggml.bos_token_id", 151643);
+        WriteKvUint32(writer, "tokenizer.ggml.eos_token_id", 151645);
+        WriteKvString(writer, "tokenizer.chat_template", "chatml");
+        WriteKvInt32Array(writer, "test.array_int32", [10, 20, 30]);
+        WriteKvBool(writer, "test.flag", true);
+
+        WriteTensorInfo(writer, "blk.0.attn_q.weight", [256, 2], GgmlIQ2_XXS, 0);
+        WriteTensorInfo(writer, "blk.0.attn_k.weight", [256, 3], GgmlIQ2_S, 160);
+        WriteTensorInfo(writer, "blk.0.attn_v.weight", [64, 4], GgmlQ2_0, 416);
+        WriteTensorInfo(writer, "blk.0.attn_output.weight", [8, 2], GgmlBF16, 512);
+        WriteTensorInfo(writer, "blk.0.ffn_up.weight", [256, 2], GgmlIQ2_XS, 544);
+        WriteTensorInfo(writer, "blk.0.ffn_down.weight", [256, 2], GgmlIQ3_S, 704);
+
+        long headerLength = stream.Position;
+        long dataStart = (headerLength + 31) / 32 * 32;
+        for (long i = headerLength; i < dataStart; i++)
+        {
+            writer.Write((byte)0);
+        }
+
+        // Payload region: 0..131 = IQ2_XXS (132 bytes + 28 alignment pad to offset 160), 160..405 = IQ2_S (246 bytes
+        // + 10 pad to offset 416), 416..487 = Q2_0 (72 bytes + 24 pad to offset 512), 512..543 = BF16 (32 bytes,
+        // offset 544 needs no pad), 544..691 = IQ2_XS (148 bytes + 12 pad to offset 704), 704..923 = IQ3_S (220 bytes).
+        for (int i = 0; i < 704 + 220; i++)
         {
             writer.Write(QuantPattern(i));
         }

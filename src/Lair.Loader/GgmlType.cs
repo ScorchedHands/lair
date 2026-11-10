@@ -26,9 +26,15 @@ internal static class GgmlType
     public const uint Q4_K = 12;
     public const uint Q5_K = 13;
     public const uint Q6_K = 14;
+    public const uint IQ2_XXS = 16;
+    public const uint IQ2_XS = 17;
     public const uint IQ3_XXS = 18;
     public const uint IQ4_NL = 20;
+    public const uint IQ3_S = 21;
+    public const uint IQ2_S = 22;
     public const uint IQ4_XS = 23;
+    public const uint BF16 = 30;
+    public const uint Q2_0 = 42;
 
     public static string Name(uint id)
     {

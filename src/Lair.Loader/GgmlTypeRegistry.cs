@@ -32,6 +32,20 @@ namespace Lair.Loader;
 ///           static_assert sizeof == sizeof(ggml_half) + QK4_NL/2)
 ///   IQ4_XS: blck_size 256, type_size 136  (block_iq4_xs = half d + uint16 scales_h + uint8 scales_l[QK_K/64]
 ///           + uint8 qs[QK_K/2]; static_assert sizeof == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2)
+/// The IQ2/IQ3_S/Q2_0/BF16 geometry is likewise taken from the pinned reference tag b12032 of the same header,
+/// from which those blocks' sizeof static_asserts are read:
+///   IQ2_XXS: blck_size 256, type_size 66  (block_iq2_xxs = half d + uint16 qs[QK_K/8];
+///           static_assert sizeof == sizeof(ggml_half) + QK_K/8*sizeof(uint16_t))
+///   IQ2_XS: blck_size 256, type_size 74  (block_iq2_xs = half d + uint16 qs[QK_K/8] + uint8 scales[QK_K/32];
+///           static_assert sizeof == sizeof(ggml_half) + QK_K/8*sizeof(uint16_t) + QK_K/32)
+///   IQ2_S: blck_size 256, type_size 82  (block_iq2_s = half d + uint8 qs[QK_K/4] + uint8 qh[QK_K/32]
+///           + uint8 scales[QK_K/32]; static_assert sizeof == sizeof(ggml_half) + QK_K/4 + QK_K/16)
+///   IQ3_S: blck_size 256, type_size 110 (block_iq3_s = half d + uint8 qs[QK_K/4] + uint8 qh[QK_K/32]
+///           + uint8 signs[QK_K/8] + uint8 scales[IQ3S_N_SCALE], IQ3S_N_SCALE = QK_K/64;
+///           static_assert sizeof == sizeof(ggml_half) + 13*(QK_K/32) + IQ3S_N_SCALE)
+///   Q2_0: blck_size 64,  type_size 18   (block_q2_0 = half d + uint8 qs[QK2_0/4], QK2_0 = 64;
+///           static_assert sizeof == sizeof(ggml_half) + QK2_0/4)
+///   BF16: blck_size 1,   type_size 2    (a 2-byte big-endian-truncated float; no block struct in the header)
 /// ggml_row_size(type, ne) = type_size * ne / blck_size.
 /// </summary>
 internal static class GgmlTypeRegistry
@@ -47,9 +61,15 @@ internal static class GgmlTypeRegistry
         [GgmlType.Q6_K] = new(GgmlType.Q6_K, "Q6_K", QuantFormat.Q6_K, 256, 210),
         [GgmlType.Q2_K] = new(GgmlType.Q2_K, "Q2_K", QuantFormat.Q2_K, 256, 84),
         [GgmlType.Q3_K] = new(GgmlType.Q3_K, "Q3_K", QuantFormat.Q3_K, 256, 110),
+        [GgmlType.IQ2_XXS] = new(GgmlType.IQ2_XXS, "IQ2_XXS", QuantFormat.IQ2_XXS, 256, 66),
+        [GgmlType.IQ2_XS] = new(GgmlType.IQ2_XS, "IQ2_XS", QuantFormat.IQ2_XS, 256, 74),
+        [GgmlType.IQ2_S] = new(GgmlType.IQ2_S, "IQ2_S", QuantFormat.IQ2_S, 256, 82),
         [GgmlType.IQ3_XXS] = new(GgmlType.IQ3_XXS, "IQ3_XXS", QuantFormat.IQ3_XXS, 256, 98),
+        [GgmlType.IQ3_S] = new(GgmlType.IQ3_S, "IQ3_S", QuantFormat.IQ3_S, 256, 110),
         [GgmlType.IQ4_NL] = new(GgmlType.IQ4_NL, "IQ4_NL", QuantFormat.IQ4_NL, 32, 18),
         [GgmlType.IQ4_XS] = new(GgmlType.IQ4_XS, "IQ4_XS", QuantFormat.IQ4_XS, 256, 136),
+        [GgmlType.Q2_0] = new(GgmlType.Q2_0, "Q2_0", QuantFormat.Q2_0, 64, 18),
+        [GgmlType.BF16] = new(GgmlType.BF16, "BF16", QuantFormat.BF16, 1, 2),
     };
 
     public static bool TryResolve(uint id, out QuantDescriptor descriptor) =>
