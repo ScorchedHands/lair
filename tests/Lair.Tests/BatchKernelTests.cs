@@ -34,6 +34,8 @@ public class BatchKernelTests
     [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
     [InlineData(QuantFormat.IQ4_XS)]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.BF16)]
     public void GemvBatch_IsBitIdenticalToIndependentSingleVectorCalls(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -76,6 +78,8 @@ public class BatchKernelTests
     [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
     [InlineData(QuantFormat.IQ4_XS)]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.BF16)]
     public void GemvBatch_ScalarPath_IsBitIdenticalToScalarSingleVectorCalls(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -118,6 +122,8 @@ public class BatchKernelTests
     [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
     [InlineData(QuantFormat.IQ4_XS)]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.BF16)]
     public void GemvBatch_Threaded_IsBitIdenticalToSingleThreaded(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -152,6 +158,8 @@ public class BatchKernelTests
     [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
     [InlineData(QuantFormat.IQ4_XS)]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.BF16)]
     public void GemvBatch_BadCountOrSpanLengths_ThrowsClearMessage(QuantFormat format)
     {
         TensorShape shape = MatrixShape(4, 70);
@@ -254,6 +262,12 @@ public class BatchKernelTests
                     break;
                 case QuantFormat.IQ4_XS:
                     QuantizeIQ4X(src, dst);
+                    break;
+                case QuantFormat.Q2_0:
+                    QuantizeQ20(src, dst);
+                    break;
+                case QuantFormat.BF16:
+                    QuantizeBF16(src, dst);
                     break;
                 default:
                     QuantizeQ4K(src, dst);
@@ -361,6 +375,52 @@ public class BatchKernelTests
             dst[b * 22 + 3] = (byte)(qh >> 8);
             dst[b * 22 + 4] = (byte)(qh >> 16);
             dst[b * 22 + 5] = (byte)(qh >> 24);
+        }
+    }
+
+    // Test-only Q2_0 writer: per 64-element block, d = amax/2 stored as half-float at byte 0, and each element
+    // takes the nearest of the four code values (00 = -1, 01 = 0, 10 = +1, 11 = +2 scaled by d). Element j lives
+    // at the 2-bit field 2*(j % 4) of qs[j / 4] (block bytes 2..17). Padded elements keep zero quants.
+    private static void QuantizeQ20(ReadOnlySpan<float> src, Span<byte> dst)
+    {
+        int blocks = (src.Length + 63) / 64;
+        for (int b = 0; b < blocks; b++)
+        {
+            ReadOnlySpan<float> block = src.Slice(b * 64, Math.Min(64, src.Length - b * 64));
+
+            float amax = 0f;
+            foreach (float v in block)
+            {
+                amax = Math.Max(amax, Math.Abs(v));
+            }
+
+            Half dHalf = (Half)(amax / 2f);
+            WriteLE(dst, b * 18, (ushort)BitConverter.HalfToInt16Bits(dHalf));
+
+            if (dHalf == (Half)0f)
+            {
+                continue; // all-zero block: quants stay zero, matching the reference behavior
+            }
+
+            for (int l = 0; l < block.Length; l++)
+            {
+                int two = Math.Clamp((int)Math.Round((double)block[l] / (float)dHalf, MidpointRounding.AwayFromZero) + 1, 0, 3);
+                ref byte target = ref dst[b * 18 + 2 + (l >> 2)];
+                int shift = 2 * (l & 3);
+                target = (byte)((target & ~(3 << shift)) | (two << shift)); // padded quants stay zero
+            }
+        }
+    }
+
+    // Test-only BF16 writer: round-to-nearest-even f32-to-bf16 (rounding bias and carry as in the reference
+    // conversion), stored little-endian with the surviving 16 bits as the f32 high half.
+    private static void QuantizeBF16(ReadOnlySpan<float> src, Span<byte> dst)
+    {
+        for (int i = 0; i < src.Length; i++)
+        {
+            uint bits = BitConverter.SingleToUInt32Bits(src[i]);
+            ushort code = (ushort)((bits + (0x7FFF + ((bits >> 16) & 1))) >> 16);
+            WriteLE(dst, 2 * i, code);
         }
     }
 

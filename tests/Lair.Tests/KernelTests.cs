@@ -31,6 +31,7 @@ public class KernelTests
     [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
     [InlineData(QuantFormat.IQ4_XS)]
+    [InlineData(QuantFormat.Q2_0)]
     public void Gemv_Scalar_MatchesDoubleOracle(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -62,6 +63,8 @@ public class KernelTests
     [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
     [InlineData(QuantFormat.IQ4_XS)]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.BF16)]
     public void Gemv_Avx2_MatchesScalarWithinTightTolerance(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -109,6 +112,8 @@ public class KernelTests
     [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
     [InlineData(QuantFormat.IQ4_XS)]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.BF16)]
     public void Gemv_Parallel_IsBitIdenticalToSingleThreaded(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -143,6 +148,7 @@ public class KernelTests
     [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
     [InlineData(QuantFormat.IQ4_XS)]
+    [InlineData(QuantFormat.Q2_0)]
     public void Gemv_Avx2_MatchesDoubleOracle(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -261,6 +267,8 @@ public class KernelTests
     [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
     [InlineData(QuantFormat.IQ4_XS)]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.BF16)]
     public void WeightRef_WrongByteLength_ThrowsClearMessage(QuantFormat format)
     {
         TensorShape shape = MatrixShape(4, 70);
@@ -300,6 +308,8 @@ public class KernelTests
     [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
     [InlineData(QuantFormat.IQ4_XS)]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.BF16)]
     public void DequantRow_MatchesDoubleOracleAcrossFormats(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -722,10 +732,18 @@ public class KernelTests
     [Theory]
     [InlineData(QuantFormat.IQ4_NL)]
     [InlineData(QuantFormat.IQ4_XS)]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.BF16)]
     public void DequantRow_SyntheticBlocks_BothPathsMatchHandWrittenBytes(QuantFormat format)
     {
-        int cols = format == QuantFormat.IQ4_NL ? 96 : 512; // three IQ4_NL blocks, or two IQ4_XS super-blocks in one row
-        byte[] packed = BuildSyntheticIq4Blocks(format);
+        int cols = format switch
+        {
+            QuantFormat.IQ4_NL => 96, // three IQ4_NL blocks in one row
+            QuantFormat.Q2_0 => 128, // two Q2_0 blocks in one row
+            QuantFormat.BF16 => 8, // one chunk of eight bf16 values
+            _ => 512, // two IQ4_XS super-blocks in one row
+        };
+        byte[] packed = BuildSyntheticBlocks(format);
         TensorShape shape = MatrixShape(1, cols);
 
         using CpuBackend scalar = new(threads: 1, allowAvx2: false);
@@ -748,7 +766,7 @@ public class KernelTests
     // Hand-written IQ4 images: every nibble code 0..15 appears in both nibble halves, d covers zero and negative
     // values, and for IQ4_XS the eight sub-block scales span the whole six-bit range so negative (ls - 32) scales
     // and both scale fields take part alongside the shared table lookup.
-    private static byte[] BuildSyntheticIq4Blocks(QuantFormat format)
+    private static byte[] BuildSyntheticBlocks(QuantFormat format)
     {
         if (format == QuantFormat.IQ4_NL)
         {
@@ -774,6 +792,43 @@ public class KernelTests
             for (int j = 0; j < 16; j++)
             {
                 packed[36 + 2 + j] = (byte)(((j * 5) % 16) | (j << 4));
+            }
+
+            return packed;
+        }
+
+        if (format == QuantFormat.Q2_0)
+        {
+            byte[] packed = new byte[2 * 18];
+
+            // Block 0: d = 2.0. Byte j keeps code j & 3 in its low pair and code (j + 1) & 3 in its high pair, so
+            // all four 2-bit codes dequantize in both bit positions across the sixteen quant bytes.
+            WriteLE(packed, 0, (ushort)BitConverter.HalfToInt16Bits((Half)2f));
+            for (int j = 0; j < 16; j++)
+            {
+                packed[2 + j] = (byte)((j & 3) | (((j + 1) & 3) << 2));
+            }
+
+            // Block 1: d = -1 with varied codes across every bit position, so the negative scale and all four
+            // codes take part in both bit positions.
+            WriteLE(packed, 18, (ushort)BitConverter.HalfToInt16Bits((Half)(-1f)));
+            for (int j = 0; j < 16; j++)
+            {
+                packed[18 + 2 + j] = (byte)((j * 3) & 0xFF); // varied codes across every bit position
+            }
+
+            return packed;
+        }
+
+        if (format == QuantFormat.BF16)
+        {
+            // Hand-written bf16 codes: the smallest subnormals, a negative subnormal, signed zeros, a value whose
+            // f32 mantissa is truncated (written directly), and the negative unit.
+            ushort[] codes = [0x0001, 0x0002, 0x0080, 0x8000, 0x0000, 0x3C00, 0xBC00, 0x803F];
+            byte[] packed = new byte[2 * codes.Length];
+            for (int i = 0; i < codes.Length; i++)
+            {
+                WriteLE(packed, 2 * i, codes[i]);
             }
 
             return packed;
@@ -821,6 +876,92 @@ public class KernelTests
         return xs;
     }
 
+    // GEMV over the hand-written Q2_0/BF16 images: both paths read the same codes and must match a
+    // double-precision dot of the same row, with the AVX2 fused chain kept within a tight band of the scalar
+    // accumulation (the fused FMA reassociates rounding exactly like the other quant formats).
+    [Theory]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.BF16)]
+    public void Gemv_SyntheticQ20AndBf16_BothPathsMatchDoubleOracleWithinTightTolerance(QuantFormat format)
+    {
+        int cols = format == QuantFormat.Q2_0 ? 128 : 8;
+        byte[] packed = BuildSyntheticBlocks(format);
+        TensorShape shape = MatrixShape(1, cols);
+
+        Random rng = new(2026);
+        float[] x = NextFloats(rng, cols);
+
+        using CpuBackend scalar = new(threads: 1, allowAvx2: false);
+        using CpuBackend avx2 = new(threads: 1, allowAvx2: true);
+        WeightRef w = new(packed, shape, format);
+
+        float[] actualScalar = new float[1];
+        float[] actualAvx2 = new float[1];
+        scalar.Gemv(x, w, actualScalar);
+        avx2.Gemv(x, w, actualAvx2);
+
+        (double[] expected, double[] magnitudes) = OracleDot(x, packed, 1, cols, format);
+        AssertClose(actualScalar, expected, magnitudes, relativeTolerance: 1e-4, $"scalar {format} synthetic GEMV");
+        AssertClose(actualAvx2, expected, magnitudes, relativeTolerance: 1e-4, $"avx2 {format} synthetic GEMV");
+
+        // Bound the scalar-vs-AVX2 drift by the accumulation scale, like the tight-tolerance theory does.
+        double diff = Math.Abs(actualScalar[0] - actualAvx2[0]);
+        Assert.True(diff <= 1e-5 * Math.Max(1e-6, magnitudes[0]), $"{format}: avx2 GEMV diverges from scalar on synthetic blocks (scalar {actualScalar[0]:G9}, avx2 {actualAvx2[0]:G9})");
+    }
+
+    // Hand-written bf16 codes for the whole special-value set: subnormals, signed zeros, an infinity, a quiet NaN,
+    // the max normal, and a value whose f32 mantissa is truncated (the code is written directly). Both paths must
+    // reproduce the bit-shift conversion bit-for-bit, and the truncation case is pinned against the f32 source it
+    // was truncated from.
+    [Fact]
+    public void DequantRow_Bf16_SpecialBitPatterns_BothPathsBitIdenticalToBitShiftOracle()
+    {
+        const int cols = 9;
+        ushort[] codes = [0x0001, 0x0002, 0x0080, 0x8000, 0x0000, 0xFF80, 0x7FC0, 0x7F7F, 0x3F80];
+
+        byte[] packed = new byte[2 * cols];
+        for (int i = 0; i < cols; i++)
+        {
+            WriteLE(packed, 2 * i, codes[i]);
+        }
+
+        TensorShape shape = MatrixShape(1, cols);
+        using CpuBackend scalar = new(threads: 1, allowAvx2: false);
+        using CpuBackend avx2 = new(threads: 1, allowAvx2: true);
+        WeightRef w = new(packed, shape, QuantFormat.BF16);
+
+        float[] actualScalar = new float[cols];
+        float[] actualAvx2 = new float[cols];
+        scalar.DequantRow(w, 0, actualScalar);
+        avx2.DequantRow(w, 0, actualAvx2);
+
+        // The conversion is a pure bit placement: every stored code must land exactly on bits << 16.
+        for (int i = 0; i < cols; i++)
+        {
+            int expectedBits = unchecked((int)((uint)codes[i] << 16));
+            Assert.Equal(expectedBits, MemoryMarshal.Cast<float, int>(actualScalar.AsSpan(i, 1))[0]);
+            Assert.Equal(expectedBits, MemoryMarshal.Cast<float, int>(actualAvx2.AsSpan(i, 1))[0]);
+        }
+
+        Assert.True(actualScalar.AsSpan().SequenceEqual(actualAvx2.AsSpan()), "bf16 avx2 DequantRow diverges from scalar on special bit patterns");
+
+        // The truncation case: f32 1.00049f carries mantissa bits a bf16 cannot hold; the round-to-nearest-even
+        // conversion drops it to the code written above, and the dequantized value is the truncated f32.
+        uint source = BitConverter.SingleToUInt32Bits(1.00049f);
+        Assert.Equal((ushort)0x3F80, (ushort)((source + (0x7FFF + ((source >> 16) & 1))) >> 16));
+        Assert.Equal(1.0f, actualScalar[8]);
+
+        // Subnormals keep their exact bit patterns, -0.0 stays negative zero, and the specials land on their
+        // exact f32 counterparts.
+        Assert.Equal(BitConverter.UInt32BitsToSingle(0x0001_0000), actualScalar[0]);
+        Assert.Equal(BitConverter.UInt32BitsToSingle(0x0080_0000), actualScalar[2]);
+        Assert.Equal(unchecked((int)0x8000_0000), MemoryMarshal.Cast<float, int>(actualScalar.AsSpan(3, 1))[0]);
+        Assert.Equal(0f, actualScalar[4]);
+        Assert.Equal(float.NegativeInfinity, actualScalar[5]);
+        Assert.Equal(float.NaN, actualScalar[6]);
+        Assert.Equal(BitConverter.UInt32BitsToSingle(0x7F7F_0000), actualScalar[7]); // the largest finite bf16: f32 MaxValue truncated
+    }
+
     [Theory]
     [InlineData(QuantFormat.IQ4_NL)]
     [InlineData(QuantFormat.IQ2_XXS)]
@@ -829,9 +970,10 @@ public class KernelTests
     [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
     [InlineData(QuantFormat.IQ4_XS)]
+    [InlineData(QuantFormat.Q2_0)]
     public void Gemv_PartialFinalBlock_BothPathsMatchDoubleOracle(QuantFormat format)
     {
-        // 100 and 137 columns are neither multiples of 32 nor of 256: the final block is zero-padded and only the
+        // 100 and 137 columns are neither multiples of 32, of 64, nor of 256: the final block is zero-padded and only the
         // real columns may contribute, in both the fused and the scalar cleanup tail.
         foreach ((int rows, int cols) in new[] { (300, 100), (300, 137) })
         {
@@ -874,6 +1016,8 @@ public class KernelTests
     [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
     [InlineData(QuantFormat.IQ4_XS)]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.BF16)]
     public void DequantRow_BadRowIndexOrOutputLength_ThrowsClearMessage(QuantFormat format)
     {
         TensorShape shape = MatrixShape(4, 70);
@@ -955,6 +1099,12 @@ public class KernelTests
                     break;
                 case QuantFormat.IQ4_XS:
                     QuantizeIQ4X(src, dst);
+                    break;
+                case QuantFormat.Q2_0:
+                    QuantizeQ20(src, dst);
+                    break;
+                case QuantFormat.BF16:
+                    QuantizeBF16(src, dst);
                     break;
                 default:
                     QuantizeQ4K(src, dst);
@@ -1062,6 +1212,52 @@ public class KernelTests
             dst[b * 22 + 3] = (byte)(qh >> 8);
             dst[b * 22 + 4] = (byte)(qh >> 16);
             dst[b * 22 + 5] = (byte)(qh >> 24);
+        }
+    }
+
+    // Test-only Q2_0 writer: per 64-element block, d = amax/2 stored as half-float at byte 0, and each element
+    // takes the nearest of the four code values (00 = -1, 01 = 0, 10 = +1, 11 = +2 scaled by d). Element j lives
+    // at the 2-bit field 2*(j % 4) of qs[j / 4] (block bytes 2..17). Padded elements keep zero quants.
+    private static void QuantizeQ20(ReadOnlySpan<float> src, Span<byte> dst)
+    {
+        int blocks = (src.Length + 63) / 64;
+        for (int b = 0; b < blocks; b++)
+        {
+            ReadOnlySpan<float> block = src.Slice(b * 64, Math.Min(64, src.Length - b * 64));
+
+            float amax = 0f;
+            foreach (float v in block)
+            {
+                amax = Math.Max(amax, Math.Abs(v));
+            }
+
+            Half dHalf = (Half)(amax / 2f);
+            WriteLE(dst, b * 18, (ushort)BitConverter.HalfToInt16Bits(dHalf));
+
+            if (dHalf == (Half)0f)
+            {
+                continue; // all-zero block: quants stay zero, matching the reference behavior
+            }
+
+            for (int l = 0; l < block.Length; l++)
+            {
+                int two = Math.Clamp((int)Math.Round((double)block[l] / (float)dHalf, MidpointRounding.AwayFromZero) + 1, 0, 3);
+                ref byte target = ref dst[b * 18 + 2 + (l >> 2)];
+                int shift = 2 * (l & 3);
+                target = (byte)((target & ~(3 << shift)) | (two << shift)); // padded quants stay zero
+            }
+        }
+    }
+
+    // Test-only BF16 writer: round-to-nearest-even f32-to-bf16 (rounding bias and carry as in the reference
+    // conversion), stored little-endian with the surviving 16 bits as the f32 high half.
+    private static void QuantizeBF16(ReadOnlySpan<float> src, Span<byte> dst)
+    {
+        for (int i = 0; i < src.Length; i++)
+        {
+            uint bits = BitConverter.SingleToUInt32Bits(src[i]);
+            ushort code = (ushort)((bits + (0x7FFF + ((bits >> 16) & 1))) >> 16);
+            WriteLE(dst, 2 * i, code);
         }
     }
 
@@ -2953,6 +3149,32 @@ public class KernelTests
                         }
                     }
                 }
+                else if (format == QuantFormat.Q2_0)
+                {
+                    int blocks = (cols + 63) / 64;
+                    for (int b = 0; b < blocks; b++)
+                    {
+                        byte* block = r + b * 18;
+                        double d = (float)BitConverter.Int16BitsToHalf((short)ReadLE(block, 0));
+                        int limit = Math.Min(64, cols - b * 64); // padded quants are zero: stop at the real column count.
+                        for (int l = 0; l < limit; l++)
+                        {
+                            int two = (block[2 + (l >> 2)] >> (2 * (l & 3))) & 0x3; // 00 = -1, 01 = 0, 10 = +1, 11 = +2
+                            double w = (two - 1) * d;
+                            acc += pX[b * 64 + l] * w;
+                            mag += Math.Abs(pX[b * 64 + l] * w);
+                        }
+                    }
+                }
+                else if (format == QuantFormat.BF16)
+                {
+                    for (int i = 0; i < cols; i++)
+                    {
+                        double w = BitConverter.UInt32BitsToSingle((uint)(ReadLE(r, 2 * i) << 16)); // the stored bits land in the f32 high half
+                        acc += w * pX[i];
+                        mag += Math.Abs(w * pX[i]);
+                    }
+                }
                 else
                 {
                     int blocks = (cols + 255) / 256;
@@ -3423,6 +3645,34 @@ public class KernelTests
                             values[subStart + l] = scale * Iq4KValues[(block[8 + 16 * ib + (l & 15)] >> (4 * (l >> 4))) & 0xF];
                         }
                     }
+                }
+
+                return values;
+            }
+
+            if (format == QuantFormat.Q2_0)
+            {
+                int blocks = (cols + 63) / 64;
+                for (int b = 0; b < blocks; b++)
+                {
+                    byte* block = r + b * 18;
+                    double d = (float)BitConverter.Int16BitsToHalf((short)ReadLE(block, 0));
+                    int limit = Math.Min(64, cols - b * 64); // padded quants are zero: stop at the real column count.
+                    for (int l = 0; l < limit; l++)
+                    {
+                        int two = (block[2 + (l >> 2)] >> (2 * (l & 3))) & 0x3; // 00 = -1, 01 = 0, 10 = +1, 11 = +2
+                        values[b * 64 + l] = (two - 1) * d;
+                    }
+                }
+
+                return values;
+            }
+
+            if (format == QuantFormat.BF16)
+            {
+                for (int i = 0; i < cols; i++)
+                {
+                    values[i] = BitConverter.UInt32BitsToSingle((uint)(ReadLE(r, 2 * i) << 16)); // the stored bits land in the f32 high half
                 }
 
                 return values;
