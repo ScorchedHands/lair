@@ -11,4 +11,7 @@ public enum QuantFormat
     Q6_K,
     Q2_K,
     Q3_K,
+    IQ3_XXS,
+    IQ4_NL,
+    IQ4_XS,
 }

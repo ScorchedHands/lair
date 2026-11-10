@@ -40,6 +40,13 @@ public sealed record TensorShape(int[] Dims)
     //   Q3_K  whole 110-byte blocks (32 bytes of quant high bits, 64 bytes of 2-bit quant low bits,
     //         12 bytes packing sixteen 6-bit group scales, half d); the final block is zero-padded to
     //         cover a partial run of up to 256 elements.
+    //   IQ3_XXS whole 98-byte blocks (half d, 96 bytes of 3-bit quants); the final block is zero-padded
+    //         to cover a partial run of up to 256 elements.
+    //   IQ4_NL  whole 18-byte blocks (half d, 16 bytes of 4-bit quants); the final block is zero-padded
+    //         to cover a partial run of up to 32 elements.
+    //   IQ4_XS  whole 136-byte blocks (half d, 2 bytes of high scale bits, 4 bytes of low scale bits,
+    //         128 bytes of 4-bit quants); the final block is zero-padded to cover a partial run of up
+    //         to 256 elements.
     public long RowStrideBytes(QuantFormat fmt)
     {
         long elements = Dims.Length > 0 ? Dims[^1] : 0;
@@ -54,6 +61,9 @@ public sealed record TensorShape(int[] Dims)
             QuantFormat.Q6_K => (elements + 255) / 256 * 210,
             QuantFormat.Q2_K => (elements + 255) / 256 * 84,
             QuantFormat.Q3_K => (elements + 255) / 256 * 110,
+            QuantFormat.IQ3_XXS => (elements + 255) / 256 * 98,
+            QuantFormat.IQ4_NL => (elements + 31) / 32 * 18,
+            QuantFormat.IQ4_XS => (elements + 255) / 256 * 136,
             _ => throw new ArgumentOutOfRangeException(nameof(fmt), fmt, "Unknown quant format."),
         };
     }

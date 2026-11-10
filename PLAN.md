@@ -761,7 +761,7 @@ RoPE scaling and positional-encoding variants load through RoPE strategy adapter
 - [✓] Automated YaRN Parity: real-model output parity for the rope-scaling-patched Qwen3 fixture against pinned b12032 inside the documented band. Verify: `dotnet test --filter Category=Parity -c Release` — 33/33.
 - [✓] Manual Long-Context Serve: serve the patched model with its runtime context past the declared original length and confirm output stays coherent where unscaled RoPE would degrade. Measured live on `:8292` with `max_context_tokens: 2048`, `kv_blocks: 128`: the load line read `rope_scaling model='Qwen3 0.6B Instruct' architecture='qwen3' variant=yarn multiplier=2 original_context_length=512 attention_factor=1 rotary_dimensions=128`; the three-turn exchange ran at prompt sizes 795, 1230 and 1435 tokens, all past 512; turn 2 recovered the marker placed near the end of the long prompt (`MARKER-7741 at item 37`); turn 3 finished with `eos`. Peak working set 1,306,951,680 B — under the 4 GB ceiling. Two honest limits recorded rather than hidden: turn 3's arithmetic recall drifted (answered 30 for a 60-item list), and the unscaled control run on the same profile failed turn 2 with a chat-template render error now carried in Backlog, so the scaled/unscaled comparison is not measured end to end.
 
-### MVP3.8 [v0.3.8] - Refined
+### MVP3.8 [v0.3.8] - In Progress
 
 Dense IQ quantization loads, decodes, and serves on the CPU engine at two tiers — `IQ4_NL`/`IQ4_XS` for quality under the budget and `IQ3_XXS` as the owner's target quant — landed before MoE execution so the sparse path can reuse them.
 
@@ -782,8 +782,8 @@ Dense IQ quantization loads, decodes, and serves on the CPU engine at two tiers 
 
 #### Implementation Items
 
-- [_] IQ registry entries and geometry — ids 18 `IQ3_XXS`, 20 `IQ4_NL`, and 23 `IQ4_XS` accepted through the MVP3.5 descriptor registry with correct block size, type size, and row stride, and per-tensor type resolution proven inside a single file (see DN-M38-1).
-  - Verify: `dotnet test --filter Category=Loader -c Release` — synthetic tensors for all three ids accepted with correct stride; a truncated or mis-strided tensor fails naming the tensor, the id, and expected geometry; a file whose tensors carry different GGML ids resolves each independently; an out-of-scope id such as 22 `IQ2_S` still rejects naming its name and id, proving the scope boundary.
+- [✓] IQ registry entries and geometry — ids 18 `IQ3_XXS`, 20 `IQ4_NL`, and 23 `IQ4_XS` accepted through the MVP3.5 descriptor registry with correct block size, type size, and row stride, and per-tensor type resolution proven inside a single file (see DN-M38-1).
+  - Verify: `dotnet test --filter Category=Loader -c Release` — 162/162. Geometry comes from the pinned b12032 static_asserts: `block_iq3_xxs` 98/256 (`sizeof(half) + 3*(QK_K/8)`), `block_iq4_nl` 18/32 (`sizeof(half) + QK4_NL/2`), `block_iq4_xs` 136/256 (`sizeof(half) + sizeof(uint16_t) + QK_K/64 + QK_K/2`). A synthetic file with all three ids accepted with exact strides (36/272/294 payload sizes at alignment-32 offsets 0/64/352) and `GgufMmapWeightSource` spans byte-identical to the fixture; a mixed `Q8_0`+`IQ4_XS`+`IQ3_XXS` file resolves each tensor with its own geometry; an `IQ4_NL` tensor with fastest dimension 30 rejects naming the tensor, `ggml type 20 (IQ4_NL)`, and the block size 32; out-of-scope id 22 still rejects as `unsupported ggml type 22 (IQ2_S)`.
 - [_] `IQ4_NL` and `IQ4_XS` kernels — scalar oracle plus AVX2 fused dequant and batch path per the settled strategy (see DN-M38-1, DN-M38-3).
   - Verify: `dotnet test --filter Category=Kernel -c Release` — synthetic-block scalar-vs-AVX2 and 1T-vs-4T bit-identity for each format, `GemvBatch` equals solo `Gemv`.
 - [_] `IQ3_XXS` kernel — scalar oracle mirroring the reference tables, plus the AVX2 staging-then-fused-GEMV path (see DN-M38-1, DN-M38-3).
@@ -795,7 +795,7 @@ Dense IQ quantization loads, decodes, and serves on the CPU engine at two tiers 
 
 #### Tests
 
-- [_] Automated Registry: acceptance for ids 18/20/23, geometry and stride validation, mixed-type file resolution, out-of-scope id rejection naming name and id. Verify: `dotnet test --filter Category=Loader -c Release`.
+- [✓] Automated Registry: acceptance for ids 18/20/23, geometry and stride validation, mixed-type file resolution, out-of-scope id rejection naming name and id. Verify: `dotnet test --filter Category=Loader -c Release` — 162/162.
 - [_] Automated Kernel: per-format scalar-vs-AVX2 bit-identity, batch equivalence, and real-fixture decode sanity. Verify: `dotnet test --filter Category=Kernel|Parity -c Release`.
 - [_] Manual IQ Serve: both tiers served; chat via API and `/ui`; monitor live with the quant reported.
 - [_] Manual Quant Recommendation: read the bench table and confirm the documented recommendation matches the measured fastest format rather than the smallest file.

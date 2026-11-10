@@ -15,6 +15,16 @@ namespace Lair.Contracts;
 ///         5th quant bits, 128 bytes of 4-bit quants), last block zero-padded to cols.
 ///   Q6_K  whole blocks of 210 bytes (128 bytes of low nibbles, 64 bytes of high 2 bits, 16 signed 8-bit
 ///         group scales, half-float scale), last block zero-padded to cols.
+///   Q2_K  whole blocks of 84 bytes (16 bytes of 4-bit scale/min pairs, 64 bytes of 2-bit quants,
+///         two half-float scales), last block zero-padded to cols.
+///   Q3_K  whole blocks of 110 bytes (32 bytes of quant high bits, 64 bytes of 2-bit quant low bits,
+///         12 bytes packing sixteen 6-bit group scales, half-float scale), last block zero-padded to cols.
+///   IQ3_XXS whole blocks of 98 bytes (half-float scale, 96 bytes of 3-bit quants), last block
+///         zero-padded to cols.
+///   IQ4_NL  whole blocks of 18 bytes (half-float scale, 16 bytes of 4-bit quants), last block zero-padded
+///         to cols.
+///   IQ4_XS  whole blocks of 136 bytes (half-float scale, 2 bytes of high scale bits, 4 bytes of low
+///         scale bits, 128 bytes of 4-bit quants), last block zero-padded to cols.
 /// A span member forces this to be a ref struct: WeightRef is stack-only and must not outlive the memory it
 /// borrows (typically an IWeightSource or arena that stays alive for the whole inference run).
 /// </summary>

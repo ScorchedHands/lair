@@ -24,6 +24,14 @@ namespace Lair.Loader;
 ///         static_assert sizeof == 2*sizeof(ggml_half) + QK_K/16 + QK_K/4)
 ///   Q3_K: blck_size 256, type_size 110 (block_q3_K = uint8 hmask[QK_K/8] + uint8 qs[QK_K/4] + uint8 scales[12]
 ///         + half d; static_assert sizeof == sizeof(ggml_half) + QK_K/4 + QK_K/8 + 12)
+/// The IQ3_XXS/IQ4_NL/IQ4_XS geometry is likewise taken from the pinned reference tag b12032 of the same header,
+/// from which those blocks' sizeof static_asserts are read:
+///   IQ3_XXS: blck_size 256, type_size 98  (block_iq3_xxs = half d + uint8 qs[3*QK_K/8];
+///           static_assert sizeof == sizeof(ggml_half) + 3*(QK_K/8))
+///   IQ4_NL: blck_size 32,  type_size 18   (block_iq4_nl = half d + uint8 qs[QK4_NL/2], QK4_NL = 32;
+///           static_assert sizeof == sizeof(ggml_half) + QK4_NL/2)
+///   IQ4_XS: blck_size 256, type_size 136  (block_iq4_xs = half d + uint16 scales_h + uint8 scales_l[QK_K/64]
+///           + uint8 qs[QK_K/2]; static_assert sizeof == sizeof(ggml_half) + sizeof(uint16_t) + QK_K/64 + QK_K/2)
 /// ggml_row_size(type, ne) = type_size * ne / blck_size.
 /// </summary>
 internal static class GgmlTypeRegistry
@@ -39,6 +47,9 @@ internal static class GgmlTypeRegistry
         [GgmlType.Q6_K] = new(GgmlType.Q6_K, "Q6_K", QuantFormat.Q6_K, 256, 210),
         [GgmlType.Q2_K] = new(GgmlType.Q2_K, "Q2_K", QuantFormat.Q2_K, 256, 84),
         [GgmlType.Q3_K] = new(GgmlType.Q3_K, "Q3_K", QuantFormat.Q3_K, 256, 110),
+        [GgmlType.IQ3_XXS] = new(GgmlType.IQ3_XXS, "IQ3_XXS", QuantFormat.IQ3_XXS, 256, 98),
+        [GgmlType.IQ4_NL] = new(GgmlType.IQ4_NL, "IQ4_NL", QuantFormat.IQ4_NL, 32, 18),
+        [GgmlType.IQ4_XS] = new(GgmlType.IQ4_XS, "IQ4_XS", QuantFormat.IQ4_XS, 256, 136),
     };
 
     public static bool TryResolve(uint id, out QuantDescriptor descriptor) =>
