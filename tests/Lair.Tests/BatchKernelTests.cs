@@ -26,6 +26,8 @@ public class BatchKernelTests
     [InlineData(QuantFormat.Q6_K)]
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
     public void GemvBatch_IsBitIdenticalToIndependentSingleVectorCalls(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -61,6 +63,8 @@ public class BatchKernelTests
     [InlineData(QuantFormat.Q6_K)]
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
     public void GemvBatch_ScalarPath_IsBitIdenticalToScalarSingleVectorCalls(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -96,6 +100,8 @@ public class BatchKernelTests
     [InlineData(QuantFormat.Q6_K)]
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
     public void GemvBatch_Threaded_IsBitIdenticalToSingleThreaded(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -123,6 +129,8 @@ public class BatchKernelTests
     [InlineData(QuantFormat.Q6_K)]
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
     public void GemvBatch_BadCountOrSpanLengths_ThrowsClearMessage(QuantFormat format)
     {
         TensorShape shape = MatrixShape(4, 70);
@@ -204,6 +212,12 @@ public class BatchKernelTests
                     break;
                 case QuantFormat.Q3_K:
                     QuantizeQ3K(src, dst);
+                    break;
+                case QuantFormat.IQ4_NL:
+                    QuantizeIQ4N(src, dst);
+                    break;
+                case QuantFormat.IQ4_XS:
+                    QuantizeIQ4X(src, dst);
                     break;
                 default:
                     QuantizeQ4K(src, dst);
@@ -656,6 +670,138 @@ public class BatchKernelTests
                 }
             }
         }
+    }
+
+    // The shared 16-value IQ4 table, pinned to the reference tag: byte n holds the value a nibble code n selects.
+    private static readonly sbyte[] Iq4KValues = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+
+    // Test-only IQ4_NL writer: per 32-element block, d = amax / 113 stored as a half-float at byte 0, and each
+    // element takes the nearest of the sixteen table values scaled by d. Element j < 16 keeps its code in the low
+    // nibble of qs[j] (block bytes 2..17) and element 16+j in the high nibble of the same byte. Padded elements
+    // keep zero quants, which the kernels never read past the real column count.
+    private static void QuantizeIQ4N(ReadOnlySpan<float> src, Span<byte> dst)
+    {
+        int blocks = (src.Length + 31) / 32;
+        for (int b = 0; b < blocks; b++)
+        {
+            ReadOnlySpan<float> block = src.Slice(b * 32, Math.Min(32, src.Length - b * 32));
+
+            float amax = 0f;
+            foreach (float v in block)
+            {
+                amax = Math.Max(amax, Math.Abs(v));
+            }
+
+            Half dHalf = (Half)(amax / 113f);
+            WriteLE(dst, b * 18, (ushort)BitConverter.HalfToInt16Bits(dHalf));
+
+            if (dHalf == (Half)0f)
+            {
+                continue; // all-zero block: quants stay zero, matching the reference behavior
+            }
+
+            float dBack = (float)dHalf;
+            for (int l = 0; l < block.Length; l++)
+            {
+                int code = NearestIQ4Code((double)block[l] / dBack);
+                int j = l & 15;
+                ref byte target = ref dst[b * 18 + 2 + j];
+                if (l < 16)
+                {
+                    target = (byte)((target & 0xF0) | code);
+                }
+                else
+                {
+                    target = (byte)((target & 0x0F) | (code << 4));
+                }
+            }
+        }
+    }
+
+    // Test-only IQ4_XS writer mirroring the reference layout: eight 32-value sub-blocks per 256-element block.
+    // Block d = amax(block) / 113 stored as a half-float at byte 0; each sub-block's six-bit scale is
+    // round(amax(sub-block) / (32 * d)) clamped to [0, 63] and read back as (ls - 32), packing its low nibble in
+    // scales_l[ib/2] at bit 4*(ib%2) (block bytes 4..7) and its two high bits in scales_h at bit 2*ib (bytes 2..3).
+    // Codes quantize against dl = d * (ls - 32) and live in the 128-byte qs region at block+8 with the same
+    // low/high nibble element order as IQ4_NL. Padded elements keep zero quants.
+    private static void QuantizeIQ4X(ReadOnlySpan<float> src, Span<byte> dst)
+    {
+        int blocks = (src.Length + 255) / 256;
+        for (int b = 0; b < blocks; b++)
+        {
+            ReadOnlySpan<float> srcBlock = src.Slice(b * 256, Math.Min(256, src.Length - b * 256));
+
+            float amaxBlock = 0f;
+            foreach (float v in srcBlock)
+            {
+                amaxBlock = Math.Max(amaxBlock, Math.Abs(v));
+            }
+
+            Half dHalf = (Half)(amaxBlock / 113f);
+            WriteLE(dst, b * 136, (ushort)BitConverter.HalfToInt16Bits(dHalf));
+            float dBack = (float)dHalf;
+
+            ushort scalesH = 0;
+            for (int ib = 0; ib < 8; ib++)
+            {
+                int start = ib * 32;
+                if (start >= srcBlock.Length)
+                {
+                    break; // padded region contributes nothing
+                }
+
+                ReadOnlySpan<float> sub = srcBlock.Slice(start, Math.Min(32, srcBlock.Length - start));
+                float amax = 0f;
+                foreach (float v in sub)
+                {
+                    amax = Math.Max(amax, Math.Abs(v));
+                }
+
+                int ls = dBack > 0f ? Math.Clamp((int)Math.Round((double)amax / (32.0 * dBack), MidpointRounding.AwayFromZero), 0, 63) : 0;
+                dst[b * 136 + 4 + ib / 2] |= (byte)((ls & 0xF) << (4 * (ib % 2)));
+                scalesH |= (ushort)(((ls >> 4) & 0x3) << (2 * ib));
+
+                float dl = dBack * (ls - 32);
+                if (dl == 0f)
+                {
+                    continue; // zero sub-block scale: quants stay zero, matching the reference behavior
+                }
+
+                for (int e = 0; e < sub.Length; e++)
+                {
+                    int code = NearestIQ4Code((double)sub[e] / dl);
+                    ref byte target = ref dst[b * 136 + 8 + 16 * ib + (e & 15)];
+                    if (e < 16)
+                    {
+                        target = (byte)((target & 0xF0) | code);
+                    }
+                    else
+                    {
+                        target = (byte)((target & 0x0F) | (code << 4));
+                    }
+                }
+            }
+
+            WriteLE(dst, b * 136 + 2, scalesH);
+        }
+    }
+
+    // Test-only nearest-code lookup: pick the table entry closest to the scaled value, clamped to the table range.
+    private static int NearestIQ4Code(double scaled)
+    {
+        int best = 0;
+        double bestDiff = double.MaxValue;
+        for (int n = 0; n < Iq4KValues.Length; n++)
+        {
+            double diff = Math.Abs(scaled - Iq4KValues[n]);
+            if (diff < bestDiff)
+            {
+                bestDiff = diff;
+                best = n;
+            }
+        }
+
+        return best;
     }
 
     // Test-only Q4_K writer mirroring the reference layout: per-group amax/15 scales and max(0, -min) offsets,

@@ -23,6 +23,8 @@ public class KernelTests
     [InlineData(QuantFormat.Q6_K)]
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
     public void Gemv_Scalar_MatchesDoubleOracle(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -47,6 +49,8 @@ public class KernelTests
     [InlineData(QuantFormat.Q6_K)]
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
     public void Gemv_Avx2_MatchesScalarWithinTightTolerance(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -87,6 +91,8 @@ public class KernelTests
     [InlineData(QuantFormat.Q6_K)]
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
     public void Gemv_Parallel_IsBitIdenticalToSingleThreaded(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -114,6 +120,8 @@ public class KernelTests
     [InlineData(QuantFormat.Q6_K)]
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
     public void Gemv_Avx2_MatchesDoubleOracle(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -225,6 +233,8 @@ public class KernelTests
     [InlineData(QuantFormat.Q6_K)]
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
     public void WeightRef_WrongByteLength_ThrowsClearMessage(QuantFormat format)
     {
         TensorShape shape = MatrixShape(4, 70);
@@ -257,6 +267,8 @@ public class KernelTests
     [InlineData(QuantFormat.Q6_K)]
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
     public void DequantRow_MatchesDoubleOracleAcrossFormats(QuantFormat format)
     {
         foreach ((int rows, int cols) in MatrixSizes)
@@ -479,6 +491,141 @@ public class KernelTests
     }
 
     [Theory]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
+    public void DequantRow_SyntheticBlocks_BothPathsMatchHandWrittenBytes(QuantFormat format)
+    {
+        int cols = format == QuantFormat.IQ4_NL ? 96 : 512; // three IQ4_NL blocks, or two IQ4_XS super-blocks in one row
+        byte[] packed = BuildSyntheticIq4Blocks(format);
+        TensorShape shape = MatrixShape(1, cols);
+
+        using CpuBackend scalar = new(threads: 1, allowAvx2: false);
+        using CpuBackend avx2 = new(threads: 1, allowAvx2: true);
+        WeightRef w = new(packed, shape, format);
+
+        float[] actualScalar = new float[cols];
+        float[] actualAvx2 = new float[cols];
+        scalar.DequantRow(w, 0, actualScalar);
+        avx2.DequantRow(w, 0, actualAvx2);
+
+        double[] expected = OracleDequantRow(packed, 0, cols, format);
+        AssertValuesClose(actualScalar, expected, relativeTolerance: 1e-6, $"scalar {format} synthetic blocks");
+        AssertValuesClose(actualAvx2, expected, relativeTolerance: 1e-6, $"avx2 {format} synthetic blocks");
+
+        // Both paths unpack the same bytes with the same arithmetic order, so the expansion must match bit-for-bit.
+        Assert.True(actualScalar.AsSpan().SequenceEqual(actualAvx2.AsSpan()), $"{format}: avx2 DequantRow diverges from scalar on synthetic blocks");
+    }
+
+    // Hand-written IQ4 images: every nibble code 0..15 appears in both nibble halves, d covers zero and negative
+    // values, and for IQ4_XS the eight sub-block scales span the whole six-bit range so negative (ls - 32) scales
+    // and both scale fields take part alongside the shared table lookup.
+    private static byte[] BuildSyntheticIq4Blocks(QuantFormat format)
+    {
+        if (format == QuantFormat.IQ4_NL)
+        {
+            byte[] packed = new byte[3 * 18];
+
+            // Block 0: d = 1.0. Byte j keeps code j in its low nibble and code (j + 8) % 16 in its high nibble, so
+            // all sixteen table entries dequantize in both nibble halves.
+            WriteLE(packed, 0, (ushort)BitConverter.HalfToInt16Bits((Half)1f));
+            for (int j = 0; j < 16; j++)
+            {
+                packed[2 + j] = (byte)(j | (((j + 8) % 16) << 4));
+            }
+
+            // Block 1: d = 0 makes every weight zero whatever the code; code 15 (table value 113) must not leak in.
+            WriteLE(packed, 18, (ushort)BitConverter.HalfToInt16Bits((Half)0f));
+            for (int j = 0; j < 16; j++)
+            {
+                packed[18 + 2 + j] = 0xFF;
+            }
+
+            // Block 2: d = -0.5 with varied codes so the negative scale and the negative table entries both run.
+            WriteLE(packed, 36, (ushort)BitConverter.HalfToInt16Bits((Half)(-0.5f)));
+            for (int j = 0; j < 16; j++)
+            {
+                packed[36 + 2 + j] = (byte)(((j * 5) % 16) | (j << 4));
+            }
+
+            return packed;
+        }
+
+        byte[] xs = new byte[2 * 136];
+
+        // Block 0: d = 1.0. Sub-block scales vary across the whole six-bit range; the low nibble lands in
+        // scales_l[ib/2] at bit 4*(ib%2) and the two high bits in scales_h at bit 2*ib.
+        WriteLE(xs, 0, (ushort)BitConverter.HalfToInt16Bits((Half)1f));
+        ushort scalesH0 = 0;
+        for (int ib = 0; ib < 8; ib++)
+        {
+            int ls = (ib * 9) & 0x3F; // 0, 9, 18, ... covering both nibble fields and both scale halves
+            xs[4 + ib / 2] |= (byte)((ls & 0xF) << (4 * (ib % 2)));
+            scalesH0 |= (ushort)(((ls >> 4) & 0x3) << (2 * ib));
+        }
+
+        WriteLE(xs, 2, scalesH0);
+        for (int ib = 0; ib < 8; ib++)
+        {
+            for (int j = 0; j < 16; j++)
+            {
+                xs[8 + 16 * ib + j] = (byte)(((ib + j) % 16) | ((15 - j) << 4)); // every table entry in both nibble halves
+            }
+        }
+
+        // Block 1: d = 0.25 with scale code 0 (read back as -32) and code 63 (read back as +31) side by side, so
+        // negative and positive sub-block scales dequantize through the same lookup.
+        WriteLE(xs, 136, (ushort)BitConverter.HalfToInt16Bits((Half)0.25f));
+        ushort scalesH1 = 0;
+        for (int ib = 0; ib < 8; ib++)
+        {
+            int ls = ib < 4 ? 0 : 63;
+            xs[136 + 4 + ib / 2] |= (byte)((ls & 0xF) << (4 * (ib % 2)));
+            scalesH1 |= (ushort)(((ls >> 4) & 0x3) << (2 * ib));
+        }
+
+        WriteLE(xs, 136 + 2, scalesH1);
+        for (int e = 0; e < 128; e++)
+        {
+            xs[136 + 8 + e] = (byte)(e & 0xFF); // varied codes across every nibble position
+        }
+
+        return xs;
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
+    public void Gemv_PartialFinalBlock_BothPathsMatchDoubleOracle(QuantFormat format)
+    {
+        // 100 and 137 columns are neither multiples of 32 nor of 256: the final block is zero-padded and only the
+        // real columns may contribute, in both the fused and the scalar cleanup tail.
+        foreach ((int rows, int cols) in new[] { (300, 100), (300, 137) })
+        {
+            (float[] x, byte[] weights) = CreateCase(rows, cols, format, seed: 4242);
+
+            using CpuBackend scalar = new(threads: 1, allowAvx2: false);
+            using CpuBackend avx2 = new(threads: 1, allowAvx2: true);
+            WeightRef w = new(weights, MatrixShape(rows, cols), format);
+
+            float[] actualScalar = new float[rows];
+            float[] actualAvx2 = new float[rows];
+            scalar.Gemv(x, w, actualScalar);
+            avx2.Gemv(x, w, actualAvx2);
+
+            (double[] expected, double[] magnitudes) = OracleDot(x, weights, rows, cols, format);
+            AssertClose(actualScalar, expected, magnitudes, relativeTolerance: 1e-4, $"scalar {format} partial final block at {rows}x{cols}");
+            AssertClose(actualAvx2, expected, magnitudes, relativeTolerance: 1e-4, $"avx2 {format} partial final block at {rows}x{cols}");
+
+            // The dequant expansion of the same padded row must agree bit-for-bit across paths.
+            float[] rowScalar = new float[cols];
+            float[] rowAvx2 = new float[cols];
+            scalar.DequantRow(w, 0, rowScalar);
+            avx2.DequantRow(w, 0, rowAvx2);
+            Assert.True(rowScalar.AsSpan().SequenceEqual(rowAvx2.AsSpan()), $"{format}: avx2 DequantRow diverges from scalar on a partial final block");
+        }
+    }
+
+    [Theory]
     [InlineData(QuantFormat.F32)]
     [InlineData(QuantFormat.Q4_K)]
     [InlineData(QuantFormat.Q5_0)]
@@ -486,6 +633,8 @@ public class KernelTests
     [InlineData(QuantFormat.Q6_K)]
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
     public void DequantRow_BadRowIndexOrOutputLength_ThrowsClearMessage(QuantFormat format)
     {
         TensorShape shape = MatrixShape(4, 70);
@@ -546,6 +695,12 @@ public class KernelTests
                     break;
                 case QuantFormat.Q3_K:
                     QuantizeQ3K(src, dst);
+                    break;
+                case QuantFormat.IQ4_NL:
+                    QuantizeIQ4N(src, dst);
+                    break;
+                case QuantFormat.IQ4_XS:
+                    QuantizeIQ4X(src, dst);
                     break;
                 default:
                     QuantizeQ4K(src, dst);
@@ -1000,6 +1155,138 @@ public class KernelTests
         }
     }
 
+    // The shared 16-value IQ4 table, pinned to the reference tag: byte n holds the value a nibble code n selects.
+    private static readonly sbyte[] Iq4KValues = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+
+    // Test-only IQ4_NL writer: per 32-element block, d = amax / 113 stored as a half-float at byte 0, and each
+    // element takes the nearest of the sixteen table values scaled by d. Element j < 16 keeps its code in the low
+    // nibble of qs[j] (block bytes 2..17) and element 16+j in the high nibble of the same byte. Padded elements
+    // keep zero quants, which the kernels never read past the real column count.
+    private static void QuantizeIQ4N(ReadOnlySpan<float> src, Span<byte> dst)
+    {
+        int blocks = (src.Length + 31) / 32;
+        for (int b = 0; b < blocks; b++)
+        {
+            ReadOnlySpan<float> block = src.Slice(b * 32, Math.Min(32, src.Length - b * 32));
+
+            float amax = 0f;
+            foreach (float v in block)
+            {
+                amax = Math.Max(amax, Math.Abs(v));
+            }
+
+            Half dHalf = (Half)(amax / 113f);
+            WriteLE(dst, b * 18, (ushort)BitConverter.HalfToInt16Bits(dHalf));
+
+            if (dHalf == (Half)0f)
+            {
+                continue; // all-zero block: quants stay zero, matching the reference behavior
+            }
+
+            float dBack = (float)dHalf;
+            for (int l = 0; l < block.Length; l++)
+            {
+                int code = NearestIQ4Code((double)block[l] / dBack);
+                int j = l & 15;
+                ref byte target = ref dst[b * 18 + 2 + j];
+                if (l < 16)
+                {
+                    target = (byte)((target & 0xF0) | code);
+                }
+                else
+                {
+                    target = (byte)((target & 0x0F) | (code << 4));
+                }
+            }
+        }
+    }
+
+    // Test-only IQ4_XS writer mirroring the reference layout: eight 32-value sub-blocks per 256-element block.
+    // Block d = amax(block) / 113 stored as a half-float at byte 0; each sub-block's six-bit scale is
+    // round(amax(sub-block) / (32 * d)) clamped to [0, 63] and read back as (ls - 32), packing its low nibble in
+    // scales_l[ib/2] at bit 4*(ib%2) (block bytes 4..7) and its two high bits in scales_h at bit 2*ib (bytes 2..3).
+    // Codes quantize against dl = d * (ls - 32) and live in the 128-byte qs region at block+8 with the same
+    // low/high nibble element order as IQ4_NL. Padded elements keep zero quants.
+    private static void QuantizeIQ4X(ReadOnlySpan<float> src, Span<byte> dst)
+    {
+        int blocks = (src.Length + 255) / 256;
+        for (int b = 0; b < blocks; b++)
+        {
+            ReadOnlySpan<float> srcBlock = src.Slice(b * 256, Math.Min(256, src.Length - b * 256));
+
+            float amaxBlock = 0f;
+            foreach (float v in srcBlock)
+            {
+                amaxBlock = Math.Max(amaxBlock, Math.Abs(v));
+            }
+
+            Half dHalf = (Half)(amaxBlock / 113f);
+            WriteLE(dst, b * 136, (ushort)BitConverter.HalfToInt16Bits(dHalf));
+            float dBack = (float)dHalf;
+
+            ushort scalesH = 0;
+            for (int ib = 0; ib < 8; ib++)
+            {
+                int start = ib * 32;
+                if (start >= srcBlock.Length)
+                {
+                    break; // padded region contributes nothing
+                }
+
+                ReadOnlySpan<float> sub = srcBlock.Slice(start, Math.Min(32, srcBlock.Length - start));
+                float amax = 0f;
+                foreach (float v in sub)
+                {
+                    amax = Math.Max(amax, Math.Abs(v));
+                }
+
+                int ls = dBack > 0f ? Math.Clamp((int)Math.Round((double)amax / (32.0 * dBack), MidpointRounding.AwayFromZero), 0, 63) : 0;
+                dst[b * 136 + 4 + ib / 2] |= (byte)((ls & 0xF) << (4 * (ib % 2)));
+                scalesH |= (ushort)(((ls >> 4) & 0x3) << (2 * ib));
+
+                float dl = dBack * (ls - 32);
+                if (dl == 0f)
+                {
+                    continue; // zero sub-block scale: quants stay zero, matching the reference behavior
+                }
+
+                for (int e = 0; e < sub.Length; e++)
+                {
+                    int code = NearestIQ4Code((double)sub[e] / dl);
+                    ref byte target = ref dst[b * 136 + 8 + 16 * ib + (e & 15)];
+                    if (e < 16)
+                    {
+                        target = (byte)((target & 0xF0) | code);
+                    }
+                    else
+                    {
+                        target = (byte)((target & 0x0F) | (code << 4));
+                    }
+                }
+            }
+
+            WriteLE(dst, b * 136 + 2, scalesH);
+        }
+    }
+
+    // Test-only nearest-code lookup: pick the table entry closest to the scaled value, clamped to the table range.
+    private static int NearestIQ4Code(double scaled)
+    {
+        int best = 0;
+        double bestDiff = double.MaxValue;
+        for (int n = 0; n < Iq4KValues.Length; n++)
+        {
+            double diff = Math.Abs(scaled - Iq4KValues[n]);
+            if (diff < bestDiff)
+            {
+                bestDiff = diff;
+                best = n;
+            }
+        }
+
+        return best;
+    }
+
     // Test-only Q4_K writer mirroring the reference layout: per-group amax/15 scales and max(0, -min) offsets,
     // block-level d/dmin = group-max / 63 stored as half-floats, then nibbles quantized against exactly those
     // stored values so dequantization is self-consistent with the kernels. Padded elements produce zero blocks.
@@ -1306,6 +1593,53 @@ public class KernelTests
                         }
                     }
                 }
+                else if (format == QuantFormat.IQ4_NL)
+                {
+                    int blocks = (cols + 31) / 32;
+                    for (int b = 0; b < blocks; b++)
+                    {
+                        byte* block = r + b * 18;
+                        double d = (float)BitConverter.Int16BitsToHalf((short)ReadLE(block, 0));
+                        int limit = Math.Min(32, cols - b * 32); // padded nibbles are zero: stop at the real column count.
+                        for (int l = 0; l < limit; l++)
+                        {
+                            int code = (block[2 + (l & 15)] >> (4 * (l >> 4))) & 0xF;
+                            double w = d * Iq4KValues[code];
+                            acc += pX[b * 32 + l] * w;
+                            mag += Math.Abs(pX[b * 32 + l] * w);
+                        }
+                    }
+                }
+                else if (format == QuantFormat.IQ4_XS)
+                {
+                    int blocks = (cols + 255) / 256;
+                    for (int b = 0; b < blocks; b++)
+                    {
+                        byte* block = r + b * 136;
+                        double d = (float)BitConverter.Int16BitsToHalf((short)ReadLE(block, 0));
+                        ushort scalesH = (ushort)(block[2] | (block[3] << 8));
+
+                        for (int ib = 0; ib < 8; ib++)
+                        {
+                            int subStart = b * 256 + ib * 32;
+                            if (subStart >= cols)
+                            {
+                                break; // zero-padded tail block carries no real columns
+                            }
+
+                            int ls = ((block[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scalesH >> (2 * ib)) & 3) << 4);
+                            double scale = d * (ls - 32);
+                            int limit = Math.Min(32, cols - subStart); // padded nibbles are zero: stop at the real column count.
+                            for (int l = 0; l < limit; l++)
+                            {
+                                int code = (block[8 + 16 * ib + (l & 15)] >> (4 * (l >> 4))) & 0xF;
+                                double w = scale * Iq4KValues[code];
+                                acc += pX[subStart + l] * w;
+                                mag += Math.Abs(pX[subStart + l] * w);
+                            }
+                        }
+                    }
+                }
                 else
                 {
                     int blocks = (cols + 255) / 256;
@@ -1564,6 +1898,53 @@ public class KernelTests
                             int two = (block[32 + 32 * h + 16 * (k & 1) + e] >> (2 * (k >> 1))) & 3;
                             int highBit = (block[16 * (k & 1) + e] >> (4 * h + (k >> 1))) & 1;
                             values[subStart + e] = scale * (two + (highBit << 2) - 4);
+                        }
+                    }
+                }
+
+                return values;
+            }
+
+            if (format == QuantFormat.IQ4_NL)
+            {
+                int blocks = (cols + 31) / 32;
+                for (int b = 0; b < blocks; b++)
+                {
+                    byte* block = r + b * 18;
+                    double d = (float)BitConverter.Int16BitsToHalf((short)ReadLE(block, 0));
+                    int limit = Math.Min(32, cols - b * 32); // padded nibbles are zero: stop at the real column count.
+                    for (int l = 0; l < limit; l++)
+                    {
+                        values[b * 32 + l] = d * Iq4KValues[(block[2 + (l & 15)] >> (4 * (l >> 4))) & 0xF];
+                    }
+                }
+
+                return values;
+            }
+
+            if (format == QuantFormat.IQ4_XS)
+            {
+                int blocks = (cols + 255) / 256;
+                for (int b = 0; b < blocks; b++)
+                {
+                    byte* block = r + b * 136;
+                    double d = (float)BitConverter.Int16BitsToHalf((short)ReadLE(block, 0));
+                    ushort scalesH = (ushort)(block[2] | (block[3] << 8));
+
+                    for (int ib = 0; ib < 8; ib++)
+                    {
+                        int subStart = b * 256 + ib * 32;
+                        if (subStart >= cols)
+                        {
+                            break; // zero-padded tail block carries no real columns
+                        }
+
+                        int ls = ((block[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) | (((scalesH >> (2 * ib)) & 3) << 4);
+                        double scale = d * (ls - 32);
+                        int limit = Math.Min(32, cols - subStart); // padded nibbles are zero: stop at the real column count.
+                        for (int l = 0; l < limit; l++)
+                        {
+                            values[subStart + l] = scale * Iq4KValues[(block[8 + 16 * ib + (l & 15)] >> (4 * (l >> 4))) & 0xF];
                         }
                     }
                 }
