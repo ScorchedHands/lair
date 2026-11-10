@@ -9,7 +9,7 @@ namespace Lair.Backends.Cpu;
 
 /// <summary>
 /// CPU compute backend: aligned arena management plus dense kernels. GEMV fuses dequantization for F16/Q8_0/Q4_K/
-/// Q5_0/Q5_K/Q6_K/Q2_K/Q3_K/IQ4_NL/IQ4_XS in a single pass over the packed bytes, taking an AVX2 fast path when
+/// Q5_0/Q5_K/Q6_K/Q2_K/Q3_K/IQ3_XXS/IQ4_NL/IQ4_XS in a single pass over the packed bytes, taking an AVX2 fast path when
 /// the runtime supports it and scalar reference paths otherwise. Rows are partitioned into blocks executed by a
 /// persistent worker pool; each row is computed independently so results are bit-identical regardless of thread
 /// count.
@@ -58,6 +58,14 @@ public sealed unsafe class CpuBackend : IBackend
     // the same group-pair windows as Q2_K, twelve bytes packing sixteen six-bit group scales at 96..107, and
     // half-float d at bytes 108..109. w = d * (sc - 32) * q with sc in [0, 63] and q in [0, 7].
     private const int Q3KBlockBytes = 110;
+
+    // IQ3_XXS super-blocks hold 256 elements in 98 bytes: half-float d at byte 0, 64 grid-index bytes at 2..65 (the
+    // qs region), and the eight little-endian aux words packing sub-block signs and scale codes at 66..97 (qs + 64).
+    // Eight 32-value sub-blocks: sub-block ib consumes eight consecutive grid indices at qs[8ib,8ib+8) and one aux
+    // word; bits 0..27 carry four seven-bit sign-group codes (group l reads bits 7l..7l+6, each a row of the shared
+    // sign table), bits 28..31 the sub-block scale code. w = d * (0.5f + aux >> 28) * 0.5f * grid byte, sign-applied
+    // per value through the sign table.
+    private const int IQ3XxsBlockBytes = 98;
 
     // IQ4_NL blocks hold 32 elements in 18 bytes: half-float d at byte 0 and 16 nibble bytes at bytes 2..17.
     // Element j < 16 is the low nibble of qs[j] and element 16+j the high nibble of the same byte; every nibble is
@@ -629,6 +637,43 @@ public sealed unsafe class CpuBackend : IBackend
                     }
 
                     break;
+                case QuantFormat.IQ3_XXS:
+                    if (_useAvx2)
+                    {
+                        DequantIQ3XAvx2(rowPtr, pOut, cols);
+                    }
+                    else
+                    {
+                        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+                        {
+                            byte* block = rowPtr + (long)(baseIdx / QkK) * IQ3XxsBlockBytes;
+                            float d = ReadHalfLE(block);
+
+                            for (int ib = 0; ib < 8; ib++)
+                            {
+                                int subStart = baseIdx + ib * 32;
+                                if (subStart >= cols)
+                                {
+                                    break; // zero-padded tail block: no elements left to consume.
+                                }
+
+                                uint aux = ReadIQ3AuxLE(block + 66 + 4 * ib);
+                                float db = d * (0.5f + (aux >> 28)) * 0.5f;
+                                byte* qs = block + 2 + 8 * ib; // grid-index window for the sub-block: bytes [qs, qs+8) always inside the block
+
+                                int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
+                                for (int e = 0; e < limit; e++)
+                                {
+                                    byte signs = GetKSignsIQ2XS()[(int)((aux >> (7 * (e >> 3))) & 127)]; // seven-bit sign-group code of the group holding element e
+                                    int gi = qs[2 * (e >> 3) + ((e >> 2) & 1)]; // grid index: low four values from the first entry, high four from the second
+                                    int grid = GetIq3XXSGrid()[gi * 4 + (e & 3)];
+                                    pOut[subStart + e] = db * grid * ((signs & KMaskIQ2XS(e & 7)) != 0 ? -1f : 1f);
+                                }
+                            }
+                        }
+                    }
+
+                    break;
                 case QuantFormat.IQ4_NL:
                     if (_useAvx2)
                     {
@@ -801,6 +846,7 @@ public sealed unsafe class CpuBackend : IBackend
             QuantFormat.Q6_K => avx2 ? RowDotQ6KAvx2(row, x, cols) : RowDotQ6KScalar(row, x, cols),
             QuantFormat.Q2_K => avx2 ? RowDotQ2KAvx2(row, x, cols) : RowDotQ2KScalar(row, x, cols),
             QuantFormat.Q3_K => avx2 ? RowDotQ3KAvx2(row, x, cols) : RowDotQ3KScalar(row, x, cols),
+            QuantFormat.IQ3_XXS => avx2 ? RowDotIQ3XAvx2(row, x, cols) : RowDotIQ3XScalar(row, x, cols),
             QuantFormat.IQ4_NL => avx2 ? RowDotIQ4NAvx2(row, x, cols) : RowDotIQ4NScalar(row, x, cols),
             QuantFormat.IQ4_XS => avx2 ? RowDotIQ4XAvx2(row, x, cols) : RowDotIQ4XScalar(row, x, cols),
             _ => throw new ArgumentOutOfRangeException(nameof(format), format, "Unknown quant format."),
@@ -1024,6 +1070,20 @@ public sealed unsafe class CpuBackend : IBackend
                     for (int b = 0; b < count; b++)
                     {
                         outBase[b * rows] = RowDotQ3KScalar(rowBytes, inputs + (long)b * cols, cols);
+                    }
+                }
+
+                break;
+            case QuantFormat.IQ3_XXS:
+                if (avx2)
+                {
+                    BatchIQ3X_Avx2(rowBytes, inputs, count, rows, cols, outBase);
+                }
+                else
+                {
+                    for (int b = 0; b < count; b++)
+                    {
+                        outBase[b * rows] = RowDotIQ3XScalar(rowBytes, inputs + (long)b * cols, cols);
                     }
                 }
 
@@ -1539,6 +1599,65 @@ public sealed unsafe class CpuBackend : IBackend
         }
     }
 
+    // Batched IQ3_XXS row: one staged sub-block feeds all accumulator chains with the same fused (x * w) FMA shape as
+    // RowDotIQ3XAvx2, so the packed bytes are streamed once for the whole batch.
+    private static void BatchIQ3X_Avx2(byte* row, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> acc = stackalloc float[MaxBatch * 8];
+        Span<float> tail = stackalloc float[MaxBatch];
+        Span<float> stage = stackalloc float[32]; // staging buffer for the current 32-value sub-block
+        BatchInit(acc, tail, count);
+
+        fixed (float* pAcc = acc)
+        {
+            for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+            {
+                byte* block = row + (long)(baseIdx / QkK) * IQ3XxsBlockBytes;
+                float dHalf = ReadHalfLE(block);
+
+                for (int ib = 0; ib < 8; ib++)
+                {
+                    int subStart = baseIdx + ib * 32;
+                    if (subStart >= cols)
+                    {
+                        break; // zero-padded tail block: no elements left to consume.
+                    }
+
+                    uint aux = ReadIQ3AuxLE(block + 66 + 4 * ib);
+                    float db = dHalf * (0.5f + (aux >> 28)) * 0.5f;
+                    int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
+
+                    FillIQ3SubBlock(block + 2 + 8 * ib, aux, db, stage);
+
+                    fixed (float* pStage = stage)
+                    {
+                        for (int c = 0; c + 8 <= limit; c += 8)
+                        {
+                            Vector256<float> wchunk = Avx.LoadVector256(pStage + c); // staged weights, materialized once per sub-block
+                            for (int b = 0; b < count; b++)
+                            {
+                                float* chain = pAcc + b * 8;
+                                Avx.Store(chain, Fma.MultiplyAdd(Avx.LoadVector256(inputs + (long)b * cols + subStart + c), wchunk, Avx.LoadVector256(chain)));
+                            }
+                        }
+
+                        for (int l = (limit / 8) * 8; l < limit; l++)
+                        {
+                            // Partial final chunk of the sub-block: scalar cleanup, at most seven elements per sub-block.
+                            float w = stage[l];
+                            for (int b = 0; b < count; b++)
+                            {
+                                tail[b] += w * inputs[(long)b * cols + subStart + l];
+                            }
+                        }
+                    }
+                }
+            }
+
+            BatchFinish(pAcc, tail, count, rows, outBase);
+        }
+    }
+
     // Batched IQ4_NL row: one table lookup per eight-element chunk feeds all accumulator chains with the same
     // fused (x * w) FMA shape as RowDotIQ4NAvx2, so the packed bytes are streamed once for the whole batch.
     private static void BatchIQ4N_Avx2(byte* row, float* inputs, int count, int rows, int cols, float* outBase)
@@ -1863,6 +1982,95 @@ public sealed unsafe class CpuBackend : IBackend
 
     // Little-endian 16-bit load of the IQ4_XS scale-high field at block bytes 2..3.
     private static ushort ReadScalesHLE(byte* block) => (ushort)(block[2] | (block[3] << 8));
+
+    // Little-endian 32-bit load of one IQ3_XXS aux word at scales_and_signs + 4*ib (block byte 66 + 4*ib).
+    private static uint ReadIQ3AuxLE(byte* p) => (uint)(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24));
+
+    // The IQ3_XXS grid, pinned to the reference table iq3xxs_grid: 256 entries of four magnitude bytes each. The
+    // table is materialized in little-endian byte order per entry (entry 0x04040C1C -> bytes 1C, 0C, 04, 04) so a
+    // grid byte indexes exactly the byte the reference reads through a uint8 cast over the packed table.
+    private static ReadOnlySpan<byte> GetIq3XXSGrid() => [
+        0x04, 0x04, 0x04, 0x04, 0x14, 0x04, 0x04, 0x04, 0x24, 0x04, 0x04, 0x04, 0x0C, 0x0C, 0x04, 0x04,  // 0x04040404 0x04040414 0x04040424 0x04040C0C
+        0x1C, 0x0C, 0x04, 0x04, 0x3E, 0x0C, 0x04, 0x04, 0x04, 0x14, 0x04, 0x04, 0x14, 0x14, 0x04, 0x04,  // 0x04040C1C 0x04040C3E 0x04041404 0x04041414
+        0x0C, 0x1C, 0x04, 0x04, 0x14, 0x24, 0x04, 0x04, 0x1C, 0x3E, 0x04, 0x04, 0x2C, 0x3E, 0x04, 0x04,  // 0x04041C0C 0x04042414 0x04043E1C 0x04043E2C
+        0x0C, 0x04, 0x0C, 0x04, 0x1C, 0x04, 0x0C, 0x04, 0x04, 0x0C, 0x0C, 0x04, 0x14, 0x0C, 0x0C, 0x04,  // 0x040C040C 0x040C041C 0x040C0C04 0x040C0C14
+        0x0C, 0x14, 0x0C, 0x04, 0x2C, 0x14, 0x0C, 0x04, 0x04, 0x1C, 0x0C, 0x04, 0x14, 0x1C, 0x0C, 0x04,  // 0x040C140C 0x040C142C 0x040C1C04 0x040C1C14
+        0x0C, 0x24, 0x0C, 0x04, 0x24, 0x2C, 0x0C, 0x04, 0x04, 0x3E, 0x0C, 0x04, 0x04, 0x04, 0x14, 0x04,  // 0x040C240C 0x040C2C24 0x040C3E04 0x04140404
+        0x14, 0x04, 0x14, 0x04, 0x24, 0x04, 0x14, 0x04, 0x0C, 0x0C, 0x14, 0x04, 0x04, 0x14, 0x14, 0x04,  // 0x04140414 0x04140424 0x04140C0C 0x04141404
+        0x14, 0x14, 0x14, 0x04, 0x0C, 0x1C, 0x14, 0x04, 0x1C, 0x1C, 0x14, 0x04, 0x3E, 0x1C, 0x14, 0x04,  // 0x04141414 0x04141C0C 0x04141C1C 0x04141C3E
+        0x0C, 0x2C, 0x14, 0x04, 0x3E, 0x2C, 0x14, 0x04, 0x2C, 0x3E, 0x14, 0x04, 0x0C, 0x04, 0x1C, 0x04,  // 0x04142C0C 0x04142C3E 0x04143E2C 0x041C040C
+        0x3E, 0x04, 0x1C, 0x04, 0x04, 0x0C, 0x1C, 0x04, 0x14, 0x0C, 0x1C, 0x04, 0x2C, 0x14, 0x1C, 0x04,  // 0x041C043E 0x041C0C04 0x041C0C14 0x041C142C
+        0x04, 0x3E, 0x1C, 0x04, 0x1C, 0x0C, 0x24, 0x04, 0x3E, 0x1C, 0x24, 0x04, 0x24, 0x24, 0x24, 0x04,  // 0x041C3E04 0x04240C1C 0x04241C3E 0x04242424
+        0x3E, 0x2C, 0x24, 0x04, 0x1C, 0x3E, 0x24, 0x04, 0x2C, 0x3E, 0x24, 0x04, 0x0C, 0x04, 0x2C, 0x04,  // 0x04242C3E 0x04243E1C 0x04243E2C 0x042C040C
+        0x3E, 0x04, 0x2C, 0x04, 0x14, 0x1C, 0x2C, 0x04, 0x14, 0x2C, 0x2C, 0x04, 0x2C, 0x1C, 0x34, 0x04,  // 0x042C043E 0x042C1C14 0x042C2C14 0x04341C2C
+        0x24, 0x34, 0x34, 0x04, 0x04, 0x0C, 0x3E, 0x04, 0x24, 0x0C, 0x3E, 0x04, 0x34, 0x0C, 0x3E, 0x04,  // 0x04343424 0x043E0C04 0x043E0C24 0x043E0C34
+        0x1C, 0x24, 0x3E, 0x04, 0x0C, 0x34, 0x3E, 0x04, 0x0C, 0x04, 0x04, 0x0C, 0x1C, 0x04, 0x04, 0x0C,  // 0x043E241C 0x043E340C 0x0C04040C 0x0C04041C
+        0x04, 0x0C, 0x04, 0x0C, 0x14, 0x0C, 0x04, 0x0C, 0x0C, 0x14, 0x04, 0x0C, 0x1C, 0x14, 0x04, 0x0C,  // 0x0C040C04 0x0C040C14 0x0C04140C 0x0C04141C
+        0x04, 0x1C, 0x04, 0x0C, 0x14, 0x1C, 0x04, 0x0C, 0x24, 0x1C, 0x04, 0x0C, 0x3E, 0x24, 0x04, 0x0C,  // 0x0C041C04 0x0C041C14 0x0C041C24 0x0C04243E
+        0x04, 0x2C, 0x04, 0x0C, 0x04, 0x04, 0x0C, 0x0C, 0x14, 0x04, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C,  // 0x0C042C04 0x0C0C0404 0x0C0C0414 0x0C0C0C0C
+        0x04, 0x14, 0x0C, 0x0C, 0x14, 0x14, 0x0C, 0x0C, 0x0C, 0x04, 0x14, 0x0C, 0x1C, 0x04, 0x14, 0x0C,  // 0x0C0C1404 0x0C0C1414 0x0C14040C 0x0C14041C
+        0x04, 0x0C, 0x14, 0x0C, 0x14, 0x0C, 0x14, 0x0C, 0x0C, 0x14, 0x14, 0x0C, 0x04, 0x1C, 0x14, 0x0C,  // 0x0C140C04 0x0C140C14 0x0C14140C 0x0C141C04
+        0x14, 0x3E, 0x14, 0x0C, 0x04, 0x04, 0x1C, 0x0C, 0x14, 0x04, 0x1C, 0x0C, 0x04, 0x14, 0x1C, 0x0C,  // 0x0C143E14 0x0C1C0404 0x0C1C0414 0x0C1C1404
+        0x0C, 0x1C, 0x1C, 0x0C, 0x34, 0x24, 0x1C, 0x0C, 0x34, 0x34, 0x1C, 0x0C, 0x0C, 0x04, 0x24, 0x0C,  // 0x0C1C1C0C 0x0C1C2434 0x0C1C3434 0x0C24040C
+        0x2C, 0x04, 0x24, 0x0C, 0x04, 0x2C, 0x24, 0x0C, 0x04, 0x14, 0x2C, 0x0C, 0x24, 0x14, 0x2C, 0x0C,  // 0x0C24042C 0x0C242C04 0x0C2C1404 0x0C2C1424
+        0x34, 0x24, 0x2C, 0x0C, 0x0C, 0x3E, 0x2C, 0x0C, 0x2C, 0x04, 0x34, 0x0C, 0x14, 0x14, 0x3E, 0x0C,  // 0x0C2C2434 0x0C2C3E0C 0x0C34042C 0x0C3E1414
+        0x04, 0x24, 0x3E, 0x0C, 0x04, 0x04, 0x04, 0x14, 0x14, 0x04, 0x04, 0x14, 0x0C, 0x0C, 0x04, 0x14,  // 0x0C3E2404 0x14040404 0x14040414 0x14040C0C
+        0x1C, 0x0C, 0x04, 0x14, 0x04, 0x14, 0x04, 0x14, 0x14, 0x14, 0x04, 0x14, 0x34, 0x14, 0x04, 0x14,  // 0x14040C1C 0x14041404 0x14041414 0x14041434
+        0x0C, 0x1C, 0x04, 0x14, 0x14, 0x24, 0x04, 0x14, 0x0C, 0x04, 0x0C, 0x14, 0x1C, 0x04, 0x0C, 0x14,  // 0x14041C0C 0x14042414 0x140C040C 0x140C041C
+        0x2C, 0x04, 0x0C, 0x14, 0x04, 0x0C, 0x0C, 0x14, 0x14, 0x0C, 0x0C, 0x14, 0x0C, 0x14, 0x0C, 0x14,  // 0x140C042C 0x140C0C04 0x140C0C14 0x140C140C
+        0x04, 0x1C, 0x0C, 0x14, 0x1C, 0x34, 0x0C, 0x14, 0x3E, 0x34, 0x0C, 0x14, 0x04, 0x3E, 0x0C, 0x14,  // 0x140C1C04 0x140C341C 0x140C343E 0x140C3E04
+        0x04, 0x04, 0x14, 0x14, 0x14, 0x04, 0x14, 0x14, 0x0C, 0x0C, 0x14, 0x14, 0x3E, 0x0C, 0x14, 0x14,  // 0x14140404 0x14140414 0x14140C0C 0x14140C3E
+        0x04, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x14, 0x3E, 0x1C, 0x14, 0x14, 0x04, 0x24, 0x14, 0x14,  // 0x14141404 0x14141414 0x14141C3E 0x14142404
+        0x2C, 0x2C, 0x14, 0x14, 0x0C, 0x04, 0x1C, 0x14, 0x04, 0x0C, 0x1C, 0x14, 0x24, 0x0C, 0x1C, 0x14,  // 0x14142C2C 0x141C040C 0x141C0C04 0x141C0C24
+        0x04, 0x3E, 0x1C, 0x14, 0x24, 0x3E, 0x1C, 0x14, 0x2C, 0x1C, 0x24, 0x14, 0x1C, 0x2C, 0x24, 0x14,  // 0x141C3E04 0x141C3E24 0x14241C2C 0x14242C1C
+        0x1C, 0x04, 0x2C, 0x14, 0x3E, 0x14, 0x2C, 0x14, 0x0C, 0x24, 0x2C, 0x14, 0x24, 0x3E, 0x2C, 0x14,  // 0x142C041C 0x142C143E 0x142C240C 0x142C3E24
+        0x0C, 0x04, 0x3E, 0x14, 0x1C, 0x04, 0x3E, 0x14, 0x34, 0x0C, 0x3E, 0x14, 0x2C, 0x24, 0x3E, 0x14,  // 0x143E040C 0x143E041C 0x143E0C34 0x143E242C
+        0x0C, 0x04, 0x04, 0x1C, 0x04, 0x0C, 0x04, 0x1C, 0x14, 0x0C, 0x04, 0x1C, 0x0C, 0x14, 0x04, 0x1C,  // 0x1C04040C 0x1C040C04 0x1C040C14 0x1C04140C
+        0x1C, 0x14, 0x04, 0x1C, 0x04, 0x2C, 0x04, 0x1C, 0x2C, 0x34, 0x04, 0x1C, 0x14, 0x3E, 0x04, 0x1C,  // 0x1C04141C 0x1C042C04 0x1C04342C 0x1C043E14
+        0x04, 0x04, 0x0C, 0x1C, 0x14, 0x04, 0x0C, 0x1C, 0x04, 0x14, 0x0C, 0x1C, 0x0C, 0x1C, 0x0C, 0x1C,  // 0x1C0C0404 0x1C0C0414 0x1C0C1404 0x1C0C1C0C
+        0x24, 0x24, 0x0C, 0x1C, 0x34, 0x24, 0x0C, 0x1C, 0x0C, 0x04, 0x14, 0x1C, 0x1C, 0x04, 0x14, 0x1C,  // 0x1C0C2424 0x1C0C2434 0x1C14040C 0x1C14041C
+        0x04, 0x0C, 0x14, 0x1C, 0x2C, 0x14, 0x14, 0x1C, 0x14, 0x2C, 0x14, 0x1C, 0x14, 0x3E, 0x14, 0x1C,  // 0x1C140C04 0x1C14142C 0x1C142C14 0x1C143E14
+        0x0C, 0x0C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x1C, 0x04, 0x1C, 0x24, 0x1C, 0x3E, 0x24, 0x24, 0x1C,  // 0x1C1C0C0C 0x1C1C1C1C 0x1C241C04 0x1C24243E
+        0x14, 0x3E, 0x24, 0x1C, 0x04, 0x04, 0x2C, 0x1C, 0x34, 0x04, 0x2C, 0x1C, 0x14, 0x14, 0x2C, 0x1C,  // 0x1C243E14 0x1C2C0404 0x1C2C0434 0x1C2C1414
+        0x2C, 0x2C, 0x2C, 0x1C, 0x24, 0x0C, 0x34, 0x1C, 0x34, 0x1C, 0x34, 0x1C, 0x1C, 0x34, 0x34, 0x1C,  // 0x1C2C2C2C 0x1C340C24 0x1C341C34 0x1C34341C
+        0x1C, 0x1C, 0x3E, 0x1C, 0x04, 0x34, 0x3E, 0x1C, 0x24, 0x04, 0x04, 0x24, 0x3E, 0x0C, 0x04, 0x24,  // 0x1C3E1C1C 0x1C3E3404 0x24040424 0x24040C3E
+        0x2C, 0x1C, 0x04, 0x24, 0x3E, 0x1C, 0x04, 0x24, 0x1C, 0x2C, 0x04, 0x24, 0x3E, 0x2C, 0x04, 0x24,  // 0x24041C2C 0x24041C3E 0x24042C1C 0x24042C3E
+        0x24, 0x3E, 0x0C, 0x24, 0x04, 0x14, 0x14, 0x24, 0x3E, 0x1C, 0x14, 0x24, 0x04, 0x24, 0x14, 0x24,  // 0x240C3E24 0x24141404 0x24141C3E 0x24142404
+        0x04, 0x34, 0x14, 0x24, 0x34, 0x34, 0x14, 0x24, 0x3E, 0x04, 0x1C, 0x24, 0x2C, 0x24, 0x1C, 0x24,  // 0x24143404 0x24143434 0x241C043E 0x241C242C
+        0x24, 0x04, 0x24, 0x24, 0x0C, 0x2C, 0x24, 0x24, 0x24, 0x34, 0x24, 0x24, 0x2C, 0x14, 0x2C, 0x24,  // 0x24240424 0x24242C0C 0x24243424 0x242C142C
+        0x1C, 0x24, 0x2C, 0x24, 0x04, 0x3E, 0x2C, 0x24, 0x2C, 0x04, 0x3E, 0x24, 0x04, 0x0C, 0x3E, 0x24,  // 0x242C241C 0x242C3E04 0x243E042C 0x243E0C04
+        0x14, 0x0C, 0x3E, 0x24, 0x04, 0x1C, 0x3E, 0x24, 0x14, 0x0C, 0x04, 0x2C, 0x0C, 0x24, 0x04, 0x2C,  // 0x243E0C14 0x243E1C04 0x2C040C14 0x2C04240C
+        0x04, 0x3E, 0x04, 0x2C, 0x04, 0x04, 0x0C, 0x2C, 0x34, 0x04, 0x0C, 0x2C, 0x34, 0x14, 0x0C, 0x2C,  // 0x2C043E04 0x2C0C0404 0x2C0C0434 0x2C0C1434
+        0x2C, 0x2C, 0x0C, 0x2C, 0x24, 0x0C, 0x14, 0x2C, 0x14, 0x1C, 0x14, 0x2C, 0x14, 0x3E, 0x14, 0x2C,  // 0x2C0C2C2C 0x2C140C24 0x2C141C14 0x2C143E14
+        0x14, 0x04, 0x1C, 0x2C, 0x1C, 0x2C, 0x1C, 0x2C, 0x04, 0x0C, 0x24, 0x2C, 0x1C, 0x14, 0x24, 0x2C,  // 0x2C1C0414 0x2C1C2C1C 0x2C240C04 0x2C24141C
+        0x3E, 0x14, 0x24, 0x2C, 0x14, 0x3E, 0x24, 0x2C, 0x14, 0x04, 0x2C, 0x2C, 0x0C, 0x1C, 0x2C, 0x2C,  // 0x2C24143E 0x2C243E14 0x2C2C0414 0x2C2C1C0C
+        0x04, 0x2C, 0x34, 0x2C, 0x24, 0x14, 0x3E, 0x2C, 0x14, 0x24, 0x3E, 0x2C, 0x24, 0x14, 0x04, 0x34,  // 0x2C342C04 0x2C3E1424 0x2C3E2414 0x34041424
+        0x24, 0x24, 0x04, 0x34, 0x34, 0x24, 0x04, 0x34, 0x24, 0x34, 0x04, 0x34, 0x0C, 0x14, 0x0C, 0x34,  // 0x34042424 0x34042434 0x34043424 0x340C140C
+        0x0C, 0x34, 0x0C, 0x34, 0x3E, 0x0C, 0x14, 0x34, 0x24, 0x34, 0x14, 0x34, 0x04, 0x1C, 0x1C, 0x34,  // 0x340C340C 0x34140C3E 0x34143424 0x341C1C04
+        0x34, 0x1C, 0x1C, 0x34, 0x24, 0x24, 0x24, 0x34, 0x2C, 0x04, 0x2C, 0x34, 0x14, 0x2C, 0x2C, 0x34,  // 0x341C1C34 0x34242424 0x342C042C 0x342C2C14
+        0x1C, 0x1C, 0x34, 0x34, 0x1C, 0x04, 0x3E, 0x34, 0x0C, 0x14, 0x3E, 0x34, 0x1C, 0x04, 0x04, 0x3E,  // 0x34341C1C 0x343E041C 0x343E140C 0x3E04041C
+        0x2C, 0x04, 0x04, 0x3E, 0x3E, 0x04, 0x04, 0x3E, 0x04, 0x0C, 0x04, 0x3E, 0x14, 0x1C, 0x04, 0x3E,  // 0x3E04042C 0x3E04043E 0x3E040C04 0x3E041C14
+        0x14, 0x2C, 0x04, 0x3E, 0x34, 0x14, 0x0C, 0x3E, 0x04, 0x24, 0x0C, 0x3E, 0x14, 0x0C, 0x14, 0x3E,  // 0x3E042C14 0x3E0C1434 0x3E0C2404 0x3E140C14
+        0x2C, 0x24, 0x14, 0x3E, 0x14, 0x2C, 0x14, 0x3E, 0x04, 0x04, 0x1C, 0x3E, 0x2C, 0x0C, 0x1C, 0x3E,  // 0x3E14242C 0x3E142C14 0x3E1C0404 0x3E1C0C2C
+        0x1C, 0x1C, 0x1C, 0x3E, 0x04, 0x34, 0x1C, 0x3E, 0x0C, 0x14, 0x24, 0x3E, 0x0C, 0x24, 0x24, 0x3E,  // 0x3E1C1C1C 0x3E1C3404 0x3E24140C 0x3E24240C
+        0x04, 0x04, 0x2C, 0x3E, 0x14, 0x04, 0x2C, 0x3E, 0x24, 0x14, 0x2C, 0x3E, 0x04, 0x1C, 0x34, 0x3E,  // 0x3E2C0404 0x3E2C0414 0x3E2C1424 0x3E341C04
+    ];
+
+    // The shared sign table ksigns_iq2xs: a seven-bit code selects the eight-value sign byte of a grid pair. Every
+    // row carries an even number of set bits, matching the reference lattice; bit i tests value i of the pair.
+    private static ReadOnlySpan<byte> GetKSignsIQ2XS() => [
+        0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
+        144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
+        160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,
+        48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
+        192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207,
+        80, 209, 210, 83, 212, 85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95,
+        96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+        240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+    ];
+
+    // The shared sign mask kmask_iq2xs: bit i of a sign byte tests value i of the eight-value grid pair.
+    private static int KMaskIQ2XS(int i) => 1 << i;
 
     // The shared 16-value IQ4 table: kvalues_iq4nl = -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53,
     // 69, 89, 113. Byte lane n holds the value for nibble n, so a pshufb lookup takes the nibble directly.
@@ -2540,6 +2748,151 @@ public sealed unsafe class CpuBackend : IBackend
         return HSum(acc) + tail;
     }
 
+    // IQ3_XXS: each 98-byte block covers 256 elements in eight 32-value sub-blocks ib. Sub-block ib reads its aux
+    // word at scales_and_signs + 4*ib (block byte 66 + 4*ib): bits 28..31 give the sub-block scale, read back as
+    // db = d * (0.5f + aux >> 28) * 0.5f; bits 0..27 pack four seven-bit sign-group codes, each selecting a row of
+    // the shared sign table for the eight values of group l. Elements l*8..l*8+3 take grid entry qs[8ib+2l] and
+    // elements l*8+4..l*8+7 entry qs[8ib+2l+1], byte j of each entry in little-endian order. w = db * grid byte,
+    // sign-applied through the sign table. This is the literal scalar port of the reference dequant formula.
+    private static float RowDotIQ3XScalar(byte* row, float* x, int cols)
+    {
+        float acc = 0f;
+
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+        {
+            byte* block = row + (long)(baseIdx / QkK) * IQ3XxsBlockBytes;
+            float d = ReadHalfLE(block);
+            byte* qs = block + 2; // grid-index region: bytes [qs, qs+64) always inside the block
+            byte* scalesAndSigns = qs + QkK / 4;
+
+            for (int ib = 0; ib < 8; ib++)
+            {
+                int subStart = baseIdx + ib * 32;
+                if (subStart >= cols)
+                {
+                    break; // zero-padded tail block: no elements left to consume.
+                }
+
+                uint aux = ReadIQ3AuxLE(scalesAndSigns + 4 * ib);
+                float db = d * (0.5f + (aux >> 28)) * 0.5f;
+                int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
+                for (int e = 0; e < limit; e++)
+                {
+                    byte signs = GetKSignsIQ2XS()[(int)((aux >> (7 * (e >> 3))) & 127)]; // seven-bit sign-group code of the group holding element e
+                    int gi = qs[8 * ib + 2 * (e >> 3) + ((e >> 2) & 1)]; // grid index: low four values from entry qs[g], high four from entry qs[g+1]
+                    int grid = GetIq3XXSGrid()[gi * 4 + (e & 3)];
+                    acc += x[subStart + e] * (db * grid * ((signs & KMaskIQ2XS(e & 7)) != 0 ? -1f : 1f));
+                }
+            }
+        }
+
+        return acc;
+    }
+
+    // AVX2: expand each 32-value sub-block into a stack staging buffer with the grid/sign-table lookups (a 256-entry
+    // grid cannot be reached through a single pshufb, so staging replaces direct table lookup), then fuse the staged
+    // weights into the same eight-lane accumulator, chunk order, and lane reduction as RowDotIQ4XAvx2. Partial
+    // chunks fall to scalar accumulation.
+    private static float RowDotIQ3XAvx2(byte* row, float* x, int cols)
+    {
+        Vector256<float> acc = Vector256<float>.Zero;
+        float tail = 0f;
+        Span<float> stage = stackalloc float[32]; // staging buffer for the current 32-value sub-block
+
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+        {
+            byte* block = row + (long)(baseIdx / QkK) * IQ3XxsBlockBytes;
+            float dHalf = ReadHalfLE(block);
+
+            for (int ib = 0; ib < 8; ib++)
+            {
+                int subStart = baseIdx + ib * 32;
+                if (subStart >= cols)
+                {
+                    break; // zero-padded tail block: no elements left to consume.
+                }
+
+                uint aux = ReadIQ3AuxLE(block + 66 + 4 * ib);
+                float db = dHalf * (0.5f + (aux >> 28)) * 0.5f;
+                int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
+
+                FillIQ3SubBlock(block + 2 + 8 * ib, aux, db, stage);
+
+                fixed (float* pStage = stage)
+                {
+                    for (int c = 0; c + 8 <= limit; c += 8)
+                    {
+                        Vector256<float> xv = Avx.LoadVector256(x + subStart + c); // safe: these columns are real and block-covered
+                        acc = Fma.MultiplyAdd(xv, Avx.LoadVector256(pStage + c), acc);
+                    }
+                }
+
+                for (int l = (limit / 8) * 8; l < limit; l++)
+                {
+                    // Partial final chunk of the sub-block: scalar cleanup, at most seven elements per sub-block.
+                    tail += x[subStart + l] * stage[l];
+                }
+            }
+        }
+
+        return HSum(acc) + tail;
+    }
+
+    // IQ3_XXS sub-block staging: for each of the four eight-value groups, gather the two referenced grid entries'
+    // magnitude bytes into one broadcast pair (byte lanes 0..7 hold entry A then entry B in element order), widen them
+    // with sign (pmovsxbd) so every byte lands as its exact integer value, multiply by db, and flip the selected lanes
+    // by XOR-ing the float sign bit (exact for every finite value, matching the reference multiply by -1.f). The staged
+    // weights land in element order so the fused chunks match the scalar oracle.
+    private static void FillIQ3SubBlock(byte* qs, uint aux, float db, Span<float> stage)
+    {
+        fixed (float* pStage = stage)
+        {
+            ReadOnlySpan<byte> gridTable = GetIq3XXSGrid();
+
+            for (int l = 0; l < 4; l++)
+            {
+                byte signs = GetKSignsIQ2XS()[(int)((aux >> (7 * l)) & 127)];
+
+                // Four magnitude bytes of each referenced entry, combined little-endian into one broadcast pair.
+                int offA = qs[2 * l] * 4;
+                uint gridA = (uint)(gridTable[offA] | (gridTable[offA + 1] << 8) | (gridTable[offA + 2] << 16) | (gridTable[offA + 3] << 24));
+                int offB = qs[2 * l + 1] * 4;
+                uint gridB = (uint)(gridTable[offB] | (gridTable[offB + 1] << 8) | (gridTable[offB + 2] << 16) | (gridTable[offB + 3] << 24));
+
+                Vector128<sbyte> magnitudes = Vector128.Create((ulong)(((ulong)gridB << 32) | gridA)).AsSByte();
+                Vector128<int> magLo = Sse41.ConvertToVector128Int32(magnitudes); // bytes 0..3 -> dword lanes (pmovsxbd, magnitudes all < 128)
+                Vector128<int> magHi = Sse41.ConvertToVector128Int32(Ssse3.Shuffle(magnitudes.AsByte(), GetUpperBytesShuffle()).AsSByte()); // bytes 4..7 -> dword lanes
+
+                float dbLocal = db;
+                Vector128<float> dbV = Avx.BroadcastScalarToVector128(&dbLocal);
+                Vector128<float> wLo = Sse.Multiply(Avx.ConvertToVector128Single(magLo), dbV); // cvtdq2ps then scale
+                Vector128<float> wHi = Sse.Multiply(Avx.ConvertToVector128Single(magHi), dbV);
+
+                Sse.Store(pStage + l * 8, Avx2.Xor(wLo.AsInt32(), SignMaskIQ2XS(signs, 0)).AsSingle());
+                Sse.Store(pStage + l * 8 + 4, Avx2.Xor(wHi.AsInt32(), SignMaskIQ2XS(signs, 4)).AsSingle());
+            }
+        }
+    }
+
+    // Build the four float sign-bit lanes of one grid entry: pshufb broadcasts bit laneBase+i of the sign byte into
+    // dword lane i, a signed compare against zero builds the all-ones test mask, and AND-ing 0x80000000 turns each set
+    // test into a float sign-bit flip - exactly the reference ternary's -1.f/1.f selector.
+    private static Vector128<int> SignMaskIQ2XS(byte signs, int laneBase)
+    {
+        Vector128<byte> bitRows = Ssse3.Shuffle(
+            Vector128.Create(signs),
+            Vector128.Create((byte)laneBase, (byte)(laneBase + 1), (byte)(laneBase + 2), (byte)(laneBase + 3), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0));
+        Vector128<int> test = Sse2.And(
+            Sse41.ConvertToVector128Int32(bitRows),
+            laneBase switch
+            {
+                0 => Vector128.Create(1, 2, 4, 8), // the shared kmask_iq2xs row for bits 0..3
+                _ => Vector128.Create(16, 32, 64, 128), // and for bits 4..7
+            });
+
+        return Sse2.And(Sse2.CompareGreaterThan(test, Vector128<int>.Zero), Vector128.Create(unchecked((int)0x80000000)));
+    }
+
     // IQ4_NL: each 18-byte block covers 32 elements: half-float d at byte 0 and 16 nibble bytes at bytes 2..17.
     // Element j < 16 is the low nibble of qs[j] and element 16+j the high nibble of the same byte; every nibble is
     // a code into the shared 16-value IQ4 table. w = d * kvalue[q].
@@ -3018,6 +3371,47 @@ public sealed unsafe class CpuBackend : IBackend
                     // Partial final chunk of the group: scalar cleanup, at most seven elements per group.
                     int three = ((q[e] >> (2 * (k >> 1))) & 3) - ((hm[e] & m) != 0 ? 0 : 4);
                     outPtr[subStart + e] = three * scale;
+                }
+            }
+        }
+    }
+
+    // IQ3_XXS row expansion: w = db * grid byte, sign-applied through the sign table, per element. Same grid/sign
+    // staging as RowDotIQ3XAvx2, storing the staged weights instead of dotting them.
+    private static void DequantIQ3XAvx2(byte* row, float* outPtr, int cols)
+    {
+        Span<float> stage = stackalloc float[32]; // staging buffer for the current 32-value sub-block
+
+        for (int baseIdx = 0; baseIdx < cols; baseIdx += QkK)
+        {
+            byte* block = row + (long)(baseIdx / QkK) * IQ3XxsBlockBytes;
+            float dHalf = ReadHalfLE(block);
+
+            for (int ib = 0; ib < 8; ib++)
+            {
+                int subStart = baseIdx + ib * 32;
+                if (subStart >= cols)
+                {
+                    break; // zero-padded tail block: no elements left to consume.
+                }
+
+                uint aux = ReadIQ3AuxLE(block + 66 + 4 * ib);
+                float db = dHalf * (0.5f + (aux >> 28)) * 0.5f;
+                int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
+
+                FillIQ3SubBlock(block + 2 + 8 * ib, aux, db, stage);
+
+                fixed (float* pStage = stage)
+                {
+                    for (int c = 0; c + 8 <= limit; c += 8)
+                    {
+                        Avx.Store(outPtr + subStart + c, Avx.LoadVector256(pStage + c)); // staged weights, materialized once per sub-block
+                    }
+                }
+
+                for (int l = (limit / 8) * 8; l < limit; l++)
+                {
+                    outPtr[subStart + l] = stage[l]; // partial final chunk: at most seven elements per sub-block
                 }
             }
         }

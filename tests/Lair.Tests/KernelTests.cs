@@ -1,4 +1,5 @@
 ﻿using System.Buffers;
+using System.Numerics;
 using System.Runtime.InteropServices;
 using Lair.Backends.Cpu;
 using Lair.Contracts;
@@ -24,6 +25,7 @@ public class KernelTests
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
     [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ4_XS)]
     public void Gemv_Scalar_MatchesDoubleOracle(QuantFormat format)
     {
@@ -50,6 +52,7 @@ public class KernelTests
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
     [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ4_XS)]
     public void Gemv_Avx2_MatchesScalarWithinTightTolerance(QuantFormat format)
     {
@@ -92,6 +95,7 @@ public class KernelTests
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
     [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ4_XS)]
     public void Gemv_Parallel_IsBitIdenticalToSingleThreaded(QuantFormat format)
     {
@@ -121,6 +125,7 @@ public class KernelTests
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
     [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ4_XS)]
     public void Gemv_Avx2_MatchesDoubleOracle(QuantFormat format)
     {
@@ -234,6 +239,7 @@ public class KernelTests
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
     [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ4_XS)]
     public void WeightRef_WrongByteLength_ThrowsClearMessage(QuantFormat format)
     {
@@ -268,6 +274,7 @@ public class KernelTests
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
     [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ4_XS)]
     public void DequantRow_MatchesDoubleOracleAcrossFormats(QuantFormat format)
     {
@@ -356,6 +363,7 @@ public class KernelTests
     [Theory]
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
+    [InlineData(QuantFormat.IQ3_XXS)]
     public void DequantRow_SyntheticSuperBlocks_BothPathsMatchHandWrittenBytes(QuantFormat format)
     {
         const int cols = 512; // two full super-blocks in one row: no padded tail absorbs a wide load
@@ -418,6 +426,52 @@ public class KernelTests
             for (int e = 0; e < 64; e++)
             {
                 packed[84 + 16 + e] = (byte)(e & 0xFF); // varied 2-bit codes across every shift position
+            }
+
+            return packed;
+        }
+
+        if (format == QuantFormat.IQ3_XXS)
+        {
+            byte[] packed = new byte[2 * 98];
+
+            // Block 0: d = 1.0. Each sub-block's four-bit scale walks the whole range, and its four seven-bit sign-group
+            // codes select varied rows of the shared sign table (including code 0 at ib = 0). Grid indices vary across
+            // the full entry range so lookups land on different entries for every group.
+            WriteLE(packed, 0, (ushort)BitConverter.HalfToInt16Bits((Half)1f));
+            for (int ib = 0; ib < 8; ib++)
+            {
+                uint aux = ((uint)(ib * 2 & 0xF) << 28); // scale codes 0, 2, ... 14 across the eight sub-blocks
+                for (int l = 0; l < 4; l++)
+                {
+                    aux |= (uint)((l + 4 * ib) & 127) << (7 * l); // sign-group codes cover varied table rows, including code 0 at ib = 0, l = 0
+                }
+
+                packed[66 + 4 * ib] = (byte)aux;
+                packed[67 + 4 * ib] = (byte)(aux >> 8);
+                packed[68 + 4 * ib] = (byte)(aux >> 16);
+                packed[69 + 4 * ib] = (byte)(aux >> 24);
+
+                for (int g = 0; g < 8; g++)
+                {
+                    packed[2 + 8 * ib + g] = (byte)((ib * 37 + g * 13) & 0xFF); // varied grid indices across the whole entry range
+                }
+            }
+
+            // Block 1: d = 0 makes every weight zero whatever the scale, sign, or grid bits; maxed-out bits must not leak in.
+            WriteLE(packed, 98, (ushort)BitConverter.HalfToInt16Bits((Half)0f));
+            for (int ib = 0; ib < 8; ib++)
+            {
+                uint aux = ((uint)15 << 28) | 0x0FFFFFFF; // max scale and all-ones sign codes
+                packed[98 + 66 + 4 * ib] = (byte)aux;
+                packed[98 + 67 + 4 * ib] = (byte)(aux >> 8);
+                packed[98 + 68 + 4 * ib] = (byte)(aux >> 16);
+                packed[98 + 69 + 4 * ib] = (byte)(aux >> 24);
+
+                for (int g = 0; g < 8; g++)
+                {
+                    packed[98 + 2 + 8 * ib + g] = 255; // every group reads the last grid entry
+                }
             }
 
             return packed;
@@ -594,6 +648,7 @@ public class KernelTests
 
     [Theory]
     [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ4_XS)]
     public void Gemv_PartialFinalBlock_BothPathsMatchDoubleOracle(QuantFormat format)
     {
@@ -634,6 +689,7 @@ public class KernelTests
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
     [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ4_XS)]
     public void DequantRow_BadRowIndexOrOutputLength_ThrowsClearMessage(QuantFormat format)
     {
@@ -695,6 +751,9 @@ public class KernelTests
                     break;
                 case QuantFormat.Q3_K:
                     QuantizeQ3K(src, dst);
+                    break;
+                case QuantFormat.IQ3_XXS:
+                    QuantizeIQ3Xxs(src, dst);
                     break;
                 case QuantFormat.IQ4_NL:
                     QuantizeIQ4N(src, dst);
@@ -1287,6 +1346,190 @@ public class KernelTests
         return best;
     }
 
+    // Test-local copy of the shared IQ3_XXS grid as 256 uint32 magnitudes: entry i's little-endian bytes are the four
+    // magnitude bytes the kernels read at grid[i * 4 + n].
+    private static readonly uint[] Iq3XXSGridU32 =
+    [
+        0x04040404, 0x04040414, 0x04040424, 0x04040C0C, 0x04040C1C, 0x04040C3E, 0x04041404, 0x04041414,
+        0x04041C0C, 0x04042414, 0x04043E1C, 0x04043E2C, 0x040C040C, 0x040C041C, 0x040C0C04, 0x040C0C14,
+        0x040C140C, 0x040C142C, 0x040C1C04, 0x040C1C14, 0x040C240C, 0x040C2C24, 0x040C3E04, 0x04140404,
+        0x04140414, 0x04140424, 0x04140C0C, 0x04141404, 0x04141414, 0x04141C0C, 0x04141C1C, 0x04141C3E,
+        0x04142C0C, 0x04142C3E, 0x04143E2C, 0x041C040C, 0x041C043E, 0x041C0C04, 0x041C0C14, 0x041C142C,
+        0x041C3E04, 0x04240C1C, 0x04241C3E, 0x04242424, 0x04242C3E, 0x04243E1C, 0x04243E2C, 0x042C040C,
+        0x042C043E, 0x042C1C14, 0x042C2C14, 0x04341C2C, 0x04343424, 0x043E0C04, 0x043E0C24, 0x043E0C34,
+        0x043E241C, 0x043E340C, 0x0C04040C, 0x0C04041C, 0x0C040C04, 0x0C040C14, 0x0C04140C, 0x0C04141C,
+        0x0C041C04, 0x0C041C14, 0x0C041C24, 0x0C04243E, 0x0C042C04, 0x0C0C0404, 0x0C0C0414, 0x0C0C0C0C,
+        0x0C0C1404, 0x0C0C1414, 0x0C14040C, 0x0C14041C, 0x0C140C04, 0x0C140C14, 0x0C14140C, 0x0C141C04,
+        0x0C143E14, 0x0C1C0404, 0x0C1C0414, 0x0C1C1404, 0x0C1C1C0C, 0x0C1C2434, 0x0C1C3434, 0x0C24040C,
+        0x0C24042C, 0x0C242C04, 0x0C2C1404, 0x0C2C1424, 0x0C2C2434, 0x0C2C3E0C, 0x0C34042C, 0x0C3E1414,
+        0x0C3E2404, 0x14040404, 0x14040414, 0x14040C0C, 0x14040C1C, 0x14041404, 0x14041414, 0x14041434,
+        0x14041C0C, 0x14042414, 0x140C040C, 0x140C041C, 0x140C042C, 0x140C0C04, 0x140C0C14, 0x140C140C,
+        0x140C1C04, 0x140C341C, 0x140C343E, 0x140C3E04, 0x14140404, 0x14140414, 0x14140C0C, 0x14140C3E,
+        0x14141404, 0x14141414, 0x14141C3E, 0x14142404, 0x14142C2C, 0x141C040C, 0x141C0C04, 0x141C0C24,
+        0x141C3E04, 0x141C3E24, 0x14241C2C, 0x14242C1C, 0x142C041C, 0x142C143E, 0x142C240C, 0x142C3E24,
+        0x143E040C, 0x143E041C, 0x143E0C34, 0x143E242C, 0x1C04040C, 0x1C040C04, 0x1C040C14, 0x1C04140C,
+        0x1C04141C, 0x1C042C04, 0x1C04342C, 0x1C043E14, 0x1C0C0404, 0x1C0C0414, 0x1C0C1404, 0x1C0C1C0C,
+        0x1C0C2424, 0x1C0C2434, 0x1C14040C, 0x1C14041C, 0x1C140C04, 0x1C14142C, 0x1C142C14, 0x1C143E14,
+        0x1C1C0C0C, 0x1C1C1C1C, 0x1C241C04, 0x1C24243E, 0x1C243E14, 0x1C2C0404, 0x1C2C0434, 0x1C2C1414,
+        0x1C2C2C2C, 0x1C340C24, 0x1C341C34, 0x1C34341C, 0x1C3E1C1C, 0x1C3E3404, 0x24040424, 0x24040C3E,
+        0x24041C2C, 0x24041C3E, 0x24042C1C, 0x24042C3E, 0x240C3E24, 0x24141404, 0x24141C3E, 0x24142404,
+        0x24143404, 0x24143434, 0x241C043E, 0x241C242C, 0x24240424, 0x24242C0C, 0x24243424, 0x242C142C,
+        0x242C241C, 0x242C3E04, 0x243E042C, 0x243E0C04, 0x243E0C14, 0x243E1C04, 0x2C040C14, 0x2C04240C,
+        0x2C043E04, 0x2C0C0404, 0x2C0C0434, 0x2C0C1434, 0x2C0C2C2C, 0x2C140C24, 0x2C141C14, 0x2C143E14,
+        0x2C1C0414, 0x2C1C2C1C, 0x2C240C04, 0x2C24141C, 0x2C24143E, 0x2C243E14, 0x2C2C0414, 0x2C2C1C0C,
+        0x2C342C04, 0x2C3E1424, 0x2C3E2414, 0x34041424, 0x34042424, 0x34042434, 0x34043424, 0x340C140C,
+        0x340C340C, 0x34140C3E, 0x34143424, 0x341C1C04, 0x341C1C34, 0x34242424, 0x342C042C, 0x342C2C14,
+        0x34341C1C, 0x343E041C, 0x343E140C, 0x3E04041C, 0x3E04042C, 0x3E04043E, 0x3E040C04, 0x3E041C14,
+        0x3E042C14, 0x3E0C1434, 0x3E0C2404, 0x3E140C14, 0x3E14242C, 0x3E142C14, 0x3E1C0404, 0x3E1C0C2C,
+        0x3E1C1C1C, 0x3E1C3404, 0x3E24140C, 0x3E24240C, 0x3E2C0404, 0x3E2C0414, 0x3E2C1424, 0x3E341C04
+    ];
+
+    // Test-local copy of the shared sign table: each row is an eight-bit sign pattern with an even number of set bits.
+    private static readonly int[] KSignsIQ2Xs =
+    [
+        0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
+        144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
+        160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,
+        48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
+        192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207,
+        80, 209, 210, 83, 212, 85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95,
+        96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+        240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255
+    ];
+
+    // Test-only IQ3_XXS writer mirroring the reference layout: eight 32-value sub-blocks per 256-element block, each
+    // aux word packing a four-bit sub-block scale (read back as db = d * (0.5 + sc) * 0.5) and four seven-bit
+    // sign-group codes selecting rows of the shared sign table. Each eight-value group stores two grid indices whose
+    // little-endian bytes supply the magnitudes; the parity rule mirrors the reference, flipping the sign of the
+    // smallest-magnitude value when the chosen negative-sign set has odd parity so the row stays inside the
+    // even-parity table. Block d = amax / 32 stored as a half-float at byte 0. Padded elements keep zero quants.
+    private static void QuantizeIQ3Xxs(ReadOnlySpan<float> src, Span<byte> dst)
+    {
+        int blocks = (src.Length + 255) / 256;
+        for (int b = 0; b < blocks; b++)
+        {
+            ReadOnlySpan<float> srcBlock = src.Slice(b * 256, Math.Min(256, src.Length - b * 256));
+
+            float amaxBlock = 0f;
+            foreach (float v in srcBlock)
+            {
+                amaxBlock = Math.Max(amaxBlock, Math.Abs(v));
+            }
+
+            Half dHalf = (Half)(amaxBlock / 32f);
+            WriteLE(dst, b * 98, (ushort)BitConverter.HalfToInt16Bits(dHalf));
+            float dBack = (float)dHalf;
+
+            for (int ib = 0; ib < 8; ib++)
+            {
+                int start = ib * 32;
+                if (start >= srcBlock.Length)
+                {
+                    break; // padded region contributes nothing
+                }
+
+                ReadOnlySpan<float> sub = srcBlock.Slice(start, Math.Min(32, srcBlock.Length - start));
+                float amax = 0f;
+                foreach (float v in sub)
+                {
+                    amax = Math.Max(amax, Math.Abs(v));
+                }
+
+                int sc = dBack > 0f ? Math.Clamp((int)Math.Round((double)amax / (62.0 * dBack) - 0.5, MidpointRounding.AwayFromZero), 0, 15) : 0;
+                double db = dBack * (0.5 + sc) * 0.5;
+
+                int qsBase = b * 98 + 2 + 8 * ib;
+                uint aux = ((uint)sc << 28);
+
+                for (int l = 0; l < 4; l++)
+                {
+                    float[] group = sub.Slice(l * 8, Math.Min(8, sub.Length - l * 8)).ToArray();
+                    if (group.Length < 8)
+                    {
+                        break; // padded group: quants stay zero
+                    }
+
+                    // Pick the grid entry whose four magnitude bytes minimize the half-group's squared error, then the
+                    // sign row matching the values' signs under the reference parity rule.
+                    int[] entry = new int[2];
+                    int[] signByte = new int[2];
+                    for (int h = 0; h < 2; h++)
+                    {
+                        int bestEntry = 0;
+                        double bestCost = double.MaxValue;
+                        for (int e = 0; e < 256; e++)
+                        {
+                            double cost = 0;
+                            for (int p = 0; p < 4; p++)
+                            {
+                                double magnitude = (Iq3XXSGridU32[e] >> (8 * p)) & 0xFF;
+                                double diff = group[h * 4 + p] - db * magnitude;
+                                cost += diff * diff;
+                            }
+
+                            if (cost < bestCost)
+                            {
+                                bestCost = cost;
+                                bestEntry = e;
+                            }
+                        }
+
+                        entry[h] = bestEntry;
+
+                        int signs = 0;
+                        int smallest = 0;
+                        double smallestAbs = double.MaxValue;
+                        for (int p = 0; p < 4; p++)
+                        {
+                            if (group[h * 4 + p] < 0f)
+                            {
+                                signs |= 1 << (h * 4 + p);
+                            }
+
+                            if (Math.Abs(group[h * 4 + p]) < smallestAbs)
+                            {
+                                smallestAbs = Math.Abs(group[h * 4 + p]);
+                                smallest = h * 4 + p;
+                            }
+                        }
+
+                        if (BitOperations.PopCount((uint)signs) % 2 != 0)
+                        {
+                            signs ^= 1 << smallest; // odd parity: flip the smallest-magnitude value to land on a table row
+                        }
+
+                        signByte[h] = signs;
+                    }
+
+                    dst[qsBase + 2 * l] = (byte)entry[0];
+                    dst[qsBase + 2 * l + 1] = (byte)entry[1];
+
+                    int code = FindKSignCode(signByte[0] | signByte[1]);
+                    aux |= (uint)code << (7 * l);
+                }
+
+                dst[b * 98 + 66 + 4 * ib] = (byte)aux;
+                dst[b * 98 + 67 + 4 * ib] = (byte)(aux >> 8);
+                dst[b * 98 + 68 + 4 * ib] = (byte)(aux >> 16);
+                dst[b * 98 + 69 + 4 * ib] = (byte)(aux >> 24);
+            }
+        }
+    }
+
+    // Test-only sign-code lookup: find the table row whose byte carries the group's eight sign bits.
+    private static int FindKSignCode(int signs)
+    {
+        for (int c = 0; c < 128; c++)
+        {
+            if (KSignsIQ2Xs[c] == signs)
+            {
+                return c;
+            }
+        }
+
+        throw new InvalidOperationException("No sign-table row carries the chosen signs.");
+    }
+
     // Test-only Q4_K writer mirroring the reference layout: per-group amax/15 scales and max(0, -min) offsets,
     // block-level d/dmin = group-max / 63 stored as half-floats, then nibbles quantized against exactly those
     // stored values so dequantization is self-consistent with the kernels. Padded elements produce zero blocks.
@@ -1587,6 +1830,37 @@ public class KernelTests
                                 int two = (block[32 + 32 * h + 16 * (k & 1) + e] >> (2 * (k >> 1))) & 3;
                                 int highBit = (block[16 * (k & 1) + e] >> (4 * h + (k >> 1))) & 1;
                                 double w = scale * (two + (highBit << 2) - 4);
+                                acc += pX[subStart + e] * w;
+                                mag += Math.Abs(pX[subStart + e] * w);
+                            }
+                        }
+                    }
+                }
+                else if (format == QuantFormat.IQ3_XXS)
+                {
+                    int blocks = (cols + 255) / 256;
+                    for (int b = 0; b < blocks; b++)
+                    {
+                        byte* block = r + b * 98;
+                        double d = (float)BitConverter.Int16BitsToHalf((short)ReadLE(block, 0));
+
+                        for (int ib = 0; ib < 8; ib++)
+                        {
+                            int subStart = b * 256 + ib * 32;
+                            if (subStart >= cols)
+                            {
+                                break; // zero-padded tail block carries no real columns
+                            }
+
+                            uint aux = (uint)(block[66 + 4 * ib] | (block[67 + 4 * ib] << 8) | (block[68 + 4 * ib] << 16) | (block[69 + 4 * ib] << 24));
+                            double db = d * (0.5 + (aux >> 28)) * 0.5;
+                            int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
+                            for (int e = 0; e < limit; e++)
+                            {
+                                int signs = KSignsIQ2Xs[(aux >> (7 * (e >> 3))) & 127]; // seven-bit sign-group code of the group holding element e
+                                int gi = block[2 + 8 * ib + 2 * (e >> 3) + ((e >> 2) & 1)]; // grid index: low four values from the first entry, high four from the second
+                                int magnitude = (int)((Iq3XXSGridU32[gi] >> (8 * (e & 3))) & 0xFF);
+                                double w = db * magnitude * ((signs & (1 << (e & 7))) != 0 ? -1 : 1);
                                 acc += pX[subStart + e] * w;
                                 mag += Math.Abs(pX[subStart + e] * w);
                             }
@@ -1898,6 +2172,38 @@ public class KernelTests
                             int two = (block[32 + 32 * h + 16 * (k & 1) + e] >> (2 * (k >> 1))) & 3;
                             int highBit = (block[16 * (k & 1) + e] >> (4 * h + (k >> 1))) & 1;
                             values[subStart + e] = scale * (two + (highBit << 2) - 4);
+                        }
+                    }
+                }
+
+                return values;
+            }
+
+            if (format == QuantFormat.IQ3_XXS)
+            {
+                int blocks = (cols + 255) / 256;
+                for (int b = 0; b < blocks; b++)
+                {
+                    byte* block = r + b * 98;
+                    double d = (float)BitConverter.Int16BitsToHalf((short)ReadLE(block, 0));
+
+                    for (int ib = 0; ib < 8; ib++)
+                    {
+                        int subStart = b * 256 + ib * 32;
+                        if (subStart >= cols)
+                        {
+                            break; // zero-padded tail block carries no real columns
+                        }
+
+                        uint aux = (uint)(block[66 + 4 * ib] | (block[67 + 4 * ib] << 8) | (block[68 + 4 * ib] << 16) | (block[69 + 4 * ib] << 24));
+                        double db = d * (0.5 + (aux >> 28)) * 0.5;
+                        int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
+                        for (int e = 0; e < limit; e++)
+                        {
+                            int signs = KSignsIQ2Xs[(aux >> (7 * (e >> 3))) & 127]; // seven-bit sign-group code of the group holding element e
+                            int gi = block[2 + 8 * ib + 2 * (e >> 3) + ((e >> 2) & 1)]; // grid index: low four values from the first entry, high four from the second
+                            int magnitude = (int)((Iq3XXSGridU32[gi] >> (8 * (e & 3))) & 0xFF);
+                            values[subStart + e] = db * magnitude * ((signs & (1 << (e & 7))) != 0 ? -1 : 1);
                         }
                     }
                 }
