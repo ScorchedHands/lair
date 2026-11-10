@@ -4,6 +4,19 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-11-09
+
+### Added
+
+- Declared rope scaling loads instead of being rejected: `<arch>.rope.scaling.type` resolves `none` and `yarn` into a plan carrying the multiplier, original context length, attention factor, correction scale and both beta bounds — any other variant name, and any scaling operand declared without a variant, fails naming the key and its value — and `<arch>.rope.dimension_count` resolves a partial rotary slice instead of rejecting an unsupported partial rotation. YaRN builds its scaled `cos`/`sin` tables at open (correction band from the beta bounds, ramp mixing the interpolated angle toward the unscaled one) and the variant's attention factor is applied exactly once in the score path across single-token, batched, and encode forwards. The math is ported from the pinned b12032 reference (`ggml_rope_cache_init`, `rope_yarn`, `rope_yarn_ramp`, `ggml_rope_yarn_corr_dims`, and the `get_mscale` attention-factor block).
+- `rope_scaling model='<name>' architecture='<arch>' variant=… multiplier=… original_context_length=… attention_factor=… rotary_dimensions=…` on the serve log whenever a model's positional plan is not the plain full-head rotation; an unscaled model stays silent.
+- `scripts/patch-gguf-rope-scaling.ps1`, which writes a rope-scaling-patched copy of a GGUF — header only, with tensor info and every data byte verified identical and the run idempotent — so a variant can be declared on a file the ecosystem ships without one. `tests/fixtures/parity-qwen3-yarn.json` is generated from its output and holds inside the documented band.
+- `Category=Loader` cases for declared-key resolution and variant rejection, `Category=Layers` goldens for the scaled tables, the slice behavior in both pair layouts, and the Open-time announcement line.
+
+### Changed
+
+- The serve host prints its load-time resolution lines on the console (profile and tensor resolution, `tool_parser`, `reasoning`, and the rope plan). The engine logger previously had no provider, so those lines were written and discarded.
+
 ## [0.3.6] - 2026-11-09
 
 ### Added

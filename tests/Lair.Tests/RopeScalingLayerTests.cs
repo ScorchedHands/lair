@@ -157,8 +157,7 @@ public sealed class RopeScalingLayerTests : IDisposable
     [Fact]
     public void ApplyRope_PartialSlice_RotatesOnlyTheLeadingDimensions_InBothPairings()
     {
-        const int HeadDim = 6;
-        const int SliceHalf = 2; // two pairs: dimensions 0..3 rotate, 4 and 5 pass through
+        const int SliceHalf = 2; // two pairs: dimensions 0..3 rotate out of six, and 4 and 5 pass through
 
         float[] cos = [MathF.Cos(0.7f), MathF.Cos(1.3f)];
         float[] sin = [MathF.Sin(0.7f), MathF.Sin(1.3f)];

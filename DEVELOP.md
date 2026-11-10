@@ -40,6 +40,13 @@ pwsh -File scripts/generate-parity.ps1 -Out tests/fixtures/parity-smollm-f16.jso
 pwsh -File scripts/generate-parity.ps1 -ModelPath models/smollm-135m-instruct-q8_0.gguf -Out tests/fixtures/parity-smollm-q8.json
 ```
 
+The YaRN fixture runs on a rope-scaling-patched copy of the pinned Qwen3 file, produced by a header-only patcher (tensor data verified byte-identical, run idempotent):
+
+```powershell
+pwsh -File scripts/patch-gguf-rope-scaling.ps1
+pwsh -File scripts/generate-parity.ps1 -ModelPath models/Qwen3-0.6B-Q8_0-YaRN.gguf -Out tests/fixtures/parity-qwen3-yarn.json
+```
+
 Parity gate: model-file sha256 guard; LAIR argmax must appear in the reference top-5; LAIR's calibrated distribution must reproduce within |Δlogprob| ≤ 0.2 (calibrated-missing tokens must stay outside LAIR's top-16). The cross-tool logprob band applies only to candidates within 6 nats of the reference's own top-1; deeper tail candidates are gated on membership in LAIR's calibrated window and reproduction of LAIR's calibrated value instead of absolute agreement. Cross-tool exact string equality is not asserted — llama.cpp CLI and server modes disagree on identical greedy runs (see the pinned `reference_mode` field in each fixture).
 
 Template parity is a separate gate: `tests/fixtures/parity-templates-llama32.json` pins byte-exact `/apply-template` renders for `models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` (model + chat_template sha256 guards, pinned `date_string`), asserted by `Category=TemplateParity`. Regenerate with:

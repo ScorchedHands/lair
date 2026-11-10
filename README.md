@@ -57,3 +57,5 @@ Live table per model: tok/s, step time, batch occupancy, cache-hit rate, KV util
 One YAML file (`lair.example.yaml` shows every knob): server bind/port, engine `threads` and `max_batch_tokens`, block size, exactly one model with path, name, type, `max_context_tokens`, `kv_blocks`, optional `force_fenced_tools`, optional `tool_parser` and `reasoning`, optional placement policy (`core_set`, `thread_quota`), and the UI ring size `ui.recent_requests`.
 
 A running server watches the config file and applies edits automatically: batch width, thread quota, and KV budget take effect live; context length applies to new requests; block size, model path, and quant geometry are refused with a message telling you to restart. Invalid edits are rejected without touching the running engine.
+
+At load the server prints what each model will actually run: the profile and tensor decisions, the `tool_parser` choice, the `reasoning` policy, and the positional plan when the file declares rope scaling or a partial rotary slice (`rope_scaling model='…' variant=yarn multiplier=2 original_context_length=512 …`).
