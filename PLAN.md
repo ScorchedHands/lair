@@ -823,7 +823,7 @@ Dense IQ quantization loads, decodes, and serves on the CPU engine at two tiers 
 - [✓] Manual IQ Serve: both tiers served; chat via API and `/ui`; monitor live with the quant reported; the owner's `qwen4exp` target file resolved tensor-for-tensor through the loader with zero rejections. Measured: `quant: IQ4_XS` at 10.25 tok/s / 1,362.6 MB peak and `quant: IQ3_XXS` at 4.03 tok/s / 1,212.4 MB peak (context 4096, thread_quota 8), chat through the API, SSE streaming and the `/ui` client's own POST; loader gate green on both shards.
 - [✓] Manual Quant Recommendation: read the bench table and confirm the documented recommendation matches the measured fastest format rather than the smallest file. Measured: `IQ4_XS` 11.6 tok/s beats the 10.3–10.4 tok/s `Q4_K_M` baseline while being smaller, and the smallest file (`UD-IQ3_XXS`, 575 MB) is the slowest at 3.9 tok/s — the recommendation follows speed, not size.
 
-### MVP3.9 [v0.3.9] - Refined
+### MVP3.9 [v0.3.9] - In Progress
 
 Sparse and windowed architectures execute: dense-resident MoE decoding and sliding-window/local attention, both through the MVP3.4 model plan.
 
@@ -856,8 +856,8 @@ Sparse and windowed architectures execute: dense-resident MoE decoding and slidi
 
 #### Implementation Items
 
-- [_] MoE execution — router scoring, top-k with renormalize, optional shared expert, and per-expert FFN accumulation into the residual (see DN-M39-1, DN-M39-3).
-  - Verify: `dotnet test --filter Category=Moe -c Release` — sparse-FFN output matches a dense-equivalent reference across router tie-breaking, renormalization, and a model with no shared expert.
+- [✓] MoE execution — router scoring, top-k with renormalize, optional shared expert, and per-expert FFN accumulation into the residual (see DN-M39-1, DN-M39-3).
+  - Verify: `dotnet test --filter Category=Moe -c Release` — 18/18 against an independently computed double-precision dense-equivalent reference. Routing applies softmax over all declared experts, then top-k with lower-index tie-breaking, optional renormalization by the selected sum, and the declared weights scale, in that order; a shared expert contributes once per token at weight `1f`, or multiplied by `silu(score)/score` from its selector vector when the file ships `blk.{layer}.ffn_gate_inp_shexp.weight` (qwen2moe names that role, qwen3moe declares none, and OLMoE-1B-7B carries no shared tensors at all). A selector shipped for some layers only fails load naming the missing layer; ungated models stay bit-identical. Batched execution equals solo stepping bit-for-bit across 1/2/4 sequences with unequal history lengths, thread counts stay deterministic, single-expert and spread routing are both covered, `Encode` rejects sparse models explicitly, and a declared shared expert without its tensors reports as the missing role rather than deferred execution. Non-model suites 1204/1204; Parity 41/41 unchanged.
 - [_] Sparse-FFN factorized-layout representability — extend `SparseFfnDescriptor` with layout + rank + optional shared-basis/coefficient roles and resolve a `SparseFfnStrategy { DenseResident, LowRankSharedBasis }` plan value; only the dense-resident variant executes (see DN-M39-6).
   - Verify: `dotnet test --filter Category=Loader -c Release` — a synthetic MoE file declaring a factorized layout resolves its descriptor's rank/roles and strategy value, an un-factorizable file keeps `LowRankSharedBasis` unselected with `DenseResident` executed, and the resolved strategy is reported on `/v1/models`.
 - [_] `olmoe` profile and MoE fixture parity — register the family, resolve its expert tensor naming from the pinned file, and prove decode parity (see DN-M39-3).

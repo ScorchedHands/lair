@@ -9,14 +9,14 @@ using Lair.Models.Engine;
 namespace Lair.Tests;
 
 /// <summary>
-/// Load-time resolution and deferred execution for the sparse-FFN (MoE) slot: the registered MoE architectures
+/// Load-time resolution and execution for the sparse-FFN (MoE) slot: the registered MoE architectures
 /// the pinned reference reports resolve a validated descriptor from the file's declared expert metadata
 /// (<c>expert_count</c>, <c>expert_used_count</c>, <c>expert_shared_count</c>, <c>expert_weights_scale</c>, and
 /// <c>expert_weights_norm</c>) with the router, per-expert, and shared-expert tensor roles the profile's map
 /// names under the reference's names; a declared count that is present but not a sane positive integer fails
-/// naming key and value; a recognized MoE file fails engine open with the deferral naming the architecture and
-/// the expert count — never as a missing-tensor failure; a dense family file keeps a null descriptor; and an
-/// unregistered architecture carrying MoE tensor names still fails through the tensor-table message.
+/// naming key and value; a recognized MoE file opens into the engine with its descriptor and runs the routed
+/// experts instead of deferring; a dense family file keeps a null descriptor; and an unregistered architecture
+/// carrying MoE tensor names still fails through the tensor-table message.
 /// </summary>
 [Trait("Category", "Loader")]
 public sealed class SparseFfnPlanTests : IDisposable
@@ -84,8 +84,14 @@ public sealed class SparseFfnPlanTests : IDisposable
         Assert.NotNull(plan.Tensors[sparse.SharedGateRole.Value].Resolve(gguf.Tensors, 0));
         Assert.NotNull(plan.Tensors[sparse.SharedUpRole!.Value].Resolve(gguf.Tensors, 0));
         Assert.NotNull(plan.Tensors[sparse.SharedDownRole!.Value].Resolve(gguf.Tensors, 0));
-        Assert.Contains("blk.{layer}.ffn_gate_inp_shexp.weight", plan.Tensors[sparse.SharedGateRole.Value].Aliases);
+        // The shared-expert selector vector is its own tensor under a role of its own, and the shared gate matrix's
+        // name carries no alias onto it: they are different tensors with different shapes.
+        Assert.Equal(TensorRole.MoeSharedExpertInputGate, sparse.SharedInputGateRole);
+        Assert.Equal("blk.0.ffn_gate_inp_shexp.weight", plan.Tensors[sparse.SharedInputGateRole!.Value].NameFor(0));
+        Assert.NotNull(plan.Tensors[sparse.SharedInputGateRole.Value].Resolve(gguf.Tensors, 0));
+        Assert.Empty(plan.Tensors[sparse.SharedGateRole.Value].Aliases);
     }
+
 
     [Fact]
     public void ModelPlan_Qwen3MoeFile_WithoutDeclaredSharedExpert_ResolvesSharedRolesNull()
@@ -102,6 +108,7 @@ public sealed class SparseFfnPlanTests : IDisposable
         Assert.Null(sparse.SharedGateRole);
         Assert.Null(sparse.SharedUpRole);
         Assert.Null(sparse.SharedDownRole);
+        Assert.Null(sparse.SharedInputGateRole); // no shared expert, so nothing to gate it with
         Assert.True(Math.Abs(sparse.ExpertWeightsScale - 1f) < 1e-6f, "the declared scale must land in the descriptor");
         Assert.True(sparse.NormalizeExpertWeights);
     }
@@ -188,37 +195,40 @@ public sealed class SparseFfnPlanTests : IDisposable
         Assert.Contains("-0.5", ex.Message);
     }
 
-    // ---------------------------------------------------------------- deferred execution at Open
+    // ---------------------------------------------------------------- descriptor-bearing files open and execute
 
     [Fact]
-    public void TransformerModelOpen_Qwen2MoeFile_FailsWithDeferredExecutionMessage_NotAMissingTensorFailure()
+    public void TransformerModelOpen_Qwen2MoeFile_ResolvesTheDescriptorAndReplacesTheDenseFfnNames()
     {
         string path = WriteTemp(BuildGguf(MoeMetadata("qwen2moe"), [.. MoeTensors()]));
 
         using CpuBackend backend = new();
         using GgufFile gguf = GgufFile.Open(path);
-        ModelException ex = Assert.Throws<ModelException>(() => TransformerModel.Open(gguf, backend, maxContextTokens: 8));
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
 
-        Assert.Contains("qwen2moe", ex.Message);
-        Assert.Contains("8 experts", ex.Message);
-        Assert.Contains("sparse FFN execution is not implemented", ex.Message);
-        Assert.DoesNotContain("is missing", ex.Message); // the deferral is not a missing-tensor complaint
-        Assert.DoesNotContain("blk.0.ffn_gate.weight", ex.Message); // the dense FFN name the file lacks never surfaces
+        SparseFfnDescriptor sparse = model.Plan.SparseFfn!;
+        Assert.Equal(8, sparse.ExpertCount);
+        Assert.True(sparse.HasSharedExpert);
+        Assert.Null(model.Plan.Tensors[TensorRole.FeedForwardGate].Resolve(gguf.Tensors, 0)); // the routed block replaces the dense FFN names
+        Assert.Null(model.Plan.Tensors[TensorRole.FeedForwardUp].Resolve(gguf.Tensors, 0));
+        Assert.Null(model.Plan.Tensors[TensorRole.FeedForwardDown].Resolve(gguf.Tensors, 0));
     }
 
     [Fact]
-    public void TransformerModelOpen_Qwen3MoeFile_FailsWithDeferredExecutionMessage_NamingItsArchitectureAndCount()
+    public void TransformerModelOpen_Qwen3MoeFile_WithoutSharedExpert_ResolvesTheDescriptorAndExecutes()
     {
-        string path = WriteTemp(BuildGguf(MoeMetadata("qwen3moe", sharedExpert: false), [.. MoeTensors()]));
+        string path = WriteTemp(BuildGguf(MoeMetadata("qwen3moe", sharedExpert: false), [.. MoeTensors("qwen3moe")]));
 
         using CpuBackend backend = new();
         using GgufFile gguf = GgufFile.Open(path);
-        ModelException ex = Assert.Throws<ModelException>(() => TransformerModel.Open(gguf, backend, maxContextTokens: 8));
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
 
-        Assert.Contains("qwen3moe", ex.Message);
-        Assert.Contains("8 experts", ex.Message);
-        Assert.Contains("sparse FFN execution is not implemented", ex.Message);
-        Assert.DoesNotContain("is missing", ex.Message);
+        SparseFfnDescriptor sparse = model.Plan.SparseFfn!;
+        Assert.Equal(8, sparse.ExpertCount);
+        Assert.False(sparse.HasSharedExpert);
+        Assert.Null(model.Plan.Tensors[TensorRole.FeedForwardGate].Resolve(gguf.Tensors, 0));
+        Assert.Null(model.Plan.Tensors[TensorRole.FeedForwardUp].Resolve(gguf.Tensors, 0));
+        Assert.Null(model.Plan.Tensors[TensorRole.FeedForwardDown].Resolve(gguf.Tensors, 0));
     }
 
     // ---------------------------------------------------------------- dense families and the fallback gate
@@ -238,7 +248,7 @@ public sealed class SparseFfnPlanTests : IDisposable
 
         using CpuBackend backend = new();
         using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
-        Assert.Null(model.Plan.SparseFfn); // the deferral never fires for a dense family file
+        Assert.Null(model.Plan.SparseFfn); // no expert count declared: the dense block stays the only one
     }
 
     [Fact]
@@ -269,10 +279,14 @@ public sealed class SparseFfnPlanTests : IDisposable
         Assert.True(qwen2MoeShape!.HasSharedExpert);
         Assert.Equal(TensorRole.MoeRouter, qwen2MoeShape.RouterRole);
 
+        // The reference gates its shared expert per token with a vector of its own, so only qwen2moe names that role.
+        Assert.Equal(TensorRole.MoeSharedExpertInputGate, qwen2MoeShape.SharedInputGateRole);
+
         SparseFfnDescriptor? qwen3MoeShape = ModelProfiles.Resolve("qwen3moe").SparseFfn;
         Assert.NotNull(qwen3MoeShape);
         Assert.False(qwen3MoeShape!.HasSharedExpert);
         Assert.Null(qwen3MoeShape.SharedGateRole);
+        Assert.Null(qwen3MoeShape.SharedInputGateRole);
 
         foreach (string architecture in new string[] { "llama", "qwen2", "qwen3", "gemma2" })
         {
@@ -372,25 +386,40 @@ public sealed class SparseFfnPlanTests : IDisposable
     // router matrix [hidden, experts], the stacked per-expert gate/up/down triplets [intermediate, hidden,
     // experts] and [hidden, intermediate, experts], and the shared expert's dense triplet plus its gate vector.
     // The dense gate/up/down names stay absent: an expert-routed block ships none of them.
-    private static List<TensorDef> MoeTensors() =>
-        [
-            new("token_embd.weight", [6, 4]),
-            new("blk.0.attn_q.weight", [4, 4]),
-            new("blk.0.attn_k.weight", [4, 4]),
-            new("blk.0.attn_v.weight", [4, 4]),
-            new("blk.0.attn_output.weight", [4, 4]),
-            new("blk.0.attn_norm.weight", [4]),
-            new("blk.0.ffn_norm.weight", [4]),
-            new("output_norm.weight", [4]),
-            new("blk.0.ffn_gate_inp.weight", [4, 8]),
-            new("blk.0.ffn_gate_exps.weight", [8, 4, 8]),
-            new("blk.0.ffn_up_exps.weight", [8, 4, 8]),
-            new("blk.0.ffn_down_exps.weight", [4, 8, 8]),
-            new("blk.0.ffn_gate_shexp.weight", [8, 4]),
-            new("blk.0.ffn_up_shexp.weight", [8, 4]),
-            new("blk.0.ffn_down_shexp.weight", [4, 8]),
-            new("blk.0.ffn_gate_inp_shexp.weight", [1, 4]),
-        ];
+    private static List<TensorDef> MoeTensors(string architecture = "qwen2moe")
+    {
+        List<TensorDef> tensors =
+            [
+                new("token_embd.weight", [6, 4]),
+                new("blk.0.attn_q.weight", [4, 4]),
+                new("blk.0.attn_k.weight", [4, 4]),
+                new("blk.0.attn_v.weight", [4, 4]),
+                new("blk.0.attn_output.weight", [4, 4]),
+                new("blk.0.attn_norm.weight", [4]),
+                new("blk.0.ffn_norm.weight", [4]),
+                new("output_norm.weight", [4]),
+                new("blk.0.ffn_gate_inp.weight", [8, 4]),
+                new("blk.0.ffn_gate_exps.weight", [8, 8, 4]),
+                new("blk.0.ffn_up_exps.weight", [8, 8, 4]),
+                new("blk.0.ffn_down_exps.weight", [8, 4, 8]),
+            ];
+
+        if (architecture == "qwen2moe")
+        {
+            tensors.Add(new("blk.0.ffn_gate_shexp.weight", [8, 4]));
+            tensors.Add(new("blk.0.ffn_up_shexp.weight", [8, 4]));
+            tensors.Add(new("blk.0.ffn_down_shexp.weight", [4, 8]));
+            tensors.Add(new("blk.0.ffn_gate_inp_shexp.weight", [4])); // one-dimensional, the size of the hidden stream
+        }
+
+        if (architecture is "qwen3" or "qwen3moe")
+        {
+            tensors.Add(new("blk.0.attn_q_norm.weight", [2]));
+            tensors.Add(new("blk.0.attn_k_norm.weight", [2]));
+        }
+
+        return tensors;
+    }
 
     // A complete single-layer dense block with the same tiny geometry: hidden 4, heads 2, kv-heads 1, head dim
     // 4 (2 x 4 against a hidden of 4 is the grouped-query shape the fixtures use), ffn 8, vocab 6 — all F32

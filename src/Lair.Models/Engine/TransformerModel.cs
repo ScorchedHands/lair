@@ -35,9 +35,18 @@ namespace Lair.Models.Engine;
 /// final-logit softcap saturates every logit vector — untied output head or tied token-embedding rows — after
 /// the full vector is computed and before any softmax, sampling, or copy-out. A resolved input-embedding gain
 /// multiplies every freshly dequantized embedding row by its value before the first layer on every forward path.
-/// A resolved sparse-FFN descriptor fails Open with a deferral naming the architecture and the declared expert
-/// count: the engine forwards dense gate/up/down blocks only.
+/// A resolved sparse-FFN descriptor replaces this block's dense gate/up/down triplet with an expert-routed block
+/// whose every expert is resident: the router matrix scores all experts, top-k selection keeps the
+/// <c>&lt;prefix&gt;expert_used_count</c> best-scoring experts — equal scores resolve to the lower expert index — and
+/// renormalizes the selected routing weights by their own sum when the descriptor declares normalization; each
+/// selected expert's gate/up/down GEMVs then run over the same normalized stream in ascending expert-index order and
+/// accumulate into the residual scaled by its weight. A declared shared expert adds one dense gate/up/down block to
+/// that accumulation once per token, an undeclared shared expert reads no sparse role tensor at all, and a file
+/// declaring none keeps the dense triplet path unchanged. Sparse routing runs on the prefill/decode token path and on
+/// <see cref="DecodeBatch"/>; <see cref="Encode"/> forwards dense blocks only and fails naming the descriptor when a
+/// model carries one.
 /// </summary>
+
 public sealed class TransformerModel : IDisposable
 {
     /// <summary>Largest number of sequences a single <see cref="DecodeBatch"/> call may advance.</summary>
@@ -63,9 +72,53 @@ public sealed class TransformerModel : IDisposable
     private readonly LogicalTensor[] _wk;
     private readonly LogicalTensor[] _wv;
     private readonly LogicalTensor[] _wo;
-    private readonly LogicalTensor[] _ffnGate;
-    private readonly LogicalTensor[] _ffnUp;
-    private readonly LogicalTensor[] _ffnDown;
+    private LogicalTensor[] _ffnGate = []; // empty when a sparse descriptor replaces the dense block
+    private LogicalTensor[] _ffnUp = []; // empty when a sparse descriptor replaces the dense block
+    private LogicalTensor[] _ffnDown = []; // empty when a sparse descriptor replaces the dense block
+
+    // Sparse-FFN block state, resolved once at Open from the plan's descriptor; empty arrays and zero geometry mean
+    // the dense gate/up/down triplet runs. The router tensor is [experts x hidden]; each expert matrix role is one
+    // stacked tensor whose logical shape carries the expert count as its outermost dimension, so expert e's block is
+    // the contiguous row range [e * rows .. (e + 1) * rows) and a per-expert GEMV reads it through a slice of that
+    // role's payload with the fixed two-dimensional shape below. Every expert stays resident: routing selects among
+    // these tensors instead of fetching them.
+    private readonly SparseFfnDescriptor? _sparseFfn;
+    private LogicalTensor[] _moeRouter = [];
+    private LogicalTensor[] _moeExpertGate = [];
+    private LogicalTensor[] _moeExpertUp = [];
+    private LogicalTensor[] _moeExpertDown = [];
+    private LogicalTensor[] _sharedGate = [];
+    private LogicalTensor[] _sharedUp = [];
+    private LogicalTensor[] _sharedDown = [];
+
+    // The shared expert's per-token selector rows, dequantized once at load exactly like the norm and bias vectors.
+    // One row of the hidden size per layer when the file ships them for every layer; an empty array when it ships
+    // none, which is what leaves the shared contribution ungated.
+    private float[][] _sharedInputGate = [];
+
+    // Per-expert slice geometry: one expert's rows and cols as the shape a GEMV over its slice carries, plus that
+    // slice's packed byte block per role. Built once at Open so routing and expert execution allocate nothing per
+    // token; zero means no sparse block runs.
+    private TensorShape _moeExpertGateShape = new([0, 0]);
+    private TensorShape _moeExpertUpShape = new([0, 0]);
+    private TensorShape _moeExpertDownShape = new([0, 0]);
+    private long _moeExpertGateBytes;
+    private long _moeExpertUpBytes;
+    private long _moeExpertDownBytes;
+
+    // Routing scratch, sized at Open for descriptor-bearing models only. The token path consumes one
+    // routing at a time; the batch path stores every sequence's selection flat, sequence by sequence, so
+    // each expert group can pack its member rows into one batched gate/up/down pass instead of paying a
+    // batch call per member. Selection order is ascending expert index, which is the order the batch path
+    // groups by.
+
+    private float[] _moeLogits = [];      // experts: router scores for one sequence, consumed during selection
+    private int[] _moeIds = [];           // routedExpertsPerToken: selected expert indexes, ascending order
+    private float[] _moeWeights = [];     // routedExpertsPerToken: the weight of each selected expert
+    private int[] _batchMoeIds = [];      // MaxBatchSequences * routedExpertsPerToken: per-sequence selections
+    private float[] _batchMoeWeights = [];// same length, aligned with _batchMoeIds
+    private int[] _expertMembers = []; // MaxBatchSequences: member rows of the expert under execution
+    private float[] _moeSubsetIn = []; // MaxBatchSequences * hidden: one expert group's activations and down results, packed in place
 
     // Small FP32 vectors preloaded at Open: per-layer norm weights and any biases present in the file. Null
     // entries mean the tensor is absent (llama files carry no attention bias, qwen2 files may).
@@ -194,17 +247,13 @@ public sealed class TransformerModel : IDisposable
             throw new ModelException($"head dimension {Plan.HeadDim} is odd; RoPE pairs require an even head dimension");
         }
 
-        // A resolved sparse-FFN descriptor names an expert-routed feed-forward block this engine cannot run: the
-        // failure is the deferral itself — it names the architecture and the declared expert count and is not a
-        // missing-tensor complaint — and it lands before any tensor loads, so no partial load can make it
-        // misleading.
-        SparseFfnDescriptor? sparseFfn = Plan.SparseFfn;
-        if (sparseFfn is not null)
-        {
-            throw new ModelException(
-                $"architecture '{Plan.Architecture}' declares a sparse-FFN block with {sparseFfn.ExpertCount} experts " +
-                $"routing {sparseFfn.RoutedExpertsPerToken} per token: sparse FFN execution is not implemented by the forward engine");
-        }
+        // A resolved sparse-FFN descriptor replaces this block's dense gate/up/down triplet with expert-routed
+        // execution: the dense feed-forward roles are neither required nor loaded, and any dense feed-forward tensor
+        // such a file still ships is reported as ignored. Every declared expert loads here — all experts of every
+        // layer stay resident in the mmap view for the model's lifetime, so forward-time routing selects among them
+        // instead of fetching them, and no residency machinery runs on this path. The dense gate/up/down block stays
+        // exactly as it was for a file that declares no expert count.
+        _sparseFfn = Plan.SparseFfn;
 
         int layers = Plan.LayerCount;
 
@@ -212,18 +261,96 @@ public sealed class TransformerModel : IDisposable
         _wk = LoadMatrices(layers, TensorRole.AttentionKey, FusedQkvName(TensorRole.AttentionKey));
         _wv = LoadMatrices(layers, TensorRole.AttentionValue, FusedQkvName(TensorRole.AttentionValue));
         _wo = LoadMatrices(layers, TensorRole.AttentionOutput);
-        _ffnGate = LoadMatrices(layers, TensorRole.FeedForwardGate);
-        _ffnUp = LoadMatrices(layers, TensorRole.FeedForwardUp);
-        _ffnDown = LoadMatrices(layers, TensorRole.FeedForwardDown);
+        if (_sparseFfn is null)
+        {
+            _ffnGate = LoadMatrices(layers, TensorRole.FeedForwardGate);
+            _ffnUp = LoadMatrices(layers, TensorRole.FeedForwardUp);
+            _ffnDown = LoadMatrices(layers, TensorRole.FeedForwardDown);
+        }
+        else
+        {
+            int experts = _sparseFfn.ExpertCount;
+
+            // The router emits one score per declared expert from the hidden stream. Each stacked role is one tensor
+            // whose logical shape carries that expert count as its outermost dimension followed by this matrix's rows
+            // and columns, so a GEMV over one expert reads a contiguous row range of the stack: gate/up experts emit
+            // intermediateSize values from hidden inputs, down experts emit hidden values from intermediate inputs.
+            _moeRouter = LoadMatrices(layers, _sparseFfn.RouterRole);
+            RequireShape(_moeRouter, experts, Plan.HiddenSize);
+
+            LogicalTensor[] expertGate = LoadExpertStacks(layers, _sparseFfn.ExpertGateRole, experts, Plan.IntermediateSize, Plan.HiddenSize);
+            LogicalTensor[] expertUp = LoadExpertStacks(layers, _sparseFfn.ExpertUpRole, experts, Plan.IntermediateSize, Plan.HiddenSize);
+            LogicalTensor[] expertDown = LoadExpertStacks(layers, _sparseFfn.ExpertDownRole, experts, Plan.HiddenSize, Plan.IntermediateSize);
+
+            // Per-expert slice geometry for these roles: one expert's packed block and the two-dimensional shape a
+            // GEMV over that slice carries. The byte count comes from the same row stride the stack validation above
+            // used, so a slice is exactly the rows the role declares per expert.
+            _moeExpertGate = expertGate;
+            _moeExpertUp = expertUp;
+            _moeExpertDown = expertDown;
+            QuantFormat format = expertGate[0].Format;
+            long gateBytes = (long)Plan.IntermediateSize * expertGate[0].Shape.RowStrideBytes(format);
+            long downBytes = (long)Plan.HiddenSize * expertDown[0].Shape.RowStrideBytes(format);
+            _moeExpertGateShape = new TensorShape([Plan.IntermediateSize, Plan.HiddenSize]);
+            _moeExpertUpShape = new TensorShape([Plan.IntermediateSize, Plan.HiddenSize]);
+            _moeExpertDownShape = new TensorShape([Plan.HiddenSize, Plan.IntermediateSize]);
+            _moeExpertGateBytes = gateBytes;
+            _moeExpertUpBytes = gateBytes;
+            _moeExpertDownBytes = downBytes;
+
+            // Routing scratch and packed-expert storage sized from the descriptor's concrete counts: one selection at
+            // a time for routing plus per-sequence copies of every batched selection, member-row indexes for one
+            // expert group, and one hidden-sized buffer carrying each group's activations and down results in place.
+            _moeLogits = new float[_sparseFfn.ExpertCount];
+            _moeIds = new int[_sparseFfn.RoutedExpertsPerToken];
+            _moeWeights = new float[_sparseFfn.RoutedExpertsPerToken];
+            _batchMoeIds = new int[MaxBatchSequences * _sparseFfn.RoutedExpertsPerToken];
+            _batchMoeWeights = new float[MaxBatchSequences * _sparseFfn.RoutedExpertsPerToken];
+            _expertMembers = new int[MaxBatchSequences];
+            _moeSubsetIn = new float[MaxBatchSequences * Plan.HiddenSize];
+
+            // A declared shared expert is one dense-shaped matrix triplet the routing adds to every token's output,
+            // plus — for a family whose reference gates it — one selector vector per layer. An undeclared shared
+            // block loads and reads nothing here at all.
+            if (_sparseFfn.HasSharedExpert)
+            {
+                TensorRole gateRole = RequiredSparseRole(_sparseFfn.SharedGateRole, "gate");
+                TensorRole upRole = RequiredSparseRole(_sparseFfn.SharedUpRole, "up");
+                TensorRole downRole = RequiredSparseRole(_sparseFfn.SharedDownRole, "down");
+
+                _sharedGate = LoadMatrices(layers, gateRole);
+                _sharedUp = LoadMatrices(layers, upRole);
+                _sharedDown = LoadMatrices(layers, downRole);
+                RequireShape(_sharedGate, Plan.IntermediateSize, Plan.HiddenSize);
+                RequireShape(_sharedUp, Plan.IntermediateSize, Plan.HiddenSize);
+                RequireShape(_sharedDown, Plan.HiddenSize, Plan.IntermediateSize);
+
+                // The reference also ships one selector vector of the hidden size per layer for the shared expert and
+                // takes this token's score from it. A file that carries none of them stays ungated; a table carrying
+                // them for only part of the block fails here rather than gating some layers and not others.
+                if (_sparseFfn.SharedInputGateRole is { } inputGateRole)
+                {
+                    _sharedInputGate = LoadSharedExpertSelectors(layers, Plan.Tensors[inputGateRole]);
+                }
+            }
+
+            if (logLine is not null)
+            {
+                ReportIgnoredTensors(logLine, "dense_ffn_ignored", file, [TensorRole.FeedForwardGate, TensorRole.FeedForwardUp, TensorRole.FeedForwardDown]);
+            }
+        }
 
         // Matrix shapes must agree with the declared dimensions: rows are the output side, columns the input side.
         RequireShape(_wq, (long)Plan.HeadCount * Plan.HeadDim, Plan.HiddenSize); // q emits headCount * head_dim
         RequireShape(_wk, (long)Plan.KvHeadCount * Plan.HeadDim, Plan.HiddenSize);
         RequireShape(_wv, (long)Plan.KvHeadCount * Plan.HeadDim, Plan.HiddenSize);
         RequireShape(_wo, Plan.HiddenSize, (long)Plan.HeadCount * Plan.HeadDim);
-        RequireShape(_ffnGate, Plan.IntermediateSize, Plan.HiddenSize);
-        RequireShape(_ffnUp, Plan.IntermediateSize, Plan.HiddenSize);
-        RequireShape(_ffnDown, Plan.HiddenSize, Plan.IntermediateSize);
+        if (_sparseFfn is null)
+        {
+            RequireShape(_ffnGate, Plan.IntermediateSize, Plan.HiddenSize);
+            RequireShape(_ffnUp, Plan.IntermediateSize, Plan.HiddenSize);
+            RequireShape(_ffnDown, Plan.HiddenSize, Plan.IntermediateSize);
+        }
 
         // Quantization companions of nameable tensors are validated before anything loads, and fused qkv
         // tensors the split map resolved past are reported once, in the style of the ignored-tensor lines.
@@ -571,20 +698,27 @@ public sealed class TransformerModel : IDisposable
                 ApplyNorm(cur, _ffnNormWeight[l], _ffnNormBias[l], _batchNormed.AsSpan(s * hidden, hidden));
             }
 
-            bytes = _weights.Resolve(_ffnGate[l]);
-            _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, new WeightRef(bytes, _ffnGate[l].Shape, _ffnGate[l].Format), _batchGateUp.AsSpan(0, n * inter));
-
-            bytes = _weights.Resolve(_ffnUp[l]);
-            _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, new WeightRef(bytes, _ffnUp[l].Shape, _ffnUp[l].Format), _batchUp.AsSpan(0, n * inter));
-
-            // act = activation(gate) * up in place on each sequence's gate buffer.
-            for (int s = 0; s < n; s++)
+            if (_sparseFfn is { } routing)
             {
-                ApplyActivation(_batchGateUp.AsSpan(s * inter, inter), _batchUp.AsSpan(s * inter, inter));
+                ApplySparseFeedForwardBatch(routing, l, n);
             }
+            else
+            {
+                bytes = _weights.Resolve(_ffnGate[l]);
+                _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, new WeightRef(bytes, _ffnGate[l].Shape, _ffnGate[l].Format), _batchGateUp.AsSpan(0, n * inter));
 
-            bytes = _weights.Resolve(_ffnDown[l]);
-            _backend.GemvBatch(_batchGateUp.AsSpan(0, n * inter), n, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _batchProj.AsSpan(0, n * hidden));
+                bytes = _weights.Resolve(_ffnUp[l]);
+                _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, new WeightRef(bytes, _ffnUp[l].Shape, _ffnUp[l].Format), _batchUp.AsSpan(0, n * inter));
+
+                // act = activation(gate) * up in place on each sequence's gate buffer.
+                for (int s = 0; s < n; s++)
+                {
+                    ApplyActivation(_batchGateUp.AsSpan(s * inter, inter), _batchUp.AsSpan(s * inter, inter));
+                }
+
+                bytes = _weights.Resolve(_ffnDown[l]);
+                _backend.GemvBatch(_batchGateUp.AsSpan(0, n * inter), n, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _batchProj.AsSpan(0, n * hidden));
+            }
 
             for (int s = 0; s < n; s++)
             {
@@ -672,6 +806,13 @@ public sealed class TransformerModel : IDisposable
             throw new ArgumentException(
                 $"{n} encoder tokens starting at position {basePosition} exceed this model's max context of {MaxContextTokens}.",
                 nameof(tokens));
+        }
+
+        if (_sparseFfn is { } encoderSparse)
+        {
+            throw new ModelException(
+                $"architecture '{Plan.Architecture}' declares a sparse-FFN block with {encoderSparse.ExpertCount} experts " +
+                $"routing {encoderSparse.RoutedExpertsPerToken} per token: the encoder forward runs dense gate/up/down blocks only");
         }
 
         int qkvRegion = Plan.HeadCount * Plan.HeadDim;
@@ -952,17 +1093,24 @@ public sealed class TransformerModel : IDisposable
 
             ApplyNorm(_cur.AsSpan(0, hidden), _ffnNormWeight[l], _ffnNormBias[l], _normed);
 
-            bytes = _weights.Resolve(_ffnGate[l]);
-            _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _ffnGate[l].Shape, _ffnGate[l].Format), _gateUp);
+            if (_sparseFfn is { } routing)
+            {
+                ApplySparseFeedForward(routing, l);
+            }
+            else
+            {
+                bytes = _weights.Resolve(_ffnGate[l]);
+                _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _ffnGate[l].Shape, _ffnGate[l].Format), _gateUp);
 
-            bytes = _weights.Resolve(_ffnUp[l]);
-            _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _ffnUp[l].Shape, _ffnUp[l].Format), _up);
+                bytes = _weights.Resolve(_ffnUp[l]);
+                _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _ffnUp[l].Shape, _ffnUp[l].Format), _up);
 
-            // act = activation(gate) * up with the plan's resolved activation, applied in place on the gate buffer.
-            ApplyActivation(_gateUp.AsSpan(0, Plan.IntermediateSize), _up.AsSpan(0, Plan.IntermediateSize));
+                // act = activation(gate) * up with the plan's resolved activation, applied in place on the gate buffer.
+                ApplyActivation(_gateUp.AsSpan(0, Plan.IntermediateSize), _up.AsSpan(0, Plan.IntermediateSize));
 
-            bytes = _weights.Resolve(_ffnDown[l]);
-            _backend.Gemv(_gateUp.AsSpan(0, Plan.IntermediateSize), new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _proj);
+                bytes = _weights.Resolve(_ffnDown[l]);
+                _backend.Gemv(_gateUp.AsSpan(0, Plan.IntermediateSize), new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _proj);
+            }
 
             ApplyPostSublayerNorm(_proj, _postFfnNorm[l]);
 
@@ -1229,6 +1377,443 @@ public sealed class TransformerModel : IDisposable
         _backend.DequantRow(new WeightRef(bytes, row, tensor.Format), 0, values);
         return values;
     }
+
+    // Loads one per-layer stacked expert role and validates it against the descriptor's counts: the logical shape
+    // carries the declared expert count as its outermost dimension followed by this matrix's rows and columns, and
+    // the payload holds exactly that many packed rows so a single expert's slice stays inside the tensor. A stack
+    // whose per-expert block is too large for one addressable slice fails here rather than mis-slicing at forward time.
+    private LogicalTensor[] LoadExpertStacks(int layers, TensorRole role, int experts, long rows, long cols)
+    {
+        LogicalTensor[] tensors = new LogicalTensor[layers];
+
+        for (int l = 0; l < layers; l++)
+        {
+            LogicalTensor tensor = RequireTensor(role, l);
+            int[] dims = tensor.Shape.Dims;
+            if (dims.Length != 3 || dims[0] != experts || dims[1] != rows || dims[^1] != cols)
+            {
+                throw new ModelException(
+                    $"tensor '{tensor.Name}' must have shape [{experts}, {rows}, {cols}], got [{string.Join(", ", dims)}]");
+            }
+
+            long stride = tensor.Shape.RowStrideBytes(tensor.Format);
+            long payload = (long)dims[0] * rows * stride;
+            if (payload != tensor.SizeBytes)
+            {
+                throw new ModelException(
+                    $"tensor '{tensor.Name}' declares {tensor.SizeBytes} payload bytes but its shape and format require {payload}");
+            }
+
+            long expertBlock = rows * stride;
+            if (expertBlock > int.MaxValue)
+            {
+                throw new ModelException(
+                    $"tensor '{tensor.Name}' has an expert block of {expertBlock} bytes, beyond a single addressable slice");
+            }
+
+            tensors[l] = tensor;
+        }
+
+        return tensors;
+    }
+
+    // A descriptor that declares a shared expert names all three matrices together at plan resolution. This reads the
+    // declared role and fails on any half-set left unset, so a malformed descriptor never reaches execution; an
+    // undeclared shared expert loads nothing here at all.
+    private static TensorRole RequiredSparseRole(TensorRole? role, string side)
+    {
+        if (role is not { } resolved)
+        {
+            throw new ModelException($"the sparse-FFN descriptor declares a shared expert without naming its {side} matrix");
+        }
+
+        return resolved;
+    }
+
+    // Loads every layer's shared-expert selector vector, in the presence discipline the optional tensors use: a file
+    // shipping none of them loads nothing and the shared block keeps its ungated accumulation, a file shipping one for
+    // some layers only fails naming the first missing layer instead of gating half the block, and a complete table is
+    // dequantized once here so forward time reads plain floats like every other vector role.
+    private float[][] LoadSharedExpertSelectors(int layers, TensorDescriptor descriptor)
+    {
+        LogicalTensor?[] present = new LogicalTensor?[layers];
+        bool anyPresent = false;
+        int firstMissingLayer = -1;
+
+        for (int l = 0; l < layers; l++)
+        {
+            present[l] = descriptor.Resolve(_fileTensors, l);
+            if (present[l] is null)
+            {
+                if (firstMissingLayer < 0)
+                {
+                    firstMissingLayer = l;
+                }
+            }
+            else
+            {
+                anyPresent = true;
+            }
+        }
+
+        if (!anyPresent)
+        {
+            return [];
+        }
+
+        if (firstMissingLayer >= 0)
+        {
+            throw new ModelException(
+                $"tensor '{descriptor.NameFor(firstMissingLayer)}' is missing: architecture '{Plan.Architecture}' " +
+                "ships the shared-expert selector vector for some layers only");
+        }
+
+        float[][] vectors = new float[layers][];
+        for (int l = 0; l < layers; l++)
+        {
+            vectors[l] = LoadVector(present[l]!, Plan.HiddenSize);
+        }
+
+        return vectors;
+    }
+
+    // A slice of one expert's resident stack as the weight operand a GEMV over that expert consumes: the contiguous
+    // row range at this role's per-expert byte geometry, carrying the two-dimensional shape resolved for it at Open.
+    private static WeightRef ExpertWeightRef(ReadOnlySpan<byte> payload, long expertBytes, int expertIndex, TensorShape shape, QuantFormat format) =>
+        new(payload.Slice((int)(expertIndex * expertBytes), (int)expertBytes), shape, format);
+
+    // Router scoring and top-k selection for one normalized activation vector, shared by both forward paths so a
+    // batched step reproduces single-sequence routing exactly. The router emits one score per declared expert; every
+    // score is softmaxed together because the reference routes over all experts, then RoutedExpertsPerToken picks run
+    // as ascending-index scans using strict greater-than comparison — equal scores resolve to the lower expert index
+    // deterministically, with no sort or dictionary stability assumption. A picked slot is poisoned so later passes
+    // cannot re-pick it; selected slots are insertion-sorted into ascending expert-index execution order alongside
+    // their weights. Normalization divides by the selected probability sum when declared, and a nonzero
+    // ExpertWeightsScale multiplies every weight after that division. Scratch holds one routing at a time: batched
+    // callers copy each selection before selecting the next sequence.
+    private void RouteSparseExperts(SparseFfnDescriptor sparse, int layer, ReadOnlySpan<float> input)
+    {
+        LogicalTensor router = _moeRouter[layer];
+        ReadOnlySpan<byte> bytes = _weights.Resolve(router);
+        Span<float> scores = _moeLogits.AsSpan(0, sparse.ExpertCount);
+
+        // The router emits one score per declared expert before any selection or softmax runs.
+        _backend.Gemv(input, new WeightRef(bytes, router.Shape, router.Format), scores);
+
+        float maxScore = float.NegativeInfinity;
+        for (int e = 0; e < scores.Length; e++)
+        {
+            if (scores[e] > maxScore)
+            {
+                maxScore = scores[e];
+            }
+        }
+
+        // All-expert softmax probabilities in place, summed and divided in ascending expert order: the reference
+        // routes over every declared expert before selecting any of them. The max-subtraction guard keeps every
+        // exponent in range.
+        float allSum = 0f;
+        for (int e = 0; e < scores.Length; e++)
+        {
+            scores[e] = MathF.Exp(scores[e] - maxScore);
+            allSum += scores[e];
+        }
+
+        for (int e = 0; e < scores.Length; e++)
+        {
+            scores[e] /= allSum;
+        }
+
+        int routed = sparse.RoutedExpertsPerToken;
+        float selectedSum = 0f;
+        for (int pick = 0; pick < routed; pick++)
+        {
+            int best = -1;
+            float bestScore = float.NegativeInfinity;
+            for (int e = 0; e < scores.Length; e++)
+            {
+                // Strict '>' over ascending indexes: a tie keeps the earlier expert, so equal scores resolve to the
+                // lower index regardless of call order or buffer reuse.
+                if (scores[e] > bestScore)
+                {
+                    best = e;
+                    bestScore = scores[e];
+                }
+            }
+
+            _moeIds[pick] = best;
+            _moeWeights[pick] = bestScore;
+            selectedSum += bestScore;
+            scores[best] = float.NegativeInfinity; // consumed: later passes cannot re-pick this expert
+        }
+
+        for (int i = 1; i < routed; i++)
+        {
+            int id = _moeIds[i];
+            float weight = _moeWeights[i];
+            int j = i - 1;
+            while (j >= 0 && _moeIds[j] > id)
+            {
+                _moeIds[j + 1] = _moeIds[j];
+                _moeWeights[j + 1] = _moeWeights[j];
+                j--;
+            }
+
+            _moeIds[j + 1] = id;
+            _moeWeights[j + 1] = weight;
+        }
+
+        if (sparse.NormalizeExpertWeights && selectedSum > 0f)
+        {
+            for (int i = 0; i < routed; i++)
+            {
+                _moeWeights[i] /= selectedSum;
+            }
+        }
+
+        if (sparse.ExpertWeightsScale != 0f)
+        {
+            for (int i = 0; i < routed; i++)
+            {
+                _moeWeights[i] *= sparse.ExpertWeightsScale;
+            }
+        }
+    }
+
+    // Adds weight times source into target element-wise, in ascending order: the accumulation both forward paths use
+    // for every selected expert's down output, so a batched step replays the single-token arithmetic exactly.
+    private static void AccumulateScaled(Span<float> target, ReadOnlySpan<float> source, float weight)
+    {
+        for (int i = 0; i < source.Length; i++)
+        {
+            target[i] += weight * source[i];
+        }
+    }
+
+    // The weight a declared shared expert contributes with. A block whose profile names no selector role, or whose
+    // file ships none of those vectors, gets exactly 1f: the ungated accumulation this path has always used. When the
+    // vectors are present the score is taken from them against this token's normalized stream and applied as
+    // silu(score) / score to the shared output — the pinned qwen2moe graph builds it that way, as
+    // `ggml_div(ggml_silu(cur_gate_inp), cur_gate_inp)` over a GEMV of ffn_gate_inp_shexp, which is sigmoid's value
+    // read through its own silu rather than a separate node. The dot runs in ascending column order and both forward
+    // paths reach it through this method with the same per-token stream, so batched steps stay bit-identical to
+    // single-sequence ones. A score of exactly zero divides 0 by 0 as the reference graph does.
+    private float SharedExpertWeight(int layer, ReadOnlySpan<float> normed)
+    {
+        if (_sharedInputGate.Length == 0)
+        {
+            return 1f; // no selector vector in this file: the shared block adds ungated, exactly as before
+        }
+
+        float[] selector = _sharedInputGate[layer];
+        float score = 0f;
+        for (int c = 0; c < selector.Length; c++)
+        {
+            score += selector[c] * normed[c];
+        }
+
+        return LayerOps.Silu(score) / score;
+    }
+
+    // Sparse feed-forward for the current token: routing selects, each selected expert's gate/up/down chain runs over
+    // the normalized stream in ascending expert-index order, and every output accumulates into _proj scaled by its
+    // routing weight — a declared shared expert contributing once under SharedExpertWeight, which is 1f unless the
+    // file ships that block's selector vectors. The caller's post-feed-forward norm
+    // and residual add then run exactly as they do on the dense path.
+    private void ApplySparseFeedForward(SparseFfnDescriptor sparse, int layer)
+    {
+        RouteSparseExperts(sparse, layer, _normed.AsSpan(0, Plan.HiddenSize));
+
+        int hidden = Plan.HiddenSize;
+        Span<float> proj = _proj;
+        proj.Clear(); // the routed and shared contributions accumulate from zero below
+
+        for (int slot = 0; slot < sparse.RoutedExpertsPerToken; slot++)
+        {
+            ExecuteRoutedExpert(layer, _moeIds[slot], _moeSubsetIn.AsSpan(0, hidden));
+            AccumulateScaled(proj, _moeSubsetIn.AsSpan(0, hidden), _moeWeights[slot]);
+        }
+
+        if (sparse.HasSharedExpert)
+        {
+            RunSharedExpertToken(layer, _moeSubsetIn.AsSpan(0, hidden));
+            AccumulateScaled(proj, _moeSubsetIn.AsSpan(0, hidden), SharedExpertWeight(layer, _normed.AsSpan(0, hidden)));
+        }
+    }
+
+    // One routed expert's gate/up/down chain over a single activation vector. The gate and up intermediates reuse the
+    // dense token buffers; each GEMV reads this expert's contiguous row range of its resident stacked role at the
+    // per-expert byte geometry resolved at Open, so no copy of any expert tensor exists anywhere.
+    private void ExecuteRoutedExpert(int layer, int expertIndex, Span<float> output)
+    {
+        LogicalTensor gate = _moeExpertGate[layer];
+        ReadOnlySpan<byte> payload = _weights.Resolve(gate);
+        _backend.Gemv(_normed.AsSpan(0, Plan.HiddenSize), ExpertWeightRef(payload, _moeExpertGateBytes, expertIndex, _moeExpertGateShape, gate.Format), _gateUp);
+
+        LogicalTensor up = _moeExpertUp[layer];
+        payload = _weights.Resolve(up);
+        _backend.Gemv(_normed.AsSpan(0, Plan.HiddenSize), ExpertWeightRef(payload, _moeExpertUpBytes, expertIndex, _moeExpertUpShape, up.Format), _up);
+
+        ApplyActivation(_gateUp.AsSpan(0, Plan.IntermediateSize), _up.AsSpan(0, Plan.IntermediateSize));
+
+        LogicalTensor down = _moeExpertDown[layer];
+        payload = _weights.Resolve(down);
+        _backend.Gemv(_gateUp.AsSpan(0, Plan.IntermediateSize), ExpertWeightRef(payload, _moeExpertDownBytes, expertIndex, _moeExpertDownShape, down.Format), output);
+    }
+
+    // The shared expert's dense-shaped triplet over a single activation vector: the same gate/up/down GEMVs the dense
+    // block runs, reading its own per-layer tensors and writing this token's contribution into the accumulation slot.
+    private void RunSharedExpertToken(int layer, Span<float> output)
+    {
+        LogicalTensor gate = _sharedGate[layer];
+        ReadOnlySpan<byte> bytes = _weights.Resolve(gate);
+        _backend.Gemv(_normed.AsSpan(0, Plan.HiddenSize), new WeightRef(bytes, gate.Shape, gate.Format), _gateUp);
+
+        LogicalTensor up = _sharedUp[layer];
+        bytes = _weights.Resolve(up);
+        _backend.Gemv(_normed.AsSpan(0, Plan.HiddenSize), new WeightRef(bytes, up.Shape, up.Format), _up);
+
+        ApplyActivation(_gateUp.AsSpan(0, Plan.IntermediateSize), _up.AsSpan(0, Plan.IntermediateSize));
+
+        LogicalTensor down = _sharedDown[layer];
+        bytes = _weights.Resolve(down);
+        _backend.Gemv(_gateUp.AsSpan(0, Plan.IntermediateSize), new WeightRef(bytes, down.Shape, down.Format), output);
+    }
+
+    // Sparse feed-forward for one batched step: every sequence routes first (one selection at a time in scratch,
+    // copied into the per-sequence arrays before the next selection runs). Execution then walks selection slots in
+    // ascending order and experts by index within each slot, packing that group's member rows of _batchNormed for one
+    // GemvBatch pass through the expert's resident stack; results accumulate straight into each sequence's projection
+    // stream under its routing weight. A declared shared expert runs last over all sequences, every sequence scaled by
+    // its own SharedExpertWeight. The packed subset buffer carries activations and down results in place, so no copy of any expert tensor or whole-batch
+    // output exists — and because every sequence accumulates its own contributions in the same slot order a single
+    // token does, each batched result is bit-identical to stepping that sequence alone. The caller's post-feed-forward
+    // norm and residual add then run exactly as they do on the dense path.
+    private void ApplySparseFeedForwardBatch(SparseFfnDescriptor sparse, int layer, int n)
+    {
+        int hidden = Plan.HiddenSize;
+        int routed = sparse.RoutedExpertsPerToken;
+
+        for (int s = 0; s < n; s++)
+        {
+            RouteSparseExperts(sparse, layer, _batchNormed.AsSpan(s * hidden, hidden));
+
+            for (int pick = 0; pick < routed; pick++)
+            {
+                _batchMoeIds[s * routed + pick] = _moeIds[pick];
+                _batchMoeWeights[s * routed + pick] = _moeWeights[pick];
+            }
+        }
+
+        Span<float> batchProj = _batchProj.AsSpan(0, n * hidden);
+        batchProj.Clear(); // the routed and shared contributions accumulate from zero below
+
+        for (int slot = 0; slot < routed; slot++)
+        {
+            for (int expertIndex = 0; expertIndex < sparse.ExpertCount; expertIndex++)
+            {
+                int count = 0;
+                for (int s = 0; s < n; s++)
+                {
+                    if (_batchMoeIds[s * routed + slot] == expertIndex)
+                    {
+                        _expertMembers[count++] = s;
+                    }
+                }
+
+                ExecuteRoutedExpertBatch(layer, expertIndex, count, slot, routed);
+            }
+        }
+
+        if (sparse.HasSharedExpert)
+        {
+            RunSharedExpertBatch(layer, n, hidden);
+        }
+    }
+
+    // One routed expert's gate/up/down chain over the packed member rows of one selection slot: a single batched pass
+    // through its resident stack, bit-identical per row to the token path, with each member's down result accumulated
+    // into that sequence's projection stream under its routing weight as soon as the group completes. _moeSubsetIn
+    // carries this group's activations and then its contiguous down results in place; gate/up intermediates reuse the
+    // dense batch buffers. A slot no sequence selected runs nothing at all.
+    private void ExecuteRoutedExpertBatch(int layer, int expertIndex, int count, int slot, int routed)
+    {
+        if (count == 0)
+        {
+            return;
+        }
+
+        int hidden = Plan.HiddenSize;
+        int inter = Plan.IntermediateSize;
+        Span<float> subsetIn = _moeSubsetIn.AsSpan(0, count * hidden);
+
+        for (int m = 0; m < count; m++)
+        {
+            _batchNormed.AsSpan(_expertMembers[m] * hidden, hidden).CopyTo(subsetIn.Slice(m * hidden, hidden));
+        }
+
+        LogicalTensor gate = _moeExpertGate[layer];
+        ReadOnlySpan<byte> payload = _weights.Resolve(gate);
+        _backend.GemvBatch(subsetIn, count, ExpertWeightRef(payload, _moeExpertGateBytes, expertIndex, _moeExpertGateShape, gate.Format), _batchGateUp.AsSpan(0, count * inter));
+
+        LogicalTensor up = _moeExpertUp[layer];
+        payload = _weights.Resolve(up);
+        _backend.GemvBatch(subsetIn, count, ExpertWeightRef(payload, _moeExpertUpBytes, expertIndex, _moeExpertUpShape, up.Format), _batchUp.AsSpan(0, count * inter));
+
+        for (int m = 0; m < count; m++)
+        {
+            ApplyActivation(_batchGateUp.AsSpan(m * inter, inter), _batchUp.AsSpan(m * inter, inter));
+        }
+
+        LogicalTensor down = _moeExpertDown[layer];
+        payload = _weights.Resolve(down);
+        _backend.GemvBatch(_batchGateUp.AsSpan(0, count * inter), count, ExpertWeightRef(payload, _moeExpertDownBytes, expertIndex, _moeExpertDownShape, down.Format), subsetIn);
+
+        for (int m = 0; m < count; m++)
+        {
+            int s = _expertMembers[m];
+            AccumulateScaled(_batchProj.AsSpan(s * hidden, hidden), subsetIn.Slice(m * hidden, hidden), _batchMoeWeights[s * routed + slot]);
+        }
+    }
+
+    // The shared expert's dense-shaped triplet over every sequence in one batched pass: the same gate/up/down
+    // GemvBatch traversal the dense block runs, accumulating each sequence's output into its projection stream under
+    // that sequence's SharedExpertWeight — 1f for a file shipping no selector vectors. An undeclared shared expert
+    // never reaches this path and reads none of these roles at all.
+    private void RunSharedExpertBatch(int layer, int n, int hidden)
+    {
+        LogicalTensor gate = _sharedGate[layer];
+        ReadOnlySpan<byte> bytes = _weights.Resolve(gate);
+
+        for (int s = 0; s < n; s++)
+        {
+            _batchNormed.AsSpan(s * hidden, hidden).CopyTo(_moeSubsetIn.AsSpan(s * hidden, hidden));
+        }
+
+        Span<float> subsetIn = _moeSubsetIn.AsSpan(0, n * hidden);
+        int inter = Plan.IntermediateSize;
+
+        _backend.GemvBatch(subsetIn, n, new WeightRef(bytes, gate.Shape, gate.Format), _batchGateUp.AsSpan(0, n * inter));
+
+        LogicalTensor up = _sharedUp[layer];
+        bytes = _weights.Resolve(up);
+        _backend.GemvBatch(subsetIn, n, new WeightRef(bytes, up.Shape, up.Format), _batchUp.AsSpan(0, n * inter));
+
+        for (int s = 0; s < n; s++)
+        {
+            ApplyActivation(_batchGateUp.AsSpan(s * inter, inter), _batchUp.AsSpan(s * inter, inter));
+        }
+
+        LogicalTensor down = _sharedDown[layer];
+        bytes = _weights.Resolve(down);
+        _backend.GemvBatch(_batchGateUp.AsSpan(0, n * inter), n, new WeightRef(bytes, down.Shape, down.Format), subsetIn);
+
+        for (int s = 0; s < n; s++)
+        {
+            AccumulateScaled(_batchProj.AsSpan(s * hidden, hidden), _moeSubsetIn.AsSpan(s * hidden, hidden), SharedExpertWeight(layer, _batchNormed.AsSpan(s * hidden, hidden)));
+        }
+    }
+
 
     private static void RequireSingle(LogicalTensor tensor, int rows, long cols)
     {

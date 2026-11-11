@@ -768,7 +768,8 @@ public static class ModelPlans
     // when the key is absent — and <prefix>expert_weights_norm, false when the key is absent. The roles come
     // from the resolved profile's declared sparse-FFN shape, or from the map's sparse names when the profile
     // declares no shape of its own; the shared-expert roles are carried only when the file declares a shared
-    // expert and the resolved profile names them.
+    // expert and the resolved profile names them. The shared expert's per-token selector vector is named by the
+    // profile alone: whether it gates anything is decided later, by whether the file ships that tensor.
     private static SparseFfnDescriptor? ResolveSparseFfn(GgufMetadata metadata, string prefix, SparseFfnDescriptor? shape)
     {
         int expertCount = ResolveMoECount(metadata, prefix + "expert_count", fallback: 0, positive: true);
@@ -798,6 +799,10 @@ public static class ModelPlans
             SharedGateRole: hasSharedExpert ? shape?.SharedGateRole ?? TensorRole.MoeSharedExpertGate : null,
             SharedUpRole: hasSharedExpert ? shape?.SharedUpRole ?? TensorRole.MoeSharedExpertUp : null,
             SharedDownRole: hasSharedExpert ? shape?.SharedDownRole ?? TensorRole.MoeSharedExpertDown : null,
+            // Whether a family selects its shared expert with a per-token vector is part of the reference's block
+            // semantics, not something a canonical name can infer: only a profile whose sparse-FFN shape names the
+            // role carries it, and the file decides at load whether that tensor is there.
+            SharedInputGateRole: hasSharedExpert ? shape?.SharedInputGateRole : null,
             ExpertWeightsScale: ResolveMoEScale(metadata, prefix + "expert_weights_scale"),
             NormalizeExpertWeights: metadata.GetBool(prefix + "expert_weights_norm", fallback: false));
     }

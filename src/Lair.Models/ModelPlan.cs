@@ -156,8 +156,9 @@ public sealed record ModelPlan
     /// <c>&lt;prefix&gt;expert_used_count</c>, <c>&lt;prefix&gt;expert_shared_count</c>,
     /// <c>&lt;prefix&gt;expert_weights_scale</c>, and <c>&lt;prefix&gt;expert_weights_norm</c>) against the
     /// resolved profile's sparse-FFN shape, or <c>null</c> when the file declares no expert count and the dense
-    /// gate/up/down block runs. A resolved descriptor names the router and expert tensor roles the forward
-    /// engine refuses to execute today.
+    /// gate/up/down block runs. A resolved descriptor names the router and per-expert tensor roles every expert
+    /// of the block is resident under: all experts stay in RAM, so routing selects among them rather than
+    /// fetching them.
     /// </summary>
     public SparseFfnDescriptor? SparseFfn { get; init; }
 

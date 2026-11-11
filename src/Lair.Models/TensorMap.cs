@@ -41,6 +41,14 @@ public enum TensorRole
     MoeSharedExpertGate,
     MoeSharedExpertUp,
     MoeSharedExpertDown,
+
+    /// <summary>
+    /// The shared expert's per-token scalar gate: one row of the hidden size whose score selects the shared
+    /// expert for this token. It is a distinct tensor from <see cref="MoeSharedExpertGate"/> — that role names the
+    /// shared block's SwiGLU gate matrix, this one names the selector vector the reference multiplies the shared
+    /// output by — and only some families ship it at all.
+    /// </summary>
+    MoeSharedExpertInputGate,
 }
 
 /// <summary>Whether a tensor name is a single global name or a per-block name carrying a <c>{layer}</c> placeholder.</summary>
@@ -151,7 +159,8 @@ public sealed class TensorMap
     public TensorDescriptor this[TensorRole role] => _byRole[(int)role];
 
     /// <summary>
-    /// Whether a role belongs to the sparse-FFN block: the router and the expert matrices, dense or shared.
+    /// Whether a role belongs to the sparse-FFN block: the router, the expert matrices dense or shared, and the
+    /// shared expert's scalar gate vector.
     /// A dense profile names these roles for the load-time report only — its forward consumes none of them,
     /// and the generic llama-shaped fallback treats a tensor under a sparse name as material its map cannot
     /// match rather than as a matchable optional role.
@@ -163,5 +172,6 @@ public sealed class TensorMap
             or TensorRole.MoeExpertDown
             or TensorRole.MoeSharedExpertGate
             or TensorRole.MoeSharedExpertUp
-            or TensorRole.MoeSharedExpertDown;
+            or TensorRole.MoeSharedExpertDown
+            or TensorRole.MoeSharedExpertInputGate;
 }

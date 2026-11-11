@@ -26,6 +26,10 @@ public static class ModelProfiles
         SharedGateRole: TensorRole.MoeSharedExpertGate,
         SharedUpRole: TensorRole.MoeSharedExpertUp,
         SharedDownRole: TensorRole.MoeSharedExpertDown,
+        // The reference qwen2moe block ships one selector vector of the file's hidden size per layer and multiplies
+        // this token's shared-expert output by its score, so this shape names that role. A sparse shape naming no
+        // gate role adds its shared block ungated instead.
+        SharedInputGateRole: TensorRole.MoeSharedExpertInputGate,
         ExpertWeightsScale: 0f,
         NormalizeExpertWeights: false);
 
@@ -40,6 +44,8 @@ public static class ModelProfiles
         SharedGateRole: null,
         SharedUpRole: null,
         SharedDownRole: null,
+        // The reference qwen3moe block ships no shared expert at all, so it names neither its matrices nor a gate.
+        SharedInputGateRole: null,
         ExpertWeightsScale: 0f,
         NormalizeExpertWeights: false);
 
@@ -122,9 +128,9 @@ public static class ModelProfiles
             Prefix = "qwen2moe.",
             // The reference qwen2moe block routes every token through a per-layer router matrix over its experts,
             // sums the routed expert outputs with the routing weights, and adds one shared-expert block to that —
-            // the profile names those tensors and declares the sparse-FFN shape, while the forward engine refuses
-            // the block until sparse execution exists. The shared-expert gate vector the conversion ships is
-            // nameable through the shared gate role's alias.
+            // the profile names those tensors and declares the sparse-FFN shape. The shared expert is selected per
+            // token by a separate hidden-sized vector of the same layer, named by its own role rather than folded
+            // into the shared gate matrix's name.
             SparseFfn = Qwen2MoeSparseFfn,
             Norm = NormStrategy.RmsNorm,
             Activation = ActivationStrategy.SwiGLU,
@@ -247,13 +253,13 @@ public static class ModelProfiles
     // The MoE tensor map: the canonical map with the dense gate/up/down roles relaxed to optional — an
     // expert-routed block ships its gate/up/down triplets per expert instead of a dense triplet, so a MoE
     // file carries none of the dense names — plus the sparse-FFN roles under the names the reference uses:
-    // the router matrix, the stacked per-expert gate/up/down triplets, and the shared expert's gate/up/down
-    // triplets. Every sparse role is optional: the map names a MoE file's table so the load can report the
-    // file instead of rejecting its material, and the forward engine refuses a resolved sparse block before
-    // any of these tensors is consumed. The shared gate role also names the gate vector the qwen2moe
-    // conversion ships alongside the shared gate matrix. Dense profiles carry no sparse roles at all: their
-    // forward consumes none, and the generic llama-shaped fallback treats a tensor under a sparse name as
-    // material its map cannot match.
+    // the router matrix, the stacked per-expert gate/up/down triplets, the shared expert's gate/up/down
+    // triplets, and the hidden-sized vector that selects the shared expert for a token. Every sparse role is
+    // optional: the map names a MoE file's table so the load can report the file instead of rejecting its
+    // material, and only the families whose reference ships each tensor name it — the shared selector vector is a
+    // separate tensor from the shared gate matrix, with a shape of its own, so it carries no alias onto that name.
+    // Dense profiles carry no sparse roles at all: their forward consumes none, and the generic llama-shaped fallback
+    // treats a tensor under a sparse name as material its map cannot match.
     private static TensorMap MoeTensors() =>
         new(
         [
@@ -265,8 +271,9 @@ public static class ModelProfiles
             new TensorDescriptor(TensorRole.MoeExpertGate, TensorScope.PerLayer, "blk.{layer}.ffn_gate_exps.weight", Required: false, []),
             new TensorDescriptor(TensorRole.MoeExpertUp, TensorScope.PerLayer, "blk.{layer}.ffn_up_exps.weight", Required: false, []),
             new TensorDescriptor(TensorRole.MoeExpertDown, TensorScope.PerLayer, "blk.{layer}.ffn_down_exps.weight", Required: false, []),
-            new TensorDescriptor(TensorRole.MoeSharedExpertGate, TensorScope.PerLayer, "blk.{layer}.ffn_gate_shexp.weight", Required: false, ["blk.{layer}.ffn_gate_inp_shexp.weight"]),
+            new TensorDescriptor(TensorRole.MoeSharedExpertGate, TensorScope.PerLayer, "blk.{layer}.ffn_gate_shexp.weight", Required: false, []),
             new TensorDescriptor(TensorRole.MoeSharedExpertUp, TensorScope.PerLayer, "blk.{layer}.ffn_up_shexp.weight", Required: false, []),
             new TensorDescriptor(TensorRole.MoeSharedExpertDown, TensorScope.PerLayer, "blk.{layer}.ffn_down_shexp.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.MoeSharedExpertInputGate, TensorScope.PerLayer, "blk.{layer}.ffn_gate_inp_shexp.weight", Required: false, []),
         ]);
 }
