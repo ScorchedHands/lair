@@ -106,11 +106,13 @@ public sealed record ModelPlan
     public float FinalLogitSoftcap { get; init; }
 
     /// <summary>
-    /// Declared <c>&lt;prefix&gt;attention.sliding_window</c>: the attention score window in positions. At query
-    /// position <c>i</c> the causal range narrows to <c>[max(0, i - window + 1), i]</c>, and the bidirectional
-    /// range to <c>[max(0, i - window + 1), i + window]</c> clamped to the sequence. <c>0</c> when the key is
-    /// absent means unbounded, and <see cref="WindowInterleave"/> decides which layers the declared value narrows.
-    /// The value masks scores only: every position is still written to and readable from the KV cache.
+    /// Declared <c>&lt;prefix&gt;attention.sliding_window</c>: the attention window in positions. At query position
+    /// <c>i</c> a layer that carries this window reads <c>[max(0, i - window + 1), i]</c> causally and
+    /// <c>[max(0, i - window + 1), i + window]</c> bidirectionally, clamped to the sequence; see
+    /// <see cref="AttentionWindowForLayer"/> for what one layer actually resolves. <c>0</c> when the key is absent
+    /// means unbounded, and <see cref="WindowInterleave"/> decides which layers the declared value narrows. Every
+    /// position's K/V is still written to and stays readable in the KV cache — the window bounds what a layer reads,
+    /// not what the sequence stores, because another layer of the same model may attend the whole range.
     /// </summary>
     public int AttentionWindow { get; init; }
 
@@ -121,6 +123,31 @@ public sealed record ModelPlan
     /// pattern.
     /// </summary>
     public WindowInterleave WindowInterleave { get; init; } = WindowInterleave.AllLayers;
+
+    /// <summary>
+    /// The window one layer reads within, resolved here from <see cref="AttentionWindow"/> against
+    /// <see cref="WindowInterleave"/> so the plan carries the per-layer value lair.kv's block selection honors: every
+    /// layer under <see cref="WindowInterleave.AllLayers"/>, even-indexed layers only under
+    /// <see cref="WindowInterleave.AlternatingLocalFirst"/>, where the odd-indexed layers resolve unbounded. A resolved
+    /// window of <c>0</c> is unbounded whatever the pattern, and a pattern this engine cannot resolve fails naming it
+    /// instead of silently masking some other set of layers. The value bounds what that layer reads; storage stays whole.
+    /// </summary>
+    public int AttentionWindowForLayer(int layer)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(layer);
+
+        switch (WindowInterleave)
+        {
+            case WindowInterleave.AllLayers:
+                return AttentionWindow;
+
+            case WindowInterleave.AlternatingLocalFirst:
+                return layer % 2 == 0 ? AttentionWindow : 0;
+
+            default:
+                throw new ModelException($"window interleave '{WindowInterleave}' is not implemented by the forward engine");
+        }
+    }
 
     /// <summary>
     /// The resolved profile's input-embedding gain: <c>sqrt(hidden size)</c> on a profile whose reference graph

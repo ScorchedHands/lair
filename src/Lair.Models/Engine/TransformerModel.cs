@@ -16,8 +16,9 @@ namespace Lair.Models.Engine;
     /// (2i, 2i + 1) under the llama-family strategy or the head halves (i, i + headDim/2) under the qwen3 strategy;
     /// attention scores scale by 1/sqrt(headDim), pass through the plan's attention-score softcap when one is resolved, and
 /// softmax runs online over positions 0..pos, narrowed per layer to <c>[max(0, pos - window + 1), pos]</c> on the
-/// layers the plan's resolved window interleave masks and left unbounded on the layers it leaves alone. The window
-/// masks scores only: every position's K/V is still written and stays readable. The residual added before the
+/// layers the plan's resolved window interleave masks and left unbounded on the layers it leaves alone. The narrowing
+/// is a block selection lair.kv resolves for that read: masked positions are not addressed at all, while every
+/// position's K/V is still written and stays readable for the layers whose own selection covers it. The residual added before the
 /// FFN norm is the pre-attention stream value, or that stream plus a normalized attention output under a placement that
 /// norms sublayer outputs — either way matching the reference graph's ffn_inp add; rope scaling variants
 /// are not supported. FP32 buffers are allocated once at Open and reused across calls; packed matrix rows are
@@ -1297,25 +1298,12 @@ public sealed class TransformerModel : IDisposable
         }
     }
 
-    // The score window one layer narrows to runs as a direct branch on the plan's resolved interleave, the way the
-    // norm, activation, and softcap switches do: the declared window masks every layer under AllLayers, and only the
-    // even-indexed layers under AlternatingLocalFirst, where the odd-indexed layers attend the whole range. A
-    // declared window of zero is unbounded whatever the pattern. The value is resolved once per layer — never per
-    // token or per head — and bounds scores only: every position's K/V is still written and stays readable.
-    private int LayerAttentionWindow(int layer)
-    {
-        switch (Plan.WindowInterleave)
-        {
-            case WindowInterleave.AllLayers:
-                return Plan.AttentionWindow;
-
-            case WindowInterleave.AlternatingLocalFirst:
-                return layer % 2 == 0 ? Plan.AttentionWindow : 0;
-
-            default:
-                throw new ModelException($"window interleave '{Plan.WindowInterleave}' is not implemented by the forward engine");
-        }
-    }
+    // The window one layer reads within comes from the plan's resolved per-layer value, called directly the way the
+    // norm, activation, and softcap switches do: no dispatch and nothing resolved per token or per head. lair.kv then
+    // turns that value into a block selection at each attention call — see LayerOps.CausalAttention — so the windowed
+    // layers read only the blocks their window covers while the unbounded ones select the whole table. Storage is not
+    // narrowed: every position's K/V is still written and stays readable for whichever layer attends it.
+    private int LayerAttentionWindow(int layer) => Plan.AttentionWindowForLayer(layer);
 
     private void ApplyActivation(Span<float> gate, ReadOnlySpan<float> up)
     {
