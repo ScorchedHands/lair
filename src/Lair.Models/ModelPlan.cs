@@ -32,7 +32,11 @@ namespace Lair.Models;
 /// it today. The sparse-FFN slot reads <c>&lt;prefix&gt;expert_count</c>, <c>&lt;prefix&gt;expert_used_count</c>,
 /// <c>&lt;prefix&gt;expert_shared_count</c>, <c>&lt;prefix&gt;expert_weights_scale</c>, and
 /// <c>&lt;prefix&gt;expert_weights_norm</c>: a declared expert count resolves the descriptor against the resolved
-/// profile's declared shape, and a file declaring no expert count keeps the dense gate/up/down block. The rope
+/// profile's declared shape, and a file declaring no expert count keeps the dense gate/up/down block. The same slot reads
+/// <c>&lt;prefix&gt;expert_layout</c>, <c>&lt;prefix&gt;expert_rank</c>, and <c>&lt;prefix&gt;sparse_ffn_strategy</c>: the first two say how
+/// the block's experts are stored, and the third resolves against the resolved profile's default into the plan's
+/// expert-computation variant — a declaration can override that default in either direction but cannot select storage the
+/// file does not declare. The rope
 /// scaling reads <c>&lt;prefix&gt;rope.scaling.type</c>, <c>&lt;prefix&gt;rope.scaling.factor</c>,
 /// <c>&lt;prefix&gt;rope.scaling.original_context_length</c>, <c>&lt;prefix&gt;rope.scaling.attn_factor</c>, and the
 /// YaRN operands <c>&lt;prefix&gt;rope.scaling.yarn_log_multiplier</c>, <c>&lt;prefix&gt;rope.scaling.yarn_ext_factor</c>,
@@ -158,9 +162,20 @@ public sealed record ModelPlan
     /// resolved profile's sparse-FFN shape, or <c>null</c> when the file declares no expert count and the dense
     /// gate/up/down block runs. A resolved descriptor names the router and per-expert tensor roles every expert
     /// of the block is resident under: all experts stay in RAM, so routing selects among them rather than
-    /// fetching them.
+    /// fetching them. It also carries how those experts are stored — the declared <c>&lt;prefix&gt;expert_layout</c>
+    /// (stacked unless the file declares a shared basis), that layout's rank when it has one, and the tensor roles a
+    /// factorized declaration reaches for. Which of those shapes anything computes with is the strategy value below.
     /// </summary>
     public SparseFfnDescriptor? SparseFfn { get; init; }
+
+    /// <summary>
+    /// The expert-computation variant this model resolves to: the declared <c>&lt;prefix&gt;sparse_ffn_strategy</c>
+    /// overriding the resolved profile's default, exactly as the per-head QK-norm mode resolves. <c>null</c> when the
+    /// file declares no experts and no block routes anything. A value names what the load decided, not what proved
+    /// runnable: a variant the forward engine cannot yet run stays recorded here and reports at engine open instead of
+    /// falling back to another strategy invisibly.
+    /// </summary>
+    public SparseFfnStrategy? SparseFfnStrategy { get; init; }
 
     /// <summary>The flat scalar view of this plan's resolved geometry.</summary>
     public ModelDesc ToDesc() =>

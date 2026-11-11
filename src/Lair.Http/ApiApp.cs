@@ -111,7 +111,8 @@ public static class ApiApp
                     gen.Model.Architecture,
                     gen.ModelType,
                     gen.Model.ToolParser,
-                    gen.Model.Reasoning)]);
+                    gen.Model.Reasoning,
+                    gen.Model.SparseFfnStrategy)]);
 
             return Results.Json(models, statusCode: 200);
         });

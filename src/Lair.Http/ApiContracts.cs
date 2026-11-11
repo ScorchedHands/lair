@@ -119,7 +119,7 @@ internal sealed record ChunkDelta(
 /// <summary><c>/v1/models</c> envelope.</summary>
 internal sealed record ModelsResponse(string Object, IReadOnlyList<ModelEntry> Data);
 
-/// <summary>One advertised model: OpenAI baseline fields plus the context/quant/architecture metadata, the configured model kind, and the tool output parser resolved for the model at load. The type field is additive payload so chat surfaces can exclude embed models on a fact; it defaults to "chat" because the config loader accepts no other value in this build.</summary>
+/// <summary>One advertised model: OpenAI baseline fields plus the context/quant/architecture metadata, the configured model kind, the tool output parser resolved for the model at load, and the sparse-FFN strategy its plan resolved when it routes experts. The type field is additive payload so chat surfaces can exclude embed models on a fact; it defaults to "chat" because the config loader accepts no other value in this build. A model with no expert-routed block carries no strategy value, and the null-ignore serializer omits the key there.</summary>
 internal sealed record ModelEntry(
     string Id,
     string Object,
@@ -130,7 +130,8 @@ internal sealed record ModelEntry(
     string Architecture,
     string Type = "chat",
     string ToolParser = "auto",
-    string Reasoning = "keep");
+    string Reasoning = "keep",
+    string? SparseFfnStrategy = null);
 
 /// <summary><c>/healthz</c> body.</summary>
 internal sealed record HealthResponse(string Status, bool ModelReady);

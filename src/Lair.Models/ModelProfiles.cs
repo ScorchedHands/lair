@@ -14,7 +14,10 @@ public static class ModelProfiles
 
     // The sparse-FFN shape each MoE profile declares: the router and expert roles its tensor map names, and
     // whether its reference block adds a shared expert. The counts the plan carries come from the file's
-    // declared expert metadata, never from the profile, so these shapes carry zero counts.
+    // declared expert metadata, never from the profile, so these shapes carry zero counts. They name the factorized
+    // layout's basis/coefficient/output-basis roles too — the map declares them as optional tensors a sidecar-produced
+    // file can reach — while carrying the stacked layout and no rank, because which layout a block has is what its own
+    // declaration says, not what the family prefers.
     private static readonly SparseFfnDescriptor Qwen2MoeSparseFfn = new(
         ExpertCount: 0,
         RoutedExpertsPerToken: 0,
@@ -30,6 +33,11 @@ public static class ModelProfiles
         // this token's shared-expert output by its score, so this shape names that role. A sparse shape naming no
         // gate role adds its shared block ungated instead.
         SharedInputGateRole: TensorRole.MoeSharedExpertInputGate,
+        Layout: SparseFfnLayout.StackedExperts,
+        Rank: null,
+        ExpertInputBasisRole: TensorRole.MoeExpertInputBasis,
+        ExpertCoefficientRole: TensorRole.MoeExpertCoefficients,
+        ExpertOutputBasisRole: TensorRole.MoeExpertOutputBasis,
         ExpertWeightsScale: 0f,
         NormalizeExpertWeights: false);
 
@@ -46,6 +54,11 @@ public static class ModelProfiles
         SharedDownRole: null,
         // The reference qwen3moe block ships no shared expert at all, so it names neither its matrices nor a gate.
         SharedInputGateRole: null,
+        Layout: SparseFfnLayout.StackedExperts,
+        Rank: null,
+        ExpertInputBasisRole: TensorRole.MoeExpertInputBasis,
+        ExpertCoefficientRole: TensorRole.MoeExpertCoefficients,
+        ExpertOutputBasisRole: TensorRole.MoeExpertOutputBasis,
         ExpertWeightsScale: 0f,
         NormalizeExpertWeights: false);
 
@@ -275,5 +288,33 @@ public static class ModelProfiles
             new TensorDescriptor(TensorRole.MoeSharedExpertUp, TensorScope.PerLayer, "blk.{layer}.ffn_up_shexp.weight", Required: false, []),
             new TensorDescriptor(TensorRole.MoeSharedExpertDown, TensorScope.PerLayer, "blk.{layer}.ffn_down_shexp.weight", Required: false, []),
             new TensorDescriptor(TensorRole.MoeSharedExpertInputGate, TensorScope.PerLayer, "blk.{layer}.ffn_gate_inp_shexp.weight", Required: false, []),
+
+            // The factorized layout's tensors. No published conversion ships them — LAIR converts nothing itself, so a
+            // file carrying these arrives through an alternate weight provider — and the names follow this family's own
+            // GGUF conventions rather than inventing a vocabulary: block-scoped `blk.N.` prefix, `.weight` suffix, and
+            // the same `ffn_…exps…` stem the dense-stacked expert roles use. The shared basis is one matrix per layer on
+            // each side of the compressed space (`basis_in` reads hidden values, `basis_out` writes them), the per-expert
+            // coefficients keep the plural `_coefficients` shape the stacked expert triplets use so their outermost
+            // dimension indexes experts exactly as `ffn_gate_exps` does, and each role carries the shorter singular form
+            // of its own name as an alias because a sidecar exporter is free to spell it either way. All stay optional:
+            // only a file declaring the factorized layout declares these tensors, and nothing resident today reads them.
+            new TensorDescriptor(
+                TensorRole.MoeExpertInputBasis,
+                TensorScope.PerLayer,
+                "blk.{layer}.ffn_exps_basis_in.weight",
+                Required: false,
+                ["blk.{layer}.ffn_experts_basis_in.weight"]),
+            new TensorDescriptor(
+                TensorRole.MoeExpertCoefficients,
+                TensorScope.PerLayer,
+                "blk.{layer}.ffn_exps_coefficient.weight",
+                Required: false,
+                ["blk.{layer}.ffn_experts_coefficient.weight"]),
+            new TensorDescriptor(
+                TensorRole.MoeExpertOutputBasis,
+                TensorScope.PerLayer,
+                "blk.{layer}.ffn_exps_basis_out.weight",
+                Required: false,
+                ["blk.{layer}.ffn_experts_basis_out.weight"]),
         ]);
 }

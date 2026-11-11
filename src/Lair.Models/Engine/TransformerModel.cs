@@ -255,6 +255,19 @@ public sealed class TransformerModel : IDisposable
         // exactly as it was for a file that declares no expert count.
         _sparseFfn = Plan.SparseFfn;
 
+        // A resolved strategy other than the dense-resident variant is a shape this engine has no kernel for: the plan
+        // can represent it, so the load records it and reports here rather than running some other variant behind the
+        // selection the file declared. The message names the strategy, what the descriptor carries for it, and the one
+        // value that runs today — nothing falls back silently.
+        if (Plan.SparseFfnStrategy is { } resolvedStrategy && resolvedStrategy != SparseFfnStrategy.DenseResident)
+        {
+            throw new ModelException(
+                $"sparse-FFN strategy '{resolvedStrategy}' is not implemented by the forward engine: architecture " +
+                $"'{Plan.Architecture}' declares a sparse-FFN block with {_sparseFfn!.ExpertCount} experts routing " +
+                $"{_sparseFfn.RoutedExpertsPerToken} per token over a shared basis at rank {_sparseFfn.Rank?.ToString(CultureInfo.InvariantCulture) ?? "an undeclared rank"}: " +
+                $"only {SparseFfnStrategy.DenseResident} executes today — declare {Plan.Prefix}sparse_ffn_strategy 'dense_resident' to run this file");
+        }
+
         int layers = Plan.LayerCount;
 
         _wq = LoadMatrices(layers, TensorRole.AttentionQuery, FusedQkvName(TensorRole.AttentionQuery));

@@ -27,7 +27,13 @@ namespace Lair.Models;
     /// <c>sqrt(hidden size)</c> in the plan, every other profile resolves zero. The sparse-FFN slot resolves the
     /// declared <c>&lt;prefix&gt;expert_count</c> together with its routing, shared-expert, weight-scale, and
     /// weight-normalization keys against the resolved profile's declared shape; a file that declares no expert
-    /// count keeps the dense gate/up/down block. An unregistered architecture is accepted only through the generic llama-shaped fallback profile, which
+    /// count keeps the dense gate/up/down block; its declared <c>&lt;prefix&gt;expert_layout</c> (<c>stacked</c> when the key is
+    /// absent) and <c>&lt;prefix&gt;expert_rank</c> decide how factorized that storage is, and only a declaration of the
+    /// shared-basis layout carries the basis/coefficient/output-basis tensor roles or names a rank. The sparse-FFN strategy
+    /// resolves the declared <c>&lt;prefix&gt;sparse_ffn_strategy</c> against the resolved profile's default exactly as the
+    /// QK-norm mode does, and lands in the plan only for a block that declares experts: an unrecognized strategy name fails
+    /// at load naming the key and the value, and selecting <see cref="SparseFfnStrategy.LowRankSharedBasis"/> on a file whose
+    /// declaration stores its experts as stacked matrices is refused there rather than downgraded. An unregistered architecture is accepted only through the generic llama-shaped fallback profile, which
 /// requires the file's tensor table to match the llama map exactly and reports the substitution as one structured
 /// log line when applied.
 /// </summary>
@@ -242,6 +248,11 @@ public static class ModelPlans
             }
         }
 
+        // The sparse-FFN slot and its resolved strategy resolve together: the descriptor says how the block stores its
+        // experts, and the plan's strategy value is what a file declares on top of the profile's default — refused here,
+        // not downgraded, when it selects a variant the declared storage cannot back.
+        SparseFfnDescriptor? sparseFfn = ResolveSparseFfn(metadata, prefix, profile.SparseFfn);
+
         return new ModelPlan
         {
             Architecture = architecture,
@@ -274,7 +285,8 @@ public static class ModelPlans
             Rope = profile.Rope,
             RopeScaling = ropeScaling,
             RopeRotaryDimensions = ropeRotaryDimensions,
-            SparseFfn = ResolveSparseFfn(metadata, prefix, profile.SparseFfn),
+            SparseFfn = sparseFfn,
+            SparseFfnStrategy = ResolveSparseFfnStrategy(metadata, prefix, profile.DefaultSparseFfnStrategy, sparseFfn),
         };
     }
 
@@ -769,7 +781,11 @@ public static class ModelPlans
     // from the resolved profile's declared sparse-FFN shape, or from the map's sparse names when the profile
     // declares no shape of its own; the shared-expert roles are carried only when the file declares a shared
     // expert and the resolved profile names them. The shared expert's per-token selector vector is named by the
-    // profile alone: whether it gates anything is decided later, by whether the file ships that tensor.
+    // profile alone: whether it gates anything is decided later, by whether the file ships that tensor. The storage
+    // shape reads <prefix>expert_layout — absent means stacked, 'shared_basis' declares a factorized block — and a
+    // factorized declaration must also declare its rank under <prefix>expert_rank while carrying the basis,
+    // coefficient, and output-basis roles; a stacked block names none of them and declaring a rank for one is an
+    // inconsistent declaration rather than something to ignore.
     private static SparseFfnDescriptor? ResolveSparseFfn(GgufMetadata metadata, string prefix, SparseFfnDescriptor? shape)
     {
         int expertCount = ResolveMoECount(metadata, prefix + "expert_count", fallback: 0, positive: true);
@@ -788,6 +804,9 @@ public static class ModelPlans
 
         bool hasSharedExpert = ResolveMoECount(metadata, prefix + "expert_shared_count", fallback: 0, positive: false) > 0;
 
+        SparseFfnLayout layout = ResolveMoELayout(metadata, prefix + "expert_layout");
+        int? rank = ResolveMoERank(metadata, prefix, layout);
+
         return new SparseFfnDescriptor(
             ExpertCount: expertCount,
             RoutedExpertsPerToken: routed,
@@ -803,8 +822,128 @@ public static class ModelPlans
             // semantics, not something a canonical name can infer: only a profile whose sparse-FFN shape names the
             // role carries it, and the file decides at load whether that tensor is there.
             SharedInputGateRole: hasSharedExpert ? shape?.SharedInputGateRole : null,
+            Layout: layout,
+            Rank: rank,
+            // The factorized roles name tensors a sidecar-produced file can reach; they belong to the declared storage
+            // shape and nothing resident reads them yet. A stacked block names none of them, which is what keeps an
+            // un-factorizable descriptor out of any shared-basis selection.
+            ExpertInputBasisRole: layout == SparseFfnLayout.FactorizedSharedBasis ? shape?.ExpertInputBasisRole ?? TensorRole.MoeExpertInputBasis : null,
+            ExpertCoefficientRole: layout == SparseFfnLayout.FactorizedSharedBasis ? shape?.ExpertCoefficientRole ?? TensorRole.MoeExpertCoefficients : null,
+            ExpertOutputBasisRole: layout == SparseFfnLayout.FactorizedSharedBasis ? shape?.ExpertOutputBasisRole ?? TensorRole.MoeExpertOutputBasis : null,
             ExpertWeightsScale: ResolveMoEScale(metadata, prefix + "expert_weights_scale"),
             NormalizeExpertWeights: metadata.GetBool(prefix + "expert_weights_norm", fallback: false));
+    }
+
+    // Shared sparse-FFN layout resolution in the style of the rope-scaling variant name: an absent key means the
+    // stacked expert storage every published conversion ships. A declared 'shared_basis' names a factorized block; any
+    // other value — or a value that is not a string at all — fails the load naming the key and what it declares.
+    private static SparseFfnLayout ResolveMoELayout(GgufMetadata metadata, string key)
+    {
+        if (!metadata.Has(key))
+        {
+            return SparseFfnLayout.StackedExperts;
+        }
+
+        string declared;
+        try
+        {
+            declared = metadata.Get(key).AsString();
+        }
+        catch (GgufException ex)
+        {
+            throw new ModelException($"GGUF metadata key '{key}' must be a string", ex);
+        }
+
+        return declared switch
+        {
+            "stacked" => SparseFfnLayout.StackedExperts,
+            "shared_basis" => SparseFfnLayout.FactorizedSharedBasis,
+            _ => throw new ModelException(
+                $"GGUF metadata key '{key}' declares sparse-FFN expert layout '{declared}'; only 'stacked' and 'shared_basis' are recognized"),
+        };
+    }
+
+    // Shared factorization-rank resolution: a stacked block declares no rank, and declaring one for it fails naming the
+    // key and its value rather than leaving a number nothing can use. A factorized declaration must declare its rank as
+    // a positive integer that fits the int range — absent, fractional, text, zero, negative, or out-of-int-range all
+    // fail naming the key — because a coefficient-space width is exactly what makes the declared layout readable. The
+    // numeric bounds against the matrices it compresses are a kernel question: nothing resident computes with the rank
+    // yet, so this validates that a declaration states one and leaves its fit where the tensors themselves get checked.
+    private static int? ResolveMoERank(GgufMetadata metadata, string prefix, SparseFfnLayout layout)
+    {
+        string key = prefix + "expert_rank";
+
+        if (layout != SparseFfnLayout.FactorizedSharedBasis)
+        {
+            if (metadata.Has(key))
+            {
+                GgufValue declared = metadata.Get(key);
+                throw new ModelException(
+                    $"GGUF metadata key '{key}' declares {declared}; only a block whose {prefix}expert_layout is 'shared_basis' can declare {prefix}expert_rank");
+            }
+
+            return null;
+        }
+
+        if (!metadata.Has(key))
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' is not present: a sparse-FFN block declaring {prefix}expert_layout 'shared_basis' must declare the rank its coefficient tensors carry");
+        }
+
+        return ResolveMoECount(metadata, key, fallback: 0, positive: true);
+    }
+
+    // Shared sparse-FFN strategy resolution in the style of the per-head QK-norm mode: an absent declaration keeps the
+    // resolved profile's default, and a declared name overrides it. Only these two names are recognized — anything else
+    // fails naming the key and the value, as every other variant-name declaration does. A selection is checked against
+    // what the descriptor says the file stores rather than downgraded to something runnable: asking for shared-basis
+    // low-rank work from a block whose experts are stacked dense matrices reports both sides of that mismatch with the
+    // two declarations that would settle it, because silently running the resident path under a low-rank selection would
+    // report an experiment that never ran. A block that declares no experts carries no strategy value at all.
+    private static SparseFfnStrategy? ResolveSparseFfnStrategy(
+        GgufMetadata metadata,
+        string prefix,
+        SparseFfnStrategy profileDefault,
+        SparseFfnDescriptor? descriptor)
+    {
+        if (descriptor is null)
+        {
+            return null;
+        }
+
+        string key = prefix + "sparse_ffn_strategy";
+        if (!metadata.Has(key))
+        {
+            return profileDefault;
+        }
+
+        string declared;
+        try
+        {
+            declared = metadata.Get(key).AsString();
+        }
+        catch (GgufException ex)
+        {
+            throw new ModelException($"GGUF metadata key '{key}' must be a string", ex);
+        }
+
+        SparseFfnStrategy requested = declared switch
+        {
+            "dense_resident" => SparseFfnStrategy.DenseResident,
+            "low_rank_shared_basis" => SparseFfnStrategy.LowRankSharedBasis,
+            _ => throw new ModelException(
+                $"GGUF metadata key '{key}' declares sparse-FFN strategy '{declared}'; only 'dense_resident' and 'low_rank_shared_basis' are recognized"),
+        };
+
+        if (requested == SparseFfnStrategy.LowRankSharedBasis && descriptor.Layout != SparseFfnLayout.FactorizedSharedBasis)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares sparse-FFN strategy 'low_rank_shared_basis' on a block whose {prefix}expert_layout stores its experts as stacked dense matrices with no rank: " +
+                $"a shared-basis selection needs the factorized storage this file does not declare — declare {prefix}expert_layout 'shared_basis' with an {prefix}expert_rank, or select 'dense_resident'");
+        }
+
+        return requested;
     }
 
     // Shared MoE count resolution in the style of the attention window: an absent key takes the fallback. A

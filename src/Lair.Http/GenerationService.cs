@@ -471,6 +471,18 @@ public sealed class GenerationService : IDisposable
                 modelConfig.Name,
                 ReasoningPolicyNames.Of(outputParser.Reasoning));
 
+            // The sparse-FFN facts a routed block resolves to are reported the same way: they come straight from the
+            // model's plan, and only a file that declares experts carries them. A dense model advertises nothing here.
+            if (model.Plan.SparseFfn is { } sparsePlan)
+            {
+                logger?.LogInformation(
+                    "sparse_ffn model='{Model}' layout={Layout} rank={Rank} strategy={Strategy}",
+                    modelConfig.Name,
+                    sparsePlan.Layout,
+                    sparsePlan.Rank ?? (object)"none",
+                    SparseFfnStrategyNames.Of(model.Plan.SparseFfnStrategy!.Value));
+            }
+
             ModelInfo info = new(
                 modelConfig.Name,
                 maxContext,
@@ -479,7 +491,8 @@ public sealed class GenerationService : IDisposable
                 model.Plan.Architecture,
                 model.Plan.VocabSize,
                 ToolParserNames.Of(outputParser.ToolParser),
-                ReasoningPolicyNames.Of(outputParser.Reasoning));
+                ReasoningPolicyNames.Of(outputParser.Reasoning),
+                model.Plan.SparseFfnStrategy is { } strategy ? SparseFfnStrategyNames.Of(strategy) : null);
 
             GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, logger, pool, scheduler, info, config);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses

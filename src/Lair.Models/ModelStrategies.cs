@@ -124,6 +124,57 @@ public enum RopeStrategy
 }
 
 /// <summary>
+/// How a sparse-FFN block's expert matrices are laid out in the file it loads from: one dense-shaped matrix per
+/// role, or a factorized shape whose experts share an input basis and carry only their own coefficients. Resolved
+/// once at load from the declared <c>&lt;prefix&gt;expert_layout</c> (absent means the stacked layout every family
+/// ships today) and carried by the <see cref="SparseFfnDescriptor"/>, so a factorized file is recognizable before
+/// any kernel decision runs.
+/// </summary>
+public enum SparseFfnLayout
+{
+    /// <summary>
+    /// Dense-stacked expert storage: one tensor per role whose outermost dimension indexes experts, each expert block
+    /// carrying the full matrix for its side of the gate/up/down chain. This is what every published MoE conversion
+    /// ships and what the resident expert execution reads today.
+    /// </summary>
+    StackedExperts,
+
+    /// <summary>
+    /// Factorized expert storage: a shared input basis read once per layer plus one coefficient matrix per expert in
+    /// that compressed space, expanded through one shared output projection. The layout names the tensors it needs;
+    /// whether anything computes with them is decided by the resolved strategy, not here.
+    /// </summary>
+    FactorizedSharedBasis,
+}
+
+/// <summary>
+/// Which expert-computation variant a sparse-FFN block resolves to: the resident dense-stacked chain, or the shared-
+/// basis low-rank collapse over factorized coefficients. Resolved once per model from the resolved profile's default and
+/// the file's declared <c>&lt;prefix&gt;sparse_ffn_strategy</c>, exactly as the QK-norm mode resolves against its profile
+/// default, and never re-decided per token or per layer — a variant is chosen by the plan once, not dispatched inside the
+/// forward. Selecting a variant is independent of whether any engine can run it: an unimplemented selection stays visible
+/// in the plan and reports at engine open rather than falling back to what happens to work.
+/// </summary>
+public enum SparseFfnStrategy
+{
+    /// <summary>
+    /// Every declared expert stays resident and routing selects among them, each selected expert running its own
+    /// gate/up/down chain over the normalized stream. The dense-equivalent reference forward describes this variant,
+    /// so it is what every sparse file executes today whatever its layout declaration says about factorization.
+    /// </summary>
+    DenseResident,
+
+    /// <summary>
+    /// Factor each routed expert as shared basis times per-expert coefficients: apply the input basis once per layer,
+    /// accumulate small coefficient-space vectors across the selected experts under their routing weights, and expand
+    /// that sum through one output projection instead of running a full down-projection per expert. It requires a file
+    /// declaring <see cref="SparseFfnLayout.FactorizedSharedBasis"/> with its rank and tensor roles carried in the
+    /// descriptor.
+    /// </summary>
+    LowRankSharedBasis,
+}
+
+/// <summary>
 /// Which layers a model's declared attention window masks. Resolved once per model from its
 /// <see cref="ModelProfile"/>; no metadata key decides it today, and the forward path switches on the value and
 /// never dispatches through a per-token interface.
