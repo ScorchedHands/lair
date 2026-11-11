@@ -70,7 +70,53 @@ pwsh -File scripts/generate-tokenizer-parity.ps1 -ModelPath models/Llama-3.2-1B-
 dotnet run --project bench/Lair.Bench -- <args>
 ```
 
-Kernel microbenchmarks (fused dequant GEMV vs scalar oracle, thread scaling).
+Kernel microbenchmarks (fused dequant GEMV vs scalar oracle, thread scaling). `gemv` runs the synthetic Q4_K control; `gguf-dump <path>` prints a file's tensor table; `gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M]` times real GGUF bytes through the mmap weight source (defaults: quota 8, reps 150, max 1024 rows per tensor) and prints both mapping-timed numbers and a private-copy pass over the identical bytes.
+
+### Measured GEMV throughput on this box
+
+AVX2 available; 24 physical / 32 logical cores. The engine posture is a quota-capped backend (8 workers). Values are warm-best after 150 repetitions, taken from `gemv-file` runs over real file bytes with the default options. `ns/elt` isolates kernel cost across formats regardless of tensor geometry; mapping-timed and private-copy columns agree once a region is resident.
+
+Llama-3.2 fixtures (contraction width 2048):
+
+| Format | Measured tensors | bpw | ns/GEMV 1-thread | ns/elt |
+|---|---|---|---|---|
+| Q4_K baseline | `blk.0.attn_k/attn_output/attn_q/ffn_gate`, UD `blk.{0,1,10,11}.attn_v` | 4.50 | 332–351 | 0.164–0.171 |
+| IQ4_XS | `blk.0.attn_k/attn_output/attn_q/ffn_gate`; UD `blk.{0,1,13,14}.ffn_down` (width 8192) | 4.25 | 348–351 (8192-wide rows: 1372) | 0.168–0.170 |
+| Q5_K | `blk.{0,1,10,11}.attn_v`, UD `token_embd` | 5.50 | 466–488 | 0.228–0.237 |
+| Q6_K | `blk.{0,1,10,13}.attn_v`, IQ4_XS-file `token_embd` | 6.56 | 763–771 | 0.372–0.377 |
+| IQ3_XXS | UD `blk.0.attn_k/attn_q/ffn_gate/ffn_up` | 3.06 | 2194–2228 | 1.071–1.088 |
+| IQ3_S | UD `blk.{0,1,10,11}.attn_output` | 3.44 | 2216–2221 | 1.083–1.085 |
+| IQ2_XS | UD `blk.{2,3}.attn_k/attn_q` | 2.31 | 2202–2206 | 1.075–1.077 |
+| IQ2_S | UD `blk.{10,11}.attn_k/attn_q` | 2.56 | 2205–2212 | 1.078–1.080 |
+
+Owner shard `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf` (`qwen4exp`, contraction width 2560; expert down projections 640) — GEMV coverage only, the file is not servable:
+
+| Format | Measured tensors | bpw | ns/GEMV 1-thread | ns/elt |
+|---|---|---|---|---|
+| Q4_K anchor | `blk.11.attn_k/attn_q/attn_v`, `blk.11.ffn_gate_shexp` | 4.50 | 415–430 | 0.162–0.168 |
+| IQ4_XS anchor | `blk.{0,1}.attn_qkv`, `ffn_gate_shexp` | 4.25 | 420–435 | 0.169 |
+| Q5_K / Q6_K anchors | shexp and attention rows at width 2560 | 5.50 / 6.56 | 582–606 / 952–955 | 0.233 / 0.372 |
+| IQ4_NL | `blk.{2,28,29}.ffn_down_exps` (width 640) | 4.50 | 107–110 | 0.167–0.172 |
+| Q2_0 | `blk.{10,11,12}.ffn_down_exps` (width 640) | 2.25 | 117–118 | 0.183–0.184 |
+| BF16 | `blk.{0,1,10,11}.ffn_gate_inp` (width 2560) | 16.00 | 272 | 0.106 |
+
+Ranges are settled per-tensor values; the bench also prints group aggregates and quota-threaded numbers (`gemv8T`, `batch16`) for every tensor, which inherit a skew described below. Two caveats:
+- Within a format group the first-measured tensor can still read 2–6× high on mapping-timed lines only — that is page residency, not kernel cost; it disappears in the private-copy column and at higher rep counts (verified against 30/60/150-rep runs). Group aggregates inherit that skew.
+- BF16's aggregate bandwidth exceeds DRAM because a 2560-wide row region stays cache-resident; its per-element cost is real, but it is not a streaming comparison against the quantized formats at this size.
+
+The finding that matters for format choice: every sub-Q4 i-quants (IQ3_XXS, IQ3_S, IQ2_XS, IQ2_S) sit at a near-constant ~1.07–1.09 ns/elt — about 6.5× the Q4_K baseline cost per element — and that constant holds across both files and every geometry measured. `IQ4_NL`, `Q2_0`, `IQ4_XS`, `Q5_K`, and `Q6_K` stay within ~1–2× of the baseline on a per-element basis, so their decode cost tracks bytes read rather than kernel work.
+
+### Measured live decode throughput
+
+Measured through the documented serve surface: `dotnet run --project src/Lair.Host -c Release -- serve -c <config>`, one server at a time, each killed before the next runs and none left running. Config for every model: `max_context_tokens: 4096` with `kv_blocks: 256` (`block_size: 16`), engine `threads: 0` with `placement.thread_quota: 8`; server metrics confirm `worker_threads: 8`, `thread_quota: 8`, `metrics_kv_capacity_blocks: 256`. Fixed greedy prompt set, three prompts per model, repeated twice per model (`temperature: 0`, `max_tokens: 256`): "Explain what a KV cache is in two sentences.", "Count from one to ten.", "Write a short paragraph about the sea." Aggregate tok/s = completion tokens summed over `/v1/chat/completions` divided by client-side wall seconds, after one untimed warm request. Peak working set is read from `metrics_process_working_set_mb` in the server's own metrics snapshots; all three stay well inside the 4096 MB budget.
+
+| Model file | File size | Aggregate decode tok/s (run 1 / run 2) | Peak working set |
+|---|---|---|---|
+| `models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` | 807,694,368 B | 10.4 / 10.3 | 1396 MB / 1375 MB |
+| `models/Llama-3.2-1B-Instruct-IQ4_XS.gguf` | 743,141,504 B | 11.6 / 11.6 | 1332 MB / 1323 MB |
+| `models/Llama-3.2-1B-Instruct-UD-IQ3_XXS.gguf` | 575,381,536 B | 3.9 / 3.9 | 1152 MB / 1107 MB |
+
+IQ4_XS wins: fastest decode (≈12% over the Q4_K_M baseline) on a smaller file. UD-IQ3_XXS is the smallest of the three yet decodes ~2.6× slower than the baseline, matching its measured kernel cost — under this CPU runtime a sub-Q4 i-quant buys bytes but pays for them in decode time.
 
 ## Manual smoke
 

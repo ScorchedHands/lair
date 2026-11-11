@@ -5,7 +5,13 @@ A C#/.NET inference runtime that serves GGUF LLMs locally behind an OpenAI-compa
 ## Requirements
 
 - .NET SDK 10.0.400+ (x64)
-- A GGUF model file (F32, F16, Q8_0, Q4_K, Q5_0, Q5_K, Q6_K, Q3_K, or Q2_K quants), e.g. from Hugging Face
+- A GGUF model file, e.g. from Hugging Face — see Quantization below for the supported tensor types and which one to pick
+
+## Quantization
+
+Supported tensor types: F32, F16, BF16, Q8_0, Q4_K, Q5_0, Q5_K, Q6_K, Q3_K, Q2_K, IQ4_NL, IQ4_XS, IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, Q2_0.
+
+For dense Llama-class models under a 4 GB working-set budget on CPU, `IQ4_XS` is the measured pick: it decoded fastest of the fixtures tested — 11.6 tok/s against 10.3–10.4 for `Q4_K_M`, at context 4096 with thread quota 8 — and it is smaller than the baseline (743 MB against 808 MB). Quality is a separate question: the repo's parity fixtures pin `smollm` models only, so IQ4_XS is a throughput pick here rather than an accuracy-verified one. Sub-Q4 i-quants (`IQ3_XXS`, `IQ3_S`, `IQ2_*`) cut file size further but decode about 2.6× slower than `Q4_K_M` on this runtime, because their kernels cost roughly 6.5× more per element — they buy bytes you then pay for in tokens.
 
 ## Quick start
 
