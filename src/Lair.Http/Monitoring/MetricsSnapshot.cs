@@ -81,7 +81,16 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_prefill_device")] string? PrefillDevice = null,
 
     /// <summary>The KV residency mode configured for this model (<c>dram</c>, ...).</summary>
-    [property: JsonPropertyName("metrics_kv_residency")] string? KvResidency = null)
+    [property: JsonPropertyName("metrics_kv_residency")] string? KvResidency = null,
+
+    /// <summary>Layers whose resolved plan carries a finite attention window.</summary>
+    [property: JsonPropertyName("metrics_kv_windowed_layers")] int WindowedLayers = 0,
+
+    /// <summary>Logical KV blocks the declared windows select across all layers at the current soft budget.</summary>
+    [property: JsonPropertyName("metrics_kv_read_footprint_blocks")] long KvReadFootprintBlocks = 0,
+
+    /// <summary>Whole logical blocks excluded by declared windows at the current soft budget.</summary>
+    [property: JsonPropertyName("metrics_kv_skipped_read_blocks")] long SkippedKvReadBlocks = 0)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

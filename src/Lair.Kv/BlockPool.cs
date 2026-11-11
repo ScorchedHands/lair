@@ -45,6 +45,11 @@ public sealed class BlockPool : IDisposable
     // the cap on its own. Volatile so observer threads (admission checks) see a hot edit immediately.
     private int _budgetBlocks;
 
+    // Windowed-read accounting is resolved once at model open and never consulted on the attention hot path. It keeps
+    // the pool honest about what a declared window would read under the current soft budget without changing storage:
+    // whole-KV blocks still stay allocated for layers that attend outside those windows.
+    private readonly int[] _layerWindowTokens;
+    private int _windowedLayerCount;
     // Admission-window bookkeeping: windows opened by the admitting scheduler (one per admitted sequence) carry a
     // shared ceiling — the widest reservation any still-running admitted sequence needs. While at least one window
     // is open, allocations may reach that ceiling even above a shrunk soft cap; it resets when all close.
@@ -73,6 +78,8 @@ public sealed class BlockPool : IDisposable
         BytesPerBlock = checked(FloatsPerBlock * sizeof(float));
         CapacityBlocks = capacityBlocks;
         _budgetBlocks = capacityBlocks; // no cap until one is set: a fresh pool budgets its whole reservation
+        _layerWindowTokens = new int[layerCount];
+        _windowedLayerCount = 0;
         _backend = backend;
 
         long totalBytes = checked((long)capacityBlocks * BytesPerBlock);
@@ -131,6 +138,55 @@ public sealed class BlockPool : IDisposable
 
     /// <summary>The ceiling allocations currently reach: the soft cap, or an open admission window's wider reservation while admitted sequences still run under it.</summary>
     public int AllocationCeiling => Math.Max(EffectiveBudgetBlocks, Volatile.Read(ref _windowCeiling));
+
+    /// <summary>Declares the per-layer attention windows this pool accounts for. The values are read-side accounting only: storage and allocation remain whole-KV.</summary>
+    public void DeclareAttentionWindows(ReadOnlySpan<int> layerWindows)
+    {
+        ThrowIfDisposed();
+
+        if (layerWindows.Length != LayerCount)
+        {
+            throw new ArgumentException($"attention-window table must cover {LayerCount} layers, got {layerWindows.Length}.", nameof(layerWindows));
+        }
+
+        int windowed = 0;
+        for (int layer = 0; layer < layerWindows.Length; layer++)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(layerWindows[layer]);
+            _layerWindowTokens[layer] = layerWindows[layer];
+            if (layerWindows[layer] > 0)
+            {
+                windowed++;
+            }
+        }
+
+        Volatile.Write(ref _windowedLayerCount, windowed);
+    }
+
+    /// <summary>The number of layers declared with a finite attention window.</summary>
+    public int DeclaredWindowedLayerCount => Volatile.Read(ref _windowedLayerCount);
+
+    /// <summary>Logical KV blocks the model's attention would select across all layers at the current soft budget.</summary>
+    public long KvReadFootprintBlocksAtBudget
+    {
+        get
+        {
+            ThrowIfDisposed();
+            ComputeKvReadFootprints(Volatile.Read(ref _budgetBlocks), out long read, out _);
+            return read;
+        }
+    }
+
+    /// <summary>Whole logical blocks excluded by declared windows at the current soft budget.</summary>
+    public long SkippedKvReadFootprintBlocksAtBudget
+    {
+        get
+        {
+            ThrowIfDisposed();
+            ComputeKvReadFootprints(Volatile.Read(ref _budgetBlocks), out _, out long skipped);
+            return skipped;
+        }
+    }
 
     /// <summary>
     /// Sets the soft usage cap to <paramref name="blocks"/> blocks, clamped into [1, <see cref="CapacityBlocks"/>], and returns the value applied. The physical arena is never touched: raising the cap makes already-free blocks allocatable again immediately; lowering it withholds new allocations while in-use count exceeds the cap (already-allocated blocks are never revoked).
@@ -317,6 +373,33 @@ public sealed class BlockPool : IDisposable
         if (physicalBlockId >= CapacityBlocks)
         {
             throw new ArgumentOutOfRangeException(nameof(physicalBlockId), $"Block id {physicalBlockId} is outside the pool of {CapacityBlocks} blocks.");
+        }
+    }
+
+    private void ComputeKvReadFootprints(int budgetBlocks, out long readBlocks, out long skippedBlocks)
+    {
+        readBlocks = 0;
+        skippedBlocks = 0;
+
+        if (budgetBlocks <= 0)
+        {
+            return;
+        }
+
+        long budgetSlots = (long)budgetBlocks * BlockTokens;
+
+        for (int layer = 0; layer < LayerCount; layer++)
+        {
+            int window = _layerWindowTokens[layer];
+            long visiblePositions = window > 0 ? Math.Min(window, budgetSlots) : budgetSlots;
+            long selectedBlocks = (visiblePositions + BlockTokens - 1) / BlockTokens;
+
+            readBlocks += selectedBlocks;
+
+            if (window > 0)
+            {
+                skippedBlocks += budgetBlocks - selectedBlocks;
+            }
         }
     }
 

@@ -420,6 +420,14 @@ public sealed class GenerationService : IDisposable
                 modelConfig.KvBlocks,
                 backend);
 
+            int[] attentionWindows = new int[model.Plan.LayerCount];
+            for (int layer = 0; layer < model.Plan.LayerCount; layer++)
+            {
+                attentionWindows[layer] = model.Plan.AttentionWindowForLayer(layer);
+            }
+
+            pool.DeclareAttentionWindows(attentionWindows);
+
             PrefixCache cache = new(pool);
             scheduler = new GenerationScheduler(model, pool, config.Engine.MaxBatchTokens, cache);
 
