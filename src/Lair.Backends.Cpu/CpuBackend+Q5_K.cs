@@ -6,14 +6,16 @@ namespace Lair.Backends.Cpu;
 public sealed unsafe partial class CpuBackend
 {
     // Q5_K super-blocks hold 256 elements in 176 bytes: the Q4_K scale layout at bytes 0..15 (half d, half dmin,
-    // 12 packed 6-bit group scales/mins, see QkK), 32 bytes of 5th quant bits at bytes 16..47 (group j reads bit
-    // j of the window byte), and 128 nibble bytes at bytes 48..175 in the same group-pair windows as Q4_K.
-    // w = d * sc_j * q - dmin * m_j with q in [0, 31].
+    // 12 packed 6-bit group scales/mins, see QkK), a single fixed 32-byte plane of 5th quant bits at bytes 16..47,
+    // and 128 nibble bytes at bytes 48..175 in the same group-pair windows as Q4_K. The 5th-bit plane is NOT
+    // windowed like the nibbles: element position l inside any 32-element group reads byte l of that one plane, and
+    // its group j selects bit j (so each byte carries eight different groups' bits). w = d * sc_j * q - dmin * m_j
+    // with q in [0, 31].
     private const int Q5KBlockBytes = 176;
 
     // Q5_K chunk loader for eight window bytes at offset c: low nibbles for even groups, high nibbles for odd,
-    // each OR-ed with bit j of the matching 5th-bit byte. Window loads are clamped so they never pass the end
-    // of the block, exactly like LoadGroupBytes.
+    // each OR-ed with bit j of plane byte qh[c .. c+8). The 16-byte plane load may spill past the end of the plane
+    // into the nibble region (only its first eight bytes are consumed), and stays inside the block either way.
     private static Vector256<int> LoadQ5KChunk(byte* q, byte* qh, byte* blockEnd, int j, int c)
     {
         Vector128<byte> window = LoadGroupBytes(q, blockEnd, c);
@@ -42,7 +44,7 @@ public sealed unsafe partial class CpuBackend
 
     // Q5_K: each 176-byte block covers 256 elements in eight 32-element groups j (0..7) with the Q4_K scale
     // layout at bytes 0..15. Group j uses the low nibbles of qs[32*(j/2) .. +31] (qs at byte 48) when j is even
-    // and the high nibbles when odd; bit j of qh[32*(j/2) + l] (qh at byte 16) supplies the 5th bit.
+    // and the high nibbles when odd; bit j of qh[l] (qh always at byte 16) supplies the 5th bit.
     // w = d * sc_j * q - dmin * m_j with q in [0, 31].
     private static float RowDotQ5KScalar(byte* row, float* x, int cols)
     {
@@ -67,7 +69,7 @@ public sealed unsafe partial class CpuBackend
                 float shift = min * m;
 
                 byte* q = block + 48 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
-                byte* qh = block + 16 + 32 * (j / 2); // 5th bits for the same window bytes, bit j per byte
+                byte* qh = block + 16; // every group reads bit j of byte l in the one fixed 32-byte 5th-bit plane at bytes 16..47
                 int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
                 for (int l = 0; l < limit; l++)
                 {
@@ -110,7 +112,7 @@ public sealed unsafe partial class CpuBackend
                 Vector256<float> shiftV = Avx.BroadcastScalarToVector256(&negShift);
 
                 byte* q = block + 48 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
-                byte* qh = block + 16 + 32 * (j / 2); // 5th bits for the same window bytes, bit j per byte
+                byte* qh = block + 16; // every group reads bit j of byte l in the one fixed 32-byte 5th-bit plane at bytes 16..47
                 int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
 
                 for (int c = 0; c + 8 <= limit; c += 8)
@@ -167,7 +169,7 @@ public sealed unsafe partial class CpuBackend
                     Vector256<float> shiftV = Avx.BroadcastScalarToVector256(&negShift);
 
                     byte* q = block + 48 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
-                    byte* qh = block + 16 + 32 * (j / 2); // 5th bits for the same window bytes, bit j per byte
+                    byte* qh = block + 16; // every group reads bit j of byte l in the one fixed 32-byte 5th-bit plane at bytes 16..47
                     int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
 
                     for (int c = 0; c + 8 <= limit; c += 8)
@@ -224,7 +226,7 @@ public sealed unsafe partial class CpuBackend
                 Vector256<float> shiftV = Avx.BroadcastScalarToVector256(&negShift);
 
                 byte* q = block + 48 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
-                byte* qh = block + 16 + 32 * (j / 2); // 5th bits for the same window bytes, bit j per byte
+                byte* qh = block + 16; // every group reads bit j of byte l in the one fixed 32-byte 5th-bit plane at bytes 16..47
                 int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
 
                 for (int c = 0; c + 8 <= limit; c += 8)

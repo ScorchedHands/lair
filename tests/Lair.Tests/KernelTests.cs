@@ -1361,8 +1361,9 @@ public class KernelTests
                     target = (byte)((target & 0x0F) | (five << 4));
                 }
 
-                // The 5th bit lives at bit j of the matching qh byte.
-                dst[b * 176 + 16 + 32 * (j / 2) + (e % 32)] |= (byte)(((five >> 4) & 1) << j);
+                // The 5th bit lives at bit j of plane byte (e % 32) in the fixed qh region: every group writes into
+                // the same 32 bytes, so one byte carries eight groups' bits.
+                dst[b * 176 + 16 + (e % 32)] |= (byte)(((five >> 4) & 1) << j);
             }
         }
     }
@@ -2837,8 +2838,8 @@ public class KernelTests
                             int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
                             for (int l = 0; l < limit; l++)
                             {
-                                byte qByte = block[48 + 32 * (j / 2) + l];
-                                int five = ((qByte >> (4 * (j & 1))) & 0xF) | (((block[16 + 32 * (j / 2) + l] >> j) & 1) << 4);
+                                byte qByte = block[48 + 32 * (j / 2) + l]; // nibble window advances per group pair; the 5th-bit plane never does
+                                int five = ((qByte >> (4 * (j & 1))) & 0xF) | (((block[16 + l] >> j) & 1) << 4);
                                 double w = (d * sc * five) - (min * m);
                                 acc += pX[subStart + l] * w;
                                 mag += Math.Abs(pX[subStart + l] * w);
@@ -3329,8 +3330,8 @@ public class KernelTests
                         int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
                         for (int l = 0; l < limit; l++)
                         {
-                            byte qByte = block[48 + 32 * (j / 2) + l];
-                            int five = ((qByte >> (4 * (j & 1))) & 0xF) | (((block[16 + 32 * (j / 2) + l] >> j) & 1) << 4);
+                            byte qByte = block[48 + 32 * (j / 2) + l]; // nibble window advances per group pair; the 5th-bit plane never does
+                            int five = ((qByte >> (4 * (j & 1))) & 0xF) | (((block[16 + l] >> j) & 1) << 4);
                             values[subStart + l] = (d * sc * five) - (min * m);
                         }
                     }

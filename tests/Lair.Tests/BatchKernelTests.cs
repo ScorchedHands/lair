@@ -524,8 +524,9 @@ public class BatchKernelTests
                     target = (byte)((target & 0x0F) | (five << 4));
                 }
 
-                // The 5th bit lives at bit j of the matching qh byte.
-                dst[b * 176 + 16 + 32 * (j / 2) + (e % 32)] |= (byte)(((five >> 4) & 1) << j);
+                // The 5th bit lives at bit j of plane byte (e % 32) in the fixed qh region: every group writes into
+                // the same 32 bytes, so one byte carries eight groups' bits.
+                dst[b * 176 + 16 + (e % 32)] |= (byte)(((five >> 4) & 1) << j);
             }
         }
     }

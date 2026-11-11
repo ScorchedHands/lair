@@ -456,7 +456,7 @@ public sealed unsafe partial class CpuBackend : IBackend
                                 float shift = min * m;
 
                                 byte* q = block + 48 + 32 * (j / 2); // group-pair window: bytes [q, q+32) always inside the block
-                                byte* qh = block + 16 + 32 * (j / 2); // 5th bits for the same window bytes, bit j per byte
+                                byte* qh = block + 16; // every group reads bit j of byte l in the one fixed 5th-bit plane at bytes 16..47
                                 int limit = Math.Min(32, cols - subStart); // padded quants are zero: stop at the real column count.
                                 for (int l = 0; l < limit; l++)
                                 {
