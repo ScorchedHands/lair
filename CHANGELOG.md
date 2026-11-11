@@ -4,6 +4,26 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.8] - 2026-11-11
+
+### Added
+
+- Dense IQ quant formats load, decode and serve on the CPU engine: `IQ4_NL`, `IQ4_XS`, `IQ3_XXS`, `IQ3_S`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `Q2_0` and `BF16` (ggml ids 16/17/18/20/21/22/23/30/42), each with block geometry read from the pinned reference, a literal scalar oracle and an AVX2 fused dequant/GEMV/batch path — 214 kernel cases and 175 loader cases green.
+- Two pinned Llama-3.2-1B IQ fixtures for parity and serving: `Llama-3.2-1B-Instruct-IQ4_XS.gguf` (743,141,504 B) and `Llama-3.2-1B-Instruct-UD-IQ3_XXS.gguf` (575,381,536 B), whose mixed per-layer tiers resolve through one registry path and serve with `/v1/models` reporting `quant: IQ4_XS` / `quant: IQ3_XXS`.
+- `Lair.Bench gemv-file <gguf> [--threads N] [--reps R] [--max-rows M]`: GEMV timed over real mmap'd tensor rows, reporting per-tensor geometry, first-pass versus warm-best cost, and a private-copy pass that separates page residency from kernel cost.
+- Measured quant guidance: `IQ4_XS` decodes at 11.6 tok/s against the `Q4_K_M` baseline's 10.3–10.4 while being the smaller file, so `README.md` names it as the pick with its accuracy caveat stated; sub-4-bit i-quants measure 1.07–1.09 ns/element (about 6.5× the baseline) and the mixed-tier `UD-IQ3_XXS` file serves at 3.9 tok/s.
+- A loader gate over the owner's `qwen4exp` model shards: both headers parse and all 1,224 declared tensors resolve with pinned geometry, skipping cleanly when those files are absent.
+- Kernel goldens written from the reference's own byte layout (`QuantLayoutTests.cs`), so a format that both LAIR's reader and a test writer misread cannot pass silently.
+
+### Fixed
+
+- `Q5_K` read the fifth bit from a plane advanced per nibble window instead of the single fixed plane the format defines, corrupting groups ≥ 2 in every `Q5_K` tensor since that format landed. Measured against a requantized reference: max |Δ| 0.0666, 1,535 divergent elements, ~770 of 2048 columns wrong in `token_embd`. Corrected at all five kernel sites and in the test writers, and now guarded by reference-encoded block bytes.
+
+### Changed
+
+- `CpuBackend` split into per-format partial files (`CpuBackend+<Format>.cs`, shared IQ plumbing in `CpuBackend+IQ.cs`); no behavior change.
+- The parity harness's chat-header prompt carries an unambiguous user turn. The pinned reference's own top-1 token for the previous header flips between quantizations of the same model (`'Hello'` at `Q4_K_M`, `'<'` at `UD-IQ3_XXS`, `'What'` at `Q8_0`), so absolute cross-tool logprobs there were not a stable gate. Bands, windows and tolerances are unchanged and all nine fixtures were regenerated under the pinned harness.
+
 ## [0.3.7] - 2026-11-09
 
 ### Added
