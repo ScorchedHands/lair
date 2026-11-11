@@ -529,17 +529,19 @@ internal static class LayerOps
     /// same online softmax as <see cref="CausalAttention"/>, including its scaled-then-capped score path when
     /// softcap is positive, with its score window widened from [0, position] to
     /// [fromPosition, toPosition], which must lie inside the sequence's existing KV (<see cref="SequenceKv.Length"/>).
-    /// The queries' own absolute positions start at <paramref name="queryPositionOffset"/>, so a positive window
-    /// narrows each query's range symmetrically to <c>[max(fromPosition, q - window + 1), min(toPosition, q + window)]</c>
-    /// around its own position <c>q</c>: positions further away than the window on either side are never scored. The
-    /// narrowing happens before the online max, so the running max and sum stay exact over the positions that do
-    /// contribute; a query whose windowed range does not intersect the given KV range is a failure. A non-positive
-    /// window leaves the given range untouched.
+    /// The queries' own absolute positions start at <paramref name="queryPositionOffset"/>, so a positive window narrows
+    /// each query's range backward-only to <c>[max(fromPosition, q - window + 1), min(toPosition, q)]</c> relative to its
+    /// own position <c>q</c>: positions further back than the window are never scored, and neither is any position past
+    /// the query itself — a positive window never grants forward visibility. The narrowing happens before the online max,
+    /// so the running max and sum stay exact over the positions that do contribute; a query whose windowed range does not
+    /// intersect the given KV range is a failure. A non-positive window leaves the given range untouched, which is what
+    /// keeps an unbounded layer bidirectional over it.
     /// Restricting that window yields a block-local variant used when long sequences are processed in chunks: every
     /// query then sees exactly one contiguous range of positions. With fromPosition == 0 and toPosition == p over a
     /// sequence of length p + 1 the numeric path is identical to <see cref="CausalAttention"/> at position p, which
-    /// lets chunk boundaries be verified against the causal decode kernels bit-for-bit. Each query's resolved range
-    /// becomes a <see cref="BlockSelection"/> from <see cref="SequenceKv.SelectRangeRead"/>, and its reads walk only
+    /// lets chunk boundaries be verified against the causal decode kernels bit-for-bit; with a positive window it is
+    /// identical to that kernel's own narrowed range at the same query under the same window. Each query's resolved
+    /// range becomes a <see cref="BlockSelection"/> from <see cref="SequenceKv.SelectRangeRead"/>, and its reads walk only
     /// that selection's blocks — positions outside it are never addressed, exactly as in the causal path.
     /// </summary>
     internal static void BidirectionalAttention(
@@ -556,7 +558,7 @@ internal static class LayerOps
         int layer,
         float attnScale,
         float softcap, // positive enables the score softcap; non-positive disables it
-        int window, // positive narrows each query's range to the window around its own position; non-positive leaves it as given
+        int window, // positive narrows each query's range to its backward span ending at the query itself; non-positive leaves it as given
         Span<float> outConcat) // queryCount * headCount * headDim, position-major
     {
         ArgumentNullException.ThrowIfNull(backend);
@@ -585,8 +587,11 @@ internal static class LayerOps
             int lastVisible = toPosition;
             if (window > 0)
             {
+                // Backward-only: the window reaches behind the query and stops at the query itself, so this is exactly
+                // the range SequenceKv.SelectCausalRead resolves for the same position and window. The literal
+                // [fromPosition..toPosition] edges still bound it; a non-positive window keeps them as given.
                 firstVisible = Math.Max(firstVisible, queryPosition - window + 1);
-                lastVisible = Math.Min(lastVisible, queryPosition + window);
+                lastVisible = Math.Min(lastVisible, queryPosition);
 
                 if (firstVisible > lastVisible)
                 {

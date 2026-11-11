@@ -15,10 +15,11 @@ namespace Lair.Tests;
 /// position beyond the window, and demonstrably differs from the same weights masked on every layer; a plan resolving
 /// the all-layers pattern keeps those same weights and the same window bit-identical to the behavior of masking
 /// every layer. Batched decode is bit-identical to single-token decode under the alternating pattern, the
-/// bidirectional <see cref="TransformerModel.Encode"/> path is golden against the even-layers-only reference across a
-/// chunk boundary, and a resolved window of zero under the alternating pattern is bit-identical to no window at all.
-/// Engine-to-engine comparisons are asserted bit-for-bit; reference comparisons use the double-precision tolerance
-/// shared by the strategy goldens.
+/// <see cref="TransformerModel.Encode"/> path narrows each masked layer's queries backward-only and is golden against
+/// the even-layers-only reference across a chunk boundary, and a resolved window of zero under the alternating pattern
+/// is bit-identical to no window at all. Engine-to-engine comparisons are asserted bit-for-bit; reference comparisons use
+/// the double-precision tolerance shared by the strategy goldens. Encoder cases carry both the Layers and Embeddings
+/// categories.
 /// </summary>
 [Trait("Category", "Layers")]
 public sealed class WindowInterleaveLayerTests : IDisposable
@@ -101,6 +102,7 @@ public sealed class WindowInterleaveLayerTests : IDisposable
     // ---------------------------------------------------------------- the all-layers pattern is unchanged
 
     [Fact]
+    [Trait("Category", "Embeddings")]
     public void Forward_AllLayersWindow_MatchesEveryLayerReference_AndIsBitIdenticalToAnExplicitAllLayersPlan()
     {
         InterleaveModelSpec spec = new();
@@ -243,8 +245,10 @@ public sealed class WindowInterleaveLayerTests : IDisposable
     // ---------------------------------------------------------------- encode under the alternation
 
     [Fact]
+    [Trait("Category", "Embeddings")]
     public void Forward_AlternatingWindow_EncodeMatchesEvenLayersOnlyReference_AcrossChunks()
     {
+        // Under the alternating pattern only the even layers narrow, and each of those narrows backward-only from its own query.
         InterleaveModelSpec spec = new();
         string path = WriteTemp(BuildGguf(spec.MetadataPairs(Window), spec.Tensors()));
 
@@ -728,9 +732,10 @@ public sealed class WindowInterleaveLayerTests : IDisposable
 
     // A scalar reference forward over the spec's tensors for either interleave: RMSNorm, standard full-head RoPE,
     // causal or bidirectional attention with an explicit softmax and the score mask applied per layer — every layer
-    // when the pattern masks all of them, the even-indexed layers only when it alternates — silu(gate) * up, and the
-    // tied token-embedding logits. A resolved window of zero leaves every layer unbounded whatever the pattern.
-    // Computed in double and compared against the engine's float values with the shared tolerance.
+    // when the pattern masks all of them, the even-indexed layers only when it alternates — where a masked layer's
+    // range is backward-only from its own query in both paths, silu(gate) * up, and the tied token-embedding logits.
+    // A resolved window of zero leaves every layer unbounded whatever the pattern, which is the whole sequence in both
+    // directions. Computed in double and compared against the engine's float values with the shared tolerance.
     private sealed class InterleaveReference
     {
         private readonly InterleaveModelSpec _spec;
@@ -792,7 +797,7 @@ public sealed class WindowInterleaveLayerTests : IDisposable
                 for (int p = 0; p < n; p++)
                 {
                     (int from, int to) = layerWindow > 0
-                        ? (Math.Max(0, p - layerWindow + 1), Math.Min(n - 1, p + layerWindow))
+                        ? (Math.Max(0, p - layerWindow + 1), p) // backward-only: a masked layer never sees past its own query
                         : (0, n - 1);
 
                     Attention(qAll[p], kvK[layer], kvV[layer], from, to, attnOut.AsSpan(p * InterleaveModelSpec.Heads * InterleaveModelSpec.HeadDim));

@@ -14,12 +14,15 @@ namespace Lair.Tests;
 /// at a query position beyond the window match a double-precision scalar reference forward that applies the same
 /// score mask, and demonstrably differ from the same model with the mask removed; a window at or beyond the
 /// sequence length producing logits bit-identical to the same model with no window declared; batched decode and
-/// single-token decode bit-identical under a window; the bidirectional <see cref="TransformerModel.Encode"/>
-/// path matching the symmetric masked reference across a chunk boundary; the mask applied together with an
-/// attention-score softcap against a reference doing both; and kernel-level goldens showing the causal range
-/// narrowing, the symmetric narrowing around each query, and that every masked-out position stays readable in
-/// the KV cache. Engine-to-engine comparisons are asserted bit-for-bit; reference comparisons use the
-/// double-precision tolerance shared by the strategy goldens.
+/// single-token decode bit-identical under a window; the <see cref="TransformerModel.Encode"/> path narrowing each
+/// query backward-only — matching the backward-only masked reference across a chunk boundary, differing from the
+/// unmasked bidirectional forward at every position whose span it narrows, leaving position 0 with no forward
+/// visibility, and keeping an undeclared window bit-identical to the full-sequence path; the mask applied together
+/// with an attention-score softcap against a reference doing both; and kernel-level goldens showing the causal range
+/// narrowing, the backward-only narrowing around each query — identical to the causal kernel's own output for the
+/// same position and window — and that every masked-out position stays readable in the KV cache. Engine-to-engine
+/// comparisons are asserted bit-for-bit; reference comparisons use the double-precision tolerance shared by the
+/// strategy goldens. Encoder cases carry both the Layers and Embeddings categories.
 /// </summary>
 [Trait("Category", "Layers")]
 public sealed class SlidingWindowLayerTests : IDisposable
@@ -53,6 +56,7 @@ public sealed class SlidingWindowLayerTests : IDisposable
     // ---------------------------------------------------------------- decode + encode goldens
 
     [Fact]
+    [Trait("Category", "Embeddings")]
     public void Forward_SlidingWindow_MatchesMaskedReference_DiffersFromUnmasked_BatchMatchesSingle()
     {
         WindowModelSpec spec = new();
@@ -102,7 +106,8 @@ public sealed class SlidingWindowLayerTests : IDisposable
             Closest(maskedLogits, reference.LogitsAt([1, 4, 2, 5, 3], 0, window: 0)),
             "a window narrower than the causal prefix must not leave the logits equal to the unmasked reference");
 
-        // Encode: the bidirectional path narrows each query symmetrically around its own position.
+        // Encode: a positive window narrows each query backward-only to [max(0, p - window + 1), p], so every position
+        // short of the sequence end loses both its deep history and everything after it.
         using SequenceKv encodeKv = new(pool);
         float[] encoded = model.Encode([1, 4, 2, 5, 3], encodeKv);
 
@@ -142,14 +147,16 @@ public sealed class SlidingWindowLayerTests : IDisposable
     }
 
     [Fact]
-    public void Forward_WindowAtOrBeyondSequenceLength_IsBitIdenticalToWindowlessModel()
+    [Trait("Category", "Embeddings")]
+    public void Forward_WindowAtOrBeyondSequenceLength_DecodesBitIdenticallyToWindowless_EncodeStaysBackwardOnly()
     {
         WindowModelSpec spec = new();
         byte[] image = BuildGguf(spec.MetadataPairs(), spec.Tensors());
 
         // Window exactly the sequence length (six positions once the query token is appended), a window beyond
-        // it, and no window at all: the mask never excludes a position, so every forward must be bit-for-bit the
-        // same computation.
+        // it, and no window at all: on the causal decode path the mask never excludes a position, so every forward there
+        // is bit-for-bit the same computation. On the encoder path a positive window still ends at its own query, so only
+        // the final row — whose backward span already covers the whole sequence — is left unchanged by declaring one.
         string exactPath = WriteTemp(BuildGguf([.. spec.MetadataPairs(), ("llama.attention.sliding_window", 6)], spec.Tensors()));
         string widePath = WriteTemp(BuildGguf([.. spec.MetadataPairs(), ("llama.attention.sliding_window", 9)], spec.Tensors()));
         string nonePath = WriteTemp(image);
@@ -193,15 +200,55 @@ public sealed class SlidingWindowLayerTests : IDisposable
         float[] wideEncoded = wideModel.Encode([1, 4, 2, 5, 3], wideEncodeKv);
         float[] noneEncoded = noneModel.Encode([1, 4, 2, 5, 3], noneEncodeKv);
 
-        Assert.True(exactEncoded.AsSpan().SequenceEqual(noneEncoded.AsSpan()), "windowed encode rows must match the windowless encode bit-for-bit");
-        Assert.True(wideEncoded.AsSpan().SequenceEqual(noneEncoded.AsSpan()), "over-wide windowed encode rows must match the windowless encode bit-for-bit");
+        int hidden = exactModel.Plan.HiddenSize;
+
+        // An exact window and an over-wide one resolve the same backward spans, so their encodes agree bit-for-bit.
+        Assert.True(
+            exactEncoded.AsSpan().SequenceEqual(wideEncoded.AsSpan()),
+            "a window equal to the sequence length and a window beyond it must encode identically: both narrow every query to its own backward span");
+
+        // Every position short of the end loses forward visibility under a positive window, even one that covers all of
+        // its history, so those rows move away from the same model with no window declared. The final row's backward
+        // span already reaches back over the whole sequence and has nothing after it: there both paths coincide.
+        for (int p = 0; p < 5; p++)
+        {
+            var windowedRow = exactEncoded.AsSpan(p * hidden, hidden);
+            var unwindowedRow = noneEncoded.AsSpan(p * hidden, hidden);
+
+            if (p == 4)
+            {
+                Assert.True(
+                    BitsEqual(windowedRow, unwindowedRow),
+                    $"encode row {p}: the final position's backward span covers the whole sequence, so its windowed row must match the windowless model bit-for-bit");
+            }
+            else
+            {
+                Assert.True(
+                    AnyEntryDiffers(windowedRow, unwindowedRow),
+                    $"encode row {p}: a positive encoder window must remove forward visibility even when it covers every earlier position");
+            }
+        }
+
+        // The same five rows against the backward-only scalar reference: exact match at every entry.
+        double[][] expectedBackwardOnly = new WindowReference(spec).Encoded([1, 4, 2, 5, 3], window: 6);
+        for (int p = 0; p < 5; p++)
+        {
+            for (int i = 0; i < hidden; i++)
+            {
+                double expectedValue = expectedBackwardOnly[p][i];
+                Assert.True(
+                    Math.Abs(exactEncoded[p * hidden + i] - expectedValue) <= 1e-5 * Math.Max(1.0, Math.Abs(expectedValue)),
+                    $"encode hidden[{p}][{i}] under a window that covers the whole sequence: expected {expectedValue:G9}, got {exactEncoded[p * hidden + i]:G9}");
+            }
+        }
     }
 
     [Fact]
+    [Trait("Category", "Embeddings")]
     public void Forward_WindowAcrossEncodeChunks_MatchesMaskedReference_RegardlessOfChunking()
     {
-        // Ten positions span two encoder chunks: the mask is applied around each query's own absolute position,
-        // so the result must match the unchunked scalar reference across the chunk boundary.
+        // Ten positions span two encoder chunks: the mask is applied as a backward-only range ending at each query's own
+        // absolute position, so the result must match the unchunked scalar reference across the chunk boundary.
         WindowModelSpec spec = new();
         string path = WriteTemp(BuildGguf(
             [.. spec.MetadataPairs(), ("llama.attention.sliding_window", Window)],
@@ -234,6 +281,184 @@ public sealed class SlidingWindowLayerTests : IDisposable
         }
 
         Assert.True(Differs(encoded, reference.Encoded(tokens, window: 0)), "the windowed encode must differ from the unmasked bidirectional forward");
+    }
+
+    [Fact]
+    [Trait("Category", "Embeddings")]
+    public void Encode_PositiveWindow_LeavesPositionZeroNoForwardVisibility_MatchingItsOwnSingleTokenRun()
+    {
+        WindowModelSpec spec = new();
+        string windowedPath = WriteTemp(BuildGguf(
+            [.. spec.MetadataPairs(), ("llama.attention.sliding_window", Window)],
+            spec.Tensors()));
+        string unwindowedPath = WriteTemp(BuildGguf(spec.MetadataPairs(), spec.Tensors()));
+
+        using CpuBackend backend = new(threads: 1, allowAvx2: true);
+        using GgufFile windowedGguf = GgufFile.Open(windowedPath);
+        using GgufFile unwindowedGguf = GgufFile.Open(unwindowedPath);
+        using TransformerModel windowed = TransformerModel.Open(windowedGguf, backend, maxContextTokens: 8);
+        using TransformerModel unwindowed = TransformerModel.Open(unwindowedGguf, backend, maxContextTokens: 8);
+
+        int hidden = windowed.Plan.HiddenSize;
+
+        using BlockPool pool = new(blockTokens: 4, layerCount: windowed.Plan.LayerCount, kvHeads: windowed.Plan.KvHeadCount, headDim: windowed.Plan.HeadDim, capacityBlocks: 16, backend);
+
+        float[] windowedRows;
+        float[] unwindowedRows;
+        float[] windowedSoloRow;
+        {
+            using SequenceKv kv = new(pool);
+            windowedRows = windowed.Encode([1, 4, 2, 5, 3], kv);
+
+            // The same weights with no declared window: position 0 attends forward over the four tokens after it.
+            using (SequenceKv unwindowedKv = new(pool))
+            {
+                unwindowedRows = unwindowed.Encode([1, 4, 2, 5, 3], unwindowedKv);
+            }
+
+            // Each model's own single-token run at position 0: the causal-prefix reference for that position. A window
+            // has nothing to mask there, so both models produce it identically.
+            using (SequenceKv soloKv = new(pool))
+            {
+                windowedSoloRow = windowed.Encode([1], soloKv);
+            }
+        }
+
+        float[] unwindowedSoloRow;
+
+        using (SequenceKv unwindowedSoloKv = new(pool))
+        {
+            unwindowedSoloRow = unwindowed.Encode([1], unwindowedSoloKv);
+        }
+
+        Assert.True(
+            BitsEqual(windowedRows.AsSpan(0, hidden), windowedSoloRow),
+            "position 0 under a positive window sees only itself: its row must match the same model encoding that token alone, bit-for-bit");
+        Assert.True(
+            BitsEqual(unwindowedSoloRow, windowedSoloRow),
+            "a single-token encode has no later position to attend, so declaring a window cannot change it");
+
+        Assert.True(
+            AnyEntryDiffers(windowedRows.AsSpan(0, hidden), unwindowedRows.AsSpan(0, hidden)),
+            "position 0's row must differ from the same run on the model with no declared window: that one attends forward over its sequence");
+
+        // The undeclared path keeps today's full-sequence bidirectional behavior in both directions: position 0 of an
+        // unwindowed run is not that token encoded alone, because it still sees every later position.
+        Assert.True(
+            AnyEntryDiffers(unwindowedRows.AsSpan(0, hidden), unwindowedSoloRow),
+            "an unbounded layer must leave position 0 attending forward: its full-sequence row differs from the same model encoding that token alone");
+
+        // Against the reference oracle: position 0 lands on its backward-only range and not on the full bidirectional one.
+        WindowReference reference = new(spec);
+        Assert.True(
+            Closest(windowedRows.AsSpan(0, hidden), reference.Encoded([1, 4, 2, 5, 3], window: Window)[0]),
+            "position 0's encoded row must match the backward-only scalar reference");
+        Assert.False(
+            Closest(windowedRows.AsSpan(0, hidden), reference.Encoded([1, 4, 2, 5, 3], window: 0)[0]),
+            "position 0's encoded row must not match the full bidirectional reference — a declared window removes its forward visibility");
+
+        Assert.True(
+            AnyEntryDiffers(windowedRows, unwindowedRows),
+            "a windowed model's encoder output must differ from the same model with no declared window");
+    }
+
+    [Fact]
+    [Trait("Category", "Embeddings")]
+    public void Encode_BackwardOnlyWindow_MatchesEachPositionsOwnPrefixRun_AcrossChunks()
+    {
+        WindowModelSpec spec = new();
+        string windowedPath = WriteTemp(BuildGguf(
+            [.. spec.MetadataPairs(), ("llama.attention.sliding_window", Window)],
+            spec.Tensors()));
+
+        using CpuBackend backend = new(threads: 1, allowAvx2: true);
+        using GgufFile gguf = GgufFile.Open(windowedPath);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 16);
+
+        int hidden = model.Plan.HiddenSize;
+        int[] tokens = [1, 4, 2, 5, 3, 0, 1, 5, 2, 4]; // ten positions across two encoder chunks and three KV blocks
+
+        using BlockPool pool = new(blockTokens: 4, layerCount: model.Plan.LayerCount, kvHeads: model.Plan.KvHeadCount, headDim: model.Plan.HeadDim, capacityBlocks: 8, backend);
+
+        float[] fullRows;
+        {
+            using SequenceKv kv = new(pool);
+            fullRows = model.Encode(tokens, kv);
+        }
+
+        // Under a positive window every query's span is its own backward range and nothing after it, so each row of the
+        // ten-position run equals the final row of a run over just that prefix — whatever chunking either run used.
+        for (int p = 0; p < tokens.Length; p++)
+        {
+            float[] prefixRows;
+            using (SequenceKv prefixKv = new(pool))
+            {
+                prefixRows = model.Encode(tokens[..(p + 1)], prefixKv);
+            }
+
+            Assert.True(
+                BitsEqual(fullRows.AsSpan(p * hidden, hidden), prefixRows.AsSpan(prefixRows.Length - hidden, hidden)),
+                $"row {p} of the ten-position encode must match position {p}'s own prefix run bit-for-bit under a backward-only window");
+        }
+
+        // With no declared window only the final row has that property: every earlier one attends forward over what follows.
+        using GgufFile unwindowedGguf = GgufFile.Open(WriteTemp(BuildGguf(spec.MetadataPairs(), spec.Tensors())));
+        using TransformerModel unwindowed = TransformerModel.Open(unwindowedGguf, backend, maxContextTokens: 16);
+
+        float[] unwindowedFullRows;
+        {
+            using SequenceKv kv = new(pool);
+            unwindowedFullRows = unwindowed.Encode(tokens, kv);
+        }
+
+        for (int p = 0; p < tokens.Length; p++)
+        {
+            float[] prefixRows;
+            using (SequenceKv prefixKv = new(pool))
+            {
+                prefixRows = unwindowed.Encode(tokens[..(p + 1)], prefixKv);
+            }
+
+            var fullRow = unwindowedFullRows.AsSpan(p * hidden, hidden);
+            var lastPrefixRow = prefixRows.AsSpan(prefixRows.Length - hidden, hidden);
+
+            if (p == tokens.Length - 1)
+            {
+                Assert.True(
+                    BitsEqual(fullRow, lastPrefixRow),
+                    $"row {p}: the final position of an unwindowed encode already attends exactly its prefix, so its prefix run must agree bit-for-bit");
+            }
+            else
+            {
+                Assert.True(
+                    AnyEntryDiffers(fullRow, lastPrefixRow),
+                    $"row {p} of an unwindowed encode must differ from that position's own prefix run: it attends the positions after it");
+            }
+        }
+
+        // The windowed rows are also the backward-only scalar reference across both chunk boundaries.
+        WindowReference reference = new(spec);
+        double[][] expected = reference.Encoded(tokens, window: Window);
+        for (int p = 0; p < tokens.Length; p++)
+        {
+            Assert.True(
+                Closest(fullRows.AsSpan(p * hidden, hidden), expected[p]),
+                $"row {p} of the ten-position encode must match the backward-only scalar reference");
+        }
+
+        // The same weights with no declared window still run today's full-sequence bidirectional path unchanged: every
+        // row matches the whole-range reference, which is what a resolved zero window must keep bit-for-bit.
+        double[][] expectedUnwindowed = reference.Encoded(tokens, window: 0);
+        for (int p = 0; p < tokens.Length; p++)
+        {
+            Assert.True(
+                Closest(unwindowedFullRows.AsSpan(p * hidden, hidden), expectedUnwindowed[p]),
+                $"row {p} of the unwindowed ten-position encode must match the full-sequence scalar reference");
+
+            Assert.False(
+                BitsEqual(fullRows.AsSpan(p * hidden, hidden), unwindowedFullRows.AsSpan(p * hidden, hidden)),
+                $"row {p}: a windowed model's encoder output must differ from the same weights with no declared window");
+        }
     }
 
     [Fact]
@@ -327,7 +552,7 @@ public sealed class SlidingWindowLayerTests : IDisposable
     }
 
     [Fact]
-    public void BidirectionalAttention_Window_NarrowsSymmetricallyAroundEachQuery()
+    public void BidirectionalAttention_Window_NarrowsBackwardOnlyAroundEachQuery()
     {
         const int Positions = 7; // KV positions 0..6; the queries themselves live at 2..6
         const int QueryCount = 5;
@@ -363,7 +588,7 @@ public sealed class SlidingWindowLayerTests : IDisposable
         {
             int queryPosition = QueryOffset + p;
             int from = Math.Max(0, queryPosition - KernelWindow + 1);
-            int to = Math.Min(Positions - 1, queryPosition + KernelWindow);
+            int to = Math.Min(Positions - 1, queryPosition); // the window stops at the query: nothing after it is scored
 
             float[] expected = new float[Region];
             HandComputeAttention(
@@ -378,9 +603,17 @@ public sealed class SlidingWindowLayerTests : IDisposable
                     Math.Abs(windowedOut[p * Region + i] - expected[i]) <= 1e-5 * Math.Max(1.0, Math.Abs(expected[i])),
                     $"query at position {queryPosition} range [{from}..{to}] entry {i}: expected {expected[i]:G9}, got {windowedOut[p * Region + i]:G9}");
             }
+
+            // Same positions, same window, causal kernel: the encoder narrowing is exactly the decode kernel's range.
+            float[] causalOut = new float[Region];
+            LayerOps.CausalAttention(backend, qPositions.AsSpan(p * Region, Region), Heads, KvHeads, HeadDim, kv, layer: 0, position: queryPosition, scale, softcap: 0f, window: KernelWindow, causalOut);
+
+            Assert.True(
+                BitsEqual(windowedOut.AsSpan(p * Region, Region), causalOut),
+                $"query at position {queryPosition}: the windowed bidirectional row must match CausalAttention under the same window bit-for-bit");
         }
 
-        // The same call with the window disabled sees the full given range, so the narrowing is a real mask.
+        // The same call with the window disabled sees the full given range in both directions, so the narrowing is a real mask.
         float[] fullOut = new float[QueryCount * Region];
         LayerOps.BidirectionalAttention(
             backend, qPositions, QueryCount, queryPositionOffset: QueryOffset, fromPosition: 0, toPosition: Positions - 1,
@@ -388,16 +621,40 @@ public sealed class SlidingWindowLayerTests : IDisposable
 
         Assert.True(
             !BitsEqual(windowedOut.AsSpan(0, Region), fullOut.AsSpan(0, Region)),
-            "the query at position 2 under a symmetric window of 2 must differ from the full-range bidirectional run");
+            "the query at position 2 under a backward-only window of 2 must differ from the full-range bidirectional run");
 
-        // A window covering the whole range is the unmasked path bit-for-bit.
+        // A positive window that reaches back past every earlier position is still not the unbounded path: it cuts off
+        // everything after each query. Only the last query, whose backward span already covers the table, coincides.
         float[] wideOut = new float[QueryCount * Region];
         LayerOps.BidirectionalAttention(
             backend, qPositions, QueryCount, queryPositionOffset: QueryOffset, fromPosition: 0, toPosition: Positions - 1,
             Heads, KvHeads, HeadDim, kv, layer: 0, scale, softcap: 0f, window: Positions, wideOut);
-        Assert.True(
-            BitsEqual(wideOut, fullOut),
-            "a window covering the whole KV range must match the unmasked kernel bit-for-bit");
+
+        for (int p = 0; p < QueryCount; p++)
+        {
+            var wideRow = wideOut.AsSpan(p * Region, Region);
+            var fullRow = fullOut.AsSpan(p * Region, Region);
+
+            if (p == QueryCount - 1)
+            {
+                Assert.True(
+                    BitsEqual(wideRow, fullRow),
+                    $"query at position {QueryOffset + p}: its backward span covers the whole table, so a window that wide matches the unmasked kernel bit-for-bit");
+            }
+            else
+            {
+                Assert.True(
+                    AnyEntryDiffers(wideRow, fullRow),
+                    $"query at position {QueryOffset + p}: a positive window must still remove its forward visibility against the unmasked run");
+            }
+
+            float[] causalOut = new float[Region];
+            LayerOps.CausalAttention(backend, qPositions.AsSpan(p * Region, Region), Heads, KvHeads, HeadDim, kv, layer: 0, position: QueryOffset + p, scale, softcap: 0f, window: Positions, causalOut);
+
+            Assert.True(
+                BitsEqual(wideRow, causalOut),
+                $"query at position {QueryOffset + p}: the wide-windowed bidirectional row must match CausalAttention under the same window bit-for-bit");
+        }
 
         // A query whose windowed range misses the given KV range entirely is an argument error, not a silent zero.
         Assert.Throws<ArgumentException>(() => LayerOps.BidirectionalAttention(
@@ -431,6 +688,26 @@ public sealed class SlidingWindowLayerTests : IDisposable
                 {
                     return true;
                 }
+            }
+        }
+
+        return false;
+    }
+
+    // Engine-to-engine divergence: at least one entry of the two rows moves past the shared tolerance, which is what a
+    // mask that changes the scored positions must do to an attention output.
+    private static bool AnyEntryDiffers(ReadOnlySpan<float> actual, ReadOnlySpan<float> other)
+    {
+        if (actual.Length != other.Length)
+        {
+            throw new ArgumentException("Divergence checks compare equal-length rows.", nameof(other));
+        }
+
+        for (int i = 0; i < other.Length; i++)
+        {
+            if (Math.Abs(actual[i] - other[i]) > 1e-4 * Math.Max(1.0, Math.Abs(other[i])))
+            {
+                return true;
             }
         }
 
@@ -644,9 +921,10 @@ public sealed class SlidingWindowLayerTests : IDisposable
 
     // A scalar reference forward over the spec's hand-picked tensors: RMSNorm, standard full-head RoPE, causal or
     // bidirectional attention with an explicit softmax and the score mask applied to the visible range, silu(gate)
-    // * up, and the tied token-embedding logits. With a positive window the causal range narrows to
-    // [max(0, i - window + 1), i] and the bidirectional range to [max(0, i - window + 1), i + window] clamped to
-    // the sequence. Computed in double and compared against the engine's float values with the shared tolerance.
+    // * up, and the tied token-embedding logits. With a positive window both ranges are backward-only —
+    // [max(0, i - window + 1), i] on the causal path and the same span ending at its own query on the bidirectional one;
+    // an unbounded range is the whole sequence in either direction. Computed in double and compared against the engine's
+    // float values with the shared tolerance.
     private sealed class WindowReference
     {
         private readonly WindowModelSpec _spec;
@@ -781,10 +1059,11 @@ public sealed class SlidingWindowLayerTests : IDisposable
         private static (int From, int To) CausalRange(int position, int window) =>
             (window > 0 ? Math.Max(0, position - window + 1) : 0, position);
 
-        // The bidirectional visible range: symmetric around the query position, clamped to the sequence.
+        // The bidirectional visible range: backward-only from the query position, clamped to the sequence. A positive
+        // window never reaches past the query itself; only an unbounded layer attends what follows it.
         private static (int From, int To) BidirectionalRange(int position, int sequenceLength, int window) =>
             window > 0
-                ? (Math.Max(0, position - window + 1), Math.Min(sequenceLength - 1, position + window))
+                ? (Math.Max(0, position - window + 1), position)
                 : (0, sequenceLength - 1);
 
         private static void Attention(double[] q, double[][] kvK, double[][] kvV, (int From, int To) range, float cap, Span<double> outHead)

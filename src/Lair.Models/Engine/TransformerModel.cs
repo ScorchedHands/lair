@@ -798,8 +798,8 @@ public sealed class TransformerModel : IDisposable
     /// <summary>
     /// Encoder-only forward: runs the whole token sequence through every layer with full-sequence (bidirectional)
     /// attention — each query position scores against all positions of its own sequence's KV contents instead of a
-    /// causal prefix, narrowed per layer to the plan's resolved attention window around the query's own position on
-    /// the layers its resolved window interleave masks — and returns the final hidden states after the output norm,
+    /// causal prefix, narrowed per layer to that layer's resolved attention window read backward from the query's own
+    /// position on the layers its resolved window interleave masks — and returns the final hidden states after the output norm,
     /// without lm_head logits. Per-position norms, RoPE at absolute positions, biases, residuals, and the gated
     /// activation are exactly the decode-path
     /// operations; K/V for
@@ -808,8 +808,9 @@ public sealed class TransformerModel : IDisposable
     /// once per chunk of up to <see cref="EncodeChunkTokens"/> positions via <see cref="IBackend.GemvBatch"/>; every
     /// position then attends over the whole finished KV span, which is what distinguishes this path from incremental
     /// causal decode. All queries — whichever chunk they belong to — see exactly every position of their sequence after
-    /// appending (0..<see cref="SequenceKv.Length"/>) in ascending order — within the resolved window around its own
-    /// position when one is declared — so results are independent of chunking.
+    /// appending (0..<see cref="SequenceKv.Length"/>) in ascending order: within <c>[max(0, q - window + 1), q]</c> when the
+    /// layer resolves a positive window, where no query sees past its own position, and over the whole sequence on an
+    /// unbounded layer — so results are independent of chunking.
     /// This establishes the dense-LLM architecture running in encoder mode as groundwork for embedding extraction;
     /// dedicated encoder-native architectures (ModernBERT-class) require their own tensor layouts and arrive with the
     /// embeddings endpoint itself. The returned array is caller-owned: <c>hidden[position * HiddenSize + i]</c>, length
@@ -938,8 +939,9 @@ public sealed class TransformerModel : IDisposable
                     }
                 }
 
-                // Phase 2: bidirectional attention per chunk — every query scores against all n positions of this
-                // sequence's finished KV. Chunk-local outputs land at each position's slot in attnOut.
+                // Phase 2: attention per chunk — every query scores against this sequence's finished KV, over all n
+                // positions on a layer whose resolved window is zero and over [max(0, q - window + 1), q] on one that
+                // resolves a positive window. Chunk-local outputs land at each position's slot in attnOut.
                 for (int c = 0; c < chunkCount; c++)
                 {
                     int m = Math.Min(EncodeChunkTokens, n - c * EncodeChunkTokens);
@@ -1300,8 +1302,9 @@ public sealed class TransformerModel : IDisposable
 
     // The window one layer reads within comes from the plan's resolved per-layer value, called directly the way the
     // norm, activation, and softcap switches do: no dispatch and nothing resolved per token or per head. lair.kv then
-    // turns that value into a block selection at each attention call — see LayerOps.CausalAttention — so the windowed
-    // layers read only the blocks their window covers while the unbounded ones select the whole table. Storage is not
+    // turns that value into a block selection at each attention call — see LayerOps.CausalAttention and
+    // LayerOps.BidirectionalAttention — so the windowed layers read only the blocks their backward span covers while
+    // the unbounded ones select the whole table, on both the causal decode path and the encoder path. Storage is not
     // narrowed: every position's K/V is still written and stays readable for whichever layer attends it.
     private int LayerAttentionWindow(int layer) => Plan.AttentionWindowForLayer(layer);
 

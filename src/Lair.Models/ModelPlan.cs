@@ -107,12 +107,13 @@ public sealed record ModelPlan
 
     /// <summary>
     /// Declared <c>&lt;prefix&gt;attention.sliding_window</c>: the attention window in positions. At query position
-    /// <c>i</c> a layer that carries this window reads <c>[max(0, i - window + 1), i]</c> causally and
-    /// <c>[max(0, i - window + 1), i + window]</c> bidirectionally, clamped to the sequence; see
-    /// <see cref="AttentionWindowForLayer"/> for what one layer actually resolves. <c>0</c> when the key is absent
-    /// means unbounded, and <see cref="WindowInterleave"/> decides which layers the declared value narrows. Every
-    /// position's K/V is still written to and stays readable in the KV cache — the window bounds what a layer reads,
-    /// not what the sequence stores, because another layer of the same model may attend the whole range.
+    /// <c>i</c> a layer that carries this window reads <c>[max(0, i - window + 1), i]</c> on every path — the causal
+    /// decode range and the encoder's bidirectional pass alike: a declared window reaches behind the query and never
+    /// grants visibility past the query itself. A layer the plan resolves to zero attends the whole sequence in both
+    /// directions instead; see <see cref="AttentionWindowForLayer"/> for what one layer actually resolves. <c>0</c> when
+    /// the key is absent means unbounded, and <see cref="WindowInterleave"/> decides which layers the declared value
+    /// narrows. Every position's K/V is still written to and stays readable in the KV cache — the window bounds what a
+    /// layer reads, not what the sequence stores, because another layer of the same model may attend the whole range.
     /// </summary>
     public int AttentionWindow { get; init; }
 
