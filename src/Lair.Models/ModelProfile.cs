@@ -42,11 +42,11 @@ public sealed record ModelProfile
     public SparseFfnStrategy DefaultSparseFfnStrategy { get; init; } = SparseFfnStrategy.DenseResident;
 
     /// <summary>
-    /// Feature default for per-head QK-norm, applied when the file declares no
+    /// Feature default for QK-norm, applied when the file declares no
     /// <c>&lt;prefix&gt;attention.use_qk_norm</c>: a declared false overrides it to <see cref="QkNormMode.Off"/>
-    /// whatever the profile defaults to, and a profile defaulting to a weighted mode makes the per-head norm vectors
-    /// required at load for a file that declares nothing. A profile defaults this to
-    /// <see cref="Lair.Models.QkNormMode.Off"/>.
+    /// whatever the profile defaults to, and a profile defaulting to a weighted mode makes that mode's norm vectors
+    /// required at load for a file that declares nothing — each side-sized as its mode names them. A profile defaults
+    /// this to <see cref="Lair.Models.QkNormMode.Off"/>.
     /// </summary>
     public QkNormMode DefaultQkNorm { get; init; } = QkNormMode.Off;
 

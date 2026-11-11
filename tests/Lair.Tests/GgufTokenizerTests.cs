@@ -191,7 +191,7 @@ public sealed class GgufTokenizerTests : IDisposable
         GgufException ex = Assert.Throws<GgufException>(() => GgufTokenizer.FromGguf(GgufFile.Open(WriteTemp(image))));
 
         // The supported list is sourced from the profile registry itself.
-        Assert.Contains("(supported: 'llama-bpe', 'gpt2', 'qwen2', 'smollm')", ex.Message);
+        Assert.Contains("(supported: 'llama-bpe', 'gpt2', 'qwen2', 'olmo', 'smollm')", ex.Message);
     }
 
     [Fact]
@@ -213,6 +213,24 @@ public sealed class GgufTokenizerTests : IDisposable
 
         // Whole-number digit runs: the "3 4" merge spans digits the llama-bpe splitter would cut.
         Assert.Equal([22, 23], tokenizer.Encode("1234"));
+    }
+
+    [Fact]
+    public void ProfileSelection_OlmoPre_ResolvesAndSharesTheGpt2SplitRules()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteSyntheticVocab("olmo"));
+        GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
+
+        // The olmo family's own pre-split is pinned id-for-id against the reference by
+        // tests/fixtures/parity-tokenizer-olmo.json; on this synthetic vocab it splits exactly as gpt2 does:
+        // case-sensitive contraction, no merge shortcut, whole digit runs.
+        Assert.Equal([16], tokenizer.Encode("'s"));
+        Assert.Equal([14, 24 + 0x53], tokenizer.Encode("'S"));
+        Assert.Equal([7], tokenizer.Encode("abc"));
+        Assert.Equal([22, 23], tokenizer.Encode("1234"));
+
+        // add_bos defaults to false for the olmo family.
+        Assert.False(tokenizer.AddBosToken);
     }
 
     [Fact]

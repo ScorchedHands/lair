@@ -87,6 +87,21 @@ internal static class TokenizerProfiles
         },
         new TokenizerProfile
         {
+            PreKey = "olmo",
+            // The olmo vocabulary is byte-level GPT-2 BPE with the family's own pre-split rules; this entry starts
+            // from the gpt2 form and its split strategy is pinned by tests/fixtures/parity-tokenizer-olmo.json, which
+            // captures the reference /tokenize id sequences for this exact file.
+            Split = SplitGpt2,
+            IgnoreMerges = false,
+            CleanSpaces = true,
+            AddBosDefault = false,
+            // The pinned olmo fixture declares its own bos/eos ids (50279), so these family-convention fallbacks
+            // only apply to a file that omits them.
+            BosFallbackId = 1,
+            EosFallbackId = 2,
+        },
+        new TokenizerProfile
+        {
             PreKey = "smollm",
             Split = SplitSmollm,
             IgnoreMerges = false,

@@ -23,7 +23,7 @@ namespace Lair.Models;
 /// profile's QK-norm mode. The norm placement comes from the resolved profile alone: no metadata key selects
 /// it today. The block-norm epsilon reads <c>&lt;prefix&gt;attention.layer_norm_epsilon</c>, resolving to
 /// <c>0f</c> when the key is absent, and feeds only the LayerNorm block norms; the RMS epsilon from
-/// <c>&lt;prefix&gt;attention.layer_norm_rms_epsilon</c> keeps feeding the RMS norms and the per-head QK-norm. The declared softcaps read
+/// <c>&lt;prefix&gt;attention.layer_norm_rms_epsilon</c> keeps feeding the RMS norms and the QK-norm. The declared softcaps read
 /// <c>&lt;prefix&gt;attn_logit_softcapping</c> and <c>&lt;prefix&gt;final_logit_softcapping</c>, each
 /// resolving to <c>0f</c> (disabled) when the key is absent and to a positive finite number otherwise. The
 /// declared attention window reads <c>&lt;prefix&gt;attention.sliding_window</c>, resolving to <c>0</c>
@@ -77,7 +77,7 @@ public sealed record ModelPlan
 
     /// <summary>
     /// The epsilon under the root of the LayerNorm block norms: <c>0f</c> unless the file declares
-    /// <c>&lt;prefix&gt;attention.layer_norm_epsilon</c>. The RMS norms and the per-head QK-norm keep
+    /// <c>&lt;prefix&gt;attention.layer_norm_epsilon</c>. The RMS norms and the QK-norm keep
     /// <see cref="EpsRmsNorm"/> whatever this resolves to.
     /// </summary>
     public float EpsLayerNorm { get; init; }
@@ -93,7 +93,7 @@ public sealed record ModelPlan
     /// <summary>Declared <c>&lt;prefix&gt;attention.norm_bias</c>: whether the norm layers carry additive bias vectors.</summary>
     public required bool UseNormBias { get; init; }
 
-    /// <summary>Resolved per-head QK-norm mode: a declared <c>&lt;prefix&gt;attention.use_qk_norm=false</c> forces <see cref="QkNormMode.Off"/>; absent the key resolves to the resolved profile's mode, and a declaration of <c>true</c> selects the weighted form on an architecture whose profile defaults it off.</summary>
+    /// <summary>Resolved QK-norm mode: a declared <c>&lt;prefix&gt;attention.use_qk_norm=false</c> forces <see cref="QkNormMode.Off"/>; absent the key resolves to the resolved profile's mode, and a declaration of <c>true</c> keeps that profile's own weighted form when it has one, or selects the per-head weighted form on an architecture whose profile defaults it off.</summary>
     public required QkNormMode QkNorm { get; init; }
 
     /// <summary>The resolved profile's norm placement: whether each sublayer output is normalized again with its own vector before joining the residual stream, or only the streams feeding each sublayer are normalized. No metadata key decides it.</summary>
@@ -170,7 +170,7 @@ public sealed record ModelPlan
 
     /// <summary>
     /// The expert-computation variant this model resolves to: the declared <c>&lt;prefix&gt;sparse_ffn_strategy</c>
-    /// overriding the resolved profile's default, exactly as the per-head QK-norm mode resolves. <c>null</c> when the
+    /// overriding the resolved profile's default, exactly as the QK-norm mode resolves. <c>null</c> when the
     /// file declares no experts and no block routes anything. A value names what the load decided, not what proved
     /// runnable: a variant the forward engine cannot yet run stays recorded here and reports at engine open instead of
     /// falling back to another strategy invisibly.

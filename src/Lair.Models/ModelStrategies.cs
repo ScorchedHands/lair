@@ -77,14 +77,14 @@ public enum NormPlacement
 }
 
 /// <summary>
-/// Per-head normalization applied to the q and k heads after their projection (and any bias) and before RoPE.
-/// Resolved once per model from its <see cref="ModelProfile"/> default and the file's declared
-/// <c>&lt;prefix&gt;attention.use_qk_norm</c>; the forward path switches on the value and never dispatches through a
-/// per-token interface.
+/// Normalization applied to the projected q and k streams after their projection (and any bias) and before RoPE —
+/// either over each head's own slice or over the whole stream at once. Resolved once per model from its
+/// <see cref="ModelProfile"/> default and the file's declared <c>&lt;prefix&gt;attention.use_qk_norm</c>; the forward
+/// path switches on the value and never dispatches through a per-token interface.
 /// </summary>
 public enum QkNormMode
 {
-    /// <summary>No per-head normalization: q and k go from their projection straight to RoPE.</summary>
+    /// <summary>No normalization: q and k go from their projection straight to RoPE.</summary>
     Off,
 
     /// <summary>
@@ -99,6 +99,15 @@ public enum QkNormMode
     /// it demands none and ignores any per-head norm vectors the file carries.
     /// </summary>
     PerHeadUnweighted,
+
+    /// <summary>
+    /// RMS norm over each side's whole projected stream — every head of q normalized jointly under one mean over that
+    /// side's full width (<c>head_count × head_dim</c>, and likewise <c>kv_head_count × head_dim</c> for k), scaled
+    /// element by element by the layer's stream-sized weight vector: <c>src / sqrt(mean(src^2) + eps) * w[i]</c>. This
+    /// is the form the reference runs when it normalizes q and k before splitting them into heads, as the olmoe block
+    /// does with one [hidden]-sized vector per layer; the file must carry a vector covering each side's whole width.
+    /// </summary>
+    StreamWeighted,
 }
 
 /// <summary>

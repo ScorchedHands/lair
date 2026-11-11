@@ -19,12 +19,16 @@ public sealed class TokenizerParityTests
 {
     private const string SmolLmFixture = "tests/fixtures/parity-tokenizer-smollm.json";
     private const string Llama32Fixture = "tests/fixtures/parity-tokenizer-llama32.json";
+    private const string OlmoFixture = "tests/fixtures/parity-tokenizer-olmo.json";
 
     [Fact]
     public void SmolLm_Encode_MatchesPinnedTokenizeOracle() => AssertFixture(SmolLmFixture);
 
     [Fact]
     public void Llama32_Encode_MatchesPinnedTokenizeOracle() => AssertFixture(Llama32Fixture);
+
+    [Fact]
+    public void Olmo_Encode_MatchesPinnedTokenizeOracle() => AssertFixture(OlmoFixture);
 
     private static void AssertFixture(string fixtureRelativePath)
     {

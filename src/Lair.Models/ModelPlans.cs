@@ -515,9 +515,10 @@ public static class ModelPlans
         return eps;
     }
 
-    // Shared per-head QK-norm resolution: an absent declaration keeps the resolved profile's mode. A declared false
-    // forces Off whatever that default is, and a declared true requests the norm — which no metadata key can express
-    // as unweighted, so it lands on the weighted form unless the profile already resolves the unweighted one. The
+    // Shared QK-norm resolution: an absent declaration keeps the resolved profile's mode. A declared false forces Off
+    // whatever that default is, and a declared true requests the norm — which no metadata key can express as
+    // unweighted or say which weighted form the architecture runs, so it keeps the profile's own weighted mode when it
+    // has one and asks for the per-head weighted form on an architecture whose default leaves the feature off. The
     // tensor side of every mode is enforced by the forward engine at Open.
     private static QkNormMode ResolveQkNorm(GgufMetadata metadata, string prefix, QkNormMode profileDefault)
     {
@@ -531,7 +532,9 @@ public static class ModelPlans
             return QkNormMode.Off;
         }
 
-        return profileDefault == QkNormMode.PerHeadUnweighted ? QkNormMode.PerHeadUnweighted : QkNormMode.PerHeadWeighted;
+        return profileDefault is QkNormMode.PerHeadUnweighted or QkNormMode.StreamWeighted
+            ? profileDefault
+            : QkNormMode.PerHeadWeighted;
     }
 
     // Shared attention-window resolution: an absent key means unbounded (zero). A declared key must read as an

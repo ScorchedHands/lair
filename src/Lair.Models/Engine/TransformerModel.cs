@@ -26,9 +26,9 @@ namespace Lair.Models.Engine;
 /// <see cref="BiasPolicy.Declared"/> the resolved <c>use_bias</c> flag — a declaration or the profile's feature
 /// default — makes the q/k/v bias vectors required or leaves every attention bias unloaded and unapplied, with one
 /// structured log line naming the ignored tensors, while an output-projection bias is loaded whenever the file
-/// carries one; the plan's resolved
-/// <see cref="QkNormMode"/> normalizes each q and k head between its projection (plus any bias) and its rotation — scaled
-/// by the layer's per-head vector, normalized with the epsilon alone, or not at all. Under
+/// carries one; the plan's resolved <see cref="QkNormMode"/> normalizes each q and k head between its projection
+/// (plus any bias) and its rotation — per head scaled by the layer's head-dimension vector, over each side's whole
+/// projected stream scaled by that side's full-width vector, normalized with the epsilon alone, or not at all. Under
 /// <see cref="NormPlacement.PostSublayerOutputs"/> every sublayer output is normalized once more with its own vector before
 /// it joins the residual stream, which makes each layer's post-sublayer norm tensors required; a pre-only placement reads
 /// none and rejects a file that carries one. A resolved
@@ -97,14 +97,15 @@ public sealed class TransformerModel : IDisposable
     private float[][] _sharedInputGate = [];
 
     // Per-expert slice geometry: one expert's rows and cols as the shape a GEMV over its slice carries, plus that
-    // slice's packed byte block per role. Built once at Open so routing and expert execution allocate nothing per
-    // token; zero means no sparse block runs.
+    // slice's packed byte block per role — indexed by layer, because a converted file is free to hold different quant
+    // tiers in the same role at different layers. Built once at Open so routing and expert execution allocate nothing
+    // per token; empty means no sparse block runs.
     private TensorShape _moeExpertGateShape = new([0, 0]);
     private TensorShape _moeExpertUpShape = new([0, 0]);
     private TensorShape _moeExpertDownShape = new([0, 0]);
-    private long _moeExpertGateBytes;
-    private long _moeExpertUpBytes;
-    private long _moeExpertDownBytes;
+    private long[] _moeExpertGateBytes = [];
+    private long[] _moeExpertUpBytes = [];
+    private long[] _moeExpertDownBytes = [];
 
     // Routing scratch, sized at Open for descriptor-bearing models only. The token path consumes one
     // routing at a time; the batch path stores every sequence's selection flat, sequence by sequence, so
@@ -296,19 +297,28 @@ public sealed class TransformerModel : IDisposable
             LogicalTensor[] expertDown = LoadExpertStacks(layers, _sparseFfn.ExpertDownRole, experts, Plan.HiddenSize, Plan.IntermediateSize);
 
             // Per-expert slice geometry for these roles: one expert's packed block and the two-dimensional shape a
-            // GEMV over that slice carries. The byte count comes from the same row stride the stack validation above
-            // used, so a slice is exactly the rows the role declares per expert.
+            // GEMV over that slice carries, per layer — each role sizes its slice from that layer's own tensor format
+            // and row stride, because a converted file is free to hold different quant tiers in one role at different
+            // layers (the reference converter does exactly that), while LoadExpertStacks has already pinned every
+            // layer of a role to the same rows and columns.
             _moeExpertGate = expertGate;
             _moeExpertUp = expertUp;
             _moeExpertDown = expertDown;
-            QuantFormat format = expertGate[0].Format;
-            long gateBytes = (long)Plan.IntermediateSize * expertGate[0].Shape.RowStrideBytes(format);
-            long downBytes = (long)Plan.HiddenSize * expertDown[0].Shape.RowStrideBytes(format);
+            long[] gateBytes = new long[layers];
+            long[] upBytes = new long[layers];
+            long[] downBytes = new long[layers];
+            for (int l = 0; l < layers; l++)
+            {
+                gateBytes[l] = Plan.IntermediateSize * expertGate[l].Shape.RowStrideBytes(expertGate[l].Format);
+                upBytes[l] = Plan.IntermediateSize * expertUp[l].Shape.RowStrideBytes(expertUp[l].Format);
+                downBytes[l] = Plan.HiddenSize * expertDown[l].Shape.RowStrideBytes(expertDown[l].Format);
+            }
+
             _moeExpertGateShape = new TensorShape([Plan.IntermediateSize, Plan.HiddenSize]);
             _moeExpertUpShape = new TensorShape([Plan.IntermediateSize, Plan.HiddenSize]);
             _moeExpertDownShape = new TensorShape([Plan.HiddenSize, Plan.IntermediateSize]);
             _moeExpertGateBytes = gateBytes;
-            _moeExpertUpBytes = gateBytes;
+            _moeExpertUpBytes = upBytes;
             _moeExpertDownBytes = downBytes;
 
             // Routing scratch and packed-expert storage sized from the descriptor's concrete counts: one selection at
@@ -427,6 +437,14 @@ public sealed class TransformerModel : IDisposable
                 _attnKNorm = LoadLayerVectors(layers, TensorRole.AttentionKeyNorm, Plan.HeadDim);
                 break;
 
+            case QkNormMode.StreamWeighted:
+                // The whole-stream form normalizes each side's projected width at once, before any head split, so the
+                // file's vector must cover that side's full projection — head_count × head_dim for q and kv_head_count ×
+                // head_dim for k — rather than one head. A per-head-sized vector fails the load naming its shape.
+                _attnQNorm = LoadLayerVectors(layers, TensorRole.AttentionQueryNorm, Plan.HeadCount * Plan.HeadDim);
+                _attnKNorm = LoadLayerVectors(layers, TensorRole.AttentionKeyNorm, Plan.KvHeadCount * Plan.HeadDim);
+                break;
+
             case QkNormMode.Off:
                 // Resolved off: present per-head vectors are neither loaded nor applied, and the file is reported once naming them.
                 _attnQNorm = new float[layers][];
@@ -443,7 +461,7 @@ public sealed class TransformerModel : IDisposable
                 break;
 
             default:
-                throw new ModelException($"per-head QK-norm mode '{Plan.QkNorm}' is not implemented by the forward engine");
+                throw new ModelException($"QK-norm mode '{Plan.QkNorm}' is not implemented by the forward engine");
         }
 
         if (Plan.NormPlacement == NormPlacement.PostSublayerOutputs)
@@ -1076,8 +1094,8 @@ public sealed class TransformerModel : IDisposable
             _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _wv[l].Shape, _wv[l].Format), _v);
             AddBias(_v, _biasV[l]);
 
-            // Resolved QK-norm mode: each q and k head is normalized in its own head-dimension slice, after the
-            // projection and bias and before RoPE.
+            // Resolved QK-norm mode: each side's projected stream is normalized after the projection and bias and
+            // before RoPE, either per head in its own head-dimension slice or across all its heads under one mean.
             ApplyQkNorm(_q, _attnQNorm[l]);
             ApplyQkNorm(_k, _attnKNorm[l]);
 
@@ -1204,18 +1222,26 @@ public sealed class TransformerModel : IDisposable
         }
     }
 
-    // Per-head QK-norm runs as a direct call chosen from the plan's resolved mode, exactly as the norm and activation
+    // The resolved QK-norm form runs as a direct call chosen from the plan's mode, exactly as the norm and activation
     // strategies do: no interface dispatch and no allocation anywhere in the forward, so every path — single token,
     // batched decode, and encode — applies the resolved form identically between each head's projection (plus any bias)
-    // and its rotation. The weighted variant consumes the layer's per-head vector; the unweighted variant normalizes with
-    // the plan epsilon alone, which is numerically identical to a weight of ones and reads nothing from the file; off
-    // leaves every head region untouched. Each form normalizes in place: it finishes reading a value before writing back at that index.
+    // and its rotation. The per-head weighted variant consumes the layer's head-dimension vector over each head region;
+    // the stream-weighted variant consumes one whole-projection vector and normalizes every head of q (or of k) under a
+    // single mean across that side's full width, which is what the reference does before splitting its projection into
+    // heads. The unweighted variant normalizes with the plan epsilon alone, which is numerically identical to a weight
+    // of ones and reads nothing from the file; off leaves every head region untouched. Each form normalizes in place: it finishes reading a value before writing back at that index.
     private void ApplyQkNorm(Span<float> heads, ReadOnlySpan<float> weight)
     {
         switch (Plan.QkNorm)
         {
             case QkNormMode.PerHeadWeighted:
                 LayerOps.RmsNormWeightedHeads(heads, weight, Plan.HeadDim, Plan.EpsRmsNorm, heads);
+                break;
+
+            case QkNormMode.StreamWeighted:
+                // One mean over the whole q (or k) projection and one element-by-element vector covering that same
+                // width: every head is scaled by its own weights but normalized jointly with the other heads.
+                LayerOps.RmsNormWeighted(heads, weight, Plan.EpsRmsNorm, heads);
                 break;
 
             case QkNormMode.PerHeadUnweighted:
@@ -1226,7 +1252,7 @@ public sealed class TransformerModel : IDisposable
                 return;
 
             default:
-                throw new ModelException($"per-head QK-norm mode '{Plan.QkNorm}' is not implemented by the forward engine");
+                throw new ModelException($"QK-norm mode '{Plan.QkNorm}' is not implemented by the forward engine");
         }
     }
 
@@ -1661,17 +1687,17 @@ public sealed class TransformerModel : IDisposable
     {
         LogicalTensor gate = _moeExpertGate[layer];
         ReadOnlySpan<byte> payload = _weights.Resolve(gate);
-        _backend.Gemv(_normed.AsSpan(0, Plan.HiddenSize), ExpertWeightRef(payload, _moeExpertGateBytes, expertIndex, _moeExpertGateShape, gate.Format), _gateUp);
+        _backend.Gemv(_normed.AsSpan(0, Plan.HiddenSize), ExpertWeightRef(payload, _moeExpertGateBytes[layer], expertIndex, _moeExpertGateShape, gate.Format), _gateUp);
 
         LogicalTensor up = _moeExpertUp[layer];
         payload = _weights.Resolve(up);
-        _backend.Gemv(_normed.AsSpan(0, Plan.HiddenSize), ExpertWeightRef(payload, _moeExpertUpBytes, expertIndex, _moeExpertUpShape, up.Format), _up);
+        _backend.Gemv(_normed.AsSpan(0, Plan.HiddenSize), ExpertWeightRef(payload, _moeExpertUpBytes[layer], expertIndex, _moeExpertUpShape, up.Format), _up);
 
         ApplyActivation(_gateUp.AsSpan(0, Plan.IntermediateSize), _up.AsSpan(0, Plan.IntermediateSize));
 
         LogicalTensor down = _moeExpertDown[layer];
         payload = _weights.Resolve(down);
-        _backend.Gemv(_gateUp.AsSpan(0, Plan.IntermediateSize), ExpertWeightRef(payload, _moeExpertDownBytes, expertIndex, _moeExpertDownShape, down.Format), output);
+        _backend.Gemv(_gateUp.AsSpan(0, Plan.IntermediateSize), ExpertWeightRef(payload, _moeExpertDownBytes[layer], expertIndex, _moeExpertDownShape, down.Format), output);
     }
 
     // The shared expert's dense-shaped triplet over a single activation vector: the same gate/up/down GEMVs the dense
@@ -1767,11 +1793,11 @@ public sealed class TransformerModel : IDisposable
 
         LogicalTensor gate = _moeExpertGate[layer];
         ReadOnlySpan<byte> payload = _weights.Resolve(gate);
-        _backend.GemvBatch(subsetIn, count, ExpertWeightRef(payload, _moeExpertGateBytes, expertIndex, _moeExpertGateShape, gate.Format), _batchGateUp.AsSpan(0, count * inter));
+        _backend.GemvBatch(subsetIn, count, ExpertWeightRef(payload, _moeExpertGateBytes[layer], expertIndex, _moeExpertGateShape, gate.Format), _batchGateUp.AsSpan(0, count * inter));
 
         LogicalTensor up = _moeExpertUp[layer];
         payload = _weights.Resolve(up);
-        _backend.GemvBatch(subsetIn, count, ExpertWeightRef(payload, _moeExpertUpBytes, expertIndex, _moeExpertUpShape, up.Format), _batchUp.AsSpan(0, count * inter));
+        _backend.GemvBatch(subsetIn, count, ExpertWeightRef(payload, _moeExpertUpBytes[layer], expertIndex, _moeExpertUpShape, up.Format), _batchUp.AsSpan(0, count * inter));
 
         for (int m = 0; m < count; m++)
         {
@@ -1780,7 +1806,7 @@ public sealed class TransformerModel : IDisposable
 
         LogicalTensor down = _moeExpertDown[layer];
         payload = _weights.Resolve(down);
-        _backend.GemvBatch(_batchGateUp.AsSpan(0, count * inter), count, ExpertWeightRef(payload, _moeExpertDownBytes, expertIndex, _moeExpertDownShape, down.Format), subsetIn);
+        _backend.GemvBatch(_batchGateUp.AsSpan(0, count * inter), count, ExpertWeightRef(payload, _moeExpertDownBytes[layer], expertIndex, _moeExpertDownShape, down.Format), subsetIn);
 
         for (int m = 0; m < count; m++)
         {

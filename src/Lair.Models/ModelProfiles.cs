@@ -62,6 +62,32 @@ public static class ModelProfiles
         ExpertWeightsScale: 0f,
         NormalizeExpertWeights: false);
 
+    // The reference olmoe block routes every token through a per-layer router matrix over its experts and adds no
+    // shared expert at all, so this shape names the router and the stacked gate/up/down triplets and none of the
+    // shared-expert roles. Its counts come from the file's declared metadata like every other sparse shape, so they
+    // stay zero here; the reference reads no routing-weight gain or renormalization for this family either — a real
+    // olmoe conversion declares neither key, which resolves to scale 0f (disabled) and normalization off.
+    private static readonly SparseFfnDescriptor OlmoeSparseFfn = new(
+        ExpertCount: 0,
+        RoutedExpertsPerToken: 0,
+        HasSharedExpert: false,
+        RouterRole: TensorRole.MoeRouter,
+        ExpertGateRole: TensorRole.MoeExpertGate,
+        ExpertUpRole: TensorRole.MoeExpertUp,
+        ExpertDownRole: TensorRole.MoeExpertDown,
+        SharedGateRole: null,
+        SharedUpRole: null,
+        SharedDownRole: null,
+        // The reference olmoe block ships no shared expert at all, so it names neither its matrices nor a gate.
+        SharedInputGateRole: null,
+        Layout: SparseFfnLayout.StackedExperts,
+        Rank: null,
+        ExpertInputBasisRole: TensorRole.MoeExpertInputBasis,
+        ExpertCoefficientRole: TensorRole.MoeExpertCoefficients,
+        ExpertOutputBasisRole: TensorRole.MoeExpertOutputBasis,
+        ExpertWeightsScale: 0f,
+        NormalizeExpertWeights: false);
+
     private static readonly ModelProfile[] Profiles =
     [
         new ModelProfile
@@ -165,6 +191,26 @@ public static class ModelProfiles
             Bias = BiasPolicy.Declared,
             Rope = RopeStrategy.RotateHalfFullHead,
             DefaultQkNorm = QkNormMode.PerHeadWeighted,
+            NormPlacement = NormPlacement.PreOnly,
+            Tensors = MoeTensors(),
+        },
+        new ModelProfile
+        {
+            Architecture = "olmoe",
+            Prefix = "olmoe.",
+            // The reference olmoe block routes every token through a per-layer router over its experts with no shared
+            // expert, and normalizes each layer's projected q and k the way its graph does: one RMS norm over the whole
+            // projection — before the heads are split — scaled element by element by that layer's hidden-sized vector.
+            // The file ships those vectors whether or not it declares the feature, so the profile defaults the mode to
+            // the stream-weighted form; a declared attention.use_qk_norm=false still turns it off.
+            SparseFfn = OlmoeSparseFfn,
+            Norm = NormStrategy.RmsNorm,
+            Activation = ActivationStrategy.SwiGLU,
+            Bias = BiasPolicy.Declared,
+            // The reference reads no rope pairing declaration for this family and its graph asserts the rotation covers
+            // each head in full, which is the adjacent-pair layout it applies to a file that declares none.
+            Rope = RopeStrategy.StandardFullHead,
+            DefaultQkNorm = QkNormMode.StreamWeighted,
             NormPlacement = NormPlacement.PreOnly,
             Tensors = MoeTensors(),
         },
