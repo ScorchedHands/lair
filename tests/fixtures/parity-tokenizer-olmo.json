@@ -6,7 +6,7 @@
   "add_space_prefix": true,
   "llama_cpp_tag": "b12032",
   "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
-  "reference_mode": "llama-server /tokenize with add_special=false and parse_special=false — the same surface LAIR's GgufTokenizer.Encode exposes (no BOS, no special-token parsing). tokens are the reference id sequence and tokens_str the pieces the reference resolved them to; the parity tests assert LAIR's Encode matches id-for-id. Cases are plain text so a mismatch is a tokenizer mismatch, not a special-token one.",
+  "reference_mode": "Plain-text cases captured from llama-server /tokenize with add_special=false and parse_special=false. ChatML prompt goldens were pinned separately with tools/llama.cpp/b12032/llama-tokenize.exe --no-bos --ids --show-count -f <file> against exact raw/rendered chat prompts; the parity tests assert LAIR's Encode matches id-for-id.",
   "generated_utc": "2026-11-11T17:48:41Z",
   "cases": [
     {
@@ -203,6 +203,74 @@
       "content": " ",
       "tokens": [
         209
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "chatml_raw_no_trailing",
+      "content": "<|endoftext|><|user|\nWhat is 2 + 2? Answer only the number.\n<|assistant|>",
+      "tokens": [
+        50279,
+        29,
+        93,
+        4537,
+        93,
+        187,
+        1276,
+        310,
+        374,
+        559,
+        374,
+        32,
+        37741,
+        760,
+        253,
+        1180,
+        15,
+        187,
+        29,
+        93,
+        515,
+        5567,
+        49651
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "chatml_rendered",
+      "content": "<|endoftext|>\n\n<|user|>\nWhat is 2 + 2? Answer only the number.\n\n\n<|assistant|>\n\n",
+      "tokens": [
+        50279,
+        187,
+        187,
+        29,
+        93,
+        4537,
+        49651,
+        187,
+        1276,
+        310,
+        374,
+        559,
+        374,
+        32,
+        37741,
+        760,
+        253,
+        1180,
+        15,
+        535,
+        187,
+        29,
+        93,
+        515,
+        5567,
+        49651,
+        535
       ],
       "tokens_str": [
         null

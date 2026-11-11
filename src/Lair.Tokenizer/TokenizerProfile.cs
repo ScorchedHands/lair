@@ -88,11 +88,10 @@ internal static class TokenizerProfiles
         new TokenizerProfile
         {
             PreKey = "olmo",
-            // The olmo vocabulary is byte-level GPT-2 BPE with the family's own pre-split rules; this entry starts
-            // from the gpt2 form and its split strategy is pinned by tests/fixtures/parity-tokenizer-olmo.json, which
-            // captures the reference /tokenize id sequences for this exact file.
-            Split = SplitGpt2,
-            IgnoreMerges = false,
+            // The olmo vocabulary is byte-level GPT-2 BPE with the family's own pre-split rules: ChatML/math
+            // delimiters stay in the symbol alternative instead of falling through to undefined-character splits.
+            Split = SplitOlmo,
+            IgnoreMerges = true,
             CleanSpaces = true,
             AddBosDefault = false,
             // The pinned olmo fixture declares its own bos/eos ids (50279), so these family-convention fallbacks
@@ -165,7 +164,11 @@ internal static class TokenizerProfiles
         return next;
     }
 
-    private static List<int> SplitGpt2(string text, List<int> offsets)
+    private static List<int> SplitOlmo(string text, List<int> offsets) => SplitByteLevel(text, offsets, allowMathSymbols: true);
+
+    private static List<int> SplitGpt2(string text, List<int> offsets) => SplitByteLevel(text, offsets, allowMathSymbols: false);
+
+    private static List<int> SplitByteLevel(string text, List<int> offsets, bool allowMathSymbols)
     {
         List<int> words = [];
         int start = 0;
@@ -254,15 +257,15 @@ internal static class TokenizerProfiles
                 }
 
                 int symbolStart = pos;
-                if (text[pos] == ' ' && pos + 1 < end && IsGpt2Symbol(text, pos + 1))
+                if (text[pos] == ' ' && pos + 1 < end && IsByteLevelSymbol(text, pos + 1, allowMathSymbols))
                 {
                     symbolStart = pos + 1;
                 }
 
-                if (IsGpt2Symbol(text, symbolStart))
+                if (IsByteLevelSymbol(text, symbolStart, allowMathSymbols))
                 {
                     pos = symbolStart;
-                    while (pos < end && IsGpt2Symbol(text, pos))
+                    while (pos < end && IsByteLevelSymbol(text, pos, allowMathSymbols))
                     {
                         pos += CodepointLength(text, pos);
                     }
@@ -494,6 +497,17 @@ internal static class TokenizerProfiles
             && !IsLetterAt(text, pos)
             && !IsNumberAt(text, pos)
             && !IsUndefined(CategoryAt(text, pos));
+    }
+
+    private static bool IsByteLevelSymbol(string text, int pos, bool allowMathSymbols)
+    {
+        if (pos >= text.Length || char.IsWhiteSpace(text, pos) || IsLetterAt(text, pos) || IsNumberAt(text, pos))
+        {
+            return false;
+        }
+
+        UnicodeCategory category = CategoryAt(text, pos);
+        return !IsUndefined(category) || allowMathSymbols && category == UnicodeCategory.MathSymbol;
     }
 
     private static bool IsLlama3Symbol(string text, int pos)

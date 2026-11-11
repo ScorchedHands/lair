@@ -27,6 +27,7 @@ public sealed class TokenizerParityTests
     [Fact]
     public void Llama32_Encode_MatchesPinnedTokenizeOracle() => AssertFixture(Llama32Fixture);
 
+    // The olmo fixture mixes plain-text server /tokenize goldens with pinned ChatML prompt goldens captured from llama-tokenize.exe --no-bos ... because chat prompts expose declared control tokens; LAIR's Encode matches both id-for-id after the olmo profile split fix.
     [Fact]
     public void Olmo_Encode_MatchesPinnedTokenizeOracle() => AssertFixture(OlmoFixture);
 
