@@ -8,7 +8,7 @@
     "context": 1024,
     "temperature": 0.0
   },
-  "generated_utc": "2026-11-01T12:35:01Z",
+  "generated_utc": "2026-11-11T00:57:40Z",
   "prompts": [
     {
       "prompt": "The capital of France is",
@@ -122,39 +122,39 @@
       ]
     },
     {
-      "prompt": "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n",
+      "prompt": "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
       "max_tokens": 48,
-      "output": "The given equation is not a simple linear equation. It is a quadratic equation in the form of $ax^2 + bx + c = 0$. To solve it, we can use the quadratic formula:\n\n$$x =",
+      "output": "Mars is a planet that is not a star. It is a rocky planet with a thick atmosphere and a surface temperature of around 400°C. Mars is not a star because it is not a star. It is a planet",
       "top_logprobs": [
+        {
+          "id": 38861,
+          "token": "Mars",
+          "logprob": -0.9490194320678711,
+          "lair_logprob": -0.9494
+        },
         {
           "id": 504,
           "token": "The",
-          "logprob": -1.6995388269424438,
-          "lair_logprob": -1.7006
+          "logprob": -1.7382726669311523,
+          "lair_logprob": -1.7375
         },
         {
-          "id": 4239,
-          "token": "Let",
-          "logprob": -2.080674886703491,
-          "lair_logprob": -2.0813
+          "id": 198,
+          "token": "\n",
+          "logprob": -2.7723817825317383,
+          "lair_logprob": -2.7734
         },
         {
-          "id": 2068,
-          "token": "To",
-          "logprob": -2.287137508392334,
-          "lair_logprob": -2.2872
+          "id": 57,
+          "token": "I",
+          "logprob": -2.9464330673217773,
+          "lair_logprob": -2.9482
         },
         {
           "id": 788,
           "token": "In",
-          "logprob": -2.420670986175537,
-          "lair_logprob": -2.4195
-        },
-        {
-          "id": 1882,
-          "token": "We",
-          "logprob": -2.614043712615967,
-          "lair_logprob": -2.6145
+          "logprob": -3.930281639099121,
+          "lair_logprob": -3.9294
         }
       ]
     }

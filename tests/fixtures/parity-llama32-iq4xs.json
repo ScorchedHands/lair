@@ -1,0 +1,162 @@
+{
+  "model_file": "models/Llama-3.2-1B-Instruct-IQ4_XS.gguf",
+  "model_sha256": "69e85c871a13a99e4008c09916a957d170e4e5623a5b2e06be46408029a7afba",
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
+  "decode": {
+    "context": 1024,
+    "temperature": 0.0
+  },
+  "generated_utc": "2026-11-11T01:10:23Z",
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "max_tokens": 48,
+      "output": " Paris. The Eiffel Tower is located in Paris. The Eiffel Tower is one of the most famous landmarks in the world. It was built for the 1889 World's Fair. The tower stands at 324 meters tall",
+      "top_logprobs": [
+        {
+          "id": 12366,
+          "token": " Paris",
+          "logprob": -0.378044992685318,
+          "lair_logprob": -0.3892
+        },
+        {
+          "id": 264,
+          "token": " a",
+          "logprob": -3.05916690826416,
+          "lair_logprob": -3.0068
+        },
+        {
+          "id": 539,
+          "token": " not",
+          "logprob": -3.595228910446167,
+          "lair_logprob": -3.5218
+        },
+        {
+          "id": 1131,
+          "token": "...",
+          "logprob": -4.355195045471191,
+          "lair_logprob": -4.353
+        },
+        {
+          "id": 279,
+          "token": " the",
+          "logprob": -4.404899597167969,
+          "lair_logprob": -4.4165
+        }
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "max_tokens": 48,
+      "output": ", in a small village nestled in the rolling hills of the countryside, there lived a young girl named Sophia. Sophia was a curious and adventurous child, with a mop of curly brown hair and a smile that could light up the darkest of rooms",
+      "top_logprobs": [
+        {
+          "id": 11,
+          "token": ",",
+          "logprob": -0.06684283912181854,
+          "lair_logprob": -0.0617
+        },
+        {
+          "id": 304,
+          "token": " in",
+          "logprob": -3.0210626125335693,
+          "lair_logprob": -3.1572
+        },
+        {
+          "id": 1070,
+          "token": " there",
+          "logprob": -5.09861946105957,
+          "lair_logprob": -4.9746
+        },
+        {
+          "id": 1131,
+          "token": "...",
+          "logprob": -5.5790324211120605,
+          "lair_logprob": -5.5825
+        },
+        {
+          "id": 9522,
+          "token": "...\n",
+          "logprob": -6.476528167724609,
+          "lair_logprob": -6.4995
+        }
+      ]
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "max_tokens": 48,
+      "output": "    \"\"\"\n    This function generates the Fibonacci sequence up to the nth number.\n    \n    Args:\n    n (int): The number of Fibonacci numbers to generate.\n    \n    Returns:\n    list: A list of Fibonacci numbers.\n    \"\"\"\n   ",
+      "top_logprobs": [
+        {
+          "id": 262,
+          "token": "   ",
+          "logprob": -0.005209701135754585,
+          "lair_logprob": -0.0055
+        },
+        {
+          "id": 220,
+          "token": " ",
+          "logprob": -5.445242881774902,
+          "lair_logprob": -5.3954
+        },
+        {
+          "id": 197,
+          "token": "\t",
+          "logprob": -8.14057731628418,
+          "lair_logprob": -8.3694
+        },
+        {
+          "id": 1084,
+          "token": "    \n",
+          "logprob": -8.338260650634766,
+          "lair_logprob": -8.2267
+        },
+        {
+          "id": 748,
+          "token": "\tif",
+          "logprob": -9.298269271850586,
+          "lair_logprob": -9.3483
+        }
+      ]
+    },
+    {
+      "prompt": "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
+      "max_tokens": 48,
+      "output": "Mars is often referred to as the \"Red Planet\" due to its reddish appearance, which is caused by iron oxide in the planet's soil.",
+      "top_logprobs": [
+        {
+          "id": 44,
+          "token": "M",
+          "logprob": -0.2958497703075409,
+          "lair_logprob": -0.2682
+        },
+        {
+          "id": 791,
+          "token": "The",
+          "logprob": -1.686945915222168,
+          "lair_logprob": -1.8001
+        },
+        {
+          "id": 53,
+          "token": "V",
+          "logprob": -4.141074180603027,
+          "lair_logprob": -4.0384
+        },
+        {
+          "id": 2169,
+          "token": "Pl",
+          "logprob": -4.676278114318848,
+          "lair_logprob": -4.6018
+        },
+        {
+          "id": 62066,
+          "token": "NASA",
+          "logprob": -5.153740882873535,
+          "lair_logprob": -4.6784
+        }
+      ]
+    }
+  ]
+}

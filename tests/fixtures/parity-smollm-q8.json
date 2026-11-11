@@ -8,7 +8,7 @@
     "context": 1024,
     "temperature": 0.0
   },
-  "generated_utc": "2026-11-01T12:35:23Z",
+  "generated_utc": "2026-11-11T00:58:09Z",
   "prompts": [
     {
       "prompt": "The capital of France is",
@@ -122,39 +122,39 @@
       ]
     },
     {
-      "prompt": "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n",
+      "prompt": "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
       "max_tokens": 48,
-      "output": "The equation $x^2 + 1 = 0$ has no real solutions. This is because the discriminant of the quadratic equation $x^2 + 1 = 0$ is $(-1)^2 = 1",
+      "output": "Mars is a planet that is not a star. It is a rocky planet with a thick atmosphere and a small, rocky core. Mars is not a star because it is not a star. It is a planet that is not a star because",
       "top_logprobs": [
+        {
+          "id": 38861,
+          "token": "Mars",
+          "logprob": -1.298050045967102,
+          "lair_logprob": -0.9284
+        },
         {
           "id": 504,
           "token": "The",
-          "logprob": -1.7102593183517456,
-          "lair_logprob": -1.6445
-        },
-        {
-          "id": 4239,
-          "token": "Let",
-          "logprob": -2.0433130264282227,
-          "lair_logprob": -2.1438
-        },
-        {
-          "id": 2068,
-          "token": "To",
-          "logprob": -2.23140811920166,
-          "lair_logprob": -2.2939
-        },
-        {
-          "id": 788,
-          "token": "In",
-          "logprob": -2.4007654190063477,
-          "lair_logprob": -2.4281
+          "logprob": -1.4260730743408203,
+          "lair_logprob": -1.6656
         },
         {
           "id": 198,
           "token": "\n",
-          "logprob": -2.805619239807129,
-          "lair_logprob": -2.6869
+          "logprob": -2.4701709747314453,
+          "lair_logprob": -2.953
+        },
+        {
+          "id": 57,
+          "token": "I",
+          "logprob": -2.921213150024414,
+          "lair_logprob": -3.0701
+        },
+        {
+          "id": 33,
+          "token": "1",
+          "logprob": -3.9194774627685547,
+          "lair_logprob": -4.273
         }
       ]
     }

@@ -5,10 +5,10 @@
   "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
   "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
   "decode": {
-    "context": 1024,
-    "temperature": 0.0
+    "temperature": 0.0,
+    "context": 1024
   },
-  "generated_utc": "2026-11-09T12:02:39Z",
+  "generated_utc": "2026-11-11T01:07:38Z",
   "prompts": [
     {
       "prompt": "The capital of France is",
@@ -122,39 +122,39 @@
       ]
     },
     {
-      "prompt": "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n",
+      "prompt": "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
       "max_tokens": 48,
-      "output": "Hello, how can I assist you today?",
+      "output": "Mars is the planet that is often referred to as the \"Red Planet\" due to its reddish appearance in the sky. It is located in the outer solar system, and is the only planet in our solar system that is not part",
       "top_logprobs": [
         {
-          "id": 9906,
-          "token": "Hello",
-          "logprob": -0.8404862880706787,
-          "lair_logprob": -1.8285
+          "id": 44,
+          "token": "M",
+          "logprob": -0.19537484645843506,
+          "lair_logprob": -0.2275
+        },
+        {
+          "id": 791,
+          "token": "The",
+          "logprob": -2.7109885215759277,
+          "lair_logprob": -2.9057
+        },
+        {
+          "id": 8586,
+          "token": "Here",
+          "logprob": -3.7321486473083496,
+          "lair_logprob": -3.6904
         },
         {
           "id": 27,
           "token": "<",
-          "logprob": -1.4952600002288818,
-          "lair_logprob": -0.7994
+          "logprob": -4.642245769500732,
+          "lair_logprob": -3.7839
         },
         {
-          "id": 13347,
-          "token": "Hi",
-          "logprob": -3.072273015975952,
-          "lair_logprob": -3.6587
-        },
-        {
-          "id": 2675,
-          "token": "You",
-          "logprob": -3.226003408432007,
-          "lair_logprob": -2.9827
-        },
-        {
-          "id": 19182,
-          "token": "Hey",
-          "logprob": -3.3699214458465576,
-          "lair_logprob": -4.1271
+          "id": 40,
+          "token": "I",
+          "logprob": -4.747182369232178,
+          "lair_logprob": -4.4459
         }
       ]
     }

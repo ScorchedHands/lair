@@ -5,10 +5,10 @@
   "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
   "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
   "decode": {
-    "temperature": 0.0,
-    "context": 1024
+    "context": 1024,
+    "temperature": 0.0
   },
-  "generated_utc": "2026-11-09T22:12:13Z",
+  "generated_utc": "2026-11-11T01:01:35Z",
   "prompts": [
     {
       "prompt": "The capital of France is",
@@ -122,39 +122,39 @@
       ]
     },
     {
-      "prompt": "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n",
+      "prompt": "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
       "max_tokens": 48,
-      "output": "<think>\nOkay, the user just said \"Hello\". I need to respond appropriately. Since they didn't ask a specific question, I should acknowledge their greeting and offer help. Let me make sure to keep it friendly and open-ended. Maybe",
+      "output": "<think>\nOkay, the user wants a single sentence about Mars. Let me start by recalling what I know. Mars is the fourth planet from the Sun, right? It's known for its red color, which is a key feature. I",
       "top_logprobs": [
         {
           "id": 151667,
           "token": "<think>",
-          "logprob": -0.00031583529198542237,
-          "lair_logprob": -0.0004
-        },
-        {
-          "id": 151644,
-          "token": "",
-          "logprob": -9.454272270202637,
-          "lair_logprob": -9.4579
-        },
-        {
-          "id": 151668,
-          "token": "</think>",
-          "logprob": -10.314248085021973,
-          "lair_logprob": -10.3525
-        },
-        {
-          "id": 2784,
-          "token": " hum",
-          "logprob": -10.4544038772583,
-          "lair_logprob": -10.5301
+          "logprob": -0.0006713736220262945,
+          "lair_logprob": -0.0008
         },
         {
           "id": 80135,
           "token": "iquement",
-          "logprob": -10.890162467956543,
-          "lair_logprob": -10.8161
+          "logprob": -9.854272842407227,
+          "lair_logprob": -10.4503
+        },
+        {
+          "id": 151644,
+          "token": "",
+          "logprob": -10.032901763916016,
+          "lair_logprob": -10.1206
+        },
+        {
+          "id": 151645,
+          "token": "",
+          "logprob": -10.579061508178711,
+          "lair_logprob": -10.6498
+        },
+        {
+          "id": 151668,
+          "token": "</think>",
+          "logprob": -10.760591506958008,
+          "lair_logprob": -10.667
         }
       ]
     }
