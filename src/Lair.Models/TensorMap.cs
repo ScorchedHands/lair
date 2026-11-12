@@ -11,6 +11,15 @@ namespace Lair.Models;
 public enum TensorRole
 {
     TokenEmbedding,
+
+    /// <summary>
+    /// One layer's fused q/k/v projection buffer: a single matrix whose rows are every head of q, then every head of k,
+    /// then every head of v. Only a family whose conversion ships that layout names it, and the engine reads each side
+    /// as its own slice rather than splitting the tensor into three matrices — see <see cref="QkvLayout"/>. A profile
+    /// whose block projects through three separate tensors leaves this role out of its map entirely.
+    /// </summary>
+    AttentionQkv,
+
     AttentionQuery,
     AttentionKey,
     AttentionValue,
@@ -125,9 +134,10 @@ public sealed record TensorDescriptor(
 }
 
 /// <summary>
-/// A profile's complete tensor map: exactly one <see cref="TensorDescriptor"/> per <see cref="TensorRole"/>
-/// except the sparse-FFN roles, which a dense profile leaves out of its map entirely, resolved once at load
-/// and carried immutably by the <see cref="ModelPlan"/>. The forward engine looks tensors up through this map
+/// A profile's complete tensor map: exactly one <see cref="TensorDescriptor"/> per <see cref="TensorRole"/> except the
+/// roles a family's block may not ship at all — the sparse-FFN roles, which a dense profile leaves out of its map
+/// entirely, and the fused qkv buffer, which only a family projecting through one fused tensor names. Resolved once
+/// at load and carried immutably by the <see cref="ModelPlan"/>. The forward engine looks tensors up through this map
 /// instead of through hardcoded name suffixes.
 /// </summary>
 public sealed class TensorMap
@@ -151,15 +161,15 @@ public sealed class TensorMap
 
         foreach (TensorRole role in Enum.GetValues<TensorRole>())
         {
-            if (_byRole[(int)role] is null && !IsSparseRole(role))
+            if (_byRole[(int)role] is null && !IsProfileOptionalRole(role))
             {
                 throw new ModelException($"tensor map is missing a descriptor for role '{role}'");
             }
         }
 
-        // Sparse roles stay absent from a dense profile's map: the map names only the tensors its forward can
-        // consume, so a dense map carries no router or expert descriptors and a tensor under a sparse name is
-        // material its map cannot match.
+        // Sparse and fused-layout roles stay absent from a profile whose block ships none of them: the map names only
+        // the tensors its forward can consume, so such a map carries no router, expert, or fused-qkv descriptor and a
+        // tensor under one of those names is material its map cannot match.
         List<TensorDescriptor> declared = [];
         foreach (TensorDescriptor descriptor in _byRole)
         {
@@ -197,4 +207,13 @@ public sealed class TensorMap
             or TensorRole.MoeExpertInputBasis
             or TensorRole.MoeExpertCoefficients
             or TensorRole.MoeExpertOutputBasis;
+
+    /// <summary>
+    /// Whether a profile's map may leave this role out entirely: the sparse-FFN roles above, which no dense block ships,
+    /// and <see cref="TensorRole.AttentionQkv"/>, which only a family whose conversion fuses q/k/v into one tensor names.
+    /// A map that omits such a role has no name to resolve for it, so nothing may ask the indexer for its descriptor;
+    /// every profile today either consumes the fused layout or leaves the role undeclared.
+    /// </summary>
+    public static bool IsProfileOptionalRole(TensorRole role) =>
+        IsSparseRole(role) || role == TensorRole.AttentionQkv;
 }

@@ -1,0 +1,217 @@
+{
+  "model_file": "models/gemma-2-2b-it.Q4_K_M.gguf",
+  "model_sha256": "ff7c35808d3b2fc5c4f955ca931efdec71c0808b9ec89a9878cb771608787058",
+  "pre": "default",
+  "add_bos": true,
+  "add_space_prefix": false,
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "llama-server /tokenize with add_special=false and parse_special=false — the same surface LAIR's GgufTokenizer.Encode exposes (no BOS, no special-token parsing). tokens are the reference id sequence and tokens_str the pieces the reference resolved them to; the parity tests assert LAIR's Encode matches id-for-id. Cases are plain text so a mismatch is a tokenizer mismatch, not a special-token one.",
+  "generated_utc": "2026-11-12T13:30:54Z",
+  "cases": [
+    {
+      "name": "hello_world",
+      "content": "Hello, world!",
+      "tokens": [
+        4521,
+        235269,
+        2134,
+        235341
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "leading_space",
+      "content": " world",
+      "tokens": [
+        2134
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "leading_space_punct",
+      "content": " world!",
+      "tokens": [
+        2134,
+        235341
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "ascii_sentence",
+      "content": "The quick brown fox jumps over the lazy dog.",
+      "tokens": [
+        651,
+        4320,
+        8426,
+        25341,
+        36271,
+        1163,
+        573,
+        27894,
+        5929,
+        235265
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "digits",
+      "content": "1234567890 42 3.14159",
+      "tokens": [
+        235274,
+        235284,
+        235304,
+        235310,
+        235308,
+        235318,
+        235324,
+        235321,
+        235315,
+        235276,
+        235248,
+        235310,
+        235284,
+        235248,
+        235304,
+        235265,
+        235274,
+        235310,
+        235274,
+        235308,
+        235315
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "newline_tab",
+      "content": "line1\nline2\ttabbed\r\ncrlf",
+      "tokens": [
+        703,
+        235274,
+        108,
+        703,
+        235284,
+        226,
+        1189,
+        2907,
+        235316,
+        108,
+        204132,
+        235266
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "multibyte",
+      "content": "café ☕ 你好 — über",
+      "tokens": [
+        81453,
+        235248,
+        241275,
+        30485,
+        235607,
+        2062,
+        5149
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "emoji",
+      "content": "emoji 😀🎉 test",
+      "tokens": [
+        62400,
+        79937,
+        239548,
+        2121
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "repeated_words",
+      "content": "the the the the the the the the the the",
+      "tokens": [
+        1175,
+        573,
+        573,
+        573,
+        573,
+        573,
+        573,
+        573,
+        573,
+        573
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "long_prompt",
+      "content": "You are a helpful assistant. Answer the question concisely.\nQuestion: What is the capital of France?\nAnswer:",
+      "tokens": [
+        2045,
+        708,
+        476,
+        10055,
+        20409,
+        235265,
+        10358,
+        573,
+        2872,
+        66004,
+        605,
+        235265,
+        108,
+        9413,
+        235292,
+        2439,
+        603,
+        573,
+        6037,
+        576,
+        6081,
+        235336,
+        108,
+        1261,
+        235292
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "empty",
+      "content": "",
+      "tokens": [],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "single_space",
+      "content": " ",
+      "tokens": [
+        235248
+      ],
+      "tokens_str": [
+        null
+      ]
+    }
+  ]
+}

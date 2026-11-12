@@ -296,9 +296,14 @@ public sealed class GgufTokenizerTests : IDisposable
     [Fact]
     public void FromGguf_UnsupportedModel_ThrowsWithItsName()
     {
-        byte[] image = BuildSyntheticImage(model: "llama");
+        // 'wander22' names a vocabulary type the registry does not implement; 'llama' and 'spm'
+        // resolve to the SentencePiece implementation, so this rejection needs its own unknown key.
+        byte[] image = BuildSyntheticImage(model: "wander22");
         GgufException ex = Assert.Throws<GgufException>(() => GgufTokenizer.FromGguf(GgufFile.Open(WriteTemp(image))));
-        Assert.Contains("tokenizer.ggml.model is 'llama'", ex.Message);
+        Assert.Contains("tokenizer.ggml.model is 'wander22'", ex.Message);
+
+        // The supported list is sourced from the vocabulary registry itself.
+        Assert.Contains("(supported: 'llama', 'spm', 'gpt2', 'llama-bpe')", ex.Message);
     }
 
     [Fact]

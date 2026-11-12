@@ -10,7 +10,8 @@ namespace Lair.Models;
 /// Metadata keys follow the canonical GGUF naming (<c>&lt;prefix&gt;embedding_length</c>,
 /// <c>&lt;prefix&gt;block_count</c>, <c>&lt;prefix&gt;attention.head_count</c>,
 /// <c>&lt;prefix&gt;attention.head_count_kv</c>, <c>&lt;prefix&gt;feed_forward_length</c>,
-/// <c>&lt;prefix&gt;rope.freq_base</c>, <c>&lt;prefix&gt;attention.layer_norm_rms_epsilon</c>,
+/// <c>&lt;prefix&gt;rope.freq_base</c>, <c>&lt;prefix&gt;rope.freq_base_swa</c>,
+/// <c>&lt;prefix&gt;attention.layer_norm_rms_epsilon</c>,
 /// <c>&lt;prefix&gt;vocab_size</c>), with <c>&lt;prefix&gt;attention.head_length</c> as the preferred source
 /// for an explicit head dimension and <c>&lt;prefix&gt;attention.key_length</c> /
 /// <c>&lt;prefix&gt;attention.value_length</c> accepted as equivalent sources; the head dimension no longer
@@ -73,6 +74,19 @@ public sealed record ModelPlan
 
     public required float RopeTheta { get; init; }
 
+    /// <summary>
+    /// Declared <c>&lt;prefix&gt;rope.freq_base_swa</c>: the rotary base a layer that carries this plan's attention
+    /// window rotates at. Absent the key it resolves to the same base a file declaring no rotary frequency is read at,
+    /// and a declared value must land in the float range as a positive finite number — anything else fails naming the
+    /// key and the declared value. It reaches only layers <see cref="AttentionWindowForLayer"/> narrows; an unbounded
+    /// layer rotates at <see cref="RopeTheta"/>, and see <see cref="RopeThetaForLayer"/> for what one layer actually
+    /// rotates at. A plan whose every layer is unbounded never consults it.
+    /// </summary>
+    public float RopeWindowedTheta { get; init; } = DefaultRopeTheta;
+
+    /// <summary>The rotary base a file declaring no <c>&lt;prefix&gt;rope.freq_base</c> is read at.</summary>
+    public const float DefaultRopeTheta = 10_000f;
+
     public required float EpsRmsNorm { get; init; }
 
     /// <summary>
@@ -119,9 +133,9 @@ public sealed record ModelPlan
 
     /// <summary>
     /// The resolved profile's window interleave: whether the declared attention window narrows the score range of
-    /// every layer or only the even-indexed layers, leaving the odd-indexed layers unbounded. No metadata key
-    /// decides it. A resolved <see cref="AttentionWindow"/> of <c>0</c> leaves every layer unbounded whatever the
-    /// pattern.
+    /// every layer, only the even-indexed layers leaving the odd-indexed ones unbounded, or all but the last layer of
+    /// each group of six leaving that one unbounded. No metadata key decides it. A resolved <see cref="AttentionWindow"/>
+    /// of <c>0</c> leaves every layer unbounded whatever the pattern.
     /// </summary>
     public WindowInterleave WindowInterleave { get; init; } = WindowInterleave.AllLayers;
 
@@ -129,9 +143,11 @@ public sealed record ModelPlan
     /// The window one layer reads within, resolved here from <see cref="AttentionWindow"/> against
     /// <see cref="WindowInterleave"/> so the plan carries the per-layer value lair.kv's block selection honors: every
     /// layer under <see cref="WindowInterleave.AllLayers"/>, even-indexed layers only under
-    /// <see cref="WindowInterleave.AlternatingLocalFirst"/>, where the odd-indexed layers resolve unbounded. A resolved
-    /// window of <c>0</c> is unbounded whatever the pattern, and a pattern this engine cannot resolve fails naming it
-    /// instead of silently masking some other set of layers. The value bounds what that layer reads; storage stays whole.
+    /// <see cref="WindowInterleave.AlternatingLocalFirst"/>, where the odd-indexed layers resolve unbounded, and all but
+    /// the last layer of each group of six under <see cref="WindowInterleave.SixLayerGroupsLocalFirst"/>, where that
+    /// last layer resolves unbounded. A resolved window of <c>0</c> is unbounded whatever the pattern, and a pattern this
+    /// engine cannot resolve fails naming it instead of silently masking some other set of layers. The value bounds what
+    /// that layer reads; storage stays whole.
     /// </summary>
     public int AttentionWindowForLayer(int layer)
     {
@@ -145,10 +161,22 @@ public sealed record ModelPlan
             case WindowInterleave.AlternatingLocalFirst:
                 return layer % 2 == 0 ? AttentionWindow : 0;
 
+            case WindowInterleave.SixLayerGroupsLocalFirst:
+                return layer % 6 == 5 ? 0 : AttentionWindow;
+
             default:
                 throw new ModelException($"window interleave '{WindowInterleave}' is not implemented by the forward engine");
         }
     }
+
+    /// <summary>
+    /// The rotary base one layer rotates at, resolved here from this plan's pair of bases against its own window so a
+    /// model whose reference graph rotates its windowed layers at a different frequency than its unbounded ones reads
+    /// each layer the way that graph does: <see cref="RopeWindowedTheta"/> for a layer carrying a window,
+    /// <see cref="RopeTheta"/> for one attending the whole range. A plan whose every layer is unbounded resolves to
+    /// <see cref="RopeTheta"/> at every layer whatever the declared second base says.
+    /// </summary>
+    public float RopeThetaForLayer(int layer) => AttentionWindowForLayer(layer) > 0 ? RopeWindowedTheta : RopeTheta;
 
     /// <summary>
     /// The resolved profile's input-embedding gain: <c>sqrt(hidden size)</c> on a profile whose reference graph
@@ -167,6 +195,12 @@ public sealed record ModelPlan
     public required BiasPolicy Bias { get; init; }
 
     public required RopeStrategy Rope { get; init; }
+
+    /// <summary>The resolved profile's q/k/v projection layout: three per-layer matrices the tensor map names one role each, or one fused buffer per layer whose query, key, and value regions the engine reads as slices of that payload. No metadata key decides it.</summary>
+    public required QkvLayout AttentionWeights { get; init; }
+
+    /// <summary>The resolved profile's feed-forward gate side: a gate matrix named by its own tensor role, or the leading rows of this block's up tensor when the conversion ships both halves there and names no gate tensor. No metadata key decides it.</summary>
+    public required FeedForwardGateSource GateSource { get; init; }
 
     /// <summary>
     /// The rope-scaling shape resolved from the file's declared <c>&lt;prefix&gt;rope.scaling.*</c> metadata, or

@@ -163,6 +163,72 @@ public static class ModelProfiles
         },
         new ModelProfile
         {
+            Architecture = "gemma3",
+            Prefix = "gemma3.",
+            // The reference gemma3 graph runs every block norm — pre-sublayer, post-sublayer, and output — as an RMS
+            // norm with the file's layer_norm_rms_epsilon, exactly like its predecessor. It also normalizes each q and
+            // k head inside that sublayer: the conversion ships per-head norm vectors for every layer, so QK-norm
+            // defaults to the weighted mode here rather than staying off until declared.
+            Norm = NormStrategy.RmsNorm,
+            // The reference FFN gates with the exact GELU, not the tanh approximation, as its predecessor's does.
+            Activation = ActivationStrategy.GeGluExact,
+            Bias = BiasPolicy.Declared,
+            // The gemma3 block carries its rotary q/k rows in rotate-half order like the gemma2 and qwen3 blocks do,
+            // so the engine pairs each head's halves rather than adjacent dimensions.
+            Rope = RopeStrategy.RotateHalfFullHead,
+            // This family ships no attention-bias vectors for these checkpoints, and nothing in its reference forward
+            // adds one where they are absent: bias stays declared-only like every other profile, so a declared
+            // use_bias=true still makes each layer's q/k/v vectors required at load.
+            DefaultAttentionBias = false,
+            DefaultQkNorm = QkNormMode.PerHeadWeighted,
+            // The gemma3 block normalizes each sublayer output with its own vector before the residual add like
+            // gemma2 does, which makes every layer's post-sublayer norm tensors required at load.
+            NormPlacement = NormPlacement.PostSublayerOutputs,
+            // The reference scales the token-embedding row by sqrt(hidden size) before the first layer; the conversion
+            // leaves that gain out of the weights, so the engine applies it.
+            ScaleInputEmbeddingsBySqrtHidden = true,
+            // The reference declares this family's window stride itself and reads no per-layer declaration for it: local
+            // attention on four layers in every group of six, full attention on the sixth — so the declared window masks
+            // all but the last layer of each group here. Its logit softcaps stay metadata-only like every other profile:
+            // a file that declares neither cap runs uncapped whatever this entry says about them.
+            WindowInterleave = WindowInterleave.SixLayerGroupsLocalFirst,
+            Tensors = CanonicalTensors(),
+        },
+        new ModelProfile
+        {
+            Architecture = "phi3",
+            Prefix = "phi3.",
+            // The reference phi3 block runs its pre-sublayer and output norms as RMS norms with the file's
+            // layer_norm_rms_epsilon, gates its feed-forward with SiLU over a gate/up pair, and normalizes neither q nor
+            // k per head: the conversion ships no per-head norm vectors for this family. Its attention carries no bias
+            // vector either — the reference block projects each side from weights alone — so bias stays declared-only
+            // like every other profile rather than defaulting on.
+            Norm = NormStrategy.RmsNorm,
+            Activation = ActivationStrategy.SwiGLU,
+            Bias = BiasPolicy.Declared,
+            DefaultQkNorm = QkNormMode.Off,
+            // The reference rotary covers each head in full at the base a file declaring no rope frequency is read at:
+            // this conversion ships no rope scaling keys and no rope-factor tensors for the 4k variant, so the rotation
+            // stays unscaled over the whole head dimension whatever the declared slice says. Its rotary rows sit in
+            // rotate-half order — each head's two halves of every pair, not adjacent dimensions — so the engine pairs the
+            // head halves the way the qwen3 and gemma blocks' rows do.
+            Rope = RopeStrategy.RotateHalfFullHead,
+            // The reference block projects q, k, and v through one fused matrix per layer — its attention reads the query
+            // region of that buffer, then the key region, then the value region — so this profile resolves the fused
+            // layout and names that tensor in its map instead of the three split roles. Its head regions are contiguous:
+            // every head of q first (head_count × head_dim rows), then every head of k (kv_head_count × head_dim rows),
+            // then value again, which is how the conversion writes one linear projection's output columns in order.
+            AttentionWeights = QkvLayout.FusedBufferSlices,
+            // The reference block ships no gate matrix at all: its feed-forward reads one fused gate/up projection whose
+            // first intermediate_size rows are the gate side and next intermediate_size rows are the up side, then gates
+            // with SiLU. This profile resolves that shape so a file carrying only blk.N.ffn_up.weight loads, and a file
+            // shipping a separate gate matrix is reported as material this block does not read.
+            GateSource = FeedForwardGateSource.UpTensorHalves,
+            NormPlacement = NormPlacement.PreOnly,
+            Tensors = PhiTensors(),
+        },
+        new ModelProfile
+        {
             Architecture = "qwen2moe",
             Prefix = "qwen2moe.",
             // The reference qwen2moe block routes every token through a per-layer router matrix over its experts,
@@ -308,6 +374,22 @@ public static class ModelProfiles
             new TensorDescriptor(TensorRole.PostAttentionNorm, TensorScope.PerLayer, "blk.{layer}.post_attention_norm.weight", Required: false, []),
             new TensorDescriptor(TensorRole.PostFeedForwardNorm, TensorScope.PerLayer, "blk.{layer}.post_ffw_norm.weight", Required: false, []),
         ];
+
+    // The phi3 tensor names: the canonical map with this family's two fused roles swapped in. q/k/v arrive as one buffer
+    // per layer, so its name is required and the three split roles stay declared-but-optional — a file shipping them for
+    // this architecture is material the resolved layout does not read rather than an unnameable table, and the engine
+    // reports it instead of loading it. The gate matrix role relaxes the same way: this family's conversion ships no
+    // blk.N.ffn_gate.weight at all, its gate half living inside ffn_up.weight, so a file that does carry one is reported
+    // as unread rather than rejected for naming a tensor this block never consumes.
+    private static TensorMap PhiTensors() =>
+        new(
+        [
+            .. CanonicalDescriptors().Select(descriptor =>
+                descriptor.Role is TensorRole.AttentionQuery or TensorRole.AttentionKey or TensorRole.AttentionValue or TensorRole.FeedForwardGate
+                    ? descriptor with { Required = false }
+                    : descriptor),
+            new TensorDescriptor(TensorRole.AttentionQkv, TensorScope.PerLayer, "blk.{layer}.attn_qkv.weight", Required: true, []),
+        ]);
 
     // The MoE tensor map: the canonical map with the dense gate/up/down roles relaxed to optional — an
     // expert-routed block ships its gate/up/down triplets per expert instead of a dense triplet, so a MoE

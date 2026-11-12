@@ -133,6 +133,49 @@ public enum RopeStrategy
 }
 
 /// <summary>
+/// How one layer's q/k/v projections reach their GEMVs: three per-layer matrices the tensor map names one role each,
+/// or a single fused buffer carrying all three. Resolved once per model from its <see cref="ModelProfile"/>; no
+/// metadata key decides it today, and the forward path switches on the value and never dispatches through a
+/// per-token interface.
+/// </summary>
+public enum QkvLayout
+{
+    /// <summary>
+    /// Each side of the projection is its own tensor: the map's query, key, and value roles resolve to three matrices
+    /// this layer GEMVs over separately. A fused qkv buffer the file carries alongside them is not consumed — it is
+    /// reported as material the resolved layout does not read.
+    /// </summary>
+    SeparateTensors,
+
+    /// <summary>
+    /// One tensor per layer carries every head of q followed by every head of k and then every head of v: its rows are
+    /// the query region (<c>head_count × head_dim</c>), the key region (<c>kv_head_count × head_dim</c>, repeated for
+    /// value), in that order. Each projection reads its own contiguous row range of that one payload as a slice, so no
+    /// copy of any side exists anywhere and every GEMV still addresses whole quant blocks.
+    /// </summary>
+    FusedBufferSlices,
+}
+
+/// <summary>
+/// Which tensor supplies the gate half of the gated feed-forward block. Resolved once per model from its
+/// <see cref="ModelProfile"/>; no metadata key decides it today, and the forward path switches on the value and never
+/// dispatches through a per-token interface.
+/// </summary>
+public enum FeedForwardGateSource
+{
+    /// <summary>The map's gate role names this block's own gate matrix, one tensor beside the up and down matrices.</summary>
+    SeparateGateMatrix,
+
+    /// <summary>
+    /// The conversion ships no gate tensor at all: the layer's up matrix carries both halves of the gated pair in one
+    /// buffer, its first <c>intermediate_size</c> rows being the gate side and the next <c>intermediate_size</c> rows
+    /// the up side. Each half is read as a slice of that tensor's payload under the same activation and down projection
+    /// the separate-matrix form runs.
+    /// </summary>
+    UpTensorHalves,
+}
+
+/// <summary>
 /// How a sparse-FFN block's expert matrices are laid out in the file it loads from: one dense-shaped matrix per
 /// role, or a factorized shape whose experts share an input basis and carry only their own coefficients. Resolved
 /// once at load from the declared <c>&lt;prefix&gt;expert_layout</c> (absent means the stacked layout every family
@@ -199,4 +242,12 @@ public enum WindowInterleave
     /// layer unbounded whatever the pattern.
     /// </summary>
     AlternatingLocalFirst,
+
+    /// <summary>
+    /// The last layer of every group of six — the layers whose index leaves a remainder of five when divided by six —
+    /// attends the whole range and every other layer narrows its score range to the declared window, which is how the
+    /// reference applies this family's window: it declares the stride itself and reads no per-layer declaration for it.
+    /// A declared window of <c>0</c> leaves every layer unbounded whatever the pattern.
+    /// </summary>
+    SixLayerGroupsLocalFirst,
 }

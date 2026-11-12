@@ -47,6 +47,13 @@ pwsh -File scripts/patch-gguf-rope-scaling.ps1
 pwsh -File scripts/generate-parity.ps1 -ModelPath models/Qwen3-0.6B-Q8_0-YaRN.gguf -Out tests/fixtures/parity-qwen3-yarn.json
 ```
 
+The SentencePiece families' logit fixtures run on the pinned files directly:
+
+```powershell
+pwsh -File scripts/generate-parity.ps1 -ModelPath models/gemma-2-2b-it.Q4_K_M.gguf -Out tests/fixtures/parity-gemma2.json
+pwsh -File scripts/generate-parity.ps1 -ModelPath models/Phi-3-mini-4k-instruct-Q2_K.gguf -Out tests/fixtures/parity-phi3.json
+```
+
 Parity gate: model-file sha256 guard; LAIR argmax must appear in the reference top-5; LAIR's calibrated distribution must reproduce within |Δlogprob| ≤ 0.2 (calibrated-missing tokens must stay outside LAIR's top-16). The cross-tool logprob band applies only to candidates within 6 nats of the reference's own top-1; deeper tail candidates are gated on membership in LAIR's calibrated window and reproduction of LAIR's calibrated value instead of absolute agreement. Cross-tool exact string equality is not asserted — llama.cpp CLI and server modes disagree on identical greedy runs (see the pinned `reference_mode` field in each fixture).
 
 Template parity is a separate gate: `tests/fixtures/parity-templates-llama32.json` pins byte-exact `/apply-template` renders for `models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` (model + chat_template sha256 guards, pinned `date_string`), asserted by `Category=TemplateParity`. Regenerate with:
@@ -55,11 +62,13 @@ Template parity is a separate gate: `tests/fixtures/parity-templates-llama32.jso
 pwsh -File scripts/generate-template-parity.ps1
 ```
 
-Tokenizer parity is a third gate: `tests/fixtures/parity-tokenizer-smollm.json` and `tests/fixtures/parity-tokenizer-llama32.json` pin `/tokenize` id sequences (`add_special=false`, `parse_special=false`) for both real fixtures, with model sha256 and `tokenizer.ggml.pre` guards, asserted id-for-id by `Category=Tokenizer`. Regenerate with:
+Tokenizer parity is a third gate: `tests/fixtures/parity-tokenizer-smollm.json`, `tests/fixtures/parity-tokenizer-llama32.json`, `tests/fixtures/parity-tokenizer-gemma2.json`, and `tests/fixtures/parity-tokenizer-phi3.json` pin `/tokenize` id sequences (`add_special=false`, `parse_special=false`) for the real fixtures, with model sha256 guards (and a `tokenizer.ggml.pre` guard on the BPE fixtures), asserted id-for-id by `Category=Tokenizer`; the SentencePiece fixtures also assert `Decode(Encode(content)) == content`. Regenerate with:
 
 ```powershell
 pwsh -File scripts/generate-tokenizer-parity.ps1
 pwsh -File scripts/generate-tokenizer-parity.ps1 -ModelPath models/Llama-3.2-1B-Instruct-Q4_K_M.gguf -Out tests/fixtures/parity-tokenizer-llama32.json
+pwsh -File scripts/generate-tokenizer-parity.ps1 -ModelPath models/gemma-2-2b-it.Q4_K_M.gguf -Out tests/fixtures/parity-tokenizer-gemma2.json
+pwsh -File scripts/generate-tokenizer-parity.ps1 -ModelPath models/Phi-3-mini-4k-instruct-Q2_K.gguf -Out tests/fixtures/parity-tokenizer-phi3.json
 ```
 
 `CalibrationProbeTests` (Category `Calib`) are silent unless `LAIR_CALIB_MODEL` and `LAIR_CALIB_OUT` are set; the generator script uses them to embed calibration data.

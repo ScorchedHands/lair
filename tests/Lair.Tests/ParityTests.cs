@@ -63,6 +63,19 @@ public sealed class ParityTests
     // reference and the same quantized-file band.
     private const string Llama32UdIq3XxsFixture = "tests/fixtures/parity-llama32-udiq3xxs.json";
 
+    // The Gemma-2 Q4_K_M fixture: a real gemma2 load (SentencePiece vocabulary resolved from the file's own
+    // tokenizer metadata, and its alternating local/full attention blocks applied by the profile) against the same
+    // pinned reference and the same quantized-file band. The chat-header prompt uses ChatML markers this model does
+    // not use in its own turn template; both engines read them as ordinary text, which is what the recorded outputs
+    // show — each side still lands on a one-sentence answer about Mars.
+    private const string Gemma2Q4KFixture = "tests/fixtures/parity-gemma2.json";
+
+    // The Phi-3-mini Q2_K fixture: a real phi3 load (one fused qkv buffer per layer read as three head-region slices,
+    // the gate half of the gated pair living inside blk.N.ffn_up.weight with no separate gate tensor at all, 96-wide
+    // heads rotated in rotate-half order, and an untied Q6_K output head) against the same pinned reference and the
+    // same quantized-file band.
+    private const string Phi3Q2KFixture = "tests/fixtures/parity-phi3.json";
+
     /// <summary>Ranking window whose reproduction the fixtures calibrate.</summary>
     private const int CalibrationWindow = 16;
 
@@ -85,7 +98,7 @@ public sealed class ParityTests
     public static TheoryData<string, int> PromptCases()
     {
         TheoryData<string, int> cases = [];
-        foreach (string fixture in new[] { F16Fixture, Q8Fixture, Q4KMFixture, Qwen3Fixture, Llama32Q3KFixture, Llama32Q2KFixture, Qwen3YaRNFixture, Llama32Iq4XsFixture, Llama32UdIq3XxsFixture })
+        foreach (string fixture in new[] { F16Fixture, Q8Fixture, Q4KMFixture, Qwen3Fixture, Llama32Q3KFixture, Llama32Q2KFixture, Qwen3YaRNFixture, Llama32Iq4XsFixture, Llama32UdIq3XxsFixture, Gemma2Q4KFixture, Phi3Q2KFixture })
         {
             string? path = ModelFixture.ResolveRepoRelative(fixture);
             if (path is null)

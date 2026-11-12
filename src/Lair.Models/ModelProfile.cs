@@ -21,6 +21,21 @@ public sealed record ModelProfile
 
     public required RopeStrategy Rope { get; init; }
 
+    /// <summary>
+    /// How this architecture's block projects q/k/v: three matrices the tensor map names one role each, or one fused
+    /// buffer whose head regions each projection reads as its own slice of that payload. A profile defaults to
+    /// <see cref="Lair.Models.QkvLayout.SeparateTensors"/>; no metadata key selects it, and a profile resolving the
+    /// fused form names that buffer in its tensor map instead of leaving the role undeclared.
+    /// </summary>
+    public QkvLayout AttentionWeights { get; init; } = QkvLayout.SeparateTensors;
+
+    /// <summary>
+    /// Which tensor supplies this block's gate half: a matrix of its own named by the feed-forward gate role, or the
+    /// leading rows of the up tensor for a conversion that ships the gated pair as one buffer and names no gate matrix.
+    /// A profile defaults to <see cref="Lair.Models.FeedForwardGateSource.SeparateGateMatrix"/>; no metadata key selects it.
+    /// </summary>
+    public FeedForwardGateSource GateSource { get; init; } = FeedForwardGateSource.SeparateGateMatrix;
+
     public required TensorMap Tensors { get; init; }
 
     /// <summary>
@@ -77,9 +92,11 @@ public sealed record ModelProfile
 
     /// <summary>
     /// Which layers this architecture's forward masks with its declared attention window: a profile defaults to
-    /// <see cref="Lair.Models.WindowInterleave.AllLayers"/>, and
+    /// <see cref="Lair.Models.WindowInterleave.AllLayers"/>,
     /// <see cref="Lair.Models.WindowInterleave.AlternatingLocalFirst"/> narrows the mask to the even-indexed layers
-    /// and leaves the odd-indexed ones unbounded, which is how the gemma2 reference graph applies its window. No
+    /// and leaves the odd-indexed ones unbounded, which is how the gemma2 reference graph applies its window, and
+    /// <see cref="Lair.Models.WindowInterleave.SixLayerGroupsLocalFirst"/> leaves the last layer of each group of six
+    /// unbounded and masks the rest, which is how the reference applies this family's window. No
     /// metadata key selects it: the profile decides, and a declared window of <c>0</c> is unbounded whatever the
     /// pattern.
     /// </summary>
