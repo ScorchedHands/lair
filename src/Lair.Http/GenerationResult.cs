@@ -21,4 +21,5 @@ public sealed record GenerationResult(
     IReadOnlyList<TokenLogprob>? LogProbs = null,
     IReadOnlyList<ToolCall>? ToolCalls = null,
     IReadOnlyList<ReasoningRegion>? ReasoningRegions = null,
-    ReasoningPolicy Reasoning = ReasoningPolicy.Keep);
+    ReasoningPolicy Reasoning = ReasoningPolicy.Keep,
+    string? BudgetExhausted = null);

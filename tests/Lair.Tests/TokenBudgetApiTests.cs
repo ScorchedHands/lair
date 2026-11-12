@@ -367,9 +367,8 @@ public sealed class TokenBudgetApiTests : IDisposable
         return new ServedModel(app, engine);
     }
 
-    // The same tiny llama-shaped model the parser tests serve — six-token BPE vocabulary, two layers, a ChatML template — so both
-    // chat and completion requests reach the real request pipeline without loading a fixture model. No reasoning budget is declared
-    // here; each case declares its own ceilings in config.
+    // The same tiny llama-shaped model the parser tests serve — a BPE vocabulary carrying <think> and </think> as ordinary entries, two layers, a ChatML template — so both
+    // chat and completion requests reach the real request pipeline without loading a fixture model, and a reasoning ceiling declared on it has whole-marker tokens to bind.
     private const string ChatMlTemplate =
         "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}";
 
@@ -378,10 +377,10 @@ public sealed class TokenBudgetApiTests : IDisposable
         using MemoryStream stream = new();
         using BinaryWriter writer = new(stream, Encoding.UTF8, leaveOpen: true);
 
-        string[] tokens = ["<unk>", "hello", "world", "!", "<s>", "</s>"];
-        int[] tokenTypes = [2, 1, 1, 1, 4, 5];
+        string[] tokens = ["<unk>", "hello", "world", "!", "<s>", "</s>", "<think>", "</think>"];
+        int[] tokenTypes = [2, 1, 1, 1, 4, 5, 1, 1];
 
-        List<(string Name, int[] Dims)> tensors = [new("token_embd.weight", [6, 4])];
+        List<(string Name, int[] Dims)> tensors = [new("token_embd.weight", [8, 4])];
         for (int layer = 0; layer < 2; layer++)
         {
             tensors.Add(($"blk.{layer}.attn_q.weight", [4, 4]));
@@ -411,7 +410,7 @@ public sealed class TokenBudgetApiTests : IDisposable
         WriteInt32Kv(writer, "llama.feed_forward_length", 8);
         WriteFloat32Kv(writer, "llama.rope.freq_base", 10_000f);
         WriteFloat32Kv(writer, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
-        WriteInt32Kv(writer, "llama.vocab_size", 6);
+        WriteInt32Kv(writer, "llama.vocab_size", 8);
         WriteStringKv(writer, "tokenizer.ggml.model", "gpt2");
         WriteStringArrayKv(writer, "tokenizer.ggml.tokens", tokens);
         WriteInt32ArrayKv(writer, "tokenizer.ggml.token_type", tokenTypes);

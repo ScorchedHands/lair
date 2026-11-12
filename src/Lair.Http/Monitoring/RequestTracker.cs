@@ -95,11 +95,11 @@ internal sealed class RequestTracker
 
 
     /// <summary>Publishes the final lifecycle frame — status plus finish reason, cached tokens, and the full retained sample series.</summary>
-    public RequestPayload Complete(string status, int cachedTokens, string? finishReason)
+    public RequestPayload Complete(string status, int cachedTokens, string? finishReason, string? budgetExhausted = null)
     {
         EnsureStarted(); // a generation that never produced an update token still gets its start frame ahead of completion
 
-        RequestPayload payload = BuildPayload(status, cachedTokens, finishReason);
+        RequestPayload payload = BuildPayload(status, cachedTokens, finishReason, budgetExhausted);
         _bus.PublishRequest(MonitorEventNames.RequestComplete, payload);
         return payload;
     }
@@ -115,7 +115,7 @@ internal sealed class RequestTracker
         }
     }
 
-    private RequestPayload BuildPayload(string status, int? cachedTokens, string? finishReason)
+    private RequestPayload BuildPayload(string status, int? cachedTokens, string? finishReason, string? budgetExhausted = null)
     {
         int generated = Volatile.Read(ref _generated);
         IReadOnlyList<TokenSample>? samples = BuildSamples(generated);
@@ -142,7 +142,8 @@ internal sealed class RequestTracker
             TokensPerSec: tokensPerSec,
             CachedTokens: cachedTokens,
             FinishReason: finishReason,
-            Samples: samples);
+            Samples: samples,
+            BudgetExhausted: budgetExhausted);
     }
 
     // Chronological oldest→newest sample points over the retained window: token indices run from max(1, generated -

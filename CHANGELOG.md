@@ -4,6 +4,14 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.10] - 2026-11-12
+
+### Added
+
+- Per-model token budgets: `max_reasoning_tokens` and `max_response_tokens` config keys (absent means unbudgeted, values validated at load naming the model and key), request-side overrides on chat and completion bodies clamped to the model's declared ceiling with the clamp reported in `token_budgets`, and enforcement through scheduling and decode — KV admission reserves the resolved reasoning-plus-response sum, an open reasoning region closes at its ceiling, and the response ceiling bounds visible output. Budget keys hot-reload as new-requests-only changes.
+- Budget attribution: `budget_exhausted` names which ceiling ended a run (`"reasoning"` or `"response"`) on chat and completion bodies, on the closing chunk of a stream, and on `/monitor/stream` request lifecycle frames. `finish_reason` values are unchanged.
+- Reasoning-marker vocabulary gate at model load: a declared reasoning ceiling binds only when the loaded tokenizer delivers `<think>` and `</think>` as whole tokens. A model declaring `max_reasoning_tokens` on a vocabulary that splits or lacks either marker fails at open naming the model, the key, and the marker; a hot-reloaded ceiling on such a model is refused the same way; response-side accounting on such a model behaves exactly as an unbudgeted region model. Load reports the bound pair as `reasoning_region model='…' open_token_id=… close_token_id=…`.
+
 ## [0.3.9] - 2026-11-12
 
 ### Added

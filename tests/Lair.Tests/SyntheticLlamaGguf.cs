@@ -7,15 +7,25 @@ internal static class SyntheticLlamaGguf
     private const string ChatMlTemplate =
         "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>' + '\\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}";
 
-    public static string Write(string modelName)
+    /// <summary>
+    /// Writes one tiny synthetic llama-shaped GGUF. With <paramref name="withReasoningMarkers"/> the vocabulary carries
+    /// <c>&lt;think&gt;</c> and <c>&lt;/think&gt;</c> as ordinary entries, so a reasoning budget declared on this model has
+    /// whole-marker tokens to bind; without them the vocabulary carries none, which is the shape a budget gate must refuse.
+    /// </summary>
+    public static string Write(string modelName, bool withReasoningMarkers = true)
     {
         using MemoryStream stream = new();
         using BinaryWriter writer = new(stream, Encoding.UTF8, leaveOpen: true);
 
-        string[] tokens = ["<unk>", "hello", "world", "!", "<s>", "</s>"];
-        int[] tokenTypes = [2, 1, 1, 1, 4, 5];
+        string[] tokens = withReasoningMarkers
+            ? ["<unk>", "hello", "world", "!", "<s>", "</s>", "<think>", "</think>"]
+            : ["<unk>", "hello", "world", "!", "<s>", "</s>"];
+        int[] tokenTypes = withReasoningMarkers
+            ? [2, 1, 1, 1, 4, 5, 1, 1]
+            : [2, 1, 1, 1, 4, 5];
+        int vocabSize = tokens.Length;
 
-        List<(string Name, int[] Dims)> tensors = [new("token_embd.weight", [6, 4])];
+        List<(string Name, int[] Dims)> tensors = [new("token_embd.weight", [vocabSize, 4])];
         for (int layer = 0; layer < 2; layer++)
         {
             tensors.Add(($"blk.{layer}.attn_q.weight", [4, 4]));
@@ -45,7 +55,7 @@ internal static class SyntheticLlamaGguf
         WriteInt32Kv(writer, "llama.feed_forward_length", 8);
         WriteFloat32Kv(writer, "llama.rope.freq_base", 10_000f);
         WriteFloat32Kv(writer, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
-        WriteInt32Kv(writer, "llama.vocab_size", 6);
+        WriteInt32Kv(writer, "llama.vocab_size", vocabSize);
         WriteStringKv(writer, "tokenizer.ggml.model", "gpt2");
         WriteStringArrayKv(writer, "tokenizer.ggml.tokens", tokens);
         WriteInt32ArrayKv(writer, "tokenizer.ggml.token_type", tokenTypes);

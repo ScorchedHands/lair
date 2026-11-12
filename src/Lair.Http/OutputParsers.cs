@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using Lair.Templating.Minja;
+using Lair.Tokenizer;
 
 namespace Lair.Http;
 
@@ -62,8 +63,15 @@ public static class ReasoningPolicyNames
 /// <summary>Half-open span offsets of one recognized reasoning region over the generated text.</summary>
 public sealed record ReasoningRegion(int Start, int End);
 
-/// <summary>The open/close markup pair a model's plan resolves its reasoning region to — the same markers the recognizer reads over generated text. A ceiling bounds only a region this resolved, so request-time budget rules consult it instead of guessing a shape per request.</summary>
-public sealed record ReasoningRegionMarkers(string OpenMarkup, string CloseMarkup);
+/// <summary>The open/close markup pair a model's plan resolves its reasoning region to — the same markers the recognizer reads over generated text, plus the single vocabulary token each marker arrives as in this model's tokenizer. A ceiling bounds only a region this resolved, so request-time budget rules consult it instead of guessing a shape per request.</summary>
+public sealed record ReasoningRegionMarkers(string OpenMarkup, string CloseMarkup)
+{
+    /// <summary>The id one sampled token must carry for the open marker to arrive whole.</summary>
+    public required int OpenTokenId { get; init; }
+
+    /// <summary>The id one sampled token must carry for the close marker to arrive whole.</summary>
+    public required int CloseTokenId { get; init; }
+}
 
 /// <summary>The reasoning regions recognized in one generation plus the visible text with them removed.</summary>
 public sealed record ReasoningDetection(IReadOnlyList<ReasoningRegion> Regions, string VisibleText);
@@ -529,25 +537,69 @@ public sealed class TemplateNativeToolOutputParser : IToolOutputParser
 /// </summary>
 public static class OutputParserRegistry
 {
-    /// <summary>The plan one model runs: resolved from its configuration plus its load-probed capabilities.</summary>
-    public static OutputParserPlan Resolve(string toolParser, bool forceFencedTools, TemplateCapabilities? capabilities, string reasoning = ReasoningPolicyNames.Keep, int? maxReasoningTokens = null) => toolParser switch
+    /// <summary>The plan one model runs: resolved from its configuration plus its load-probed capabilities. The reasoning region is the vocabulary-proven marker pair carried in, never a guess.</summary>
+    public static OutputParserPlan Resolve(string toolParser, bool forceFencedTools, TemplateCapabilities? capabilities, string reasoning = ReasoningPolicyNames.Keep, ReasoningRegionMarkers? reasoningRegion = null) => toolParser switch
     {
-        ToolParserNames.Template => Plan(ToolParser.Template, new TemplateNativeToolOutputParser(), reasoning, ResolvedRegion(maxReasoningTokens)),
-        ToolParserNames.Fenced => Plan(ToolParser.Fenced, new FencedJsonToolOutputParser(), reasoning, ResolvedRegion(maxReasoningTokens)),
-        ToolParserNames.None => Plan(ToolParser.None, parser: null, reasoning, ResolvedRegion(maxReasoningTokens)),
+        ToolParserNames.Template => Plan(ToolParser.Template, new TemplateNativeToolOutputParser(), reasoning, reasoningRegion),
+        ToolParserNames.Fenced => Plan(ToolParser.Fenced, new FencedJsonToolOutputParser(), reasoning, reasoningRegion),
+        ToolParserNames.None => Plan(ToolParser.None, parser: null, reasoning, reasoningRegion),
 
         // "auto" (the only remaining loader-accepted value): today's capability precedence, expressed as a resolved choice.
         _ => forceFencedTools || capabilities is null || !capabilities.SupportsTools
-            ? Plan(ToolParser.Fenced, new FencedJsonToolOutputParser(), reasoning, ResolvedRegion(maxReasoningTokens))
-            : Plan(ToolParser.Template, new TemplateNativeToolOutputParser(), reasoning, ResolvedRegion(maxReasoningTokens)),
+            ? Plan(ToolParser.Fenced, new FencedJsonToolOutputParser(), reasoning, reasoningRegion)
+            : Plan(ToolParser.Template, new TemplateNativeToolOutputParser(), reasoning, reasoningRegion),
     };
 
     private static OutputParserPlan Plan(ToolParser toolParser, IToolOutputParser? parser, string reasoning, ReasoningRegionMarkers? region) =>
         new(toolParser, parser, reasoning == ReasoningPolicyNames.Strip ? ReasoningPolicy.Strip : ReasoningPolicy.Keep) { ReasoningRegion = region };
 
-    // A model's declared reasoning ceiling is what establishes its reasoning region at load: the pair resolved here is exactly
-    // the markup the recognizer reads over generated text, so a request bounds a region this plan already resolved and an
-    // unbudgeted model resolves none.
-    private static ReasoningRegionMarkers? ResolvedRegion(int? maxReasoningTokens) =>
-        maxReasoningTokens is >= 1 ? new(ReasoningRecognition.OpenMarkup, ReasoningRecognition.CloseMarkup) : null;
+    /// <summary>
+    /// Proves what a reasoning ceiling could bound in this model's vocabulary: each marker must arrive whole as one token — an entry whose single-token decode is exactly the markup the recognizer reads over generated text. The proof does not depend on whether a ceiling is declared, because a hot-reloaded ceiling can arrive after load; a caller that declares a ceiling without a proven pair refuses it rather than serving a bound that would bind nothing.
+    /// </summary>
+    public static bool TryResolveMarkerPair(GgufTokenizer tokenizer, out ReasoningRegionMarkers? pair, out string refusalDetail)
+    {
+        ArgumentNullException.ThrowIfNull(tokenizer);
+
+        if (!TryResolveMarker(ReasoningRecognition.OpenMarkup, tokenizer, out int openId, out refusalDetail))
+        {
+            pair = null;
+            return false;
+        }
+
+        if (!TryResolveMarker(ReasoningRecognition.CloseMarkup, tokenizer, out int closeId, out refusalDetail))
+        {
+            pair = null;
+            return false;
+        }
+
+        pair = new ReasoningRegionMarkers(ReasoningRecognition.OpenMarkup, ReasoningRecognition.CloseMarkup)
+        {
+            OpenTokenId = openId,
+            CloseTokenId = closeId,
+        };
+        refusalDetail = string.Empty;
+        return true;
+    }
+
+    private static bool TryResolveMarker(string markup, GgufTokenizer tokenizer, out int tokenId, out string refusalDetail)
+    {
+        if (tokenizer.IdOf(markup) is not int id)
+        {
+            tokenId = -1;
+            refusalDetail = $"'{markup}' is not an entry in this model's vocabulary";
+            return false;
+        }
+
+        string decoded = tokenizer.Decode(new[] { id });
+        if (!string.Equals(decoded, markup, StringComparison.Ordinal))
+        {
+            tokenId = -1;
+            refusalDetail = $"the '{markup}' entry decodes to '{decoded}' rather than the marker itself (this build drops that token type from generated text)";
+            return false;
+        }
+
+        tokenId = id;
+        refusalDetail = string.Empty;
+        return true;
+    }
 }

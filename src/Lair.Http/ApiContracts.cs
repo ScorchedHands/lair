@@ -64,7 +64,8 @@ internal sealed record ChatCompletionResponse(
     string Model,
     IReadOnlyList<ChatChoice> Choices,
     Usage Usage,
-    IReadOnlyList<TokenBudgetReport>? TokenBudgets = null);
+    IReadOnlyList<TokenBudgetReport>? TokenBudgets = null,
+    [property: JsonPropertyName("budget_exhausted")] string? BudgetExhausted = null);
 
 /// <summary>One chat choice: the assistant message plus why generation ended.</summary>
 internal sealed record ChatChoice(
@@ -96,7 +97,8 @@ internal sealed record TextCompletionResponse(
     string Model,
     IReadOnlyList<TextChoice> Choices,
     Usage Usage,
-    IReadOnlyList<TokenBudgetReport>? TokenBudgets = null);
+    IReadOnlyList<TokenBudgetReport>? TokenBudgets = null,
+    [property: JsonPropertyName("budget_exhausted")] string? BudgetExhausted = null);
 
 /// <summary>One completion choice: the continuation text plus why generation ended.</summary>
 internal sealed record TextChoice(
@@ -118,7 +120,8 @@ internal sealed record ChunkPayload(
     long Created,
     string Model,
     IReadOnlyList<ChunkChoice> Choices,
-    IReadOnlyList<TokenBudgetReport>? TokenBudgets = null);
+    IReadOnlyList<TokenBudgetReport>? TokenBudgets = null,
+    [property: JsonPropertyName("budget_exhausted")] string? BudgetExhausted = null);
 
 /// <summary>A streamed choice: the delta plus <c>finish_reason</c> on the final content chunk.</summary>
 internal sealed record ChunkChoice(int Index, ChunkDelta Delta, string? FinishReason);

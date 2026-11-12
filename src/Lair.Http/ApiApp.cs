@@ -514,7 +514,7 @@ public static class ApiApp
 
         await WriteChunkAsync(stream, new ChunkPayload(
             completionId, "chat.completion.chunk", created, model,
-            [new ChunkChoice(0, new ChunkDelta(), result.FinishReason)], BudgetReportsOf(http)), http);
+            [new ChunkChoice(0, new ChunkDelta(), result.FinishReason)], BudgetReportsOf(http), result.BudgetExhausted), http);
 
         await stream.WriteAsync(DoneEvent, http.RequestAborted);
         await stream.FlushAsync(http.RequestAborted);
@@ -575,7 +575,8 @@ public static class ApiApp
             request.Model,
             [new ChatChoice(0, new AssistantMessage("assistant", result.Text, WireCalls(result.ToolCalls)), result.FinishReason, LogProbsReportOf(request, gen, result))],
             UsageOf(result),
-            budgets);
+            budgets,
+            result.BudgetExhausted);
 
     private static TextCompletionResponse BuildTextCompletion(GenerationRequest request, GenerationService gen, GenerationResult result, IReadOnlyList<TokenBudgetReport>? budgets) =>
         new(
@@ -585,7 +586,8 @@ public static class ApiApp
             request.Model,
             [new TextChoice(0, result.Text, result.FinishReason, LogProbsReportOf(request, gen, result))],
             UsageOf(result),
-            budgets);
+            budgets,
+            result.BudgetExhausted);
 
     // The logprobs report rides on the choice only when the request asked for it; its entries mirror the
     // generated tokens in order, each carrying the sampled distribution's top candidates.
