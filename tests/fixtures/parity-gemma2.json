@@ -1,0 +1,162 @@
+{
+  "model_file": "models/gemma-2-2b-it.Q4_K_M.gguf",
+  "model_sha256": "ff7c35808d3b2fc5c4f955ca931efdec71c0808b9ec89a9878cb771608787058",
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
+  "decode": {
+    "temperature": 0.0,
+    "context": 1024
+  },
+  "generated_utc": "2026-11-12T10:31:03Z",
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "max_tokens": 48,
+      "output": " Paris. \n\nIs this correct? ",
+      "top_logprobs": [
+        {
+          "id": 7127,
+          "token": " Paris",
+          "logprob": -1.4640424251556396,
+          "lair_logprob": -1.4684
+        },
+        {
+          "id": 235292,
+          "token": ":",
+          "logprob": -1.4968822002410889,
+          "lair_logprob": -1.4979
+        },
+        {
+          "id": 5231,
+          "token": " **",
+          "logprob": -2.014702558517456,
+          "lair_logprob": -1.9773
+        },
+        {
+          "id": 955,
+          "token": "...",
+          "logprob": -2.9793431758880615,
+          "lair_logprob": -2.9919
+        },
+        {
+          "id": 235248,
+          "token": " ",
+          "logprob": -3.33121657371521,
+          "lair_logprob": -3.3902
+        }
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "max_tokens": 48,
+      "output": ", in a land filled with magic and wonder, lived a young girl named Elara. Elara was known for her kindness and her love for all creatures, big and small. She had a heart as pure as the morning dew and a",
+      "top_logprobs": [
+        {
+          "id": 235269,
+          "token": ",",
+          "logprob": -0.055496979504823685,
+          "lair_logprob": -0.0467
+        },
+        {
+          "id": 575,
+          "token": " in",
+          "logprob": -3.1661148071289062,
+          "lair_logprob": -3.3916
+        },
+        {
+          "id": 1104,
+          "token": " there",
+          "logprob": -4.918182373046875,
+          "lair_logprob": -4.891
+        },
+        {
+          "id": 955,
+          "token": "...",
+          "logprob": -6.7764997482299805,
+          "lair_logprob": -6.7838
+        },
+        {
+          "id": 591,
+          "token": " (",
+          "logprob": -6.895170211791992,
+          "lair_logprob": -7.0021
+        }
+      ]
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "max_tokens": 48,
+      "output": "  \"\"\"\n  This function calculates the nth Fibonacci number.\n\n  Args:\n    n: The index of the desired Fibonacci number.\n\n  Returns:\n    The nth Fibonacci number.\n  \"\"\"\n  if n <= ",
+      "top_logprobs": [
+        {
+          "id": 139,
+          "token": "  ",
+          "logprob": -0.33252057433128357,
+          "lair_logprob": -0.3587
+        },
+        {
+          "id": 141,
+          "token": "    ",
+          "logprob": -1.3089532852172852,
+          "lair_logprob": -1.2453
+        },
+        {
+          "id": 140,
+          "token": "   ",
+          "logprob": -5.260343551635742,
+          "lair_logprob": -5.2914
+        },
+        {
+          "id": 226,
+          "token": "\t",
+          "logprob": -5.316379547119141,
+          "lair_logprob": -5.1684
+        },
+        {
+          "id": 235248,
+          "token": " ",
+          "logprob": -7.624795913696289,
+          "lair_logprob": -7.6879
+        }
+      ]
+    },
+    {
+      "prompt": "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
+      "max_tokens": 48,
+      "output": "Mars is a terrestrial planet known for its rusty red color. \n<|im_end|> ",
+      "top_logprobs": [
+        {
+          "id": 48009,
+          "token": "Mars",
+          "logprob": -0.030337026342749596,
+          "lair_logprob": -0.028
+        },
+        {
+          "id": 1718,
+          "token": "It",
+          "logprob": -5.26875638961792,
+          "lair_logprob": -5.3142
+        },
+        {
+          "id": 651,
+          "token": "The",
+          "logprob": -5.3702616691589355,
+          "lair_logprob": -5.2937
+        },
+        {
+          "id": 3793,
+          "token": "Mar",
+          "logprob": -5.457437992095947,
+          "lair_logprob": -5.6453
+        },
+        {
+          "id": 235322,
+          "token": "<",
+          "logprob": -5.479612350463867,
+          "lair_logprob": -5.5231
+        }
+      ]
+    }
+  ]
+}
