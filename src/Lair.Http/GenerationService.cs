@@ -29,6 +29,16 @@ public sealed class GenerationService : IDisposable
     private readonly GgufTokenizer _tokenizer;
     private readonly MinjaChatTemplate? _chatTemplate;
     private readonly TemplateCapabilities? _chatTemplateCapabilities;
+
+    // The output-parser plan resolved once at model load (reference-swapped under the reload gate when a
+    // new-requests-only tool key changes): request behavior consumes this resolved value instead of re-deciding.
+    private OutputParserPlan _outputParser;
+
+    // The reasoning-marker pair this model's vocabulary was proven to carry whole at open (null when it cannot), plus
+    // the reason it could not — a declared reasoning ceiling is only ever applied against that proof, at load and on reload.
+    private readonly ReasoningRegionMarkers? _reasoningMarkers;
+    private readonly string _markerRefusalDetail;
+
     private readonly ILogger? _logger;
     private readonly BlockPool _pool;
     private readonly GenerationScheduler _scheduler;
@@ -58,6 +68,9 @@ public sealed class GenerationService : IDisposable
         GgufTokenizer tokenizer,
         MinjaChatTemplate? chatTemplate,
         TemplateCapabilities? chatTemplateCapabilities,
+        OutputParserPlan outputParser,
+        ReasoningRegionMarkers? reasoningMarkers,
+        string markerRefusalDetail,
         ILogger? logger,
         BlockPool pool,
         GenerationScheduler scheduler,
@@ -70,6 +83,9 @@ public sealed class GenerationService : IDisposable
         _tokenizer = tokenizer;
         _chatTemplate = chatTemplate;
         _chatTemplateCapabilities = chatTemplateCapabilities;
+        _outputParser = outputParser;
+        _reasoningMarkers = reasoningMarkers;
+        _markerRefusalDetail = markerRefusalDetail;
         _logger = logger;
         _pool = pool;
         _scheduler = scheduler;
@@ -87,6 +103,13 @@ public sealed class GenerationService : IDisposable
     /// truth on the loaded-model path.
     /// </summary>
     public TemplateCapabilities? ChatTemplateCapabilities => _chatTemplateCapabilities;
+
+    /// <summary>
+    /// The output-parser plan resolved for the loaded model at load (re-resolved only when a new-requests-only tool
+    /// key is reloaded). Its <c>ToolParser</c> choice decides which tool surface a chat request gets and whether its
+    /// decoded text is read for calls; its reasoning-region slot stays inert until the separate recognizer fills it.
+    /// </summary>
+    internal OutputParserPlan ResolvedOutputParser => Volatile.Read(ref _outputParser);
 
     /// <summary>The id that ends a generation: the model's declared EOT id (<c>tokenizer.ggml.eot_token_id</c>) when it has one, otherwise the EOS id.</summary>
     internal int StopId => _tokenizer.EotId >= 0 ? _tokenizer.EotId : _tokenizer.EosId;
@@ -239,6 +262,10 @@ public sealed class GenerationService : IDisposable
             List<FieldResult> results = [];
             LairConfig effective = _current;
 
+            // The plan re-resolved when a new-requests-only tool key lands, so later requests follow the candidate's
+            // value while sequences already in flight stay on their resolved limits.
+            OutputParserPlan replanned;
+
             foreach (FieldChange change in ConfigMutationTable.Diff(effective, candidate))
             {
                 switch (change.Field)
@@ -275,8 +302,49 @@ public sealed class GenerationService : IDisposable
 
                     case "models[0].force_fenced_tools":
                         effective = effective with { Models = [effective.Models[0] with { ForceFencedTools = candidate.Models[0].ForceFencedTools }] };
+                        replanned = ResolvePlanFor(effective);
+                        Volatile.Write(ref _outputParser, replanned);
+                        RefreshAdvertisedModel(effective);
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
                             $"chat requests admitted from now on {(candidate.Models[0].ForceFencedTools ? "inject LAIR's fenced tool block even for a tool-capable template" : "follow the loaded template's tool capabilities")}; sequences already in flight are unaffected"));
+                        break;
+
+                    case "models[0].tool_parser":
+                        effective = effective with { Models = [effective.Models[0] with { ToolParser = candidate.Models[0].ToolParser }] };
+                        replanned = ResolvePlanFor(effective);
+                        Volatile.Write(ref _outputParser, replanned);
+                        RefreshAdvertisedModel(effective);
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"chat requests admitted from now on resolve to the {ToolParserNames.Of(replanned.ToolParser)} tool parser; sequences already in flight are unaffected"));
+                        break;
+
+                    case "models[0].reasoning":
+                        effective = effective with { Models = [effective.Models[0] with { Reasoning = candidate.Models[0].Reasoning }] };
+                        replanned = ResolvePlanFor(effective);
+                        Volatile.Write(ref _outputParser, replanned);
+                        RefreshAdvertisedModel(effective);
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"chat requests admitted from now on carry recognized reasoning regions as {ReasoningPolicyNames.Of(replanned.Reasoning)}; sequences already in flight are unaffected"));
+                        break;
+
+                    case "models[0].max_reasoning_tokens":
+                        if (candidate.Models[0].MaxReasoningTokens is >= 1 && _reasoningMarkers is null)
+                        {
+                            results.Add(new FieldResult(change, ConfigApplyOutcome.Refused, MarkerRefusalForReload(change)));
+                            break;
+                        }
+
+                        effective = effective with { Models = [effective.Models[0] with { MaxReasoningTokens = candidate.Models[0].MaxReasoningTokens } ] };
+                        replanned = ResolvePlanFor(effective);
+                        Volatile.Write(ref _outputParser, replanned);
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"reasoning budget {change.OldValue} -> {change.NewValue}: the configuration in force carries it for requests admitted from now on; sequences already in flight are unaffected"));
+                        break;
+
+                    case "models[0].max_response_tokens":
+                        effective = effective with { Models = [effective.Models[0] with { MaxResponseTokens = candidate.Models[0].MaxResponseTokens } ] };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"response budget {change.OldValue} -> {change.NewValue}: the configuration in force carries it for requests admitted from now on; sequences already in flight are unaffected"));
                         break;
 
                     case "ui.recent_requests":
@@ -309,14 +377,25 @@ public sealed class GenerationService : IDisposable
     // Advertised model facts recomputed from the effective configuration and live pool state: the window admission
     // validates against is the smallest of configured max context, what the forward engine can actually address
     // (its precomputed RoPE extent), and the token slots the current KV budget can back. A raise beyond the engine's
-    // addressed extent clamps there — re-cutting those tables belongs to a model reload, not to a hot edit.
+    // addressed extent clamps there — re-cutting those tables belongs to a model reload, not to a hot edit. The tool
+    // parser rides on the same swap so /v1/models always reports what requests admitted now follow.
     private void RefreshAdvertisedModel(LairConfig effective)
     {
         long backed = Math.Min((long)_pool.EffectiveBudgetBlocks * _pool.BlockTokens, _model.MaxContextTokens);
         int context = (int)Math.Min(effective.Models[0].MaxContextTokens, backed);
 
-        Volatile.Write(ref _modelInfo, _modelInfo with { ContextLength = context, KvBlocks = _pool.EffectiveBudgetBlocks });
+        Volatile.Write(ref _modelInfo, _modelInfo with { ContextLength = context, KvBlocks = _pool.EffectiveBudgetBlocks, ToolParser = ToolParserNames.Of(_outputParser.ToolParser), Reasoning = ReasoningPolicyNames.Of(_outputParser.Reasoning) });
     }
+
+    // The plan the configuration in force resolves to: same registry decision as model load, against the capabilities
+    // probed once for this template. Only a new-requests-only reload calls it; generation never re-decides. A declared
+    // reasoning ceiling travels through the same resolve carrying the marker pair proven from this vocabulary at open —
+    // the region later requests may bound is that pair, never a markup guessed per request.
+    private OutputParserPlan ResolvePlanFor(LairConfig effective) =>
+        OutputParserRegistry.Resolve(effective.Models[0].ToolParser, effective.Models[0].ForceFencedTools, _chatTemplateCapabilities, effective.Models[0].Reasoning, effective.Models[0].MaxReasoningTokens is >= 1 ? _reasoningMarkers : null);
+
+    private string MarkerRefusalForReload(FieldChange change) =>
+        $"{change.Field} refused: {_markerRefusalDetail}. The loaded model's vocabulary cannot carry the reasoning markers a 'max_reasoning_tokens' budget would bound; remove the key from this model entry or serve a model whose vocabulary carries them.";
 
     private static string RefusalDetail(FieldChange change) => change.Field switch
     {
@@ -365,6 +444,22 @@ public sealed class GenerationService : IDisposable
             // Profile-scoped tokenizer defaults applied at load (absent BOS/EOS keys) surface as structured
             // log lines on the host logger.
             GgufTokenizer tokenizer = GgufTokenizer.FromGguf(file, line => logger?.LogInformation("{TokenizerLog}", line));
+
+            // The reasoning markers a budget would bound are proven against this vocabulary once here: each must arrive
+            // whole as one token. A model declaring max_reasoning_tokens on a vocabulary that cannot carry them is refused
+            // now — before weights are mapped — instead of serving with a ceiling that could bind nothing.
+            bool markersProven = OutputParserRegistry.TryResolveMarkerPair(tokenizer, out ReasoningRegionMarkers? markerPair, out string markerRefusal);
+            if (!markersProven && modelConfig.MaxReasoningTokens is >= 1)
+            {
+                logger?.LogError(
+                    "max_reasoning_tokens model='{Model}' cannot bind a reasoning region: {Detail}",
+                    modelConfig.Name,
+                    markerRefusal);
+
+                throw new InvalidOperationException(
+                    $"model '{modelConfig.Name}' declares 'max_reasoning_tokens' but its tokenizer cannot carry the reasoning markers that budget would bound: {markerRefusal}. Remove 'max_reasoning_tokens' from this model entry or serve a model whose vocabulary carries them.");
+            }
+
             // Profile resolution events (the generic llama-shaped fallback applied to an unknown architecture)
             // surface as structured log lines the same way.
             model = TransformerModel.Open(file, backend, reservedSlots, line => logger?.LogInformation("{ProfileLog}", line));
@@ -375,6 +470,14 @@ public sealed class GenerationService : IDisposable
                 model.Plan.HeadDim,
                 modelConfig.KvBlocks,
                 backend);
+
+            int[] attentionWindows = new int[model.Plan.LayerCount];
+            for (int layer = 0; layer < model.Plan.LayerCount; layer++)
+            {
+                attentionWindows[layer] = model.Plan.AttentionWindowForLayer(layer);
+            }
+
+            pool.DeclareAttentionWindows(attentionWindows);
 
             PrefixCache cache = new(pool);
             scheduler = new GenerationScheduler(model, pool, config.Engine.MaxBatchTokens, cache);
@@ -413,15 +516,52 @@ public sealed class GenerationService : IDisposable
                 chatTemplateCapabilities = chatTemplate.DetectCapabilities();
             }
 
+            // The output-parser plan is resolved once here, from the load-probed capabilities plus the model's tool
+            // configuration: every later chat request consumes this plan instead of re-deciding which tool surface it
+            // gets, and the resolved choice is announced on the host's load log in the style of the tokenizer-default
+            // and profile-resolution lines.
+            OutputParserPlan outputParser = OutputParserRegistry.Resolve(modelConfig.ToolParser, modelConfig.ForceFencedTools, chatTemplateCapabilities, modelConfig.Reasoning, modelConfig.MaxReasoningTokens is >= 1 ? markerPair : null);
+            logger?.LogInformation(
+                "tool_parser model='{Model}' choice={Choice}",
+                modelConfig.Name,
+                ToolParserNames.Of(outputParser.ToolParser));
+            logger?.LogInformation(
+                "reasoning model='{Model}' policy={Policy}",
+                modelConfig.Name,
+                ReasoningPolicyNames.Of(outputParser.Reasoning));
+            if (outputParser.ReasoningRegion is { } reasoningRegion)
+            {
+                logger?.LogInformation(
+                    "reasoning_region model='{Model}' open_token_id={OpenTokenId} close_token_id={CloseTokenId}",
+                    modelConfig.Name,
+                    reasoningRegion.OpenTokenId,
+                    reasoningRegion.CloseTokenId);
+            }
+
+            // The sparse-FFN facts a routed block resolves to are reported the same way: they come straight from the
+            // model's plan, and only a file that declares experts carries them. A dense model advertises nothing here.
+            if (model.Plan.SparseFfn is { } sparsePlan)
+            {
+                logger?.LogInformation(
+                    "sparse_ffn model='{Model}' layout={Layout} rank={Rank} strategy={Strategy}",
+                    modelConfig.Name,
+                    sparsePlan.Layout,
+                    sparsePlan.Rank ?? (object)"none",
+                    SparseFfnStrategyNames.Of(model.Plan.SparseFfnStrategy!.Value));
+            }
+
             ModelInfo info = new(
                 modelConfig.Name,
                 maxContext,
                 modelConfig.KvBlocks,
                 DominantQuant(file),
                 model.Plan.Architecture,
-                model.Plan.VocabSize);
+                model.Plan.VocabSize,
+                ToolParserNames.Of(outputParser.ToolParser),
+                ReasoningPolicyNames.Of(outputParser.Reasoning),
+                model.Plan.SparseFfnStrategy is { } strategy ? SparseFfnStrategyNames.Of(strategy) : null);
 
-            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, logger, pool, scheduler, info, config);
+            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, markerPair, markersProven ? string.Empty : markerRefusal, logger, pool, scheduler, info, config);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
             file = null;
             model = null;
@@ -474,13 +614,31 @@ public sealed class GenerationService : IDisposable
             throw new ArgumentException($"'top_logprobs' must be in [0, 20], got {request.TopLogprobs}.", nameof(request));
         }
 
+        // Budget overrides are sized request knobs too: a value below 1 is refused here for programmatic callers exactly as the
+        // API host refuses it on the wire. The ceiling itself belongs to the loaded model and is applied where the override is
+        // admitted, so what reaches this facade is already resolved.
+        if (request.MaxReasoningTokens is < 1)
+        {
+            throw new ArgumentException($"'max_reasoning_tokens' must be 1 or greater, got {request.MaxReasoningTokens}.", nameof(request));
+        }
+
+        if (request.MaxResponseTokens is < 1)
+        {
+            throw new ArgumentException($"'max_response_tokens' must be 1 or greater, got {request.MaxResponseTokens}.", nameof(request));
+        }
+
         IReadOnlyDictionary<int, float>? logitBias = ResolveLogitBias(request.LogitBias);
 
         // Tool declarations and the choice are validated here too so programmatic callers meet the same rules as HTTP ones.
         // The pipeline is active only for chat requests that declare tools under a mode other than none: which tool surface
         // the request gets — the template's own rendering or LAIR's fenced block — is resolved once by capability
-        // precedence, and detection reads fences out of the decoded text against the names this choice allows.
-        ToolPipeline tools = ResolveToolPipeline(request);
+        // precedence, and detection reads recognized calls out of the decoded text against the names this choice allows.
+        // The plan this request runs on is the one resolved when it was admitted, captured once here: a new-requests-only
+        // reload re-resolves the shared plan for later requests and leaves an already-admitted sequence on what it started
+        // with — its tool surface, its reasoning policy, everything else about its output follows the same one value.
+        OutputParserPlan plan = Volatile.Read(ref _outputParser);
+
+        ToolPipeline tools = ResolveToolPipeline(request, plan);
 
         IReadOnlyCollection<string> callableNames = tools.Active
             ? tools.Choice.Mode == ToolChoiceMode.Function
@@ -497,7 +655,10 @@ public sealed class GenerationService : IDisposable
             throw new ContextLengthExceededException(prompt.Count, Model.ContextLength);
         }
 
-        int maxTokens = Math.Min(request.MaxTokens, Model.ContextLength - prompt.Count);
+        ModelConfig modelConfig = EffectiveConfiguration.Models[0];
+        ResolvedTokenBudgets budgets = ResolveTokenBudgets(request, modelConfig, plan);
+        int generationCeiling = ResolveGenerationCeiling(request, budgets);
+        int maxTokens = Math.Min(generationCeiling, Model.ContextLength - prompt.Count);
         if (maxTokens <= 0)
         {
             // The clamp left no budget: the sequence generates nothing and reports the budget as spent.
@@ -515,6 +676,8 @@ public sealed class GenerationService : IDisposable
         int decodedChars = 0;
         bool stopped = false;
         SequenceHandle? handle = null;
+        BudgetStreamState? budgetState = budgets.ReasoningTokens is null && budgets.ResponseTokens is null ? null : new BudgetStreamState(plan.ReasoningRegion);
+        bool budgetCeilingReached = false;
 
         // The stop signal is a cancellation the sequence observes at its next step boundary rather than a call through the
         // handle: the scheduler can invoke the streaming hook for the first sampled token before this call has its handle
@@ -529,6 +692,8 @@ public sealed class GenerationService : IDisposable
         {
             PromptTokens = [.. prompt],
             MaxTokens = maxTokens,
+            ReasoningTokenBudget = budgets.ReasoningTokens,
+            ResponseTokenBudget = budgets.ResponseTokens,
             Sampling = new SamplingParams
             {
                 Temperature = request.Temperature,
@@ -548,6 +713,15 @@ public sealed class GenerationService : IDisposable
                 tracker?.ObserveToken();
 
                 string piece = _tokenizer.Decode([tokenId]);
+                if (budgetState is not null)
+                {
+                    if (budgetState.Feed(piece, tokenId, budgets.ReasoningTokens, budgets.ResponseTokens))
+                    {
+                        budgetCeilingReached = true;
+                        stopSignal.Cancel();
+                    }
+                }
+
                 if (piece.Length == 0)
                 {
                     return;
@@ -617,7 +791,7 @@ public sealed class GenerationService : IDisposable
         }
         else if (outcome.FinishReason == FinishReason.Canceled)
         {
-            finishReason = "cancelled";
+            finishReason = budgetCeilingReached && !stopped && !cancellationToken.IsCancellationRequested ? "length" : "cancelled";
         }
         else if (outcome.FinishReason == FinishReason.Eos)
         {
@@ -628,12 +802,34 @@ public sealed class GenerationService : IDisposable
             finishReason = "length";
         }
 
+        string? budgetExhausted = null;
+        if (budgetState is not null)
+        {
+            if (budgetState.ResponseCeilingReached)
+            {
+                budgetExhausted = "response";
+            }
+            else if (budgetState.ReasoningCeilingReached)
+            {
+                budgetExhausted = "reasoning";
+            }
+            else if (finishReason == "length")
+            {
+                // The token that exhausts the scheduler's combined ceiling never reaches the token hook, so a length finish
+                // still has to be attributed from the resolved pair itself: no response ceiling means the reasoning ceiling
+                // bounded the run, and a response ceiling present but not yet marked by the hook is what the combined ceiling stopped.
+                budgetExhausted = budgets.ResponseTokens is null
+                    ? budgets.ReasoningTokens is null ? null : "reasoning"
+                    : budgets.ReasoningTokens is null || budgetState.ReasoningTokens < budgets.ReasoningTokens.Value ? "response" : "reasoning";
+            }
+        }
+
         // The completion frame publishes before failure semantics surface: a failed or cancelled generation still gets
         // its final lifecycle row with the status it ended on, so stream state matches engine state.
         if (tracker is RequestTracker finished)
         {
             _monitoredRequests.TryRemove(finished.RequestId, out _);
-            finished.Complete(finishReason, outcome.PrefillCachedTokens, finishReason);
+            finished.Complete(finishReason, outcome.PrefillCachedTokens, finishReason, budgetExhausted);
         }
 
         if (finishReason == "failed")
@@ -648,14 +844,34 @@ public sealed class GenerationService : IDisposable
             throw new OperationCanceledException(cancellationToken);
         }
 
-        // Recognized fences take over the result: the fences vanish from the visible text, the calls ride along as data,
-        // and the finish reason becomes tool_calls no matter how decoding ended. Detection is unchanged by which tool
-        // surface the prompt used: it reads fenced-JSON calls out of the decoded text whenever the pipeline is active,
-        // whether LAIR injected the contract or the template rendered the tools itself.
-        IReadOnlyList<ToolCall>? toolCalls = null;
-        if (tools.Active)
+        // A recognized call takes over the result: its markup vanishes from the visible text, the calls ride along as data,
+        // and the finish reason becomes tool_calls no matter how decoding ended. What counts as a call follows the plan's
+        // parser — fenced blocks for an injected contract, the template's own object shape when the template rendered the
+        // tools — so each surface is read only by its matching reader; an inert plan has no parser, so its decoded text is
+        // never read and its content stays byte-for-byte what the model generated.
+        // Reasoning regions are recognized from the markup this generation actually contains, whichever model produced it:
+        // boundaries are recorded either way, and only a strip policy withholds them from visible content. A keep policy
+        // leaves the text byte-for-byte as generated, which is what every model serves today. Recognition runs before call
+        // reading so a call markup inside reasoning that gets stripped never reaches the parser as a call. The plan in force
+        // is the one this sequence was admitted on, not whatever a reload has since resolved.
+        if (budgetState is not null)
         {
-            ToolDetection detection = ToolCallDetector.Detect(text, callableNames);
+            text = ApplyBudgetStreamState(text, budgetState);
+        }
+
+        ReasoningDetection reasoning = plan.Reasoning == ReasoningPolicy.Strip
+            ? ReasoningRecognition.Strip(text)
+            : new ReasoningDetection(ReasoningRecognition.FindRegions(text), text);
+        if (plan.Reasoning == ReasoningPolicy.Strip)
+        {
+            text = reasoning.VisibleText;
+        }
+
+        IReadOnlyList<ToolCall>? toolCalls = null;
+        IToolOutputParser? outputParser = plan.Parser;
+        if (tools.Active && outputParser is not null)
+        {
+            ToolDetection detection = outputParser.ReadCalls(text, callableNames);
             if (detection.Calls.Count > 0)
             {
                 text = detection.VisibleText;
@@ -671,7 +887,10 @@ public sealed class GenerationService : IDisposable
             finishReason,
             outcome.PrefillCachedTokens,
             request.LogProbs ? outcome.LogProbs : null,
-            toolCalls);
+            toolCalls,
+            reasoning.Regions.Count > 0 ? reasoning.Regions : null,
+            plan.Reasoning,
+            budgetExhausted);
     }
 
     public void Dispose()
@@ -796,7 +1015,7 @@ public sealed class GenerationService : IDisposable
     internal string BuildChatPrompt(GenerationRequest request, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
-        return BuildChatPrompt(request, ResolveToolPipeline(request), cancellationToken).Text;
+        return BuildChatPrompt(request, ResolveToolPipeline(request, Volatile.Read(ref _outputParser)), cancellationToken).Text;
     }
 
     /// <summary>
@@ -811,27 +1030,22 @@ public sealed class GenerationService : IDisposable
         IReadOnlyList<ToolDefinition>? TemplateTools,
         IReadOnlyList<ToolDefinition>? InjectedTools);
 
-    private ToolPipeline ResolveToolPipeline(GenerationRequest request)
+    private ToolPipeline ResolveToolPipeline(GenerationRequest request, OutputParserPlan outputParser)
     {
         IReadOnlyList<ToolDefinition>? declaredTools = ValidateToolDeclarations(request.Tools);
         ToolChoiceSelection choice = ResolveToolChoice(request.ToolChoice, declaredTools);
 
         // ToolChoiceMode.None closes the pipeline before any precedence decision: no template tools, no injection.
-        if (!request.IsChat || declaredTools is not { Count: > 0 } || choice.Mode == ToolChoiceMode.None)
+        // An inert plan closes it the same way for every request: the model gets no tool surface at all.
+        if (!request.IsChat || declaredTools is not { Count: > 0 } || choice.Mode == ToolChoiceMode.None || outputParser.ToolParser == ToolParser.None)
         {
             return new ToolPipeline(declaredTools, choice, false, null, null);
         }
 
-        return ShouldInjectFencedTools(_chatTemplateCapabilities, Volatile.Read(ref _current).Models[0].ForceFencedTools)
+        return outputParser.ToolParser == ToolParser.Fenced
             ? new ToolPipeline(declaredTools, choice, true, null, declaredTools)
             : new ToolPipeline(declaredTools, choice, true, declaredTools, null);
     }
-
-    // DN-M32-7 tool precedence: a loaded template that renders tools owns the tool surface for that request. LAIR's
-    // fenced block is the fallback for a template without tool support (and for a model with no chat template at all),
-    // and the model's force_fenced_tools override selects it even for a tool-capable template.
-    private static bool ShouldInjectFencedTools(TemplateCapabilities? capabilities, bool forceOverride) =>
-        forceOverride || capabilities is null || !capabilities.SupportsTools;
 
     private static ChatMessage MapChatMessage(Lair.Tokenizer.Templating.ChatMessage message) =>
         new() { Role = message.Role, Content = MinjaValue.Of(message.Content) };
@@ -903,6 +1117,201 @@ public sealed class GenerationService : IDisposable
         return resolved;
     }
 
+    private ResolvedTokenBudgets ResolveTokenBudgets(GenerationRequest request, ModelConfig modelConfig, OutputParserPlan plan)
+    {
+        int? reasoning = request.MaxReasoningTokens;
+        if (reasoning is not null)
+        {
+            if (!plan.HasResolvedReasoningRegion)
+            {
+                throw new ArgumentException(
+                    $"model '{Model.Id}' resolves no reasoning region, so 'max_reasoning_tokens' cannot be applied to it: declare max_reasoning_tokens for the model or omit the field.",
+                    nameof(request));
+            }
+
+            if (modelConfig.MaxReasoningTokens is int reasoningCeiling && reasoning > reasoningCeiling)
+            {
+                reasoning = reasoningCeiling;
+            }
+        }
+        else
+        {
+            reasoning = modelConfig.MaxReasoningTokens;
+        }
+
+        int? response = request.MaxResponseTokens;
+        if (response is null)
+        {
+            response = modelConfig.MaxResponseTokens;
+        }
+        else if (modelConfig.MaxResponseTokens is int responseCeiling && response > responseCeiling)
+        {
+            response = responseCeiling;
+        }
+
+        if (reasoning is < 1)
+        {
+            throw new ArgumentException($"'max_reasoning_tokens' must be 1 or greater, got {reasoning}.", nameof(request));
+        }
+
+        if (response is < 1)
+        {
+            throw new ArgumentException($"'max_response_tokens' must be 1 or greater, got {response}.", nameof(request));
+        }
+
+        return new ResolvedTokenBudgets(reasoning, response);
+    }
+
+    private static int ResolveGenerationCeiling(GenerationRequest request, ResolvedTokenBudgets budgets)
+    {
+        if (budgets.ReasoningTokens is null && budgets.ResponseTokens is null)
+        {
+            return request.MaxTokens;
+        }
+
+        int sum = (budgets.ReasoningTokens ?? 0) + (budgets.ResponseTokens ?? 0);
+        if (sum <= 0)
+        {
+            return request.MaxTokens;
+        }
+
+        return request.MaxTokensWasSupplied ? Math.Min(request.MaxTokens, sum) : sum;
+    }
+
+    private static string ApplyBudgetStreamState(string text, BudgetStreamState state)
+    {
+        if (state.SyntheticCloseChar >= 0)
+        {
+            int closeAt = Math.Min(state.SyntheticCloseChar, text.Length);
+            text = text[..closeAt] + ReasoningRecognition.CloseMarkup + text[closeAt..];
+        }
+
+        if (state.ResponseStopChar >= 0)
+        {
+            int stopAt = state.ResponseStopChar;
+            if (state.SyntheticCloseChar >= 0 && stopAt >= state.SyntheticCloseChar)
+            {
+                stopAt += ReasoningRecognition.CloseMarkup.Length;
+            }
+
+            stopAt = Math.Min(stopAt, text.Length);
+            text = text[..stopAt];
+        }
+
+        return text;
+    }
+
+    private sealed record ResolvedTokenBudgets(int? ReasoningTokens, int? ResponseTokens);
+
+    private sealed class BudgetStreamState
+    {
+        private const string Open = ReasoningRecognition.OpenMarkup;
+        private const string Close = ReasoningRecognition.CloseMarkup;
+
+        // The ids model open proved deliver each marker whole for this model (-1 when the vocabulary carries no such entry).
+        // A budgeted model always has them; a marker-less vocabulary can only ever hold a response budget, where region
+        // boundaries are read from the text the pieces carry.
+        private readonly int _openTokenId;
+        private readonly int _closeTokenId;
+        private readonly List<string> _pieces = [];
+        private int _charPos;
+        private bool _inReasoning;
+
+        public BudgetStreamState(ReasoningRegionMarkers? markers)
+        {
+            _openTokenId = markers?.OpenTokenId ?? -1;
+            _closeTokenId = markers?.CloseTokenId ?? -1;
+        }
+
+        public int ReasoningTokens;
+        public int VisibleTokens;
+        public int SyntheticCloseChar = -1;
+        public int ResponseStopChar = -1;
+        public bool ReasoningCeilingReached;
+        public bool ResponseCeilingReached;
+
+        public bool Feed(string piece, int tokenId, int? reasoningCeiling, int? responseCeiling)
+        {
+            ArgumentNullException.ThrowIfNull(piece);
+
+            _pieces.Add(piece);
+
+            bool openArrivesWhole = _openTokenId >= 0 && tokenId == _openTokenId;
+            bool closeArrivesWhole = _closeTokenId >= 0 && tokenId == _closeTokenId;
+
+            bool startsInReasoning = _inReasoning;
+            bool tokenIsReasoning = startsInReasoning || openArrivesWhole || piece.Contains(Open, StringComparison.Ordinal);
+
+            int scan = 0;
+            while (scan < piece.Length)
+            {
+                if (!_inReasoning)
+                {
+                    if (openArrivesWhole)
+                    {
+                        _inReasoning = true;
+                        scan = piece.Length;
+                        continue;
+                    }
+
+                    int open = piece.IndexOf(Open, scan, StringComparison.Ordinal);
+                    if (open < 0)
+                    {
+                        break;
+                    }
+
+                    _inReasoning = true;
+                    scan = open + Open.Length;
+                }
+                else
+                {
+                    if (closeArrivesWhole)
+                    {
+                        _inReasoning = false;
+                        scan = piece.Length;
+                        continue;
+                    }
+
+                    int close = piece.IndexOf(Close, scan, StringComparison.Ordinal);
+                    if (close < 0)
+                    {
+                        break;
+                    }
+
+                    _inReasoning = false;
+                    scan = close + Close.Length;
+                }
+            }
+
+            _charPos += piece.Length;
+
+            if (tokenIsReasoning)
+            {
+                ReasoningTokens++;
+            }
+            else
+            {
+                VisibleTokens++;
+            }
+
+            if (reasoningCeiling is int reasoningLimit && ReasoningTokens == reasoningLimit && _inReasoning)
+            {
+                ReasoningCeilingReached = true;
+                SyntheticCloseChar = _charPos;
+                _inReasoning = false;
+            }
+
+            if (responseCeiling is int responseLimit && !tokenIsReasoning && VisibleTokens == responseLimit)
+            {
+                ResponseCeilingReached = true;
+                ResponseStopChar = _charPos;
+                return true;
+            }
+
+            return false;
+        }
+    }
+
     private static int StopIndex(string text, IReadOnlyList<string>? stopStrings)
     {
         if (stopStrings is null)
@@ -953,7 +1362,7 @@ public sealed class GenerationService : IDisposable
         return tools;
     }
 
-    // A null choice means auto. A forced function must name one of the declared tools: its fences are then the only ones detection accepts.
+    // A null choice means auto. A forced function must name one of the declared tools: only calls naming it are then accepted.
     private static ToolChoiceSelection ResolveToolChoice(ToolChoiceSelection? choice, IReadOnlyList<ToolDefinition>? declaredTools)
     {
         if (choice is null || choice.Mode == ToolChoiceMode.Auto)

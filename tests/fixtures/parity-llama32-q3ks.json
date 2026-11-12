@@ -1,0 +1,162 @@
+{
+  "model_file": "models/Llama-3.2-1B-Instruct-Q3_K_S.gguf",
+  "model_sha256": "7fe2f725782ce9e742ecb8fc8ba9a3e1621736297d98bcdb2145e30ad88c0a4f",
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
+  "decode": {
+    "temperature": 0.0,
+    "context": 1024
+  },
+  "generated_utc": "2026-11-11T01:04:52Z",
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "max_tokens": 48,
+      "output": " Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France is Paris. The capital of France",
+      "top_logprobs": [
+        {
+          "id": 12366,
+          "token": " Paris",
+          "logprob": -0.11072122305631638,
+          "lair_logprob": -0.1074
+        },
+        {
+          "id": 3604,
+          "token": " actually",
+          "logprob": -3.834939479827881,
+          "lair_logprob": -3.9745
+        },
+        {
+          "id": 264,
+          "token": " a",
+          "logprob": -4.7573676109313965,
+          "lair_logprob": -4.8263
+        },
+        {
+          "id": 539,
+          "token": " not",
+          "logprob": -5.132514476776123,
+          "lair_logprob": -5.2045
+        },
+        {
+          "id": 1101,
+          "token": " also",
+          "logprob": -5.336949825286865,
+          "lair_logprob": -5.352
+        }
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "max_tokens": 48,
+      "output": ", in a small village nestled in the rolling hills of the countryside, there lived a young girl named Sophia. Sophia was a curious and adventurous child, with a heart full of wonder and a mind full of questions. She spent most of her",
+      "top_logprobs": [
+        {
+          "id": 11,
+          "token": ",",
+          "logprob": -0.08722537010908127,
+          "lair_logprob": -0.0815
+        },
+        {
+          "id": 304,
+          "token": " in",
+          "logprob": -3.306187152862549,
+          "lair_logprob": -3.3786
+        },
+        {
+          "id": 1070,
+          "token": " there",
+          "logprob": -4.29934549331665,
+          "lair_logprob": -4.524
+        },
+        {
+          "id": 320,
+          "token": " (",
+          "logprob": -4.397390842437744,
+          "lair_logprob": -4.3178
+        },
+        {
+          "id": 1131,
+          "token": "...",
+          "logprob": -4.796396732330322,
+          "lair_logprob": -4.6626
+        }
+      ]
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "max_tokens": 48,
+      "output": "    if n <= 0:\n        return 0\n    elif n == 1:\n        return 1\n    else:\n        return fibonacci(n-1) + fibonacci(n-2)\n\ndef main():\n    fib = fibonacci(",
+      "top_logprobs": [
+        {
+          "id": 262,
+          "token": "   ",
+          "logprob": -0.007537147495895624,
+          "lair_logprob": -0.0066
+        },
+        {
+          "id": 220,
+          "token": " ",
+          "logprob": -5.019593715667725,
+          "lair_logprob": -5.1555
+        },
+        {
+          "id": 1084,
+          "token": "    \n",
+          "logprob": -7.9244608879089355,
+          "lair_logprob": -8.204
+        },
+        {
+          "id": 748,
+          "token": "\tif",
+          "logprob": -8.914555549621582,
+          "lair_logprob": -9.2199
+        },
+        {
+          "id": 286,
+          "token": "       ",
+          "logprob": -9.725960731506348,
+          "lair_logprob": -9.7906
+        }
+      ]
+    },
+    {
+      "prompt": "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
+      "max_tokens": 48,
+      "output": "Mars is often referred to as the \"Red Planet\" due to its reddish appearance, which is caused by iron oxide in the planet's soil.",
+      "top_logprobs": [
+        {
+          "id": 44,
+          "token": "M",
+          "logprob": -0.367032527923584,
+          "lair_logprob": -0.3315
+        },
+        {
+          "id": 791,
+          "token": "The",
+          "logprob": -2.2896628379821777,
+          "lair_logprob": -2.501
+        },
+        {
+          "id": 40,
+          "token": "I",
+          "logprob": -3.6643900871276855,
+          "lair_logprob": -3.699
+        },
+        {
+          "id": 8586,
+          "token": "Here",
+          "logprob": -3.998256206512451,
+          "lair_logprob": -3.6816
+        },
+        {
+          "id": 27814,
+          "token": "Mer",
+          "logprob": -4.328376293182373,
+          "lair_logprob": -4.9024
+        }
+      ]
+    }
+  ]
+}

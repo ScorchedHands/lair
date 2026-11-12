@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text;
 
 using Lair.Backends.Cpu;
+using Lair.Kv;
 using Lair.Loader;
 using Lair.Models;
 using Lair.Models.Engine;
@@ -9,14 +10,19 @@ using Lair.Models.Engine;
 namespace Lair.Tests;
 
 /// <summary>
-/// Load-time resolution and deferred execution for the sparse-FFN (MoE) slot: the registered MoE architectures
+/// Load-time resolution and execution for the sparse-FFN (MoE) slot: the registered MoE architectures
 /// the pinned reference reports resolve a validated descriptor from the file's declared expert metadata
 /// (<c>expert_count</c>, <c>expert_used_count</c>, <c>expert_shared_count</c>, <c>expert_weights_scale</c>, and
-/// <c>expert_weights_norm</c>) with the router, per-expert, and shared-expert tensor roles the profile's map
-/// names under the reference's names; a declared count that is present but not a sane positive integer fails
-/// naming key and value; a recognized MoE file fails engine open with the deferral naming the architecture and
-/// the expert count — never as a missing-tensor failure; a dense family file keeps a null descriptor; and an
-/// unregistered architecture carrying MoE tensor names still fails through the tensor-table message.
+/// <c>expert_weights_norm</c>) with the router, per-expert, and shared-expert tensor roles the profile's map names
+/// under the reference's names; a declared count that is present but not a sane positive integer fails naming key and
+/// value; a recognized MoE file opens into the engine with its descriptor and runs the routed experts instead of
+/// deferring; a dense family file keeps a null descriptor; an unregistered architecture carrying MoE tensor names still
+/// fails through the tensor-table message. The same slot also carries how a block stores its experts: the declared
+/// <c>expert_layout</c> and <c>expert_rank</c> resolve into the descriptor's layout, rank, basis/coefficient/output-basis
+/// roles (absent means stacked with no rank and none of those roles), and the declared <c>sparse_ffn_strategy</c>
+/// resolves against every profile's dense-resident default — an unrecognized name fails naming key and value, a
+/// shared-basis selection on a stacked declaration is refused rather than downgraded, and a strategy the forward engine
+/// has no kernel for reports at engine open instead of running something else.
 /// </summary>
 [Trait("Category", "Loader")]
 public sealed class SparseFfnPlanTests : IDisposable
@@ -84,8 +90,14 @@ public sealed class SparseFfnPlanTests : IDisposable
         Assert.NotNull(plan.Tensors[sparse.SharedGateRole.Value].Resolve(gguf.Tensors, 0));
         Assert.NotNull(plan.Tensors[sparse.SharedUpRole!.Value].Resolve(gguf.Tensors, 0));
         Assert.NotNull(plan.Tensors[sparse.SharedDownRole!.Value].Resolve(gguf.Tensors, 0));
-        Assert.Contains("blk.{layer}.ffn_gate_inp_shexp.weight", plan.Tensors[sparse.SharedGateRole.Value].Aliases);
+        // The shared-expert selector vector is its own tensor under a role of its own, and the shared gate matrix's
+        // name carries no alias onto it: they are different tensors with different shapes.
+        Assert.Equal(TensorRole.MoeSharedExpertInputGate, sparse.SharedInputGateRole);
+        Assert.Equal("blk.0.ffn_gate_inp_shexp.weight", plan.Tensors[sparse.SharedInputGateRole!.Value].NameFor(0));
+        Assert.NotNull(plan.Tensors[sparse.SharedInputGateRole.Value].Resolve(gguf.Tensors, 0));
+        Assert.Empty(plan.Tensors[sparse.SharedGateRole.Value].Aliases);
     }
+
 
     [Fact]
     public void ModelPlan_Qwen3MoeFile_WithoutDeclaredSharedExpert_ResolvesSharedRolesNull()
@@ -102,6 +114,7 @@ public sealed class SparseFfnPlanTests : IDisposable
         Assert.Null(sparse.SharedGateRole);
         Assert.Null(sparse.SharedUpRole);
         Assert.Null(sparse.SharedDownRole);
+        Assert.Null(sparse.SharedInputGateRole); // no shared expert, so nothing to gate it with
         Assert.True(Math.Abs(sparse.ExpertWeightsScale - 1f) < 1e-6f, "the declared scale must land in the descriptor");
         Assert.True(sparse.NormalizeExpertWeights);
     }
@@ -188,37 +201,40 @@ public sealed class SparseFfnPlanTests : IDisposable
         Assert.Contains("-0.5", ex.Message);
     }
 
-    // ---------------------------------------------------------------- deferred execution at Open
+    // ---------------------------------------------------------------- descriptor-bearing files open and execute
 
     [Fact]
-    public void TransformerModelOpen_Qwen2MoeFile_FailsWithDeferredExecutionMessage_NotAMissingTensorFailure()
+    public void TransformerModelOpen_Qwen2MoeFile_ResolvesTheDescriptorAndReplacesTheDenseFfnNames()
     {
         string path = WriteTemp(BuildGguf(MoeMetadata("qwen2moe"), [.. MoeTensors()]));
 
         using CpuBackend backend = new();
         using GgufFile gguf = GgufFile.Open(path);
-        ModelException ex = Assert.Throws<ModelException>(() => TransformerModel.Open(gguf, backend, maxContextTokens: 8));
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
 
-        Assert.Contains("qwen2moe", ex.Message);
-        Assert.Contains("8 experts", ex.Message);
-        Assert.Contains("sparse FFN execution is not implemented", ex.Message);
-        Assert.DoesNotContain("is missing", ex.Message); // the deferral is not a missing-tensor complaint
-        Assert.DoesNotContain("blk.0.ffn_gate.weight", ex.Message); // the dense FFN name the file lacks never surfaces
+        SparseFfnDescriptor sparse = model.Plan.SparseFfn!;
+        Assert.Equal(8, sparse.ExpertCount);
+        Assert.True(sparse.HasSharedExpert);
+        Assert.Null(model.Plan.Tensors[TensorRole.FeedForwardGate].Resolve(gguf.Tensors, 0)); // the routed block replaces the dense FFN names
+        Assert.Null(model.Plan.Tensors[TensorRole.FeedForwardUp].Resolve(gguf.Tensors, 0));
+        Assert.Null(model.Plan.Tensors[TensorRole.FeedForwardDown].Resolve(gguf.Tensors, 0));
     }
 
     [Fact]
-    public void TransformerModelOpen_Qwen3MoeFile_FailsWithDeferredExecutionMessage_NamingItsArchitectureAndCount()
+    public void TransformerModelOpen_Qwen3MoeFile_WithoutSharedExpert_ResolvesTheDescriptorAndExecutes()
     {
-        string path = WriteTemp(BuildGguf(MoeMetadata("qwen3moe", sharedExpert: false), [.. MoeTensors()]));
+        string path = WriteTemp(BuildGguf(MoeMetadata("qwen3moe", sharedExpert: false), [.. MoeTensors("qwen3moe")]));
 
         using CpuBackend backend = new();
         using GgufFile gguf = GgufFile.Open(path);
-        ModelException ex = Assert.Throws<ModelException>(() => TransformerModel.Open(gguf, backend, maxContextTokens: 8));
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
 
-        Assert.Contains("qwen3moe", ex.Message);
-        Assert.Contains("8 experts", ex.Message);
-        Assert.Contains("sparse FFN execution is not implemented", ex.Message);
-        Assert.DoesNotContain("is missing", ex.Message);
+        SparseFfnDescriptor sparse = model.Plan.SparseFfn!;
+        Assert.Equal(8, sparse.ExpertCount);
+        Assert.False(sparse.HasSharedExpert);
+        Assert.Null(model.Plan.Tensors[TensorRole.FeedForwardGate].Resolve(gguf.Tensors, 0));
+        Assert.Null(model.Plan.Tensors[TensorRole.FeedForwardUp].Resolve(gguf.Tensors, 0));
+        Assert.Null(model.Plan.Tensors[TensorRole.FeedForwardDown].Resolve(gguf.Tensors, 0));
     }
 
     // ---------------------------------------------------------------- dense families and the fallback gate
@@ -238,7 +254,7 @@ public sealed class SparseFfnPlanTests : IDisposable
 
         using CpuBackend backend = new();
         using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
-        Assert.Null(model.Plan.SparseFfn); // the deferral never fires for a dense family file
+        Assert.Null(model.Plan.SparseFfn); // no expert count declared: the dense block stays the only one
     }
 
     [Fact]
@@ -269,15 +285,278 @@ public sealed class SparseFfnPlanTests : IDisposable
         Assert.True(qwen2MoeShape!.HasSharedExpert);
         Assert.Equal(TensorRole.MoeRouter, qwen2MoeShape.RouterRole);
 
+        // The reference gates its shared expert per token with a vector of its own, so only qwen2moe names that role.
+        Assert.Equal(TensorRole.MoeSharedExpertInputGate, qwen2MoeShape.SharedInputGateRole);
+
         SparseFfnDescriptor? qwen3MoeShape = ModelProfiles.Resolve("qwen3moe").SparseFfn;
         Assert.NotNull(qwen3MoeShape);
         Assert.False(qwen3MoeShape!.HasSharedExpert);
         Assert.Null(qwen3MoeShape.SharedGateRole);
+        Assert.Null(qwen3MoeShape.SharedInputGateRole);
 
         foreach (string architecture in new string[] { "llama", "qwen2", "qwen3", "gemma2" })
         {
             Assert.Null(ModelProfiles.Resolve(architecture).SparseFfn);
         }
+    }
+
+    // ---------------------------------------------------------------- declared expert storage layout and rank
+
+    [Fact]
+    public void ModelPlan_Qwen2MoeFile_DeclaringSharedBasisLayout_ResolvesRankRolesAndTheLowRankStrategy()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(
+            [.. MoeMetadata("qwen2moe"), ("qwen2moe.expert_layout", "shared_basis"), ("qwen2moe.expert_rank", 4), ("qwen2moe.sparse_ffn_strategy", "low_rank_shared_basis")],
+            [.. MoeTensors(), .. FactorizedTensors(aliasSpellings: true)])));
+
+        ModelPlan plan = ModelPlans.Resolve(gguf);
+
+        Assert.NotNull(plan.SparseFfn);
+        SparseFfnDescriptor sparse = plan.SparseFfn!;
+
+        Assert.Equal(SparseFfnLayout.FactorizedSharedBasis, sparse.Layout);
+        Assert.Equal<int?>(4, sparse.Rank); // the declared rank lands in the descriptor as the coefficient-space width
+
+        Assert.Equal(TensorRole.MoeExpertInputBasis, sparse.ExpertInputBasisRole);
+        Assert.Equal(TensorRole.MoeExpertCoefficients, sparse.ExpertCoefficientRole);
+        Assert.Equal(TensorRole.MoeExpertOutputBasis, sparse.ExpertOutputBasisRole);
+
+        // Each factorized role resolves through the plan's map under this family's naming shape. The coefficient tensor
+        // this fixture ships is spelled with the plural alias, and it resolves all the same: a sidecar exporter that
+        // spells its stacked-coefficient name either way reaches the same role through the layer-substituted alias.
+        var inputBasis = plan.Tensors[sparse.ExpertInputBasisRole!.Value].Resolve(gguf.Tensors, 0);
+        var coefficient = plan.Tensors[sparse.ExpertCoefficientRole!.Value].Resolve(gguf.Tensors, 0);
+        var outputBasis = plan.Tensors[sparse.ExpertOutputBasisRole!.Value].Resolve(gguf.Tensors, 0);
+
+        Assert.NotNull(inputBasis);
+        Assert.NotNull(coefficient); // found through the alias name
+        Assert.NotNull(outputBasis);
+
+        Assert.Equal("blk.0.ffn_exps_basis_in.weight", inputBasis!.Name);
+        Assert.Equal("blk.0.ffn_experts_coefficient.weight", coefficient!.Name);
+        Assert.Equal("blk.0.ffn_exps_basis_out.weight", outputBasis!.Name);
+
+        // The declaration selects its strategy too: a factorized file naming its own variant has it recorded rather than
+        // some other variant running behind its back.
+        Assert.Equal(SparseFfnStrategy.LowRankSharedBasis, plan.SparseFfnStrategy);
+    }
+
+    [Fact]
+    public void ModelPlan_MoEFile_WithoutLayoutDeclaration_ResolvesStackedLayoutNoRankAndNoFactorizedRoles()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(MoeMetadata("qwen2moe"), [.. MoeTensors()])));
+
+        ModelPlan plan = ModelPlans.Resolve(gguf);
+
+        Assert.NotNull(plan.SparseFfn);
+        SparseFfnDescriptor stacked = plan.SparseFfn!;
+
+        Assert.Equal(SparseFfnLayout.StackedExperts, stacked.Layout); // every published conversion stores its experts this way
+        Assert.Null(stacked.Rank);
+        Assert.Null(stacked.ExpertInputBasisRole);
+        Assert.Null(stacked.ExpertCoefficientRole);
+        Assert.Null(stacked.ExpertOutputBasisRole);
+
+        // A stacked declaration is an un-factorizable file: nothing in its descriptor points at shared-basis work, so no
+        // low-rank variant is selected for it. Absent the strategy key, the resolved profile's default answers instead.
+        Assert.Equal(SparseFfnStrategy.DenseResident, plan.SparseFfnStrategy);
+    }
+
+    [Fact]
+    public void ModelPlan_ExplicitlyDeclaredDenseResidentStrategy_ResolvesItOverTheProfileDefault()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(
+            [.. MoeMetadata("qwen3moe", sharedExpert: false), ("qwen3moe.sparse_ffn_strategy", "dense_resident")], [])));
+
+        Assert.Equal(SparseFfnStrategy.DenseResident, ModelPlans.Resolve(gguf).SparseFfnStrategy);
+    }
+
+    [Fact]
+    public void ModelPlan_DenseFamilyWithoutExperts_CarriesNoSparseFfnStrategyAtAll()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(Metadata("llama", tiny: true), [.. DenseTensors("llama")])));
+
+        Assert.Null(ModelPlans.Resolve(gguf).SparseFfn);
+        Assert.Null(ModelPlans.Resolve(gguf).SparseFfnStrategy); // nothing routes, so no variant is selected for it
+    }
+
+    [Fact]
+    public void ModelProfiles_DefaultSparseFfnStrategy_IsDenseResidentForEveryRegisteredProfile()
+    {
+        foreach (string architecture in ModelProfiles.SupportedArchitectures)
+        {
+            Assert.Equal(SparseFfnStrategy.DenseResident, ModelProfiles.Resolve(architecture).DefaultSparseFfnStrategy);
+        }
+
+        // A factorized shape is what a file declares, never what a family prefers: the sparse shapes carry the stacked
+        // layout with no rank while naming the basis/coefficient/output roles their maps can resolve.
+        SparseFfnDescriptor qwen2MoeShape = ModelProfiles.Resolve("qwen2moe").SparseFfn!;
+
+        Assert.Equal(SparseFfnLayout.StackedExperts, qwen2MoeShape.Layout);
+        Assert.Null(qwen2MoeShape.Rank);
+        Assert.NotNull(qwen2MoeShape.ExpertInputBasisRole);
+    }
+
+    // ---------------------------------------------------------------- declared layout and strategy validation
+
+    [Theory]
+    [InlineData("qwen2moe.sparse_ffn_strategy", "auto")]
+    [InlineData("qwen2moe.sparse_ffn_strategy", "low_rank")]
+    [InlineData("qwen2moe.sparse_ffn_strategy", "stacked")] // a layout value is not a strategy name
+    public void ModelPlan_InvalidDeclaredSparseFfnStrategy_FailsNamingKeyAndValue(string key, string declared)
+    {
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(
+            [.. MoeMetadata("qwen2moe"), (key, declared)], [])));
+
+        ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(gguf));
+
+        Assert.Contains(key, ex.Message);
+        Assert.Contains(declared, ex.Message);
+        Assert.Contains("sparse-FFN strategy", ex.Message);
+        Assert.Contains("'dense_resident' and 'low_rank_shared_basis'", ex.Message); // the accepted set is stated, not guessed
+    }
+
+    [Fact]
+    public void ModelPlan_InvalidDeclaredSparseFfnStrategyType_FailsNamingKey()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(
+            [.. MoeMetadata("qwen2moe"), ("qwen2moe.sparse_ffn_strategy", 7)], [])));
+
+        ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(gguf));
+
+        Assert.Contains("qwen2moe.sparse_ffn_strategy", ex.Message);
+        Assert.Contains("must be a string", ex.Message);
+    }
+
+    [Fact]
+    public void ModelPlan_LowRankStrategyOnAStackedFile_IsRefusedNotDowngraded_NamingBothSidesOfTheMismatch()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(
+            [.. MoeMetadata("qwen2moe"), ("qwen2moe.expert_layout", "stacked"), ("qwen2moe.sparse_ffn_strategy", "low_rank_shared_basis")], [])));
+
+        ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(gguf)); // no plan resolves: nothing runs dense math under a low-rank label
+
+        Assert.Contains("qwen2moe.sparse_ffn_strategy", ex.Message);
+        Assert.Contains("'low_rank_shared_basis'", ex.Message);
+        Assert.Contains("stacked dense matrices with no rank", ex.Message);
+        Assert.Contains("expert_layout 'shared_basis'", ex.Message); // the two declarations that would settle it are named
+        Assert.Contains("dense_resident", ex.Message);
+
+        // The same file without the selection still resolves cleanly, so the refusal is about the mismatch alone.
+        using GgufFile plain = GgufFile.Open(WriteTemp(BuildGguf(MoeMetadata("qwen2moe"), [])));
+        Assert.Equal(SparseFfnStrategy.DenseResident, ModelPlans.Resolve(plain).SparseFfnStrategy);
+    }
+
+    [Theory]
+    [InlineData("qwen2moe.expert_layout", "lora")]
+    [InlineData("qwen2moe.expert_layout", "factorized")] // the plan's own wording for it is not a declaration value
+    public void ModelPlan_InvalidDeclaredExpertLayout_FailsNamingKeyAndValue(string key, string declared)
+    {
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf([.. MoeMetadata("qwen2moe"), (key, declared)], [])));
+
+        ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(gguf));
+
+        Assert.Contains(key, ex.Message);
+        Assert.Contains(declared, ex.Message);
+        Assert.Contains("'stacked' and 'shared_basis'", ex.Message);
+    }
+
+    [Fact]
+    public void ModelPlan_SharedBasisLayoutWithoutARank_FailsNamingTheMissingRankKey()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(
+            [.. MoeMetadata("qwen2moe"), ("qwen2moe.expert_layout", "shared_basis")], [])));
+
+        ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(gguf));
+
+        Assert.Contains("qwen2moe.expert_rank", ex.Message);
+        Assert.Contains("must declare the rank its coefficient tensors carry", ex.Message);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-3)]
+    [InlineData("wide")]
+    public void ModelPlan_InvalidDeclaredRank_FailsNamingKeyAndValue(object declared)
+    {
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(
+            [.. MoeMetadata("qwen2moe"), ("qwen2moe.expert_layout", "shared_basis"), ("qwen2moe.expert_rank", declared)], [])));
+
+        ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(gguf));
+
+        Assert.Contains("qwen2moe.expert_rank", ex.Message);
+        Assert.Contains(
+            declared is string text ? text : System.Convert.ToInt64(declared).ToString(CultureInfo.InvariantCulture),
+            ex.Message);
+    }
+
+    [Fact]
+    public void ModelPlan_RankDeclaredOnAStackedFile_FailsAsAnInconsistentDeclaration()
+    {
+        using GgufFile gguf = GgufFile.Open(WriteTemp(BuildGguf(
+            [.. MoeMetadata("qwen2moe"), ("qwen2moe.expert_rank", 4)], [])));
+
+        ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(gguf));
+
+        Assert.Contains("qwen2moe.expert_rank", ex.Message);
+        Assert.Contains("only a block whose qwen2moe.expert_layout is 'shared_basis'", ex.Message);
+    }
+
+    // ---------------------------------------------------------------- strategy execution and refusal
+
+    [Fact]
+    public void TransformerModelOpen_FactorizedFileSelectingLowRank_ReportsNotImplemented_NamingTheStrategyAndWhatRunsToday()
+    {
+        string path = WriteTemp(BuildGguf(
+            [.. MoeMetadata("qwen2moe"), ("qwen2moe.expert_layout", "shared_basis"), ("qwen2moe.expert_rank", 4), ("qwen2moe.sparse_ffn_strategy", "low_rank_shared_basis")],
+            [.. MoeTensors(), .. FactorizedTensors()]));
+
+        using CpuBackend backend = new();
+        using GgufFile gguf = GgufFile.Open(path);
+
+        ModelException ex = Assert.Throws<ModelException>(() => TransformerModel.Open(gguf, backend, maxContextTokens: 8));
+
+        Assert.Contains("sparse-FFN strategy 'LowRankSharedBasis' is not implemented by the forward engine", ex.Message);
+        Assert.Contains("architecture 'qwen2moe'", ex.Message);
+        Assert.Contains("8 experts routing 2 per token over a shared basis at rank 4", ex.Message);
+        Assert.Contains("only DenseResident executes today", ex.Message);
+        Assert.Contains("declare qwen2moe.sparse_ffn_strategy 'dense_resident' to run this file", ex.Message);
+
+        // A strategy with no kernel reports as the missing variant, never as a tensor problem: the factorized tensors are
+        // representable material and nothing here is absent.
+        Assert.DoesNotContain("is missing", ex.Message);
+    }
+
+    [Fact]
+    public void TransformerModelOpen_FactorizedFileWithoutASelection_ExecutesDenseResident_AndKeepsItsFactorizedDescriptor()
+    {
+        string path = WriteTemp(BuildGguf(
+            [.. MoeMetadata("qwen2moe"), ("qwen2moe.expert_layout", "shared_basis"), ("qwen2moe.expert_rank", 4)],
+            [.. MoeTensors(), .. FactorizedTensors()]));
+
+        using CpuBackend backend = new();
+        using GgufFile gguf = GgufFile.Open(path);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8); // the engine takes this factorized file on its resident dense path today
+
+        Assert.Equal(SparseFfnLayout.FactorizedSharedBasis, model.Plan.SparseFfn!.Layout); // representable either way
+        Assert.Equal<int?>(4, model.Plan.SparseFfn.Rank);                                 // the declared rank stays visible to callers
+        Assert.Equal(TensorRole.MoeExpertCoefficients, model.Plan.SparseFfn.ExpertCoefficientRole);
+        Assert.Equal(SparseFfnStrategy.DenseResident, model.Plan.SparseFfnStrategy);      // and the profile default runs it
+    }
+
+    [Fact]
+    public void TransformerModelOpen_StackedFileWithNoFactorizedDeclaration_KeepsLowRankUnselected_AndExecutesDenseResident()
+    {
+        string path = WriteTemp(BuildGguf(MoeMetadata("qwen2moe"), [.. MoeTensors()]));
+
+        using CpuBackend backend = new();
+        using GgufFile gguf = GgufFile.Open(path);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8); // an un-factorizable file has no low-rank variant to select and runs the resident experts
+
+        Assert.Equal(SparseFfnLayout.StackedExperts, model.Plan.SparseFfn!.Layout);
+        Assert.Null(model.Plan.SparseFfn.Rank);
+        Assert.NotEqual(SparseFfnStrategy.LowRankSharedBasis, model.Plan.SparseFfnStrategy!.Value);
+        Assert.Equal(SparseFfnStrategy.DenseResident, model.Plan.SparseFfnStrategy.Value);
     }
 
     // ---------------------------------------------------------------- shared helpers
@@ -372,24 +651,52 @@ public sealed class SparseFfnPlanTests : IDisposable
     // router matrix [hidden, experts], the stacked per-expert gate/up/down triplets [intermediate, hidden,
     // experts] and [hidden, intermediate, experts], and the shared expert's dense triplet plus its gate vector.
     // The dense gate/up/down names stay absent: an expert-routed block ships none of them.
-    private static List<TensorDef> MoeTensors() =>
+    private static List<TensorDef> MoeTensors(string architecture = "qwen2moe")
+    {
+        List<TensorDef> tensors =
+            [
+                new("token_embd.weight", [6, 4]),
+                new("blk.0.attn_q.weight", [4, 4]),
+                new("blk.0.attn_k.weight", [4, 4]),
+                new("blk.0.attn_v.weight", [4, 4]),
+                new("blk.0.attn_output.weight", [4, 4]),
+                new("blk.0.attn_norm.weight", [4]),
+                new("blk.0.ffn_norm.weight", [4]),
+                new("output_norm.weight", [4]),
+                new("blk.0.ffn_gate_inp.weight", [8, 4]),
+                new("blk.0.ffn_gate_exps.weight", [8, 8, 4]),
+                new("blk.0.ffn_up_exps.weight", [8, 8, 4]),
+                new("blk.0.ffn_down_exps.weight", [8, 4, 8]),
+            ];
+
+        if (architecture == "qwen2moe")
+        {
+            tensors.Add(new("blk.0.ffn_gate_shexp.weight", [8, 4]));
+            tensors.Add(new("blk.0.ffn_up_shexp.weight", [8, 4]));
+            tensors.Add(new("blk.0.ffn_down_shexp.weight", [4, 8]));
+            tensors.Add(new("blk.0.ffn_gate_inp_shexp.weight", [4])); // one-dimensional, the size of the hidden stream
+        }
+
+        if (architecture is "qwen3" or "qwen3moe")
+        {
+            tensors.Add(new("blk.0.attn_q_norm.weight", [2]));
+            tensors.Add(new("blk.0.attn_k_norm.weight", [2]));
+        }
+
+        return tensors;
+    }
+
+    // The factorized layout's tensors at the same geometry (hidden 4, intermediate 8, declared rank 4): one shared input
+    // basis mapping hidden to rank, one coefficient stack carrying a [rank] contribution per expert with the expert count
+    // as its outermost dimension exactly like the dense-stacked roles do, and one shared output projection expanding rank
+    // back to hidden. Nothing resident reads these three today — they exist so a factorized declaration resolves through
+    // this family's map names. With aliasSpellings set the coefficient tensor is shipped under the plural alias spelling
+    // instead of the primary name, which the same role must still resolve.
+    private static List<TensorDef> FactorizedTensors(bool aliasSpellings = false) =>
         [
-            new("token_embd.weight", [6, 4]),
-            new("blk.0.attn_q.weight", [4, 4]),
-            new("blk.0.attn_k.weight", [4, 4]),
-            new("blk.0.attn_v.weight", [4, 4]),
-            new("blk.0.attn_output.weight", [4, 4]),
-            new("blk.0.attn_norm.weight", [4]),
-            new("blk.0.ffn_norm.weight", [4]),
-            new("output_norm.weight", [4]),
-            new("blk.0.ffn_gate_inp.weight", [4, 8]),
-            new("blk.0.ffn_gate_exps.weight", [8, 4, 8]),
-            new("blk.0.ffn_up_exps.weight", [8, 4, 8]),
-            new("blk.0.ffn_down_exps.weight", [4, 8, 8]),
-            new("blk.0.ffn_gate_shexp.weight", [8, 4]),
-            new("blk.0.ffn_up_shexp.weight", [8, 4]),
-            new("blk.0.ffn_down_shexp.weight", [4, 8]),
-            new("blk.0.ffn_gate_inp_shexp.weight", [1, 4]),
+            new("blk.0.ffn_exps_basis_in.weight", [4, 4]),
+            new(aliasSpellings ? "blk.0.ffn_experts_coefficient.weight" : "blk.0.ffn_exps_coefficient.weight", [8, 4]),
+            new("blk.0.ffn_exps_basis_out.weight", [4, 4]),
         ];
 
     // A complete single-layer dense block with the same tiny geometry: hidden 4, heads 2, kv-heads 1, head dim

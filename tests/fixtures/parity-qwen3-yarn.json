@@ -1,0 +1,162 @@
+{
+  "model_file": "models/Qwen3-0.6B-Q8_0-YaRN.gguf",
+  "model_sha256": "27fde3cbdfceadc2be288ad4e0bb70373cb2a66e7b5900b928660157567c7ef9",
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
+  "decode": {
+    "context": 1024,
+    "temperature": 0.0
+  },
+  "generated_utc": "2026-11-11T01:01:35Z",
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "max_tokens": 48,
+      "output": " Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of China is Beijing. The capital of India is New Delhi. The capital of Japan is Tokyo. The capital of Brazil is Brasilia. The",
+      "top_logprobs": [
+        {
+          "id": 12095,
+          "token": " Paris",
+          "logprob": -0.5803658366203308,
+          "lair_logprob": -0.5315
+        },
+        {
+          "id": 7407,
+          "token": " located",
+          "logprob": -3.2234578132629395,
+          "lair_logprob": -3.3008
+        },
+        {
+          "id": 279,
+          "token": " the",
+          "logprob": -3.401592969894409,
+          "lair_logprob": -3.3232
+        },
+        {
+          "id": 220,
+          "token": " ",
+          "logprob": -3.6492440700531006,
+          "lair_logprob": -3.7571
+        },
+        {
+          "id": 304,
+          "token": " in",
+          "logprob": -3.8218724727630615,
+          "lair_logprob": -3.906
+        }
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "max_tokens": 48,
+      "output": ", there were 3 people who were in a room. Each person had a red, blue, and green ball. The balls were in different colors. The balls were in different sizes. The balls were in different positions. The balls were",
+      "top_logprobs": [
+        {
+          "id": 11,
+          "token": ",",
+          "logprob": -0.14475582540035248,
+          "lair_logprob": -0.1412
+        },
+        {
+          "id": 1052,
+          "token": " there",
+          "logprob": -2.9691128730773926,
+          "lair_logprob": -2.8789
+        },
+        {
+          "id": 304,
+          "token": " in",
+          "logprob": -3.7114500999450684,
+          "lair_logprob": -3.9281
+        },
+        {
+          "id": 3837,
+          "token": "，",
+          "logprob": -4.343078136444092,
+          "lair_logprob": -4.3854
+        },
+        {
+          "id": 264,
+          "token": " a",
+          "logprob": -4.425654888153076,
+          "lair_logprob": -4.3867
+        }
+      ]
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "max_tokens": 48,
+      "output": "    if n == 0:\n        return 0\n    elif n == 1:\n        return 1\n    else:\n        return fibonacci(n-1) + fibonacci(n-2)\n\ndef main():\n    n = int(input",
+      "top_logprobs": [
+        {
+          "id": 262,
+          "token": "   ",
+          "logprob": -0.01523889135569334,
+          "lair_logprob": -0.0146
+        },
+        {
+          "id": 256,
+          "token": "  ",
+          "logprob": -5.125308036804199,
+          "lair_logprob": -5.3134
+        },
+        {
+          "id": 220,
+          "token": " ",
+          "logprob": -5.752446174621582,
+          "lair_logprob": -5.5526
+        },
+        {
+          "id": 421,
+          "token": " if",
+          "logprob": -6.7378435134887695,
+          "lair_logprob": -7.3547
+        },
+        {
+          "id": 257,
+          "token": "    ",
+          "logprob": -6.842291831970215,
+          "lair_logprob": -6.9031
+        }
+      ]
+    },
+    {
+      "prompt": "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
+      "max_tokens": 48,
+      "output": "<think>\nOkay, the user wants a single sentence about Mars. Let me start by recalling what I know. Mars is the fourth planet from the Sun, right? It's known for its red color, which is a key feature. I",
+      "top_logprobs": [
+        {
+          "id": 151667,
+          "token": "<think>",
+          "logprob": -0.0006713736220262945,
+          "lair_logprob": -0.0008
+        },
+        {
+          "id": 80135,
+          "token": "iquement",
+          "logprob": -9.854272842407227,
+          "lair_logprob": -10.4503
+        },
+        {
+          "id": 151644,
+          "token": "",
+          "logprob": -10.032901763916016,
+          "lair_logprob": -10.1206
+        },
+        {
+          "id": 151645,
+          "token": "",
+          "logprob": -10.579061508178711,
+          "lair_logprob": -10.6498
+        },
+        {
+          "id": 151668,
+          "token": "</think>",
+          "logprob": -10.760591506958008,
+          "lair_logprob": -10.667
+        }
+      ]
+    }
+  ]
+}

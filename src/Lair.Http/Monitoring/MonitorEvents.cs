@@ -61,7 +61,8 @@ public sealed record RequestPayload(
     [property: JsonPropertyName("tok_s")] double? TokensPerSec = null,
     [property: JsonPropertyName("cached_tokens")] int? CachedTokens = null,
     [property: JsonPropertyName("finish_reason")] string? FinishReason = null,
-    [property: JsonPropertyName("samples")] IReadOnlyList<TokenSample>? Samples = null)
+    [property: JsonPropertyName("samples")] IReadOnlyList<TokenSample>? Samples = null,
+    [property: JsonPropertyName("budget_exhausted")] string? BudgetExhausted = null)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

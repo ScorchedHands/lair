@@ -303,6 +303,38 @@ public sealed class MetricsTests
         Assert.Contains("/monitor/stream", lines[0]); // names what it tried to reach
     }
 
+    [Fact]
+    public async Task ResponseBudgetExhaustion_RidesOnMonitorRequestCompletePayload()
+    {
+        if (ModelFixture.Resolve() is null)
+        {
+            return; // real-model tests skip when the fixture is absent
+        }
+
+        await using LiveServer server = await LiveServer.StartAsync("smollm-budget-response", maxResponseTokens: 4);
+
+        string body = JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["model"] = server.ModelName,
+            ["prompt"] = "It was a dark and stormy night, and",
+            ["temperature"] = 0f,
+            ["stream"] = false,
+        });
+
+        using HttpResponseMessage response = await Http.PostAsync(
+            $"{server.BaseUrl}/v1/completions", new StringContent(body, Encoding.UTF8, "application/json"));
+        response.EnsureSuccessStatusCode();
+
+        using JsonDocument document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("length", document.RootElement.GetProperty("choices")[0].GetProperty("finish_reason").GetString());
+        Assert.Equal("response", document.RootElement.GetProperty("budget_exhausted").GetString());
+
+        RequestPayload retained = Assert.Single(server.Bus.RecentRequests());
+        Assert.Equal(server.ModelName, retained.Model);
+        Assert.Equal("length", retained.FinishReason);
+        Assert.Equal("response", retained.BudgetExhausted);
+    }
+
     private static int CountOf(Dictionary<string, int> counts, string reason) => counts.GetValueOrDefault(reason);
 
     private static List<string> DataRows(string text) =>
@@ -347,7 +379,7 @@ public sealed class MetricsTests
             BaseUrl = app.Urls.Single();
         }
 
-        public static async Task<LiveServer> StartAsync(string modelName)
+        public static async Task<LiveServer> StartAsync(string modelName, int? maxResponseTokens = null)
         {
             string modelPath = ModelFixture.Resolve() ?? throw new InvalidOperationException(
                 $"GGUF fixture '{ModelFixture.SmolLmRelativePath}' was not found walking up from the test assembly directory.");
@@ -368,6 +400,7 @@ public sealed class MetricsTests
                         Path = modelPath,
                         MaxContextTokens = 512,
                         KvBlocks = 48,
+                        MaxResponseTokens = maxResponseTokens,
                     },
                 ],
             };

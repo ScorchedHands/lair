@@ -4,6 +4,7 @@ using Lair.Host;
 using Lair.Host.Config;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 if (args.Length == 1 && (args[0] is "--version" or "-v"))
 {
@@ -16,7 +17,8 @@ if (args.Length == 3 && args[0] == "serve" && args[1] == "-c")
 {
     LairConfig config;
     GenerationService engine;
-    using Microsoft.Extensions.Logging.ILoggerFactory loggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(static _ => { });
+    using Microsoft.Extensions.Logging.ILoggerFactory loggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(builder =>
+        builder.AddSimpleConsole(options => options.SingleLine = true).SetMinimumLevel(LogLevel.Information));
     try
     {
         config = YamlConfigLoader.Load(args[2]);

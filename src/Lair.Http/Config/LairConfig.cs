@@ -64,6 +64,29 @@ public sealed record ModelConfig
     /// </summary>
     public bool ForceFencedTools { get; init; }
 
+    /// <summary>
+    /// Which tool output parser the model resolves to at load: <c>auto</c> (default — the loaded template's detected
+    /// capabilities decide, with LAIR's fenced block as fallback), <c>template</c> (the model's own chat-template
+    /// rendering is authoritative and no fenced injection happens), <c>fenced</c> (LAIR's fenced tool block for every
+    /// declared-tool request regardless of the template), or <c>none</c> (inert: no tool surface reaches the model,
+    /// content stays byte-for-byte what was generated, and no <c>tool_calls</c> are reported).
+    /// </summary>
+    public string ToolParser { get; init; } = "auto";
+
+    /// <summary>
+    /// How a recognized reasoning region reaches the wire: <c>keep</c> (default — the region streams through as ordinary
+    /// visible content, byte-for-byte as generated) or <c>strip</c> (the region is withheld from visible content while its
+    /// boundaries stay recorded for the request). Recognition itself keys on the markup a generation contains, not on this
+    /// key: with neither marker present nothing is recognized and either value leaves output untouched.
+    /// </summary>
+    public string Reasoning { get; init; } = "keep";
+
+    /// <summary>Per-model reasoning-token budget carried with the model entry; null (absent) means unbudgeted — today's behavior, no ceiling applied.</summary>
+    public int? MaxReasoningTokens { get; init; }
+
+    /// <summary>Per-model response-token budget carried with the model entry; null (absent) means unbudgeted and leaves request token limits at their existing semantics.</summary>
+    public int? MaxResponseTokens { get; init; }
+
     public PlacementConfig Placement { get; init; } = new();
 }
 

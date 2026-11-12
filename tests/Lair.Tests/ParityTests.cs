@@ -23,6 +23,7 @@ namespace Lair.Tests;
 /// test during scripts/generate-parity.ps1 regeneration.
 /// </summary>
 [Trait("Category", "Parity")]
+[Collection("model-loaded")] // shares one serialized lane with the latency-budget suite so a large fixture loading alongside it cannot starve that measurement
 public sealed class ParityTests
 {
     private const string F16Fixture = "tests/fixtures/parity-smollm-f16.json";
@@ -39,6 +40,29 @@ public sealed class ParityTests
     // 1024-hidden model, tied output head) against the same pinned reference and the same quantized-file band.
     private const string Qwen3Fixture = "tests/fixtures/parity-qwen3.json";
 
+    // The Llama-3.2 Q3_K_S fixture: a real llama load (32 x 8 GQA at head_dim 64 over a 2048-hidden, 16-layer model)
+    // against the same pinned reference and the same quantized-file band.
+    private const string Llama32Q3KFixture = "tests/fixtures/parity-llama32-q3ks.json";
+
+    // The Llama-3.2 Q2_K fixture: the same architecture at 2-bit weights, and the suite's closest case to the
+    // cross-tool band — on the chat-header prompt the reference's '<' candidate sits 0.86 nats from LAIR's value.
+    private const string Llama32Q2KFixture = "tests/fixtures/parity-llama32-q2k.json";
+
+    // The YaRN fixture: the pinned Qwen3 Q8_0 file with qwen3.rope.scaling.type = yarn, .factor = 2 and
+    // .original_context_length = 512 declared on a copy produced by scripts/patch-gguf-rope-scaling.ps1, so both
+    // engines read the same declared keys and the scaled rotary tables and attention factor run inside the band.
+    private const string Qwen3YaRNFixture = "tests/fixtures/parity-qwen3-yarn.json";
+
+    // The Llama-3.2 IQ4_XS fixture: the same 16-layer llama architecture with every attention-value and MLP weight
+    // at IQ4_XS (96 IQ4_XS tensors beside 16 Q5_K attention-value tensors and a Q6_K token-embedding tensor) against
+    // the same pinned reference and the same quantized-file band.
+    private const string Llama32Iq4XsFixture = "tests/fixtures/parity-llama32-iq4xs.json";
+
+    // The Llama-3.2 UD IQ3_XXS fixture: a dynamic quant whose per-layer tiers vary inside one file — IQ3_XXS,
+    // IQ4_XS, IQ3_S, IQ2_XS and IQ2_S tensors side by side over the same architecture — against the same pinned
+    // reference and the same quantized-file band.
+    private const string Llama32UdIq3XxsFixture = "tests/fixtures/parity-llama32-udiq3xxs.json";
+
     /// <summary>Ranking window whose reproduction the fixtures calibrate.</summary>
     private const int CalibrationWindow = 16;
 
@@ -51,10 +75,17 @@ public sealed class ParityTests
     private static double CrossToolTolerance(string fixturePath) =>
         fixturePath == F16Fixture ? 0.05 : 1.0;
 
+    // The band applies to candidates carrying sampling weight: within this many nats of the reference's own top-1,
+    // a candidate's softmax weight is at least ~0.25% of the leader's, so its absolute logprob is a decision-relevant
+    // quantity and both pipelines must agree on it. Deeper candidates are compared only on membership in LAIR's
+    // calibrated window and on reproduction of LAIR's own calibrated value, because their absolute cross-entropy is
+    // dominated by tail shape, where sub-nat logit differences reorder the tail wholesale.
+    private const double CrossToolWindowNats = 6.0;
+
     public static TheoryData<string, int> PromptCases()
     {
         TheoryData<string, int> cases = [];
-        foreach (string fixture in new[] { F16Fixture, Q8Fixture, Q4KMFixture, Qwen3Fixture })
+        foreach (string fixture in new[] { F16Fixture, Q8Fixture, Q4KMFixture, Qwen3Fixture, Llama32Q3KFixture, Llama32Q2KFixture, Qwen3YaRNFixture, Llama32Iq4XsFixture, Llama32UdIq3XxsFixture })
         {
             string? path = ModelFixture.ResolveRepoRelative(fixture);
             if (path is null)
@@ -140,11 +171,14 @@ public sealed class ParityTests
                 $"beyond the {ReproductionTolerance:F2} reproduction tolerance.\nlair: [{Format(top)}]");
 
             double crossToolDelta = Math.Abs(top[slot].Logprob - reference.Logprob);
+            double belowLeader = reference.Logprob - entry.TopLogprobs[0].Logprob;
             Assert.True(
-                crossToolDelta <= CrossToolTolerance(fixturePath),
+                belowLeader < -CrossToolWindowNats || crossToolDelta <= CrossToolTolerance(fixturePath),
                 $"prompt '{entry.Prompt.Trim()}' token {reference.Id}('{reference.Token}') sits {crossToolDelta:F4} nats " +
                 $"from the pinned llama.cpp logprob {reference.Logprob:F4} (LAIR now {top[slot].Logprob:F4}), beyond the " +
-                $"{CrossToolTolerance(fixturePath):F2} cross-tool band for this fixture.\nlair: [{Format(top)}]");
+                $"{CrossToolTolerance(fixturePath):F2} cross-tool band, and it is only {-belowLeader:F4} nats below the " +
+                $"reference's top-1 — inside the {-CrossToolWindowNats:F1}-nat window where a candidate carries " +
+                $"sampling weight.\nlair: [{Format(top)}]");
         }
     }
 

@@ -23,7 +23,7 @@ namespace Lair.Models;
 /// profile's QK-norm mode. The norm placement comes from the resolved profile alone: no metadata key selects
 /// it today. The block-norm epsilon reads <c>&lt;prefix&gt;attention.layer_norm_epsilon</c>, resolving to
 /// <c>0f</c> when the key is absent, and feeds only the LayerNorm block norms; the RMS epsilon from
-/// <c>&lt;prefix&gt;attention.layer_norm_rms_epsilon</c> keeps feeding the RMS norms and the per-head QK-norm. The declared softcaps read
+/// <c>&lt;prefix&gt;attention.layer_norm_rms_epsilon</c> keeps feeding the RMS norms and the QK-norm. The declared softcaps read
 /// <c>&lt;prefix&gt;attn_logit_softcapping</c> and <c>&lt;prefix&gt;final_logit_softcapping</c>, each
 /// resolving to <c>0f</c> (disabled) when the key is absent and to a positive finite number otherwise. The
 /// declared attention window reads <c>&lt;prefix&gt;attention.sliding_window</c>, resolving to <c>0</c>
@@ -32,7 +32,18 @@ namespace Lair.Models;
 /// it today. The sparse-FFN slot reads <c>&lt;prefix&gt;expert_count</c>, <c>&lt;prefix&gt;expert_used_count</c>,
 /// <c>&lt;prefix&gt;expert_shared_count</c>, <c>&lt;prefix&gt;expert_weights_scale</c>, and
 /// <c>&lt;prefix&gt;expert_weights_norm</c>: a declared expert count resolves the descriptor against the resolved
-/// profile's declared shape, and a file declaring no expert count keeps the dense gate/up/down block.
+/// profile's declared shape, and a file declaring no expert count keeps the dense gate/up/down block. The same slot reads
+/// <c>&lt;prefix&gt;expert_layout</c>, <c>&lt;prefix&gt;expert_rank</c>, and <c>&lt;prefix&gt;sparse_ffn_strategy</c>: the first two say how
+/// the block's experts are stored, and the third resolves against the resolved profile's default into the plan's
+/// expert-computation variant — a declaration can override that default in either direction but cannot select storage the
+/// file does not declare. The rope
+/// scaling reads <c>&lt;prefix&gt;rope.scaling.type</c>, <c>&lt;prefix&gt;rope.scaling.factor</c>,
+/// <c>&lt;prefix&gt;rope.scaling.original_context_length</c>, <c>&lt;prefix&gt;rope.scaling.attn_factor</c>, and the
+/// YaRN operands <c>&lt;prefix&gt;rope.scaling.yarn_log_multiplier</c>, <c>&lt;prefix&gt;rope.scaling.yarn_ext_factor</c>,
+/// <c>&lt;prefix&gt;rope.scaling.yarn_beta_fast</c>, and <c>&lt;prefix&gt;rope.scaling.yarn_beta_slow</c>: an absent
+/// variant declaration keeps the standard unscaled rotation and the declared <c>yarn</c> variant resolves the
+/// scaling plan. The rotary slice reads <c>&lt;prefix&gt;rope.dimension_count</c>, resolving to the full head
+/// dimension when the key is absent and to a declared positive even count not exceeding it otherwise.
 /// </summary>
 public sealed record ModelPlan
 {
@@ -66,7 +77,7 @@ public sealed record ModelPlan
 
     /// <summary>
     /// The epsilon under the root of the LayerNorm block norms: <c>0f</c> unless the file declares
-    /// <c>&lt;prefix&gt;attention.layer_norm_epsilon</c>. The RMS norms and the per-head QK-norm keep
+    /// <c>&lt;prefix&gt;attention.layer_norm_epsilon</c>. The RMS norms and the QK-norm keep
     /// <see cref="EpsRmsNorm"/> whatever this resolves to.
     /// </summary>
     public float EpsLayerNorm { get; init; }
@@ -82,7 +93,7 @@ public sealed record ModelPlan
     /// <summary>Declared <c>&lt;prefix&gt;attention.norm_bias</c>: whether the norm layers carry additive bias vectors.</summary>
     public required bool UseNormBias { get; init; }
 
-    /// <summary>Resolved per-head QK-norm mode: a declared <c>&lt;prefix&gt;attention.use_qk_norm=false</c> forces <see cref="QkNormMode.Off"/>; absent the key resolves to the resolved profile's mode, and a declaration of <c>true</c> selects the weighted form on an architecture whose profile defaults it off.</summary>
+    /// <summary>Resolved QK-norm mode: a declared <c>&lt;prefix&gt;attention.use_qk_norm=false</c> forces <see cref="QkNormMode.Off"/>; absent the key resolves to the resolved profile's mode, and a declaration of <c>true</c> keeps that profile's own weighted form when it has one, or selects the per-head weighted form on an architecture whose profile defaults it off.</summary>
     public required QkNormMode QkNorm { get; init; }
 
     /// <summary>The resolved profile's norm placement: whether each sublayer output is normalized again with its own vector before joining the residual stream, or only the streams feeding each sublayer are normalized. No metadata key decides it.</summary>
@@ -95,11 +106,14 @@ public sealed record ModelPlan
     public float FinalLogitSoftcap { get; init; }
 
     /// <summary>
-    /// Declared <c>&lt;prefix&gt;attention.sliding_window</c>: the attention score window in positions. At query
-    /// position <c>i</c> the causal range narrows to <c>[max(0, i - window + 1), i]</c>, and the bidirectional
-    /// range to <c>[max(0, i - window + 1), i + window]</c> clamped to the sequence. <c>0</c> when the key is
-    /// absent means unbounded, and <see cref="WindowInterleave"/> decides which layers the declared value narrows.
-    /// The value masks scores only: every position is still written to and readable from the KV cache.
+    /// Declared <c>&lt;prefix&gt;attention.sliding_window</c>: the attention window in positions. At query position
+    /// <c>i</c> a layer that carries this window reads <c>[max(0, i - window + 1), i]</c> on every path — the causal
+    /// decode range and the encoder's bidirectional pass alike: a declared window reaches behind the query and never
+    /// grants visibility past the query itself. A layer the plan resolves to zero attends the whole sequence in both
+    /// directions instead; see <see cref="AttentionWindowForLayer"/> for what one layer actually resolves. <c>0</c> when
+    /// the key is absent means unbounded, and <see cref="WindowInterleave"/> decides which layers the declared value
+    /// narrows. Every position's K/V is still written to and stays readable in the KV cache — the window bounds what a
+    /// layer reads, not what the sequence stores, because another layer of the same model may attend the whole range.
     /// </summary>
     public int AttentionWindow { get; init; }
 
@@ -110,6 +124,31 @@ public sealed record ModelPlan
     /// pattern.
     /// </summary>
     public WindowInterleave WindowInterleave { get; init; } = WindowInterleave.AllLayers;
+
+    /// <summary>
+    /// The window one layer reads within, resolved here from <see cref="AttentionWindow"/> against
+    /// <see cref="WindowInterleave"/> so the plan carries the per-layer value lair.kv's block selection honors: every
+    /// layer under <see cref="WindowInterleave.AllLayers"/>, even-indexed layers only under
+    /// <see cref="WindowInterleave.AlternatingLocalFirst"/>, where the odd-indexed layers resolve unbounded. A resolved
+    /// window of <c>0</c> is unbounded whatever the pattern, and a pattern this engine cannot resolve fails naming it
+    /// instead of silently masking some other set of layers. The value bounds what that layer reads; storage stays whole.
+    /// </summary>
+    public int AttentionWindowForLayer(int layer)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(layer);
+
+        switch (WindowInterleave)
+        {
+            case WindowInterleave.AllLayers:
+                return AttentionWindow;
+
+            case WindowInterleave.AlternatingLocalFirst:
+                return layer % 2 == 0 ? AttentionWindow : 0;
+
+            default:
+                throw new ModelException($"window interleave '{WindowInterleave}' is not implemented by the forward engine");
+        }
+    }
 
     /// <summary>
     /// The resolved profile's input-embedding gain: <c>sqrt(hidden size)</c> on a profile whose reference graph
@@ -130,14 +169,41 @@ public sealed record ModelPlan
     public required RopeStrategy Rope { get; init; }
 
     /// <summary>
+    /// The rope-scaling shape resolved from the file's declared <c>&lt;prefix&gt;rope.scaling.*</c> metadata, or
+    /// <c>null</c> when the file declares no scaling variant: the engine then rotates the full head with the
+    /// unscaled angles. A resolved plan names the variant, the multiplier, the original context length, the
+    /// attention factor the score path applies, and the correction scale and beta pair the angle tables blend.
+    /// </summary>
+    public RopeScalingPlan? RopeScaling { get; init; }
+
+    /// <summary>
+    /// Declared <c>&lt;prefix&gt;rope.dimension_count</c>: the leading head dimensions the rotation covers, with
+    /// the remaining dimensions passed through unchanged. <c>0</c> when the key is absent means the full head
+    /// dimension, and a declared value must be an even count not exceeding the head dimension.
+    /// </summary>
+    public int RopeRotaryDimensions { get; init; }
+
+    /// <summary>
     /// The sparse-FFN shape resolved from the file's declared expert metadata (<c>&lt;prefix&gt;expert_count</c>,
     /// <c>&lt;prefix&gt;expert_used_count</c>, <c>&lt;prefix&gt;expert_shared_count</c>,
     /// <c>&lt;prefix&gt;expert_weights_scale</c>, and <c>&lt;prefix&gt;expert_weights_norm</c>) against the
     /// resolved profile's sparse-FFN shape, or <c>null</c> when the file declares no expert count and the dense
-    /// gate/up/down block runs. A resolved descriptor names the router and expert tensor roles the forward
-    /// engine refuses to execute today.
+    /// gate/up/down block runs. A resolved descriptor names the router and per-expert tensor roles every expert
+    /// of the block is resident under: all experts stay in RAM, so routing selects among them rather than
+    /// fetching them. It also carries how those experts are stored — the declared <c>&lt;prefix&gt;expert_layout</c>
+    /// (stacked unless the file declares a shared basis), that layout's rank when it has one, and the tensor roles a
+    /// factorized declaration reaches for. Which of those shapes anything computes with is the strategy value below.
     /// </summary>
     public SparseFfnDescriptor? SparseFfn { get; init; }
+
+    /// <summary>
+    /// The expert-computation variant this model resolves to: the declared <c>&lt;prefix&gt;sparse_ffn_strategy</c>
+    /// overriding the resolved profile's default, exactly as the QK-norm mode resolves. <c>null</c> when the
+    /// file declares no experts and no block routes anything. A value names what the load decided, not what proved
+    /// runnable: a variant the forward engine cannot yet run stays recorded here and reports at engine open instead of
+    /// falling back to another strategy invisibly.
+    /// </summary>
+    public SparseFfnStrategy? SparseFfnStrategy { get; init; }
 
     /// <summary>The flat scalar view of this plan's resolved geometry.</summary>
     public ModelDesc ToDesc() =>

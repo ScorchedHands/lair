@@ -424,11 +424,10 @@ public sealed class LayerTests : IDisposable
         Assert.Contains("rope scaling", ex.Message);
         Assert.Contains("llama.rope.scaling.type", ex.Message);
 
-        // A partial rotary slice is equally unsupported.
+        // A partial rotary slice is accepted: the leading dimensions rotate and the rest pass through.
         List<(string Key, object Value)> partial = [.. RequiredLlamaMetadata(), ("llama.rope.dimension_count", 32)];
         using GgufFile ggufPartial = GgufFile.Open(WriteTemp(BuildGguf([.. partial], [])));
-        ModelException rotEx = Assert.Throws<ModelException>(() => ModelDesc.FromGguf(ggufPartial));
-        Assert.Contains("partial rotary", rotEx.Message);
+        Assert.Equal(64, ModelDesc.FromGguf(ggufPartial).HeadDim);
 
         // The fixture-consistent full-dimension slice (64 == 576/9) must pass.
         List<(string Key, object Value)> exact = [.. RequiredLlamaMetadata(), ("llama.rope.dimension_count", 64)];

@@ -137,6 +137,26 @@ public static class ConfigMutationTable
             changes.Add(new FieldChange("models[0].force_fenced_tools", Text(oldModel.ForceFencedTools), Text(newModel.ForceFencedTools), ConfigMutationClass.NewRequestsOnly));
         }
 
+        if (newModel.ToolParser != oldModel.ToolParser)
+        {
+            changes.Add(new FieldChange("models[0].tool_parser", oldModel.ToolParser, newModel.ToolParser, ConfigMutationClass.NewRequestsOnly));
+        }
+
+        if (newModel.Reasoning != oldModel.Reasoning)
+        {
+            changes.Add(new FieldChange("models[0].reasoning", oldModel.Reasoning, newModel.Reasoning, ConfigMutationClass.NewRequestsOnly));
+        }
+
+        if (newModel.MaxReasoningTokens != oldModel.MaxReasoningTokens)
+        {
+            changes.Add(new FieldChange("models[0].max_reasoning_tokens", TextOrNone(oldModel.MaxReasoningTokens), TextOrNone(newModel.MaxReasoningTokens), ConfigMutationClass.NewRequestsOnly));
+        }
+
+        if (newModel.MaxResponseTokens != oldModel.MaxResponseTokens)
+        {
+            changes.Add(new FieldChange("models[0].max_response_tokens", TextOrNone(oldModel.MaxResponseTokens), TextOrNone(newModel.MaxResponseTokens), ConfigMutationClass.NewRequestsOnly));
+        }
+
         PlacementConfig oldPlacement = oldModel.Placement;
         PlacementConfig newPlacement = newModel.Placement;
         Add(changes, "models[0].placement.device", oldPlacement.Device, newPlacement.Device);
@@ -218,6 +238,10 @@ public static class ConfigMutationTable
         "ui.recent_requests" => ConfigMutationClass.Live,
         "models[0].max_context_tokens" => ConfigMutationClass.NewRequestsOnly,
         "models[0].force_fenced_tools" => ConfigMutationClass.NewRequestsOnly,
+        "models[0].tool_parser" => ConfigMutationClass.NewRequestsOnly,
+        "models[0].reasoning" => ConfigMutationClass.NewRequestsOnly,
+        "models[0].max_reasoning_tokens" => ConfigMutationClass.NewRequestsOnly,
+        "models[0].max_response_tokens" => ConfigMutationClass.NewRequestsOnly,
         _ => ConfigMutationClass.RestartOnly,
     };
 
@@ -247,6 +271,10 @@ public static class ConfigMutationTable
         yield return ("models[0].max_context_tokens", ScalarText(model, "max_context_tokens"));
         yield return ("models[0].kv_blocks", ScalarText(model, "kv_blocks"));
         yield return ("models[0].force_fenced_tools", ScalarText(model, "force_fenced_tools"));
+        yield return ("models[0].tool_parser", ScalarText(model, "tool_parser"));
+        yield return ("models[0].reasoning", ScalarText(model, "reasoning"));
+        yield return ("models[0].max_reasoning_tokens", ScalarText(model, "max_reasoning_tokens"));
+        yield return ("models[0].max_response_tokens", ScalarText(model, "max_response_tokens"));
 
         YamlDotNet.RepresentationModel.YamlMappingNode? placement = Child(model, "placement");
         yield return ("models[0].placement.device", ScalarText(placement, "device"));
@@ -271,6 +299,10 @@ public static class ConfigMutationTable
         "models[0].max_context_tokens" => Text(current.Models[0].MaxContextTokens),
         "models[0].kv_blocks" => Text(current.Models[0].KvBlocks),
         "models[0].force_fenced_tools" => Text(current.Models[0].ForceFencedTools),
+        "models[0].tool_parser" => current.Models[0].ToolParser,
+        "models[0].reasoning" => current.Models[0].Reasoning,
+        "models[0].max_reasoning_tokens" => TextOrNone(current.Models[0].MaxReasoningTokens),
+        "models[0].max_response_tokens" => TextOrNone(current.Models[0].MaxResponseTokens),
         "models[0].placement.device" => current.Models[0].Placement.Device,
         "models[0].placement.kv_residency" => current.Models[0].Placement.KvResidency,
         "models[0].placement.prefill" => current.Models[0].Placement.Prefill,

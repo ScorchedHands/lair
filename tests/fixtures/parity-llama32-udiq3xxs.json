@@ -1,0 +1,162 @@
+{
+  "model_file": "models/Llama-3.2-1B-Instruct-UD-IQ3_XXS.gguf",
+  "model_sha256": "f39f7695f7e9d8d6b4f6a7278f606e9177ef86ddb10c59d2538e3a7ddc332cb6",
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
+  "decode": {
+    "temperature": 0.0,
+    "context": 1024
+  },
+  "generated_utc": "2026-11-11T01:16:45Z",
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "max_tokens": 48,
+      "output": " Paris. The city is known for its rich history, cultural significance, and iconic landmarks such as the Eiffel Tower and Notre-Dame Cathedral. Paris is a major hub for business, tourism, and international diplomacy, attracting millions of visitors",
+      "top_logprobs": [
+        {
+          "id": 12366,
+          "token": " Paris",
+          "logprob": -0.6055503487586975,
+          "lair_logprob": -0.6712
+        },
+        {
+          "id": 264,
+          "token": " a",
+          "logprob": -2.6054129600524902,
+          "lair_logprob": -2.4308
+        },
+        {
+          "id": 279,
+          "token": " the",
+          "logprob": -3.784018039703369,
+          "lair_logprob": -3.5862
+        },
+        {
+          "id": 1148,
+          "token": " what",
+          "logprob": -3.912532329559326,
+          "lair_logprob": -3.9271
+        },
+        {
+          "id": 539,
+          "token": " not",
+          "logprob": -4.0521979331970215,
+          "lair_logprob": -3.8953
+        }
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "max_tokens": 48,
+      "output": ", in a small village, there lived a young boy named Kaito. Kaito was a curious and adventurous boy, always eager to explore the world around him. One day, while wandering through the village, he stumbled upon a",
+      "top_logprobs": [
+        {
+          "id": 11,
+          "token": ",",
+          "logprob": -0.14400885999202728,
+          "lair_logprob": -0.1431
+        },
+        {
+          "id": 304,
+          "token": " in",
+          "logprob": -2.236768960952759,
+          "lair_logprob": -2.2167
+        },
+        {
+          "id": 1070,
+          "token": " there",
+          "logprob": -4.650913715362549,
+          "lair_logprob": -4.7337
+        },
+        {
+          "id": 1131,
+          "token": "...",
+          "logprob": -5.206884384155273,
+          "lair_logprob": -5.2487
+        },
+        {
+          "id": 320,
+          "token": " (",
+          "logprob": -5.913462162017822,
+          "lair_logprob": -5.9516
+        }
+      ]
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "max_tokens": 48,
+      "output": "    \"\"\"\n    This function generates the Fibonacci sequence up to the nth number.\n    \n    Parameters:\n    n (int): The number of terms in the Fibonacci sequence.\n    \n    Returns:\n    list: A list of Fibonacci numbers up to the",
+      "top_logprobs": [
+        {
+          "id": 262,
+          "token": "   ",
+          "logprob": -0.010016911663115025,
+          "lair_logprob": -0.0102
+        },
+        {
+          "id": 220,
+          "token": " ",
+          "logprob": -5.118432521820068,
+          "lair_logprob": -5.231
+        },
+        {
+          "id": 1084,
+          "token": "    \n",
+          "logprob": -6.233693599700928,
+          "lair_logprob": -6.0242
+        },
+        {
+          "id": 3270,
+          "token": " \"\"\"\n",
+          "logprob": -7.480556011199951,
+          "lair_logprob": -7.3688
+        },
+        {
+          "id": 720,
+          "token": " \n",
+          "logprob": -8.166458129882812,
+          "lair_logprob": -8.0474
+        }
+      ]
+    },
+    {
+      "prompt": "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
+      "max_tokens": 48,
+      "output": "Mars is often referred to as the \"Red Planet\" due to its reddish appearance, which is caused by iron oxide in the planet's soil. <|im_end|>",
+      "top_logprobs": [
+        {
+          "id": 44,
+          "token": "M",
+          "logprob": -0.48087507486343384,
+          "lair_logprob": -0.693
+        },
+        {
+          "id": 791,
+          "token": "The",
+          "logprob": -1.3457984924316406,
+          "lair_logprob": -1.0845
+        },
+        {
+          "id": 53,
+          "token": "V",
+          "logprob": -3.6602821350097656,
+          "lair_logprob": -3.1828
+        },
+        {
+          "id": 62066,
+          "token": "NASA",
+          "logprob": -4.183681488037109,
+          "lair_logprob": -3.7547
+        },
+        {
+          "id": 2170,
+          "token": "As",
+          "logprob": -4.959434509277344,
+          "lair_logprob": -4.9871
+        }
+      ]
+    }
+  ]
+}

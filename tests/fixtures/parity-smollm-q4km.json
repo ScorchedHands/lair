@@ -5,10 +5,10 @@
   "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
   "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
   "decode": {
-    "context": 1024,
-    "temperature": 0.0
+    "temperature": 0.0,
+    "context": 1024
   },
-  "generated_utc": "2026-11-03T20:14:48Z",
+  "generated_utc": "2026-11-11T00:59:10Z",
   "prompts": [
     {
       "prompt": "The capital of France is",
@@ -122,39 +122,39 @@
       ]
     },
     {
-      "prompt": "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n",
+      "prompt": "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
       "max_tokens": 48,
-      "output": "The given question is equivalent to:\n\n$$\\lim_{x\\to 0}\\frac{1}{x}\\int_{0}^{x}\\frac{1}{1+t^2}dt$$\n\nThe limit is",
+      "output": "The planet Mars is known to have a thick atmosphere, which is why it is often referred to as \"Mars\" or \"Mars\" in popular culture. However, the planet's atmosphere is not as dense as Earth's, and it is",
       "top_logprobs": [
         {
           "id": 504,
           "token": "The",
-          "logprob": -1.528476595878601,
-          "lair_logprob": -1.6095
+          "logprob": -1.1628923416137695,
+          "lair_logprob": -1.2835
         },
         {
-          "id": 4239,
-          "token": "Let",
-          "logprob": -2.1150436401367188,
-          "lair_logprob": -1.9293
+          "id": 198,
+          "token": "\n",
+          "logprob": -2.4753541946411133,
+          "lair_logprob": -2.7981
         },
         {
-          "id": 2068,
-          "token": "To",
-          "logprob": -2.2433221340179443,
-          "lair_logprob": -2.323
+          "id": 57,
+          "token": "I",
+          "logprob": -2.6724977493286133,
+          "lair_logprob": -2.5935
         },
         {
-          "id": 1882,
-          "token": "We",
-          "logprob": -2.358663558959961,
-          "lair_logprob": -2.324
+          "id": 38861,
+          "token": "Mars",
+          "logprob": -2.8288087844848633,
+          "lair_logprob": -2.7223
         },
         {
-          "id": 788,
-          "token": "In",
-          "logprob": -2.767240524291992,
-          "lair_logprob": -3.1156
+          "id": 33,
+          "token": "1",
+          "logprob": -3.208054542541504,
+          "lair_logprob": -3.5359
         }
       ]
     }

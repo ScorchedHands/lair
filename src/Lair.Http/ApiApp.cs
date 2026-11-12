@@ -109,7 +109,10 @@ public static class ApiApp
                     gen.Model.ContextLength,
                     gen.Model.Quant,
                     gen.Model.Architecture,
-                    gen.ModelType)]);
+                    gen.ModelType,
+                    gen.Model.ToolParser,
+                    gen.Model.Reasoning,
+                    gen.Model.SparseFfnStrategy)]);
 
             return Results.Json(models, statusCode: 200);
         });
@@ -218,6 +221,21 @@ public static class ApiApp
     private const string RequestAuditKey = "lair.request.audit";
     private const string RequestIdItemKey = "lair.request.id";
 
+    // The budget reports accepted for this request, handed from the handler that resolved them to whichever surface renders the
+    // response, so a clamp is reported exactly where its override arrived. Absent means no override was carried.
+    private const string BudgetReportsItemKey = "lair.request.budget_reports";
+
+    private static void AttachBudgetReports(HttpContext http, IReadOnlyList<TokenBudgetReport>? reports)
+    {
+        if (reports is not null)
+        {
+            http.Items[BudgetReportsItemKey] = reports;
+        }
+    }
+
+    private static IReadOnlyList<TokenBudgetReport>? BudgetReportsOf(HttpContext http) =>
+        http.Items.TryGetValue(BudgetReportsItemKey, out object? value) ? value as IReadOnlyList<TokenBudgetReport> : null;
+
     // The middleware-minted correlation id, read back by handlers to key monitor lifecycle frames on the same value
     // this response carries in x-lair-request-id.
     private static string? RequestIdOf(HttpContext http) =>
@@ -237,12 +255,23 @@ public static class ApiApp
             return InvalidRequest(rangeError);
         }
 
+        BudgetResolution budgets = ResolveTokenBudgets(gen, body.MaxReasoningTokens, body.MaxResponseTokens);
+        if (budgets.Error is string budgetError)
+        {
+            return InvalidRequest(budgetError);
+        }
+
+        AttachBudgetReports(http, budgets.Reports);
+
         GenerationRequest request = new()
         {
             Model = body.Model ?? string.Empty,
             IsChat = true,
             Messages = [.. body.Messages.Select(m => new ChatMessage(m.Role ?? "user", m.Content ?? string.Empty))],
             MaxTokens = body.MaxTokens ?? 128,
+            MaxTokensWasSupplied = body.MaxTokens.HasValue,
+            MaxReasoningTokens = budgets.MaxReasoningTokens,
+            MaxResponseTokens = budgets.MaxResponseTokens,
             Temperature = body.Temperature ?? 1.0f,
             TopP = body.TopP ?? 0.9f,
             TopK = body.TopK ?? 40,
@@ -274,12 +303,23 @@ public static class ApiApp
             return InvalidRequest(rangeError);
         }
 
+        BudgetResolution budgets = ResolveTokenBudgets(gen, body.MaxReasoningTokens, body.MaxResponseTokens);
+        if (budgets.Error is string budgetError)
+        {
+            return InvalidRequest(budgetError);
+        }
+
+        AttachBudgetReports(http, budgets.Reports);
+
         GenerationRequest request = new()
         {
             Model = body.Model ?? string.Empty,
             IsChat = false,
             Prompt = body.Prompt,
             MaxTokens = body.MaxTokens ?? 128,
+            MaxTokensWasSupplied = body.MaxTokens.HasValue,
+            MaxReasoningTokens = budgets.MaxReasoningTokens,
+            MaxResponseTokens = budgets.MaxResponseTokens,
             Temperature = body.Temperature ?? 1.0f,
             TopP = body.TopP ?? 0.9f,
             TopK = body.TopK ?? 40,
@@ -304,6 +344,71 @@ public static class ApiApp
         topLogprobs is < 0 or > 20 ? $"'top_logprobs' must be in [0, 20], got {topLogprobs}." :
         null;
 
+    // One budget-override resolution: either the refusal that stops the request, or the values admitted for it plus what each
+    // override resolved to. Absent overrides resolve to nothing at all — today's request shape and behavior unchanged.
+    private sealed record BudgetResolution(
+        string? Error,
+        int? MaxReasoningTokens,
+        int? MaxResponseTokens,
+        IReadOnlyList<TokenBudgetReport>? Reports);
+
+    // Request budget overrides resolved against what this model already resolved at load: a value below 1 fails naming the field
+    // and its number as every other sized knob does; a reasoning override on a model whose plan resolves no reasoning region is
+    // refused naming that model, because bounding an unresolved region would be a guess decided per request; and an accepted
+    // override above the ceiling the model declares lands clamped to it with the clamp reported where the client reads it. A side
+    // with no declared ceiling takes the requested value as given — opt-in budgeting on a model that set none, not a silent default.
+    private static BudgetResolution ResolveTokenBudgets(GenerationService gen, int? maxReasoningTokens, int? maxResponseTokens)
+    {
+        if (maxReasoningTokens is < 1)
+        {
+            return new($"'max_reasoning_tokens' must be 1 or greater, got {maxReasoningTokens}.", null, null, null);
+        }
+
+        if (maxResponseTokens is < 1)
+        {
+            return new($"'max_response_tokens' must be 1 or greater, got {maxResponseTokens}.", null, null, null);
+        }
+
+        if (maxReasoningTokens is not null && !gen.ResolvedOutputParser.HasResolvedReasoningRegion)
+        {
+            return new(
+                $"model '{gen.Model.Id}' resolves no reasoning region, so 'max_reasoning_tokens' cannot be applied to it: declare max_reasoning_tokens for the model or omit the field.",
+                null,
+                null,
+                null);
+        }
+
+        ModelConfig model = gen.EffectiveConfiguration.Models[0];
+
+        List<TokenBudgetReport> reports = [];
+        int? reasoningTokens = null;
+        int? responseTokens = null;
+
+        if (maxReasoningTokens is not null)
+        {
+            (int applied, TokenBudgetReport report) = ResolveOverride("max_reasoning_tokens", maxReasoningTokens.Value, model.MaxReasoningTokens);
+            reasoningTokens = applied;
+            reports.Add(report);
+        }
+
+        if (maxResponseTokens is not null)
+        {
+            (int applied, TokenBudgetReport report) = ResolveOverride("max_response_tokens", maxResponseTokens.Value, model.MaxResponseTokens);
+            responseTokens = applied;
+            reports.Add(report);
+        }
+
+        return new(null, reasoningTokens, responseTokens, reports.Count > 0 ? reports : null);
+    }
+
+    // A declared ceiling lowers an override to itself and says so; no ceiling leaves the requested value exactly as it arrived.
+    private static (int Applied, TokenBudgetReport Report) ResolveOverride(string field, int requested, int? ceiling)
+    {
+        bool clamped = ceiling is not null && requested > ceiling.Value;
+        int applied = clamped ? ceiling!.Value : requested;
+        return (applied, new(field, requested, applied, clamped));
+    }
+
     private static IResult InvalidRequest(string message) =>
         Results.Json(
             new ErrorResponse(new ErrorDetail(message, "invalid_request_error", "invalid_request")),
@@ -327,8 +432,8 @@ public static class ApiApp
         AuditOf(http)?.Completion(result);
 
         return request.IsChat
-            ? Results.Json(BuildChatCompletion(request, gen, result))
-            : Results.Json(BuildTextCompletion(request, gen, result));
+            ? Results.Json(BuildChatCompletion(request, gen, result, BudgetReportsOf(http)))
+            : Results.Json(BuildTextCompletion(request, gen, result, BudgetReportsOf(http)));
     }
 
     private static async Task StreamCompletionsAsync(GenerationRequest request, GenerationService gen, Stream stream, HttpContext http)
@@ -352,12 +457,38 @@ public static class ApiApp
 
         if (request.LogProbs && result.LogProbs is { Count: > 0 } entries)
         {
-            // With logprobs on, every generated token gets its own content chunk carrying its logprob entry.
+            // With logprobs on, every generated token gets its own content chunk carrying its logprob entry. That path keeps
+            // the one-chunk-per-token contract it promises and carries the generated markup as generated: withholding a token's
+            // text would strand its logprob entry, so the strip policy is applied where it can be — over streamed content.
             foreach (TokenLogprob entry in entries)
             {
                 await WriteChunkAsync(stream, new ChunkPayload(
                     completionId, "chat.completion.chunk", created, model,
                     [new ChunkChoice(0, new ChunkDelta(Content: gen.DecodeToken(entry.TokenId), Logprobs: WireEntry(gen, entry)), null)]), http);
+            }
+        }
+        else if (result.Reasoning == ReasoningPolicy.Strip)
+        {
+            // A strip policy withholds the recognized reasoning regions from streamed content exactly as they settle: a
+            // boundary marker split across pieces stays pending until the next piece settles it, so no part of a region ever
+            // reaches the wire and every delta is ordinary visible text. The filter follows the policy this sequence was
+            // admitted on — carried on its result — not whatever reload has since resolved. Boundaries are recorded there too.
+            ReasoningRegionFilter filter = new();
+            foreach (string piece in pieces)
+            {
+                foreach (string visible in filter.Feed(piece))
+                {
+                    await WriteChunkAsync(stream, new ChunkPayload(
+                        completionId, "chat.completion.chunk", created, model,
+                        [new ChunkChoice(0, new ChunkDelta(Content: visible), null)]), http);
+                }
+            }
+
+            foreach (string visible in filter.Finish())
+            {
+                await WriteChunkAsync(stream, new ChunkPayload(
+                    completionId, "chat.completion.chunk", created, model,
+                    [new ChunkChoice(0, new ChunkDelta(Content: visible), null)]), http);
             }
         }
         else
@@ -383,7 +514,7 @@ public static class ApiApp
 
         await WriteChunkAsync(stream, new ChunkPayload(
             completionId, "chat.completion.chunk", created, model,
-            [new ChunkChoice(0, new ChunkDelta(), result.FinishReason)]), http);
+            [new ChunkChoice(0, new ChunkDelta(), result.FinishReason)], BudgetReportsOf(http), result.BudgetExhausted), http);
 
         await stream.WriteAsync(DoneEvent, http.RequestAborted);
         await stream.FlushAsync(http.RequestAborted);
@@ -436,23 +567,27 @@ public static class ApiApp
         return new ChatRequestInput(body, tools, toolChoice);
     }
 
-    private static ChatCompletionResponse BuildChatCompletion(GenerationRequest request, GenerationService gen, GenerationResult result) =>
+    private static ChatCompletionResponse BuildChatCompletion(GenerationRequest request, GenerationService gen, GenerationResult result, IReadOnlyList<TokenBudgetReport>? budgets) =>
         new(
             "chatcmpl-" + Guid.NewGuid().ToString("N"),
             "chat.completion",
             DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
             request.Model,
             [new ChatChoice(0, new AssistantMessage("assistant", result.Text, WireCalls(result.ToolCalls)), result.FinishReason, LogProbsReportOf(request, gen, result))],
-            UsageOf(result));
+            UsageOf(result),
+            budgets,
+            result.BudgetExhausted);
 
-    private static TextCompletionResponse BuildTextCompletion(GenerationRequest request, GenerationService gen, GenerationResult result) =>
+    private static TextCompletionResponse BuildTextCompletion(GenerationRequest request, GenerationService gen, GenerationResult result, IReadOnlyList<TokenBudgetReport>? budgets) =>
         new(
             "cmpl-" + Guid.NewGuid().ToString("N"),
             "text_completion",
             DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
             request.Model,
             [new TextChoice(0, result.Text, result.FinishReason, LogProbsReportOf(request, gen, result))],
-            UsageOf(result));
+            UsageOf(result),
+            budgets,
+            result.BudgetExhausted);
 
     // The logprobs report rides on the choice only when the request asked for it; its entries mirror the
     // generated tokens in order, each carrying the sampled distribution's top candidates.

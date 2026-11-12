@@ -278,6 +278,91 @@ internal static class LayerOps
     }
 
     /// <summary>
+    /// Fills position-major cos/sin tables for the YaRN scaling variant up to maxPositions, over the leading
+    /// <c>ropeDimensions</c> head dimensions. Each position stores <c>ropeDimensions / 2</c> entries. Pair i of
+    /// position p starts from the unscaled angle <c>p * base^(-2i/headDim)</c>: the table angle interpolates it
+    /// toward <c>angle / multiplier</c> and blends the two back toward the unscaled angle across the correction
+    /// band <c>[corrLow, corrHigh]</c> with weight <c>correctionScale * (1 - clamp((i - corrLow) / (corrHigh - corrLow)))</c>,
+    /// where the band ends are the pair indices whose unscaled frequency reaches <c>betaFast</c> and
+    /// <c>betaSlow</c> at the original context — <c>i(x) = headDim * ln(originalContext / (x * 2 * pi)) / (2 * ln(base))</c>,
+    /// clamped to <c>[0, headDim - 1]</c>. Every entry is then multiplied by <c>attentionFactor</c>, which gains
+    /// <c>1 + 0.1 * ln(multiplier)</c> when the correction scale is non-zero. Angles and scales are computed in
+    /// double and stored as float, so the same inputs always produce bit-identical rotations.
+    /// </summary>
+    internal static void BuildRopeScalingTables(
+        double thetaBase,
+        int headDim,
+        int ropeDimensions,
+        int maxPositions,
+        double multiplier,
+        double originalContext,
+        double attentionFactor,
+        double correctionScale,
+        double betaFast,
+        double betaSlow,
+        Span<float> cos,
+        Span<float> sin)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(headDim);
+        if (headDim % 2 != 0)
+        {
+            throw new ArgumentException($"RoPE pairs require an even head dimension, got {headDim}.", nameof(headDim));
+        }
+
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(ropeDimensions);
+        if (ropeDimensions > headDim || ropeDimensions % 2 != 0)
+        {
+            throw new ArgumentException(
+                $"the rotary slice must be an even count of head dimensions not exceeding {headDim}, got {ropeDimensions}.",
+                nameof(ropeDimensions));
+        }
+
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxPositions);
+
+        int half = ropeDimensions / 2;
+        if (cos.Length < maxPositions * half || sin.Length < maxPositions * half)
+        {
+            throw new ArgumentException("Cos/sin tables must cover maxPositions * ropeDimensions/2 entries each.", nameof(cos));
+        }
+
+        double freqScale = 1.0 / multiplier;
+
+        // Band ends in pair indices, from the reference's solved correction dimensions.
+        static double CorrDim(double beta, int headDim, double originalContext, double thetaBase) =>
+            headDim * Math.Log(originalContext / (beta * 2.0 * Math.PI)) / (2.0 * Math.Log(thetaBase));
+
+        double corrLow = Math.Max(0.0, Math.Floor(CorrDim(betaFast, headDim, originalContext, thetaBase)));
+        double corrHigh = Math.Min(headDim - 1.0, Math.Ceiling(CorrDim(betaSlow, headDim, originalContext, thetaBase)));
+        double bandWidth = Math.Max(0.001, corrHigh - corrLow);
+
+        double magnitude = attentionFactor;
+        if (correctionScale != 0.0)
+        {
+            magnitude *= 1.0 + 0.1 * Math.Log(multiplier); // 1 / freqScale == multiplier
+        }
+
+        for (int pos = 0; pos < maxPositions; pos++)
+        {
+            int tableBase = pos * half;
+            for (int i = 0; i < half; i++)
+            {
+                double unscaled = pos * Math.Pow(thetaBase, -2.0 * i / headDim);
+                double angle = unscaled * freqScale;
+
+                if (correctionScale != 0.0)
+                {
+                    double ramp = 1.0 - Math.Min(1.0, Math.Max(0.0, (i - corrLow) / bandWidth));
+                    double mix = ramp * correctionScale;
+                    angle = angle * (1.0 - mix) + unscaled * mix;
+                }
+
+                cos[tableBase + i] = (float)(Math.Cos(angle) * magnitude);
+                sin[tableBase + i] = (float)(Math.Sin(angle) * magnitude);
+            }
+        }
+    }
+
+    /// <summary>
     /// Rotates one head region in place with GGUF/llama-style adjacent pairs: out[2i] = x[2i]*cos_i - x[2i+1]*sin_i,
     /// out[2i + 1] = x[2i + 1]*cos_i + x[2i]*sin_i. Table entry i is the angle of the pair occupying adjacent head
     /// dimensions 2i and 2i + 1, which is how rotary q/k rows are laid out in converted llama-family GGUF checkpoints.
@@ -341,8 +426,14 @@ internal static class LayerOps
     /// narrows that causal range to <c>[max(0, position - window + 1), position]</c>: keys further back than the
     /// window are never scored, so they contribute nothing to the softmax. The narrowing happens before the online
     /// max, so the running max and sum stay exact over the positions that do contribute. A non-positive window
-    /// leaves the range unbounded. The weighted V accumulation is normalized in place into outConcat (head-major
-    /// layout). A non-positive softcap disables the cap: the score path is then exactly the uncapped one.
+    /// leaves the range unbounded. The narrowed range is resolved once into a <see cref="BlockSelection"/> by
+    /// <see cref="SequenceKv.SelectCausalRead"/>, and every K/V read of this call addresses a position inside that
+    /// selection through <see cref="SequenceKv.ReadK(BlockSelection, int, int)"/>: the pass walks exactly the selected
+    /// blocks in ascending order — reading each block's slots that fall in range, partial at either edge — so an
+    /// out-of-window physical block is never addressed rather than merely skipped by a loop bound, and a read outside
+    /// the selection fails instead of reaching past the window. Positions excluded this way stay written and readable
+    /// for every other layer's own selection. The weighted V accumulation is normalized in place into outConcat
+    /// (head-major layout). A non-positive softcap disables the cap: the score path is then exactly the uncapped one.
     /// </summary>
     internal static void CausalAttention(
         IBackend backend,
@@ -366,7 +457,8 @@ internal static class LayerOps
             throw new ArgumentException("Attention operands must cover every head's full region.", nameof(qHeads));
         }
 
-        int firstVisible = window > 0 ? Math.Max(0, position - window + 1) : 0;
+        BlockSelection read = kv.SelectCausalRead(position, window); // the in-window positions and exactly which blocks they live in
+        int blockTokens = kv.BlockTokens;
 
         for (int h = 0; h < headCount; h++)
         {
@@ -378,39 +470,47 @@ internal static class LayerOps
             float sumExp = 0f;
             outHead.Clear();
 
-            for (int t = firstVisible; t <= position; t++)
+            for (int blockIndex = read.FirstBlockIndex; blockIndex <= read.LastBlockIndex; blockIndex++)
             {
-                ReadOnlySpan<float> kt = kv.ReadK(t, layer).Slice(kvHead * headDim, headDim);
-                float score = backend.Dot(qh, kt) * attnScale;
-                if (softcap > 0f)
-                {
-                    score = Softcap(score, softcap); // after scaling, before the online softmax sees it
-                }
+                // Only the selected block's slots inside the windowed range: a partial first or last block contributes its
+                // in-range positions, and no position outside the selection is ever addressed.
+                int slotFirst = Math.Max(read.FirstPosition, blockIndex * blockTokens);
+                int slotLast = Math.Min(read.LastPosition, (blockIndex + 1) * blockTokens - 1);
 
-                if (score > runningMax)
+                for (int t = slotFirst; t <= slotLast; t++)
                 {
-                    // Rescale everything accumulated under the old max so all weights share the new exponent base.
-                    if (!float.IsNegativeInfinity(runningMax))
+                    ReadOnlySpan<float> kt = kv.ReadK(read, t, layer).Slice(kvHead * headDim, headDim);
+                    float score = backend.Dot(qh, kt) * attnScale;
+                    if (softcap > 0f)
                     {
-                        float rescale = MathF.Exp(runningMax - score);
-                        sumExp *= rescale;
-
-                        for (int j = 0; j < headDim; j++)
-                        {
-                            outHead[j] *= rescale;
-                        }
+                        score = Softcap(score, softcap); // after scaling, before the online softmax sees it
                     }
 
-                    runningMax = score;
-                }
+                    if (score > runningMax)
+                    {
+                        // Rescale everything accumulated under the old max so all weights share the new exponent base.
+                        if (!float.IsNegativeInfinity(runningMax))
+                        {
+                            float rescale = MathF.Exp(runningMax - score);
+                            sumExp *= rescale;
 
-                float weight = MathF.Exp(score - runningMax); // the current max term contributes exactly 1
-                sumExp += weight;
+                            for (int j = 0; j < headDim; j++)
+                            {
+                                outHead[j] *= rescale;
+                            }
+                        }
 
-                ReadOnlySpan<float> vt = kv.ReadV(t, layer).Slice(kvHead * headDim, headDim);
-                for (int j = 0; j < headDim; j++)
-                {
-                    outHead[j] += weight * vt[j];
+                        runningMax = score;
+                    }
+
+                    float weight = MathF.Exp(score - runningMax); // the current max term contributes exactly 1
+                    sumExp += weight;
+
+                    ReadOnlySpan<float> vt = kv.ReadV(read, t, layer).Slice(kvHead * headDim, headDim);
+                    for (int j = 0; j < headDim; j++)
+                    {
+                        outHead[j] += weight * vt[j];
+                    }
                 }
             }
 
@@ -429,16 +529,20 @@ internal static class LayerOps
     /// same online softmax as <see cref="CausalAttention"/>, including its scaled-then-capped score path when
     /// softcap is positive, with its score window widened from [0, position] to
     /// [fromPosition, toPosition], which must lie inside the sequence's existing KV (<see cref="SequenceKv.Length"/>).
-    /// The queries' own absolute positions start at <paramref name="queryPositionOffset"/>, so a positive window
-    /// narrows each query's range symmetrically to <c>[max(fromPosition, q - window + 1), min(toPosition, q + window)]</c>
-    /// around its own position <c>q</c>: positions further away than the window on either side are never scored. The
-    /// narrowing happens before the online max, so the running max and sum stay exact over the positions that do
-    /// contribute; a query whose windowed range does not intersect the given KV range is a failure. A non-positive
-    /// window leaves the given range untouched.
+    /// The queries' own absolute positions start at <paramref name="queryPositionOffset"/>, so a positive window narrows
+    /// each query's range backward-only to <c>[max(fromPosition, q - window + 1), min(toPosition, q)]</c> relative to its
+    /// own position <c>q</c>: positions further back than the window are never scored, and neither is any position past
+    /// the query itself — a positive window never grants forward visibility. The narrowing happens before the online max,
+    /// so the running max and sum stay exact over the positions that do contribute; a query whose windowed range does not
+    /// intersect the given KV range is a failure. A non-positive window leaves the given range untouched, which is what
+    /// keeps an unbounded layer bidirectional over it.
     /// Restricting that window yields a block-local variant used when long sequences are processed in chunks: every
     /// query then sees exactly one contiguous range of positions. With fromPosition == 0 and toPosition == p over a
     /// sequence of length p + 1 the numeric path is identical to <see cref="CausalAttention"/> at position p, which
-    /// lets chunk boundaries be verified against the causal decode kernels bit-for-bit.
+    /// lets chunk boundaries be verified against the causal decode kernels bit-for-bit; with a positive window it is
+    /// identical to that kernel's own narrowed range at the same query under the same window. Each query's resolved
+    /// range becomes a <see cref="BlockSelection"/> from <see cref="SequenceKv.SelectRangeRead"/>, and its reads walk only
+    /// that selection's blocks — positions outside it are never addressed, exactly as in the causal path.
     /// </summary>
     internal static void BidirectionalAttention(
         IBackend backend,
@@ -454,7 +558,7 @@ internal static class LayerOps
         int layer,
         float attnScale,
         float softcap, // positive enables the score softcap; non-positive disables it
-        int window, // positive narrows each query's range to the window around its own position; non-positive leaves it as given
+        int window, // positive narrows each query's range to its backward span ending at the query itself; non-positive leaves it as given
         Span<float> outConcat) // queryCount * headCount * headDim, position-major
     {
         ArgumentNullException.ThrowIfNull(backend);
@@ -483,8 +587,11 @@ internal static class LayerOps
             int lastVisible = toPosition;
             if (window > 0)
             {
+                // Backward-only: the window reaches behind the query and stops at the query itself, so this is exactly
+                // the range SequenceKv.SelectCausalRead resolves for the same position and window. The literal
+                // [fromPosition..toPosition] edges still bound it; a non-positive window keeps them as given.
                 firstVisible = Math.Max(firstVisible, queryPosition - window + 1);
-                lastVisible = Math.Min(lastVisible, queryPosition + window);
+                lastVisible = Math.Min(lastVisible, queryPosition);
 
                 if (firstVisible > lastVisible)
                 {
@@ -497,6 +604,10 @@ internal static class LayerOps
             ReadOnlySpan<float> qAtPosition = qPositions.Slice(p * region, region);
             Span<float> outAtPosition = outConcat.Slice(p * region, region);
 
+            // This query's own windowed range resolved into the blocks it covers: reads walk that selection only.
+            BlockSelection read = kv.SelectRangeRead(firstVisible, lastVisible);
+            int blockTokens = kv.BlockTokens;
+
             for (int h = 0; h < headCount; h++)
             {
                 ReadOnlySpan<float> qh = qAtPosition.Slice(h * headDim, headDim);
@@ -507,39 +618,45 @@ internal static class LayerOps
                 float sumExp = 0f;
                 outHead.Clear();
 
-                for (int t = firstVisible; t <= lastVisible; t++)
+                for (int blockIndex = read.FirstBlockIndex; blockIndex <= read.LastBlockIndex; blockIndex++)
                 {
-                    ReadOnlySpan<float> kt = kv.ReadK(t, layer).Slice(kvHead * headDim, headDim);
-                    float score = backend.Dot(qh, kt) * attnScale;
-                    if (softcap > 0f)
-                    {
-                        score = Softcap(score, softcap); // after scaling, before the online softmax sees it
-                    }
+                    int slotFirst = Math.Max(read.FirstPosition, blockIndex * blockTokens);
+                    int slotLast = Math.Min(read.LastPosition, (blockIndex + 1) * blockTokens - 1);
 
-                    if (score > runningMax)
+                    for (int t = slotFirst; t <= slotLast; t++)
                     {
-                        // Rescale everything accumulated under the old max so all weights share the new exponent base.
-                        if (!float.IsNegativeInfinity(runningMax))
+                        ReadOnlySpan<float> kt = kv.ReadK(read, t, layer).Slice(kvHead * headDim, headDim);
+                        float score = backend.Dot(qh, kt) * attnScale;
+                        if (softcap > 0f)
                         {
-                            float rescale = MathF.Exp(runningMax - score);
-                            sumExp *= rescale;
-
-                            for (int j = 0; j < headDim; j++)
-                            {
-                                outHead[j] *= rescale;
-                            }
+                            score = Softcap(score, softcap); // after scaling, before the online softmax sees it
                         }
 
-                        runningMax = score;
-                    }
+                        if (score > runningMax)
+                        {
+                            // Rescale everything accumulated under the old max so all weights share the new exponent base.
+                            if (!float.IsNegativeInfinity(runningMax))
+                            {
+                                float rescale = MathF.Exp(runningMax - score);
+                                sumExp *= rescale;
 
-                    float weight = MathF.Exp(score - runningMax); // the current max term contributes exactly 1
-                    sumExp += weight;
+                                for (int j = 0; j < headDim; j++)
+                                {
+                                    outHead[j] *= rescale;
+                                }
+                            }
 
-                    ReadOnlySpan<float> vt = kv.ReadV(t, layer).Slice(kvHead * headDim, headDim);
-                    for (int j = 0; j < headDim; j++)
-                    {
-                        outHead[j] += weight * vt[j];
+                            runningMax = score;
+                        }
+
+                        float weight = MathF.Exp(score - runningMax); // the current max term contributes exactly 1
+                        sumExp += weight;
+
+                        ReadOnlySpan<float> vt = kv.ReadV(read, t, layer).Slice(kvHead * headDim, headDim);
+                        for (int j = 0; j < headDim; j++)
+                        {
+                            outHead[j] += weight * vt[j];
+                        }
                     }
                 }
 

@@ -17,7 +17,7 @@ public static class YamlConfigLoader
     private static readonly string[] ServerKeys = ["bind", "port"];
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens"];
     private static readonly string[] UiKeys = ["recent_requests"];
-    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools"];
+    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota"];
 
     /// <summary>Loads and validates <paramref name="filePath"/>; no file watching.</summary>
@@ -224,6 +224,40 @@ public static class YamlConfigLoader
         // the model's chat template reports tool support. Absent means false — the template's capabilities decide.
         bool forceFencedTools = TryBoolean(keys, "force_fenced_tools", $"models[{index}].force_fenced_tools") ?? false;
 
+        // Tool output parser: auto (default), or one of the three explicit choices. An unrecognized value fails
+        // naming the model entry and the key with the accepted set.
+        string toolParser = TryText(keys, "tool_parser", $"models[{index}].tool_parser") ?? "auto";
+        if (toolParser is not ("auto" or "template" or "fenced" or "none"))
+        {
+            throw new ConfigException(
+                $"models[{index}].tool_parser '{toolParser}' is invalid: 'tool_parser' accepts only 'auto', 'template', 'fenced', or 'none'.");
+        }
+
+        // Reasoning visibility policy: keep (default) or strip. An unrecognized value fails naming the model entry and
+        // the key with the accepted set, exactly as the tool parser choice does.
+        string reasoning = TryText(keys, "reasoning", $"models[{index}].reasoning") ?? "keep";
+        if (reasoning is not ("keep" or "strip"))
+        {
+            throw new ConfigException(
+                $"models[{index}].reasoning '{reasoning}' is invalid: 'reasoning' accepts only 'keep' or 'strip'.");
+        }
+
+        // Per-model token budgets: absent means unbudgeted, and a present value must be 1 or greater. A rejected value
+        // fails naming the model entry, key, and offending number exactly as the other sized keys do.
+        int? maxReasoningTokens = TryInteger(keys, "max_reasoning_tokens", $"models[{index}].max_reasoning_tokens");
+        if (maxReasoningTokens is < 1)
+        {
+            throw new ConfigException(
+                $"models[{index}].max_reasoning_tokens {maxReasoningTokens} is invalid: 'max_reasoning_tokens' must be 1 or greater.");
+        }
+
+        int? maxResponseTokens = TryInteger(keys, "max_response_tokens", $"models[{index}].max_response_tokens");
+        if (maxResponseTokens is < 1)
+        {
+            throw new ConfigException(
+                $"models[{index}].max_response_tokens {maxResponseTokens} is invalid: 'max_response_tokens' must be 1 or greater.");
+        }
+
         return new ModelConfig
         {
             Name = name,
@@ -232,6 +266,10 @@ public static class YamlConfigLoader
             MaxContextTokens = maxContextTokens,
             KvBlocks = kvBlocks,
             ForceFencedTools = forceFencedTools,
+            ToolParser = toolParser,
+            Reasoning = reasoning,
+            MaxReasoningTokens = maxReasoningTokens,
+            MaxResponseTokens = maxResponseTokens,
             Placement = ParsePlacement(keys, index),
         };
     }

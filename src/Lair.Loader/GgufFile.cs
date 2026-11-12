@@ -133,7 +133,7 @@ public sealed class GgufFile : IDisposable
         List<LogicalTensor> tensors = new((int)nTensors);
         for (ulong i = 0; i < nTensors; i++)
         {
-            tensors.Add(ReadTensorInfo(reader, fileSize));
+            tensors.Add(ReadTensorInfo(reader, fileSize, out QuantDescriptor _));
         }
 
         long dataStart = AlignUp(stream.Position, alignment);
@@ -171,7 +171,7 @@ public sealed class GgufFile : IDisposable
         return (int)alignment;
     }
 
-    private static LogicalTensor ReadTensorInfo(BinaryReader reader, long fileSize)
+    private static LogicalTensor ReadTensorInfo(BinaryReader reader, long fileSize, out QuantDescriptor descriptor)
     {
         string name = ReadString(reader, fileSize);
 
@@ -198,24 +198,68 @@ public sealed class GgufFile : IDisposable
         uint ggmlType = reader.ReadUInt32();
         ulong offset = reader.ReadUInt64();
 
-        if (!GgmlType.TryGetSupported(ggmlType, out QuantFormat format, out int blockElements, out int blockBytes))
+        if (!GgmlTypeRegistry.TryResolve(ggmlType, out descriptor))
         {
             throw new GgufException(
                 $"tensor '{name}' has unsupported ggml type {ggmlType} ({GgmlType.Name(ggmlType)})");
         }
 
-        if (stored[0] % (uint)blockElements != 0)
+        if (stored[0] % (uint)descriptor.BlockSize != 0)
         {
             throw new GgufException(
-                $"tensor '{name}' fastest dimension {stored[0]} is not a multiple of the " +
-                $"{GgmlType.Name(ggmlType)} block size {blockElements}");
+                $"tensor '{name}' with ggml type {ggmlType} ({descriptor.Name}) fastest dimension {stored[0]} " +
+                $"is not a multiple of the {descriptor.Name} block size {descriptor.BlockSize}");
         }
 
-        long rowBytes = (long)blockBytes * (stored[0] / blockElements);
+        // The payload is one descriptor block per BlockSize elements: the element
+        // count must divide into whole blocks and the byte length must match the
+        // descriptor arithmetic exactly. A tensor whose declared payload disagrees
+        // with its type geometry is a malformed file.
+        bool ConsistentWithDescriptor(QuantDescriptor geometry, long sizeBytes, out long elementCount)
+        {
+            elementCount = 1;
+            foreach (uint dim in stored)
+            {
+                elementCount = checked(elementCount * dim);
+            }
+
+            if (elementCount % geometry.BlockSize != 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                return sizeBytes == checked(geometry.TypeSize * (elementCount / geometry.BlockSize));
+            }
+            catch (OverflowException)
+            {
+                return false;
+            }
+        }
+
+        long rowBytes = (long)descriptor.TypeSize * (stored[0] / descriptor.BlockSize);
         long sizeBytes = rowBytes;
         for (int d = 1; d < stored.Length; d++)
         {
             sizeBytes = checked(sizeBytes * stored[d]);
+        }
+
+        if (!ConsistentWithDescriptor(descriptor, sizeBytes, out long elementCount))
+        {
+            throw new GgufException(
+                $"tensor '{name}' with ggml type {ggmlType} ({descriptor.Name}) declares {elementCount} elements " +
+                $"but its {sizeBytes} payload bytes do not match {descriptor.Name} geometry " +
+                $"({descriptor.TypeSize} bytes per {descriptor.BlockSize}-element block)");
+        }
+
+        long payloadEnd = checked((long)offset + sizeBytes);
+        if (payloadEnd > fileSize)
+        {
+            throw new GgufException(
+                $"tensor '{name}' with ggml type {ggmlType} ({descriptor.Name}) needs {sizeBytes} payload bytes at " +
+                $"offset {offset}, which runs past the end of the {fileSize}-byte file " +
+                $"(expected {descriptor.TypeSize} bytes per {descriptor.BlockSize}-element block)");
         }
 
         int[] logical = new int[nDims];
@@ -227,7 +271,7 @@ public sealed class GgufFile : IDisposable
         return new LogicalTensor(
             name,
             new TensorShape(logical),
-            format,
+            descriptor.Format,
             (long)offset,
             sizeBytes);
     }

@@ -490,7 +490,11 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 ThreadQuota: facts?.ThreadQuota,
                 DecodeDevice: facts?.DecodeDevice,
                 PrefillDevice: facts?.PrefillDevice,
-                KvResidency: facts?.KvResidency);
+                KvResidency: facts?.KvResidency,
+
+                WindowedLayers: _pool.DeclaredWindowedLayerCount,
+                KvReadFootprintBlocks: _pool.KvReadFootprintBlocksAtBudget,
+                SkippedKvReadBlocks: _pool.SkippedKvReadFootprintBlocksAtBudget);
 
             long id = ++_eventSeq;
             frame = new MonitorFrame(id, MonitorEventNames.Snapshot, snapshot.ToJson());

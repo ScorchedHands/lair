@@ -168,6 +168,57 @@ public sealed class MonitorStreamTests
     }
 
     [Fact]
+    public async Task RequestCompleteFrame_CarriesBudgetExhaustedAttribution_TheLiveFrameSpeaksWhatTheBodyReported()
+    {
+        if (ModelFixture.Resolve() is null)
+        {
+            return; // real-model tests skip when the fixture is absent
+        }
+
+        await using LiveServer server = await LiveServer.StartAsync("smollm-budget", uiRecentRequests: 25);
+
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(180));
+
+        await using Stream body = await OpenStreamAsync(server, lastEventId: null, deadline.Token);
+        StreamReader reader = new(body);
+
+        string requestBody = JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["model"] = server.ModelName,
+            ["prompt"] = ShortPrompt,
+            ["max_tokens"] = 16,
+            ["max_response_tokens"] = 3,
+            ["temperature"] = 0f,
+            ["stream"] = false,
+        });
+
+        using HttpResponseMessage response = await Http.PostAsync(
+            $"{server.BaseUrl}/v1/completions", new StringContent(requestBody, Encoding.UTF8, "application/json"));
+        response.EnsureSuccessStatusCode();
+
+        string requestId = response.Headers.TryGetValues(ApiApp.RequestIdHeader, out IEnumerable<string>? values)
+            ? values.FirstOrDefault() ?? throw new InvalidOperationException("the response carried no x-lair-request-id")
+            : throw new InvalidOperationException("the response carried no x-lair-request-id");
+
+        using JsonDocument responseBody = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        Assert.Equal("response", responseBody.RootElement.GetProperty("budget_exhausted").GetString());
+
+        SseFrame complete = await ReadFramesUntilAsync(
+            reader,
+            f => f.Event == MonitorEventNames.RequestComplete && RequestIdOf(f) == requestId,
+            deadline.Token);
+
+        using JsonDocument document = JsonDocument.Parse(complete.Data);
+        JsonElement root = document.RootElement;
+
+        // The frame's token series can stop one short of the completion count when the combined ceiling ends a run, so this
+        // asserts the attribution the completion carries, not the tally.
+        Assert.Equal("response", root.GetProperty("budget_exhausted").GetString());
+        Assert.Equal("length", root.GetProperty("finish_reason").GetString());
+        Assert.True(root.GetProperty("generated_tokens").GetInt32() > 0);
+    }
+
+    [Fact]
     public async Task RecentRequestRing_IsBoundedByUiConfig_ResyncCarriesOnlyNewest()
     {
         if (ModelFixture.Resolve() is null)

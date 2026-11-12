@@ -18,6 +18,7 @@ namespace Lair.Tests;
 /// as a concurrency refusal.
 /// </summary>
 [Trait("Category", "Concurrency")]
+[Collection("model-loaded")] // shares one serialized lane with the real-model parity suites: two engines loading at once starves the latency budgets this suite measures
 public sealed class ConcurrencyTests
 {
     private const string ModelName = "smollm-concurrency";

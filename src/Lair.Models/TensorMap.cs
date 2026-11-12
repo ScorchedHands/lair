@@ -41,6 +41,34 @@ public enum TensorRole
     MoeSharedExpertGate,
     MoeSharedExpertUp,
     MoeSharedExpertDown,
+
+    /// <summary>
+    /// The shared expert's per-token scalar gate: one row of the hidden size whose score selects the shared
+    /// expert for this token. It is a distinct tensor from <see cref="MoeSharedExpertGate"/> — that role names the
+    /// shared block's SwiGLU gate matrix, this one names the selector vector the reference multiplies the shared
+    /// output by — and only some families ship it at all.
+    /// </summary>
+    MoeSharedExpertInputGate,
+
+    /// <summary>
+    /// The factorized layout's shared input basis: one matrix per layer read once over the hidden stream to produce
+    /// a rank-sized vector every expert of that layer consumes. Only a file declaring
+    /// <see cref="SparseFfnLayout.FactorizedSharedBasis"/> ships it, and no dense-stacked family names it at all.
+    /// </summary>
+    MoeExpertInputBasis,
+
+    /// <summary>
+    /// The factorized layout's per-expert coefficients: one stacked tensor whose outermost dimension indexes experts
+    /// exactly as the dense expert roles do, holding each expert's contribution in the shared basis' compressed space.
+    /// </summary>
+    MoeExpertCoefficients,
+
+    /// <summary>
+    /// The factorized layout's shared output projection: one matrix per layer that expands the accumulated
+    /// coefficient-space sum back to the hidden stream, which is what lets a weighted expert sum collapse into a single
+    /// application instead of one down-projection per expert.
+    /// </summary>
+    MoeExpertOutputBasis,
 }
 
 /// <summary>Whether a tensor name is a single global name or a per-block name carrying a <c>{layer}</c> placeholder.</summary>
@@ -151,7 +179,8 @@ public sealed class TensorMap
     public TensorDescriptor this[TensorRole role] => _byRole[(int)role];
 
     /// <summary>
-    /// Whether a role belongs to the sparse-FFN block: the router and the expert matrices, dense or shared.
+    /// Whether a role belongs to the sparse-FFN block: the router, the expert matrices dense or shared, the
+    /// shared expert's scalar gate vector, and the factorized layout's basis/coefficient/output-basis tensors.
     /// A dense profile names these roles for the load-time report only — its forward consumes none of them,
     /// and the generic llama-shaped fallback treats a tensor under a sparse name as material its map cannot
     /// match rather than as a matchable optional role.
@@ -163,5 +192,9 @@ public sealed class TensorMap
             or TensorRole.MoeExpertDown
             or TensorRole.MoeSharedExpertGate
             or TensorRole.MoeSharedExpertUp
-            or TensorRole.MoeSharedExpertDown;
+            or TensorRole.MoeSharedExpertDown
+            or TensorRole.MoeSharedExpertInputGate
+            or TensorRole.MoeExpertInputBasis
+            or TensorRole.MoeExpertCoefficients
+            or TensorRole.MoeExpertOutputBasis;
 }

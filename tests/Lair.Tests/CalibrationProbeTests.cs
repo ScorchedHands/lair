@@ -19,7 +19,7 @@ public sealed class CalibrationProbeTests
         ("p1", "The capital of France is"),
         ("p2", "Once upon a time"),
         ("p3", "def fibonacci(n):\n"),
-        ("p4", "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n"),
+        ("p4", "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n"),
     ];
 
     [Fact]

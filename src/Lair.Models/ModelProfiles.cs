@@ -14,7 +14,10 @@ public static class ModelProfiles
 
     // The sparse-FFN shape each MoE profile declares: the router and expert roles its tensor map names, and
     // whether its reference block adds a shared expert. The counts the plan carries come from the file's
-    // declared expert metadata, never from the profile, so these shapes carry zero counts.
+    // declared expert metadata, never from the profile, so these shapes carry zero counts. They name the factorized
+    // layout's basis/coefficient/output-basis roles too — the map declares them as optional tensors a sidecar-produced
+    // file can reach — while carrying the stacked layout and no rank, because which layout a block has is what its own
+    // declaration says, not what the family prefers.
     private static readonly SparseFfnDescriptor Qwen2MoeSparseFfn = new(
         ExpertCount: 0,
         RoutedExpertsPerToken: 0,
@@ -26,6 +29,15 @@ public static class ModelProfiles
         SharedGateRole: TensorRole.MoeSharedExpertGate,
         SharedUpRole: TensorRole.MoeSharedExpertUp,
         SharedDownRole: TensorRole.MoeSharedExpertDown,
+        // The reference qwen2moe block ships one selector vector of the file's hidden size per layer and multiplies
+        // this token's shared-expert output by its score, so this shape names that role. A sparse shape naming no
+        // gate role adds its shared block ungated instead.
+        SharedInputGateRole: TensorRole.MoeSharedExpertInputGate,
+        Layout: SparseFfnLayout.StackedExperts,
+        Rank: null,
+        ExpertInputBasisRole: TensorRole.MoeExpertInputBasis,
+        ExpertCoefficientRole: TensorRole.MoeExpertCoefficients,
+        ExpertOutputBasisRole: TensorRole.MoeExpertOutputBasis,
         ExpertWeightsScale: 0f,
         NormalizeExpertWeights: false);
 
@@ -40,6 +52,39 @@ public static class ModelProfiles
         SharedGateRole: null,
         SharedUpRole: null,
         SharedDownRole: null,
+        // The reference qwen3moe block ships no shared expert at all, so it names neither its matrices nor a gate.
+        SharedInputGateRole: null,
+        Layout: SparseFfnLayout.StackedExperts,
+        Rank: null,
+        ExpertInputBasisRole: TensorRole.MoeExpertInputBasis,
+        ExpertCoefficientRole: TensorRole.MoeExpertCoefficients,
+        ExpertOutputBasisRole: TensorRole.MoeExpertOutputBasis,
+        ExpertWeightsScale: 0f,
+        NormalizeExpertWeights: false);
+
+    // The reference olmoe block routes every token through a per-layer router matrix over its experts and adds no
+    // shared expert at all, so this shape names the router and the stacked gate/up/down triplets and none of the
+    // shared-expert roles. Its counts come from the file's declared metadata like every other sparse shape, so they
+    // stay zero here; the reference reads no routing-weight gain or renormalization for this family either — a real
+    // olmoe conversion declares neither key, which resolves to scale 0f (disabled) and normalization off.
+    private static readonly SparseFfnDescriptor OlmoeSparseFfn = new(
+        ExpertCount: 0,
+        RoutedExpertsPerToken: 0,
+        HasSharedExpert: false,
+        RouterRole: TensorRole.MoeRouter,
+        ExpertGateRole: TensorRole.MoeExpertGate,
+        ExpertUpRole: TensorRole.MoeExpertUp,
+        ExpertDownRole: TensorRole.MoeExpertDown,
+        SharedGateRole: null,
+        SharedUpRole: null,
+        SharedDownRole: null,
+        // The reference olmoe block ships no shared expert at all, so it names neither its matrices nor a gate.
+        SharedInputGateRole: null,
+        Layout: SparseFfnLayout.StackedExperts,
+        Rank: null,
+        ExpertInputBasisRole: TensorRole.MoeExpertInputBasis,
+        ExpertCoefficientRole: TensorRole.MoeExpertCoefficients,
+        ExpertOutputBasisRole: TensorRole.MoeExpertOutputBasis,
         ExpertWeightsScale: 0f,
         NormalizeExpertWeights: false);
 
@@ -122,9 +167,9 @@ public static class ModelProfiles
             Prefix = "qwen2moe.",
             // The reference qwen2moe block routes every token through a per-layer router matrix over its experts,
             // sums the routed expert outputs with the routing weights, and adds one shared-expert block to that —
-            // the profile names those tensors and declares the sparse-FFN shape, while the forward engine refuses
-            // the block until sparse execution exists. The shared-expert gate vector the conversion ships is
-            // nameable through the shared gate role's alias.
+            // the profile names those tensors and declares the sparse-FFN shape. The shared expert is selected per
+            // token by a separate hidden-sized vector of the same layer, named by its own role rather than folded
+            // into the shared gate matrix's name.
             SparseFfn = Qwen2MoeSparseFfn,
             Norm = NormStrategy.RmsNorm,
             Activation = ActivationStrategy.SwiGLU,
@@ -146,6 +191,26 @@ public static class ModelProfiles
             Bias = BiasPolicy.Declared,
             Rope = RopeStrategy.RotateHalfFullHead,
             DefaultQkNorm = QkNormMode.PerHeadWeighted,
+            NormPlacement = NormPlacement.PreOnly,
+            Tensors = MoeTensors(),
+        },
+        new ModelProfile
+        {
+            Architecture = "olmoe",
+            Prefix = "olmoe.",
+            // The reference olmoe block routes every token through a per-layer router over its experts with no shared
+            // expert, and normalizes each layer's projected q and k the way its graph does: one RMS norm over the whole
+            // projection — before the heads are split — scaled element by element by that layer's hidden-sized vector.
+            // The file ships those vectors whether or not it declares the feature, so the profile defaults the mode to
+            // the stream-weighted form; a declared attention.use_qk_norm=false still turns it off.
+            SparseFfn = OlmoeSparseFfn,
+            Norm = NormStrategy.RmsNorm,
+            Activation = ActivationStrategy.SwiGLU,
+            Bias = BiasPolicy.Declared,
+            // The reference reads no rope pairing declaration for this family and its graph asserts the rotation covers
+            // each head in full, which is the adjacent-pair layout it applies to a file that declares none.
+            Rope = RopeStrategy.StandardFullHead,
+            DefaultQkNorm = QkNormMode.StreamWeighted,
             NormPlacement = NormPlacement.PreOnly,
             Tensors = MoeTensors(),
         },
@@ -247,13 +312,13 @@ public static class ModelProfiles
     // The MoE tensor map: the canonical map with the dense gate/up/down roles relaxed to optional — an
     // expert-routed block ships its gate/up/down triplets per expert instead of a dense triplet, so a MoE
     // file carries none of the dense names — plus the sparse-FFN roles under the names the reference uses:
-    // the router matrix, the stacked per-expert gate/up/down triplets, and the shared expert's gate/up/down
-    // triplets. Every sparse role is optional: the map names a MoE file's table so the load can report the
-    // file instead of rejecting its material, and the forward engine refuses a resolved sparse block before
-    // any of these tensors is consumed. The shared gate role also names the gate vector the qwen2moe
-    // conversion ships alongside the shared gate matrix. Dense profiles carry no sparse roles at all: their
-    // forward consumes none, and the generic llama-shaped fallback treats a tensor under a sparse name as
-    // material its map cannot match.
+    // the router matrix, the stacked per-expert gate/up/down triplets, the shared expert's gate/up/down
+    // triplets, and the hidden-sized vector that selects the shared expert for a token. Every sparse role is
+    // optional: the map names a MoE file's table so the load can report the file instead of rejecting its
+    // material, and only the families whose reference ships each tensor name it — the shared selector vector is a
+    // separate tensor from the shared gate matrix, with a shape of its own, so it carries no alias onto that name.
+    // Dense profiles carry no sparse roles at all: their forward consumes none, and the generic llama-shaped fallback
+    // treats a tensor under a sparse name as material its map cannot match.
     private static TensorMap MoeTensors() =>
         new(
         [
@@ -265,8 +330,37 @@ public static class ModelProfiles
             new TensorDescriptor(TensorRole.MoeExpertGate, TensorScope.PerLayer, "blk.{layer}.ffn_gate_exps.weight", Required: false, []),
             new TensorDescriptor(TensorRole.MoeExpertUp, TensorScope.PerLayer, "blk.{layer}.ffn_up_exps.weight", Required: false, []),
             new TensorDescriptor(TensorRole.MoeExpertDown, TensorScope.PerLayer, "blk.{layer}.ffn_down_exps.weight", Required: false, []),
-            new TensorDescriptor(TensorRole.MoeSharedExpertGate, TensorScope.PerLayer, "blk.{layer}.ffn_gate_shexp.weight", Required: false, ["blk.{layer}.ffn_gate_inp_shexp.weight"]),
+            new TensorDescriptor(TensorRole.MoeSharedExpertGate, TensorScope.PerLayer, "blk.{layer}.ffn_gate_shexp.weight", Required: false, []),
             new TensorDescriptor(TensorRole.MoeSharedExpertUp, TensorScope.PerLayer, "blk.{layer}.ffn_up_shexp.weight", Required: false, []),
             new TensorDescriptor(TensorRole.MoeSharedExpertDown, TensorScope.PerLayer, "blk.{layer}.ffn_down_shexp.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.MoeSharedExpertInputGate, TensorScope.PerLayer, "blk.{layer}.ffn_gate_inp_shexp.weight", Required: false, []),
+
+            // The factorized layout's tensors. No published conversion ships them — LAIR converts nothing itself, so a
+            // file carrying these arrives through an alternate weight provider — and the names follow this family's own
+            // GGUF conventions rather than inventing a vocabulary: block-scoped `blk.N.` prefix, `.weight` suffix, and
+            // the same `ffn_…exps…` stem the dense-stacked expert roles use. The shared basis is one matrix per layer on
+            // each side of the compressed space (`basis_in` reads hidden values, `basis_out` writes them), the per-expert
+            // coefficients keep the plural `_coefficients` shape the stacked expert triplets use so their outermost
+            // dimension indexes experts exactly as `ffn_gate_exps` does, and each role carries the shorter singular form
+            // of its own name as an alias because a sidecar exporter is free to spell it either way. All stay optional:
+            // only a file declaring the factorized layout declares these tensors, and nothing resident today reads them.
+            new TensorDescriptor(
+                TensorRole.MoeExpertInputBasis,
+                TensorScope.PerLayer,
+                "blk.{layer}.ffn_exps_basis_in.weight",
+                Required: false,
+                ["blk.{layer}.ffn_experts_basis_in.weight"]),
+            new TensorDescriptor(
+                TensorRole.MoeExpertCoefficients,
+                TensorScope.PerLayer,
+                "blk.{layer}.ffn_exps_coefficient.weight",
+                Required: false,
+                ["blk.{layer}.ffn_experts_coefficient.weight"]),
+            new TensorDescriptor(
+                TensorRole.MoeExpertOutputBasis,
+                TensorScope.PerLayer,
+                "blk.{layer}.ffn_exps_basis_out.weight",
+                Required: false,
+                ["blk.{layer}.ffn_experts_basis_out.weight"]),
         ]);
 }

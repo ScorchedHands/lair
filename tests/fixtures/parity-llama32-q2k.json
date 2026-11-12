@@ -1,0 +1,162 @@
+{
+  "model_file": "models/Llama-3.2-1B-Instruct-Q2_K.gguf",
+  "model_sha256": "8b7091a92bc10d70392a91ebe06cd43e1f5048ae0162e88f8fbe8445447ceae8",
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
+  "decode": {
+    "temperature": 0.0,
+    "context": 1024
+  },
+  "generated_utc": "2026-11-11T01:07:38Z",
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "max_tokens": 48,
+      "output": " Paris. The capital of France is actually Paris. The capital of France is actually Paris. The capital of France is actually Paris. The capital of France is actually Paris. The capital of France is actually Paris. The capital of France is actually",
+      "top_logprobs": [
+        {
+          "id": 12366,
+          "token": " Paris",
+          "logprob": -0.37149283289909363,
+          "lair_logprob": -0.3668
+        },
+        {
+          "id": 2663,
+          "token": " called",
+          "logprob": -3.631561756134033,
+          "lair_logprob": -3.7573
+        },
+        {
+          "id": 279,
+          "token": " the",
+          "logprob": -3.7172045707702637,
+          "lair_logprob": -3.7426
+        },
+        {
+          "id": 264,
+          "token": " a",
+          "logprob": -3.817551851272583,
+          "lair_logprob": -3.721
+        },
+        {
+          "id": 539,
+          "token": " not",
+          "logprob": -3.8718390464782715,
+          "lair_logprob": -3.8188
+        }
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "max_tokens": 48,
+      "output": ", in the early morning, when the sky was still dark and the world was still quiet, the sun would rise, and the world would come alive. The sun would rise, and the world would come alive, and the world would be",
+      "top_logprobs": [
+        {
+          "id": 11,
+          "token": ",",
+          "logprob": -0.11503913998603821,
+          "lair_logprob": -0.1209
+        },
+        {
+          "id": 304,
+          "token": " in",
+          "logprob": -3.624049425125122,
+          "lair_logprob": -3.6632
+        },
+        {
+          "id": 1131,
+          "token": "...",
+          "logprob": -4.1681342124938965,
+          "lair_logprob": -4.0144
+        },
+        {
+          "id": 198,
+          "token": "\n",
+          "logprob": -4.267337322235107,
+          "lair_logprob": -4.3175
+        },
+        {
+          "id": 320,
+          "token": " (",
+          "logprob": -4.809577465057373,
+          "lair_logprob": -4.8377
+        }
+      ]
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "max_tokens": 48,
+      "output": "    \"\"\"\n    Calculate the nth Fibonacci number.\n\n    Parameters:\n    n (int): The index of the Fibonacci sequence.\n\n    Returns:\n    int: The nth Fibonacci number.\n    \"\"\"\n    if n <= 0:\n        raise ValueError(\"",
+      "top_logprobs": [
+        {
+          "id": 262,
+          "token": "   ",
+          "logprob": -0.0033616237342357635,
+          "lair_logprob": -0.0037
+        },
+        {
+          "id": 220,
+          "token": " ",
+          "logprob": -6.0722856521606445,
+          "lair_logprob": -5.9635
+        },
+        {
+          "id": 1084,
+          "token": "    \n",
+          "logprob": -7.039231300354004,
+          "lair_logprob": -7.0061
+        },
+        {
+          "id": 286,
+          "token": "       ",
+          "logprob": -9.907052040100098,
+          "lair_logprob": -9.7146
+        },
+        {
+          "id": 720,
+          "token": " \n",
+          "logprob": -11.036048889160156,
+          "lair_logprob": -10.8471
+        }
+      ]
+    },
+    {
+      "prompt": "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
+      "max_tokens": 48,
+      "output": "Mars is the planet that is often referred to as the \"Red Planet\" due to its reddish appearance in the sky. It is located in the outer solar system, and is the only planet in our solar system that is not part",
+      "top_logprobs": [
+        {
+          "id": 44,
+          "token": "M",
+          "logprob": -0.19537484645843506,
+          "lair_logprob": -0.2275
+        },
+        {
+          "id": 791,
+          "token": "The",
+          "logprob": -2.7109885215759277,
+          "lair_logprob": -2.9057
+        },
+        {
+          "id": 8586,
+          "token": "Here",
+          "logprob": -3.7321486473083496,
+          "lair_logprob": -3.6904
+        },
+        {
+          "id": 27,
+          "token": "<",
+          "logprob": -4.642245769500732,
+          "lair_logprob": -3.7839
+        },
+        {
+          "id": 40,
+          "token": "I",
+          "logprob": -4.747182369232178,
+          "lair_logprob": -4.4459
+        }
+      ]
+    }
+  ]
+}

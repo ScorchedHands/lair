@@ -1,0 +1,280 @@
+{
+  "model_file": "models/OLMoE-1B-7B-0924-Instruct-Q2_K.gguf",
+  "model_sha256": "0b6554d40b4ae1ed84c20f0411b7869c10da264e826b8f185758cfd02e782b33",
+  "pre": "olmo",
+  "add_bos": false,
+  "add_space_prefix": true,
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "Plain-text cases captured from llama-server /tokenize with add_special=false and parse_special=false. ChatML prompt goldens were pinned separately with tools/llama.cpp/b12032/llama-tokenize.exe --no-bos --ids --show-count -f <file> against exact raw/rendered chat prompts; the parity tests assert LAIR's Encode matches id-for-id.",
+  "generated_utc": "2026-11-11T17:48:41Z",
+  "cases": [
+    {
+      "name": "hello_world",
+      "content": "Hello, world!",
+      "tokens": [
+        12092,
+        13,
+        1533,
+        2
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "leading_space",
+      "content": " world",
+      "tokens": [
+        1533
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "leading_space_punct",
+      "content": " world!",
+      "tokens": [
+        1533,
+        2
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "ascii_sentence",
+      "content": "The quick brown fox jumps over the lazy dog.",
+      "tokens": [
+        510,
+        3158,
+        8516,
+        30013,
+        27287,
+        689,
+        253,
+        22658,
+        4370,
+        15
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "digits",
+      "content": "1234567890 42 3.14159",
+      "tokens": [
+        42594,
+        25025,
+        2270,
+        5976,
+        495,
+        15,
+        1047,
+        17220
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "newline_tab",
+      "content": "line1\nline2\ttabbed\r\ncrlf",
+      "tokens": [
+        1282,
+        18,
+        187,
+        1282,
+        19,
+        186,
+        8476,
+        3026,
+        190,
+        187,
+        7083,
+        35331
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "multibyte",
+      "content": "café ☕ 你好 — über",
+      "tokens": [
+        68,
+        2320,
+        860,
+        3384,
+        235,
+        232,
+        209,
+        24553,
+        34439,
+        1905,
+        20150
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "emoji",
+      "content": "emoji 😀🎉 test",
+      "tokens": [
+        43208,
+        8020,
+        49042,
+        211,
+        14931,
+        225,
+        220,
+        1071
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "repeated_words",
+      "content": "the the the the the the the the the the",
+      "tokens": [
+        783,
+        253,
+        253,
+        253,
+        253,
+        253,
+        253,
+        253,
+        253,
+        253
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "long_prompt",
+      "content": "You are a helpful assistant. Answer the question concisely.\nQuestion: What is the capital of France?\nAnswer:",
+      "tokens": [
+        1394,
+        403,
+        247,
+        9371,
+        13372,
+        15,
+        37741,
+        253,
+        1953,
+        7036,
+        9299,
+        15,
+        187,
+        23433,
+        27,
+        1737,
+        310,
+        253,
+        5347,
+        273,
+        6181,
+        32,
+        187,
+        32869,
+        27
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "empty",
+      "content": "",
+      "tokens": [],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "single_space",
+      "content": " ",
+      "tokens": [
+        209
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "chatml_raw_no_trailing",
+      "content": "<|endoftext|><|user|\nWhat is 2 + 2? Answer only the number.\n<|assistant|>",
+      "tokens": [
+        50279,
+        29,
+        93,
+        4537,
+        93,
+        187,
+        1276,
+        310,
+        374,
+        559,
+        374,
+        32,
+        37741,
+        760,
+        253,
+        1180,
+        15,
+        187,
+        29,
+        93,
+        515,
+        5567,
+        49651
+      ],
+      "tokens_str": [
+        null
+      ]
+    },
+    {
+      "name": "chatml_rendered",
+      "content": "<|endoftext|>\n\n<|user|>\nWhat is 2 + 2? Answer only the number.\n\n\n<|assistant|>\n\n",
+      "tokens": [
+        50279,
+        187,
+        187,
+        29,
+        93,
+        4537,
+        49651,
+        187,
+        1276,
+        310,
+        374,
+        559,
+        374,
+        32,
+        37741,
+        760,
+        253,
+        1180,
+        15,
+        535,
+        187,
+        29,
+        93,
+        515,
+        5567,
+        49651,
+        535
+      ],
+      "tokens_str": [
+        null
+      ]
+    }
+  ]
+}

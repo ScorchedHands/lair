@@ -77,14 +77,14 @@ public enum NormPlacement
 }
 
 /// <summary>
-/// Per-head normalization applied to the q and k heads after their projection (and any bias) and before RoPE.
-/// Resolved once per model from its <see cref="ModelProfile"/> default and the file's declared
-/// <c>&lt;prefix&gt;attention.use_qk_norm</c>; the forward path switches on the value and never dispatches through a
-/// per-token interface.
+/// Normalization applied to the projected q and k streams after their projection (and any bias) and before RoPE —
+/// either over each head's own slice or over the whole stream at once. Resolved once per model from its
+/// <see cref="ModelProfile"/> default and the file's declared <c>&lt;prefix&gt;attention.use_qk_norm</c>; the forward
+/// path switches on the value and never dispatches through a per-token interface.
 /// </summary>
 public enum QkNormMode
 {
-    /// <summary>No per-head normalization: q and k go from their projection straight to RoPE.</summary>
+    /// <summary>No normalization: q and k go from their projection straight to RoPE.</summary>
     Off,
 
     /// <summary>
@@ -99,11 +99,21 @@ public enum QkNormMode
     /// it demands none and ignores any per-head norm vectors the file carries.
     /// </summary>
     PerHeadUnweighted,
+
+    /// <summary>
+    /// RMS norm over each side's whole projected stream — every head of q normalized jointly under one mean over that
+    /// side's full width (<c>head_count × head_dim</c>, and likewise <c>kv_head_count × head_dim</c> for k), scaled
+    /// element by element by the layer's stream-sized weight vector: <c>src / sqrt(mean(src^2) + eps) * w[i]</c>. This
+    /// is the form the reference runs when it normalizes q and k before splitting them into heads, as the olmoe block
+    /// does with one [hidden]-sized vector per layer; the file must carry a vector covering each side's whole width.
+    /// </summary>
+    StreamWeighted,
 }
 
 /// <summary>
-/// Rotary position embedding applied to the q and k heads. Resolved once per model from its
-/// <see cref="ModelProfile"/>; scaling variants and partial rotary slices are outside the implemented set.
+/// Rotary position embedding pairing applied to the q and k heads. Resolved once per model from its
+/// <see cref="ModelProfile"/>; the pair layout is the profile's, while the file's declared metadata can narrow
+/// the rotation to a leading slice of the head and select a scaling variant for the angle tables.
 /// </summary>
 public enum RopeStrategy
 {
@@ -120,6 +130,57 @@ public enum RopeStrategy
     /// this order, so the engine must pair the head halves rather than adjacent dimensions to reproduce them.
     /// </summary>
     RotateHalfFullHead,
+}
+
+/// <summary>
+/// How a sparse-FFN block's expert matrices are laid out in the file it loads from: one dense-shaped matrix per
+/// role, or a factorized shape whose experts share an input basis and carry only their own coefficients. Resolved
+/// once at load from the declared <c>&lt;prefix&gt;expert_layout</c> (absent means the stacked layout every family
+/// ships today) and carried by the <see cref="SparseFfnDescriptor"/>, so a factorized file is recognizable before
+/// any kernel decision runs.
+/// </summary>
+public enum SparseFfnLayout
+{
+    /// <summary>
+    /// Dense-stacked expert storage: one tensor per role whose outermost dimension indexes experts, each expert block
+    /// carrying the full matrix for its side of the gate/up/down chain. This is what every published MoE conversion
+    /// ships and what the resident expert execution reads today.
+    /// </summary>
+    StackedExperts,
+
+    /// <summary>
+    /// Factorized expert storage: a shared input basis read once per layer plus one coefficient matrix per expert in
+    /// that compressed space, expanded through one shared output projection. The layout names the tensors it needs;
+    /// whether anything computes with them is decided by the resolved strategy, not here.
+    /// </summary>
+    FactorizedSharedBasis,
+}
+
+/// <summary>
+/// Which expert-computation variant a sparse-FFN block resolves to: the resident dense-stacked chain, or the shared-
+/// basis low-rank collapse over factorized coefficients. Resolved once per model from the resolved profile's default and
+/// the file's declared <c>&lt;prefix&gt;sparse_ffn_strategy</c>, exactly as the QK-norm mode resolves against its profile
+/// default, and never re-decided per token or per layer — a variant is chosen by the plan once, not dispatched inside the
+/// forward. Selecting a variant is independent of whether any engine can run it: an unimplemented selection stays visible
+/// in the plan and reports at engine open rather than falling back to what happens to work.
+/// </summary>
+public enum SparseFfnStrategy
+{
+    /// <summary>
+    /// Every declared expert stays resident and routing selects among them, each selected expert running its own
+    /// gate/up/down chain over the normalized stream. The dense-equivalent reference forward describes this variant,
+    /// so it is what every sparse file executes today whatever its layout declaration says about factorization.
+    /// </summary>
+    DenseResident,
+
+    /// <summary>
+    /// Factor each routed expert as shared basis times per-expert coefficients: apply the input basis once per layer,
+    /// accumulate small coefficient-space vectors across the selected experts under their routing weights, and expand
+    /// that sum through one output projection instead of running a full down-projection per expert. It requires a file
+    /// declaring <see cref="SparseFfnLayout.FactorizedSharedBasis"/> with its rank and tensor roles carried in the
+    /// descriptor.
+    /// </summary>
+    LowRankSharedBasis,
 }
 
 /// <summary>

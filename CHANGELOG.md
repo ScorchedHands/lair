@@ -4,6 +4,87 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.10] - 2026-11-12
+
+### Added
+
+- Per-model token budgets: `max_reasoning_tokens` and `max_response_tokens` config keys (absent means unbudgeted, values validated at load naming the model and key), request-side overrides on chat and completion bodies clamped to the model's declared ceiling with the clamp reported in `token_budgets`, and enforcement through scheduling and decode — KV admission reserves the resolved reasoning-plus-response sum, an open reasoning region closes at its ceiling, and the response ceiling bounds visible output. Budget keys hot-reload as new-requests-only changes.
+- Budget attribution: `budget_exhausted` names which ceiling ended a run (`"reasoning"` or `"response"`) on chat and completion bodies, on the closing chunk of a stream, and on `/monitor/stream` request lifecycle frames. `finish_reason` values are unchanged.
+- Reasoning-marker vocabulary gate at model load: a declared reasoning ceiling binds only when the loaded tokenizer delivers `<think>` and `</think>` as whole tokens. A model declaring `max_reasoning_tokens` on a vocabulary that splits or lacks either marker fails at open naming the model, the key, and the marker; a hot-reloaded ceiling on such a model is refused the same way; response-side accounting on such a model behaves exactly as an unbudgeted region model. Load reports the bound pair as `reasoning_region model='…' open_token_id=… close_token_id=…`.
+
+## [0.3.9] - 2026-11-12
+
+### Added
+
+- Dense-resident MoE execution through the model plan: router softmax/top-k selection with optional renormalization/weights scale, shared-expert support including gated selector semantics when a file ships it, and per-expert gate/up/down accumulation into the residual. The pinned `OLMoE-1B-7B-0924-Instruct-Q2_K.gguf` fixture loads, decodes routed steps through its mixed-tier expert stacks, and serves under the 4 GB model budget; `/v1/models` reports `sparse_ffn_strategy: dense_resident`.
+- Sparse-FFN layout representability for later residency work: layouts/ranks/shared-basis tensor roles resolve into the plan, but only `DenseResident` executes in this release and non-dense selections are refused rather than silently downgraded.
+- Windowed KV execution accounting: bounded causal/range reads select only the blocks covering a windowed layer's positions; per-layer AllLayers/AlternatingLocalFirst patterns resolve through the model plan; monitor snapshots report `metrics_kv_windowed_layers`, `metrics_kv_read_footprint_blocks`, and `metrics_kv_skipped_read_blocks`.
+- Windowed encoder masking: declared positive windows apply backward-only in embeddings, keeping unbounded models bit-identical.
+
+### Fixed
+
+- Olmo chat prompt tokenization matches pinned b12032 `/tokenize` id-for-id for exact raw no-trailing-newline and rendered ChatML prompts by resolving an olmo-specific byte-level split with math-symbol symbol runs and whole-pre-token lookup; non-Olmo BPE profiles are unchanged.
+- Expert tensor slices now derive their byte size from each layer's own quant tier rather than one role-wide value, so converted files that mix tiers inside an expert role load correctly. OLMoE attention normalizes whole projected Q/K streams with hidden-sized vectors (`QkNormMode.StreamWeighted`) matching the reference graph behavior.
+
+## [0.3.8] - 2026-11-11
+
+### Added
+
+- Dense IQ quant formats load, decode and serve on the CPU engine: `IQ4_NL`, `IQ4_XS`, `IQ3_XXS`, `IQ3_S`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `Q2_0` and `BF16` (ggml ids 16/17/18/20/21/22/23/30/42), each with block geometry read from the pinned reference, a literal scalar oracle and an AVX2 fused dequant/GEMV/batch path — 214 kernel cases and 175 loader cases green.
+- Two pinned Llama-3.2-1B IQ fixtures for parity and serving: `Llama-3.2-1B-Instruct-IQ4_XS.gguf` (743,141,504 B) and `Llama-3.2-1B-Instruct-UD-IQ3_XXS.gguf` (575,381,536 B), whose mixed per-layer tiers resolve through one registry path and serve with `/v1/models` reporting `quant: IQ4_XS` / `quant: IQ3_XXS`.
+- `Lair.Bench gemv-file <gguf> [--threads N] [--reps R] [--max-rows M]`: GEMV timed over real mmap'd tensor rows, reporting per-tensor geometry, first-pass versus warm-best cost, and a private-copy pass that separates page residency from kernel cost.
+- Measured quant guidance: `IQ4_XS` decodes at 11.6 tok/s against the `Q4_K_M` baseline's 10.3–10.4 while being the smaller file, so `README.md` names it as the pick with its accuracy caveat stated; sub-4-bit i-quants measure 1.07–1.09 ns/element (about 6.5× the baseline) and the mixed-tier `UD-IQ3_XXS` file serves at 3.9 tok/s.
+- A loader gate over the owner's `qwen4exp` model shards: both headers parse and all 1,224 declared tensors resolve with pinned geometry, skipping cleanly when those files are absent.
+- Kernel goldens written from the reference's own byte layout (`QuantLayoutTests.cs`), so a format that both LAIR's reader and a test writer misread cannot pass silently.
+
+### Fixed
+
+- `Q5_K` read the fifth bit from a plane advanced per nibble window instead of the single fixed plane the format defines, corrupting groups ≥ 2 in every `Q5_K` tensor since that format landed. Measured against a requantized reference: max |Δ| 0.0666, 1,535 divergent elements, ~770 of 2048 columns wrong in `token_embd`. Corrected at all five kernel sites and in the test writers, and now guarded by reference-encoded block bytes.
+
+### Changed
+
+- `CpuBackend` split into per-format partial files (`CpuBackend+<Format>.cs`, shared IQ plumbing in `CpuBackend+IQ.cs`); no behavior change.
+- The parity harness's chat-header prompt carries an unambiguous user turn. The pinned reference's own top-1 token for the previous header flips between quantizations of the same model (`'Hello'` at `Q4_K_M`, `'<'` at `UD-IQ3_XXS`, `'What'` at `Q8_0`), so absolute cross-tool logprobs there were not a stable gate. Bands, windows and tolerances are unchanged and all nine fixtures were regenerated under the pinned harness.
+
+## [0.3.7] - 2026-11-09
+
+### Added
+
+- Declared rope scaling loads instead of being rejected: `<arch>.rope.scaling.type` resolves `none` and `yarn` into a plan carrying the multiplier, original context length, attention factor, correction scale and both beta bounds — any other variant name, and any scaling operand declared without a variant, fails naming the key and its value — and `<arch>.rope.dimension_count` resolves a partial rotary slice instead of rejecting an unsupported partial rotation. YaRN builds its scaled `cos`/`sin` tables at open (correction band from the beta bounds, ramp mixing the interpolated angle toward the unscaled one) and the variant's attention factor is applied exactly once in the score path across single-token, batched, and encode forwards. The math is ported from the pinned b12032 reference (`ggml_rope_cache_init`, `rope_yarn`, `rope_yarn_ramp`, `ggml_rope_yarn_corr_dims`, and the `get_mscale` attention-factor block).
+- `rope_scaling model='<name>' architecture='<arch>' variant=… multiplier=… original_context_length=… attention_factor=… rotary_dimensions=…` on the serve log whenever a model's positional plan is not the plain full-head rotation; an unscaled model stays silent.
+- `scripts/patch-gguf-rope-scaling.ps1`, which writes a rope-scaling-patched copy of a GGUF — header only, with tensor info and every data byte verified identical and the run idempotent — so a variant can be declared on a file the ecosystem ships without one. `tests/fixtures/parity-qwen3-yarn.json` is generated from its output and holds inside the documented band.
+- `Category=Loader` cases for declared-key resolution and variant rejection, `Category=Layers` goldens for the scaled tables, the slice behavior in both pair layouts, and the Open-time announcement line.
+
+### Changed
+
+- The serve host prints its load-time resolution lines on the console (profile and tensor resolution, `tool_parser`, `reasoning`, and the rope plan). The engine logger previously had no provider, so those lines were written and discarded.
+
+## [0.3.6] - 2026-11-09
+
+### Added
+
+- Tool-call output parsing resolved per model at load through a parser plan (`OutputParserRegistry` / `IToolOutputParser`): the fenced-JSON detector behind the plan, a template-native reader for the call shape a tool-capable chat template instructs its own model to emit (`{name, parameters}` objects, arguments compacted onto the wire), and an inert `none` plan that never reads decoded text. `models[].tool_parser: auto | template | fenced | none` (default `auto`, preserving the existing capability precedence) with load-time validation, a new-requests-only hot-reload class, a `tool_parser model='<name>' choice=<choice>` load line, and the resolved choice reported by `/v1/models`.
+- Reasoning-region recognition from the markup a generation emits (`<think>` … `</think>`): closed regions, several regions in document order, markup inside a region treated as content, a close with no open left as ordinary text, and an open that never closes recorded to the end of generation. Recognition also runs over streamed output piece by piece, holding a boundary marker split across pieces until the next piece settles it, so no part of a region reaches the wire. `models[].reasoning: keep | strip` (default `keep`, new-requests-only class, `reasoning model='<name>' policy=<policy>` load line, reported by `/v1/models`); under `strip` the region leaves visible content while `GenerationResult.ReasoningRegions` records its span, and prompt tokens, completion tokens, and finish reasons are unchanged.
+- `Category=ToolCalls` goldens for both parser families plus reasoning recognition and streaming-piece cases; a pinned-Qwen3 serve suite (`Category=Serve`) proving `keep` carries the model's own thinking block, `strip` removes it at identical token counts, and a policy flip landing mid-generation leaves the admitted sequence on the policy it started with.
+
+### Changed
+
+- A sequence runs on the output-parser plan it was admitted on: the plan is captured when generation starts and travels on the result, so a `tool_parser` or `reasoning` reload re-plans later requests only. Streaming content filters follow the policy on the result rather than whatever is current when generation ends.
+- `/v1/models` now also reports the resolved reasoning policy alongside `tool_parser`, `architecture`, and `quant`.
+
+## [0.3.5] - 2026-11-09
+
+### Added
+
+- `Q2_K` and `Q3_K` quant support end to end on CPU: loader acceptance plus scalar and AVX2 fused-dequant GEMV kernels in single and batched decode (llama.cpp `ggml-common.h` block geometry from the pinned b12032 tag — 256 elements per block, 84 bytes for `Q2_K`, 110 for `Q3_K`), so published low-bit K-quant files load and serve as-is.
+- `tests/fixtures/parity-llama32-q3ks.json` and `tests/fixtures/parity-llama32-q2k.json`: pinned b12032 output parity for `models/Llama-3.2-1B-Instruct-Q3_K_S.gguf` and `models/Llama-3.2-1B-Instruct-Q2_K.gguf` (`Category=Parity`), regenerated with `scripts/generate-parity.ps1`.
+
+### Changed
+
+- GGML type acceptance resolved at load through a descriptor registry (`GgmlTypeRegistry.TryResolve` / `QuantDescriptor`) instead of a hardcoded switch: membership in the registry is the acceptance rule, and block geometry plus row-stride/byte-length validation are computed from the descriptor. Currently accepted tensor types: F32, F16, Q8_0, Q4_K, Q5_0, Q5_K, Q6_K, Q2_K, Q3_K.
+- Parity cross-tool logprob band applies only to candidates within 6 nats of the reference's own top-1, where a candidate carries sampling weight; deeper tail candidates are gated on membership in LAIR's calibrated window and reproduction of LAIR's calibrated value instead of absolute agreement, since sub-nat logit differences legitimately reorder the deep tail. Argmax-membership and reproduction gates are unchanged.
+- `ConcurrencyTests` and `ParityTests` share one serialized xunit collection (`model-loaded`), so real-model suites never load engines beside the latency-budget suite — a second engine loading at once starves the inter-token budgets that suite measures.
+
 ## [0.3.4] - 2026-11-08
 
 ### Added

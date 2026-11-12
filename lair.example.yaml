@@ -18,6 +18,10 @@ models:
     max_context_tokens: 4096
     kv_blocks: 256
     # force_fenced_tools: false  # optional; true forces LAIR's fenced tool injection even when the model's chat template renders tools itself
+    # tool_parser: auto          # optional; auto | template | fenced | none — pins which tool output parser the model resolves to at load
+    # reasoning: keep            # optional; keep | strip — keep streams a recognized reasoning region through as visible content, strip withholds it
+    # max_reasoning_tokens: 256  # optional; tokens a reasoning region may spend before it is closed; requires the model's tokenizer to carry <think>/</think> as whole tokens
+    # max_response_tokens: 1024  # optional; tokens of visible output the model may generate
     placement:
       device: cpu
       kv_residency: dram

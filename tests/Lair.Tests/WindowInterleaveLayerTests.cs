@@ -15,10 +15,11 @@ namespace Lair.Tests;
 /// position beyond the window, and demonstrably differs from the same weights masked on every layer; a plan resolving
 /// the all-layers pattern keeps those same weights and the same window bit-identical to the behavior of masking
 /// every layer. Batched decode is bit-identical to single-token decode under the alternating pattern, the
-/// bidirectional <see cref="TransformerModel.Encode"/> path is golden against the even-layers-only reference across a
-/// chunk boundary, and a resolved window of zero under the alternating pattern is bit-identical to no window at all.
-/// Engine-to-engine comparisons are asserted bit-for-bit; reference comparisons use the double-precision tolerance
-/// shared by the strategy goldens.
+/// <see cref="TransformerModel.Encode"/> path narrows each masked layer's queries backward-only and is golden against
+/// the even-layers-only reference across a chunk boundary, and a resolved window of zero under the alternating pattern
+/// is bit-identical to no window at all. Engine-to-engine comparisons are asserted bit-for-bit; reference comparisons use
+/// the double-precision tolerance shared by the strategy goldens. Encoder cases carry both the Layers and Embeddings
+/// categories.
 /// </summary>
 [Trait("Category", "Layers")]
 public sealed class WindowInterleaveLayerTests : IDisposable
@@ -101,6 +102,7 @@ public sealed class WindowInterleaveLayerTests : IDisposable
     // ---------------------------------------------------------------- the all-layers pattern is unchanged
 
     [Fact]
+    [Trait("Category", "Embeddings")]
     public void Forward_AllLayersWindow_MatchesEveryLayerReference_AndIsBitIdenticalToAnExplicitAllLayersPlan()
     {
         InterleaveModelSpec spec = new();
@@ -243,8 +245,10 @@ public sealed class WindowInterleaveLayerTests : IDisposable
     // ---------------------------------------------------------------- encode under the alternation
 
     [Fact]
+    [Trait("Category", "Embeddings")]
     public void Forward_AlternatingWindow_EncodeMatchesEvenLayersOnlyReference_AcrossChunks()
     {
+        // Under the alternating pattern only the even layers narrow, and each of those narrows backward-only from its own query.
         InterleaveModelSpec spec = new();
         string path = WriteTemp(BuildGguf(spec.MetadataPairs(Window), spec.Tensors()));
 
@@ -338,7 +342,230 @@ public sealed class WindowInterleaveLayerTests : IDisposable
             "the alternating pattern with no declared window must encode bit-identically to the same model with no pattern");
     }
 
+    // ---------------------------------------------------------------- windowed KV reads and block selection
+
+    [Fact]
+    public void Forward_AlternatingWindow_PerLayerSelectionsReadOnlyInWindowBlocks_AndFullLayersSelectWholeTable()
+    {
+        InterleaveModelSpec spec = new();
+        string path = WriteTemp(BuildGguf(spec.MetadataPairs(Window), spec.Tensors()));
+
+        ModelProfile alternating = ModelProfiles.Resolve("llama") with { WindowInterleave = WindowInterleave.AlternatingLocalFirst };
+
+        using CpuBackend backend = new(threads: 1, allowAvx2: true);
+        using GgufFile gguf = GgufFile.Open(path);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8, alternating);
+
+        Assert.Equal(WindowInterleave.AlternatingLocalFirst, model.Plan.WindowInterleave);
+        Assert.Equal(Window, model.Plan.AttentionWindow);
+
+        // Two positions per block, so five positions live in three blocks and a window that excludes the first two
+        // positions excludes an entire physical block instead of merely trimming a partial one.
+        using BlockPool pool = new(blockTokens: 2, layerCount: model.Plan.LayerCount, kvHeads: model.Plan.KvHeadCount, headDim: model.Plan.HeadDim, capacityBlocks: 8, backend);
+        using SequenceKv kv = new(pool);
+
+        model.Prefill([1, 4, 2], kv);
+        model.DecodeNext(5, kv); // position 3
+        float[] logitsAtFour = model.DecodeNext(3, kv).ToArray(); // position 4: windowed layers see [2..4] only
+
+        Assert.True(
+            Closest(logitsAtFour, new InterleaveReference(spec).LogitsAt([1, 4, 2, 5], 3, Window, alternating: true)),
+            "the bounded-read forward must still match the full-KV reference masking only the even-indexed layers");
+
+        Assert.Equal(5, kv.Length);
+        Assert.Equal(3, kv.Blocks.Count); // positions 0..1 in block 0, 2..3 in block 1, 4 in block 2
+
+        for (int layer = 0; layer < model.Plan.LayerCount; layer++)
+        {
+            int layerWindow = model.Plan.AttentionWindowForLayer(layer);
+            BlockSelection read = kv.SelectCausalRead(queryPosition: 4, layerWindow: layerWindow);
+
+            Assert.Equal(4, read.LastPosition);
+
+            if (layer % 2 == 0)
+            {
+                // The plan resolves the declared window for this layer, and its selection covers blocks 1..2 only:
+                // block 0 — positions 0..1 — is not addressed by any head of a masked layer at this query.
+                Assert.Equal(Window, layerWindow);
+                Assert.Equal(2, read.FirstPosition);
+                Assert.Equal(1, read.FirstBlockIndex);
+                Assert.Equal(2, read.SelectedBlocks);
+                Assert.Equal(3, read.TotalBlocks);
+                Assert.Equal(1, read.SkippedBlocks);
+                Assert.False(read.CoversWholeTable);
+
+                // A position the selection does not cover is refused rather than silently reached.
+                Assert.Throws<ArgumentOutOfRangeException>(() => kv.ReadK(read, 0, layer));
+                Assert.Throws<ArgumentOutOfRangeException>(() => kv.ReadV(read, 1, layer));
+            }
+            else
+            {
+                // The full-attention half of the interleave selects every block below its query position: boundedness
+                // is provably absent for these layers, on the same model and sequence as the masked ones above.
+                Assert.Equal(0, layerWindow);
+                Assert.Equal(0, read.FirstPosition);
+                Assert.Equal(0, read.FirstBlockIndex);
+                Assert.Equal(3, read.SelectedBlocks);
+                Assert.Equal(0, read.SkippedBlocks);
+                Assert.True(read.CoversWholeTable);
+
+                // The earliest block is inside the selection and reads back its real bytes.
+                Assert.Equal(kv.BlockFor(0), kv.BlockFor(read.FirstPosition));
+            }
+        }
+    }
+
+    [Fact]
+    public void Forward_BoundedReadsNeverTouchOutOfWindowKv_LiveBytesProveItAgainstTheFullKvReference()
+    {
+        const int narrow = 2; // a window that excludes whole two-position blocks from position 4 onward
+
+        InterleaveModelSpec spec = new();
+        string path = WriteTemp(BuildGguf(spec.MetadataPairs(narrow), spec.Tensors()));
+
+        using CpuBackend backend = new(threads: 1, allowAvx2: true);
+        using GgufFile gguf = GgufFile.Open(path);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8); // the llama profile masks every layer
+
+        Assert.Equal(WindowInterleave.AllLayers, model.Plan.WindowInterleave);
+        Assert.Equal(narrow, model.Plan.AttentionWindow);
+
+        InterleaveReference reference = new(spec);
+
+        using BlockPool pool = new(blockTokens: 2, layerCount: model.Plan.LayerCount, kvHeads: model.Plan.KvHeadCount, headDim: model.Plan.HeadDim, capacityBlocks: 8, backend);
+
+        // Baseline run: the same five tokens on clean KV bytes.
+        float[] baseline;
+        using (SequenceKv clean = new(pool))
+        {
+            model.Prefill([1, 4, 2], clean);
+            model.DecodeNext(5, clean);
+            baseline = model.DecodeNext(3, clean).ToArray(); // position 4 reads [3..4] on every layer
+        }
+
+        Assert.True(
+            Closest(baseline, reference.LogitsAt([1, 4, 2, 5], 3, narrow, alternating: false)),
+            "the all-layers windowed forward must match the full-KV scalar reference masking every layer");
+
+        // Same sequence over KV bytes that carry unmistakable garbage in the positions this query's windows exclude —
+        // block 0 (positions 0..1), poisoned after those positions were written and before the bounded read runs. A
+        // forward that still lands bit-for-bit on the clean baseline never addressed them; a forward that did would be
+        // thrown far off by values this large.
+        float[] overPoisoned;
+        using SequenceKv poisoned = new(pool); // declared outside the block so the kernel probes below read this same KV
+        {
+            model.Prefill([1, 4, 2], poisoned);
+            model.DecodeNext(5, poisoned); // position 3 lands clean; positions 0..1 are now outside every later window
+
+            for (int position = 0; position <= 1; position++)
+            {
+                for (int layer = 0; layer < model.Plan.LayerCount; layer++)
+                {
+                    poisoned.WriteK(position, layer, GarbageRow(model.Plan.KvHeadCount * model.Plan.HeadDim, position, layer, sign: 1));
+                    poisoned.WriteV(position, layer, GarbageRow(model.Plan.KvHeadCount * model.Plan.HeadDim, position, layer, sign: -1));
+                }
+            }
+
+            overPoisoned = model.DecodeNext(3, poisoned).ToArray(); // the bounded forward at position 4
+
+            BlockSelection read = poisoned.SelectCausalRead(queryPosition: 4, layerWindow: narrow);
+            Assert.Equal(3, read.FirstPosition); // positions 0..1 are outside every masked layer's selection here
+            Assert.Equal(1, read.SkippedBlocks); // the whole poisoned block sits in what this read skips
+        }
+
+        Assert.True(
+            baseline.AsSpan().SequenceEqual(overPoisoned.AsSpan()),
+            "a windowed forward must be bit-identical over KV bytes whose out-of-window positions are poisoned");
+
+        // The same poisoned block is live data: an unbounded selection at the very same position addresses it, and the
+        // attention kernel's output moves. So the equality above means "not addressed", not "values coincide".
+        int region = model.Plan.HeadCount * model.Plan.HeadDim;
+        for (int layer = 0; layer < model.Plan.LayerCount; layer++)
+        {
+            float[] q = new float[region];
+            for (int i = 0; i < region; i++)
+            {
+                q[i] = 0.25f * (1 + (i % 4));
+            }
+
+            float scale = 1f / MathF.Sqrt(model.Plan.HeadDim);
+            float[] boundedOut = new float[region];
+            LayerOps.CausalAttention(backend, q, model.Plan.HeadCount, model.Plan.KvHeadCount, model.Plan.HeadDim, poisoned, layer, position: 4, scale, softcap: 0f, window: narrow, boundedOut);
+
+            float[] unboundedOut = new float[region];
+            LayerOps.CausalAttention(backend, q, model.Plan.HeadCount, model.Plan.KvHeadCount, model.Plan.HeadDim, poisoned, layer, position: 4, scale, softcap: 0f, window: 0, unboundedOut);
+
+            Assert.True(
+                !boundedOut.AsSpan().SequenceEqual(unboundedOut.AsSpan()),
+                $"layer {layer}: the bounded selection must not address the poisoned block an unbounded read at the same position does");
+        }
+
+    }
+
+    [Fact]
+    public void SequenceKv_Selection_ExcludesWholeBlocksUnderAWindow_AndAnUnboundedSelectionCoversTheTable()
+    {
+        using CpuBackend backend = new(threads: 1, allowAvx2: true);
+        using BlockPool pool = new(blockTokens: 2, layerCount: 1, kvHeads: InterleaveModelSpec.KvHeads, headDim: InterleaveModelSpec.HeadDim, capacityBlocks: 8, backend);
+        using SequenceKv kv = new(pool);
+
+        for (int position = 0; position < 7; position++) // positions 0..6 across blocks 0..3
+        {
+            kv.Append();
+            kv.WriteK(position, 0, GarbageRow(pool.KvDim, position, layer: 0, sign: 1));
+            kv.WriteV(position, 0, GarbageRow(pool.KvDim, position, layer: 0, sign: -1));
+        }
+
+        BlockSelection windowed = kv.SelectCausalRead(queryPosition: 6, layerWindow: Window); // [4..6] over a four-block table
+        Assert.Equal(4, windowed.FirstPosition);
+        Assert.Equal(6, windowed.LastPosition);
+        Assert.Equal(2, windowed.FirstBlockIndex);
+        Assert.Equal(2, windowed.SelectedBlocks);
+        Assert.Equal(3, windowed.LastBlockIndex); // the run is blocks 2..3 of four: whole blocks 0 and 1 are excluded
+        Assert.Equal(4, windowed.TotalBlocks);
+        Assert.Equal(2, windowed.SkippedBlocks); // blocks 0 and 1 are excluded: whole blocks of live bytes this read never addresses
+        Assert.False(windowed.CoversWholeTable);
+
+        BlockSelection unbounded = kv.SelectCausalRead(queryPosition: 6, layerWindow: 0);
+        Assert.True(unbounded.CoversWholeTable);
+        Assert.Equal(kv.Blocks.Count, unbounded.SelectedBlocks);
+        Assert.Equal(0, unbounded.SkippedBlocks);
+
+        // The selection's edges address the same physical blocks the table maps them to.
+        Assert.Equal(kv.BlockFor(windowed.FirstPosition), kv.Blocks[windowed.FirstBlockIndex]);
+        Assert.Equal(kv.BlockFor(unbounded.LastPosition), kv.Blocks[unbounded.LastBlockIndex]);
+
+        // Reads inside the selection work; reads outside it fail in both directions.
+        Assert.True(kv.ReadK(windowed, 4, 0).SequenceEqual(kv.ReadK(4, 0)));
+        Assert.Throws<ArgumentOutOfRangeException>(() => kv.ReadV(windowed, 3, 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() => kv.ReadK(windowed, 7, 0));
+
+        // A range read selects exactly the blocks its edges fall in — partial at either edge, whole between.
+        BlockSelection ranged = kv.SelectRangeRead(1, 5);
+        Assert.Equal(0, ranged.FirstBlockIndex); // block 0 is selected for position 1 alone
+        Assert.Equal(2, ranged.LastBlockIndex); // block 2 is selected for positions 4..5
+        Assert.Equal(3, ranged.SelectedBlocks);
+        Assert.Equal(1, ranged.SkippedBlocks);
+
+        // A selection is a read contract over positions the sequence holds: an edge beyond its length fails.
+        Assert.Throws<ArgumentOutOfRangeException>(() => kv.SelectRangeRead(0, 7));
+        Assert.Throws<ArgumentOutOfRangeException>(() => kv.SelectCausalRead(queryPosition: 9, layerWindow: Window));
+    }
+
     // ---------------------------------------------------------------- reference oracle
+
+    // Loudly-valued KV rows: magnitudes far past anything this fixture's forwards produce, so a read that addressed
+    // them would move logits and attention outputs unmistakably rather than by rounding noise.
+    private static float[] GarbageRow(int length, int position, int layer, int sign)
+    {
+        float[] values = new float[length];
+        for (int i = 0; i < length; i++)
+        {
+            values[i] = sign * (50_000f + 1_000f * position + 100f * layer + i);
+        }
+
+        return values;
+    }
 
     private static bool Closest(ReadOnlySpan<float> actual, double[] expected)
     {
@@ -505,9 +732,10 @@ public sealed class WindowInterleaveLayerTests : IDisposable
 
     // A scalar reference forward over the spec's tensors for either interleave: RMSNorm, standard full-head RoPE,
     // causal or bidirectional attention with an explicit softmax and the score mask applied per layer — every layer
-    // when the pattern masks all of them, the even-indexed layers only when it alternates — silu(gate) * up, and the
-    // tied token-embedding logits. A resolved window of zero leaves every layer unbounded whatever the pattern.
-    // Computed in double and compared against the engine's float values with the shared tolerance.
+    // when the pattern masks all of them, the even-indexed layers only when it alternates — where a masked layer's
+    // range is backward-only from its own query in both paths, silu(gate) * up, and the tied token-embedding logits.
+    // A resolved window of zero leaves every layer unbounded whatever the pattern, which is the whole sequence in both
+    // directions. Computed in double and compared against the engine's float values with the shared tolerance.
     private sealed class InterleaveReference
     {
         private readonly InterleaveModelSpec _spec;
@@ -569,7 +797,7 @@ public sealed class WindowInterleaveLayerTests : IDisposable
                 for (int p = 0; p < n; p++)
                 {
                     (int from, int to) = layerWindow > 0
-                        ? (Math.Max(0, p - layerWindow + 1), Math.Min(n - 1, p + layerWindow))
+                        ? (Math.Max(0, p - layerWindow + 1), p) // backward-only: a masked layer never sees past its own query
                         : (0, n - 1);
 
                     Attention(qAll[p], kvK[layer], kvV[layer], from, to, attnOut.AsSpan(p * InterleaveModelSpec.Heads * InterleaveModelSpec.HeadDim));

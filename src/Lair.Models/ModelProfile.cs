@@ -32,11 +32,21 @@ public sealed record ModelProfile
     public SparseFfnDescriptor? SparseFfn { get; init; }
 
     /// <summary>
-    /// Feature default for per-head QK-norm, applied when the file declares no
+    /// Feature default for which expert-computation variant a sparse-FFN block of this family resolves to, applied when
+    /// the file declares no <c>&lt;prefix&gt;sparse_ffn_strategy</c>: a declaration overrides it in either direction and
+    /// only then does the plan carry a strategy value at all. A profile defaults this to
+    /// <see cref="Lair.Models.SparseFfnStrategy.DenseResident"/>, which is every registered family today, so selecting
+    /// another variant takes a declaration rather than a family's own preference — and no default can name a variant the
+    /// forward engine cannot run.
+    /// </summary>
+    public SparseFfnStrategy DefaultSparseFfnStrategy { get; init; } = SparseFfnStrategy.DenseResident;
+
+    /// <summary>
+    /// Feature default for QK-norm, applied when the file declares no
     /// <c>&lt;prefix&gt;attention.use_qk_norm</c>: a declared false overrides it to <see cref="QkNormMode.Off"/>
-    /// whatever the profile defaults to, and a profile defaulting to a weighted mode makes the per-head norm vectors
-    /// required at load for a file that declares nothing. A profile defaults this to
-    /// <see cref="Lair.Models.QkNormMode.Off"/>.
+    /// whatever the profile defaults to, and a profile defaulting to a weighted mode makes that mode's norm vectors
+    /// required at load for a file that declares nothing — each side-sized as its mode names them. A profile defaults
+    /// this to <see cref="Lair.Models.QkNormMode.Off"/>.
     /// </summary>
     public QkNormMode DefaultQkNorm { get; init; } = QkNormMode.Off;
 

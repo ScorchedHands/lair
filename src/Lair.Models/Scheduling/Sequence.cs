@@ -63,7 +63,7 @@ internal sealed class Sequence
     public bool IsFinished => Outcome.Task.IsCompleted;
 
     /// <summary>True while the sequence still has token budget left to advance.</summary>
-    public bool HasBudget => Generated.Count < Request.MaxTokens;
+    public bool HasBudget => Generated.Count < Request.GenerationTokenCeiling;
 
     public void RequestCancel() => Volatile.Write(ref _cancelRequested, 1);
 
