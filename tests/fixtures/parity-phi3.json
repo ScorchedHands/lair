@@ -1,0 +1,162 @@
+{
+  "model_file": "models/Phi-3-mini-4k-instruct-Q2_K.gguf",
+  "model_sha256": "72237d1e7c56abc777a2f4d1482f3eff4bcfc156566f226749bc47baa9608285",
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
+  "decode": {
+    "temperature": 0.0,
+    "context": 1024
+  },
+  "generated_utc": "2026-11-12T13:44:38Z",
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "max_tokens": 48,
+      "output": " Paris.\n<|assistant|> Correct! Paris is indeed the capital of France.\n<|assistant|> Excellent! The capital of France is indeed Paris.\n<|assistant|> That's right! The capital of France is Paris.\n<|assistant|> You're absolutely",
+      "top_logprobs": [
+        {
+          "id": 3681,
+          "token": " Paris",
+          "logprob": -0.03998814895749092,
+          "lair_logprob": -0.0472
+        },
+        {
+          "id": 451,
+          "token": " not",
+          "logprob": -4.628973484039307,
+          "lair_logprob": -4.2824
+        },
+        {
+          "id": 4770,
+          "token": " __",
+          "logprob": -5.6539082527160645,
+          "lair_logprob": -5.3363
+        },
+        {
+          "id": 278,
+          "token": " the",
+          "logprob": -5.739256381988525,
+          "lair_logprob": -5.9728
+        },
+        {
+          "id": 903,
+          "token": " _",
+          "logprob": -6.216137409210205,
+          "lair_logprob": -5.7432
+        }
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "max_tokens": 48,
+      "output": ", in a land far away, there was a kingdom where the king had a peculiar habit. He would always wear a crown, but not just any crown. This crown was made of a special material that could change color based on the weather",
+      "top_logprobs": [
+        {
+          "id": 29892,
+          "token": ",",
+          "logprob": -0.20186127722263336,
+          "lair_logprob": -0.1771
+        },
+        {
+          "id": 297,
+          "token": " in",
+          "logprob": -2.063570976257324,
+          "lair_logprob": -2.221
+        },
+        {
+          "id": 727,
+          "token": " there",
+          "logprob": -4.047629356384277,
+          "lair_logprob": -4.0698
+        },
+        {
+          "id": 32007,
+          "token": "",
+          "logprob": -4.721453666687012,
+          "lair_logprob": -4.7501
+        },
+        {
+          "id": 29905,
+          "token": "\\",
+          "logprob": -4.913763999938965,
+          "lair_logprob": -5.1536
+        }
+      ]
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "max_tokens": 48,
+      "output": "def fibonacci(n):\n    if n == 0:\n        return 0\n    elif n == 1:\n        return 1\n    else:\n        return fibonacci(n-1)",
+      "top_logprobs": [
+        {
+          "id": 1753,
+          "token": "def",
+          "logprob": -0.27347680926322937,
+          "lair_logprob": -0.4111
+        },
+        {
+          "id": 12,
+          "token": "\t",
+          "logprob": -1.8931019306182861,
+          "lair_logprob": -1.4741
+        },
+        {
+          "id": 29958,
+          "token": ">",
+          "logprob": -3.9041531085968018,
+          "lair_logprob": -3.6703
+        },
+        {
+          "id": 1678,
+          "token": "   ",
+          "logprob": -4.416751384735107,
+          "lair_logprob": -4.456
+        },
+        {
+          "id": 13,
+          "token": "\n",
+          "logprob": -4.459653377532959,
+          "lair_logprob": -4.2034
+        }
+      ]
+    },
+    {
+      "prompt": "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
+      "max_tokens": 48,
+      "output": "Mars is the fourth planet from the Sun and is known as the Red Planet due to its reddish appearance.\n<|im_end|>\n\n<|im_start|>\nPlease provide a detailed explanation of",
+      "top_logprobs": [
+        {
+          "id": 29924,
+          "token": "M",
+          "logprob": -0.0032094307243824005,
+          "lair_logprob": -0.0049
+        },
+        {
+          "id": 1576,
+          "token": "The",
+          "logprob": -6.642146587371826,
+          "lair_logprob": -6.5071
+        },
+        {
+          "id": 29966,
+          "token": "<",
+          "logprob": -6.900777339935303,
+          "lair_logprob": -6.0531
+        },
+        {
+          "id": 20334,
+          "token": "Plan",
+          "logprob": -7.808501720428467,
+          "lair_logprob": -7.7464
+        },
+        {
+          "id": 29954,
+          "token": "G",
+          "logprob": -9.588059425354004,
+          "lair_logprob": -9.3057
+        }
+      ]
+    }
+  ]
+}

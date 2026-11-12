@@ -70,6 +70,12 @@ public sealed class ParityTests
     // show — each side still lands on a one-sentence answer about Mars.
     private const string Gemma2Q4KFixture = "tests/fixtures/parity-gemma2.json";
 
+    // The Phi-3-mini Q2_K fixture: a real phi3 load (one fused qkv buffer per layer read as three head-region slices,
+    // the gate half of the gated pair living inside blk.N.ffn_up.weight with no separate gate tensor at all, 96-wide
+    // heads rotated in rotate-half order, and an untied Q6_K output head) against the same pinned reference and the
+    // same quantized-file band.
+    private const string Phi3Q2KFixture = "tests/fixtures/parity-phi3.json";
+
     /// <summary>Ranking window whose reproduction the fixtures calibrate.</summary>
     private const int CalibrationWindow = 16;
 
@@ -92,7 +98,7 @@ public sealed class ParityTests
     public static TheoryData<string, int> PromptCases()
     {
         TheoryData<string, int> cases = [];
-        foreach (string fixture in new[] { F16Fixture, Q8Fixture, Q4KMFixture, Qwen3Fixture, Llama32Q3KFixture, Llama32Q2KFixture, Qwen3YaRNFixture, Llama32Iq4XsFixture, Llama32UdIq3XxsFixture, Gemma2Q4KFixture })
+        foreach (string fixture in new[] { F16Fixture, Q8Fixture, Q4KMFixture, Qwen3Fixture, Llama32Q3KFixture, Llama32Q2KFixture, Qwen3YaRNFixture, Llama32Iq4XsFixture, Llama32UdIq3XxsFixture, Gemma2Q4KFixture, Phi3Q2KFixture })
         {
             string? path = ModelFixture.ResolveRepoRelative(fixture);
             if (path is null)

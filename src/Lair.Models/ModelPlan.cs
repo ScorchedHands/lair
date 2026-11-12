@@ -196,6 +196,12 @@ public sealed record ModelPlan
 
     public required RopeStrategy Rope { get; init; }
 
+    /// <summary>The resolved profile's q/k/v projection layout: three per-layer matrices the tensor map names one role each, or one fused buffer per layer whose query, key, and value regions the engine reads as slices of that payload. No metadata key decides it.</summary>
+    public required QkvLayout AttentionWeights { get; init; }
+
+    /// <summary>The resolved profile's feed-forward gate side: a gate matrix named by its own tensor role, or the leading rows of this block's up tensor when the conversion ships both halves there and names no gate tensor. No metadata key decides it.</summary>
+    public required FeedForwardGateSource GateSource { get; init; }
+
     /// <summary>
     /// The rope-scaling shape resolved from the file's declared <c>&lt;prefix&gt;rope.scaling.*</c> metadata, or
     /// <c>null</c> when the file declares no scaling variant: the engine then rotates the full head with the

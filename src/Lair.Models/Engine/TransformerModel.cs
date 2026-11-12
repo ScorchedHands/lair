@@ -68,13 +68,27 @@ public sealed class TransformerModel : IDisposable
     private readonly List<string> _ignoredFusedTensors = [];
     private HashSet<string>? _nameableTensors;
 
-    // Per-layer packed matrix tensors, resolved from the mmap view on each use so no dequantized copy is kept.
-    private readonly LogicalTensor[] _wq;
-    private readonly LogicalTensor[] _wk;
-    private readonly LogicalTensor[] _wv;
+    // Per-layer packed matrix tensors, resolved from the mmap view on each use so no dequantized copy is kept. The q/k/v
+    // trio stays empty when the plan resolves a fused buffer instead: those roles then read slices of one tensor per layer.
+    private LogicalTensor[] _wq = [];
+    private LogicalTensor[] _wk = [];
+    private LogicalTensor[] _wv = [];
     private readonly LogicalTensor[] _wo;
-    private LogicalTensor[] _ffnGate = []; // empty when a sparse descriptor replaces the dense block
+    private LogicalTensor[] _ffnGate = []; // empty when a sparse descriptor replaces the dense block, or when the gate half rides inside the up tensor
     private LogicalTensor[] _ffnUp = []; // empty when a sparse descriptor replaces the dense block
+
+    // Fused-layout slice geometry, pinned once at Open: one packed buffer per layer carrying every head of q, then k,
+    // then v; each role's byte range inside that payload and the two-dimensional shape a GEMV over its slice carries.
+    // Byte lengths are per layer because a converted file is free to hold different quant tiers in this tensor at
+    // different layers. The gate half of a fused gate/up buffer needs only its own block size: both halves share one
+    // format, so the up side starts exactly one block after the gate side. Empty arrays mean neither layout runs.
+    private LogicalTensor[] _wqkv = [];
+    private TensorShape _qkvQueryShape = new([0, 0]);
+    private TensorShape _qkvKeyValueShape = new([0, 0]);
+    private long[] _qkvQueryBytes = [];
+    private long[] _qkvKeyBytes = [];
+    private TensorShape _gateUpHalfShape = new([0, 0]);
+    private long[] _gateUpHalfBytes = [];
     private LogicalTensor[] _ffnDown = []; // empty when a sparse descriptor replaces the dense block
 
     // Sparse-FFN block state, resolved once at Open from the plan's descriptor; empty arrays and zero geometry mean
@@ -274,14 +288,39 @@ public sealed class TransformerModel : IDisposable
 
         int layers = Plan.LayerCount;
 
-        _wq = LoadMatrices(layers, TensorRole.AttentionQuery, FusedQkvName(TensorRole.AttentionQuery));
-        _wk = LoadMatrices(layers, TensorRole.AttentionKey, FusedQkvName(TensorRole.AttentionKey));
-        _wv = LoadMatrices(layers, TensorRole.AttentionValue, FusedQkvName(TensorRole.AttentionValue));
+        // The plan's resolved q/k/v layout decides which tensors this block reads before any of them load: three matrices
+        // the map names one role each, or one fused buffer per layer whose head regions each projection slices for itself.
+        // Under the split layout a fused tensor the file still carries is recorded for the structured line naming ignored
+        // material; under the fused layout it is the other side's tensors that go unread.
+        if (Plan.AttentionWeights == QkvLayout.FusedBufferSlices)
+        {
+            LoadFusedQkvBuffers(layers);
+            ReportIgnoredTensors(logLine, "split_qkv_ignored", file, [TensorRole.AttentionQuery, TensorRole.AttentionKey, TensorRole.AttentionValue]);
+        }
+        else
+        {
+            _wq = LoadMatrices(layers, TensorRole.AttentionQuery, FusedQkvName(TensorRole.AttentionQuery));
+            _wk = LoadMatrices(layers, TensorRole.AttentionKey, FusedQkvName(TensorRole.AttentionKey));
+            _wv = LoadMatrices(layers, TensorRole.AttentionValue, FusedQkvName(TensorRole.AttentionValue));
+        }
+
         _wo = LoadMatrices(layers, TensorRole.AttentionOutput);
         if (_sparseFfn is null)
         {
-            _ffnGate = LoadMatrices(layers, TensorRole.FeedForwardGate);
-            _ffnUp = LoadMatrices(layers, TensorRole.FeedForwardUp);
+            // The same rule on the feed-forward side: a block whose gate half rides inside its up tensor loads one buffer
+            // per layer and reads each half as a slice, while a block with a gate matrix of its own loads the triplet. A
+            // gate tensor a halves-form file still ships is reported rather than loaded.
+            if (Plan.GateSource == FeedForwardGateSource.UpTensorHalves)
+            {
+                LoadFusedGateUpBuffers(layers);
+                ReportIgnoredTensors(logLine, "ffn_gate_ignored", file, [TensorRole.FeedForwardGate]);
+            }
+            else
+            {
+                _ffnGate = LoadMatrices(layers, TensorRole.FeedForwardGate);
+                _ffnUp = LoadMatrices(layers, TensorRole.FeedForwardUp);
+            }
+
             _ffnDown = LoadMatrices(layers, TensorRole.FeedForwardDown);
         }
         else
@@ -366,15 +405,25 @@ public sealed class TransformerModel : IDisposable
             }
         }
 
-        // Matrix shapes must agree with the declared dimensions: rows are the output side, columns the input side.
-        RequireShape(_wq, (long)Plan.HeadCount * Plan.HeadDim, Plan.HiddenSize); // q emits headCount * head_dim
-        RequireShape(_wk, (long)Plan.KvHeadCount * Plan.HeadDim, Plan.HiddenSize);
-        RequireShape(_wv, (long)Plan.KvHeadCount * Plan.HeadDim, Plan.HiddenSize);
+        // Matrix shapes must agree with the declared dimensions: rows are the output side, columns the input side. A fused
+        // buffer validates its own region geometry against those same declarations when it loads, so only the tensors this
+        // layout reads one role each get checked here.
+        if (Plan.AttentionWeights == QkvLayout.SeparateTensors)
+        {
+            RequireShape(_wq, (long)Plan.HeadCount * Plan.HeadDim, Plan.HiddenSize); // q emits headCount * head_dim
+            RequireShape(_wk, (long)Plan.KvHeadCount * Plan.HeadDim, Plan.HiddenSize);
+            RequireShape(_wv, (long)Plan.KvHeadCount * Plan.HeadDim, Plan.HiddenSize);
+        }
+
         RequireShape(_wo, Plan.HiddenSize, (long)Plan.HeadCount * Plan.HeadDim);
-        if (_sparseFfn is null)
+        if (_sparseFfn is null && Plan.GateSource == FeedForwardGateSource.SeparateGateMatrix)
         {
             RequireShape(_ffnGate, Plan.IntermediateSize, Plan.HiddenSize);
             RequireShape(_ffnUp, Plan.IntermediateSize, Plan.HiddenSize);
+        }
+
+        if (_sparseFfn is null)
+        {
             RequireShape(_ffnDown, Plan.HiddenSize, Plan.IntermediateSize);
         }
 
@@ -694,14 +743,11 @@ public sealed class TransformerModel : IDisposable
             }
 
             // One weight pass per matrix for the whole batch; each sequence's row result matches its single-vector GEMV.
-            ReadOnlySpan<byte> bytes = _weights.Resolve(_wq[l]);
-            _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, new WeightRef(bytes, _wq[l].Shape, _wq[l].Format), _batchQ.AsSpan(0, n * qkvRegion));
+            _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, AttentionQueryWeight(l), _batchQ.AsSpan(0, n * qkvRegion));
 
-            bytes = _weights.Resolve(_wk[l]);
-            _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, new WeightRef(bytes, _wk[l].Shape, _wk[l].Format), _batchK.AsSpan(0, n * kvRegion));
+            _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, AttentionKeyWeight(l), _batchK.AsSpan(0, n * kvRegion));
 
-            bytes = _weights.Resolve(_wv[l]);
-            _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, new WeightRef(bytes, _wv[l].Shape, _wv[l].Format), _batchV.AsSpan(0, n * kvRegion));
+            _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, AttentionValueWeight(l), _batchV.AsSpan(0, n * kvRegion));
 
             for (int s = 0; s < n; s++)
             {
@@ -721,7 +767,7 @@ public sealed class TransformerModel : IDisposable
                 LayerOps.CausalAttention(_backend, _batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kvs[s], l, positions[s], attnScale, Plan.AttentionSoftcap, layerWindow, _batchAttnOut.AsSpan(s * qkvRegion, qkvRegion));
             }
 
-            bytes = _weights.Resolve(_wo[l]);
+            ReadOnlySpan<byte> bytes = _weights.Resolve(_wo[l]);
             _backend.GemvBatch(_batchAttnOut.AsSpan(0, n * qkvRegion), n, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _batchProj.AsSpan(0, n * hidden));
 
             for (int s = 0; s < n; s++)
@@ -748,11 +794,9 @@ public sealed class TransformerModel : IDisposable
             }
             else
             {
-                bytes = _weights.Resolve(_ffnGate[l]);
-                _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, new WeightRef(bytes, _ffnGate[l].Shape, _ffnGate[l].Format), _batchGateUp.AsSpan(0, n * inter));
+                _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, FeedForwardGateWeight(l), _batchGateUp.AsSpan(0, n * inter));
 
-                bytes = _weights.Resolve(_ffnUp[l]);
-                _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, new WeightRef(bytes, _ffnUp[l].Shape, _ffnUp[l].Format), _batchUp.AsSpan(0, n * inter));
+                _backend.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, FeedForwardUpWeight(l), _batchUp.AsSpan(0, n * inter));
 
                 // act = activation(gate) * up in place on each sequence's gate buffer.
                 for (int s = 0; s < n; s++)
@@ -922,14 +966,11 @@ public sealed class TransformerModel : IDisposable
                         ApplyNorm(cur.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden), _attnNormWeight[l], _attnNormBias[l], chunkNormed.AsSpan(i * hidden, hidden));
                     }
 
-                    ReadOnlySpan<byte> bytes = _weights.Resolve(_wq[l]);
-                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, new WeightRef(bytes, _wq[l].Shape, _wq[l].Format), chunkQ.AsSpan(0, m * qkvRegion));
+                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, AttentionQueryWeight(l), chunkQ.AsSpan(0, m * qkvRegion));
 
-                    bytes = _weights.Resolve(_wk[l]);
-                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, new WeightRef(bytes, _wk[l].Shape, _wk[l].Format), chunkK.AsSpan(0, m * kvRegion));
+                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, AttentionKeyWeight(l), chunkK.AsSpan(0, m * kvRegion));
 
-                    bytes = _weights.Resolve(_wv[l]);
-                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, new WeightRef(bytes, _wv[l].Shape, _wv[l].Format), chunkV.AsSpan(0, m * kvRegion));
+                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, AttentionValueWeight(l), chunkV.AsSpan(0, m * kvRegion));
 
                     for (int i = 0; i < m; i++)
                     {
@@ -1007,11 +1048,9 @@ public sealed class TransformerModel : IDisposable
                 {
                     int m = Math.Min(EncodeChunkTokens, n - c * EncodeChunkTokens);
 
-                    ReadOnlySpan<byte> bytes = _weights.Resolve(_ffnGate[l]);
-                    _backend.GemvBatch(normed.AsSpan(c * EncodeChunkTokens * hidden, m * hidden), m, new WeightRef(bytes, _ffnGate[l].Shape, _ffnGate[l].Format), chunkGateUp.AsSpan(0, m * inter));
+                    _backend.GemvBatch(normed.AsSpan(c * EncodeChunkTokens * hidden, m * hidden), m, FeedForwardGateWeight(l), chunkGateUp.AsSpan(0, m * inter));
 
-                    bytes = _weights.Resolve(_ffnUp[l]);
-                    _backend.GemvBatch(normed.AsSpan(c * EncodeChunkTokens * hidden, m * hidden), m, new WeightRef(bytes, _ffnUp[l].Shape, _ffnUp[l].Format), chunkUp.AsSpan(0, m * inter));
+                    _backend.GemvBatch(normed.AsSpan(c * EncodeChunkTokens * hidden, m * hidden), m, FeedForwardUpWeight(l), chunkUp.AsSpan(0, m * inter));
 
                     for (int i = 0; i < m; i++)
                     {
@@ -1019,7 +1058,7 @@ public sealed class TransformerModel : IDisposable
                     }
 
                     // Phase 5: down GEMV and the ffn_out residual add, completing this layer for every position.
-                    bytes = _weights.Resolve(_ffnDown[l]);
+                    ReadOnlySpan<byte> bytes = _weights.Resolve(_ffnDown[l]);
                     _backend.GemvBatch(chunkGateUp.AsSpan(0, m * inter), m, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), chunkProj.AsSpan(0, m * hidden));
 
                     for (int i = 0; i < m; i++)
@@ -1097,16 +1136,13 @@ public sealed class TransformerModel : IDisposable
             // Pre-attention norm on the stream: normed = rmsnorm(cur) * attn_norm weight.
             ApplyNorm(_cur.AsSpan(0, hidden), _attnNormWeight[l], _attnNormBias[l], _normed);
 
-            ReadOnlySpan<byte> bytes = _weights.Resolve(_wq[l]);
-            _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _wq[l].Shape, _wq[l].Format), _q);
+            _backend.Gemv(_normed.AsSpan(0, hidden), AttentionQueryWeight(l), _q);
             AddBias(_q, _biasQ[l]);
 
-            bytes = _weights.Resolve(_wk[l]);
-            _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _wk[l].Shape, _wk[l].Format), _k);
+            _backend.Gemv(_normed.AsSpan(0, hidden), AttentionKeyWeight(l), _k);
             AddBias(_k, _biasK[l]);
 
-            bytes = _weights.Resolve(_wv[l]);
-            _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _wv[l].Shape, _wv[l].Format), _v);
+            _backend.Gemv(_normed.AsSpan(0, hidden), AttentionValueWeight(l), _v);
             AddBias(_v, _biasV[l]);
 
             // Resolved QK-norm mode: each side's projected stream is normalized after the projection and bias and
@@ -1126,7 +1162,7 @@ public sealed class TransformerModel : IDisposable
             // stream value (ffn_inp = attn_out + inpSA), matching the reference graph. cur held that stream through
             // attention untouched, so adding proj in place turns it into ffn_inp. Under a post-sublayer-output
             // placement the attention output — including any output bias — is normalized with its own vector first.
-            bytes = _weights.Resolve(_wo[l]);
+            ReadOnlySpan<byte> bytes = _weights.Resolve(_wo[l]);
             _backend.Gemv(_attnOut.AsSpan(0, Plan.HeadCount * Plan.HeadDim), new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _proj);
             AddBias(_proj, _biasO[l]);
 
@@ -1145,11 +1181,9 @@ public sealed class TransformerModel : IDisposable
             }
             else
             {
-                bytes = _weights.Resolve(_ffnGate[l]);
-                _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _ffnGate[l].Shape, _ffnGate[l].Format), _gateUp);
+                _backend.Gemv(_normed.AsSpan(0, hidden), FeedForwardGateWeight(l), _gateUp);
 
-                bytes = _weights.Resolve(_ffnUp[l]);
-                _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(bytes, _ffnUp[l].Shape, _ffnUp[l].Format), _up);
+                _backend.Gemv(_normed.AsSpan(0, hidden), FeedForwardUpWeight(l), _up);
 
                 // act = activation(gate) * up with the plan's resolved activation, applied in place on the gate buffer.
                 ApplyActivation(_gateUp.AsSpan(0, Plan.IntermediateSize), _up.AsSpan(0, Plan.IntermediateSize));
@@ -1439,6 +1473,151 @@ public sealed class TransformerModel : IDisposable
 
         return tensors;
     }
+
+    // Loads every layer's fused qkv buffer and pins each head region's byte geometry against the declared dimensions: that
+    // one matrix carries the query region (head_count × head_dim rows), then the key region (kv_head_count × head_dim
+    // rows), then value again, over columns of the hidden size. Row packing is per row in every format these kernels
+    // implement, so a region boundary lands on whole rows and each role reads its own window of one payload — no copy of
+    // any side exists anywhere on this path. A buffer whose shape or payload disagrees with those regions fails here naming
+    // the tensor and both sides of the mismatch; a layer carrying none of it while its three split matrices are present
+    // fails there instead.
+    private void LoadFusedQkvBuffers(int layers)
+    {
+        long queryRows = (long)Plan.HeadCount * Plan.HeadDim;
+        long keyValueRows = (long)Plan.KvHeadCount * Plan.HeadDim;
+
+        _qkvQueryShape = new TensorShape([checked((int)queryRows), Plan.HiddenSize]);
+        _qkvKeyValueShape = new TensorShape([checked((int)keyValueRows), Plan.HiddenSize]);
+
+        long totalRows = queryRows + 2 * keyValueRows;
+        if (totalRows > int.MaxValue)
+        {
+            throw new ModelException(
+                $"architecture '{Plan.Architecture}' declares head_count {Plan.HeadCount} and kv_head_count " +
+                $"{Plan.KvHeadCount} at head dimension {Plan.HeadDim}: a fused qkv buffer of {totalRows} rows is beyond one addressable tensor");
+        }
+
+        _wqkv = new LogicalTensor[layers];
+        long[] queryBytes = new long[layers];
+        long[] keyBytes = new long[layers];
+
+        for (int l = 0; l < layers; l++)
+        {
+            LogicalTensor tensor = RequireTensor(TensorRole.AttentionQkv, l);
+
+            int[] dims = tensor.Shape.Dims;
+            if (dims.Length != 2 || dims[0] != totalRows || dims[^1] != Plan.HiddenSize)
+            {
+                throw new ModelException(
+                    $"tensor '{tensor.Name}' must have shape [{totalRows}, {Plan.HiddenSize}] — the query region of " +
+                    $"{queryRows} rows, then the key and value regions of {keyValueRows} rows each, over the hidden size — got [{string.Join(", ", dims)}]");
+            }
+
+            long stride = tensor.Shape.RowStrideBytes(tensor.Format);
+            long payload = totalRows * stride;
+            if (payload != tensor.SizeBytes)
+            {
+                throw new ModelException(
+                    $"tensor '{tensor.Name}' declares {tensor.SizeBytes} payload bytes but its shape and format require {payload}");
+            }
+
+            queryBytes[l] = checked(queryRows * stride);
+            keyBytes[l] = checked(keyValueRows * stride);
+            if (queryBytes[l] > int.MaxValue || keyBytes[l] > int.MaxValue)
+            {
+                throw new ModelException(
+                    $"tensor '{tensor.Name}' has a head region of {Math.Max(queryBytes[l], keyBytes[l])} bytes, beyond a single addressable slice");
+            }
+
+            _wqkv[l] = tensor;
+        }
+
+        _qkvQueryBytes = queryBytes;
+        _qkvKeyBytes = keyBytes;
+    }
+
+    // Loads every layer's fused gate/up buffer for a block whose gate half lives inside it: one matrix carrying both
+    // halves' rows — the gate side first, then the up side — over columns of the hidden size. Each half is validated as
+    // exactly what the split triplet's gate and up matrices would have been, so the activation and down projection see the
+    // same intermediate-sized stream either way, and both GEMVs read their own window of one payload.
+    private void LoadFusedGateUpBuffers(int layers)
+    {
+        long halfRows = Plan.IntermediateSize;
+        long totalRows = 2 * halfRows;
+
+        _gateUpHalfShape = new TensorShape([Plan.IntermediateSize, Plan.HiddenSize]);
+
+        _ffnUp = new LogicalTensor[layers];
+        long[] halfBytes = new long[layers];
+
+        for (int l = 0; l < layers; l++)
+        {
+            LogicalTensor tensor = RequireTensor(TensorRole.FeedForwardUp, l);
+
+            int[] dims = tensor.Shape.Dims;
+            if (dims.Length != 2 || dims[0] != totalRows || dims[^1] != Plan.HiddenSize)
+            {
+                throw new ModelException(
+                    $"tensor '{tensor.Name}' must have shape [{totalRows}, {Plan.HiddenSize}] — the gate half of " +
+                    $"{halfRows} rows followed by the up half, over the hidden size — got [{string.Join(", ", dims)}]");
+            }
+
+            long stride = tensor.Shape.RowStrideBytes(tensor.Format);
+            long payload = totalRows * stride;
+            if (payload != tensor.SizeBytes)
+            {
+                throw new ModelException(
+                    $"tensor '{tensor.Name}' declares {tensor.SizeBytes} payload bytes but its shape and format require {payload}");
+            }
+
+            halfBytes[l] = checked(halfRows * stride);
+            if (halfBytes[l] > int.MaxValue)
+            {
+                throw new ModelException(
+                    $"tensor '{tensor.Name}' has a gate/up half of {halfBytes[l]} bytes, beyond a single addressable slice");
+            }
+
+            _ffnUp[l] = tensor;
+        }
+
+        _gateUpHalfBytes = halfBytes;
+    }
+
+    // The weight operand one projection reads on this layer: its own tensor when the plan resolves a matrix per role, or
+    // that role's region of the shared buffer when it resolves a fused layout. Both sides address packed bytes in place —
+    // a slice is a window over the resolved payload, never a copy — and every byte range was pinned at Open against this
+    // layer's own format and row stride.
+    private WeightRef OwnWeight(LogicalTensor tensor) => new(_weights.Resolve(tensor), tensor.Shape, tensor.Format);
+
+    private static WeightRef SliceWeight(ReadOnlySpan<byte> payload, LogicalTensor tensor, long offset, long length, TensorShape shape) =>
+        new(payload.Slice((int)offset, (int)length), shape, tensor.Format);
+
+    private WeightRef AttentionQueryWeight(int layer) =>
+        Plan.AttentionWeights == QkvLayout.FusedBufferSlices
+            ? SliceWeight(_weights.Resolve(_wqkv[layer]), _wqkv[layer], 0, _qkvQueryBytes[layer], _qkvQueryShape)
+            : OwnWeight(_wq[layer]);
+
+    private WeightRef AttentionKeyWeight(int layer) =>
+        Plan.AttentionWeights == QkvLayout.FusedBufferSlices
+            ? SliceWeight(_weights.Resolve(_wqkv[layer]), _wqkv[layer], _qkvQueryBytes[layer], _qkvKeyBytes[layer], _qkvKeyValueShape)
+            : OwnWeight(_wk[layer]);
+
+    // The value region follows the key region inside the same buffer, and both carry the same rows of the same format —
+    // one head slice per kv head — so only its offset differs from the key side's.
+    private WeightRef AttentionValueWeight(int layer) =>
+        Plan.AttentionWeights == QkvLayout.FusedBufferSlices
+            ? SliceWeight(_weights.Resolve(_wqkv[layer]), _wqkv[layer], _qkvQueryBytes[layer] + _qkvKeyBytes[layer], _qkvKeyBytes[layer], _qkvKeyValueShape)
+            : OwnWeight(_wv[layer]);
+
+    private WeightRef FeedForwardGateWeight(int layer) =>
+        Plan.GateSource == FeedForwardGateSource.UpTensorHalves
+            ? SliceWeight(_weights.Resolve(_ffnUp[layer]), _ffnUp[layer], 0, _gateUpHalfBytes[layer], _gateUpHalfShape)
+            : OwnWeight(_ffnGate[layer]);
+
+    private WeightRef FeedForwardUpWeight(int layer) =>
+        Plan.GateSource == FeedForwardGateSource.UpTensorHalves
+            ? SliceWeight(_weights.Resolve(_ffnUp[layer]), _ffnUp[layer], _gateUpHalfBytes[layer], _gateUpHalfBytes[layer], _gateUpHalfShape)
+            : OwnWeight(_ffnUp[layer]);
 
     private float[][] LoadLayerVectors(int layers, TensorRole role, int expectedLength)
     {
@@ -1953,6 +2132,29 @@ public sealed class TransformerModel : IDisposable
                 throw new ModelException(
                     $"tensor '{descriptor.NameFor(layer)}' is missing and '{fused}' is present: the fused qkv " +
                     $"layout is not de-interleaved for architecture '{Plan.Architecture}'");
+            }
+        }
+
+        // The other side of that mismatch: a plan reading one fused buffer against a file carrying its three matrices
+        // instead. Every split tensor the table does carry gets named, so the failure says which layout the file ships.
+        if (role == TensorRole.AttentionQkv)
+        {
+            List<string> present = [];
+            foreach (TensorRole side in new TensorRole[] { TensorRole.AttentionQuery, TensorRole.AttentionKey, TensorRole.AttentionValue })
+            {
+                TensorDescriptor? sideDescriptor = Plan.Tensors[side];
+                if (sideDescriptor?.Resolve(_fileTensors, layer) is not null)
+                {
+                    present.Add(sideDescriptor.NameFor(layer));
+                }
+            }
+
+            if (present.Count > 0)
+            {
+                throw new ModelException(
+                    $"tensor '{descriptor.NameFor(layer)}' is missing and '{string.Join("', '", present)}" +
+                    $"' {(present.Count > 1 ? "are" : "is")} present: architecture '{Plan.Architecture}' reads one fused " +
+                    "qkv buffer per layer, not the split three");
             }
         }
 

@@ -292,6 +292,11 @@ public static class ModelPlans
             Activation = profile.Activation,
             Bias = profile.Bias,
             Rope = profile.Rope,
+            // The q/k/v projection layout and the feed-forward gate side come straight from the resolved profile like
+            // the norm placement and the window interleave do: no metadata key selects either, and each decides which
+            // tensors this block's forward reads.
+            AttentionWeights = profile.AttentionWeights,
+            GateSource = profile.GateSource,
             RopeScaling = ropeScaling,
             RopeRotaryDimensions = ropeRotaryDimensions,
             SparseFfn = sparseFfn,
