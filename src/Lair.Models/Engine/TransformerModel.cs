@@ -43,14 +43,15 @@ namespace Lair.Models.Engine;
 /// selected expert's gate/up/down GEMVs then run over the same normalized stream in ascending expert-index order and
 /// accumulate into the residual scaled by its weight. A declared shared expert adds one dense gate/up/down block to
 /// that accumulation once per token, an undeclared shared expert reads no sparse role tensor at all, and a file
-/// declaring none keeps the dense triplet path unchanged. Sparse routing runs on the prefill/decode token path and on
-/// <see cref="DecodeBatch"/>; <see cref="Encode"/> forwards dense blocks only and fails naming the descriptor when a
-/// model carries one.
+    /// declaring none keeps the dense triplet path unchanged. Sparse routing runs on the decode token path and on both
+/// batched forwards — <see cref="DecodeBatch"/> and the batched rows of <see cref="Prefill"/> — where each row routes
+/// over its own normalized stream; <see cref="Encode"/> forwards dense blocks only and fails naming the descriptor when
+/// a model carries one.
 /// </summary>
 
 public sealed class TransformerModel : IDisposable
 {
-    /// <summary>Largest number of sequences a single <see cref="DecodeBatch"/> call may advance.</summary>
+    /// <summary>Row width of the engine's batched forwards: the largest number of sequences a single <see cref="DecodeBatch"/> call may advance, and the largest number of prompt rows a <see cref="Prefill"/> sub-batch carries.</summary>
     public const int MaxBatchSequences = 16;
 
     private readonly IBackend _backend;
@@ -635,15 +636,206 @@ public sealed class TransformerModel : IDisposable
         }
     }
 
-    /// <summary>Forwards each token in order, appending its K/V to the sequence's paged KV cache.</summary>
-    public void Prefill(IReadOnlyList<int> tokens, SequenceKv kv)
+    /// <summary>
+    /// Forwards a window of prompt positions in sub-batches of up to <see cref="MaxBatchSequences"/> rows and
+    /// returns the final row's logits. Each row seeds its own residual stream from its token's embedding row and
+    /// keeps its own norms, RoPE at its own absolute position, and its own causal attention, while every dense
+    /// weight matrix (attention q/k/v/o, feed-forward gate/up/down) is traversed once per sub-batch through
+    /// <see cref="IBackend.GemvBatch"/> instead of once per token — a window of 16 rows pays one traversal per
+    /// matrix, not sixteen. Within a layer the window's K/V is written for every row before any row attends, so a
+    /// row's causal selection covers exactly the positions at or before its own: earlier rows of the same
+    /// sub-batch are in it, later rows are not, and the read set is the same one the single-token forward made at
+    /// that position. Each row appends at its own position into <paramref name="kv"/>, exactly as stepping the
+    /// tokens one at a time would, and every batched result is bit-identical to that stepping — the same
+    /// guarantee <see cref="DecodeBatch"/> holds per sequence. The returned logits are the window's final row:
+    /// the sequence's next-token distribution, held in the model's last-logits buffer as <see cref="LastLogits"/>
+    /// reports it, so sampling after a prefill needs no second forward. A window longer than
+    /// <see cref="MaxBatchSequences"/> is forwarded as consecutive sub-batches, each seeing the previous ones'
+    /// KV, so sub-batch boundaries move nothing: the sequence's KV bytes and final logits are what the same
+    /// tokens forwarded one at a time would leave.
+    /// </summary>
+    /// <exception cref="ArgumentException">The window is empty.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">A token id is outside the vocabulary.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// Appending the window would pass this model's max context, checked before any slot is reserved.
+    /// </exception>
+    public Span<float> Prefill(IReadOnlyList<int> tokens, SequenceKv kv)
     {
         ArgumentNullException.ThrowIfNull(tokens);
         ArgumentNullException.ThrowIfNull(kv);
 
-        foreach (int tokenId in tokens)
+        int n = tokens.Count;
+        if (n == 0)
         {
-            ForwardToken(tokenId, kv.Length, kv);
+            throw new ArgumentException("a prefill window must hold at least one token.", nameof(tokens));
+        }
+
+        int basePosition = kv.Length;
+        if (basePosition + n > MaxContextTokens)
+        {
+            throw new InvalidOperationException(
+                $"{n} prefill tokens starting at position {basePosition} exceed this model's max context of {MaxContextTokens} tokens.");
+        }
+
+        for (int offset = 0; offset < n; offset += MaxBatchSequences)
+        {
+            PrefillWindow(tokens, offset, Math.Min(MaxBatchSequences, n - offset), basePosition, kv, emitLogits: offset + MaxBatchSequences >= n);
+        }
+
+        return _logits.AsSpan();
+    }
+
+    // One sub-batch of a prefill window: the rows advance through the whole layer loop together, each holding its
+    // own residual-stream row and its own absolute position — the same streams and positions DecodeBatch keeps per
+    // sequence — over one sequence's growing KV. Attention runs row by row through the causal kernel, so a row
+    // scores its own prefix only, including the earlier rows this sub-batch wrote at the same layer and excluding
+    // every later one. Only the window's final row reaches the output head: the rows before it are kept for their
+    // KV, not for logits, so the lm_head runs once per prefill rather than once per sub-batch.
+    private void PrefillWindow(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits)
+    {
+        int hidden = Plan.HiddenSize;
+        int qkvRegion = Plan.HeadCount * Plan.HeadDim;
+        int kvRegion = Plan.KvHeadCount * Plan.HeadDim;
+        int inter = Plan.IntermediateSize;
+        float attnScale = _attnScale;
+
+        // Embedding lookup: each token's dequantized token_embd row seeds that row's input stream.
+        ReadOnlySpan<byte> embBytes = _weights.Resolve(_tokenEmbd);
+        WeightRef embRef = new(embBytes, _tokenEmbd.Shape, _tokenEmbd.Format);
+        for (int r = 0; r < rows; r++)
+        {
+            int tokenId = tokens[offset + r];
+            if ((uint)tokenId >= (uint)Plan.VocabSize)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(tokens), $"token id {tokenId} at index {offset + r} is outside the vocabulary of {Plan.VocabSize}.");
+            }
+
+            _backend.DequantRow(embRef, tokenId, _batchCur.AsSpan(r * hidden, hidden));
+        }
+
+        ApplyInputEmbeddingScale(_batchCur.AsSpan(0, rows * hidden));
+
+        // Reserve every row's slot in the sequence before any layer writes, mirroring the append each token made.
+        for (int r = 0; r < rows; r++)
+        {
+            kv.Append();
+        }
+
+        for (int l = 0; l < Plan.LayerCount; l++)
+        {
+            int layerWindow = LayerAttentionWindow(l);
+
+            // Pre-attention norm per row: identical op to the single-token forward.
+            for (int r = 0; r < rows; r++)
+            {
+                ApplyNorm(_batchCur.AsSpan(r * hidden, hidden), _attnNormWeight[l], _attnNormBias[l], _batchNormed.AsSpan(r * hidden, hidden));
+            }
+
+            // One weight pass per matrix for the whole sub-batch; each row's result matches its single-vector GEMV.
+            _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionQueryWeight(l), _batchQ.AsSpan(0, rows * qkvRegion));
+
+            _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionKeyWeight(l), _batchK.AsSpan(0, rows * kvRegion));
+
+            _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionValueWeight(l), _batchV.AsSpan(0, rows * kvRegion));
+
+            // Bias, QK-norm, RoPE at the row's absolute position, and the K/V writes for every row complete
+            // before any row attends, so each row's causal read sees exactly the prefix it would have alone.
+            for (int r = 0; r < rows; r++)
+            {
+                int position = basePosition + offset + r;
+
+                AddBias(_batchQ.AsSpan(r * qkvRegion, qkvRegion), _biasQ[l]);
+                AddBias(_batchK.AsSpan(r * kvRegion, kvRegion), _biasK[l]);
+                AddBias(_batchV.AsSpan(r * kvRegion, kvRegion), _biasV[l]);
+
+                ApplyQkNorm(_batchQ.AsSpan(r * qkvRegion, qkvRegion), _attnQNorm[l]);
+                ApplyQkNorm(_batchK.AsSpan(r * kvRegion, kvRegion), _attnKNorm[l]);
+
+                ApplyRopeHeads(_batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, position, windowedLayer: layerWindow > 0);
+                ApplyRopeHeads(_batchK.AsSpan(r * kvRegion, kvRegion), Plan.KvHeadCount, position, windowedLayer: layerWindow > 0);
+
+                kv.WriteK(position, l, _batchK.AsSpan(r * kvRegion, kvRegion));
+                kv.WriteV(position, l, _batchV.AsSpan(r * kvRegion, kvRegion));
+            }
+
+            for (int r = 0; r < rows; r++)
+            {
+                LayerOps.CausalAttention(_backend, _batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, basePosition + offset + r, attnScale, Plan.AttentionSoftcap, layerWindow, _batchAttnOut.AsSpan(r * qkvRegion, qkvRegion));
+            }
+
+            ReadOnlySpan<byte> bytes = _weights.Resolve(_wo[l]);
+            _backend.GemvBatch(_batchAttnOut.AsSpan(0, rows * qkvRegion), rows, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _batchProj.AsSpan(0, rows * hidden));
+
+            for (int r = 0; r < rows; r++)
+            {
+                AddBias(_batchProj.AsSpan(r * hidden, hidden), _biasO[l]);
+
+                // Post-sublayer placement: this row's attention output joins its stream only after the post-attention norm.
+                ApplyPostSublayerNorm(_batchProj.AsSpan(r * hidden, hidden), _postAttnNorm[l]);
+
+                // ffn_inp add on the row's own stream, same order as the single-token forward.
+                Span<float> cur = _batchCur.AsSpan(r * hidden, hidden);
+                ReadOnlySpan<float> proj = _batchProj.AsSpan(r * hidden, hidden);
+                for (int i = 0; i < hidden; i++)
+                {
+                    cur[i] += proj[i];
+                }
+
+                ApplyNorm(cur, _ffnNormWeight[l], _ffnNormBias[l], _batchNormed.AsSpan(r * hidden, hidden));
+            }
+
+            if (_sparseFfn is { } routing)
+            {
+                ApplySparseFeedForwardBatch(routing, l, rows);
+            }
+            else
+            {
+                _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), _batchGateUp.AsSpan(0, rows * inter));
+
+                _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardUpWeight(l), _batchUp.AsSpan(0, rows * inter));
+
+                // act = activation(gate) * up in place on each row's gate buffer.
+                for (int r = 0; r < rows; r++)
+                {
+                    ApplyActivation(_batchGateUp.AsSpan(r * inter, inter), _batchUp.AsSpan(r * inter, inter));
+                }
+
+                bytes = _weights.Resolve(_ffnDown[l]);
+                _backend.GemvBatch(_batchGateUp.AsSpan(0, rows * inter), rows, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _batchProj.AsSpan(0, rows * hidden));
+            }
+
+            for (int r = 0; r < rows; r++)
+            {
+                // Post-sublayer placement: this row's feed-forward output joins its stream only after the post-feed-forward norm.
+                ApplyPostSublayerNorm(_batchProj.AsSpan(r * hidden, hidden), _postFfnNorm[l]);
+
+                // ffn_out + ffn_inp: the input stream for this row's next layer.
+                Span<float> cur = _batchCur.AsSpan(r * hidden, hidden);
+                ReadOnlySpan<float> proj = _batchProj.AsSpan(r * hidden, hidden);
+                for (int i = 0; i < hidden; i++)
+                {
+                    cur[i] += proj[i];
+                }
+            }
+        }
+
+        if (emitLogits)
+        {
+            // The window's final row is the sequence's next-token distribution: its output norm and lm_head GEMV
+            // run alone over the single-token buffers, exactly the tail the single-token forward produced.
+            ApplyNorm(_batchCur.AsSpan((rows - 1) * hidden, hidden), _outputNormWeight, _outputNormBias, _normed);
+
+            LogicalTensor lmHead = _output ?? _tokenEmbd; // tied weights reuse the token-embedding rows as logits
+            ReadOnlySpan<byte> headBytes = _weights.Resolve(lmHead);
+            _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(headBytes, lmHead.Shape, lmHead.Format), _logits);
+
+            if (_outputBias is not null)
+            {
+                AddBias(_logits, _outputBias);
+            }
+
+            ApplyFinalLogitSoftcap(_logits);
         }
     }
 
