@@ -52,6 +52,17 @@ public sealed class GgufMetadata
         return Get(key).AsInt32Array();
     }
 
+    /// <summary>Required float-array value (e.g. <c>tokenizer.ggml.scores</c>), failing like the other required accessors when the key is absent.</summary>
+    public float[] GetFloatArray(string key)
+    {
+        if (!Has(key))
+        {
+            throw new GgufException($"GGUF metadata key '{key}' is not present");
+        }
+
+        return Get(key).AsFloatArray();
+    }
+
     private string[] TokenStringArray(string key)
     {
         if (!Has(key))

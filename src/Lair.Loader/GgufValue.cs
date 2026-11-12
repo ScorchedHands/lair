@@ -156,6 +156,18 @@ public sealed class GgufValue
         return values;
     }
 
+    public float[] AsFloatArray()
+    {
+        IReadOnlyList<GgufValue> elements = AsArray();
+        float[] values = new float[elements.Count];
+        for (int i = 0; i < elements.Count; i++)
+        {
+            values[i] = (float)elements[i].AsDouble();
+        }
+
+        return values;
+    }
+
     public override string ToString()
     {
         return Type switch

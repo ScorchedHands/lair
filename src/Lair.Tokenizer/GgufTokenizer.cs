@@ -6,9 +6,12 @@ using Lair.Loader;
 namespace Lair.Tokenizer;
 
 /// <summary>
-/// BPE tokenizer for GGUF-embedded vocabularies, following the semantics of
-/// llama.cpp's llama-vocab BPE path: codepoint pre-splitting, GPT-2 byte
-/// encoding, merge-rank BPE, special-token partitioning, and byte fallback.
+/// Tokenizer for GGUF-embedded vocabularies. The vocabulary implementation is selected at load
+/// from <c>tokenizer.ggml.model</c>: the BPE path follows llama.cpp's llama-vocab BPE semantics
+/// (codepoint pre-splitting, GPT-2 byte encoding, merge-rank BPE, special-token partitioning,
+/// byte fallback), and the SentencePiece path encodes by greedy longest-match over the piece
+/// vocabulary with <c>tokenizer.ggml.scores</c> tie-breaking and <c>&lt;0xNN&gt;</c> byte
+/// fallback. Special-token partitioning is shared by both paths.
 /// </summary>
 public sealed class GgufTokenizer
 {
@@ -27,10 +30,30 @@ public sealed class GgufTokenizer
     private const int EncodeCacheLimit = 50_000;
     private const int MaxUnicodeCodepoint = 0x10FFFF;
 
+    // The SentencePiece word-start marker (U+2581 LOWER BLOCK CHARACTER): the piece vocabulary's
+    // spelling of a word boundary, rendered as a space on decode except at the start of a sequence.
+    private const char WordStartMarker = '\u2581';
+
     // The process-static GPT-2 byte-encoding map: byte -> visual codepoint, and its inverse.
     // These are the fallback when a GGUF does not declare tokenizer.ggml.byte_to_utf8.
     private static readonly int[] Gpt2ByteToUtf8 = BuildGpt2ByteToUtf8();
     private static readonly int[] Gpt2VisualToByte = BuildVisualToByte(Gpt2ByteToUtf8);
+
+    // Defaults for a vocabulary that resolves no pre profile (the SPM path): there is no pre-split
+    // stage, no merge shortcut, and no decode space cleaning; its add_bos default follows the
+    // llama-family convention and it declares no family-convention fallback special ids.
+    private static readonly TokenizerProfile UnprofiledDefaults = new()
+    {
+        PreKey = "",
+        Split = SplitWholeText,
+        IgnoreMerges = false,
+        CleanSpaces = false,
+        AddBosDefault = true,
+        BosFallbackId = NullToken,
+        EosFallbackId = NullToken,
+    };
+
+    private static List<int> SplitWholeText(string text, List<int> offsets) => offsets;
 
     private readonly string[] _pieces;
     private readonly int[] _types;
@@ -40,6 +63,8 @@ public sealed class GgufTokenizer
     private readonly int[] _byteTokenByValue;
     private readonly int[] _byteToUtf8;
     private readonly int[] _visualToByte;
+    private readonly VocabularyModel _model;
+    private readonly float[] _scores;
     private readonly PreSplitStrategy _split;
     private readonly bool _ignoreMerges;
     private readonly bool _cleanSpaces;
@@ -53,6 +78,8 @@ public sealed class GgufTokenizer
         string[] pieces,
         int[] types,
         string[] merges,
+        VocabularyModel model,
+        float[] scores,
         TokenizerProfile profile,
         int bosId,
         int eosId,
@@ -69,9 +96,16 @@ public sealed class GgufTokenizer
         ArgumentNullException.ThrowIfNull(pieces);
         ArgumentNullException.ThrowIfNull(types);
         ArgumentNullException.ThrowIfNull(merges);
+        ArgumentNullException.ThrowIfNull(scores);
         if (types.Length != pieces.Length)
         {
             throw new ArgumentException("token types and pieces must have the same length", nameof(types));
+        }
+
+        // The BPE path never reads piece scores, so only the SPM path requires one score per piece.
+        if (model == VocabularyModel.Spm && scores.Length != pieces.Length)
+        {
+            throw new ArgumentException("scores and pieces must have the same length", nameof(scores));
         }
 
         _pieces = pieces;
@@ -116,6 +150,9 @@ public sealed class GgufTokenizer
         _byteTokenByValue = byteTokenByValue;
         _byteToUtf8 = byteToUtf8;
         _visualToByte = BuildVisualToByte(byteToUtf8);
+
+        _model = model;
+        _scores = scores;
 
         _split = profile.Split;
         _ignoreMerges = profile.IgnoreMerges;
@@ -167,10 +204,11 @@ public sealed class GgufTokenizer
 
     /// <summary>
     /// Builds a tokenizer from one GGUF, resolving every metadata-selected behavior once here:
-    /// the profile from <c>tokenizer.ggml.pre</c>, the special ids (with profile-scoped fallbacks
-    /// logged through <paramref name="logLine"/> when applied), <c>byte_fallback</c>,
-    /// <c>byte_to_token</c>, <c>byte_to_utf8</c>, <c>add_space_prefix</c>, <c>eot_token_id</c>, and
-    /// <c>utf8_flush_between_controls</c>.
+    /// the vocabulary implementation from <c>tokenizer.ggml.model</c>, the profile from
+    /// <c>tokenizer.ggml.pre</c> (BPE vocabularies only — the SPM path has no pre-split stage),
+    /// the special ids (with profile-scoped fallbacks logged through <paramref name="logLine"/>
+    /// when applied), <c>byte_fallback</c>, <c>byte_to_token</c>, <c>byte_to_utf8</c>,
+    /// <c>add_space_prefix</c>, <c>eot_token_id</c>, and <c>utf8_flush_between_controls</c>.
     /// </summary>
     /// <param name="file">The GGUF to read tokenizer metadata from.</param>
     /// <param name="logLine">Sink for each structured profile-default log line; hosts may capture instead.</param>
@@ -180,19 +218,18 @@ public sealed class GgufTokenizer
 
         GgufMetadata metadata = file.Metadata;
 
-        string model = metadata.GetString("tokenizer.ggml.model", "");
-        if (model != "gpt2")
-        {
-            throw new GgufException(
-                $"tokenizer.ggml.model is '{model}' (expected 'gpt2'): only GGUF BPE vocabularies are supported");
-        }
+        VocabularyModel model = VocabularyModels.Resolve(metadata.GetString("tokenizer.ggml.model", ""));
 
-        string pre = metadata.GetString("tokenizer.ggml.pre", TokenizerProfiles.DefaultPreKey);
-        TokenizerProfile profile = TokenizerProfiles.Resolve(pre);
+        // The pre axis is BPE pre-split machinery: an SPM vocabulary resolves no profile, so the
+        // neutral defaults below apply and its declared special ids carry the special-id state.
+        TokenizerProfile profile = model == VocabularyModel.Bpe
+            ? TokenizerProfiles.Resolve(metadata.GetString("tokenizer.ggml.pre", TokenizerProfiles.DefaultPreKey))
+            : UnprofiledDefaults;
 
         string[] pieces = metadata.GetTokens();
         int[] types = metadata.GetTokenTypes();
-        string[] merges = metadata.GetMerges();
+        string[] merges = model == VocabularyModel.Bpe ? metadata.GetMerges() : [];
+        float[] scores = model == VocabularyModel.Bpe ? [] : ReadScores(metadata, pieces.Length);
 
         int bosId = ReadSpecialId(metadata, "tokenizer.ggml.bos_token_id", profile.BosFallbackId, pieces.Length, file, logLine);
         int eosId = ReadSpecialId(metadata, "tokenizer.ggml.eos_token_id", profile.EosFallbackId, pieces.Length, file, logLine);
@@ -215,6 +252,8 @@ public sealed class GgufTokenizer
             pieces,
             types,
             merges,
+            model,
+            scores,
             profile,
             bosId,
             eosId,
@@ -244,6 +283,11 @@ public sealed class GgufTokenizer
     public string Decode(IReadOnlyList<int> ids, bool includeSpecial = false)
     {
         ArgumentNullException.ThrowIfNull(ids);
+
+        if (_model == VocabularyModel.Spm)
+        {
+            return DecodePieces(ids, includeSpecial);
+        }
 
         List<byte> bytes = new(ids.Count * 4);
         StringBuilder text = new();
@@ -281,6 +325,80 @@ public sealed class GgufTokenizer
         return _cleanSpaces ? CleanSpaces(decoded) : decoded;
     }
 
+    /// <summary>
+    /// SPM decode: joins the pieces, maps the <c>▁</c> word-start marker to a space except at the
+    /// start of the sequence, and reassembles the <c>&lt;0xNN&gt;</c> byte pieces as UTF-8. Control
+    /// ids flush the byte window and honor <paramref name="includeSpecial"/> exactly as the BPE path does.
+    /// </summary>
+    private string DecodePieces(IReadOnlyList<int> ids, bool includeSpecial)
+    {
+        List<byte> bytes = new(ids.Count * 4);
+        StringBuilder text = new();
+
+        foreach (int id in ids)
+        {
+            if (id < 0 || id >= _pieces.Length)
+            {
+                continue;
+            }
+
+            bool control = _types[id] is TokenTypeUnknown or TokenTypeControl or TokenTypeUserDefined;
+            if (control)
+            {
+                FlushBytes(bytes, text);
+                if (includeSpecial)
+                {
+                    text.Append(_pieces[id]);
+                }
+
+                continue;
+            }
+
+            string piece = _pieces[id];
+            if (piece.Length == 0)
+            {
+                continue;
+            }
+
+            if (piece[0] == WordStartMarker && text.Length == 0 && bytes.Count == 0)
+            {
+                piece = piece[1..];
+            }
+
+            if (piece.Length == 0)
+            {
+                continue;
+            }
+
+            if (_types[id] == TokenTypeByte)
+            {
+                if (piece.Length == 6 && piece.StartsWith("<0x", StringComparison.Ordinal) && piece[5] == '>'
+                    && TryHexDigit(piece[3], out int high) && TryHexDigit(piece[4], out int low))
+                {
+                    bytes.Add((byte)((high << 4) | low));
+                }
+                else
+                {
+                    foreach (byte b in Encoding.UTF8.GetBytes(piece))
+                    {
+                        bytes.Add(b);
+                    }
+                }
+
+                continue;
+            }
+
+            string literal = piece.IndexOf(WordStartMarker) >= 0 ? piece.Replace(WordStartMarker, ' ') : piece;
+            foreach (byte b in Encoding.UTF8.GetBytes(literal))
+            {
+                bytes.Add(b);
+            }
+        }
+
+        FlushBytes(bytes, text);
+        return text.ToString();
+    }
+
     public int? IdOf(string token)
     {
         ArgumentNullException.ThrowIfNull(token);
@@ -307,9 +425,13 @@ public sealed class GgufTokenizer
             {
                 ids.Add(fragment.TokenId);
             }
-            else
+            else if (_model == VocabularyModel.Bpe)
             {
                 TokenizeText(fragment.Text, ids);
+            }
+            else
+            {
+                TokenizePieces(fragment.Text, ids);
             }
         }
 
@@ -384,6 +506,117 @@ public sealed class GgufTokenizer
             string encoded = ByteEncode(word);
             ApplyMerges(encoded, output);
         }
+    }
+
+    /// <summary>
+    /// SPM piece selection: greedy longest-match over the piece vocabulary, ties at the same
+    /// match length resolved by the higher <c>tokenizer.ggml.scores</c> value (equal scores keep
+    /// the lower vocabulary index). Text no piece covers falls to the vocabulary's byte pieces.
+    /// </summary>
+    private void TokenizePieces(string text, List<int> output)
+    {
+        Span<char> single = stackalloc char[2];
+        Span<byte> utf8 = stackalloc byte[4];
+
+        int position = 0;
+        while (position < text.Length)
+        {
+            int bestId = NullToken;
+            int bestLength = 0;
+            float bestScore = float.NegativeInfinity;
+            for (int id = 0; id < _pieces.Length; id++)
+            {
+                // The vocabulary's byte pieces are the fallback, not match candidates; unused
+                // entries and empty pieces never match.
+                if (_types[id] is TokenTypeUnused or TokenTypeByte)
+                {
+                    continue;
+                }
+
+                string piece = _pieces[id];
+                if (piece.Length == 0 || piece.Length < bestLength)
+                {
+                    continue;
+                }
+
+                // A candidate must fit the remaining input and match at the scan position before it
+                // can beat or tie the current best.
+                if (position + piece.Length > text.Length || !PieceMatches(text, position, piece))
+                {
+                    continue;
+                }
+
+                if (bestId == NullToken || piece.Length > bestLength || _scores[id] > bestScore)
+                {
+                    bestId = id;
+                    bestLength = piece.Length;
+                    bestScore = _scores[id];
+                }
+            }
+
+            if (bestId != NullToken)
+            {
+                output.Add(bestId);
+                position += bestLength;
+                continue;
+            }
+
+            // No piece covers the remaining text: the vocabulary's <0xNN> byte pieces carry it.
+            // An SPM piece is literal text, so an uncovered codepoint falls back to its own UTF-8
+            // bytes — no visual-map detour (byte_fallback=false keeps the unknown/drop posture).
+            if (!_byteFallback)
+            {
+                if (UnkId != NullToken)
+                {
+                    output.Add(UnkId);
+                }
+
+                position += 1;
+                continue;
+            }
+
+            int charCount = CopyRune(text, position, single);
+            int byteCount = Encoding.UTF8.GetBytes(single[..charCount], utf8);
+            for (int i = 0; i < byteCount; i++)
+            {
+                EmitByteToken(utf8[i], output);
+            }
+
+            position += charCount;
+        }
+    }
+
+    // A piece matches at the scan position when its text equals the input there, with one spelling
+    // exception: a ▁-prefixed piece also covers a literal space in the input (the word-start marker
+    // is how the vocabulary spells a word boundary). The byte fallback keeps the original character.
+    private static bool PieceMatches(string text, int position, string piece)
+    {
+        if (piece[0] == WordStartMarker && text[position] != WordStartMarker)
+        {
+            return text[position] == ' '
+                && position + 1 < text.Length
+                && string.CompareOrdinal(text, position + 1, piece, 1, piece.Length - 1) == 0;
+        }
+
+        return string.CompareOrdinal(text, position, piece, 0, piece.Length) == 0;
+    }
+
+    // UTF-16 length of the character at position: a surrogate pair counts as one codepoint and is
+    // copied whole so its UTF-8 bytes never split.
+    private static int CodepointLength(string text, int position)
+    {
+        return char.IsHighSurrogate(text[position])
+            && position + 1 < text.Length
+            && char.IsLowSurrogate(text[position + 1])
+            ? 2
+            : 1;
+    }
+
+    private static int CopyRune(string text, int position, Span<char> single)
+    {
+        int length = CodepointLength(text, position);
+        text.AsSpan(position, length).CopyTo(single);
+        return length;
     }
 
     private List<string> PreSplit(string text)
@@ -819,6 +1052,22 @@ public sealed class GgufTokenizer
         }
 
         return map;
+    }
+
+    /// <summary>
+    /// Resolves the piece scores (<c>tokenizer.ggml.scores</c>) that break SPM longest-match ties:
+    /// exactly one score per vocabulary entry, or the load fails naming the key and the counts.
+    /// </summary>
+    private static float[] ReadScores(GgufMetadata metadata, int vocabSize)
+    {
+        float[] scores = metadata.GetFloatArray("tokenizer.ggml.scores");
+        if (scores.Length != vocabSize)
+        {
+            throw new GgufException(
+                $"GGUF metadata key 'tokenizer.ggml.scores' has {scores.Length} entries (expected {vocabSize})");
+        }
+
+        return scores;
     }
 
     private static void FlushBytes(List<byte> bytes, StringBuilder text)
