@@ -5,12 +5,14 @@ namespace Lair.Http;
 // Wire-format records for the OpenAI-compatible surface. JSON names are the C# names run through
 // the snake_case naming policy configured in the app builder and in the streaming serializer.
 
-/// <summary>Request body of <c>/v1/chat/completions</c>; sampling knobs fall back to the engine defaults. The tool fields are read straight from the request document so their raw shape can be validated; they are a chat-only surface.</summary>
+/// <summary>Request body of <c>/v1/chat/completions</c>; sampling knobs fall back to the engine defaults. The tool fields are read straight from the request document so their raw shape can be validated; they are a chat-only surface. The two budget fields are LAIR's documented extension on the OpenAI body and never change what <c>max_tokens</c> means.</summary>
 internal sealed record ChatCompletionBody(
     string? Model,
     IReadOnlyList<MessageBody>? Messages,
     bool? Stream,
     int? MaxTokens,
+    int? MaxReasoningTokens,
+    int? MaxResponseTokens,
     float? Temperature,
     float? TopP,
     int? TopK,
@@ -22,12 +24,14 @@ internal sealed record ChatCompletionBody(
     [property: JsonPropertyName("logprobs")] bool? LogProbs,
     int? TopLogprobs);
 
-/// <summary>Request body of <c>/v1/completions</c>; the raw prompt replaces the messages list. Tool declarations are a chat-only surface and this endpoint ignores them.</summary>
+/// <summary>Request body of <c>/v1/completions</c>; the raw prompt replaces the messages list. Tool declarations are a chat-only surface and this endpoint ignores them. The budget fields carry the same meaning they have on the chat body.</summary>
 internal sealed record CompletionBody(
     string? Model,
     string? Prompt,
     bool? Stream,
     int? MaxTokens,
+    int? MaxReasoningTokens,
+    int? MaxResponseTokens,
     float? Temperature,
     float? TopP,
     int? TopK,
@@ -45,14 +49,22 @@ internal sealed record MessageBody(string? Role, string? Content);
 /// <summary>Token accounting reported with every non-streaming completion.</summary>
 internal sealed record Usage(int PromptTokens, int CompletionTokens, int TotalTokens);
 
-/// <summary>Non-streaming <c>/v1/chat/completions</c> result.</summary>
+/// <summary>One accepted budget override as this request resolved it: the field it arrived on in its wire name, the value the body carried, the value now in force for this request after any clamp to the model's declared ceiling, and whether that ceiling lowered it. Reported only when a body actually carried an override, so a request without one keeps today's response shape.</summary>
+internal sealed record TokenBudgetReport(
+    string Field,
+    int Requested,
+    int Applied,
+    bool Clamped);
+
+/// <summary>Non-streaming <c>/v1/chat/completions</c> result. The budget reports are LAIR's extension and absent when no override was accepted.</summary>
 internal sealed record ChatCompletionResponse(
     string Id,
     string Object,
     long Created,
     string Model,
     IReadOnlyList<ChatChoice> Choices,
-    Usage Usage);
+    Usage Usage,
+    IReadOnlyList<TokenBudgetReport>? TokenBudgets = null);
 
 /// <summary>One chat choice: the assistant message plus why generation ended.</summary>
 internal sealed record ChatChoice(
@@ -76,14 +88,15 @@ internal sealed record ToolCallWire(
 /// <summary>The function half of a wire tool call.</summary>
 internal sealed record FunctionCallWire(string Name, string Arguments);
 
-/// <summary>Non-streaming <c>/v1/completions</c> result.</summary>
+/// <summary>Non-streaming <c>/v1/completions</c> result. The budget reports carry the same meaning they have on a chat body.</summary>
 internal sealed record TextCompletionResponse(
     string Id,
     string Object,
     long Created,
     string Model,
     IReadOnlyList<TextChoice> Choices,
-    Usage Usage);
+    Usage Usage,
+    IReadOnlyList<TokenBudgetReport>? TokenBudgets = null);
 
 /// <summary>One completion choice: the continuation text plus why generation ended.</summary>
 internal sealed record TextChoice(
@@ -98,13 +111,14 @@ internal sealed record LogProbsReport(IReadOnlyList<LogProbEntry> Content);
 /// <summary>One token's logprob entry: the token text, its vocabulary id when known, and the distribution's top candidates of the same shape.</summary>
 internal sealed record LogProbEntry(int? TokenId, string Token, double Logprob, IReadOnlyList<LogProbEntry>? TopLogprobs);
 
-/// <summary>One SSE frame of a streamed completion; the choice carries the incremental delta.</summary>
+/// <summary>One SSE frame of a streamed completion; the choice carries the incremental delta. Budget reports ride on the closing frame only, and are absent when no override was accepted.</summary>
 internal sealed record ChunkPayload(
     string Id,
     string Object,
     long Created,
     string Model,
-    IReadOnlyList<ChunkChoice> Choices);
+    IReadOnlyList<ChunkChoice> Choices,
+    IReadOnlyList<TokenBudgetReport>? TokenBudgets = null);
 
 /// <summary>A streamed choice: the delta plus <c>finish_reason</c> on the final content chunk.</summary>
 internal sealed record ChunkChoice(int Index, ChunkDelta Delta, string? FinishReason);

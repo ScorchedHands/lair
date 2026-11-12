@@ -912,7 +912,7 @@ Token budgets are configured per model: a reasoning budget and a response budget
 
 - [✓] Per-model budget configuration — model-level `max_reasoning_tokens` and `max_response_tokens` defaults with load-time validation, absent meaning unbudgeted (see DN-M310-1, DN-M310-2).
   - Verify: `dotnet test --filter Category=Config -c Release` — model entries resolve both budgets, invalid or negative values fail at load naming the model and the key, and the hot-reload class reports them as new-requests-only.
-- [_] Request overrides and wire fields — `max_reasoning_tokens` and `max_response_tokens` on chat and completion bodies, clamped to the model ceiling (see DN-M310-2).
+- [✓] Request overrides and wire fields — `max_reasoning_tokens` and `max_response_tokens` on chat and completion bodies, clamped to the model ceiling (see DN-M310-2).
   - Verify: `dotnet test --filter Category=Api -c Release` — an override above the model ceiling clamps and reports the clamp; an override on a model with no resolved reasoning region is refused naming the model.
 - [_] Budget enforcement in scheduling and decode — KV reservation against both budgets, region close at the reasoning ceiling, response ceiling on visible tokens (see DN-M310-1, DN-M310-3).
   - Verify: `dotnet test --filter Category=Scheduling -c Release` — reservation math, reasoning-ceiling region close, response-ceiling stop, and batched decode equal to single-token under both ceilings.

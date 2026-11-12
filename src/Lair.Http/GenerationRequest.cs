@@ -25,6 +25,12 @@ public sealed record GenerationRequest
     /// <summary>Maximum number of tokens to generate.</summary>
     public int MaxTokens { get; init; } = 128;
 
+    /// <summary>Per-request override of the model's reasoning-token ceiling, carried as the value admitted for this request — already clamped to what the loaded model declares. Null carries no override: today's unbudgeted behavior.</summary>
+    public int? MaxReasoningTokens { get; init; }
+
+    /// <summary>Per-request override of the model's response-token ceiling, carried as the value admitted for this request — already clamped to what the loaded model declares. Null carries no override: today's unbudgeted behavior.</summary>
+    public int? MaxResponseTokens { get; init; }
+
     /// <summary>Softmax temperature; 0 selects greedy decoding.</summary>
     public float Temperature { get; init; } = 1.0f;
 

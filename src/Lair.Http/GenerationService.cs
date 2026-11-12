@@ -319,6 +319,8 @@ public sealed class GenerationService : IDisposable
 
                     case "models[0].max_reasoning_tokens":
                         effective = effective with { Models = [effective.Models[0] with { MaxReasoningTokens = candidate.Models[0].MaxReasoningTokens } ] };
+                        replanned = ResolvePlanFor(effective);
+                        Volatile.Write(ref _outputParser, replanned);
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
                             $"reasoning budget {change.OldValue} -> {change.NewValue}: the configuration in force carries it for requests admitted from now on; sequences already in flight are unaffected"));
                         break;
@@ -370,9 +372,11 @@ public sealed class GenerationService : IDisposable
     }
 
     // The plan the configuration in force resolves to: same registry decision as model load, against the capabilities
-    // probed once for this template. Only a new-requests-only reload calls it; generation never re-decides.
+    // probed once for this template. Only a new-requests-only reload calls it; generation never re-decides. A declared
+    // reasoning ceiling travels through the same resolve because that declaration is what establishes the region later
+    // requests may bound.
     private OutputParserPlan ResolvePlanFor(LairConfig effective) =>
-        OutputParserRegistry.Resolve(effective.Models[0].ToolParser, effective.Models[0].ForceFencedTools, _chatTemplateCapabilities, effective.Models[0].Reasoning);
+        OutputParserRegistry.Resolve(effective.Models[0].ToolParser, effective.Models[0].ForceFencedTools, _chatTemplateCapabilities, effective.Models[0].Reasoning, effective.Models[0].MaxReasoningTokens);
 
     private static string RefusalDetail(FieldChange change) => change.Field switch
     {
@@ -481,7 +485,7 @@ public sealed class GenerationService : IDisposable
             // configuration: every later chat request consumes this plan instead of re-deciding which tool surface it
             // gets, and the resolved choice is announced on the host's load log in the style of the tokenizer-default
             // and profile-resolution lines.
-            OutputParserPlan outputParser = OutputParserRegistry.Resolve(modelConfig.ToolParser, modelConfig.ForceFencedTools, chatTemplateCapabilities, modelConfig.Reasoning);
+            OutputParserPlan outputParser = OutputParserRegistry.Resolve(modelConfig.ToolParser, modelConfig.ForceFencedTools, chatTemplateCapabilities, modelConfig.Reasoning, modelConfig.MaxReasoningTokens);
             logger?.LogInformation(
                 "tool_parser model='{Model}' choice={Choice}",
                 modelConfig.Name,
@@ -565,6 +569,19 @@ public sealed class GenerationService : IDisposable
         if (request.TopLogprobs is < 0 or > 20)
         {
             throw new ArgumentException($"'top_logprobs' must be in [0, 20], got {request.TopLogprobs}.", nameof(request));
+        }
+
+        // Budget overrides are sized request knobs too: a value below 1 is refused here for programmatic callers exactly as the
+        // API host refuses it on the wire. The ceiling itself belongs to the loaded model and is applied where the override is
+        // admitted, so what reaches this facade is already resolved.
+        if (request.MaxReasoningTokens is < 1)
+        {
+            throw new ArgumentException($"'max_reasoning_tokens' must be 1 or greater, got {request.MaxReasoningTokens}.", nameof(request));
+        }
+
+        if (request.MaxResponseTokens is < 1)
+        {
+            throw new ArgumentException($"'max_response_tokens' must be 1 or greater, got {request.MaxResponseTokens}.", nameof(request));
         }
 
         IReadOnlyDictionary<int, float>? logitBias = ResolveLogitBias(request.LogitBias);

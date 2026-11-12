@@ -62,6 +62,9 @@ public static class ReasoningPolicyNames
 /// <summary>Half-open span offsets of one recognized reasoning region over the generated text.</summary>
 public sealed record ReasoningRegion(int Start, int End);
 
+/// <summary>The open/close markup pair a model's plan resolves its reasoning region to — the same markers the recognizer reads over generated text. A ceiling bounds only a region this resolved, so request-time budget rules consult it instead of guessing a shape per request.</summary>
+public sealed record ReasoningRegionMarkers(string OpenMarkup, string CloseMarkup);
+
 /// <summary>The reasoning regions recognized in one generation plus the visible text with them removed.</summary>
 public sealed record ReasoningDetection(IReadOnlyList<ReasoningRegion> Regions, string VisibleText);
 
@@ -267,6 +270,12 @@ public sealed record OutputParserPlan(ToolParser ToolParser, IToolOutputParser? 
         : this(toolParser, parser, ReasoningPolicy.Keep)
     {
     }
+
+    /// <summary>The reasoning region this model resolves at load: the marker pair its budgets bound. Null when the model entry declares no reasoning budget — nothing is resolved here to bound, and a per-request reasoning override names that refusal rather than guessing a region.</summary>
+    public ReasoningRegionMarkers? ReasoningRegion { get; init; }
+
+    /// <summary>True when this plan resolves a reasoning region, which is what makes a reasoning ceiling mean something for this model.</summary>
+    public bool HasResolvedReasoningRegion => ReasoningRegion is not null;
 }
 
 /// <summary>
@@ -515,23 +524,30 @@ public sealed class TemplateNativeToolOutputParser : IToolOutputParser
 /// template that renders tools owns the tool surface (and its own call shape is what the decoded text is read for),
 /// LAIR's fenced block plus fenced-JSON reading is the fallback for a template without tool support (and for a model with
 /// no chat template at all), and the model's <c>force_fenced_tools</c> override selects it even for a tool-capable
-/// template. An absent or unrecognized reasoning key lands on <c>keep</c>, which is today's wire behavior.
+/// template. An absent or unrecognized reasoning key lands on <c>keep</c>, which is today's wire behavior, and a model entry that declares no
+/// reasoning ceiling resolves no reasoning region at all — the absence request-time budget rules refuse against instead of guessing one.
 /// </summary>
 public static class OutputParserRegistry
 {
     /// <summary>The plan one model runs: resolved from its configuration plus its load-probed capabilities.</summary>
-    public static OutputParserPlan Resolve(string toolParser, bool forceFencedTools, TemplateCapabilities? capabilities, string reasoning = ReasoningPolicyNames.Keep) => toolParser switch
+    public static OutputParserPlan Resolve(string toolParser, bool forceFencedTools, TemplateCapabilities? capabilities, string reasoning = ReasoningPolicyNames.Keep, int? maxReasoningTokens = null) => toolParser switch
     {
-        ToolParserNames.Template => Plan(ToolParser.Template, new TemplateNativeToolOutputParser(), reasoning),
-        ToolParserNames.Fenced => Plan(ToolParser.Fenced, new FencedJsonToolOutputParser(), reasoning),
-        ToolParserNames.None => Plan(ToolParser.None, parser: null, reasoning),
+        ToolParserNames.Template => Plan(ToolParser.Template, new TemplateNativeToolOutputParser(), reasoning, ResolvedRegion(maxReasoningTokens)),
+        ToolParserNames.Fenced => Plan(ToolParser.Fenced, new FencedJsonToolOutputParser(), reasoning, ResolvedRegion(maxReasoningTokens)),
+        ToolParserNames.None => Plan(ToolParser.None, parser: null, reasoning, ResolvedRegion(maxReasoningTokens)),
 
         // "auto" (the only remaining loader-accepted value): today's capability precedence, expressed as a resolved choice.
         _ => forceFencedTools || capabilities is null || !capabilities.SupportsTools
-            ? Plan(ToolParser.Fenced, new FencedJsonToolOutputParser(), reasoning)
-            : Plan(ToolParser.Template, new TemplateNativeToolOutputParser(), reasoning),
+            ? Plan(ToolParser.Fenced, new FencedJsonToolOutputParser(), reasoning, ResolvedRegion(maxReasoningTokens))
+            : Plan(ToolParser.Template, new TemplateNativeToolOutputParser(), reasoning, ResolvedRegion(maxReasoningTokens)),
     };
 
-    private static OutputParserPlan Plan(ToolParser toolParser, IToolOutputParser? parser, string reasoning) =>
-        new(toolParser, parser, reasoning == ReasoningPolicyNames.Strip ? ReasoningPolicy.Strip : ReasoningPolicy.Keep);
+    private static OutputParserPlan Plan(ToolParser toolParser, IToolOutputParser? parser, string reasoning, ReasoningRegionMarkers? region) =>
+        new(toolParser, parser, reasoning == ReasoningPolicyNames.Strip ? ReasoningPolicy.Strip : ReasoningPolicy.Keep) { ReasoningRegion = region };
+
+    // A model's declared reasoning ceiling is what establishes its reasoning region at load: the pair resolved here is exactly
+    // the markup the recognizer reads over generated text, so a request bounds a region this plan already resolved and an
+    // unbudgeted model resolves none.
+    private static ReasoningRegionMarkers? ResolvedRegion(int? maxReasoningTokens) =>
+        maxReasoningTokens is >= 1 ? new(ReasoningRecognition.OpenMarkup, ReasoningRecognition.CloseMarkup) : null;
 }
