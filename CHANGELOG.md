@@ -4,6 +4,20 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.9] - 2026-11-12
+
+### Added
+
+- Dense-resident MoE execution through the model plan: router softmax/top-k selection with optional renormalization/weights scale, shared-expert support including gated selector semantics when a file ships it, and per-expert gate/up/down accumulation into the residual. The pinned `OLMoE-1B-7B-0924-Instruct-Q2_K.gguf` fixture loads, decodes routed steps through its mixed-tier expert stacks, and serves under the 4 GB model budget; `/v1/models` reports `sparse_ffn_strategy: dense_resident`.
+- Sparse-FFN layout representability for later residency work: layouts/ranks/shared-basis tensor roles resolve into the plan, but only `DenseResident` executes in this release and non-dense selections are refused rather than silently downgraded.
+- Windowed KV execution accounting: bounded causal/range reads select only the blocks covering a windowed layer's positions; per-layer AllLayers/AlternatingLocalFirst patterns resolve through the model plan; monitor snapshots report `metrics_kv_windowed_layers`, `metrics_kv_read_footprint_blocks`, and `metrics_kv_skipped_read_blocks`.
+- Windowed encoder masking: declared positive windows apply backward-only in embeddings, keeping unbounded models bit-identical.
+
+### Fixed
+
+- Olmo chat prompt tokenization matches pinned b12032 `/tokenize` id-for-id for exact raw no-trailing-newline and rendered ChatML prompts by resolving an olmo-specific byte-level split with math-symbol symbol runs and whole-pre-token lookup; non-Olmo BPE profiles are unchanged.
+- Expert tensor slices now derive their byte size from each layer's own quant tier rather than one role-wide value, so converted files that mix tiers inside an expert role load correctly. OLMoE attention normalizes whole projected Q/K streams with hidden-sized vectors (`QkNormMode.StreamWeighted`) matching the reference graph behavior.
+
 ## [0.3.8] - 2026-11-11
 
 ### Added

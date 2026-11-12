@@ -21,7 +21,7 @@ dotnet test Lair.sln --filter Category=Parity # golden parity vs pinned llama.cp
 dotnet test Lair.sln --filter Category=Kernel # kernel oracle comparisons
 ```
 
-Test categories: `Loader`, `Tokenizer`, `Template`, `TemplateDiagnostics`, `TemplateParity`, `Serve`, `MinjaSyntax`, `MinjaEval`, `MinjaStatements`, `MinjaFilters`, `MinjaChat`, `MinjaLimits`, `Kernel`, `Layers`, `Kv`, `Sampling`, `Api`, `Cli`, `Config`, `ToolCalls`, `Parity`, `Calib`, `Concurrency`, `Prefill`, `Cache`, `Cancel`, `HotReload`, `Metrics`, `Embeddings`, `Affinity`, `MonitorUi`, `WebUi`.
+Test categories: `Loader`, `Moe`, `Tokenizer`, `Template`, `TemplateDiagnostics`, `TemplateParity`, `Serve`, `MinjaSyntax`, `MinjaEval`, `MinjaStatements`, `MinjaFilters`, `MinjaChat`, `MinjaLimits`, `Kernel`, `Layers`, `Kv`, `Sampling`, `Api`, `Cli`, `Config`, `ToolCalls`, `Parity`, `Calib`, `Concurrency`, `Prefill`, `Cache`, `Cancel`, `HotReload`, `Metrics`, `Embeddings`, `Affinity`, `MonitorUi`, `WebUi`.
 
 Performance gates (inter-token latency budgets in `ConcurrencyTests`/`PrefillTests`) are only meaningful under `-c Release` — Debug JIT inflates kernels ~4.6× and the absolute budgets cannot reproduce there. Correctness suites pass in both configurations. The real-model suites (`ConcurrencyTests`, `ParityTests`, and the pinned Qwen3 reasoning serve suite) share one serialized xunit collection, `model-loaded`, so two engines never load side by side — a second engine loading alongside the latency-budget suite starves its inter-token budgets.
 

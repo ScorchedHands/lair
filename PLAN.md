@@ -823,7 +823,7 @@ Dense IQ quantization loads, decodes, and serves on the CPU engine at two tiers 
 - [✓] Manual IQ Serve: both tiers served; chat via API and `/ui`; monitor live with the quant reported; the owner's `qwen4exp` target file resolved tensor-for-tensor through the loader with zero rejections. Measured: `quant: IQ4_XS` at 10.25 tok/s / 1,362.6 MB peak and `quant: IQ3_XXS` at 4.03 tok/s / 1,212.4 MB peak (context 4096, thread_quota 8), chat through the API, SSE streaming and the `/ui` client's own POST; loader gate green on both shards.
 - [✓] Manual Quant Recommendation: read the bench table and confirm the documented recommendation matches the measured fastest format rather than the smallest file. Measured: `IQ4_XS` 11.6 tok/s beats the 10.3–10.4 tok/s `Q4_K_M` baseline while being smaller, and the smallest file (`UD-IQ3_XXS`, 575 MB) is the slowest at 3.9 tok/s — the recommendation follows speed, not size.
 
-### MVP3.9 [v0.3.9] - In Progress
+### MVP3.9 [v0.3.9] - Shipped
 
 Sparse and windowed architectures execute: dense-resident MoE decoding and sliding-window/local attention, both through the MVP3.4 model plan.
 
