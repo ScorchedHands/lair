@@ -81,6 +81,12 @@ public sealed record ModelConfig
     /// </summary>
     public string Reasoning { get; init; } = "keep";
 
+    /// <summary>Per-model reasoning-token budget carried with the model entry; null (absent) means unbudgeted — today's behavior, no ceiling applied.</summary>
+    public int? MaxReasoningTokens { get; init; }
+
+    /// <summary>Per-model response-token budget carried with the model entry; null (absent) means unbudgeted and leaves request token limits at their existing semantics.</summary>
+    public int? MaxResponseTokens { get; init; }
+
     public PlacementConfig Placement { get; init; } = new();
 }
 

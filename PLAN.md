@@ -885,7 +885,7 @@ Sparse and windowed architectures execute: dense-resident MoE decoding and slidi
 - [✓] Automated Olmo Chat Prompt Tokenizer: pinned `/tokenize` id-for-id goldens on exact raw no-trailing-newline and rendered OLMo chat prompts plus existing olmo plain-text cases unchanged. Verify: `dotnet test --filter Category=Tokenizer -c Release` — 45/45; the Olmo parity fact now covers both pinned ChatML prompt goldens and the original plain-text olmo fixture without changing their expected ids.
 - [✓] Manual MoE Serve: serve the pinned OLMoE fixture and confirm coherent multi-turn output with the monitor showing expert weights resident and no gather machinery involved. Verify: live two-turn exchange on `:8181` plus a `/monitor/stream` snapshot frame read. Measured against `models/OLMoE-1B-7B-0924-Instruct-Q2_K.gguf` with context 512, kv_blocks 32, thread_quota 8; turn 1 request `chatcmpl-03dcf952de5f4d28a3ddd7ae323e520b` returned `Hello!` for prompt `Hi`, and turn 2 with assistant history `Hello` plus new user prompt `Hello` returned `Hello there`; both finished `length` at `max_tokens=3`, recorded as a short-output limit of the Q2_K model under manual token caps rather than serving-engine failure. `/v1/models` reported architecture `olmoe` and sparse strategy `dense_resident`; tee-logged load line read `sparse_ffn model='olmoe-1b-7b-instruct-q2_k' layout=StackedExperts rank=none strategy=dense_resident`, with zero low_rank/gather matches in the server log. Monitor snapshots after requests showed working set 1975.1 MB then 1985.5 MB, and OS peak for serving child `lair.exe` PID 95148 was 1989 MB — under the 4096 MB ceiling. Honest environment caveat: an unrelated `strata.exe` process (PID 93168) remained active during the serve attempt; no pinned reference server or second LAIR engine was running concurrently, and strict Serve-suite concurrency will be rechecked/caveated at ship time if that external agent host remains present.
 
-### MVP3.10 [v0.3.10] - Refined
+### MVP3.10 [v0.3.10] - In Progress
 
 Token budgets are configured per model: a reasoning budget and a response budget, each overridable per request.
 
@@ -910,7 +910,7 @@ Token budgets are configured per model: a reasoning budget and a response budget
 
 #### Implementation Items
 
-- [_] Per-model budget configuration — model-level `max_reasoning_tokens` and `max_response_tokens` defaults with load-time validation, absent meaning unbudgeted (see DN-M310-1, DN-M310-2).
+- [✓] Per-model budget configuration — model-level `max_reasoning_tokens` and `max_response_tokens` defaults with load-time validation, absent meaning unbudgeted (see DN-M310-1, DN-M310-2).
   - Verify: `dotnet test --filter Category=Config -c Release` — model entries resolve both budgets, invalid or negative values fail at load naming the model and the key, and the hot-reload class reports them as new-requests-only.
 - [_] Request overrides and wire fields — `max_reasoning_tokens` and `max_response_tokens` on chat and completion bodies, clamped to the model ceiling (see DN-M310-2).
   - Verify: `dotnet test --filter Category=Api -c Release` — an override above the model ceiling clamps and reports the clamp; an override on a model with no resolved reasoning region is refused naming the model.

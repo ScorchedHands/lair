@@ -317,6 +317,18 @@ public sealed class GenerationService : IDisposable
                             $"chat requests admitted from now on carry recognized reasoning regions as {ReasoningPolicyNames.Of(replanned.Reasoning)}; sequences already in flight are unaffected"));
                         break;
 
+                    case "models[0].max_reasoning_tokens":
+                        effective = effective with { Models = [effective.Models[0] with { MaxReasoningTokens = candidate.Models[0].MaxReasoningTokens } ] };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"reasoning budget {change.OldValue} -> {change.NewValue}: the configuration in force carries it for requests admitted from now on; sequences already in flight are unaffected"));
+                        break;
+
+                    case "models[0].max_response_tokens":
+                        effective = effective with { Models = [effective.Models[0] with { MaxResponseTokens = candidate.Models[0].MaxResponseTokens } ] };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"response budget {change.OldValue} -> {change.NewValue}: the configuration in force carries it for requests admitted from now on; sequences already in flight are unaffected"));
+                        break;
+
                     case "ui.recent_requests":
                         _metrics?.SetRecentRequestCapacity(candidate.Ui.RecentRequests);
                         effective = effective with { Ui = candidate.Ui };
