@@ -106,7 +106,23 @@ public sealed class GenerationScheduler : IDisposable
             throw new ArgumentOutOfRangeException(nameof(request), $"MaxTokens must be greater than zero, got {request.MaxTokens}.");
         }
 
-        int needed = BlocksNeeded(request.PromptTokens.Length, request.MaxTokens);
+        if (request.ReasoningTokenBudget is < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(request), $"ReasoningTokenBudget must be zero or greater, got {request.ReasoningTokenBudget}.");
+        }
+
+        if (request.ResponseTokenBudget is < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(request), $"ResponseTokenBudget must be zero or greater, got {request.ResponseTokenBudget}.");
+        }
+
+        int generationCeiling = request.GenerationTokenCeiling;
+        if (generationCeiling <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(request), $"the resolved token budget must produce a generation ceiling greater than zero, got {generationCeiling}.");
+        }
+
+        int needed = BlocksNeeded(request.PromptTokens.Length, generationCeiling);
 
         lock (_gate)
         {
@@ -156,6 +172,13 @@ public sealed class GenerationScheduler : IDisposable
         int firstBlock = 0;
         int lastBlock = (promptTokens + maxTokens - 2) / blockTokens;
         return lastBlock - firstBlock + 1;
+    }
+
+    /// <summary>The block count this pool reserves for one scheduled request across its lifetime, using the request's resolved generation ceiling.</summary>
+    public int BlocksNeededFor(ScheduledRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        return BlocksNeeded(request.PromptTokens.Length, request.GenerationTokenCeiling);
     }
 
     /// <summary>

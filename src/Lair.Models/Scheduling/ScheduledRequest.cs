@@ -15,6 +15,17 @@ public sealed record ScheduledRequest
     /// <summary>Maximum number of tokens to generate (the token budget; eos does not count against it).</summary>
     public required int MaxTokens { get; init; }
 
+    /// <summary>Reasoning-token ceiling this sequence was admitted with, when the request resolved one; null means no separate reasoning ceiling.</summary>
+    public int? ReasoningTokenBudget { get; init; } = null;
+
+    /// <summary>Response-token ceiling this sequence was admitted with, when the request resolved one; null means no separate response ceiling.</summary>
+    public int? ResponseTokenBudget { get; init; } = null;
+
+    /// <summary>The generation ceiling the scheduler reserves and stops at: the explicit token budget when no budget pair was resolved, otherwise the explicit ceiling clamped by the resolved reasoning-plus-response sum.</summary>
+    public int GenerationTokenCeiling => ReasoningTokenBudget is null && ResponseTokenBudget is null
+        ? MaxTokens
+        : Math.Min(MaxTokens, (ReasoningTokenBudget ?? 0) + (ResponseTokenBudget ?? 0));
+
     /// <summary>Per-sequence sampling knobs; the scheduler builds one <see cref="Sampler"/> from them.</summary>
     public required SamplingParams Sampling { get; init; }
 

@@ -25,6 +25,9 @@ public sealed record GenerationRequest
     /// <summary>Maximum number of tokens to generate.</summary>
     public int MaxTokens { get; init; } = 128;
 
+    /// <summary>True when the caller supplied <see cref="MaxTokens"/> explicitly. False lets a resolved model budget pair replace today's default ceiling without overloading the OpenAI field.</summary>
+    public bool MaxTokensWasSupplied { get; init; } = true;
+
     /// <summary>Per-request override of the model's reasoning-token ceiling, carried as the value admitted for this request — already clamped to what the loaded model declares. Null carries no override: today's unbudgeted behavior.</summary>
     public int? MaxReasoningTokens { get; init; }
 

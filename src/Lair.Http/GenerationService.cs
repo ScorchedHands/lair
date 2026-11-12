@@ -612,7 +612,10 @@ public sealed class GenerationService : IDisposable
             throw new ContextLengthExceededException(prompt.Count, Model.ContextLength);
         }
 
-        int maxTokens = Math.Min(request.MaxTokens, Model.ContextLength - prompt.Count);
+        ModelConfig modelConfig = EffectiveConfiguration.Models[0];
+        ResolvedTokenBudgets budgets = ResolveTokenBudgets(request, modelConfig, plan);
+        int generationCeiling = ResolveGenerationCeiling(request, budgets);
+        int maxTokens = Math.Min(generationCeiling, Model.ContextLength - prompt.Count);
         if (maxTokens <= 0)
         {
             // The clamp left no budget: the sequence generates nothing and reports the budget as spent.
@@ -630,6 +633,8 @@ public sealed class GenerationService : IDisposable
         int decodedChars = 0;
         bool stopped = false;
         SequenceHandle? handle = null;
+        BudgetStreamState? budgetState = budgets.ReasoningTokens is null && budgets.ResponseTokens is null ? null : new BudgetStreamState();
+        bool budgetCeilingReached = false;
 
         // The stop signal is a cancellation the sequence observes at its next step boundary rather than a call through the
         // handle: the scheduler can invoke the streaming hook for the first sampled token before this call has its handle
@@ -644,6 +649,8 @@ public sealed class GenerationService : IDisposable
         {
             PromptTokens = [.. prompt],
             MaxTokens = maxTokens,
+            ReasoningTokenBudget = budgets.ReasoningTokens,
+            ResponseTokenBudget = budgets.ResponseTokens,
             Sampling = new SamplingParams
             {
                 Temperature = request.Temperature,
@@ -663,6 +670,15 @@ public sealed class GenerationService : IDisposable
                 tracker?.ObserveToken();
 
                 string piece = _tokenizer.Decode([tokenId]);
+                if (budgetState is not null)
+                {
+                    if (budgetState.Feed(piece, budgets.ReasoningTokens, budgets.ResponseTokens))
+                    {
+                        budgetCeilingReached = true;
+                        stopSignal.Cancel();
+                    }
+                }
+
                 if (piece.Length == 0)
                 {
                     return;
@@ -732,7 +748,7 @@ public sealed class GenerationService : IDisposable
         }
         else if (outcome.FinishReason == FinishReason.Canceled)
         {
-            finishReason = "cancelled";
+            finishReason = budgetCeilingReached && !stopped && !cancellationToken.IsCancellationRequested ? "length" : "cancelled";
         }
         else if (outcome.FinishReason == FinishReason.Eos)
         {
@@ -773,6 +789,11 @@ public sealed class GenerationService : IDisposable
         // leaves the text byte-for-byte as generated, which is what every model serves today. Recognition runs before call
         // reading so a call markup inside reasoning that gets stripped never reaches the parser as a call. The plan in force
         // is the one this sequence was admitted on, not whatever a reload has since resolved.
+        if (budgetState is not null)
+        {
+            text = ApplyBudgetStreamState(text, budgetState);
+        }
+
         ReasoningDetection reasoning = plan.Reasoning == ReasoningPolicy.Strip
             ? ReasoningRecognition.Strip(text)
             : new ReasoningDetection(ReasoningRecognition.FindRegions(text), text);
@@ -1028,6 +1049,173 @@ public sealed class GenerationService : IDisposable
         }
 
         return resolved;
+    }
+
+    private ResolvedTokenBudgets ResolveTokenBudgets(GenerationRequest request, ModelConfig modelConfig, OutputParserPlan plan)
+    {
+        int? reasoning = request.MaxReasoningTokens;
+        if (reasoning is not null)
+        {
+            if (!plan.HasResolvedReasoningRegion)
+            {
+                throw new ArgumentException(
+                    $"model '{Model.Id}' resolves no reasoning region, so 'max_reasoning_tokens' cannot be applied to it: declare max_reasoning_tokens for the model or omit the field.",
+                    nameof(request));
+            }
+
+            if (modelConfig.MaxReasoningTokens is int reasoningCeiling && reasoning > reasoningCeiling)
+            {
+                reasoning = reasoningCeiling;
+            }
+        }
+        else
+        {
+            reasoning = modelConfig.MaxReasoningTokens;
+        }
+
+        int? response = request.MaxResponseTokens;
+        if (response is null)
+        {
+            response = modelConfig.MaxResponseTokens;
+        }
+        else if (modelConfig.MaxResponseTokens is int responseCeiling && response > responseCeiling)
+        {
+            response = responseCeiling;
+        }
+
+        if (reasoning is < 1)
+        {
+            throw new ArgumentException($"'max_reasoning_tokens' must be 1 or greater, got {reasoning}.", nameof(request));
+        }
+
+        if (response is < 1)
+        {
+            throw new ArgumentException($"'max_response_tokens' must be 1 or greater, got {response}.", nameof(request));
+        }
+
+        return new ResolvedTokenBudgets(reasoning, response);
+    }
+
+    private static int ResolveGenerationCeiling(GenerationRequest request, ResolvedTokenBudgets budgets)
+    {
+        if (budgets.ReasoningTokens is null && budgets.ResponseTokens is null)
+        {
+            return request.MaxTokens;
+        }
+
+        int sum = (budgets.ReasoningTokens ?? 0) + (budgets.ResponseTokens ?? 0);
+        if (sum <= 0)
+        {
+            return request.MaxTokens;
+        }
+
+        return request.MaxTokensWasSupplied ? Math.Min(request.MaxTokens, sum) : sum;
+    }
+
+    private static string ApplyBudgetStreamState(string text, BudgetStreamState state)
+    {
+        if (state.SyntheticCloseChar >= 0)
+        {
+            int closeAt = Math.Min(state.SyntheticCloseChar, text.Length);
+            text = text[..closeAt] + ReasoningRecognition.CloseMarkup + text[closeAt..];
+        }
+
+        if (state.ResponseStopChar >= 0)
+        {
+            int stopAt = state.ResponseStopChar;
+            if (state.SyntheticCloseChar >= 0 && stopAt >= state.SyntheticCloseChar)
+            {
+                stopAt += ReasoningRecognition.CloseMarkup.Length;
+            }
+
+            stopAt = Math.Min(stopAt, text.Length);
+            text = text[..stopAt];
+        }
+
+        return text;
+    }
+
+    private sealed record ResolvedTokenBudgets(int? ReasoningTokens, int? ResponseTokens);
+
+    private sealed class BudgetStreamState
+    {
+        private const string Open = ReasoningRecognition.OpenMarkup;
+        private const string Close = ReasoningRecognition.CloseMarkup;
+
+        private readonly List<string> _pieces = [];
+        private int _charPos;
+        private bool _inReasoning;
+
+        public int ReasoningTokens;
+        public int VisibleTokens;
+        public int SyntheticCloseChar = -1;
+        public int ResponseStopChar = -1;
+        public bool ReasoningCeilingReached;
+        public bool ResponseCeilingReached;
+
+        public bool Feed(string piece, int? reasoningCeiling, int? responseCeiling)
+        {
+            ArgumentNullException.ThrowIfNull(piece);
+
+            _pieces.Add(piece);
+
+            bool startsInReasoning = _inReasoning;
+            bool tokenIsReasoning = startsInReasoning || piece.Contains(Open, StringComparison.Ordinal);
+
+            int scan = 0;
+            while (scan < piece.Length)
+            {
+                if (!_inReasoning)
+                {
+                    int open = piece.IndexOf(Open, scan, StringComparison.Ordinal);
+                    if (open < 0)
+                    {
+                        break;
+                    }
+
+                    _inReasoning = true;
+                    scan = open + Open.Length;
+                }
+                else
+                {
+                    int close = piece.IndexOf(Close, scan, StringComparison.Ordinal);
+                    if (close < 0)
+                    {
+                        break;
+                    }
+
+                    _inReasoning = false;
+                    scan = close + Close.Length;
+                }
+            }
+
+            _charPos += piece.Length;
+
+            if (tokenIsReasoning)
+            {
+                ReasoningTokens++;
+            }
+            else
+            {
+                VisibleTokens++;
+            }
+
+            if (reasoningCeiling is int reasoningLimit && ReasoningTokens == reasoningLimit && _inReasoning)
+            {
+                ReasoningCeilingReached = true;
+                SyntheticCloseChar = _charPos;
+                _inReasoning = false;
+            }
+
+            if (responseCeiling is int responseLimit && !tokenIsReasoning && VisibleTokens == responseLimit)
+            {
+                ResponseCeilingReached = true;
+                ResponseStopChar = _charPos;
+                return true;
+            }
+
+            return false;
+        }
     }
 
     private static int StopIndex(string text, IReadOnlyList<string>? stopStrings)
