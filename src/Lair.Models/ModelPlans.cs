@@ -10,8 +10,10 @@ namespace Lair.Models;
 /// <see cref="ModelProfiles"/>, the geometry is read from the profile's metadata prefix, the vocabulary size
 /// comes from the declared key or the tokenizer vocabulary length, the attention score window comes from the
 /// declared <c>&lt;prefix&gt;attention.sliding_window</c> (unbounded when the key is absent), and the tensor map
-/// comes from the profile together with the window interleave that decides which layers that window masks. The
-/// rope scaling resolves the declared <c>&lt;prefix&gt;rope.scaling.*</c> metadata into a scaling plan: an absent
+/// comes from the profile together with the window interleave that decides which layers that window masks. The rotary
+/// base those masked layers rotate at reads <c>&lt;prefix&gt;rope.freq_base_swa</c>, resolving to the same base an
+/// undeclared global frequency takes when the key is absent. The rope scaling resolves the declared
+/// <c>&lt;prefix&gt;rope.scaling.*</c> metadata into a scaling plan: an absent
 /// variant declaration keeps the standard unscaled rotation, the declared <c>yarn</c> variant resolves the
 /// multiplier, original context length, attention factor, correction scale, and beta pair, and any other variant
 /// declaration fails at load naming the key and the value. The rotary slice resolves the declared
@@ -186,7 +188,13 @@ public static class ModelPlans
 
         float ropeTheta = metadata.Has(prefix + "rope.freq_base")
             ? (float)metadata.Get(prefix + "rope.freq_base").AsDouble()
-            : 10_000f;
+            : ModelPlan.DefaultRopeTheta;
+
+        // The declared rotary base for the layers this profile's interleave narrows to its window: an absent key means
+        // the same base a file declaring no rotary frequency at all is read at. A declared value must land in the float
+        // range as a positive finite number — a non-positive, NaN, infinite, or out-of-range declaration fails naming
+        // the key and the declared value. Which layers it reaches is the plan's per-layer window resolution, not this call.
+        float ropeWindowedTheta = ResolveRopeBase(metadata, prefix + "rope.freq_base_swa");
 
         if (!metadata.Has(prefix + "attention.layer_norm_rms_epsilon"))
         {
@@ -265,6 +273,7 @@ public static class ModelPlans
             HeadDim = headDim,
             IntermediateSize = ffn,
             RopeTheta = ropeTheta,
+            RopeWindowedTheta = ropeWindowedTheta,
             EpsRmsNorm = eps,
             EpsLayerNorm = epsLayerNorm,
             VocabSize = vocab,
@@ -482,6 +491,38 @@ public static class ModelPlans
         }
 
         return cap;
+    }
+
+    // Shared rotary-base resolution for the windowed base: an absent key means ModelPlan.DefaultRopeTheta, the value a
+    // file declaring no rotary frequency is read at. A declared key is read as a double and must land in the float range
+    // as a positive finite number — a non-positive, NaN, infinite, or out-of-range declaration fails the load with a
+    // message naming the key and the declared value.
+    private static float ResolveRopeBase(GgufMetadata metadata, string key)
+    {
+        if (!metadata.Has(key))
+        {
+            return ModelPlan.DefaultRopeTheta;
+        }
+
+        double declared;
+        try
+        {
+            declared = metadata.Get(key).AsDouble();
+        }
+        catch (GgufException ex)
+        {
+            throw new ModelException($"GGUF metadata key '{key}' must be a number", ex);
+        }
+
+        float baseValue = (float)declared;
+        if (!float.IsFinite(baseValue) || baseValue <= 0f)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{key}' declares {declared.ToString(CultureInfo.InvariantCulture)}; " +
+                "rotary base values must be positive finite numbers");
+        }
+
+        return baseValue;
     }
 
     // Shared block-norm epsilon resolution: an absent key means zero. A declared key is read as a double and must

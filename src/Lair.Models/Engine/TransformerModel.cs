@@ -181,6 +181,8 @@ public sealed class TransformerModel : IDisposable
 
     private readonly float[] _cos;          // maxContext * rope pair count
     private readonly float[] _sin;
+    private readonly float[]? _cosWindowed; // the same shape again at a second base, or null when every layer shares one
+    private readonly float[]? _sinWindowed;
     private readonly int _ropeHalf;         // pairs the rotation covers: the declared slice, or the full head
     private readonly float _attnScale;      // head-dimension score gain times the variant's attention factor
 
@@ -534,25 +536,21 @@ public sealed class TransformerModel : IDisposable
         // scaling plan builds the variant's tables over the slice instead of the unscaled full-head tables.
         _cos = new float[maxContextTokens * _ropeHalf];
         _sin = new float[maxContextTokens * _ropeHalf];
-        if (Plan.RopeScaling is { } scaling)
+        BuildRotationTables(Plan.RopeTheta, maxContextTokens, _cos, _sin);
+
+        // A plan that resolves a second rotary base for the layers its window interleave narrows carries one more pair of
+        // tables at that base, and each layer then reads whichever pair its own resolved window selects — which is how a
+        // reference graph rotating its local-attention layers at one frequency and its full-attention layers at another is
+        // read the way it computes. One base for every layer keeps the single pair above serving all of them, so nothing
+        // extra is allocated or consulted for any model whose plan resolves no windowed rotation.
+        int windowedLayerCount = CountWindowedLayers();
+        bool splitsRopeBases = Plan.RopeWindowedTheta != Plan.RopeTheta && windowedLayerCount > 0;
+
+        if (splitsRopeBases)
         {
-            LayerOps.BuildRopeScalingTables(
-                Plan.RopeTheta,
-                Plan.HeadDim,
-                2 * _ropeHalf,
-                maxContextTokens,
-                scaling.Multiplier,
-                scaling.OriginalContextLength,
-                scaling.AttentionFactor,
-                scaling.CorrectionScale,
-                scaling.BetaFast,
-                scaling.BetaSlow,
-                _cos,
-                _sin);
-        }
-        else
-        {
-            LayerOps.BuildRopeTables(Plan.RopeTheta, Plan.HeadDim, maxContextTokens, _cos, _sin);
+            _cosWindowed = new float[maxContextTokens * _ropeHalf];
+            _sinWindowed = new float[maxContextTokens * _ropeHalf];
+            BuildRotationTables(Plan.RopeWindowedTheta, maxContextTokens, _cosWindowed, _sinWindowed);
         }
 
         // A positional plan that is not the plain full-head rotation is announced once at Open, in the style of the
@@ -571,6 +569,20 @@ public sealed class TransformerModel : IDisposable
                 $"original_context_length={(plan?.OriginalContextLength ?? 0)} " +
                 $"attention_factor={(plan?.AttentionFactor ?? 1f).ToString(CultureInfo.InvariantCulture)} " +
                 $"rotary_dimensions={(Plan.RopeRotaryDimensions > 0 ? Plan.RopeRotaryDimensions : Plan.HeadDim)}");
+        }
+
+        // A model rotating its windowed layers at a base other than the one its unbounded layers rotate at announces that
+        // split once at Open, in the same style: both bases and how many layers of each kind the resolved interleave puts
+        // them on. A plan carrying one base for every layer stays unannounced so this line only ever names a real split.
+        if (logLine is not null && splitsRopeBases)
+        {
+            GgufMetadata metadata = file.Metadata;
+            string modelName = metadata.Has("general.name") ? metadata.Get("general.name").AsString() : "";
+            logLine(
+                $"rope_bases model='{(modelName.Length > 0 ? modelName : file.Path)}' " +
+                $"architecture='{Plan.Architecture}' global_base={Plan.RopeTheta.ToString(CultureInfo.InvariantCulture)} " +
+                $"windowed_base={Plan.RopeWindowedTheta.ToString(CultureInfo.InvariantCulture)} " +
+                $"windowed_layers={windowedLayerCount} unwindowed_layers={Plan.LayerCount - windowedLayerCount}");
         }
     }
 
@@ -700,8 +712,8 @@ public sealed class TransformerModel : IDisposable
                 ApplyQkNorm(_batchQ.AsSpan(s * qkvRegion, qkvRegion), _attnQNorm[l]);
                 ApplyQkNorm(_batchK.AsSpan(s * kvRegion, kvRegion), _attnKNorm[l]);
 
-                ApplyRopeHeads(_batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, positions[s]);
-                ApplyRopeHeads(_batchK.AsSpan(s * kvRegion, kvRegion), Plan.KvHeadCount, positions[s]);
+                ApplyRopeHeads(_batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, positions[s], windowedLayer: layerWindow > 0);
+                ApplyRopeHeads(_batchK.AsSpan(s * kvRegion, kvRegion), Plan.KvHeadCount, positions[s], windowedLayer: layerWindow > 0);
 
                 kvs[s].WriteK(positions[s], l, _batchK.AsSpan(s * kvRegion, kvRegion));
                 kvs[s].WriteV(positions[s], l, _batchV.AsSpan(s * kvRegion, kvRegion));
@@ -928,8 +940,8 @@ public sealed class TransformerModel : IDisposable
                         ApplyQkNorm(chunkQ.AsSpan(i * qkvRegion, qkvRegion), _attnQNorm[l]);
                         ApplyQkNorm(chunkK.AsSpan(i * kvRegion, kvRegion), _attnKNorm[l]);
 
-                        ApplyRopeHeads(chunkQ.AsSpan(i * qkvRegion, qkvRegion), Plan.HeadCount, firstPos + i);
-                        ApplyRopeHeads(chunkK.AsSpan(i * kvRegion, kvRegion), Plan.KvHeadCount, firstPos + i);
+                        ApplyRopeHeads(chunkQ.AsSpan(i * qkvRegion, qkvRegion), Plan.HeadCount, firstPos + i, windowedLayer: layerWindow > 0);
+                        ApplyRopeHeads(chunkK.AsSpan(i * kvRegion, kvRegion), Plan.KvHeadCount, firstPos + i, windowedLayer: layerWindow > 0);
 
                         int position = c * EncodeChunkTokens + i; // sequence-relative index into the streams
                         kv.WriteK(basePosition + position, l, chunkK.AsSpan(i * kvRegion, kvRegion));
@@ -1102,8 +1114,8 @@ public sealed class TransformerModel : IDisposable
             ApplyQkNorm(_q, _attnQNorm[l]);
             ApplyQkNorm(_k, _attnKNorm[l]);
 
-            ApplyRopeHeads(_q, Plan.HeadCount, position);
-            ApplyRopeHeads(_k, Plan.KvHeadCount, position);
+            ApplyRopeHeads(_q, Plan.HeadCount, position, windowedLayer: layerWindow > 0);
+            ApplyRopeHeads(_k, Plan.KvHeadCount, position, windowedLayer: layerWindow > 0);
 
             kv.WriteK(position, l, _k);
             kv.WriteV(position, l, _v);
@@ -1168,11 +1180,16 @@ public sealed class TransformerModel : IDisposable
         ApplyFinalLogitSoftcap(_logits);
     }
 
-    /// <summary>Rotates every head region of data in place at the given position using the precomputed tables, with the pairing the plan's resolved RoPE strategy selects.</summary>
-    private void ApplyRopeHeads(Span<float> data, int headCount, int position)
+    /// <summary>Rotates every head region of data in place at the given position using the precomputed tables, with the pairing the plan's resolved RoPE strategy selects and the rotary base this layer resolves.</summary>
+    private void ApplyRopeHeads(Span<float> data, int headCount, int position, bool windowedLayer)
     {
-        ReadOnlySpan<float> cosAtPosition = _cos.AsSpan(position * _ropeHalf, _ropeHalf);
-        ReadOnlySpan<float> sinAtPosition = _sin.AsSpan(position * _ropeHalf, _ropeHalf);
+        // A model whose windowed layers resolve a second rotary base carries that pair here; every other model leaves it
+        // null and rotates at its one base whatever the flag says.
+        float[] cosTable = windowedLayer && _cosWindowed is { } windowedCos ? windowedCos : _cos;
+        float[] sinTable = windowedLayer && _sinWindowed is { } windowedSin ? windowedSin : _sin;
+
+        ReadOnlySpan<float> cosAtPosition = cosTable.AsSpan(position * _ropeHalf, _ropeHalf);
+        ReadOnlySpan<float> sinAtPosition = sinTable.AsSpan(position * _ropeHalf, _ropeHalf);
 
         for (int h = 0; h < headCount; h++)
         {
@@ -1307,6 +1324,50 @@ public sealed class TransformerModel : IDisposable
     // the unbounded ones select the whole table, on both the causal decode path and the encoder path. Storage is not
     // narrowed: every position's K/V is still written and stays readable for whichever layer attends it.
     private int LayerAttentionWindow(int layer) => Plan.AttentionWindowForLayer(layer);
+
+    // How many layers the plan's resolved interleave narrows to its window: the only case in which a second rotary base
+    // reaches anything, since an unbounded layer rotates at the plan's own base whatever that second base declares.
+    private int CountWindowedLayers()
+    {
+        int count = 0;
+
+        for (int layer = 0; layer < Plan.LayerCount; layer++)
+        {
+            if (Plan.AttentionWindowForLayer(layer) > 0)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    // The angle tables one rotary base rotates at, built the way this model's positional shape says — a resolved scaling
+    // plan over the declared slice, an unscaled plan across the full head — so every pair this engine carries differs from
+    // its neighbour only in the base it was built for.
+    private void BuildRotationTables(float theta, int maxContextTokens, float[] cos, float[] sin)
+    {
+        if (Plan.RopeScaling is { } scaling)
+        {
+            LayerOps.BuildRopeScalingTables(
+                theta,
+                Plan.HeadDim,
+                2 * _ropeHalf,
+                maxContextTokens,
+                scaling.Multiplier,
+                scaling.OriginalContextLength,
+                scaling.AttentionFactor,
+                scaling.CorrectionScale,
+                scaling.BetaFast,
+                scaling.BetaSlow,
+                cos,
+                sin);
+        }
+        else
+        {
+            LayerOps.BuildRopeTables(theta, Plan.HeadDim, maxContextTokens, cos, sin);
+        }
+    }
 
     private void ApplyActivation(Span<float> gate, ReadOnlySpan<float> up)
     {

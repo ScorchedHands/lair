@@ -199,4 +199,12 @@ public enum WindowInterleave
     /// layer unbounded whatever the pattern.
     /// </summary>
     AlternatingLocalFirst,
+
+    /// <summary>
+    /// The last layer of every group of six — the layers whose index leaves a remainder of five when divided by six —
+    /// attends the whole range and every other layer narrows its score range to the declared window, which is how the
+    /// reference applies this family's window: it declares the stride itself and reads no per-layer declaration for it.
+    /// A declared window of <c>0</c> leaves every layer unbounded whatever the pattern.
+    /// </summary>
+    SixLayerGroupsLocalFirst,
 }

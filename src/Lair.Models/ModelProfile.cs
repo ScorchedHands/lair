@@ -77,9 +77,11 @@ public sealed record ModelProfile
 
     /// <summary>
     /// Which layers this architecture's forward masks with its declared attention window: a profile defaults to
-    /// <see cref="Lair.Models.WindowInterleave.AllLayers"/>, and
+    /// <see cref="Lair.Models.WindowInterleave.AllLayers"/>,
     /// <see cref="Lair.Models.WindowInterleave.AlternatingLocalFirst"/> narrows the mask to the even-indexed layers
-    /// and leaves the odd-indexed ones unbounded, which is how the gemma2 reference graph applies its window. No
+    /// and leaves the odd-indexed ones unbounded, which is how the gemma2 reference graph applies its window, and
+    /// <see cref="Lair.Models.WindowInterleave.SixLayerGroupsLocalFirst"/> leaves the last layer of each group of six
+    /// unbounded and masks the rest, which is how the reference applies this family's window. No
     /// metadata key selects it: the profile decides, and a declared window of <c>0</c> is unbounded whatever the
     /// pattern.
     /// </summary>
