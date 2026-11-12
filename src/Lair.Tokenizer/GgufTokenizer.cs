@@ -9,9 +9,11 @@ namespace Lair.Tokenizer;
 /// Tokenizer for GGUF-embedded vocabularies. The vocabulary implementation is selected at load
 /// from <c>tokenizer.ggml.model</c>: the BPE path follows llama.cpp's llama-vocab BPE semantics
 /// (codepoint pre-splitting, GPT-2 byte encoding, merge-rank BPE, special-token partitioning,
-/// byte fallback), and the SentencePiece path encodes by greedy longest-match over the piece
-/// vocabulary with <c>tokenizer.ggml.scores</c> tie-breaking and <c>&lt;0xNN&gt;</c> byte
-/// fallback. Special-token partitioning is shared by both paths.
+/// byte fallback), and the SentencePiece path spells word boundaries with the U+2581 marker —
+/// a sequence starts at a boundary and literal spaces are consumed as markers before pieces
+/// compete for the text through score-ordered adjacent-piece merging, falling back to the
+/// vocabulary's <c>&lt;0xNN&gt;</c> byte pieces where no piece covers a position. Special-token
+/// partitioning is shared by both paths.
 /// </summary>
 public sealed class GgufTokenizer
 {
@@ -180,8 +182,10 @@ public sealed class GgufTokenizer
     public int EotId { get; }
 
     /// <summary>Declared value of <c>tokenizer.ggml.add_space_prefix</c> (default <see langword="true"/>).
-    /// Reported for parity diagnostics; the supported profiles' pre-split matches the pinned reference
-    /// whether the key is true or false.</summary>
+    /// For a SentencePiece vocabulary it gates the word-boundary marker prepended at sequence start and
+    /// after each special token; literal spaces are still spelled as markers when it is false. For BPE
+    /// vocabularies it is read for parity diagnostics only: the supported profiles' pre-split matches
+    /// the pinned reference whether the key is true or false.</summary>
     public bool AddSpacePrefix => _addSpacePrefix;
 
     public int VocabSize => _pieces.Length;
@@ -326,14 +330,20 @@ public sealed class GgufTokenizer
     }
 
     /// <summary>
-    /// SPM decode: joins the pieces, maps the <c>▁</c> word-start marker to a space except at the
-    /// start of the sequence, and reassembles the <c>&lt;0xNN&gt;</c> byte pieces as UTF-8. Control
-    /// ids flush the byte window and honor <paramref name="includeSpecial"/> exactly as the BPE path does.
+    /// SPM decode: joins the pieces, maps the <c>▁</c> word-start marker to a space — dropping it when
+    /// it opens the first rendered piece in a vocabulary that declares <c>add_space_prefix=true</c>, as
+    /// the reference's leading-space strip does there and not otherwise — and reassembles the
+    /// <c>&lt;0xNN&gt;</c> byte pieces as UTF-8. Control ids flush the byte window and honor
+    /// <paramref name="includeSpecial"/> exactly as the BPE path does.
     /// </summary>
     private string DecodePieces(IReadOnlyList<int> ids, bool includeSpecial)
     {
         List<byte> bytes = new(ids.Count * 4);
         StringBuilder text = new();
+
+        // The reference strips a leading space only from the first token slot of the rendered sequence,
+        // and only when add_space_prefix is declared; every later slot keeps its marker's space.
+        bool stripLeadingSpace = _addSpacePrefix;
 
         foreach (int id in ids)
         {
@@ -351,6 +361,7 @@ public sealed class GgufTokenizer
                     text.Append(_pieces[id]);
                 }
 
+                stripLeadingSpace = false;
                 continue;
             }
 
@@ -360,10 +371,12 @@ public sealed class GgufTokenizer
                 continue;
             }
 
-            if (piece[0] == WordStartMarker && text.Length == 0 && bytes.Count == 0)
+            if (piece[0] == WordStartMarker && stripLeadingSpace)
             {
                 piece = piece[1..];
             }
+
+            stripLeadingSpace = false;
 
             if (piece.Length == 0)
             {
@@ -419,19 +432,32 @@ public sealed class GgufTokenizer
             ids.Add(BosId);
         }
 
+        // SentencePiece word-boundary state: a sequence starts at a boundary, and every special token
+        // re-opens one for the text run that follows it. Raw-text runs spell their literal spaces as
+        // markers before pieces compete for them.
+        bool atWordBoundary = true;
+
         foreach (Fragment fragment in PartitionSpecial(text))
         {
             if (fragment.TokenId != NullToken)
             {
                 ids.Add(fragment.TokenId);
+                atWordBoundary = true;
             }
             else if (_model == VocabularyModel.Bpe)
             {
                 TokenizeText(fragment.Text, ids);
             }
-            else
+            else if (fragment.Text.Length > 0)
             {
-                TokenizePieces(fragment.Text, ids);
+                string spelled = EscapeWhitespace(fragment.Text);
+                if (_addSpacePrefix && atWordBoundary)
+                {
+                    spelled = WordStartMarker + spelled;
+                }
+
+                MergePieces(spelled, ids);
+                atWordBoundary = false;
             }
         }
 
@@ -508,97 +534,168 @@ public sealed class GgufTokenizer
         }
     }
 
-    /// <summary>
-    /// SPM piece selection: greedy longest-match over the piece vocabulary, ties at the same
-    /// match length resolved by the higher <c>tokenizer.ggml.scores</c> value (equal scores keep
-    /// the lower vocabulary index). Text no piece covers falls to the vocabulary's byte pieces.
-    /// </summary>
-    private void TokenizePieces(string text, List<int> output)
+    // The SentencePiece spelling of whitespace: literal spaces become the word-start marker, while tabs
+    // and newlines stay verbatim for the vocabulary's own pieces to name them.
+    private static string EscapeWhitespace(string text)
     {
-        Span<char> single = stackalloc char[2];
-        Span<byte> utf8 = stackalloc byte[4];
-
-        int position = 0;
-        while (position < text.Length)
+        int first = text.IndexOf(' ');
+        if (first < 0)
         {
-            int bestId = NullToken;
-            int bestLength = 0;
-            float bestScore = float.NegativeInfinity;
-            for (int id = 0; id < _pieces.Length; id++)
-            {
-                // The vocabulary's byte pieces are the fallback, not match candidates; unused
-                // entries and empty pieces never match.
-                if (_types[id] is TokenTypeUnused or TokenTypeByte)
-                {
-                    continue;
-                }
-
-                string piece = _pieces[id];
-                if (piece.Length == 0 || piece.Length < bestLength)
-                {
-                    continue;
-                }
-
-                // A candidate must fit the remaining input and match at the scan position before it
-                // can beat or tie the current best.
-                if (position + piece.Length > text.Length || !PieceMatches(text, position, piece))
-                {
-                    continue;
-                }
-
-                if (bestId == NullToken || piece.Length > bestLength || _scores[id] > bestScore)
-                {
-                    bestId = id;
-                    bestLength = piece.Length;
-                    bestScore = _scores[id];
-                }
-            }
-
-            if (bestId != NullToken)
-            {
-                output.Add(bestId);
-                position += bestLength;
-                continue;
-            }
-
-            // No piece covers the remaining text: the vocabulary's <0xNN> byte pieces carry it.
-            // An SPM piece is literal text, so an uncovered codepoint falls back to its own UTF-8
-            // bytes — no visual-map detour (byte_fallback=false keeps the unknown/drop posture).
-            if (!_byteFallback)
-            {
-                if (UnkId != NullToken)
-                {
-                    output.Add(UnkId);
-                }
-
-                position += 1;
-                continue;
-            }
-
-            int charCount = CopyRune(text, position, single);
-            int byteCount = Encoding.UTF8.GetBytes(single[..charCount], utf8);
-            for (int i = 0; i < byteCount; i++)
-            {
-                EmitByteToken(utf8[i], output);
-            }
-
-            position += charCount;
+            return text;
         }
+
+        StringBuilder spelled = new(text.Length + 8);
+        spelled.Append(text, 0, first);
+        for (int i = first; i < text.Length; i++)
+        {
+            char ch = text[i];
+            spelled.Append(ch == ' ' ? WordStartMarker : ch);
+        }
+
+        return spelled.ToString();
     }
 
-    // A piece matches at the scan position when its text equals the input there, with one spelling
-    // exception: a ▁-prefixed piece also covers a literal space in the input (the word-start marker
-    // is how the vocabulary spells a word boundary). The byte fallback keeps the original character.
-    private static bool PieceMatches(string text, int position, string piece)
+    /// <summary>
+    /// SentencePiece merge session over boundary-spelled text: each codepoint starts as its own symbol,
+    /// adjacent symbols are merged while their concatenation names a vocabulary piece, and the candidate
+    /// merge with the highest <c>tokenizer.ggml.scores</c> value is applied first (equal scores resolve
+    /// leftmost). A final run that names no piece splits back along its recorded merges; an unmergeable
+    /// single falls to its own UTF-8 bytes through the vocabulary's byte pieces.
+    /// </summary>
+    private void MergePieces(string text, List<int> output)
     {
-        if (piece[0] == WordStartMarker && text[position] != WordStartMarker)
+        int capacity = Math.Max(text.Length, 1);
+        int[] start = new int[capacity];
+        int[] length = new int[capacity];
+        int[] previous = new int[capacity];
+        int[] next = new int[capacity];
+
+        // A symbol is one whole codepoint: a surrogate pair stays together so its UTF-8 bytes never split.
+        int count = 0;
+        for (int position = 0; position < text.Length;)
         {
-            return text[position] == ' '
-                && position + 1 < text.Length
-                && string.CompareOrdinal(text, position + 1, piece, 1, piece.Length - 1) == 0;
+            int charCount = CodepointLength(text, position);
+            start[count] = position;
+            length[count] = charCount;
+            previous[count] = count - 1;
+            next[count] = -1;
+            position += charCount;
+            count++;
         }
 
-        return string.CompareOrdinal(text, position, piece, 0, piece.Length) == 0;
+        for (int i = 0; i + 1 < count; i++)
+        {
+            next[i] = i + 1;
+        }
+
+        if (count == 0)
+        {
+            return;
+        }
+
+        // The recorded halves of every merge the queue saw, keyed by the merged text: a later recording
+        // of the same concatenation replaces an earlier one, as the reference map does.
+        Dictionary<string, (int Left, int Right)> revMerge = new(StringComparer.Ordinal);
+
+        PriorityQueue<SpmBigram, (float Score, int Left)> queue =
+            new(Comparer<(float Score, int Left)>.Create((a, b) =>
+                a.Score != b.Score ? b.Score.CompareTo(a.Score) : a.Left.CompareTo(b.Left)));
+
+        void TryAddBigram(int left, int right)
+        {
+            if (left < 0 || right < 0)
+            {
+                return;
+            }
+
+            // Merged runs stay contiguous in the spelled text, so the concatenation is one substring.
+            string merged = text.Substring(start[left], length[left] + length[right]);
+            if (!_pieceToId.TryGetValue(merged, out int id))
+            {
+                return;
+            }
+
+            queue.Enqueue(new SpmBigram(left, right, _scores[id], length[left] + length[right]), (_scores[id], left));
+            revMerge[merged] = (left, right);
+        }
+
+        // Seed every adjacent pair, then keep applying the best candidate merge for as long as one exists.
+        for (int i = 1; i < count; i++)
+        {
+            TryAddBigram(i - 1, i);
+        }
+
+        while (queue.TryDequeue(out SpmBigram bigram, out _))
+        {
+            int left = bigram.Left;
+            int right = bigram.Right;
+
+            // A candidate whose symbols already merged elsewhere is stale.
+            if (length[left] == 0 || length[right] == 0 || length[left] + length[right] != bigram.Size)
+            {
+                continue;
+            }
+
+            length[left] += length[right];
+            length[right] = 0;
+
+            next[left] = next[right];
+            if (next[right] >= 0)
+            {
+                previous[next[right]] = left;
+            }
+
+            TryAddBigram(previous[left], left);
+            TryAddBigram(left, next[left]);
+        }
+
+        void Resegment(int index)
+        {
+            List<int> todo = [index];
+            while (todo.Count > 0)
+            {
+                int current = todo[^1];
+                todo.RemoveAt(todo.Count - 1);
+
+                string run = text.Substring(start[current], length[current]);
+                if (_pieceToId.TryGetValue(run, out int id))
+                {
+                    output.Add(id);
+                    continue;
+                }
+
+                if (!revMerge.TryGetValue(run, out (int LeftHalf, int RightHalf) halves))
+                {
+                    // No piece names the run and it has no recorded merge: its bytes carry it. An SPM
+                    // byte_fallback=false posture keeps the unknown/drop behavior for uncovered text.
+                    if (!_byteFallback)
+                    {
+                        if (UnkId != NullToken)
+                        {
+                            output.Add(UnkId);
+                        }
+
+                        continue;
+                    }
+
+                    foreach (byte b in Encoding.UTF8.GetBytes(run))
+                    {
+                        EmitByteToken(b, output);
+                    }
+
+                    continue;
+                }
+
+                // Left half first: the recorded pair reproduces the merge that built this run.
+                todo.Add(halves.RightHalf);
+                todo.Add(halves.LeftHalf);
+            }
+        }
+
+        for (int i = 0; i != -1; i = next[i])
+        {
+            Resegment(i);
+        }
     }
 
     // UTF-16 length of the character at position: a surrogate pair counts as one codepoint and is
@@ -610,13 +707,6 @@ public sealed class GgufTokenizer
             && char.IsLowSurrogate(text[position + 1])
             ? 2
             : 1;
-    }
-
-    private static int CopyRune(string text, int position, Span<char> single)
-    {
-        int length = CodepointLength(text, position);
-        text.AsSpan(position, length).CopyTo(single);
-        return length;
     }
 
     private List<string> PreSplit(string text)
@@ -1055,7 +1145,7 @@ public sealed class GgufTokenizer
     }
 
     /// <summary>
-    /// Resolves the piece scores (<c>tokenizer.ggml.scores</c>) that break SPM longest-match ties:
+    /// Resolves the piece scores (<c>tokenizer.ggml.scores</c>) that order SentencePiece merging:
     /// exactly one score per vocabulary entry, or the load fails naming the key and the counts.
     /// </summary>
     private static float[] ReadScores(GgufMetadata metadata, int vocabSize)
@@ -1148,4 +1238,6 @@ public sealed class GgufTokenizer
     private readonly record struct Fragment(string Text, int TokenId);
 
     private readonly record struct BigramEntry(int Left, int Right, string Text);
+
+    private readonly record struct SpmBigram(int Left, int Right, float Score, int Size);
 }

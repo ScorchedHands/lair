@@ -8,11 +8,12 @@ namespace Lair.Tests;
 /// <summary>
 /// Id-for-id tokenizer parity against the pinned llama.cpp b12032 build: token sequences captured from
 /// <c>llama-server /tokenize</c> (add_special=false, parse_special=false — the same surface
-/// <see cref="GgufTokenizer.Encode"/> exposes) for both real fixtures are compared against LAIR's
-/// <c>Encode</c> (see scripts/generate-tokenizer-parity.ps1). Guards: the model file's sha256 must match
-/// the fixture and the model's <c>tokenizer.ggml.pre</c> must match the profile the fixture was captured
-/// for. The whole category skips cleanly when a fixture or its pinned model file is absent; the fixtures
-/// are committed, so the comparisons never need llama.cpp.
+/// <see cref="GgufTokenizer.Encode"/> exposes) for each real fixture are compared against LAIR's
+/// <c>Encode</c>, and SentencePiece fixtures additionally pin <c>Decode(Encode(content)) == content</c>
+/// so both directions of the word-boundary spelling are pinned by data (see scripts/generate-tokenizer-parity.ps1).
+/// Guards: the model file's sha256 must match the fixture and the model's <c>tokenizer.ggml.pre</c> must
+/// match the profile the fixture was captured for. The whole category skips cleanly when a fixture or its
+/// pinned model file is absent; the fixtures are committed, so the comparisons never need llama.cpp.
 /// </summary>
 [Trait("Category", "Tokenizer")]
 public sealed class TokenizerParityTests
@@ -20,6 +21,8 @@ public sealed class TokenizerParityTests
     private const string SmolLmFixture = "tests/fixtures/parity-tokenizer-smollm.json";
     private const string Llama32Fixture = "tests/fixtures/parity-tokenizer-llama32.json";
     private const string OlmoFixture = "tests/fixtures/parity-tokenizer-olmo.json";
+    private const string Gemma2Fixture = "tests/fixtures/parity-tokenizer-gemma2.json";
+    private const string Phi3Fixture = "tests/fixtures/parity-tokenizer-phi3.json";
 
     [Fact]
     public void SmolLm_Encode_MatchesPinnedTokenizeOracle() => AssertFixture(SmolLmFixture);
@@ -30,6 +33,15 @@ public sealed class TokenizerParityTests
     // The olmo fixture mixes plain-text server /tokenize goldens with pinned ChatML prompt goldens captured from llama-tokenize.exe --no-bos ... because chat prompts expose declared control tokens; LAIR's Encode matches both id-for-id after the olmo profile split fix.
     [Fact]
     public void Olmo_Encode_MatchesPinnedTokenizeOracle() => AssertFixture(OlmoFixture);
+
+    // SentencePiece pieces are resolved straight from the vocab array: this model declares add_space_prefix=false, so no boundary marker is prepended at sequence start (the first word tokenizes in its bare form) while literal spaces still spell boundaries as markers mid-text; byte-fallback runs for the multibyte and emoji cases.
+    [Fact]
+    public void Gemma2_Encode_MatchesPinnedTokenizeOracle() => AssertFixture(Gemma2Fixture);
+
+    // This file declares tokenizer.ggml.model = llama with no precompiled charsmap, so its SentencePiece pieces are
+    // resolved straight from the vocab array: byte-fallback runs for the multibyte and emoji cases, a boundary marker is prepended at sequence start (add_space_prefix=true), and repeated words re-open one after every separator.
+    [Fact]
+    public void Phi3_Encode_MatchesPinnedTokenizeOracle() => AssertFixture(Phi3Fixture);
 
     private static void AssertFixture(string fixtureRelativePath)
     {
@@ -66,6 +78,11 @@ public sealed class TokenizerParityTests
 
         GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
 
+        // SentencePiece vocabularies pin the encode→decode round trip too: prepending the boundary marker at
+        // sequence start and dropping it from the first rendered piece are exact inverses, so decoding LAIR's
+        // own ids must reproduce every oracle content exactly.
+        bool sentencePiece = gguf.Metadata.GetString("tokenizer.ggml.model", "") is "llama" or "spm";
+
         List<string> mismatches = [];
         foreach (FixtureCase entry in fixture.Cases)
         {
@@ -75,6 +92,17 @@ public sealed class TokenizerParityTests
                 mismatches.Add(
                     $"case '{entry.Name}' content='{entry.Content}': reference [{string.Join(",", entry.Tokens)}] " +
                     $"({string.Join("|", entry.TokensStr)}) vs LAIR [{string.Join(",", actual)}]");
+                continue;
+            }
+
+            if (sentencePiece && actual.Count > 0)
+            {
+                string decoded = tokenizer.Decode(actual);
+                if (decoded != entry.Content)
+                {
+                    mismatches.Add(
+                        $"case '{entry.Name}' content='{entry.Content}': decode of the reference ids rendered '{decoded}'");
+                }
             }
         }
 

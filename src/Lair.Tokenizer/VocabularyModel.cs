@@ -5,9 +5,9 @@ namespace Lair.Tokenizer;
 /// <summary>
 /// The vocabulary implementations <see cref="GgufTokenizer"/> can build, selected from
 /// <c>tokenizer.ggml.model</c> at load: the BPE pipeline (pre-split, byte-encode, merge-rank)
-/// and the SentencePiece pipeline (greedy longest-match over pieces, scores, byte fallback).
-/// The selection axis is orthogonal to the <c>tokenizer.ggml.pre</c> profiles, which are BPE
-/// pre-split machinery.
+/// and the SentencePiece pipeline (word-boundary spelling with the U+2581 marker, score-driven
+/// piece merging, byte fallback). The selection axis is orthogonal to the <c>tokenizer.ggml.pre</c>
+/// profiles, which are BPE pre-split machinery.
 /// </summary>
 internal enum VocabularyModel
 {
