@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using Lair.Http.Monitoring;
 using Lair.Backends.Cpu;
+using Lair.Contracts;
 using Lair.Host.Config;
 using Lair.Kv;
 using Lair.Loader;
@@ -554,7 +555,7 @@ public sealed class GenerationService : IDisposable
                 modelConfig.Name,
                 maxContext,
                 modelConfig.KvBlocks,
-                DominantQuant(file),
+                DominantQuant(file.Tensors),
                 model.Plan.Architecture,
                 model.Plan.VocabSize,
                 ToolParserNames.Of(outputParser.ToolParser),
@@ -1397,13 +1398,24 @@ public sealed class GenerationService : IDisposable
         return ToolChoiceSelection.Function(forced);
     }
 
-    // The file's quantization is the format most of its tensors are stored in; mixed files (quantized
-    // weights with F16 embeddings) report the weights, not the embeddings.
-    private static string DominantQuant(GgufFile file)
+    // The file's quantization is the format its stored bytes bulk lives in, not the format with the most tensors: a model
+    // whose weights are quantized and whose norm vectors sit at full precision reports the weight format even when those
+    // norms outnumber every other group, and a huge-vocabulary model whose embedding carries more stored bytes than all of
+    // its quantized weight groups together reports that format instead. Ties break on tensor count and then on ordinal
+    // format name, so the reported value does not depend on table order. Internal for direct coverage of that rule.
+    internal static string DominantQuant(LogicalTensorTable table)
     {
-        return file.Tensors.Tensors
-            .GroupBy(tensor => tensor.Format)
-            .MaxBy(group => group.Count())!
+        List<IGrouping<QuantFormat, LogicalTensor>> groups = [.. table.Tensors.GroupBy(tensor => tensor.Format)];
+        if (groups.Count == 0)
+        {
+            throw new InvalidOperationException("cannot report the quantization of a file with no tensors");
+        }
+
+        return groups
+            .OrderByDescending(group => group.Sum(tensor => tensor.SizeBytes))
+            .ThenByDescending(group => group.Count())
+            .ThenBy(group => group.Key.ToString(), StringComparer.Ordinal)
+            .First()
             .Key
             .ToString();
     }
