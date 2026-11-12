@@ -4,6 +4,19 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.11] - 2026-11-12
+
+### Added
+
+- SentencePiece vocabularies load and serve: `tokenizer.ggml.model` selects the vocabulary implementation (`llama`/`spm` → SPM, `gpt2`/`llama-bpe` → BPE), orthogonal to the unchanged `tokenizer.ggml.pre` profiles. The SPM path encodes by greedy longest-match over piece vocabularies with score tie-breaking and `<0xNN>` byte fallback, honors word-boundary spelling (U+2581) per file — Gemma-2 declares no space prefix at sequence start, Phi-3 does — and pins `Decode(Encode(text)) == text`. Gemma-2, Gemma-3, and Phi-3 files load through this seam; BPE families are bit-identical.
+- Gemma-3 windowed serving: the profile resolves its hybrid pattern (four windowed layers per group of six) as `SixLayerGroupsLocalFirst` with a second rotary table when local/full bases differ, so a 512-token sliding window serves past itself while KV reads stay bounded — measured live at `metrics_kv_windowed_layers = 22`, read footprint 1728 blocks against 4928 skipped.
+- Phi-3 profile: fused attention arrives as one `blk.N.attn_qkv.weight` buffer addressed by head-region slices, the gate lives in halves of `ffn_up` with no separate gate tensor (an unexpected `ffn_gate.weight` is ignored and reported), rotary applies rotate-half over the declared 96-dimension slice, and an untied Q6_K output head resolves. Parity golden inside the documented band; worst candidate drift 0.4190 nats.
+- New pinned gates: Gemma-2 serve (`Category=Serve|Cache` 22/22), Gemma-3 plan + windowed-serve tests, Phi-3 loader/tokenize cases (`Category=Loader` 231/231, `Category=Tokenizer` 63/63 including id-for-id `/tokenize` goldens for both SPM fixtures with round-trip decode), and a Phi-3 logit fixture inside the band (`Category=Parity` 49/49).
+
+### Fixed
+
+- The advertised quant on `/v1/models` is now measured by stored bytes rather than tensor count, with ties broken deterministically: Gemma-2 reports `Q4_K`, Phi-3 `Q2_K`, and Gemma-3 `Q8_0` because its token embedding (320,864,256 B) outweighs the IQ4_NL weight group; a count-based rule had reported `F32` for that file from 157 norm vectors. Guarded by synthetic and real-fixture cases (`Category=Api`).
+
 ## [0.3.10] - 2026-11-12
 
 ### Added
