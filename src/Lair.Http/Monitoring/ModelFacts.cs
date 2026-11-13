@@ -12,4 +12,5 @@ public sealed record ModelFacts(
     int? ThreadQuota,
     string DecodeDevice,
     string PrefillDevice,
-    string KvResidency);
+    string KvResidency,
+    string PrefillKernel);

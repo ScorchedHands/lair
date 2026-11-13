@@ -6,6 +6,7 @@ using Lair.Contracts;
 using Lair.Host.Config;
 using Lair.Kv;
 using Lair.Loader;
+using Lair.Models;
 using Lair.Models.Engine;
 using Lair.Models.Scheduling;
 using Lair.Sampling;
@@ -158,7 +159,8 @@ public sealed class GenerationService : IDisposable
         config.Models[0].Placement.ThreadQuota,
         config.Models[0].Placement.Device,
         config.Models[0].Placement.Prefill,
-        config.Models[0].Placement.KvResidency);
+        config.Models[0].Placement.KvResidency,
+        config.Engine.PrefillKernel);
 
     // Pinned core ids as compressed ranges ("0-23", "1, 4-6"); null when nothing is pinned.
     private static string? FormatCoreSet(IReadOnlySet<int> cores)
@@ -355,6 +357,25 @@ public sealed class GenerationService : IDisposable
                             $"monitor recent-request ring now holds at most {candidate.Ui.RecentRequests} completed requests; entries beyond the new cap dropped oldest-first"));
                         break;
 
+                    case "engine.prefill_kernel":
+                        PrefillKernel kernel = ResolvePrefillKernel(effective.Models[0].Name, candidate.Engine.PrefillKernel);
+                        try
+                        {
+                            _model.ApplyPrefillKernel(kernel);
+                        }
+                        catch (ModelException ex)
+                        {
+                            // A selection with no kernel in this build is refused naming it and what is missing — the
+                            // engine keeps the route it opened with, and no request runs on a fallback selection.
+                            results.Add(new FieldResult(change, ConfigApplyOutcome.Refused, $"{change.Field} refused: {ex.Message}"));
+                            break;
+                        }
+
+                        effective = effective with { Engine = effective.Engine with { PrefillKernel = candidate.Engine.PrefillKernel } };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"prefill route selection {change.OldValue} -> {change.NewValue}: the engine re-reads it at every prefill window boundary; sequences already mid-window finish that window on the route they started with"));
+                        break;
+
                     default:
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Refused, RefusalDetail(change)));
                         break;
@@ -394,6 +415,19 @@ public sealed class GenerationService : IDisposable
     // the region later requests may bound is that pair, never a markup guessed per request.
     private OutputParserPlan ResolvePlanFor(LairConfig effective) =>
         OutputParserRegistry.Resolve(effective.Models[0].ToolParser, effective.Models[0].ForceFencedTools, _chatTemplateCapabilities, effective.Models[0].Reasoning, effective.Models[0].MaxReasoningTokens is >= 1 ? _reasoningMarkers : null);
+
+    // The kernel selection one configuration resolves to for the forward engine: only the three loader-accepted names
+    // map, and anything else — reachable only on a programmatically built configuration — fails naming model and value
+    // instead of defaulting onto some other route. Whether a mapped selection actually has a kernel is the engine's
+    // answer at open and on apply, not this resolver's.
+    private static PrefillKernel ResolvePrefillKernel(string modelName, string value) => value switch
+    {
+        PrefillKernelNames.GemV => PrefillKernel.GemV,
+        PrefillKernelNames.Tiled => PrefillKernel.Tiled,
+        PrefillKernelNames.Gemm => PrefillKernel.Gemm,
+        _ => throw new InvalidOperationException(
+            $"model '{modelName}' declares engine.prefill_kernel '{value}': 'prefill_kernel' accepts only '{PrefillKernelNames.GemV}', '{PrefillKernelNames.Tiled}', or '{PrefillKernelNames.Gemm}'."),
+    };
 
     private string MarkerRefusalForReload(FieldChange change) =>
         $"{change.Field} refused: {_markerRefusalDetail}. The loaded model's vocabulary cannot carry the reasoning markers a 'max_reasoning_tokens' budget would bound; remove the key from this model entry or serve a model whose vocabulary carries them.";
@@ -462,8 +496,16 @@ public sealed class GenerationService : IDisposable
             }
 
             // Profile resolution events (the generic llama-shaped fallback applied to an unknown architecture)
-            // surface as structured log lines the same way.
-            model = TransformerModel.Open(file, backend, reservedSlots, line => logger?.LogInformation("{ProfileLog}", line));
+            // surface as structured log lines the same way. The configuration's prefill kernel selection reaches the
+            // forward engine here: a reserved value the schema accepts is refused by the engine naming it and its
+            // missing kernel — the posture every unimplemented capability takes — and nothing lands on a route that
+            // was not selected.
+            model = TransformerModel.Open(
+                file,
+                backend,
+                reservedSlots,
+                line => logger?.LogInformation("{ProfileLog}", line),
+                ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel));
             pool = new BlockPool(
                 blockTokens,
                 model.Plan.LayerCount,
@@ -538,6 +580,13 @@ public sealed class GenerationService : IDisposable
                     reasoningRegion.OpenTokenId,
                     reasoningRegion.CloseTokenId);
             }
+
+            // The prefill route the forward engine resolved to is announced in the same style: it reports what this
+            // engine actually runs, and a selection with no kernel never reaches here because opening refused it.
+            logger?.LogInformation(
+                "prefill_kernel model='{Model}' kernel={Kernel}",
+                modelConfig.Name,
+                PrefillKernelNames.Of(model.ResolvedPrefillKernel));
 
             // The sparse-FFN facts a routed block resolves to are reported the same way: they come straight from the
             // model's plan, and only a file that declares experts carries them. A dense model advertises nothing here.

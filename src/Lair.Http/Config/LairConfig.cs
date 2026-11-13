@@ -41,6 +41,13 @@ public sealed record EngineConfig
 
     /// <summary>Largest prompt chunk the scheduler prefills in one step.</summary>
     public int MaxBatchTokens { get; init; } = 512;
+
+    /// <summary>
+    /// Which attention/weight path the engine's prefill route selects: <c>gemv</c> (default — the batched row window
+    /// this build runs), or <c>tiled</c> / <c>gemm</c> (reserved selections the schema accepts and the engine refuses
+    /// at model open naming the missing kernel). A hot edit takes effect from the next prefill window boundary.
+    /// </summary>
+    public string PrefillKernel { get; init; } = "gemv";
 }
 
 /// <summary>One served model and how it is placed on the machine.</summary>

@@ -1,4 +1,5 @@
 using System.Globalization;
+using Lair.Models;
 using YamlDotNet.Core;
 using YamlDotNet.RepresentationModel;
 
@@ -15,7 +16,7 @@ public static class YamlConfigLoader
 
     private static readonly string[] TopLevelKeys = ["server", "engine", "models", "ui"];
     private static readonly string[] ServerKeys = ["bind", "port"];
-    private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens"];
+    private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_kernel"];
     private static readonly string[] UiKeys = ["recent_requests"];
     private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota"];
@@ -40,7 +41,7 @@ public static class YamlConfigLoader
         return new LairConfig
         {
             Server = ParseServer(top),
-            Engine = ParseEngine(top),
+            Engine = ParseEngine(top, models),
             Models = models,
             Ui = ParseUi(top),
         };
@@ -119,7 +120,7 @@ public static class YamlConfigLoader
         return new UiConfig { RecentRequests = recentRequests };
     }
 
-    private static EngineConfig ParseEngine(Dictionary<string, YamlNode> top)
+    private static EngineConfig ParseEngine(Dictionary<string, YamlNode> top, IReadOnlyList<ModelConfig> models)
     {
         const string where = "'engine'";
         if (!top.TryGetValue("engine", out YamlNode? node))
@@ -148,7 +149,17 @@ public static class YamlConfigLoader
             throw new ConfigException($"engine.max_batch_tokens {maxBatchTokens} is invalid: 'max_batch_tokens' must be 1 or greater.");
         }
 
-        return new EngineConfig { Threads = threads, BlockSize = blockSize, MaxBatchTokens = maxBatchTokens };
+        // Prefill kernel selection: gemv (default — the batched row window this build runs) or one of the two
+        // reserved window shapes the engine refuses at model open. An unrecognized value fails naming the served
+        // model and the key with the accepted set, exactly as the per-model choice keys do.
+        string prefillKernel = TryText(keys, "prefill_kernel", "engine.prefill_kernel") ?? PrefillKernelNames.GemV;
+        if (prefillKernel is not (PrefillKernelNames.GemV or PrefillKernelNames.Tiled or PrefillKernelNames.Gemm))
+        {
+            throw new ConfigException(
+                $"engine.prefill_kernel '{prefillKernel}' is invalid for model '{models[0].Name}': 'prefill_kernel' accepts only '{PrefillKernelNames.GemV}', '{PrefillKernelNames.Tiled}', or '{PrefillKernelNames.Gemm}'.");
+        }
+
+        return new EngineConfig { Threads = threads, BlockSize = blockSize, MaxBatchTokens = maxBatchTokens, PrefillKernel = prefillKernel };
     }
 
     private static IReadOnlyList<ModelConfig> ParseModels(Dictionary<string, YamlNode> top)

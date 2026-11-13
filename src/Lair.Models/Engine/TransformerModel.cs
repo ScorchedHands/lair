@@ -57,6 +57,12 @@ public sealed class TransformerModel : IDisposable
     private readonly IBackend _backend;
     private readonly IWeightSource _weights;
 
+    // The resolved prefill kernel selection: pinned at open, re-pointed only through ApplyPrefillKernel, and read
+    // fresh at every window boundary so a hot edit lands from the next window — the same re-read discipline the
+    // scheduler's chunk width keeps. Volatile because the apply path writes it from a caller thread while worker
+    // threads consume it per forward.
+    private volatile PrefillKernel _prefillKernel;
+
     // Only a source this instance created is its own to release: a caller-supplied source stays under the caller's
     // lifetime rules and must outlive the model.
     private readonly bool _ownsWeights;
@@ -210,6 +216,32 @@ public sealed class TransformerModel : IDisposable
     /// <summary>Largest sequence length this model can forward: the extent of its precomputed RoPE tables.</summary>
     public int MaxContextTokens { get; }
 
+    /// <summary>The prefill kernel selection this engine forwards prompt windows through: resolved at open and re-read at every window boundary.</summary>
+    public PrefillKernel ResolvedPrefillKernel => _prefillKernel;
+
+    /// <summary>
+    /// Re-points the engine's prefill path selection. The new value is read fresh at the next prefill window
+    /// boundary, so sequences already mid-window finish that window on the route they started with — the same
+    /// boundary discipline a chunk-width edit keeps. A selection this build has no kernel for is refused naming it
+    /// and what is missing; nothing falls back to the route that works.
+    /// </summary>
+    public void ApplyPrefillKernel(PrefillKernel kernel)
+    {
+        if (kernel != PrefillKernel.GemV)
+        {
+            throw KernelRefusal(kernel);
+        }
+
+        _prefillKernel = kernel;
+    }
+
+    // The one refusal wording an unrunnable prefill selection gets, at open and on apply alike: it names the value,
+    // what the forward engine lacks for it, and the only selection that executes today.
+    private ModelException KernelRefusal(PrefillKernel kernel) => new(
+        $"prefill kernel '{PrefillKernelNames.Of(kernel)}' is not implemented by the forward engine: architecture " +
+        $"'{Plan.Architecture}' selects its prompt windows through this selection and no {PrefillKernelNames.Of(kernel)} attention/weight path exists in this build — only " +
+        $"{PrefillKernelNames.GemV} executes today — set engine.prefill_kernel to '{PrefillKernelNames.GemV}' (or omit it) to run this file");
+
     /// <summary>Opens the engine over a memory-mapped view of the file's own tensor payloads.</summary>
     public static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens) =>
         Open(file, backend, maxContextTokens, logLine: null);
@@ -221,6 +253,14 @@ public sealed class TransformerModel : IDisposable
     /// </summary>
     public static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens, Action<string>? logLine) =>
         new(file, backend, maxContextTokens, null, logLine);
+
+    /// <summary>
+    /// Opens the engine over a memory-mapped view of the file's own tensor payloads with an explicit prefill kernel
+    /// selection: every prompt window forwards through that route. A selection this build has no kernel for is
+    /// refused at open naming it and what is missing — never fallen back to the kernel that happens to work.
+    /// </summary>
+    public static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens, Action<string>? logLine, PrefillKernel prefillKernel) =>
+        new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel);
 
     /// <summary>
     /// Opens the engine with weight payloads supplied by an alternate <see cref="IWeightSource"/>: every tensor read
@@ -247,7 +287,7 @@ public sealed class TransformerModel : IDisposable
     internal static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens, ModelProfile profile, Action<string>? logLine = null) =>
         new(file, backend, maxContextTokens, weights: null, logLine, profile);
 
-    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null)
+    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(backend);
@@ -260,6 +300,17 @@ public sealed class TransformerModel : IDisposable
         _ownsWeights = weights is null;
         _weights = weights ?? new GgufMmapWeightSource(file);
         _fileTensors = file.Tensors;
+
+        // A prefill kernel selection this engine has no kernel for is refused at open, the posture every other
+        // unimplemented capability takes: the selection stays visible in the resolved value's vocabulary, the
+        // refusal names it and what is missing, and nothing falls back to the route that happens to work. The check
+        // lands before any tensor maps, so an unrunnable selection never spends a weight view on it.
+        if (prefillKernel != PrefillKernel.GemV)
+        {
+            throw KernelRefusal(prefillKernel);
+        }
+
+        _prefillKernel = prefillKernel;
 
         if (Plan.HeadDim % 2 != 0)
         {
@@ -679,10 +730,26 @@ public sealed class TransformerModel : IDisposable
 
         for (int offset = 0; offset < n; offset += MaxBatchSequences)
         {
-            PrefillWindow(tokens, offset, Math.Min(MaxBatchSequences, n - offset), basePosition, kv, emitLogits: offset + MaxBatchSequences >= n);
+            RunPrefillWindow(tokens, offset, Math.Min(MaxBatchSequences, n - offset), basePosition, kv, emitLogits: offset + MaxBatchSequences >= n);
         }
 
         return _logits.AsSpan();
+    }
+
+    // The resolved kernel selection decides which window route runs, re-read at every sub-batch so a hot edit lands
+    // from the next boundary: today the only selection with a kernel is the batched row window below, and a selection
+    // this build has no kernel for fails naming it rather than running some other route behind it.
+    private void RunPrefillWindow(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits)
+    {
+        switch (_prefillKernel)
+        {
+            case PrefillKernel.GemV:
+                PrefillWindow(tokens, offset, rows, basePosition, kv, emitLogits);
+                break;
+
+            default:
+                throw KernelRefusal(_prefillKernel);
+        }
     }
 
     // One sub-batch of a prefill window: the rows advance through the whole layer loop together, each holding its

@@ -251,3 +251,47 @@ public enum WindowInterleave
     /// </summary>
     SixLayerGroupsLocalFirst,
 }
+
+/// <summary>
+/// Which attention/weight path a prompt window's forward selects: the batched row window this engine runs today, or
+/// one of the wider window shapes the selection vocabulary reserves. Resolved once per model from
+/// <c>engine.prefill_kernel</c> and read fresh at every prefill window boundary, never re-decided inside a forward.
+/// Selecting a kernel is independent of whether any engine can run it: an unimplemented selection stays visible in
+/// the resolved value and reports at engine open rather than falling back to what happens to work.
+/// </summary>
+public enum PrefillKernel
+{
+    /// <summary>
+    /// The engine's batched row window: sub-batches of up to <see cref="Engine.TransformerModel.MaxBatchSequences"/>
+    /// rows, each row keeping its own residual stream, RoPE position, and causal attention while every dense weight
+    /// matrix is traversed once per sub-batch. This is the prefill route every model executes today.
+    /// </summary>
+    GemV,
+
+    /// <summary>
+    /// A tiled prefill attention/weight path: the window advances in tiles wider than the engine's row-batch width.
+    /// Reserved by the selection vocabulary — no engine runs it in this build.
+    /// </summary>
+    Tiled,
+
+    /// <summary>
+    /// A GEMM-shaped prefill: the window's rows are forwarded as a dense matrix multiply over the whole window.
+    /// Reserved by the selection vocabulary — no engine runs it in this build.
+    /// </summary>
+    Gemm,
+}
+
+/// <summary>The wire name of each prefill kernel selection, shared by the load log, the engine's refusal, and the monitor snapshot.</summary>
+public static class PrefillKernelNames
+{
+    public const string GemV = "gemv";
+    public const string Tiled = "tiled";
+    public const string Gemm = "gemm";
+
+    public static string Of(PrefillKernel kernel) => kernel switch
+    {
+        PrefillKernel.Tiled => Tiled,
+        PrefillKernel.Gemm => Gemm,
+        _ => GemV,
+    };
+}

@@ -1010,7 +1010,7 @@ Prefill forwards batched rows instead of one token at a time, and the measuremen
 - [✓] Automated Prefill Identity: batched prefill bit-identical to per-token prefill in logits, KV bytes, and sampled tokens. Verify: `dotnet test --filter Category=Prefill|Parity -c Release` — Prefill 16/16, Parity 49/49.
 - [✓] Manual Prefill Speed: serve the pinned fixture and confirm a long prompt reaches first output token measurably earlier than before batching, with decode tok/s for a second model unchanged. Verify: live monitor readings for both models plus the bench record. Live half measured 2026-11-12 with identical scripts before and after the change: `Llama-3.2-1B-Instruct-IQ4_XS` at `4096`/`256`/quota 8 took 169.3 s and 173.2 s on a 1751-token prompt before, 122.4 s and 129.7 s after (1.38×); `Qwen3-0.6B-Q8_0` at the same profile took 64.3 s and 66.6 s on a 928-token prompt before, 43.0 s and 43.7 s after (1.50×), with its short-request decode at 3.30 s and 3.76 s before against 3.36 s and 3.01 s after — unchanged within noise. Bench half measured the same day as `bench/reports/prefill-profile-2026-11-12.md`: batched prefill 13.3–16.1 tok/s at 1536–2048 tokens against the pinned reference's 412–464 tok/s, with the weight and attention terms fitted separately.
 
-### MVP3.13 [v0.3.13] - Refined
+### MVP3.13 [v0.3.13] - In Progress
 
 Prefill kernels: row-tiled prefill attention, a measured prefill row width, and a `[LibraryImport]` GEMM spike for the formats the measurements carry — every one behind a config knob, every one bit-identical. Kernels land before the arbiter (MVP3.14) so its step-time budget, dedicated lane, and buffer clamp calibrate against one final per-row cost model. Attention first, GEMM second, a gate between them.
 
@@ -1041,8 +1041,9 @@ Evidence carried in from the shipped measurement (`bench/reports/prefill-profile
 
 #### Implementation Items
 
-- [_] Prefill kernel seam and knob — `engine.prefill_kernel` selectable between `gemv` and `tiled`, with `gemm` gated on the proven-format list (see DN-M313-3).
+- [✓] Prefill kernel seam and knob — `engine.prefill_kernel` selectable between `gemv` and `tiled`, with `gemm` gated on the proven-format list (see DN-M313-3).
   - Verify: `dotnet test --filter Category=Config|HotReload -c Release` — an unknown value fails naming model and value; `gemm` before its format is proven refuses naming the format; a hot edit lands at the next chunk and produces the same token stream as a restart carrying the same value.
+  - Landed: `EngineConfig.PrefillKernel` (default `gemv`) validated against the bounded set with the model and value named; `tiled` and `gemm` accepted by the schema then refused at model open naming the value and the missing kernel, with no fallback; `TransformerModel.Prefill` dispatches per sub-batch through a resolved kernel value with the `gemv` arm calling the existing window path unchanged; classified new-requests-only in the reload table with an apply case beside the chunk-width case; reported as `metrics_prefill_kernel` on the snapshot and as a `prefill_kernel model=… kernel=…` load line. Gate run 2026-11-13: `Category=Config|HotReload` 99/99, `Category=Prefill|Parity` 65/65 unchanged, full suite 1428/1428.
 - [_] Row-tiled prefill attention — K/V slots loaded once per block and scored against every row in the sub-batch, with each row's online max/rescale order unchanged (see DN-M313-1).
   - Verify: `dotnet test --filter Category=Prefill|Parity -c Release` — the 16 `Prefill` cases and 49 `Parity` cases raw-byte identical under `tiled`, including the 1/2/15/16/17/31/32/33/40 window straddle and the windowed gemma-3 case; `Category=Concurrency` 5/5 unchanged.
 - [_] Prefill row width measured and resolved in the plan — 16 / 32 / 64 rows on both pinned fixtures against activation-buffer bytes and per-row attention cost, with the chosen width recorded in a bench report (see DN-M313-5).
@@ -1055,7 +1056,7 @@ Evidence carried in from the shipped measurement (`bench/reports/prefill-profile
 #### Tests
 
 - [_] Automated Prefill Kernel Identity: tiled prefill raw-byte identical to the GEMV path across the window straddle, both pinned fixtures, and the windowed family. Verify: `dotnet test --filter Category=Prefill|Parity -c Release`.
-- [_] Automated Kernel Knob Config: value validation, unproven-format refusal, hot-reload class, and token-stream equality between a hot edit and a restart. Verify: `dotnet test --filter Category=Config|HotReload -c Release`.
+- [✓] Automated Kernel Knob Config: value validation, unproven-format refusal, hot-reload class, and token-stream equality between a hot edit and a restart. Verify: `dotnet test --filter Category=Config|HotReload -c Release` — 99/99 on 2026-11-13, including 19 new cases in `tests/Lair.Tests/PrefillKernelConfigTests.cs`, `PrefillKernelServeTests.cs`, and `PrefillKernelHotReloadTests.cs`.
 - [_] Automated GEMM Bit-Identity: native kernels raw-byte identical to the managed reference per format, with unproven formats unselectable. Verify: `dotnet test --filter Category=Kernel|Parity -c Release`.
 - [_] Automated Decode Non-Regression: inter-token latency budgets hold with the tiled prefill kernel active. Verify: `dotnet test --filter Category=Concurrency -c Release`, read with the whole-suite load caveat recorded on 2026-11-13.
 - [_] Manual Kernel Speed Proof: serve the pinned fixture with `gemv` then `tiled`, record prefill tok/s on a 1751-token prompt and peak working set for both, and confirm the attention term falls. Verify: live monitor readings plus the committed bench report.
