@@ -523,6 +523,178 @@ internal static class LayerOps
     }
 
     /// <summary>
+    /// Row-tiled causal attention for one layer over a sub-batch of consecutive prompt rows: the walk inverts the
+    /// single-row pass's nesting — each kv-head group, then each selected block, then each in-range position — so every
+    /// attending row shares that position's K and V read instead of re-reading it from its own loop. Each head maps to
+    /// kv-head (h * kvHeadCount / headCount) exactly as <see cref="CausalAttention"/> does, and the walk visits heads in
+    /// ascending order within each group, so every query reads its assigned K/V slice under the same grouped-query
+    /// mapping. Every row keeps its own online-softmax state — running max, weight sum, accumulator — across the whole
+    /// block/position walk: a row's operation sequence is then ascending positions with the same <c>runningMax</c> update
+    /// rule, the same rescale-on-new-max arithmetic (<c>sumExp *= rescale</c>, <c>outHead[j] *= rescale</c>, then
+    /// <c>weight = exp(score - runningMax)</c>, <c>sumExp += weight</c>, <c>outHead[j] += weight * vt[j]</c>) and the same
+    /// final <c>1f / sumExp</c> normalization as that row's own single-row pass over its selection, so a tiled window is
+    /// bit-for-bit what forwarding each row alone would leave. The rows are consecutive positions of one sequence starting
+    /// at <paramref name="fromPosition"/>: at position t only the rows whose own position reaches at least t attend — no
+    /// zero-weight multiply and no skipped max update for a closed row, exactly as today where a row simply never scores
+    /// past itself. A positive window narrows each row's causal range to <c>[max(0, q - window + 1), q]</c> relative to its
+    /// own position before the online max sees any score; at t only rows whose backward span reaches t are in range — a
+    /// row never reads outside its selection. The walk addresses exactly the union of those per-row causal selections as one
+    /// contiguous run resolved through <see cref="SequenceKv.SelectRangeRead"/> and read via
+    /// <see cref="SequenceKv.ReadK(BlockSelection, int, int)"/>, so no block outside any row's selection is addressed rather than
+    /// merely skipped by a loop bound. The scores carry the same scaled-then-capped path as the single-row kernel: q·k times
+    /// attnScale per row, then <see cref="Softcap"/> when softcap is positive, before that row's running max sees them. Row
+    /// state lives in caller-owned arrays indexed by head and row (head-major within each row), reused across calls so the
+    /// pass allocates nothing itself. A non-positive softcap disables the cap: the score path stays exactly the uncapped one.
+    /// </summary>
+    internal static void CausalAttentionTiledRows(
+        IBackend backend,
+        ReadOnlySpan<float> qRows, // rowCount * headCount * headDim, row-major: every row's own rotated queries
+        int fromPosition, // absolute position of the first row; consecutive rows follow it in order
+        int rowCount,
+        int headCount,
+        int kvHeadCount,
+        int headDim,
+        SequenceKv kv,
+        int layer,
+        float attnScale,
+        float softcap, // positive enables the score softcap; non-positive disables it
+        int window, // positive narrows each row's causal range to the window; non-positive leaves it unbounded
+        Span<float> runningMaxRowState, // headCount * rowCount: every row's per-head online max across the walk
+        Span<float> sumExpRowState, // same shape: every row's per-head weight sum across the walk
+        Span<float> outConcat) // rowCount * headCount * headDim, row-major accumulator and result (head-major within each row)
+    {
+        ArgumentNullException.ThrowIfNull(backend);
+        ArgumentNullException.ThrowIfNull(kv);
+
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(rowCount);
+        if (fromPosition < 0 || fromPosition + rowCount > kv.Length)
+        {
+            throw new ArgumentException(
+                $"rows [{fromPosition}..{fromPosition + rowCount - 1}] must lie inside the positions this sequence holds ({kv.Length}): every row's K/V is written before any of its attention runs.",
+                nameof(rowCount));
+        }
+
+        int region = headCount * headDim;
+        if (qRows.Length < rowCount * region || outConcat.Length < rowCount * region)
+        {
+            throw new ArgumentException("Attention operands must cover every row's full set of heads.", nameof(qRows));
+        }
+
+        if (runningMaxRowState.Length < headCount * rowCount || sumExpRowState.Length < headCount * rowCount)
+        {
+            throw new ArgumentException("Row-state arrays must hold one entry per head for every row.", nameof(runningMaxRowState));
+        }
+
+        // The union of the rows' own causal reads: consecutive positions make each later row's backward span start at or after its predecessor's, so the selections join into exactly this contiguous run — from the earliest visible position to the last row's own. Under a positive window that is the first row's window edge; an unbounded read reaches back to position 0 of the sequence rather than merely where this sub-batch begins, covering every earlier position each row already attends. Reads walk only these blocks; a partial block at either edge contributes its in-range slots like every other causal read here does.
+        BlockSelection read = kv.SelectRangeRead(
+            window > 0 ? Math.Max(0, fromPosition - window + 1) : 0,
+            fromPosition + rowCount - 1);
+
+        int blockTokens = kv.BlockTokens;
+
+        // Seed every row's online-softmax state exactly as the single-row pass seeds each head it runs: running max at negative infinity, weight sum at zero, accumulator cleared. The state arrays live across blocks and positions while a row walks them in ascending order.
+        outConcat.Slice(0, rowCount * region).Clear();
+
+        for (int h = 0; h < headCount; h++)
+        {
+            for (int r = 0; r < rowCount; r++)
+            {
+                runningMaxRowState[r * headCount + h] = float.NegativeInfinity;
+                sumExpRowState[r * headCount + h] = 0f;
+            }
+        }
+
+        // Grouped-query walk: heads sharing one kv-head read the same K/V slice at a position, so that pair is loaded once per group and block/position here — instead of once per row as in the single-row pass, where every row re-reads it from its own loop. The grouping comes from the single-row pass's own mapping: consecutive ascending runs of h * kvHeadCount / headCount, so each query pairs with exactly its assigned kv-head and heads walk in ascending order within a group.
+        for (int hStart = 0; hStart < headCount;)
+        {
+            int kvHead = hStart * kvHeadCount / headCount; // grouped-query mapping: consecutive heads share a kv-head
+
+            int groupEnd = hStart + 1;
+            while (groupEnd < headCount && groupEnd * kvHeadCount / headCount == kvHead)
+            {
+                groupEnd++;
+            }
+
+            for (int blockIndex = read.FirstBlockIndex; blockIndex <= read.LastBlockIndex; blockIndex++)
+            {
+                // Only the selected block's slots inside the unioned range: a partial first or last block contributes its in-range positions, and no position outside any row's selection is ever addressed.
+                int slotFirst = Math.Max(read.FirstPosition, blockIndex * blockTokens);
+                int slotLast = Math.Min(read.LastPosition, (blockIndex + 1) * blockTokens - 1);
+
+                for (int t = slotFirst; t <= slotLast; t++)
+                {
+                    ReadOnlySpan<float> kt = kv.ReadK(read, t, layer).Slice(kvHead * headDim, headDim); // this position's K read once for the whole group
+                    ReadOnlySpan<float> vt = kv.ReadV(read, t, layer).Slice(kvHead * headDim, headDim); // and its V likewise
+
+                    // The rows whose own causal selection covers this position form a contiguous run: causality needs each row's own position to reach at least t — earlier rows are closed against it; under a positive window only the rows whose backward span reaches t qualify. A closed or out-of-selection row never touches this slot at all — no zero-weight multiply, no skipped max update — exactly as today where a row simply scores neither past its own position nor outside its selection.
+                    int rLow = Math.Max(0, t - fromPosition); // causal floor: only rows whose position reaches the scored one are open to it
+                    int rHigh = window > 0 ? Math.Min(rowCount - 1, t + window - 1 - fromPosition) : rowCount - 1; // a positive window excludes every row whose own selection starts past the position
+
+                    for (int r = rLow; r <= rHigh; r++)
+                    {
+                        ReadOnlySpan<float> qRow = qRows.Slice(r * region, region); // this row's queries: each head slices its assigned region under the same grouped-query mapping as the single-row pass
+                        Span<float> outHeadRow = outConcat.Slice(r * region, region);
+
+                        for (int h = hStart; h < groupEnd; h++)
+                        {
+                            ReadOnlySpan<float> qh = qRow.Slice(h * headDim, headDim);
+                            int state = r * headCount + h; // this row's online-softmax entry for the walked head across blocks and positions
+
+                            float score = backend.Dot(qh, kt) * attnScale;
+                            if (softcap > 0f)
+                            {
+                                score = Softcap(score, softcap); // after scaling, before that row's online max sees it — per row as in the single-row pass
+                            }
+
+                            if (score > runningMaxRowState[state])
+                            {
+                                // Rescale everything accumulated under this row's old max so all its weights share the new exponent base.
+                                if (!float.IsNegativeInfinity(runningMaxRowState[state]))
+                                {
+                                    float rescale = MathF.Exp(runningMaxRowState[state] - score);
+                                    sumExpRowState[state] *= rescale;
+
+                                    for (int j = 0; j < headDim; j++)
+                                    {
+                                        outHeadRow[h * headDim + j] *= rescale;
+                                    }
+                                }
+
+                                runningMaxRowState[state] = score;
+                            }
+
+                            float weight = MathF.Exp(score - runningMaxRowState[state]); // the current max term contributes exactly 1
+                            sumExpRowState[state] += weight;
+
+                            for (int j = 0; j < headDim; j++)
+                            {
+                                outHeadRow[h * headDim + j] += weight * vt[j];
+                            }
+                        }
+                    }
+                }
+            }
+
+            hStart = groupEnd; // the next group starts where this one's kv-head run ends
+        }
+
+        // Final normalization per row and per head, the same 1f / sumExp the single-row pass applies when its walk finishes. Every (row, head) pair saw exactly its selection's positions in ascending order with identical updates — so this kernel lands bit-for-bit on what forwarding each row alone would leave.
+        for (int r = 0; r < rowCount; r++)
+        {
+            Span<float> outHeadRow = outConcat.Slice(r * region, region);
+
+            for (int h = 0; h < headCount; h++)
+            {
+                float invSum = 1f / sumExpRowState[r * headCount + h]; // >= 1 because the max term contributes exp(0)
+                for (int j = 0; j < headDim; j++)
+                {
+                    outHeadRow[h * headDim + j] *= invSum;
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// Full-sequence attention over one layer's KV contents: every query position attends to all logical positions in
     /// the window instead of just a causal prefix. Queries are given position-major (queryCount * headCount * headDim)
     /// so a whole batch is processed in one pass; each head maps to kv-head (h * kvHeadCount / headCount) and runs the

@@ -48,7 +48,7 @@ public sealed class PrefillKernelHotReloadTests
         Task<GenerationResult> running = harness.Engine.GenerateAsync(Completion(prompt, 24), CancellationToken.None);
         await WaitForAsync(() => harness.Engine.Stats.ActiveSequenceCount >= 1, "the in-flight generation never became active");
 
-        harness.EditYaml(BuildYaml("tiled"));
+        harness.EditYaml(BuildYaml("gemm"));
 
         ReloadSummary summary = await harness.WaitForSummaryAsync(
             s => s.ValidationOk && s.Results.Any(r => r.Field == "engine.prefill_kernel" && r.Outcome == "refused"),
@@ -57,9 +57,9 @@ public sealed class PrefillKernelHotReloadTests
         ReloadFieldResult result = Assert.Single(summary.Results, r => r.Field == "engine.prefill_kernel");
         Assert.Equal(MutationClassNames.NewRequests, result.MutationClass); // classified new-requests-only like every admission-side choice key
         Assert.Equal("gemv", result.OldValue);
-        Assert.Equal("tiled", result.NewValue);
-        Assert.Contains("'tiled' is not implemented by the forward engine", result.Detail); // refused naming value and missing kernel
-        Assert.Contains("no tiled attention/weight path exists in this build", result.Detail);
+        Assert.Equal("gemm", result.NewValue);
+        Assert.Contains("'gemm' is not implemented by the forward engine", result.Detail); // refused naming value and missing kernel
+        Assert.Contains("no gemm attention/weight path exists in this build", result.Detail);
 
         GenerationResult inflight = await running;
         Assert.Equal(baselineText, inflight.Text); // the sequence already mid-generation finished untouched

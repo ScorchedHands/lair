@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using Lair.Backends.Cpu;
 using Lair.Kv;
 using Lair.Loader;
+using Lair.Models;
 using Lair.Models.Engine;
 using Lair.Tokenizer;
 
@@ -17,7 +18,12 @@ namespace Lair.Tests;
 /// the engine's row-batch width so a sequence spanning several sub-batches is compared, not only one that fits in
 /// a single one, and the causal read set is proven against the encoder's bidirectional shape: the same tokens
 /// through <see cref="TransformerModel.Encode"/> leave different KV bytes at the interior positions of the deeper
-/// layers, while the batched prefill lands bit-for-bit on the causal reference.
+/// layers, while the batched prefill lands bit-for-bit on the causal reference. Every identity case runs once per
+/// prefill kernel this build executes — the batched-row window and its row-tiled attention variant — so a tiled
+/// window must land byte-for-byte on the per-token forward and on what the gemv route left, not merely close to it;
+/// dedicated cases compare the two routes against each other directly. A synthetic case pins the tiled walk's causal
+/// and selection guards at the kernel boundary itself: a row scores neither past its own position nor outside its
+/// windowed selection, exactly as the per-row kernel never does.
 /// </summary>
 [Trait("Category", "Prefill")]
 [Collection("model-loaded")] // shares the serialized real-model lane with the parity suites so these forwards do not load alongside another engine
@@ -25,12 +31,31 @@ public sealed class PrefillBatchIdentityTests
 {
     private const int SmolLmDecodeSteps = 6;
 
+    // The straddling window lengths both the per-kernel theories and the route-vs-route theory enumerate.
+    private static readonly int[] StraddlingWindows = [1, 2, 15, 16, 17, 31, 32, 33, 40];
+
     /// <summary>Window lengths that straddle the engine's row-batch width: one row, a partial batch, exact batches, and a partial tail.</summary>
-    public static TheoryData<int> WindowLengths() => [1, 2, 15, 16, 17, 31, 32, 33, 40];
+    public static TheoryData<int> WindowLengths() => [.. StraddlingWindows];
+
+    /// <summary>The prefill kernels this build executes: the batched row window and its row-tiled attention variant.</summary>
+    public static TheoryData<PrefillKernel> PrefillKernels() => [PrefillKernel.GemV, PrefillKernel.Tiled];
+
+    /// <summary>Every straddling window length on each kernel this build executes.</summary>
+    public static TheoryData<int, PrefillKernel> WindowLengthsAndKernels()
+    {
+        TheoryData<int, PrefillKernel> data = [];
+        foreach (int tokens in StraddlingWindows)
+        {
+            data.Add(tokens, PrefillKernel.GemV);
+            data.Add(tokens, PrefillKernel.Tiled);
+        }
+
+        return data;
+    }
 
     [Theory]
-    [MemberData(nameof(WindowLengths))]
-    public void Prefill_LogitsAndKvBytes_MatchPerTokenForward_BitForBit(int windowTokens)
+    [MemberData(nameof(WindowLengthsAndKernels))]
+    public void Prefill_LogitsAndKvBytes_MatchPerTokenForward_BitForBit(int windowTokens, PrefillKernel kernel)
     {
         string? modelPath = ModelFixture.Resolve();
         if (modelPath is null)
@@ -43,12 +68,14 @@ public sealed class PrefillBatchIdentityTests
         int[] prompt = BuildPrompt(tokenizer, windowTokens);
 
         using CpuBackend backend = new(threads: 4, allowAvx2: true);
-        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 128);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 128, logLine: null, prefillKernel: kernel);
+        Assert.Equal(kernel, model.ResolvedPrefillKernel); // the engine opened on the selection it was handed
+
         using BlockPool pool = NewPool(model, backend, capacityBlocks: 16);
         using SequenceKv batchedKv = new(pool);
         using SequenceKv referenceKv = new(pool);
 
-        // Batched route: one window through the row-batched forward.
+        // Batched route: one window through the row-batched forward on this kernel.
         float[] batchedLogits = [.. model.Prefill(prompt, batchedKv)];
 
         // Reference route: the same tokens one at a time through the single-token forward. Its final
@@ -59,15 +86,16 @@ public sealed class PrefillBatchIdentityTests
             referenceLogits = [.. model.DecodeNext(tokenId, referenceKv)];
         }
 
-        AssertBitsEqual(referenceLogits, batchedLogits, $"prefill of a {windowTokens}-token window");
+        AssertBitsEqual(referenceLogits, batchedLogits, $"prefill of a {windowTokens}-token window on the '{PrefillKernelNames.Of(kernel)}' kernel");
         Assert.Equal(ArgMax(referenceLogits), ArgMax(batchedLogits));
 
         Assert.Equal(referenceKv.Length, batchedKv.Length);
         AssertKvBytesEqual(referenceKv, batchedKv, model.Desc.LayerCount, windowTokens);
     }
 
-    [Fact]
-    public void Prefill_ConsecutiveWindows_MatchOneWindowAndPerTokenForward_BitForBit()
+    [Theory]
+    [MemberData(nameof(PrefillKernels))]
+    public void Prefill_ConsecutiveWindows_MatchOneWindowAndPerTokenForward_BitForBit(PrefillKernel kernel)
     {
         string? modelPath = ModelFixture.Resolve();
         if (modelPath is null)
@@ -80,7 +108,7 @@ public sealed class PrefillBatchIdentityTests
         int[] prompt = BuildPrompt(tokenizer, 40);
 
         using CpuBackend backend = new(threads: 4, allowAvx2: true);
-        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 128);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 128, logLine: null, prefillKernel: kernel);
         using BlockPool pool = NewPool(model, backend, capacityBlocks: 16);
         using SequenceKv wholeWindow = new(pool);
         using SequenceKv splitWindows = new(pool);
@@ -102,8 +130,8 @@ public sealed class PrefillBatchIdentityTests
             perTokenLogits = [.. model.DecodeNext(tokenId, perToken)];
         }
 
-        AssertBitsEqual(perTokenLogits, wholeLogits, "one 40-token window against the per-token forward");
-        AssertBitsEqual(perTokenLogits, splitLogits, "consecutive 16/16/8-token windows against the per-token forward");
+        AssertBitsEqual(perTokenLogits, wholeLogits, $"one 40-token window on the '{PrefillKernelNames.Of(kernel)}' kernel against the per-token forward");
+        AssertBitsEqual(perTokenLogits, splitLogits, $"consecutive 16/16/8-token windows on the '{PrefillKernelNames.Of(kernel)}' kernel against the per-token forward");
 
         Assert.Equal(perToken.Length, wholeWindow.Length);
         Assert.Equal(perToken.Length, splitWindows.Length);
@@ -111,8 +139,9 @@ public sealed class PrefillBatchIdentityTests
         AssertKvBytesEqual(perToken, splitWindows, model.Desc.LayerCount, prompt.Length);
     }
 
-    [Fact]
-    public void Prefill_FirstSampledTokenAndContinuation_MatchPerTokenForward()
+    [Theory]
+    [MemberData(nameof(PrefillKernels))]
+    public void Prefill_FirstSampledTokenAndContinuation_MatchPerTokenForward(PrefillKernel kernel)
     {
         string? modelPath = ModelFixture.Resolve();
         if (modelPath is null)
@@ -125,7 +154,7 @@ public sealed class PrefillBatchIdentityTests
         int[] prompt = BuildPrompt(tokenizer, 24);
 
         using CpuBackend backend = new(threads: 4, allowAvx2: true);
-        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 128);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 128, logLine: null, prefillKernel: kernel);
         using BlockPool pool = NewPool(model, backend, capacityBlocks: 16);
         using SequenceKv batchedKv = new(pool);
         using SequenceKv referenceKv = new(pool);
@@ -149,7 +178,7 @@ public sealed class PrefillBatchIdentityTests
         {
             float[] batchedStep = [.. model.DecodeNext(batchedNext, batchedKv)];
             float[] referenceStep = [.. model.DecodeNext(referenceNext, referenceKv)];
-            AssertBitsEqual(referenceStep, batchedStep, $"continuation step {step} after the prefill");
+            AssertBitsEqual(referenceStep, batchedStep, $"continuation step {step} after the prefill on the '{PrefillKernelNames.Of(kernel)}' kernel");
             batchedNext = ArgMax(batchedStep);
             referenceNext = ArgMax(referenceStep);
         }
@@ -220,8 +249,9 @@ public sealed class PrefillBatchIdentityTests
             "prefill's attention shape is not proven distinct from the encoder's");
     }
 
-    [Fact]
-    public void Prefill_Llama32Iq4Xs_AcrossSubBatchesMatchesPerTokenForward()
+    [Theory]
+    [MemberData(nameof(PrefillKernels))]
+    public void Prefill_Llama32Iq4Xs_AcrossSubBatchesMatchesPerTokenForward(PrefillKernel kernel)
     {
         string? modelPath = ModelFixture.ResolveRepoRelative("models/Llama-3.2-1B-Instruct-IQ4_XS.gguf");
         if (modelPath is null)
@@ -234,7 +264,7 @@ public sealed class PrefillBatchIdentityTests
         int[] prompt = BuildPrompt(tokenizer, 33);
 
         using CpuBackend backend = new(threads: 4, allowAvx2: true);
-        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 128);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 128, logLine: null, prefillKernel: kernel);
         using BlockPool pool = NewPool(model, backend, capacityBlocks: 16);
         using SequenceKv batchedKv = new(pool);
         using SequenceKv referenceKv = new(pool);
@@ -247,13 +277,143 @@ public sealed class PrefillBatchIdentityTests
             referenceLogits = [.. model.DecodeNext(tokenId, referenceKv)];
         }
 
-        AssertBitsEqual(referenceLogits, batchedLogits, "a 33-token Llama-3.2 window spanning three row sub-batches");
+        AssertBitsEqual(referenceLogits, batchedLogits, $"a 33-token Llama-3.2 window spanning three row sub-batches on the '{PrefillKernelNames.Of(kernel)}' kernel");
         Assert.Equal(ArgMax(referenceLogits), ArgMax(batchedLogits));
         AssertKvBytesEqual(referenceKv, batchedKv, model.Desc.LayerCount, prompt.Length);
     }
 
+    [Theory]
+    [MemberData(nameof(PrefillKernels))]
+    public void Prefill_WindowedGemma3_CausalSelectionInsideWindowMatchesPerTokenForward(PrefillKernel kernel)
+    {
+        string? modelPath = ModelFixture.ResolveRepoRelative("models/gemma-3-1b-it-Q3_K_S.gguf");
+        if (modelPath is null)
+        {
+            return; // real-model tests skip when the fixture is absent
+        }
+
+        using GgufFile gguf = GgufFile.Open(modelPath);
+        GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
+        int[] prompt = BuildPrompt(tokenizer, 20);
+
+        using CpuBackend backend = new(threads: 4, allowAvx2: true);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 64, logLine: null, prefillKernel: kernel);
+        Assert.True(model.Plan.AttentionWindowForLayer(0) > 0, "the gemma3 plan must resolve a windowed layer for this case to mean anything");
+
+        using BlockPool pool = NewPool(model, backend, capacityBlocks: 16);
+        using SequenceKv batchedKv = new(pool);
+        using SequenceKv referenceKv = new(pool);
+
+        float[] batchedLogits = [.. model.Prefill(prompt, batchedKv)];
+
+        float[] referenceLogits = [];
+        foreach (int tokenId in prompt)
+        {
+            referenceLogits = [.. model.DecodeNext(tokenId, referenceKv)];
+        }
+
+        AssertBitsEqual(referenceLogits, batchedLogits, $"a windowed model's prefill window on the '{PrefillKernelNames.Of(kernel)}' kernel");
+        Assert.Equal(ArgMax(referenceLogits), ArgMax(batchedLogits));
+        AssertKvBytesEqual(referenceKv, batchedKv, model.Desc.LayerCount, prompt.Length);
+    }
+
+    // ---------------------------------------------------------------- route-vs-route identity: the two kernels against each other, not just against the per-token reference
+
+    [Theory]
+    [MemberData(nameof(WindowLengths))]
+    public void Prefill_TiledRouteMatchesGemvRoute_BitForBit(int windowTokens)
+    {
+        string? modelPath = ModelFixture.Resolve();
+        if (modelPath is null)
+        {
+            return; // real-model tests skip when the fixture is absent
+        }
+
+        using GgufFile gguf = GgufFile.Open(modelPath);
+        GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
+        int[] prompt = BuildPrompt(tokenizer, windowTokens);
+
+        using CpuBackend backend = new(threads: 4, allowAvx2: true);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 128);
+        Assert.Equal(PrefillKernel.GemV, model.ResolvedPrefillKernel); // the engine opened on the default route
+
+        using BlockPool pool = NewPool(model, backend, capacityBlocks: 32);
+        using SequenceKv gemvKv = new(pool);
+        float[] gemvLogits = [.. model.Prefill(prompt, gemvKv)];
+
+        // Re-pointed onto the row-tiled route before a fresh window of the same tokens on its own sequence.
+        model.ApplyPrefillKernel(PrefillKernel.Tiled);
+        Assert.Equal(PrefillKernel.Tiled, model.ResolvedPrefillKernel);
+
+        using SequenceKv tiledKv = new(pool);
+        float[] tiledLogits = [.. model.Prefill(prompt, tiledKv)];
+
+        // Byte-for-byte against the gemv route's output — not a tolerance: same logits, same first sampled token.
+        AssertBitsEqual(gemvLogits, tiledLogits, $"a {windowTokens}-token window on the row-tiled route against the gemv route");
+        int gemvFirst = ArgMax(gemvLogits);
+        int tiledFirst = ArgMax(tiledLogits);
+        Assert.Equal(gemvFirst, tiledFirst);
+
+        // Every position of every layer's K/V slot compared on raw bytes too.
+        AssertKvBytesEqual(gemvKv, tiledKv, model.Desc.LayerCount, windowTokens);
+
+        // And the sampled token riding into a decode continuation keeps both routes byte-identical for six steps.
+        int gemvNext = gemvFirst;
+        int tiledNext = tiledFirst;
+        for (int step = 0; step < SmolLmDecodeSteps; step++)
+        {
+            float[] gemvStep = [.. model.DecodeNext(gemvNext, gemvKv)];
+            float[] tiledStep = [.. model.DecodeNext(tiledNext, tiledKv)];
+            AssertBitsEqual(gemvStep, tiledStep, $"decode step {step} after the two routes' prefills");
+            gemvNext = ArgMax(gemvStep);
+            tiledNext = ArgMax(tiledStep);
+        }
+
+        Assert.Equal(gemvNext, tiledNext); // the sampled continuations stay identical all the way through
+    }
+
     [Fact]
-    public void Prefill_WindowedGemma3_CausalSelectionInsideWindowMatchesPerTokenForward()
+    public void Prefill_TiledRouteMatchesGemvRoute_ConsecutiveWindows_BitForBit()
+    {
+        string? modelPath = ModelFixture.Resolve();
+        if (modelPath is null)
+        {
+            return; // real-model tests skip when the fixture is absent
+        }
+
+        using GgufFile gguf = GgufFile.Open(modelPath);
+        GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
+        int[] prompt = BuildPrompt(tokenizer, 40);
+
+        using CpuBackend backend = new(threads: 4, allowAvx2: true);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 128);
+        using BlockPool pool = NewPool(model, backend, capacityBlocks: 32);
+
+        float[] gemvLogits = [];
+        using SequenceKv gemvKv = new(pool);
+        for (int offset = 0; offset < prompt.Length; offset += 16)
+        {
+            int rows = Math.Min(16, prompt.Length - offset);
+            gemvLogits = [.. model.Prefill(prompt.AsSpan(offset, rows).ToArray(), gemvKv)];
+        }
+
+        model.ApplyPrefillKernel(PrefillKernel.Tiled);
+
+        float[] tiledLogits = [];
+        using SequenceKv tiledKv = new(pool);
+        for (int offset = 0; offset < prompt.Length; offset += 16)
+        {
+            int rows = Math.Min(16, prompt.Length - offset);
+            tiledLogits = [.. model.Prefill(prompt.AsSpan(offset, rows).ToArray(), tiledKv)];
+        }
+
+        AssertBitsEqual(gemvLogits, tiledLogits, "consecutive 16/16/8-token windows on the row-tiled route against the gemv route");
+        Assert.Equal(ArgMax(gemvLogits), ArgMax(tiledLogits));
+        AssertKvBytesEqual(gemvKv, tiledKv, model.Desc.LayerCount, prompt.Length);
+    }
+
+    [Fact]
+    public void Prefill_TiledRouteMatchesGemvRoute_WindowedGemma3_BitForBit()
     {
         string? modelPath = ModelFixture.ResolveRepoRelative("models/gemma-3-1b-it-Q3_K_S.gguf");
         if (modelPath is null)
@@ -270,20 +430,155 @@ public sealed class PrefillBatchIdentityTests
         Assert.True(model.Plan.AttentionWindowForLayer(0) > 0, "the gemma3 plan must resolve a windowed layer for this case to mean anything");
 
         using BlockPool pool = NewPool(model, backend, capacityBlocks: 16);
-        using SequenceKv batchedKv = new(pool);
-        using SequenceKv referenceKv = new(pool);
+        using SequenceKv gemvKv = new(pool);
+        float[] gemvLogits = [.. model.Prefill(prompt, gemvKv)];
 
-        float[] batchedLogits = [.. model.Prefill(prompt, batchedKv)];
+        // The windowed layers are where the tiled walk's per-row selection guard earns its keep: re-point and forward again.
+        model.ApplyPrefillKernel(PrefillKernel.Tiled);
 
-        float[] referenceLogits = [];
-        foreach (int tokenId in prompt)
+        using SequenceKv tiledKv = new(pool);
+        float[] tiledLogits = [.. model.Prefill(prompt, tiledKv)];
+
+        AssertBitsEqual(gemvLogits, tiledLogits, "a windowed model's prefill on the row-tiled route against the gemv route");
+        Assert.Equal(ArgMax(gemvLogits), ArgMax(tiledLogits));
+        AssertKvBytesEqual(gemvKv, tiledKv, model.Desc.LayerCount, prompt.Length);
+    }
+
+    [Fact]
+    public void Prefill_TiledRouteMatchesGemvRoute_Llama32Iq4Xs_BitForBit()
+    {
+        string? modelPath = ModelFixture.ResolveRepoRelative("models/Llama-3.2-1B-Instruct-IQ4_XS.gguf");
+        if (modelPath is null)
         {
-            referenceLogits = [.. model.DecodeNext(tokenId, referenceKv)];
+            return; // real-model tests skip when the fixture is absent
         }
 
-        AssertBitsEqual(referenceLogits, batchedLogits, "a windowed model's prefill window");
-        Assert.Equal(ArgMax(referenceLogits), ArgMax(batchedLogits));
-        AssertKvBytesEqual(referenceKv, batchedKv, model.Desc.LayerCount, prompt.Length);
+        using GgufFile gguf = GgufFile.Open(modelPath);
+        GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
+        int[] prompt = BuildPrompt(tokenizer, 33);
+
+        using CpuBackend backend = new(threads: 4, allowAvx2: true);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 128);
+        using BlockPool pool = NewPool(model, backend, capacityBlocks: 32);
+
+        float[] gemvLogits = [];
+        using SequenceKv gemvKv = new(pool);
+        for (int offset = 0; offset < prompt.Length; offset += 16)
+        {
+            int rows = Math.Min(16, prompt.Length - offset);
+            gemvLogits = [.. model.Prefill(prompt.AsSpan(offset, rows).ToArray(), gemvKv)];
+        }
+
+        model.ApplyPrefillKernel(PrefillKernel.Tiled);
+
+        float[] tiledLogits = [];
+        using SequenceKv tiledKv = new(pool);
+        for (int offset = 0; offset < prompt.Length; offset += 16)
+        {
+            int rows = Math.Min(16, prompt.Length - offset);
+            tiledLogits = [.. model.Prefill(prompt.AsSpan(offset, rows).ToArray(), tiledKv)];
+        }
+
+        AssertBitsEqual(gemvLogits, tiledLogits, "a 33-token Llama-3.2 window spanning three row sub-batches on the row-tiled route against the gemv route");
+        Assert.Equal(ArgMax(gemvLogits), ArgMax(tiledLogits));
+        AssertKvBytesEqual(gemvKv, tiledKv, model.Desc.LayerCount, prompt.Length);
+    }
+
+    // ---------------------------------------------------------------- kernel-boundary guards: what a row may and may not touch in the tiled walk
+
+    [Fact]
+    public void CausalAttentionTiledRows_NeverScoresPastRowPositionAndNeverReadsOutsideItsSelection()
+    {
+        using CpuBackend backend = new();
+        using BlockPool pool = new(blockTokens: 3, layerCount: 1, kvHeads: 2, headDim: 4, capacityBlocks: 8, backend);
+        using SequenceKv kv = new(pool);
+
+        // Eight positions filled with a recognizable pattern — distinct per position and kv-head, signed so no value can masquerade as an unread zero. Four consecutive rows start at absolute position 4; under a window of three each row selects [p-2..p], the union is [2..7], and that walk spans all three pool blocks with partial edges on both sides. Row 0 (position 4) must never touch positions 5, 6 or 7 — its future; rows past position 4 must never read position 2, which lies behind their own selection's start.
+        for (int position = 0; position < 8; position++)
+        {
+            float[] kVec = new float[8]; // kvHeads * headDim
+            float[] vVec = new float[8];
+            for (int h = 0; h < 2; h++)
+            {
+                for (int j = 0; j < 4; j++)
+                {
+                    kVec[h * 4 + j] = 10f * (h + 1) + position - 3.5f;
+                    vVec[h * 4 + j] = -(10f * (h + 1)) - position;
+                }
+            }
+
+            kv.Append();
+            kv.WriteK(position, 0, kVec);
+            kv.WriteV(position, 0, vVec);
+        }
+
+        const int rows = 4;
+        const int headCount = 4; // grouped-query mapping: two heads per kv-head — the walk's grouping must pair each query with exactly its assigned kv-head slice
+        const int headDim = 4;
+        const int region = headCount * headDim;
+
+        float[] qRows = new float[rows * region];
+        for (int r = 0; r < rows; r++)
+        {
+            for (int h = 0; h < headCount; h++)
+            {
+                for (int j = 0; j < headDim; j++)
+                {
+                    qRows[r * region + h * headDim + j] = (r - 1) * 0.5f + (h - 2) * 0.25f + j * 0.75f; // signed and varying: every dot product is non-trivial, so a stray read moves the row's max or accumulator
+                }
+            }
+        }
+
+        foreach (int window in new int[] { 3, 0 }) // a narrowed walk once and an unbounded one: the causal guard stands on its own too
+        {
+            float[] tiledOut = new float[rows * region];
+            LayerOps.CausalAttentionTiledRows(
+                backend, qRows, fromPosition: 4, rows, headCount, kvHeadCount: 2, headDim, kv, layer: 0, attnScale: 1f, softcap: 0f, window,
+                runningMaxRowState: new float[rows * headCount], sumExpRowState: new float[rows * headCount], tiledOut);
+
+            // The per-row kernel resolves each row's own selection through SequenceKv — a read outside it fails inside that pass. Landing on those bytes therefore proves the tiled walk scored exactly [max(0, p - window + 1)..p] for every row: no position past its own, none behind its window start, and nothing outside any row's selection is ever addressed by the unioned block walk either — a stray read would move that row's running max or weight sum before normalization.
+            for (int r = 0; r < rows; r++)
+            {
+                float[] perRowOut = new float[region];
+                LayerOps.CausalAttention(
+                    backend, qRows.AsSpan(r * region, region), headCount, kvHeadCount: 2, headDim, kv, layer: 0, position: 4 + r, attnScale: 1f, softcap: 0f, window, perRowOut);
+
+                AssertBitsEqual(
+                    perRowOut,
+                    tiledOut.AsSpan(r * region, region),
+                    $"row {r} of the tiled walk against its own causal pass at position {4 + r}, window {window}");
+            }
+
+            // Direct evidence of both guards on row 0 and row 3: their online state must reflect exactly their own range. Row 0's head-0 output is a convex combination (weights sum to one after normalization) over its selection's V values only — every component lies between the smallest and largest V value of the positions it may read, so reaching past position 4 (its future) or behind its window start would pull in a magnitude outside that envelope. An unbounded row reads from position 0; under a positive window only from max(0, p - window + 1).
+            for (int j = 0; j < headDim; j++)
+            {
+                float firstVisible = window > 0 ? Math.Max(0, 4 - window + 1) : 0;
+
+                float vMin = float.PositiveInfinity;
+                float vMax = float.NegativeInfinity;
+                for (int position = (int)firstVisible; position <= 4; position++)
+                {
+                    float value = kv.ReadV(position, 0)[j]; // head 0 maps to kv-head 0 at offset j
+                    vMin = Math.Min(vMin, value);
+                    vMax = Math.Max(vMax, value);
+                }
+
+                Assert.True(
+                    tiledOut[j] >= vMin && tiledOut[j] <= vMax,
+                    $"row 0 head-0 output component {j} is {tiledOut[j]}, outside the [{vMin}, {vMax}] envelope its selection at window {window} allows — a read past position 4 or behind {firstVisible} would land here");
+
+                // Row 3 (position 7) under a positive window reads only [5..7]: components of an out-of-selection read sit outside that row's own V envelope.
+                if (window > 0)
+                {
+                    float vMinLast = Math.Min(kv.ReadV(5, 0)[j], Math.Min(kv.ReadV(6, 0)[j], kv.ReadV(7, 0)[j]));
+                    float vMaxLast = Math.Max(kv.ReadV(5, 0)[j], Math.Max(kv.ReadV(6, 0)[j], kv.ReadV(7, 0)[j]));
+
+                    Assert.True(
+                        tiledOut[(rows - 1) * region + j] >= vMinLast && tiledOut[(rows - 1) * region + j] <= vMaxLast,
+                        $"row 3 head-0 output component {j} is {tiledOut[(rows - 1) * region + j]}, outside the [{vMinLast}, {vMaxLast}] envelope its selection at window {window} allows — a read behind position 5 would land here");
+                }
+            }
+        }
     }
 
     [Fact]

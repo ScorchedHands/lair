@@ -200,6 +200,13 @@ public sealed class TransformerModel : IDisposable
     private readonly float[] _batchUp;      // MaxBatchSequences * intermediateSize
     private readonly float[] _batchLogits;  // MaxBatchSequences * vocabSize
 
+    // Row-tiled prefill attention state: one online-softmax entry per head for every row of a sub-batch — running max,
+    // then weight sum — held across the tiled walk so each row advances its own state in exactly the order its per-row
+    // kernel would. Sized once at Open for the widest window; the accumulators ride on _batchAttnOut's per-row head
+    // regions, so a tiled window allocates nothing per call.
+    private readonly float[] _tiledRowMax;    // MaxBatchSequences * headCount: every row's per-head online max across the walk
+    private readonly float[] _tiledRowSumExp; // same shape: every row's per-head weight sum across the walk
+
     private readonly float[] _cos;          // maxContext * rope pair count
     private readonly float[] _sin;
     private readonly float[]? _cosWindowed; // the same shape again at a second base, or null when every layer shares one
@@ -227,7 +234,7 @@ public sealed class TransformerModel : IDisposable
     /// </summary>
     public void ApplyPrefillKernel(PrefillKernel kernel)
     {
-        if (kernel != PrefillKernel.GemV)
+        if (kernel is not (PrefillKernel.GemV or PrefillKernel.Tiled))
         {
             throw KernelRefusal(kernel);
         }
@@ -236,11 +243,12 @@ public sealed class TransformerModel : IDisposable
     }
 
     // The one refusal wording an unrunnable prefill selection gets, at open and on apply alike: it names the value,
-    // what the forward engine lacks for it, and the only selection that executes today.
+    // what the forward engine lacks for it, and the selections that execute today.
     private ModelException KernelRefusal(PrefillKernel kernel) => new(
         $"prefill kernel '{PrefillKernelNames.Of(kernel)}' is not implemented by the forward engine: architecture " +
         $"'{Plan.Architecture}' selects its prompt windows through this selection and no {PrefillKernelNames.Of(kernel)} attention/weight path exists in this build — only " +
-        $"{PrefillKernelNames.GemV} executes today — set engine.prefill_kernel to '{PrefillKernelNames.GemV}' (or omit it) to run this file");
+        $"{PrefillKernelNames.GemV} and {PrefillKernelNames.Tiled} execute today — set engine.prefill_kernel to '{PrefillKernelNames.GemV}' or " +
+        $"'{PrefillKernelNames.Tiled}' (or omit it) to run this file");
 
     /// <summary>Opens the engine over a memory-mapped view of the file's own tensor payloads.</summary>
     public static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens) =>
@@ -303,9 +311,10 @@ public sealed class TransformerModel : IDisposable
 
         // A prefill kernel selection this engine has no kernel for is refused at open, the posture every other
         // unimplemented capability takes: the selection stays visible in the resolved value's vocabulary, the
-        // refusal names it and what is missing, and nothing falls back to the route that happens to work. The check
-        // lands before any tensor maps, so an unrunnable selection never spends a weight view on it.
-        if (prefillKernel != PrefillKernel.GemV)
+        // refusal names it and what is missing, and nothing falls back to the route that happens to work. The row-
+        // tiled window runs today; a selection with no kernel at all — the dense-matrix shape — never reaches a
+        // forward. The check lands before any tensor maps, so an unrunnable selection never spends a weight view on it.
+        if (prefillKernel is not (PrefillKernel.GemV or PrefillKernel.Tiled))
         {
             throw KernelRefusal(prefillKernel);
         }
@@ -624,6 +633,9 @@ public sealed class TransformerModel : IDisposable
         _batchUp = new float[MaxBatchSequences * Plan.IntermediateSize];
         _batchLogits = new float[MaxBatchSequences * Plan.VocabSize];
 
+        _tiledRowMax = new float[MaxBatchSequences * Plan.HeadCount];
+        _tiledRowSumExp = new float[MaxBatchSequences * Plan.HeadCount];
+
         // The rotation covers the declared rotary slice, or the full head dimension when the file declares none.
         _ropeHalf = (Plan.RopeRotaryDimensions > 0 ? Plan.RopeRotaryDimensions : Plan.HeadDim) / 2;
 
@@ -737,14 +749,18 @@ public sealed class TransformerModel : IDisposable
     }
 
     // The resolved kernel selection decides which window route runs, re-read at every sub-batch so a hot edit lands
-    // from the next boundary: today the only selection with a kernel is the batched row window below, and a selection
-    // this build has no kernel for fails naming it rather than running some other route behind it.
+    // from the next boundary: the batched row window and its row-tiled attention variant both have kernels today, and
+    // a selection this build has no kernel for fails naming it rather than running some other route behind it.
     private void RunPrefillWindow(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits)
     {
         switch (_prefillKernel)
         {
             case PrefillKernel.GemV:
                 PrefillWindow(tokens, offset, rows, basePosition, kv, emitLogits);
+                break;
+
+            case PrefillKernel.Tiled:
+                PrefillWindowTiled(tokens, offset, rows, basePosition, kv, emitLogits);
                 break;
 
             default:
@@ -830,6 +846,180 @@ public sealed class TransformerModel : IDisposable
             {
                 LayerOps.CausalAttention(_backend, _batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, basePosition + offset + r, attnScale, Plan.AttentionSoftcap, layerWindow, _batchAttnOut.AsSpan(r * qkvRegion, qkvRegion));
             }
+
+            ReadOnlySpan<byte> bytes = _weights.Resolve(_wo[l]);
+            _backend.GemvBatch(_batchAttnOut.AsSpan(0, rows * qkvRegion), rows, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _batchProj.AsSpan(0, rows * hidden));
+
+            for (int r = 0; r < rows; r++)
+            {
+                AddBias(_batchProj.AsSpan(r * hidden, hidden), _biasO[l]);
+
+                // Post-sublayer placement: this row's attention output joins its stream only after the post-attention norm.
+                ApplyPostSublayerNorm(_batchProj.AsSpan(r * hidden, hidden), _postAttnNorm[l]);
+
+                // ffn_inp add on the row's own stream, same order as the single-token forward.
+                Span<float> cur = _batchCur.AsSpan(r * hidden, hidden);
+                ReadOnlySpan<float> proj = _batchProj.AsSpan(r * hidden, hidden);
+                for (int i = 0; i < hidden; i++)
+                {
+                    cur[i] += proj[i];
+                }
+
+                ApplyNorm(cur, _ffnNormWeight[l], _ffnNormBias[l], _batchNormed.AsSpan(r * hidden, hidden));
+            }
+
+            if (_sparseFfn is { } routing)
+            {
+                ApplySparseFeedForwardBatch(routing, l, rows);
+            }
+            else
+            {
+                _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), _batchGateUp.AsSpan(0, rows * inter));
+
+                _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardUpWeight(l), _batchUp.AsSpan(0, rows * inter));
+
+                // act = activation(gate) * up in place on each row's gate buffer.
+                for (int r = 0; r < rows; r++)
+                {
+                    ApplyActivation(_batchGateUp.AsSpan(r * inter, inter), _batchUp.AsSpan(r * inter, inter));
+                }
+
+                bytes = _weights.Resolve(_ffnDown[l]);
+                _backend.GemvBatch(_batchGateUp.AsSpan(0, rows * inter), rows, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _batchProj.AsSpan(0, rows * hidden));
+            }
+
+            for (int r = 0; r < rows; r++)
+            {
+                // Post-sublayer placement: this row's feed-forward output joins its stream only after the post-feed-forward norm.
+                ApplyPostSublayerNorm(_batchProj.AsSpan(r * hidden, hidden), _postFfnNorm[l]);
+
+                // ffn_out + ffn_inp: the input stream for this row's next layer.
+                Span<float> cur = _batchCur.AsSpan(r * hidden, hidden);
+                ReadOnlySpan<float> proj = _batchProj.AsSpan(r * hidden, hidden);
+                for (int i = 0; i < hidden; i++)
+                {
+                    cur[i] += proj[i];
+                }
+            }
+        }
+
+        if (emitLogits)
+        {
+            // The window's final row is the sequence's next-token distribution: its output norm and lm_head GEMV
+            // run alone over the single-token buffers, exactly the tail the single-token forward produced.
+            ApplyNorm(_batchCur.AsSpan((rows - 1) * hidden, hidden), _outputNormWeight, _outputNormBias, _normed);
+
+            LogicalTensor lmHead = _output ?? _tokenEmbd; // tied weights reuse the token-embedding rows as logits
+            ReadOnlySpan<byte> headBytes = _weights.Resolve(lmHead);
+            _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(headBytes, lmHead.Shape, lmHead.Format), _logits);
+
+            if (_outputBias is not null)
+            {
+                AddBias(_logits, _outputBias);
+            }
+
+            ApplyFinalLogitSoftcap(_logits);
+        }
+    }
+
+    // One sub-batch of a prefill window on the row-tiled route: the same streams, positions, norms, RoPE, K/V writes,
+    // batched weight passes, and residual adds the batched-row window runs — attention alone differs. Where the
+    // batched-row route walks each row through the causal kernel on its own, this route hands the whole sub-batch to
+    // LayerOps.CausalAttentionTiledRows: one walk per layer loads each selected position's K/V once per kv-head group
+    // and applies it to every row whose own causal selection covers it, while each row advances its own online-softmax
+    // state in the preallocated row-state buffers in exactly the order its per-row kernel would have run it. Only the
+    // window's final row reaches the output head, exactly as on the batched-row route.
+    private void PrefillWindowTiled(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits)
+    {
+        int hidden = Plan.HiddenSize;
+        int qkvRegion = Plan.HeadCount * Plan.HeadDim;
+        int kvRegion = Plan.KvHeadCount * Plan.HeadDim;
+        int inter = Plan.IntermediateSize;
+        float attnScale = _attnScale;
+
+        // Embedding lookup: each token's dequantized token_embd row seeds that row's input stream.
+        ReadOnlySpan<byte> embBytes = _weights.Resolve(_tokenEmbd);
+        WeightRef embRef = new(embBytes, _tokenEmbd.Shape, _tokenEmbd.Format);
+        for (int r = 0; r < rows; r++)
+        {
+            int tokenId = tokens[offset + r];
+            if ((uint)tokenId >= (uint)Plan.VocabSize)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(tokens), $"token id {tokenId} at index {offset + r} is outside the vocabulary of {Plan.VocabSize}.");
+            }
+
+            _backend.DequantRow(embRef, tokenId, _batchCur.AsSpan(r * hidden, hidden));
+        }
+
+        ApplyInputEmbeddingScale(_batchCur.AsSpan(0, rows * hidden));
+
+        // Reserve every row's slot in the sequence before any layer writes, mirroring the append each token made.
+        for (int r = 0; r < rows; r++)
+        {
+            kv.Append();
+        }
+
+        Span<float> tiledRowMax = _tiledRowMax.AsSpan(0, rows * Plan.HeadCount); // every row's per-head online max across the tiled walk
+        Span<float> tiledRowSumExp = _tiledRowSumExp.AsSpan(0, rows * Plan.HeadCount); // every row's per-head weight sum across the walk
+
+        for (int l = 0; l < Plan.LayerCount; l++)
+        {
+            int layerWindow = LayerAttentionWindow(l);
+
+            // Pre-attention norm per row: identical op to the single-token forward.
+            for (int r = 0; r < rows; r++)
+            {
+                ApplyNorm(_batchCur.AsSpan(r * hidden, hidden), _attnNormWeight[l], _attnNormBias[l], _batchNormed.AsSpan(r * hidden, hidden));
+            }
+
+            // One weight pass per matrix for the whole sub-batch; each row's result matches its single-vector GEMV.
+            _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionQueryWeight(l), _batchQ.AsSpan(0, rows * qkvRegion));
+
+            _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionKeyWeight(l), _batchK.AsSpan(0, rows * kvRegion));
+
+            _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionValueWeight(l), _batchV.AsSpan(0, rows * kvRegion));
+
+            // Bias, QK-norm, RoPE at the row's absolute position, and the K/V writes for every row complete
+            // before any row attends, so each row's causal read sees exactly the prefix it would have alone.
+            for (int r = 0; r < rows; r++)
+            {
+                int position = basePosition + offset + r;
+
+                AddBias(_batchQ.AsSpan(r * qkvRegion, qkvRegion), _biasQ[l]);
+                AddBias(_batchK.AsSpan(r * kvRegion, kvRegion), _biasK[l]);
+                AddBias(_batchV.AsSpan(r * kvRegion, kvRegion), _biasV[l]);
+
+                ApplyQkNorm(_batchQ.AsSpan(r * qkvRegion, qkvRegion), _attnQNorm[l]);
+                ApplyQkNorm(_batchK.AsSpan(r * kvRegion, kvRegion), _attnKNorm[l]);
+
+                ApplyRopeHeads(_batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, position, windowedLayer: layerWindow > 0);
+                ApplyRopeHeads(_batchK.AsSpan(r * kvRegion, kvRegion), Plan.KvHeadCount, position, windowedLayer: layerWindow > 0);
+
+                kv.WriteK(position, l, _batchK.AsSpan(r * kvRegion, kvRegion));
+                kv.WriteV(position, l, _batchV.AsSpan(r * kvRegion, kvRegion));
+            }
+
+            // Row-tiled attention for the whole sub-batch in one walk per layer: each selected position's K/V is read
+            // once per kv-head group and applied to every row whose own causal selection covers it — a row whose causal
+            // limit or own selection excludes the position never touches that slot — while each row's online-softmax
+            // state advances through the row-state buffers in exactly the ascending order its per-row kernel ran it.
+            LayerOps.CausalAttentionTiledRows(
+                _backend,
+                _batchQ.AsSpan(0, rows * qkvRegion),
+                basePosition + offset,
+                rows,
+                Plan.HeadCount,
+                Plan.KvHeadCount,
+                Plan.HeadDim,
+                kv,
+                l,
+                attnScale,
+                Plan.AttentionSoftcap,
+                layerWindow,
+                tiledRowMax,
+                tiledRowSumExp,
+                _batchAttnOut.AsSpan(0, rows * qkvRegion));
 
             ReadOnlySpan<byte> bytes = _weights.Resolve(_wo[l]);
             _backend.GemvBatch(_batchAttnOut.AsSpan(0, rows * qkvRegion), rows, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _batchProj.AsSpan(0, rows * hidden));
