@@ -79,7 +79,7 @@ pwsh -File scripts/generate-tokenizer-parity.ps1 -ModelPath models/Phi-3-mini-4k
 dotnet run --project bench/Lair.Bench -- <args>
 ```
 
-Kernel microbenchmarks (fused dequant GEMV vs scalar oracle, thread scaling). `gemv` runs the synthetic Q4_K control; `gguf-dump <path>` prints a file's tensor table; `gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M]` times real GGUF bytes through the mmap weight source (defaults: quota 8, reps 150, max 1024 rows per tensor) and prints both mapping-timed numbers and a private-copy pass over the identical bytes.
+Kernel microbenchmarks (fused dequant GEMV vs scalar oracle, thread scaling). `gemv` runs the synthetic Q4_K control; `gguf-dump <path>` prints a file's tensor table; `gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M]` times real GGUF bytes through the mmap weight source (defaults: quota 8, reps 150, max 1024 rows per tensor) and prints both mapping-timed numbers and a private-copy pass over the identical bytes. `prefill-profile <gguf path> [--threads N] [--lengths L1,L2,…] [--reps R] [--per-token] [--out <path>]` times prompt windows through the batched-prefill path over a fresh KV per measurement — `--per-token` adds the single-token forward for comparison — and prints a table splitting measured cost into a weight term (ms per weight traversal, implied GB/s) and an attention term (µs per position pair) with the crossover length where attention overtakes the weight term; `--out` writes the same table to a file. Runs whose costs stop rising with the causal span print the split as unusable.
 
 ### Measured GEMV throughput on this box
 

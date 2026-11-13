@@ -4,6 +4,21 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.12] - 2026-11-13
+
+### Changed
+
+- Prefill forwards batched rows: a prompt window of `L` rows advances in `ceil(L / 16)` weight traversals through the engine's 16-row batch buffers with causal-within-chunk attention over the growing KV, instead of one token per traversal. Chunk width, decode priority, and step composition are unchanged, and every prompt window produces bit-identical logits, KV bytes, sampled tokens, and subsequent decode steps to the per-token route it replaces. Measured on `Llama-3.2-1B-Instruct-IQ4_XS` (1751-token prompt, 8 threads): 169.3 s / 173.2 s before, 122.4 s / 129.7 s after; `Qwen3-0.6B-Q8_0` (928-token prompt): 64.3 s / 66.6 s before, 43.0 s / 43.7 s after, with its short-request decode unchanged.
+
+### Added
+
+- `Lair.Bench prefill-profile <gguf> [--threads N] [--lengths …] [--reps N] [--per-token] [--out <path>]`: times prompt windows through the batched-prefill path (and optionally the single-token forward) over a fresh KV per measurement, then fits measured cost as a weight term plus an attention term and reports the crossover length where attention becomes the larger term. A run whose costs stop rising with the causal span prints the split as unusable instead of fitting it.
+- Committed prefill cost profile (`bench/reports/prefill-profile-2026-11-12.md` with its raw tables): `Llama-3.2-1B-Instruct-IQ4_XS` fits 252–345 ms per weight traversal (1.5–2.1 GB/s of the 496 MB a traversal streams) against 52–57 µs per position pair, crossing over at 555–827 tokens; `Qwen3-0.6B-Q8_0` fits 127 ms per traversal (3.7 GB/s) against 61 µs per position pair, crossing over at 266. At 2048 tokens on Llama the attention term is 110 s against 44 s of weight reads.
+
+### Removed
+
+- The per-token prefill route is deleted rather than kept as a fallback; batched prefill is bit-identical to it under `Category=Prefill` (16/16), with `Category=Parity` 49/49, `Category=Concurrency` 5/5, and `Category=Serve|Cache` 22/22 unchanged.
+
 ## [0.3.11] - 2026-11-12
 
 ### Added
