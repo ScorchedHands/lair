@@ -1,12 +1,16 @@
 ﻿using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.Intrinsics.X86;
 using Lair.Backends.Cpu;
 using Lair.Contracts;
+using Lair.Kv;
 using Lair.Loader;
+using Lair.Models.Engine;
+using Lair.Tokenizer;
 
 if (args.Length == 0)
 {
-    Console.WriteLine("usage: Lair.Bench <gemv|gguf-dump|gemv-file|help>");
+    Console.WriteLine("usage: Lair.Bench <gemv|gguf-dump|gemv-file|prefill-profile|help>");
     return 1;
 }
 
@@ -15,12 +19,13 @@ return args[0] switch
     "gemv" => BenchGemv(),
     "gguf-dump" => DumpGguf(args.Length > 1 ? args[1] : @"models\SmolLM-135M-Instruct-F16.gguf"),
     "gemv-file" => BenchFileGemv(args),
+    "prefill-profile" => BenchPrefillProfile(args),
     _ => Usage(),
 };
 
 static int Usage()
 {
-    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, or gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M]");
+    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M], or prefill-profile <gguf path> [--threads N] [--lengths L1,L2,...] [--reps R] [--per-token] [--out <path>]");
     return 1;
 }
 
@@ -469,6 +474,353 @@ static float[] NextActivations(Random rng, int cols)
 static bool IsAttentionOrMlp(string name) =>
     name.Contains(".attn_", StringComparison.Ordinal) || name.Contains(".ffn_", StringComparison.Ordinal);
 
+// Prefill cost profile: forward prompt windows of the requested lengths through the engine's batched-prefill path
+// (and optionally through the single-token forward, the route prefill took before row batching) over a fresh KV per
+// measurement, then split each window's measured cost into a weight-traversal term and an attention term. A window of
+// L rows runs in ceil(L / MaxBatchSequences) sub-batches, and every dense weight matrix is traversed once per
+// sub-batch regardless of row count, so the weight term is a step function of L while attention grows with the summed
+// causal span, L(L+1)/2 per layer and head. Both coefficients come from one least-squares fit of measured cost
+// against the two terms over every measured length. The implied GB/s divides the packed attention/FFN bytes the
+// engine streams per traversal by the fitted weight cost. The crossover length is where the fitted attention term
+// reaches the fitted weight term.
+static int BenchPrefillProfile(string[] args)
+{
+    if (args.Length < 2)
+    {
+        Console.WriteLine("usage: prefill-profile <gguf path> [--threads N] [--lengths 16,32,...] [--reps R] [--per-token] [--out <path>]");
+        return 1;
+    }
+
+    int threads = 0; // 0 = the backend's auto-sizing, same posture as the serve surface with engine.threads unset
+    int reps = 3;
+    bool perToken = false;
+    string? outPath = null;
+    List<int> lengths = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048];
+    for (int i = 2; i < args.Length; i++)
+    {
+        switch (args[i])
+        {
+            case "--threads":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--threads' needs a value");
+                    return 1;
+                }
+
+                threads = ParseOption(args[++i], threads);
+                break;
+            case "--reps":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--reps' needs a value");
+                    return 1;
+                }
+
+                reps = Math.Max(1, ParseOption(args[++i], reps));
+                break;
+            case "--lengths":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--lengths' needs a value");
+                    return 1;
+                }
+
+                List<int> parsed = [];
+                foreach (string part in args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    if (!int.TryParse(part, out int length) || length < 1)
+                    {
+                        Console.WriteLine($"prefill-profile: invalid length '{part}'");
+                        return 1;
+                    }
+
+                    parsed.Add(length);
+                }
+
+                if (parsed.Count == 0)
+                {
+                    Console.WriteLine("prefill-profile: --lengths listed no positive lengths");
+                    return 1;
+                }
+
+                lengths = [.. parsed.Distinct().OrderBy(l => l)];
+                break;
+            case "--per-token":
+                perToken = true;
+                break;
+            case "--out":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--out' needs a value");
+                    return 1;
+                }
+
+                outPath = args[++i];
+                break;
+            default:
+                Console.WriteLine($"prefill-profile: unknown option '{args[i]}'");
+                return 1;
+        }
+    }
+
+    if (threads < 0)
+    {
+        Console.WriteLine("prefill-profile: --threads must be 0 (auto) or positive");
+        return 1;
+    }
+
+    using GgufFile gguf = GgufFile.Open(args[1]);
+    using GgufMmapWeightSource weights = new(gguf);
+    using CpuBackend backend = new(threads: threads, allowAvx2: true);
+
+    int maxLength = lengths[^1];
+    using TransformerModel model = TransformerModel.Open(gguf, weights, backend, maxContextTokens: maxLength);
+
+    // Packed bytes the engine streams per weight traversal: the per-layer attention and feed-forward matrices. The
+    // output head is read once per window, not once per sub-batch, so it is accounted as its own constant term.
+    long traversalBytes = 0;
+    long outputHeadBytes = 0;
+    foreach (LogicalTensor tensor in gguf.Tensors.Tensors)
+    {
+        if (IsAttentionOrMlp(tensor.Name))
+        {
+            traversalBytes += tensor.SizeBytes;
+        }
+        else if (tensor.Name.Contains("output.weight", StringComparison.Ordinal) || tensor.Name.Contains("lm_head", StringComparison.Ordinal))
+        {
+            outputHeadBytes += tensor.SizeBytes;
+        }
+    }
+
+    GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
+    int[] prompt = BuildPrefillPrompt(tokenizer, maxLength);
+
+    int blockTokens = 16; // the same block granularity the tests and the engine's KV side use
+    int capacityBlocks = (maxLength + blockTokens - 1) / blockTokens + 8; // slack past the longest window so no measurement trips the pool
+    using BlockPool pool = new(blockTokens, model.Desc.LayerCount, model.Desc.KvHeadCount, model.Desc.HeadDim, capacityBlocks, backend);
+
+    int windowedLayers = 0;
+    for (int layer = 0; layer < model.Desc.LayerCount; layer++)
+    {
+        if (model.Plan.AttentionWindowForLayer(layer) > 0)
+        {
+            windowedLayers++;
+        }
+    }
+
+    Console.WriteLine($"prefill-profile file={gguf.Path} bytes={gguf.FileSize} threads={backend.EffectiveWorkerCount} maxBatchSequences={TransformerModel.MaxBatchSequences}");
+    Console.WriteLine(
+        $"  arch={model.Desc.Architecture} layers={model.Desc.LayerCount} hidden={model.Desc.HiddenSize} heads={model.Desc.HeadCount} " +
+        $"kvHeads={model.Desc.KvHeadCount} headDim={model.Desc.HeadDim} vocab={model.Desc.VocabSize} windowedLayers={windowedLayers} " +
+        $"avx2={Avx2.IsSupported}");
+    Console.WriteLine(
+        $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} " +
+        $"reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}");
+
+    List<PrefillRow> rows = [];
+    foreach (int length in lengths)
+    {
+        int subBatches = (length + TransformerModel.MaxBatchSequences - 1) / TransformerModel.MaxBatchSequences;
+
+        // Warm pass then best-of-reps timed passes, each over a fresh SequenceKv: a window that reused a previous
+        // window's KV would score against already-written blocks and report the shorter run's residency instead.
+        double batchedMs = double.PositiveInfinity;
+        for (int rep = 0; rep < reps + 1; rep++)
+        {
+            using SequenceKv kv = new(pool);
+            Stopwatch sw = Stopwatch.StartNew();
+            model.Prefill(prompt.AsSpan(0, length).ToArray(), kv);
+            sw.Stop();
+            if (rep > 0)
+            {
+                batchedMs = Math.Min(batchedMs, sw.Elapsed.TotalMilliseconds);
+            }
+        }
+
+        double perTokenMs = double.NaN;
+        if (perToken)
+        {
+            perTokenMs = double.PositiveInfinity;
+            for (int rep = 0; rep < reps + 1; rep++)
+            {
+                using SequenceKv kv = new(pool);
+                Stopwatch sw = Stopwatch.StartNew();
+                for (int i = 0; i < length; i++)
+                {
+                    model.DecodeNext(prompt[i], kv); // the route prefill used before row batching: one token at each next free position
+                }
+
+                sw.Stop();
+                if (rep > 0)
+                {
+                    perTokenMs = Math.Min(perTokenMs, sw.Elapsed.TotalMilliseconds);
+                }
+            }
+        }
+
+        rows.Add(new PrefillRow(length, subBatches, batchedMs, perTokenMs));
+    }
+
+    // Cost model: measured cost is a weight term proportional to the sub-batch count plus an attention term
+    // proportional to the summed causal span, L(L+1)/2. Both coefficients come from one least-squares fit over every
+    // measured length, solved as 2x2 normal equations, so neither term is read off a single measurement and one bad
+    // measurement on one length cannot flip the split.
+    double weightMsPerTraversal = double.NaN;
+    double attentionMsPerPair = double.NaN;
+    string fitNote;
+    double s11 = 0.0;
+    double s12 = 0.0;
+    double s22 = 0.0;
+    double b1 = 0.0;
+    double b2 = 0.0;
+    foreach (PrefillRow row in rows)
+    {
+        double traversals = row.SubBatches;
+        double pairs = (double)row.Length * (row.Length + 1) / 2.0;
+        s11 += traversals * traversals;
+        s12 += traversals * pairs;
+        s22 += pairs * pairs;
+        b1 += traversals * row.BatchedMs;
+        b2 += pairs * row.BatchedMs;
+    }
+
+    double determinant = s11 * s22 - s12 * s12;
+    if (rows.Count >= 2 && determinant > 0.0)
+    {
+        weightMsPerTraversal = (b1 * s22 - b2 * s12) / determinant;
+        attentionMsPerPair = (s11 * b2 - s12 * b1) / determinant;
+        fitNote = $"least-squares fit over {rows.Count} lengths";
+    }
+    else
+    {
+        PrefillRow only = rows.OrderBy(r => r.BatchedMs / r.SubBatches).First();
+        weightMsPerTraversal = only.BatchedMs / only.SubBatches;
+        attentionMsPerPair = 0.0;
+        fitNote = "from min per-traversal cost (the fit needs at least two distinct sub-batch counts)";
+    }
+
+    // A negative attention coefficient means the measured costs do not rise with the causal span, which happens when
+    // another workload steals cores mid-run: the cost curve stops being a function of the prompt length at all. The
+    // split is reported as unusable rather than printed as a model that no measurement supports.
+    bool splitUsable = attentionMsPerPair > 0.0 && weightMsPerTraversal > 0.0;
+    if (!splitUsable)
+    {
+        fitNote = "UNRELIABLE: measured costs are not separable into the two terms on this run";
+    }
+
+    double impliedWeightGbPerSecond = traversalBytes / (weightMsPerTraversal / 1000.0) / 1e9;
+
+    // Crossover: the first length where the fitted attention term reaches the fitted weight term. The quadratic term
+    // is only valid up to the model's resolved attention windows, so the crossover is a floor.
+    PrefillRow last = rows[^1];
+    int crossover = -1;
+    if (splitUsable)
+    {
+        for (int length = 1; length <= 4 * maxLength; length++)
+        {
+            double attention = attentionMsPerPair * length * (length + 1) / 2.0;
+            double weight = ((length + TransformerModel.MaxBatchSequences - 1) / TransformerModel.MaxBatchSequences) * weightMsPerTraversal;
+            if (attention >= weight)
+            {
+                crossover = length;
+                break;
+            }
+        }
+    }
+
+    Console.WriteLine($"  weightFit={weightMsPerTraversal:F2} ms/traversal ({fitNote}) impliedWeightGB/s={impliedWeightGbPerSecond:F2}");
+    Console.WriteLine($"  attentionFit={attentionMsPerPair * 1000.0:F3} us per position pair");
+    Console.WriteLine(
+        crossover > 0
+            ? $"  crossover: fitted attention term >= fitted weight term at length >= {crossover}"
+            : $"  crossover: not reached within 4x the longest measured length ({last.Length} tokens)");
+
+    Console.WriteLine();
+    List<string> headers = ["length", "subBatches", "batchedMs", "batchedTok/s"];
+    if (perToken)
+    {
+        headers.Add("perTokenMs");
+        headers.Add("perTokenTok/s");
+    }
+
+    headers.Add("weightMs");
+    headers.Add("attentionMs");
+    headers.Add("fitResidualMs");
+    headers.Add("weightGB/s");
+    Console.WriteLine(string.Join("  ", headers.Select(h => h.PadLeft(Math.Max(h.Length, 12)))));
+
+    List<string> lines = [];
+    foreach (PrefillRow row in rows)
+    {
+        double weightEst = row.SubBatches * weightMsPerTraversal;
+        double attentionEst = attentionMsPerPair * (double)row.Length * (row.Length + 1) / 2.0;
+        List<string> cells =
+        [
+            row.Length.ToString(CultureInfo.InvariantCulture),
+            row.SubBatches.ToString(CultureInfo.InvariantCulture),
+            $"{row.BatchedMs:F1}",
+            $"{row.Length / (row.BatchedMs / 1000.0):F2}",
+        ];
+
+        if (perToken)
+        {
+            cells.Add($"{row.PerTokenMs:F1}");
+            cells.Add($"{row.Length / (row.PerTokenMs / 1000.0):F2}");
+        }
+
+        cells.Add($"{weightEst:F1}");
+        cells.Add($"{attentionEst:F1}");
+        cells.Add($"{row.BatchedMs - weightEst - attentionEst:F1}");
+        cells.Add($"{impliedWeightGbPerSecond:F2}");
+        lines.Add(string.Join("  ", cells.Select(c => c.PadLeft(12))));
+    }
+
+    foreach (string line in lines)
+    {
+        Console.WriteLine(line);
+    }
+
+    if (outPath is not null)
+    {
+        List<string> fileLines =
+        [
+            $"prefill-profile file={gguf.Path} bytes={gguf.FileSize} threads={backend.EffectiveWorkerCount} maxBatchSequences={TransformerModel.MaxBatchSequences}",
+            $"  arch={model.Desc.Architecture} layers={model.Desc.LayerCount} hidden={model.Desc.HiddenSize} heads={model.Desc.HeadCount} kvHeads={model.Desc.KvHeadCount} headDim={model.Desc.HeadDim} vocab={model.Desc.VocabSize} windowedLayers={windowedLayers} avx2={Avx2.IsSupported}",
+            $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}",
+            $"  weightFit={weightMsPerTraversal:F2} ms/traversal ({fitNote}) impliedWeightGB/s={impliedWeightGbPerSecond:F2}",
+            $"  attentionFit={attentionMsPerPair * 1000.0:F3} us per position pair",
+            crossover > 0
+                ? $"  crossover: fitted attention term >= fitted weight term at length >= {crossover}"
+                : $"  crossover: not reached within 4x the longest measured length ({last.Length} tokens)",
+            string.Join("  ", headers.Select(h => h.PadLeft(Math.Max(h.Length, 12)))),
+            .. lines,
+        ];
+
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outPath))!);
+        File.WriteAllLines(outPath, fileLines);
+        Console.WriteLine($"wrote table to {outPath}");
+    }
+
+    return 0;
+}
+
+// A prompt of exactly the requested token count from the repeated sentence the prefill tests use, trimmed to length:
+// token values only drive embedding lookups, so any in-vocabulary ids exercise the same weight and attention work.
+static int[] BuildPrefillPrompt(GgufTokenizer tokenizer, int tokens)
+{
+    const string line = "The quick brown fox jumps over the lazy dog while the patient cat watches the rain. ";
+
+    List<int> ids = [];
+    while (ids.Count < tokens)
+    {
+        ids.AddRange(tokenizer.Encode(line));
+    }
+
+    return [.. ids.Take(tokens)];
+}
+
 static int ParseOption(string value, int fallback) => int.TryParse(value, out int parsed) ? parsed : fallback;
 
 internal sealed record RowView(LogicalTensor Tensor, int Cols, long Rows, bool Flattened);
+
+internal sealed record PrefillRow(int Length, int SubBatches, double BatchedMs, double PerTokenMs);

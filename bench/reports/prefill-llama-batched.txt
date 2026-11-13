@@ -1,0 +1,16 @@
+prefill-profile file=models/Llama-3.2-1B-Instruct-IQ4_XS.gguf bytes=743141504 threads=8 maxBatchSequences=16
+  arch=llama layers=16 hidden=2048 heads=32 kvHeads=8 headDim=64 vocab=128256 windowedLayers=0 avx2=True
+  traversalBytes=519831552 outputHeadBytes=0 kvBlocks=136 blockTokens=16 reps=3 perToken=off lengths=16,32,64,128,256,512,1024,1536,2048
+  weightFit=344.79 ms/traversal (least-squares fit over 9 lengths) impliedWeightGB/s=1.51
+  attentionFit=52.415 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 827
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+          16             1         296.8         53.91         344.8           7.1         -55.1          1.51
+          32             2         778.6         41.10         689.6          27.7          61.4          1.51
+          64             4        1559.0         41.05        1379.1         109.0          70.8          1.51
+         128             8        3279.4         39.03        2758.3         432.7          88.4          1.51
+         256            16        7261.5         35.25        5516.6        1724.2          20.7          1.51
+         512            32       17635.4         29.03       11033.2        6883.5        -281.3          1.51
+        1024            64       49286.9         20.78       22066.4       27507.3        -286.8          1.51
+        1536            96       95580.6         16.07       33099.5       61871.3         609.8          1.51
+        2048           128      153853.7         13.31       44132.7      109975.5        -254.5          1.51
