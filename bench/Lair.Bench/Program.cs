@@ -26,7 +26,7 @@ return args[0] switch
 
 static int Usage()
 {
-    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M], or prefill-profile <gguf path> [--threads N] [--lengths L1,L2,...] [--widths W1,W2,...] [--reps R] [--per-token] [--out <path>]");
+    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M], or prefill-profile <gguf path> [--threads N] [--lengths L1,L2,...] [--widths W1,W2,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--out <path>]");
     return 1;
 }
 
@@ -486,12 +486,16 @@ static bool IsAttentionOrMlp(string name) =>
 // the fitted attention term reaches the fitted weight term. With --widths each candidate row width opens its own engine
 // through the plan-resolved seam and gets its own fit, table, sub-batch counts at that resolved count, and a byte
 // estimate of one full sub-batch's activation streams computed from geometry — allocation bytes at that row count, not
-// measured residency. Omitting --widths runs exactly the single default engine as before.
+// measured residency. Omitting --widths runs exactly the single default engine as before. --kernel gemv,tiled,gemm adds
+// a second axis: every named selection opens its own engine and gets its own fit, and a selection the file cannot run is
+// reported as a refusal line naming what the engine lacks rather than falling back to a route that happens to work. The
+// report closes with this process's peak working set, which is one number for the whole run: per-kernel peaks come from
+// separate processes. Omitting --kernel keeps the default selection and the output shape unchanged.
 static int BenchPrefillProfile(string[] args)
 {
     if (args.Length < 2)
     {
-        Console.WriteLine("usage: prefill-profile <gguf path> [--threads N] [--lengths 16,32,...] [--widths 16,32,...] [--reps R] [--per-token] [--out <path>]");
+        Console.WriteLine("usage: prefill-profile <gguf path> [--threads N] [--lengths 16,32,...] [--widths 16,32,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--out <path>]");
         return 1;
     }
 
@@ -501,6 +505,8 @@ static int BenchPrefillProfile(string[] args)
     string? outPath = null;
     List<int> lengths = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048];
     List<int>? rowWidths = null; // the resolved-row-count axis: one candidate engine per listed width; absent keeps the single default engine
+    List<PrefillKernel> kernels = [PrefillKernel.GemV]; // the kernel axis: one candidate engine per named selection; absent keeps the engine's default route
+    bool kernelAxis = false; // an explicit --kernel prints a kernel header per candidate section; the omitted default keeps the report shape unchanged
     for (int i = 2; i < args.Length; i++)
     {
         switch (args[i])
@@ -576,6 +582,42 @@ static int BenchPrefillProfile(string[] args)
                 }
 
                 rowWidths = [.. parsedWidths.Distinct().OrderBy(w => w)];
+                break;
+            case "--kernel":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--kernel' needs a value");
+                    return 1;
+                }
+
+                List<PrefillKernel> parsedKernels = [];
+                foreach (string part in args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    switch (part)
+                    {
+                        case PrefillKernelNames.GemV:
+                            parsedKernels.Add(PrefillKernel.GemV);
+                            break;
+                        case PrefillKernelNames.Tiled:
+                            parsedKernels.Add(PrefillKernel.Tiled);
+                            break;
+                        case PrefillKernelNames.Gemm:
+                            parsedKernels.Add(PrefillKernel.Gemm);
+                            break;
+                        default:
+                            Console.WriteLine($"prefill-profile: invalid kernel '{part}' (expected {PrefillKernelNames.GemV}, {PrefillKernelNames.Tiled}, or {PrefillKernelNames.Gemm})");
+                            return 1;
+                    }
+                }
+
+                if (parsedKernels.Count == 0)
+                {
+                    Console.WriteLine("prefill-profile: --kernel listed no kernels");
+                    return 1;
+                }
+
+                kernels = [.. parsedKernels.Distinct()];
+                kernelAxis = true;
                 break;
             case "--per-token":
                 perToken = true;
@@ -663,17 +705,44 @@ static int BenchPrefillProfile(string[] args)
     Console.WriteLine(
         $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} " +
         $"reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" +
-        (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : ""));
+        (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : "") +
+        (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : ""));
 
-    // One engine per candidate resolved width; without the axis this is exactly the single default engine the profile has always opened. Each candidate disposes before the next opens, so peak model memory stays one engine wide even as their tables interleave in the report body below.
+    // One engine per candidate resolved width per requested kernel; without either axis this is exactly the single default engine the profile has always opened. Each candidate disposes before the next opens, so peak model memory stays one engine wide even as their tables interleave in the report body below. A kernel the engine refuses for this file contributes a refusal line and no table: the selection never falls back to the route that happens to run.
     List<int> candidateWidths = rowWidths ?? [0]; // 0: public open with no explicit resolution — whatever the plan resolves today
+    List<(PrefillKernel Kernel, int Width)> candidateEngines = [];
+    foreach (PrefillKernel kernel in kernels)
+    {
+        foreach (int width in candidateWidths)
+        {
+            candidateEngines.Add((kernel, width));
+        }
+    }
 
     List<string> reportBody = []; // summary and table lines of every candidate, for --out; blank separators are console-only
-    foreach (int requested in candidateWidths)
+    PrefillKernel? sectionedKernel = null; // a kernel header is printed once per kernel section when the axis was requested
+    foreach ((PrefillKernel kernel, int requested) in candidateEngines)
     {
-        using TransformerModel model = requested == 0
-            ? TransformerModel.Open(gguf, backend, maxContextTokens: maxLength)
-            : TransformerModel.Open(gguf, backend, maxContextTokens: maxLength, logLine: null, PrefillKernel.GemV, requested);
+        string kernelName = PrefillKernelNames.Of(kernel);
+        if (kernelAxis && kernel != sectionedKernel)
+        {
+            Console.WriteLine();
+            string kernelLine = $"prefill-profile kernel={kernelName}";
+            reportBody.Add(kernelLine);
+            Console.WriteLine(kernelLine);
+            sectionedKernel = kernel;
+        }
+
+        TransformerModel? opened = OpenCandidate(gguf, backend, maxLength, kernel, requested, out string? refusalReason);
+        if (opened is null)
+        {
+            string refusalLine = $"  kernel={kernelName} status=refused reason={refusalReason}";
+            reportBody.Add(refusalLine);
+            Console.WriteLine(refusalLine);
+            continue;
+        }
+
+        using TransformerModel model = opened;
 
         int resolvedRows = model.ResolvedPrefillRowWidth; // the engine's own answer to what its prompt windows carry
 
@@ -856,13 +925,23 @@ static int BenchPrefillProfile(string[] args)
         }
     }
 
+    // Peak working set of this process at the close of the run — the engine's own mapped weights plus whatever the
+    // measured windows allocated. It is one number for the whole process: a run that measured several kernels reports
+    // the peak across all of them, so committed per-kernel peaks come from separate single-kernel processes.
+    double peakWorkingSetMb = Process.GetCurrentProcess().PeakWorkingSet64 / (1024.0 * 1024.0);
+    string peakLine = kernels.Count > 1
+        ? $"  peakWorkingSetMb={peakWorkingSetMb:F1} cumulative across this process run: measure per-kernel peaks in separate processes"
+        : $"  peakWorkingSetMb={peakWorkingSetMb:F1}";
+    reportBody.Add(peakLine);
+    Console.WriteLine(peakLine);
+
     if (outPath is not null)
     {
         List<string> fileLines =
         [
             $"prefill-profile file={gguf.Path} bytes={gguf.FileSize} threads={backend.EffectiveWorkerCount} maxBatchSequences={TransformerModel.MaxBatchSequences}",
             $"  arch={geometry.Architecture} layers={geometry.LayerCount} hidden={geometry.HiddenSize} heads={geometry.HeadCount} kvHeads={geometry.KvHeadCount} headDim={geometry.HeadDim} vocab={geometry.VocabSize} windowedLayers={windowedLayers} avx2={Avx2.IsSupported}",
-            $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" + (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : ""),
+            $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" + (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : "") + (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : ""),
             .. reportBody,
         ];
 
@@ -896,6 +975,28 @@ static int[] BuildPrefillPrompt(GgufTokenizer tokenizer, int tokens)
 // its final row. These are allocation bytes at that row count, not measured process residency.
 static long EstimatedSubBatchActivationBytes(ModelPlan plan, int rows) =>
     4L * rows * (3L * plan.HiddenSize + 2L * plan.HeadCount * plan.HeadDim + 2L * plan.KvHeadCount * plan.HeadDim + 2L * plan.IntermediateSize);
+
+// Open one candidate engine on a stated kernel and resolved row width (0 keeps the plan's default row count). A kernel
+// this file cannot run comes back as null with the engine's refusal reason, so the caller reports the refusal instead of
+// opening some other route.
+static TransformerModel? OpenCandidate(GgufFile gguf, CpuBackend backend, int maxContextTokens, PrefillKernel kernel, int rowWidth, out string? refusalReason)
+{
+    try
+    {
+        refusalReason = null;
+        return rowWidth == 0
+            ? TransformerModel.Open(gguf, backend, maxContextTokens: maxContextTokens, logLine: null, kernel)
+            : TransformerModel.Open(gguf, backend, maxContextTokens: maxContextTokens, logLine: null, kernel, rowWidth);
+    }
+    catch (ModelException failure)
+    {
+        refusalReason = CollapseWhitespace(failure.Message);
+        return null;
+    }
+}
+
+// A refusal arrives as one long sentence; collapsing its whitespace keeps it on a single report line without rewording it.
+static string CollapseWhitespace(string text) => string.Join(' ', text.Split(" \t\r\n", StringSplitOptions.RemoveEmptyEntries));
 
 static int ParseOption(string value, int fallback) => int.TryParse(value, out int parsed) ? parsed : fallback;
 
