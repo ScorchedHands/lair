@@ -12,4 +12,8 @@ public sealed record ModelFacts(
     int? ThreadQuota,
     string DecodeDevice,
     string PrefillDevice,
-    string KvResidency);
+    string KvResidency,
+    string PrefillKernel,
+
+    /// <summary>The quant formats the served model's dense weight matrices carry: what a prefill selection needs kernels for, and what an unsupported file reports its refusal against.</summary>
+    string MatmulWeightFormats);

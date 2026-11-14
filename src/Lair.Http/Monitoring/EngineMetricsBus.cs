@@ -491,6 +491,8 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 DecodeDevice: facts?.DecodeDevice,
                 PrefillDevice: facts?.PrefillDevice,
                 KvResidency: facts?.KvResidency,
+                PrefillKernel: facts?.PrefillKernel,
+                MatmulWeightFormats: facts?.MatmulWeightFormats,
 
                 WindowedLayers: _pool.DeclaredWindowedLayerCount,
                 KvReadFootprintBlocks: _pool.KvReadFootprintBlocksAtBudget,

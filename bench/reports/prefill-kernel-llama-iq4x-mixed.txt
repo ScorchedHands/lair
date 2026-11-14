@@ -1,0 +1,24 @@
+prefill-profile file=models/Llama-3.2-1B-Instruct-IQ4_XS.gguf bytes=743141504 threads=8 maxBatchSequences=16
+  arch=llama layers=16 hidden=2048 heads=32 kvHeads=8 headDim=64 vocab=128256 windowedLayers=0 avx2=True
+  traversalBytes=519831552 outputHeadBytes=0 kvBlocks=136 blockTokens=16 reps=1 perToken=off lengths=512,1024,2048 rowWidths=32 kernels=gemv,tiled,gemm
+prefill-profile kernel=gemv
+prefill-profile rowWidth=32 subBatchActivationBytes=3538944
+  weightFit=208.35 ms/traversal (least-squares fit over 3 lengths) impliedWeightGB/s=2.49
+  attentionFit=64.006 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 213
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         512            16       14458.8         35.41        3333.7        8405.7        2719.4          2.49
+        1024            32       38217.9         26.79        6667.3       33590.2       -2039.5          2.49
+        2048            64      147969.6         13.84       13334.6      134295.1         339.9          2.49
+prefill-profile kernel=tiled
+prefill-profile rowWidth=32 subBatchActivationBytes=3538944
+  weightFit=134.67 ms/traversal (least-squares fit over 3 lengths) impliedWeightGB/s=3.86
+  attentionFit=69.500 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 125
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         512            16       14540.7         35.21        2154.7        9127.3        3258.7          3.86
+        1024            32       38339.1         26.71        4309.4       36473.8       -2444.0          3.86
+        2048            64      154850.0         13.23        8618.7      145823.9         407.3          3.86
+prefill-profile kernel=gemm
+  kernel=gemm status=refused reason=prefill kernel 'gemm' is not implemented by the forward engine: architecture 'llama' carries dense weight matrices of format(s) Q5_K and no gemm attention/weight path exists in this build for them — the window shape that multiplies a whole sub-batch against one matrix runs only where every dense weight matrix is Q8_0, Q4_K, or IQ4_XS today, while every other family forwards its prompt windows through batched row passes — set engine.prefill_kernel to 'gemv' or 'tiled' (or omit it) to run this file
+  peakWorkingSetMb=987.9 cumulative across this process run: measure per-kernel peaks in separate processes

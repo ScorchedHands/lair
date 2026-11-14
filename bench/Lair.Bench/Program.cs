@@ -5,6 +5,7 @@ using Lair.Backends.Cpu;
 using Lair.Contracts;
 using Lair.Kv;
 using Lair.Loader;
+using Lair.Models;
 using Lair.Models.Engine;
 using Lair.Tokenizer;
 
@@ -25,7 +26,7 @@ return args[0] switch
 
 static int Usage()
 {
-    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M], or prefill-profile <gguf path> [--threads N] [--lengths L1,L2,...] [--reps R] [--per-token] [--out <path>]");
+    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M], or prefill-profile <gguf path> [--threads N] [--lengths L1,L2,...] [--widths W1,W2,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--out <path>]");
     return 1;
 }
 
@@ -477,17 +478,24 @@ static bool IsAttentionOrMlp(string name) =>
 // Prefill cost profile: forward prompt windows of the requested lengths through the engine's batched-prefill path
 // (and optionally through the single-token forward, the route prefill took before row batching) over a fresh KV per
 // measurement, then split each window's measured cost into a weight-traversal term and an attention term. A window of
-// L rows runs in ceil(L / MaxBatchSequences) sub-batches, and every dense weight matrix is traversed once per
-// sub-batch regardless of row count, so the weight term is a step function of L while attention grows with the summed
-// causal span, L(L+1)/2 per layer and head. Both coefficients come from one least-squares fit of measured cost
-// against the two terms over every measured length. The implied GB/s divides the packed attention/FFN bytes the
-// engine streams per traversal by the fitted weight cost. The crossover length is where the fitted attention term
-// reaches the fitted weight term.
+// L rows runs in ceil(L / resolvedPrefillRowWidth) sub-batches — 16 unless --widths resolves another count — and every
+// dense weight matrix is traversed once per sub-batch regardless of row count, so the weight term is a step function of
+// L while attention grows with the summed causal span, L(L+1)/2 per layer and head. Both coefficients come from one
+// least-squares fit of measured cost against the two terms over every measured length. The implied GB/s divides the
+// packed attention/FFN bytes the engine streams per traversal by the fitted weight cost. The crossover length is where
+// the fitted attention term reaches the fitted weight term. With --widths each candidate row width opens its own engine
+// through the plan-resolved seam and gets its own fit, table, sub-batch counts at that resolved count, and a byte
+// estimate of one full sub-batch's activation streams computed from geometry — allocation bytes at that row count, not
+// measured residency. Omitting --widths runs exactly the single default engine as before. --kernel gemv,tiled,gemm adds
+// a second axis: every named selection opens its own engine and gets its own fit, and a selection the file cannot run is
+// reported as a refusal line naming what the engine lacks rather than falling back to a route that happens to work. The
+// report closes with this process's peak working set, which is one number for the whole run: per-kernel peaks come from
+// separate processes. Omitting --kernel keeps the default selection and the output shape unchanged.
 static int BenchPrefillProfile(string[] args)
 {
     if (args.Length < 2)
     {
-        Console.WriteLine("usage: prefill-profile <gguf path> [--threads N] [--lengths 16,32,...] [--reps R] [--per-token] [--out <path>]");
+        Console.WriteLine("usage: prefill-profile <gguf path> [--threads N] [--lengths 16,32,...] [--widths 16,32,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--out <path>]");
         return 1;
     }
 
@@ -496,6 +504,9 @@ static int BenchPrefillProfile(string[] args)
     bool perToken = false;
     string? outPath = null;
     List<int> lengths = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048];
+    List<int>? rowWidths = null; // the resolved-row-count axis: one candidate engine per listed width; absent keeps the single default engine
+    List<PrefillKernel> kernels = [PrefillKernel.GemV]; // the kernel axis: one candidate engine per named selection; absent keeps the engine's default route
+    bool kernelAxis = false; // an explicit --kernel prints a kernel header per candidate section; the omitted default keeps the report shape unchanged
     for (int i = 2; i < args.Length; i++)
     {
         switch (args[i])
@@ -545,6 +556,69 @@ static int BenchPrefillProfile(string[] args)
 
                 lengths = [.. parsed.Distinct().OrderBy(l => l)];
                 break;
+            case "--widths":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--widths' needs a value");
+                    return 1;
+                }
+
+                List<int> parsedWidths = [];
+                foreach (string part in args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    if (!int.TryParse(part, out int width) || width < 1)
+                    {
+                        Console.WriteLine($"prefill-profile: invalid row width '{part}'");
+                        return 1;
+                    }
+
+                    parsedWidths.Add(width);
+                }
+
+                if (parsedWidths.Count == 0)
+                {
+                    Console.WriteLine("prefill-profile: --widths listed no positive row widths");
+                    return 1;
+                }
+
+                rowWidths = [.. parsedWidths.Distinct().OrderBy(w => w)];
+                break;
+            case "--kernel":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--kernel' needs a value");
+                    return 1;
+                }
+
+                List<PrefillKernel> parsedKernels = [];
+                foreach (string part in args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    switch (part)
+                    {
+                        case PrefillKernelNames.GemV:
+                            parsedKernels.Add(PrefillKernel.GemV);
+                            break;
+                        case PrefillKernelNames.Tiled:
+                            parsedKernels.Add(PrefillKernel.Tiled);
+                            break;
+                        case PrefillKernelNames.Gemm:
+                            parsedKernels.Add(PrefillKernel.Gemm);
+                            break;
+                        default:
+                            Console.WriteLine($"prefill-profile: invalid kernel '{part}' (expected {PrefillKernelNames.GemV}, {PrefillKernelNames.Tiled}, or {PrefillKernelNames.Gemm})");
+                            return 1;
+                    }
+                }
+
+                if (parsedKernels.Count == 0)
+                {
+                    Console.WriteLine("prefill-profile: --kernel listed no kernels");
+                    return 1;
+                }
+
+                kernels = [.. parsedKernels.Distinct()];
+                kernelAxis = true;
+                break;
             case "--per-token":
                 perToken = true;
                 break;
@@ -569,12 +643,28 @@ static int BenchPrefillProfile(string[] args)
         return 1;
     }
 
+    // A candidate width past the engine's allocation ceiling is refused here naming it, before a file opens — the same refusal the engine raises at open for an out-of-range count.
+    if (rowWidths is not null)
+    {
+        foreach (int width in rowWidths)
+        {
+            if (width > TransformerModel.MaxPrefillRowWidth)
+            {
+                Console.WriteLine($"prefill-profile: row width {width} exceeds the engine's resolved prefill row ceiling of {TransformerModel.MaxPrefillRowWidth}");
+                return 1;
+            }
+        }
+    }
+
     using GgufFile gguf = GgufFile.Open(args[1]);
-    using GgufMmapWeightSource weights = new(gguf);
     using CpuBackend backend = new(threads: threads, allowAvx2: true);
 
+    // Each candidate engine owns and releases its own mmap view of the file: a shared source would be released by whichever
+    // candidate disposes first while later candidates still read tensors through it.
     int maxLength = lengths[^1];
-    using TransformerModel model = TransformerModel.Open(gguf, weights, backend, maxContextTokens: maxLength);
+
+    // Geometry every candidate shares over one file: pool sizing and the header line come from the resolved plan so no measurement depends on whichever engine happens to be open. Candidate engines differ only in their resolved prefill row count.
+    ModelPlan geometry = ModelPlans.Resolve(gguf);
 
     // Packed bytes the engine streams per weight traversal: the per-layer attention and feed-forward matrices. The
     // output head is read once per window, not once per sub-batch, so it is accounted as its own constant term.
@@ -597,12 +687,12 @@ static int BenchPrefillProfile(string[] args)
 
     int blockTokens = 16; // the same block granularity the tests and the engine's KV side use
     int capacityBlocks = (maxLength + blockTokens - 1) / blockTokens + 8; // slack past the longest window so no measurement trips the pool
-    using BlockPool pool = new(blockTokens, model.Desc.LayerCount, model.Desc.KvHeadCount, model.Desc.HeadDim, capacityBlocks, backend);
+    using BlockPool pool = new(blockTokens, geometry.LayerCount, geometry.KvHeadCount, geometry.HeadDim, capacityBlocks, backend);
 
     int windowedLayers = 0;
-    for (int layer = 0; layer < model.Desc.LayerCount; layer++)
+    for (int layer = 0; layer < geometry.LayerCount; layer++)
     {
-        if (model.Plan.AttentionWindowForLayer(layer) > 0)
+        if (geometry.AttentionWindowForLayer(layer) > 0)
         {
             windowedLayers++;
         }
@@ -610,190 +700,249 @@ static int BenchPrefillProfile(string[] args)
 
     Console.WriteLine($"prefill-profile file={gguf.Path} bytes={gguf.FileSize} threads={backend.EffectiveWorkerCount} maxBatchSequences={TransformerModel.MaxBatchSequences}");
     Console.WriteLine(
-        $"  arch={model.Desc.Architecture} layers={model.Desc.LayerCount} hidden={model.Desc.HiddenSize} heads={model.Desc.HeadCount} " +
-        $"kvHeads={model.Desc.KvHeadCount} headDim={model.Desc.HeadDim} vocab={model.Desc.VocabSize} windowedLayers={windowedLayers} " +
-        $"avx2={Avx2.IsSupported}");
+        $"  arch={geometry.Architecture} layers={geometry.LayerCount} hidden={geometry.HiddenSize} heads={geometry.HeadCount} " +
+        $"kvHeads={geometry.KvHeadCount} headDim={geometry.HeadDim} vocab={geometry.VocabSize} windowedLayers={windowedLayers} avx2={Avx2.IsSupported}");
     Console.WriteLine(
         $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} " +
-        $"reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}");
+        $"reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" +
+        (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : "") +
+        (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : ""));
 
-    List<PrefillRow> rows = [];
-    foreach (int length in lengths)
+    // One engine per candidate resolved width per requested kernel; without either axis this is exactly the single default engine the profile has always opened. Each candidate disposes before the next opens, so peak model memory stays one engine wide even as their tables interleave in the report body below. A kernel the engine refuses for this file contributes a refusal line and no table: the selection never falls back to the route that happens to run.
+    List<int> candidateWidths = rowWidths ?? [0]; // 0: public open with no explicit resolution — whatever the plan resolves today
+    List<(PrefillKernel Kernel, int Width)> candidateEngines = [];
+    foreach (PrefillKernel kernel in kernels)
     {
-        int subBatches = (length + TransformerModel.MaxBatchSequences - 1) / TransformerModel.MaxBatchSequences;
-
-        // Warm pass then best-of-reps timed passes, each over a fresh SequenceKv: a window that reused a previous
-        // window's KV would score against already-written blocks and report the shorter run's residency instead.
-        double batchedMs = double.PositiveInfinity;
-        for (int rep = 0; rep < reps + 1; rep++)
+        foreach (int width in candidateWidths)
         {
-            using SequenceKv kv = new(pool);
-            Stopwatch sw = Stopwatch.StartNew();
-            model.Prefill(prompt.AsSpan(0, length).ToArray(), kv);
-            sw.Stop();
-            if (rep > 0)
-            {
-                batchedMs = Math.Min(batchedMs, sw.Elapsed.TotalMilliseconds);
-            }
+            candidateEngines.Add((kernel, width));
+        }
+    }
+
+    List<string> reportBody = []; // summary and table lines of every candidate, for --out; blank separators are console-only
+    PrefillKernel? sectionedKernel = null; // a kernel header is printed once per kernel section when the axis was requested
+    foreach ((PrefillKernel kernel, int requested) in candidateEngines)
+    {
+        string kernelName = PrefillKernelNames.Of(kernel);
+        if (kernelAxis && kernel != sectionedKernel)
+        {
+            Console.WriteLine();
+            string kernelLine = $"prefill-profile kernel={kernelName}";
+            reportBody.Add(kernelLine);
+            Console.WriteLine(kernelLine);
+            sectionedKernel = kernel;
         }
 
-        double perTokenMs = double.NaN;
-        if (perToken)
+        TransformerModel? opened = OpenCandidate(gguf, backend, maxLength, kernel, requested, out string? refusalReason);
+        if (opened is null)
         {
-            perTokenMs = double.PositiveInfinity;
+            string refusalLine = $"  kernel={kernelName} status=refused reason={refusalReason}";
+            reportBody.Add(refusalLine);
+            Console.WriteLine(refusalLine);
+            continue;
+        }
+
+        using TransformerModel model = opened;
+
+        int resolvedRows = model.ResolvedPrefillRowWidth; // the engine's own answer to what its prompt windows carry
+
+        if (rowWidths is not null)
+        {
+            Console.WriteLine();
+            string axisLine = $"prefill-profile rowWidth={resolvedRows} subBatchActivationBytes={EstimatedSubBatchActivationBytes(geometry, resolvedRows)}";
+            reportBody.Add(axisLine);
+            Console.WriteLine(axisLine);
+        }
+
+        List<PrefillRow> rows = [];
+        foreach (int length in lengths)
+        {
+            int subBatches = (length + resolvedRows - 1) / resolvedRows;
+
+            // Warm pass then best-of-reps timed passes, each over a fresh SequenceKv: a window that reused a previous
+            // window's KV would score against already-written blocks and report the shorter run's residency instead.
+            double batchedMs = double.PositiveInfinity;
             for (int rep = 0; rep < reps + 1; rep++)
             {
                 using SequenceKv kv = new(pool);
                 Stopwatch sw = Stopwatch.StartNew();
-                for (int i = 0; i < length; i++)
-                {
-                    model.DecodeNext(prompt[i], kv); // the route prefill used before row batching: one token at each next free position
-                }
-
+                model.Prefill(prompt.AsSpan(0, length).ToArray(), kv);
                 sw.Stop();
                 if (rep > 0)
                 {
-                    perTokenMs = Math.Min(perTokenMs, sw.Elapsed.TotalMilliseconds);
+                    batchedMs = Math.Min(batchedMs, sw.Elapsed.TotalMilliseconds);
+                }
+            }
+
+            double perTokenMs = double.NaN;
+            if (perToken)
+            {
+                perTokenMs = double.PositiveInfinity;
+                for (int rep = 0; rep < reps + 1; rep++)
+                {
+                    using SequenceKv kv = new(pool);
+                    Stopwatch sw = Stopwatch.StartNew();
+                    for (int i = 0; i < length; i++)
+                    {
+                        model.DecodeNext(prompt[i], kv); // the route prefill used before row batching: one token at each next free position
+                    }
+
+                    sw.Stop();
+                    if (rep > 0)
+                    {
+                        perTokenMs = Math.Min(perTokenMs, sw.Elapsed.TotalMilliseconds);
+                    }
+                }
+            }
+
+            rows.Add(new PrefillRow(length, subBatches, batchedMs, perTokenMs));
+        }
+
+        // Cost model: measured cost is a weight term proportional to the sub-batch count plus an attention term
+        // proportional to the summed causal span, L(L+1)/2. Both coefficients come from one least-squares fit over every
+        // measured length, solved as 2x2 normal equations, so neither term is read off a single measurement and one bad
+        // measurement on one length cannot flip the split.
+        double weightMsPerTraversal = double.NaN;
+        double attentionMsPerPair = double.NaN;
+        string fitNote;
+        double s11 = 0.0;
+        double s12 = 0.0;
+        double s22 = 0.0;
+        double b1 = 0.0;
+        double b2 = 0.0;
+        foreach (PrefillRow row in rows)
+        {
+            double traversals = row.SubBatches;
+            double pairs = (double)row.Length * (row.Length + 1) / 2.0;
+            s11 += traversals * traversals;
+            s12 += traversals * pairs;
+            s22 += pairs * pairs;
+            b1 += traversals * row.BatchedMs;
+            b2 += pairs * row.BatchedMs;
+        }
+
+        double determinant = s11 * s22 - s12 * s12;
+        if (rows.Count >= 2 && determinant > 0.0)
+        {
+            weightMsPerTraversal = (b1 * s22 - b2 * s12) / determinant;
+            attentionMsPerPair = (s11 * b2 - s12 * b1) / determinant;
+            fitNote = $"least-squares fit over {rows.Count} lengths";
+        }
+        else
+        {
+            PrefillRow only = rows.OrderBy(r => r.BatchedMs / r.SubBatches).First();
+            weightMsPerTraversal = only.BatchedMs / only.SubBatches;
+            attentionMsPerPair = 0.0;
+            fitNote = "from min per-traversal cost (the fit needs at least two distinct sub-batch counts)";
+        }
+
+        // A negative attention coefficient means the measured costs do not rise with the causal span, which happens when
+        // another workload steals cores mid-run: the cost curve stops being a function of the prompt length at all. The
+        // split is reported as unusable rather than printed as a model that no measurement supports.
+        bool splitUsable = attentionMsPerPair > 0.0 && weightMsPerTraversal > 0.0;
+        if (!splitUsable)
+        {
+            fitNote = "UNRELIABLE: measured costs are not separable into the two terms on this run";
+        }
+
+        double impliedWeightGbPerSecond = traversalBytes / (weightMsPerTraversal / 1000.0) / 1e9;
+
+        // Crossover at this engine's resolved row width: the first length where the fitted attention term reaches the
+        // fitted weight term. The quadratic term is only valid up to the model's resolved attention windows, so the
+        // crossover is a floor.
+        PrefillRow last = rows[^1];
+        int crossover = -1;
+        if (splitUsable)
+        {
+            for (int length = 1; length <= 4 * maxLength; length++)
+            {
+                double attention = attentionMsPerPair * length * (length + 1) / 2.0;
+                double weight = ((length + resolvedRows - 1) / resolvedRows) * weightMsPerTraversal;
+                if (attention >= weight)
+                {
+                    crossover = length;
+                    break;
                 }
             }
         }
 
-        rows.Add(new PrefillRow(length, subBatches, batchedMs, perTokenMs));
-    }
-
-    // Cost model: measured cost is a weight term proportional to the sub-batch count plus an attention term
-    // proportional to the summed causal span, L(L+1)/2. Both coefficients come from one least-squares fit over every
-    // measured length, solved as 2x2 normal equations, so neither term is read off a single measurement and one bad
-    // measurement on one length cannot flip the split.
-    double weightMsPerTraversal = double.NaN;
-    double attentionMsPerPair = double.NaN;
-    string fitNote;
-    double s11 = 0.0;
-    double s12 = 0.0;
-    double s22 = 0.0;
-    double b1 = 0.0;
-    double b2 = 0.0;
-    foreach (PrefillRow row in rows)
-    {
-        double traversals = row.SubBatches;
-        double pairs = (double)row.Length * (row.Length + 1) / 2.0;
-        s11 += traversals * traversals;
-        s12 += traversals * pairs;
-        s22 += pairs * pairs;
-        b1 += traversals * row.BatchedMs;
-        b2 += pairs * row.BatchedMs;
-    }
-
-    double determinant = s11 * s22 - s12 * s12;
-    if (rows.Count >= 2 && determinant > 0.0)
-    {
-        weightMsPerTraversal = (b1 * s22 - b2 * s12) / determinant;
-        attentionMsPerPair = (s11 * b2 - s12 * b1) / determinant;
-        fitNote = $"least-squares fit over {rows.Count} lengths";
-    }
-    else
-    {
-        PrefillRow only = rows.OrderBy(r => r.BatchedMs / r.SubBatches).First();
-        weightMsPerTraversal = only.BatchedMs / only.SubBatches;
-        attentionMsPerPair = 0.0;
-        fitNote = "from min per-traversal cost (the fit needs at least two distinct sub-batch counts)";
-    }
-
-    // A negative attention coefficient means the measured costs do not rise with the causal span, which happens when
-    // another workload steals cores mid-run: the cost curve stops being a function of the prompt length at all. The
-    // split is reported as unusable rather than printed as a model that no measurement supports.
-    bool splitUsable = attentionMsPerPair > 0.0 && weightMsPerTraversal > 0.0;
-    if (!splitUsable)
-    {
-        fitNote = "UNRELIABLE: measured costs are not separable into the two terms on this run";
-    }
-
-    double impliedWeightGbPerSecond = traversalBytes / (weightMsPerTraversal / 1000.0) / 1e9;
-
-    // Crossover: the first length where the fitted attention term reaches the fitted weight term. The quadratic term
-    // is only valid up to the model's resolved attention windows, so the crossover is a floor.
-    PrefillRow last = rows[^1];
-    int crossover = -1;
-    if (splitUsable)
-    {
-        for (int length = 1; length <= 4 * maxLength; length++)
-        {
-            double attention = attentionMsPerPair * length * (length + 1) / 2.0;
-            double weight = ((length + TransformerModel.MaxBatchSequences - 1) / TransformerModel.MaxBatchSequences) * weightMsPerTraversal;
-            if (attention >= weight)
-            {
-                crossover = length;
-                break;
-            }
-        }
-    }
-
-    Console.WriteLine($"  weightFit={weightMsPerTraversal:F2} ms/traversal ({fitNote}) impliedWeightGB/s={impliedWeightGbPerSecond:F2}");
-    Console.WriteLine($"  attentionFit={attentionMsPerPair * 1000.0:F3} us per position pair");
-    Console.WriteLine(
-        crossover > 0
-            ? $"  crossover: fitted attention term >= fitted weight term at length >= {crossover}"
-            : $"  crossover: not reached within 4x the longest measured length ({last.Length} tokens)");
-
-    Console.WriteLine();
-    List<string> headers = ["length", "subBatches", "batchedMs", "batchedTok/s"];
-    if (perToken)
-    {
-        headers.Add("perTokenMs");
-        headers.Add("perTokenTok/s");
-    }
-
-    headers.Add("weightMs");
-    headers.Add("attentionMs");
-    headers.Add("fitResidualMs");
-    headers.Add("weightGB/s");
-    Console.WriteLine(string.Join("  ", headers.Select(h => h.PadLeft(Math.Max(h.Length, 12)))));
-
-    List<string> lines = [];
-    foreach (PrefillRow row in rows)
-    {
-        double weightEst = row.SubBatches * weightMsPerTraversal;
-        double attentionEst = attentionMsPerPair * (double)row.Length * (row.Length + 1) / 2.0;
-        List<string> cells =
+        string[] summaryLines =
         [
-            row.Length.ToString(CultureInfo.InvariantCulture),
-            row.SubBatches.ToString(CultureInfo.InvariantCulture),
-            $"{row.BatchedMs:F1}",
-            $"{row.Length / (row.BatchedMs / 1000.0):F2}",
+            $"  weightFit={weightMsPerTraversal:F2} ms/traversal ({fitNote}) impliedWeightGB/s={impliedWeightGbPerSecond:F2}",
+            $"  attentionFit={attentionMsPerPair * 1000.0:F3} us per position pair",
+            crossover > 0
+                ? $"  crossover: fitted attention term >= fitted weight term at length >= {crossover}"
+                : $"  crossover: not reached within 4x the longest measured length ({last.Length} tokens)",
         ];
 
-        if (perToken)
+        foreach (string summaryLine in summaryLines)
         {
-            cells.Add($"{row.PerTokenMs:F1}");
-            cells.Add($"{row.Length / (row.PerTokenMs / 1000.0):F2}");
+            reportBody.Add(summaryLine);
+            Console.WriteLine(summaryLine);
         }
 
-        cells.Add($"{weightEst:F1}");
-        cells.Add($"{attentionEst:F1}");
-        cells.Add($"{row.BatchedMs - weightEst - attentionEst:F1}");
-        cells.Add($"{impliedWeightGbPerSecond:F2}");
-        lines.Add(string.Join("  ", cells.Select(c => c.PadLeft(12))));
+        Console.WriteLine();
+        List<string> headers = ["length", "subBatches", "batchedMs", "batchedTok/s"];
+        if (perToken)
+        {
+            headers.Add("perTokenMs");
+            headers.Add("perTokenTok/s");
+        }
+
+        headers.Add("weightMs");
+        headers.Add("attentionMs");
+        headers.Add("fitResidualMs");
+        headers.Add("weightGB/s");
+        string headerLine = string.Join("  ", headers.Select(h => h.PadLeft(Math.Max(h.Length, 12))));
+        reportBody.Add(headerLine);
+        Console.WriteLine(headerLine);
+
+        foreach (PrefillRow row in rows)
+        {
+            double weightEst = row.SubBatches * weightMsPerTraversal;
+            double attentionEst = attentionMsPerPair * (double)row.Length * (row.Length + 1) / 2.0;
+            List<string> cells =
+            [
+                row.Length.ToString(CultureInfo.InvariantCulture),
+                row.SubBatches.ToString(CultureInfo.InvariantCulture),
+                $"{row.BatchedMs:F1}",
+                $"{row.Length / (row.BatchedMs / 1000.0):F2}",
+            ];
+
+            if (perToken)
+            {
+                cells.Add($"{row.PerTokenMs:F1}");
+                cells.Add($"{row.Length / (row.PerTokenMs / 1000.0):F2}");
+            }
+
+            cells.Add($"{weightEst:F1}");
+            cells.Add($"{attentionEst:F1}");
+            cells.Add($"{row.BatchedMs - weightEst - attentionEst:F1}");
+            cells.Add($"{impliedWeightGbPerSecond:F2}");
+            string tableLine = string.Join("  ", cells.Select(c => c.PadLeft(12)));
+            reportBody.Add(tableLine);
+            Console.WriteLine(tableLine);
+        }
     }
 
-    foreach (string line in lines)
-    {
-        Console.WriteLine(line);
-    }
+    // Peak working set of this process at the close of the run — the engine's own mapped weights plus whatever the
+    // measured windows allocated. It is one number for the whole process: a run that measured several kernels reports
+    // the peak across all of them, so committed per-kernel peaks come from separate single-kernel processes.
+    double peakWorkingSetMb = Process.GetCurrentProcess().PeakWorkingSet64 / (1024.0 * 1024.0);
+    string peakLine = kernels.Count > 1
+        ? $"  peakWorkingSetMb={peakWorkingSetMb:F1} cumulative across this process run: measure per-kernel peaks in separate processes"
+        : $"  peakWorkingSetMb={peakWorkingSetMb:F1}";
+    reportBody.Add(peakLine);
+    Console.WriteLine(peakLine);
 
     if (outPath is not null)
     {
         List<string> fileLines =
         [
             $"prefill-profile file={gguf.Path} bytes={gguf.FileSize} threads={backend.EffectiveWorkerCount} maxBatchSequences={TransformerModel.MaxBatchSequences}",
-            $"  arch={model.Desc.Architecture} layers={model.Desc.LayerCount} hidden={model.Desc.HiddenSize} heads={model.Desc.HeadCount} kvHeads={model.Desc.KvHeadCount} headDim={model.Desc.HeadDim} vocab={model.Desc.VocabSize} windowedLayers={windowedLayers} avx2={Avx2.IsSupported}",
-            $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}",
-            $"  weightFit={weightMsPerTraversal:F2} ms/traversal ({fitNote}) impliedWeightGB/s={impliedWeightGbPerSecond:F2}",
-            $"  attentionFit={attentionMsPerPair * 1000.0:F3} us per position pair",
-            crossover > 0
-                ? $"  crossover: fitted attention term >= fitted weight term at length >= {crossover}"
-                : $"  crossover: not reached within 4x the longest measured length ({last.Length} tokens)",
-            string.Join("  ", headers.Select(h => h.PadLeft(Math.Max(h.Length, 12)))),
-            .. lines,
+            $"  arch={geometry.Architecture} layers={geometry.LayerCount} hidden={geometry.HiddenSize} heads={geometry.HeadCount} kvHeads={geometry.KvHeadCount} headDim={geometry.HeadDim} vocab={geometry.VocabSize} windowedLayers={windowedLayers} avx2={Avx2.IsSupported}",
+            $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" + (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : "") + (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : ""),
+            .. reportBody,
         ];
 
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outPath))!);
@@ -818,6 +967,36 @@ static int[] BuildPrefillPrompt(GgufTokenizer tokenizer, int tokens)
 
     return [.. ids.Take(tokens)];
 }
+
+// Activation bytes one full sub-batch carries at a given row count, computed from the plan's geometry as FP32 stream
+// widths: each row holds its residual, normed, and projection streams (hidden), its query heads plus attention output
+// (headCount x headDim), its k/v write sources twice (kvHeadCount x headDim), and the gate/up feed-forward halves
+// (intermediateSize). The vocab-sized logits tail stays out: a prefill window reaches the output head only through
+// its final row. These are allocation bytes at that row count, not measured process residency.
+static long EstimatedSubBatchActivationBytes(ModelPlan plan, int rows) =>
+    4L * rows * (3L * plan.HiddenSize + 2L * plan.HeadCount * plan.HeadDim + 2L * plan.KvHeadCount * plan.HeadDim + 2L * plan.IntermediateSize);
+
+// Open one candidate engine on a stated kernel and resolved row width (0 keeps the plan's default row count). A kernel
+// this file cannot run comes back as null with the engine's refusal reason, so the caller reports the refusal instead of
+// opening some other route.
+static TransformerModel? OpenCandidate(GgufFile gguf, CpuBackend backend, int maxContextTokens, PrefillKernel kernel, int rowWidth, out string? refusalReason)
+{
+    try
+    {
+        refusalReason = null;
+        return rowWidth == 0
+            ? TransformerModel.Open(gguf, backend, maxContextTokens: maxContextTokens, logLine: null, kernel)
+            : TransformerModel.Open(gguf, backend, maxContextTokens: maxContextTokens, logLine: null, kernel, rowWidth);
+    }
+    catch (ModelException failure)
+    {
+        refusalReason = CollapseWhitespace(failure.Message);
+        return null;
+    }
+}
+
+// A refusal arrives as one long sentence; collapsing its whitespace keeps it on a single report line without rewording it.
+static string CollapseWhitespace(string text) => string.Join(' ', text.Split(" \t\r\n", StringSplitOptions.RemoveEmptyEntries));
 
 static int ParseOption(string value, int fallback) => int.TryParse(value, out int parsed) ? parsed : fallback;
 

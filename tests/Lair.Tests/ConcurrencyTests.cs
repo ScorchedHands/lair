@@ -255,7 +255,7 @@ public sealed class ConcurrencyTests
         return GenerationService.Open(new LairConfig
         {
             Server = new ServerConfig(),
-            Engine = new EngineConfig { MaxBatchTokens = maxBatchTokens },
+            Engine = new EngineConfig { MaxBatchTokens = maxBatchTokens, PrefillKernel = "tiled" },
             Models =
             [
                 new ModelConfig

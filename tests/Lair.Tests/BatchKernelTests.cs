@@ -15,7 +15,8 @@ public class BatchKernelTests
 {
     private static readonly (int Rows, int Cols)[] MatrixSizes = [(100, 137), (256, 256), (512, 1024)];
 
-    private static readonly int[] BatchCounts = [1, 2, 8, 16];
+    // Identity coverage runs to the backend's batch ceiling: what a decode batch advances and every prompt row width a forward engine may resolve.
+    private static readonly int[] BatchCounts = [1, 2, 8, 16, 32, 64];
 
     [Theory]
     [InlineData(QuantFormat.F32)]
@@ -174,7 +175,7 @@ public class BatchKernelTests
         Assert.Contains("count", countLow.ParamName);
 
         Assert.Throws<ArgumentOutOfRangeException>(
-            () => backend.GemvBatch(inputs, 17, new WeightRef(packed, shape, format), new float[17 * 4]));
+            () => backend.GemvBatch(inputs, 65, new WeightRef(packed, shape, format), new float[65 * 4])); // one past the batch ceiling every kernel's scratch is sized for
 
         ArgumentException inputEx = Assert.Throws<ArgumentException>(
             () => backend.GemvBatch(new float[2 * 69], 2, new WeightRef(packed, shape, format), new float[2 * 4]));
@@ -190,7 +191,7 @@ public class BatchKernelTests
     private static TensorShape MatrixShape(int rows, int cols) => new([rows, cols]);
 
     // Bit-exact comparison over the raw bits of the outputs: NaN payloads and signed zeros must match too.
-    private static void AssertBitsEqual(ReadOnlySpan<float> expected, ReadOnlySpan<float> actual, string context)
+    internal static void AssertBitsEqual(ReadOnlySpan<float> expected, ReadOnlySpan<float> actual, string context)
     {
         ReadOnlySpan<int> expectedBits = MemoryMarshal.Cast<float, int>(expected);
         ReadOnlySpan<int> actualBits = MemoryMarshal.Cast<float, int>(actual);
@@ -203,7 +204,7 @@ public class BatchKernelTests
         }
     }
 
-    private static (float[] Inputs, byte[] Weights) CreateCase(int rows, int cols, QuantFormat format, int seed, int vectors)
+    internal static (float[] Inputs, byte[] Weights) CreateCase(int rows, int cols, QuantFormat format, int seed, int vectors)
     {
         Random rng = new(seed);
         float[] inputs = NextFloats(rng, vectors * cols);

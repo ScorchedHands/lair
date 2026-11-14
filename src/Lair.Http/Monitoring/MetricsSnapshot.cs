@@ -83,6 +83,12 @@ public sealed record MetricsSnapshot(
     /// <summary>The KV residency mode configured for this model (<c>dram</c>, ...).</summary>
     [property: JsonPropertyName("metrics_kv_residency")] string? KvResidency = null,
 
+    /// <summary>The prefill kernel selection the engine's prompt-window route runs through (<c>gemv</c>, ...).</summary>
+    [property: JsonPropertyName("metrics_prefill_kernel")] string? PrefillKernel = null,
+
+    /// <summary>The quant formats the served model's dense weight matrices carry — the formats a prefill selection needs kernels for.</summary>
+    [property: JsonPropertyName("metrics_weight_formats")] string? MatmulWeightFormats = null,
+
     /// <summary>Layers whose resolved plan carries a finite attention window.</summary>
     [property: JsonPropertyName("metrics_kv_windowed_layers")] int WindowedLayers = 0,
 

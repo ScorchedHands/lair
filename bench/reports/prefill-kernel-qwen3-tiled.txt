@@ -1,0 +1,13 @@
+prefill-profile file=models/Qwen3-0.6B-Q8_0.gguf bytes=639446688 threads=8 maxBatchSequences=16
+  arch=qwen3 layers=28 hidden=1024 heads=16 kvHeads=8 headDim=128 vocab=151936 windowedLayers=0 avx2=True
+  traversalBytes=468185088 outputHeadBytes=0 kvBlocks=136 blockTokens=16 reps=2 perToken=off lengths=512,1024,2048 rowWidths=32 kernels=tiled
+prefill-profile kernel=tiled
+prefill-profile rowWidth=32 subBatchActivationBytes=1966080
+  weightFit=277.13 ms/traversal (least-squares fit over 3 lengths) impliedWeightGB/s=1.69
+  attentionFit=38.104 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 467
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         512            16        9505.1         53.87        4434.1        5004.2          66.9          1.69
+        1024            32       28815.1         35.54        8868.1       19997.2         -50.1          1.69
+        2048            64       97694.3         20.96       17736.2       79949.7           8.4          1.69
+  peakWorkingSetMb=1196.4

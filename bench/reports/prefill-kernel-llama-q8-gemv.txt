@@ -1,0 +1,13 @@
+prefill-profile file=models/Llama-3.2-1B-Instruct-Q8_0.gguf bytes=1321083008 threads=8 maxBatchSequences=16
+  arch=llama layers=16 hidden=2048 heads=32 kvHeads=8 headDim=64 vocab=128256 windowedLayers=0 avx2=True
+  traversalBytes=1034158080 outputHeadBytes=0 kvBlocks=136 blockTokens=16 reps=3 perToken=off lengths=512,1024,2048 rowWidths=32 kernels=gemv
+prefill-profile kernel=gemv
+prefill-profile rowWidth=32 subBatchActivationBytes=3538944
+  weightFit=439.52 ms/traversal (least-squares fit over 3 lengths) impliedWeightGB/s=2.35
+  attentionFit=32.491 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 855
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         512            16       11396.1         44.93        7032.4        4267.0          96.7          2.35
+        1024            32       31043.8         32.99       14064.8       17051.5         -72.5          2.35
+        2048            64       96314.5         21.26       28129.6       68172.8          12.1          2.35
+  peakWorkingSetMb=1532.0

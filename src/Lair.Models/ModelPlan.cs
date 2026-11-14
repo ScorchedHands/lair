@@ -239,6 +239,20 @@ public sealed record ModelPlan
     /// </summary>
     public SparseFfnStrategy? SparseFfnStrategy { get; init; }
 
+    /// <summary>
+    /// The row count a prefill sub-batch carries: the number of prompt positions one batched weight pass advances at
+    /// once, resolved per engine and independent of <see cref="Engine.TransformerModel.MaxBatchSequences"/>, which is
+    /// the ceiling on sequences a decode batch may advance — widening one family's rows does not widen the other's.
+    /// No metadata key selects it today: an absent resolution carries the measured default
+    /// (<see cref="Engine.TransformerModel.DefaultPrefillRowWidth"/>), and only a forward engine opened with an explicit
+    /// row count overrides it — through an overload no host configuration path reaches.
+    /// A resolved value must land in <c>1..MaxPrefillRowWidth</c>, the ceiling the engine sizes its batched streams for;
+    /// anything outside fails at engine open naming the value rather than silently sizing other buffers or forwarding a
+    /// different row count. Sub-batch boundaries move nothing: every width carries the same positions, KV bytes, and
+    /// logits as any other over the same tokens.
+    /// </summary>
+    public int PrefillRowWidth { get; init; } = Engine.TransformerModel.DefaultPrefillRowWidth;
+
     /// <summary>The flat scalar view of this plan's resolved geometry.</summary>
     public ModelDesc ToDesc() =>
         new(

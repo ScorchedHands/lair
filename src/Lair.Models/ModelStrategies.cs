@@ -251,3 +251,53 @@ public enum WindowInterleave
     /// </summary>
     SixLayerGroupsLocalFirst,
 }
+
+/// <summary>
+/// Which attention/weight path a prompt window's forward selects: the batched row window, its row-tiled attention
+/// variant, or the dense-matrix weight traversal. Resolved once per model from <c>engine.prefill_kernel</c> and read
+/// fresh at every prefill window boundary, never re-decided inside a forward. Selecting a kernel is independent of
+/// whether this engine can run it for this file: a selection the backend has no dense weight path for stays visible in
+/// the resolved value and reports at engine open rather than falling back to what happens to work.
+/// </summary>
+public enum PrefillKernel
+{
+    /// <summary>
+    /// The engine's batched row window: sub-batches of up to the plan's resolved <see cref="ModelPlan.PrefillRowWidth"/>
+    /// rows — its own count, not the decode batch ceiling — each row keeping its own residual stream, RoPE position, and
+    /// causal attention while every dense weight matrix is traversed once per sub-batch. This is the route a model runs
+    /// when no selection is stated.
+    /// </summary>
+    GemV,
+
+    /// <summary>
+    /// A tiled prefill attention path: the same batched row windows, with causal attention walked row-tiled over KV
+    /// blocks instead of one row at a time — each selected position's K/V is read once per kv-head group and applied to
+    /// every row whose own causal selection covers it. The engine runs this route today; its results are bit-identical
+    /// with <see cref="GemV"/>'s.
+    /// </summary>
+    Tiled,
+
+    /// <summary>
+    /// A GEMM-shaped prefill: the same batched row windows, with each dense weight matrix traversed by a blocked matmul
+    /// over dequantized weight tiles — one tile built per row group and multiplied against every activation vector of the
+    /// sub-batch instead of walked once per activation group. Results are bit-identical with <see cref="GemV"/>'s because
+    /// each output element keeps its single-vector accumulation order. The selection is refused for a file whose dense
+    /// weight formats have no such kernel, naming them.
+    /// </summary>
+    Gemm,
+}
+
+/// <summary>The wire name of each prefill kernel selection, shared by the load log, the engine's refusal, and the monitor snapshot.</summary>
+public static class PrefillKernelNames
+{
+    public const string GemV = "gemv";
+    public const string Tiled = "tiled";
+    public const string Gemm = "gemm";
+
+    public static string Of(PrefillKernel kernel) => kernel switch
+    {
+        PrefillKernel.Tiled => Tiled,
+        PrefillKernel.Gemm => Gemm,
+        _ => GemV,
+    };
+}
