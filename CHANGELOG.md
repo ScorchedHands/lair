@@ -4,6 +4,20 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.13] - 2026-11-14
+
+### Added
+
+- Prefill kernel selection: `engine.prefill_kernel` accepts `gemv`, `tiled`, and `gemm`. `tiled` reuses each K/V slot across the rows of a prompt sub-batch while keeping every row's online-softmax order unchanged; `gemm` uses managed unsafe blocked matmul over dequantized weight tiles for dense files whose matrices are all `Q8_0`, `Q4_K`, or `IQ4_XS`. Kernel selection is hot-reloaded as new-requests-only, reports through `/monitor/stream`, and refuses unsupported formats at model open naming them rather than falling back.
+- Prefill row width: prompt windows now resolve a measured default of 32 rows independently from decode's batch cap, with candidate widths tested bit-identically across `16`, `32`, and `64` before the engine resolves one. Decode remains capped at 16 sequences.
+- Blocked GEMM identity gates: raw-byte comparisons cover representative tensor shapes for `Q8_0`, `Q4_K`, and `IQ4_XS`, including threaded, single-threaded, scalar paths, unsupported-format refusal, model-level prefill logits/KV/decode continuation equality across `gemv`, `tiled`, and `gemm`.
+- Bench kernel axis: `prefill-profile` accepts `--kernel gemv,tiled,gemm`, opens one engine per requested kernel × row width, records refusals instead of falling back for unsupported formats, and prints process peak working set. Committed comparison reports cover Qwen3 Q8_0 and Llama-3.2 Q8_0 with raw tables plus a live `gemv` vs `gemm` rollout proof on Qwen3 Q8_0.
+
+### Changed
+
+- Prompt-window routing now has three selectable CPU routes: default batched GEMV, row-tiled causal attention, and dense blocked matmul for proven-format files. Existing parity fixtures remain raw-byte identical across the runnable kernel combinations; live `tiled` prefill measured a 6.5% combined throughput gain on Llama-3.2 IQ4_XS with lower peak working set.
+- Concurrency budget tests now run through the row-tiled prefill route, so decode inter-token budgets are checked while that prompt-window kernel is active.
+
 ## [0.3.12] - 2026-11-13
 
 ### Changed
