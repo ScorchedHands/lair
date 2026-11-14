@@ -69,6 +69,11 @@ public sealed class TransformerModel : IDisposable
     // threads consume it per forward.
     private volatile PrefillKernel _prefillKernel;
 
+    // The quant formats this engine's dense weight matrices carry, resolved once from the plan's tensor map in role
+    // order with repeats collapsed. It is what a blocked-matmul selection needs kernels for: every format it lists has
+    // to have one before that selection can run this file, and they are the names an unsupported file reports back.
+    private readonly IReadOnlyList<QuantFormat> _matmulFormats;
+
     // Only a source this instance created is its own to release: a caller-supplied source stays under the caller's
     // lifetime rules and must outlive the model.
     private readonly bool _ownsWeights;
@@ -241,11 +246,12 @@ public sealed class TransformerModel : IDisposable
     /// Re-points the engine's prefill path selection. The new value is read fresh at the next prefill window
     /// boundary, so sequences already mid-window finish that window on the route they started with — the same
     /// boundary discipline a chunk-width edit keeps. A selection this build has no kernel for is refused naming it
-    /// and what is missing; nothing falls back to the route that works.
+    /// and what is missing; nothing falls back to the route that works. The dense-matrix selection is also refused
+    /// when one of this engine's own weight formats has no blocked matmul, naming that format.
     /// </summary>
     public void ApplyPrefillKernel(PrefillKernel kernel)
     {
-        if (kernel is not (PrefillKernel.GemV or PrefillKernel.Tiled))
+        if (!KernelExecutes(kernel))
         {
             throw KernelRefusal(kernel);
         }
@@ -253,13 +259,115 @@ public sealed class TransformerModel : IDisposable
         _prefillKernel = kernel;
     }
 
-    // The one refusal wording an unrunnable prefill selection gets, at open and on apply alike: it names the value,
-    // what the forward engine lacks for it, and the selections that execute today.
-    private ModelException KernelRefusal(PrefillKernel kernel) => new(
-        $"prefill kernel '{PrefillKernelNames.Of(kernel)}' is not implemented by the forward engine: architecture " +
-        $"'{Plan.Architecture}' selects its prompt windows through this selection and no {PrefillKernelNames.Of(kernel)} attention/weight path exists in this build — only " +
-        $"{PrefillKernelNames.GemV} and {PrefillKernelNames.Tiled} execute today — set engine.prefill_kernel to '{PrefillKernelNames.GemV}' or " +
-        $"'{PrefillKernelNames.Tiled}' (or omit it) to run this file");
+    /// <summary>The quant formats this engine's dense weight matrices carry, deduplicated in role order: the formats a blocked matmul needs kernels for before the dense-matrix selection can run this file.</summary>
+    public IReadOnlyList<QuantFormat> MatmulWeightFormats => _matmulFormats;
+
+    // Whether a selection has kernels for this engine's own weights. The batched-row window and its row-tiled variant
+    // always do; the dense-matrix window does only when every dense weight matrix it multiplies activation rows
+    // against is a format the backend's blocked matmul executes. Decided from the same list an unsupported file names.
+    private bool KernelExecutes(PrefillKernel kernel) => kernel switch
+    {
+        PrefillKernel.GemV or PrefillKernel.Tiled => true,
+        PrefillKernel.Gemm => FormatsWithoutKernels().Count is 0 && _matmulFormats.Count > 0,
+        _ => false,
+    };
+
+    // The dense weight formats this engine carries that its backend has no blocked matmul for. Empty when every one of
+    // them runs through the dense-matrix window; otherwise exactly the names a refusal reports.
+    private List<QuantFormat> FormatsWithoutKernels()
+    {
+        List<QuantFormat> missing = [];
+        foreach (QuantFormat format in _matmulFormats)
+        {
+            if (!_backend.SupportsGemm(format))
+            {
+                missing.Add(format);
+            }
+        }
+
+        return missing;
+    }
+
+    // The one refusal wording an unrunnable prefill selection gets, at open and on apply alike: it names the value, what
+    // the forward engine lacks for it, and the selections that execute today. For the dense-matrix selection it also
+    // names this file's own weight formats when they are the reason the selection cannot run.
+    private ModelException KernelRefusal(PrefillKernel kernel)
+    {
+        string name = PrefillKernelNames.Of(kernel);
+        List<QuantFormat> missing = kernel == PrefillKernel.Gemm ? FormatsWithoutKernels() : [];
+
+        if (missing.Count > 0)
+        {
+            return new ModelException(
+                $"prefill kernel '{name}' is not implemented by the forward engine: architecture '{Plan.Architecture}' " +
+                $"carries dense weight matrices of format(s) {string.Join(", ", missing)} and no {name} attention/weight path exists in this build for them — " +
+                $"the window shape that multiplies a whole sub-batch against one matrix runs only where every dense weight matrix is {QuantFormat.Q8_0}, {QuantFormat.Q4_K}, or {QuantFormat.IQ4_XS} today, " +
+                $"while every other family forwards its prompt windows through batched row passes — set engine.prefill_kernel to '{PrefillKernelNames.GemV}' or " +
+                $"'{PrefillKernelNames.Tiled}' (or omit it) to run this file");
+        }
+
+        return new ModelException(
+            $"prefill kernel '{name}' is not implemented by the forward engine: architecture " +
+            $"'{Plan.Architecture}' selects its prompt windows through this selection and no {name} attention/weight path exists in this build — only " +
+            $"{PrefillKernelNames.GemV} and {PrefillKernelNames.Tiled} execute today — set engine.prefill_kernel to '{PrefillKernelNames.GemV}' or " +
+            $"'{PrefillKernelNames.Tiled}' (or omit it) to run this file");
+    }
+
+    // The quant format of every dense weight matrix a prompt window multiplies activation rows against: the attention
+    // trio — or one fused qkv buffer, whichever layout the plan resolves — the attention output, and the feed-forward
+    // block's gate/up/down as its layout names them. Deduplicated in role order because a family that keeps one format
+    // across every layer should report it once. A sparse-FFN block contributes nothing here: its expert matrices stay on
+    // batched row passes whatever selection is resolved, so they do not constrain which window shape can run.
+    private static IReadOnlyList<QuantFormat> ResolveMatmulFormats(ModelPlan plan, LogicalTensorTable tensors)
+    {
+        List<QuantFormat> formats = [];
+
+        void AddRole(TensorRole role)
+        {
+            if (plan.Tensors[role] is not TensorDescriptor descriptor)
+            {
+                return;
+            }
+
+            for (int l = 0; l < plan.LayerCount; l++)
+            {
+                if (descriptor.Resolve(tensors, l) is LogicalTensor tensor && !formats.Contains(tensor.Format))
+                {
+                    formats.Add(tensor.Format);
+                }
+            }
+        }
+
+        if (plan.AttentionWeights == QkvLayout.FusedBufferSlices)
+        {
+            AddRole(TensorRole.AttentionQkv);
+        }
+        else
+        {
+            AddRole(TensorRole.AttentionQuery);
+            AddRole(TensorRole.AttentionKey);
+            AddRole(TensorRole.AttentionValue);
+        }
+
+        AddRole(TensorRole.AttentionOutput);
+
+        if (plan.SparseFfn is null)
+        {
+            if (plan.GateSource == FeedForwardGateSource.UpTensorHalves)
+            {
+                AddRole(TensorRole.FeedForwardUp); // the gate half rides inside this buffer, so one format covers both sides
+            }
+            else
+            {
+                AddRole(TensorRole.FeedForwardGate);
+                AddRole(TensorRole.FeedForwardUp);
+            }
+
+            AddRole(TensorRole.FeedForwardDown);
+        }
+
+        return formats;
+    }
 
     /// <summary>Opens the engine over a memory-mapped view of the file's own tensor payloads.</summary>
     public static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens) =>
@@ -337,12 +445,18 @@ public sealed class TransformerModel : IDisposable
         Desc = Plan.ToDesc();
         MaxContextTokens = maxContextTokens;
 
+        // The formats this file's dense weight matrices carry, read from the plan's tensor map before any payload is
+        // touched: it decides whether a selection that multiplies a whole sub-batch against one matrix can run here at
+        // all, and it names the formats a refusal reports.
+        _matmulFormats = ResolveMatmulFormats(Plan, file.Tensors);
+
         // A prefill kernel selection this engine has no kernel for is refused at open, the posture every other
         // unimplemented capability takes: the selection stays visible in the resolved value's vocabulary, the
-        // refusal names it and what is missing, and nothing falls back to the route that happens to work. The row-
-        // tiled window runs today; a selection with no kernel at all — the dense-matrix shape — never reaches a
-        // forward. The check lands before any tensor maps, so an unrunnable selection never spends a weight view on it.
-        if (prefillKernel is not (PrefillKernel.GemV or PrefillKernel.Tiled))
+        // refusal names it and what is missing, and nothing falls back to the route that happens to work. The batched-
+        // row window and its row-tiled variant run for every family; the dense-matrix shape runs only where this file's
+        // own weight formats all have a blocked matmul. The check lands before any tensor maps are built, so an
+        // unrunnable selection never spends a weight view on it.
+        if (!KernelExecutes(prefillKernel))
         {
             throw KernelRefusal(prefillKernel);
         }
@@ -807,22 +921,44 @@ public sealed class TransformerModel : IDisposable
     }
 
     // The resolved kernel selection decides which window route runs, re-read at every sub-batch so a hot edit lands
-    // from the next boundary: the batched row window and its row-tiled attention variant both have kernels today, and
-    // a selection this build has no kernel for fails naming it rather than running some other route behind it.
+    // from the next boundary: the batched row window, its row-tiled attention variant, and the dense-matrix weight
+    // traversal all have kernels today, and a selection this build has no kernel for fails naming it rather than
+    // running some other route behind it. The dense-matrix traversal is the row window with its weight passes handed
+    // to the blocked matmul; attention stays on the same per-row causal kernel either way.
     private void RunPrefillWindow(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits)
     {
         switch (_prefillKernel)
         {
             case PrefillKernel.GemV:
-                PrefillWindow(tokens, offset, rows, basePosition, kv, emitLogits);
+                PrefillWindow(tokens, offset, rows, basePosition, kv, emitLogits, denseMatmul: false);
                 break;
 
             case PrefillKernel.Tiled:
                 PrefillWindowTiled(tokens, offset, rows, basePosition, kv, emitLogits);
                 break;
 
+            case PrefillKernel.Gemm:
+                PrefillWindow(tokens, offset, rows, basePosition, kv, emitLogits, denseMatmul: true);
+                break;
+
             default:
                 throw KernelRefusal(_prefillKernel);
+        }
+    }
+
+    // One dense weight pass over a whole sub-batch, handed to the route this window resolved: either backend traverses
+    // each matrix once for every activation vector of the window and writes the same <c>[batch * rows + row]</c> layout,
+    // the batched GEMV walking one weight row per activation group and the blocked matmul dequantizing a weight tile
+    // once for all of them. The choice is hoisted to this call so no per-row loop reads it as an operand.
+    private void WeightPass(ReadOnlySpan<float> inputs, int count, WeightRef weight, Span<float> outputs, bool denseMatmul)
+    {
+        if (denseMatmul)
+        {
+            _backend.GemmBatch(inputs, count, weight, outputs);
+        }
+        else
+        {
+            _backend.GemvBatch(inputs, count, weight, outputs);
         }
     }
 
@@ -831,8 +967,12 @@ public sealed class TransformerModel : IDisposable
     // sequence — over one sequence's growing KV. Attention runs row by row through the causal kernel, so a row
     // scores its own prefix only, including the earlier rows this sub-batch wrote at the same layer and excluding
     // every later one. Only the window's final row reaches the output head: the rows before it are kept for their
-    // KV, not for logits, so the lm_head runs once per prefill rather than once per sub-batch.
-    private void PrefillWindow(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits)
+    // KV, not for logits, so the lm_head runs once per prefill rather than once per sub-batch. Every dense weight
+    // matrix of the sub-batch is traversed once — batched across the window's activation vectors on the row route, or
+    // through the blocked matmul when <paramref name="denseMatmul"/> selects it. The two routes differ only in how a
+    // weight tile reaches the arithmetic, so each output element lands byte-identical to the other and to the
+    // single-vector reference.
+    private void PrefillWindow(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits, bool denseMatmul)
     {
         int hidden = Plan.HiddenSize;
         int qkvRegion = Plan.HeadCount * Plan.HeadDim;
@@ -873,12 +1013,13 @@ public sealed class TransformerModel : IDisposable
                 ApplyNorm(_batchCur.AsSpan(r * hidden, hidden), _attnNormWeight[l], _attnNormBias[l], _batchNormed.AsSpan(r * hidden, hidden));
             }
 
-            // One weight pass per matrix for the whole sub-batch; each row's result matches its single-vector GEMV.
-            _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionQueryWeight(l), _batchQ.AsSpan(0, rows * qkvRegion));
+            // One weight pass per matrix for the whole sub-batch; each row's result matches its single-vector GEMV on
+            // either route this selection can take.
+            WeightPass(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionQueryWeight(l), _batchQ.AsSpan(0, rows * qkvRegion), denseMatmul);
 
-            _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionKeyWeight(l), _batchK.AsSpan(0, rows * kvRegion));
+            WeightPass(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionKeyWeight(l), _batchK.AsSpan(0, rows * kvRegion), denseMatmul);
 
-            _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionValueWeight(l), _batchV.AsSpan(0, rows * kvRegion));
+            WeightPass(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionValueWeight(l), _batchV.AsSpan(0, rows * kvRegion), denseMatmul);
 
             // Bias, QK-norm, RoPE at the row's absolute position, and the K/V writes for every row complete
             // before any row attends, so each row's causal read sees exactly the prefix it would have alone.
@@ -906,7 +1047,7 @@ public sealed class TransformerModel : IDisposable
             }
 
             ReadOnlySpan<byte> bytes = _weights.Resolve(_wo[l]);
-            _backend.GemvBatch(_batchAttnOut.AsSpan(0, rows * qkvRegion), rows, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _batchProj.AsSpan(0, rows * hidden));
+            WeightPass(_batchAttnOut.AsSpan(0, rows * qkvRegion), rows, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _batchProj.AsSpan(0, rows * hidden), denseMatmul);
 
             for (int r = 0; r < rows; r++)
             {
@@ -932,9 +1073,9 @@ public sealed class TransformerModel : IDisposable
             }
             else
             {
-                _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), _batchGateUp.AsSpan(0, rows * inter));
+                WeightPass(_batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), _batchGateUp.AsSpan(0, rows * inter), denseMatmul);
 
-                _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardUpWeight(l), _batchUp.AsSpan(0, rows * inter));
+                WeightPass(_batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardUpWeight(l), _batchUp.AsSpan(0, rows * inter), denseMatmul);
 
                 // act = activation(gate) * up in place on each row's gate buffer.
                 for (int r = 0; r < rows; r++)
@@ -943,7 +1084,7 @@ public sealed class TransformerModel : IDisposable
                 }
 
                 bytes = _weights.Resolve(_ffnDown[l]);
-                _backend.GemvBatch(_batchGateUp.AsSpan(0, rows * inter), rows, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _batchProj.AsSpan(0, rows * hidden));
+                WeightPass(_batchGateUp.AsSpan(0, rows * inter), rows, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _batchProj.AsSpan(0, rows * hidden), denseMatmul);
             }
 
             for (int r = 0; r < rows; r++)

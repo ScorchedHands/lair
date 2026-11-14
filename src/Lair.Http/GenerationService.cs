@@ -151,7 +151,8 @@ public sealed class GenerationService : IDisposable
         return bus;
     }
 
-    // Snapshot identity/placement facts straight from the configuration in force plus the backend's live worker count.
+    // Snapshot identity/placement facts straight from the configuration in force, the backend's live worker count, and
+    // the formats the opened model's dense weight matrices actually carry.
     private ModelFacts BuildMonitorFacts(LairConfig config) => new(
         config.Models[0].Type,
         _backend.EffectiveWorkerCount,
@@ -160,7 +161,8 @@ public sealed class GenerationService : IDisposable
         config.Models[0].Placement.Device,
         config.Models[0].Placement.Prefill,
         config.Models[0].Placement.KvResidency,
-        config.Engine.PrefillKernel);
+        config.Engine.PrefillKernel,
+        string.Join(", ", _model.MatmulWeightFormats));
 
     // Pinned core ids as compressed ranges ("0-23", "1, 4-6"); null when nothing is pinned.
     private static string? FormatCoreSet(IReadOnlySet<int> cores)
@@ -365,9 +367,10 @@ public sealed class GenerationService : IDisposable
                         }
                         catch (ModelException ex)
                         {
-                            // A selection with no kernel in this build is refused naming it and what is missing — the
-                            // engine keeps the route it opened with, and no request runs on a fallback selection.
-                            results.Add(new FieldResult(change, ConfigApplyOutcome.Refused, $"{change.Field} refused: {ex.Message}"));
+                            // A selection this build cannot run for the served model is refused naming it, what is
+                            // missing, and which of that model's weight formats lacks a dense-matrix path — the engine
+                            // keeps the route it opened with, and no request runs on a fallback selection.
+                            results.Add(new FieldResult(change, ConfigApplyOutcome.Refused, $"{change.Field} refused for model '{effective.Models[0].Name}': {ex.Message}"));
                             break;
                         }
 
@@ -497,15 +500,25 @@ public sealed class GenerationService : IDisposable
 
             // Profile resolution events (the generic llama-shaped fallback applied to an unknown architecture)
             // surface as structured log lines the same way. The configuration's prefill kernel selection reaches the
-            // forward engine here: a reserved value the schema accepts is refused by the engine naming it and its
-            // missing kernel — the posture every unimplemented capability takes — and nothing lands on a route that
-            // was not selected.
-            model = TransformerModel.Open(
-                file,
-                backend,
-                reservedSlots,
-                line => logger?.LogInformation("{ProfileLog}", line),
-                ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel));
+            // forward engine here: a selection this build cannot run for this file is refused naming the served model,
+            // the value, and which of that file's own weight formats has no dense-matrix path — the posture every
+            // unimplemented capability takes — and nothing lands on a route that was not selected.
+            try
+            {
+                model = TransformerModel.Open(
+                    file,
+                    backend,
+                    reservedSlots,
+                    line => logger?.LogInformation("{ProfileLog}", line),
+                    ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel));
+            }
+            catch (ModelException ex) when (ex.Message.StartsWith("prefill kernel '", StringComparison.Ordinal))
+            {
+                // The engine names the selection and the weight formats it has no dense-matrix path for; this service
+                // adds which served model the refusal is about, so a load failure says what to change in the config.
+                throw new ModelException($"model '{modelConfig.Name}': {ex.Message}");
+            }
+
             pool = new BlockPool(
                 blockTokens,
                 model.Plan.LayerCount,

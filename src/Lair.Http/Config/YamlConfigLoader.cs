@@ -149,9 +149,10 @@ public static class YamlConfigLoader
             throw new ConfigException($"engine.max_batch_tokens {maxBatchTokens} is invalid: 'max_batch_tokens' must be 1 or greater.");
         }
 
-        // Prefill kernel selection: gemv (default — the batched row window this build runs) or one of the two
-        // reserved window shapes the engine refuses at model open. An unrecognized value fails naming the served
-        // model and the key with the accepted set, exactly as the per-model choice keys do.
+        // Prefill kernel selection: gemv (default — the batched row window this build runs), tiled, or gemm. All three
+        // are accepted by the schema; whether one can run for the served file is the forward engine's answer at model
+        // open. An unrecognized value fails naming the served model and the key with the accepted set, exactly as the
+        // per-model choice keys do.
         string prefillKernel = TryText(keys, "prefill_kernel", "engine.prefill_kernel") ?? PrefillKernelNames.GemV;
         if (prefillKernel is not (PrefillKernelNames.GemV or PrefillKernelNames.Tiled or PrefillKernelNames.Gemm))
         {

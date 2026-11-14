@@ -13,12 +13,13 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Lair.Tests;
 
 /// <summary>
-/// What a resolved <c>engine.prefill_kernel</c> selection does at model open on the pinned SmolLM fixture: the one
-/// reserved window shape still without a kernel is refused naming the value and what the forward engine lacks — never
-/// fallen back to the route that happens to work — while an explicit <c>gemv</c> or <c>tiled</c> opens, forwards, and
-/// serves exactly what the absent key does today: the row-tiled window is bit-identical with the batched-row one. The
-/// resolved selection also reaches the monitor snapshot's configuration-backed facts so a host can read which route an
-/// engine actually runs. Runs inside the serialized real-model lane with the parity suites.
+/// What a resolved <c>engine.prefill_kernel</c> selection does at model open on the pinned SmolLM fixture: the dense-matrix
+/// window is refused for this file because its weights carry no format with a blocked matmul, and the refusal names the
+/// served model, the value, and that file's own formats — never fallen back to the route that happens to work — while an
+/// explicit <c>gemv</c> or <c>tiled</c> opens, forwards, and serves exactly what the absent key does today: the row-tiled
+/// window is bit-identical with the batched-row one. The resolved selection also reaches the monitor snapshot's
+/// configuration-backed facts so a host can read which route an engine actually runs. Runs inside the serialized
+/// real-model lane with the parity suites.
 /// </summary>
 [Trait("Category", "Config")]
 [Collection("model-loaded")] // shares one serialized lane with the other real-model suites: two engines mapping 270 MB at once is not what this box should be doing
@@ -28,7 +29,7 @@ public sealed class PrefillKernelServeTests
 
     [Theory]
     [InlineData("gemm")]
-    public async Task GenerationServiceOpen_ReservedSelection_RefusesAtModelOpenNamingValueAndMissingKernel(string selection)
+    public async Task GenerationServiceOpen_SelectionWithoutAPathForThisFile_RefusesAtModelOpenNamingModelFormatAndMissingKernel(string selection)
     {
         if (ModelFixture.Resolve() is null)
         {
@@ -39,7 +40,8 @@ public sealed class PrefillKernelServeTests
 
         Assert.Contains($"prefill kernel '{selection}' is not implemented by the forward engine", error.Message);
         Assert.Contains($"no {selection} attention/weight path exists in this build", error.Message); // names what is missing, not just the value
-        Assert.Contains("only gemv and tiled execute today", error.Message);
+        Assert.Contains("model 'smollm-prefill-kernel'", error.Message); // names the served model the refusal is about
+        Assert.Contains("format(s) F16", error.Message); // names this file's own weight format as the reason the selection cannot run here
     }
 
     [Theory]

@@ -36,8 +36,9 @@ public sealed class PrefillKernelConfigTests : IDisposable
     [InlineData("gemm")]
     public void Load_PrefillKernel_AcceptsEachSelection(string prefillKernel)
     {
-        // The schema accepts every selection, including the two this build's engine has no kernel for: what a
-        // reserved value does is the forward engine's answer at model open, not the loader's.
+        // The schema accepts every selection: whether one can run against the served file is the forward engine's
+        // answer at model open — a dense-matrix selection over formats with no blocked matmul is refused there, naming
+        // them — and never the loader's.
         LairConfig config = YamlConfigLoader.Load(WriteConfig($"""
             models:
               - name: qwen-test

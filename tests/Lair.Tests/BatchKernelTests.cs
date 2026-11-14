@@ -191,7 +191,7 @@ public class BatchKernelTests
     private static TensorShape MatrixShape(int rows, int cols) => new([rows, cols]);
 
     // Bit-exact comparison over the raw bits of the outputs: NaN payloads and signed zeros must match too.
-    private static void AssertBitsEqual(ReadOnlySpan<float> expected, ReadOnlySpan<float> actual, string context)
+    internal static void AssertBitsEqual(ReadOnlySpan<float> expected, ReadOnlySpan<float> actual, string context)
     {
         ReadOnlySpan<int> expectedBits = MemoryMarshal.Cast<float, int>(expected);
         ReadOnlySpan<int> actualBits = MemoryMarshal.Cast<float, int>(actual);
@@ -204,7 +204,7 @@ public class BatchKernelTests
         }
     }
 
-    private static (float[] Inputs, byte[] Weights) CreateCase(int rows, int cols, QuantFormat format, int seed, int vectors)
+    internal static (float[] Inputs, byte[] Weights) CreateCase(int rows, int cols, QuantFormat format, int seed, int vectors)
     {
         Random rng = new(seed);
         float[] inputs = NextFloats(rng, vectors * cols);

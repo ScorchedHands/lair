@@ -31,6 +31,23 @@ public interface IBackend : IDisposable
     void GemvBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs);
 
     /// <summary>
+    /// Blocked matmul over dequantized weight tiles: <paramref name="count"/> activation vectors (each exactly cols
+    /// long) stored consecutively in <paramref name="inputs"/> multiply the same weight matrix, with each weight tile
+    /// dequantized once and consumed by every activation vector of the batch. Outputs use the same
+    /// <c>outputs[batch * rows + row]</c> layout as <see cref="GemvBatch"/>. Every output element accumulates in
+    /// exactly the order and with exactly the operand association the single-vector <see cref="Gemv"/> reference uses
+    /// for that element, so the result is raw-byte identical to it and deterministic regardless of internal
+    /// parallelism. Only formats this backend reports as supported reach this kernel; an unsupported format throws.
+    /// </summary>
+    void GemmBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs);
+
+    /// <summary>
+    /// Whether this backend's blocked matmul executes for weights in <paramref name="format"/>. Formats it reports as
+    /// unsupported are refused rather than run through some other route.
+    /// </summary>
+    bool SupportsGemm(QuantFormat format);
+
+    /// <summary>
     /// Dequantizes one weight row (w.Bytes-as-matrix row <paramref name="row"/>, cols = Dims[^1]) into an FP32
     /// buffer. The dequant math matches the fused GEMV kernels exactly: F32 rows copy, F16 rows expand halves,
     /// Q8_0/Q4_K rows unpack block scales and quant codes with the same arithmetic. Output must be at least cols long.
