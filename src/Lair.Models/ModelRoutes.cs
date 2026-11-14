@@ -6,8 +6,8 @@ public sealed record RouteStage(string Name, string DeviceId);
 
 /// <summary>What one model's placement resolution supplies to route resolution: its name for every message this owns,
 /// the ordered execution stages with the device each declares, the device ids the backends already opened report, and
-/// the CPU quota numbers placement carries today — a thread cap and a pinned core set. Nothing here reads a config key;
-/// callers map what their configuration states onto these values.</summary>
+/// the CPU quota numbers placement carries today — a thread cap and a pinned core set — plus any accelerator stream priority and SM
+/// share declared for an accelerator-backed segment. Nothing here reads a config key; callers map what their configuration states onto these values.</summary>
 public sealed record RouteRequest
 {
     public required string ModelName { get; init; }
@@ -27,6 +27,12 @@ public sealed record RouteRequest
     /// <summary>The logical cores pinned to this model: its core-set share, claimed by every resolved CPU segment. Empty means unpinned.</summary>
     public IReadOnlySet<int> CoreSet { get; init; } = new HashSet<int>();
 
+    /// <summary>A compute stream priority declared for this model's accelerator-backed segments (1 or greater); null claims none. Nothing a placement key sets today — these two fields are the internal share vocabulary a resolved route carries so later device execution consumes it unchanged, and resolution validates them without promising any enforcement.</summary>
+    public int? AcceleratorStreamPriority { get; init; }
+
+    /// <summary>The streaming-multiprocessor share declared for this model's accelerator-backed segments (greater than 0 and at most 100); null claims none. Declared the same internal way as the stream priority.</summary>
+    public double? AcceleratorSmSharePercent { get; init; }
+
     /// <summary>An explicit batch cap for the resolved segments; null takes the engine's own ceiling on sequences one step advances. A value outside that range refuses naming each offending segment.</summary>
     public int? BatchCap { get; init; }
 }
@@ -37,9 +43,10 @@ public sealed record RouteRequest
 /// exactly one segment over DRAM-resident weights; stages landing on different devices stay separate segments in
 /// declaration order, which is how a split or hybrid shape reaches the vocabulary before any engine can run it. Each
 /// resolved segment carries its compute device identity, weight tier, batch cap against the engine's own ceiling, and
-/// quota taken from what placement declares today — no new config key is read here. A stage naming a device no opened
-/// backend reports fails naming the model, the offending segment, and that missing backend rather than falling back to
-/// CPU silently, exactly as every other unimplemented capability reports. The resolved value set is what later step
+/// quota taken from what placement declares today — plus any accelerator stream priority and SM share a caller declared on an
+/// accelerator-backed segment, landed unchanged for later execution to consume and refused here only when out of range. No new config key is
+/// read here. A stage naming a device no opened backend reports fails naming the model, the offending segment, and that missing backend rather
+/// than falling back to CPU silently, exactly as every other unimplemented capability reports. The resolved value set is what later step
 /// composition consumes unchanged; nothing in this resolution executes it.
 /// </summary>
 public static class ModelRoutes
@@ -120,7 +127,7 @@ public static class ModelRoutes
                 BatchCap = request.BatchCap ?? Engine.TransformerModel.MaxBatchSequences,
                 Quota = IsCpuDevice(stage.DeviceId)
                     ? new SegmentQuota { Threads = request.ThreadQuota, Cores = request.CoreSet }
-                    : new SegmentQuota(),
+                    : new SegmentQuota { StreamPriority = request.AcceleratorStreamPriority, SmSharePercent = request.AcceleratorSmSharePercent },
             };
 
             ValidateSegment(request, segments.Count, segment);
@@ -198,8 +205,21 @@ public static class ModelRoutes
                 $"this model has [{DescribeDevices(request.AvailableDevices)}] opened for it, and a route naming another device is refused rather than run on CPU");
         }
 
-        // The quota a non-CPU segment carries stays unclaimed: this build cannot address that device's worker threads or
-        // cores, so resolution records the shape without inventing numbers against it.
+        // A non-CPU segment's worker-thread and core claims stay empty: this build cannot address that device's threads or cores, so
+        // resolution records the shape without inventing numbers against it. The accelerator share fields a caller declared land on the
+        // backed segment unchanged for later execution to consume — validated here for range only, never enforced against any device ledger yet.
+        if (segment.Quota.StreamPriority is < 1)
+        {
+            throw new ModelException(
+                $"model '{model}', {segment.Describe(index)}: stream priority '{segment.Quota.StreamPriority}' is invalid — an accelerator segment's compute stream priority must be 1 or greater, or absent to claim none");
+        }
+
+        if (segment.Quota.SmSharePercent is not null and (<= 0.0 or > 100.0))
+        {
+            throw new ModelException(
+                $"model '{model}', {segment.Describe(index)}: SM share '{segment.Quota.SmSharePercent}' is invalid — an accelerator segment's streaming-multiprocessor share must be greater than 0 and at most 100, or absent to claim none");
+        }
+
         return;
     }
 

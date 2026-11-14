@@ -14,8 +14,8 @@ namespace Lair.Tests;
 /// <summary>
 /// Continuous-batching tests over the real SmolLM F16 fixture: eight concurrent requests through one service
 /// must produce outputs identical to running them one after another (greedy and seeded), inter-token latency
-/// stays in budget while sequences share decode steps, and KV exhaustion is reported as capacity rather than
-/// as a concurrency refusal.
+/// stays in budget while sequences share decode steps, KV exhaustion is reported as capacity rather than
+/// as a concurrency refusal, and a configured admission cap refuses submissions past it naming the model's quota.
 /// </summary>
 [Trait("Category", "Concurrency")]
 [Collection("model-loaded")] // shares one serialized lane with the real-model parity suites: two engines loading at once starves the latency budgets this suite measures
@@ -245,9 +245,42 @@ public sealed class ConcurrencyTests
         Assert.Equal(prompt.Length, outcome.PromptTokens);
     }
 
+    [Fact]
+    public async Task ConcurrencyCap_AdmitsUpToTheCap_AndRefusesTheNextSubmission_NamingModelAndQuota()
+    {
+        if (ModelFixture.Resolve() is null)
+        {
+            return; // real-model tests skip when the fixture is absent
+        }
+
+        using GenerationService service = OpenService(kvBlocks: 64, maxContextTokens: 512, maxConcurrentRequests: 2);
+
+        // Two sequences are admitted and run alongside each other under a cap of two. A third submission arriving while both hold their slots is
+        // refused naming this model and its concurrency quota rather than queued behind them — the refusal disturbs neither running sequence.
+        Task<GenerationResult>[] live = [.. Prompts[..2].Select(prompt => service.GenerateAsync(CompletionRequest(prompt, MaxTokens), CancellationToken.None))];
+
+        EngineBusyException busy = await Assert.ThrowsAsync<EngineBusyException>(
+            () => service.GenerateAsync(CompletionRequest("hi", 4), CancellationToken.None));
+        Assert.Contains(ModelName, busy.Message);
+        Assert.Contains("max_concurrent_requests", busy.Message);
+
+        GenerationResult[] outcomes = await Task.WhenAll(live);
+        Assert.All(outcomes, result =>
+        {
+            Assert.False(string.IsNullOrEmpty(result.Text), "an admitted sequence produced no text");
+            Assert.True(
+                result.FinishReason is "eos" or "length",
+                $"admitted sequence ended with '{result.FinishReason}'");
+        });
+
+        // Once both slots came back, the same submission is admitted normally: the cap governs admission, not a permanent wall.
+        GenerationResult refilled = await service.GenerateAsync(CompletionRequest("hi", 4), CancellationToken.None);
+        Assert.False(string.IsNullOrEmpty(refilled.Text));
+    }
+
     // ---------------------------------------------------------------- helpers
 
-    internal static GenerationService OpenService(int kvBlocks, int maxContextTokens, int maxBatchTokens = 512)
+    internal static GenerationService OpenService(int kvBlocks, int maxContextTokens, int maxBatchTokens = 512, int? maxConcurrentRequests = null)
     {
         string modelPath = ModelFixture.Resolve() ?? throw new InvalidOperationException(
             $"GGUF fixture '{ModelFixture.SmolLmRelativePath}' was not found walking up from the test assembly directory.");
@@ -264,6 +297,7 @@ public sealed class ConcurrencyTests
                     Path = modelPath,
                     MaxContextTokens = maxContextTokens,
                     KvBlocks = kvBlocks,
+                    MaxConcurrentRequests = maxConcurrentRequests,
                 },
             ],
         });

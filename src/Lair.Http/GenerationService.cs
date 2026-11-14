@@ -20,8 +20,10 @@ namespace Lair.Http;
 /// Single-model generation facade: opens one configured GGUF model (weights, forward engine, tokenizer,
 /// chat template, paged KV pool) and runs <see cref="GenerationRequest"/>s against it. Requests are admitted
 /// to a continuous-batching scheduler, so admitted sequences decode together in shared steps and a long
-/// prompt never blocks shorter ones. A request is refused with <see cref="EngineBusyException"/> only when
-/// the KV pool cannot back its prompt plus token budget.
+/// prompt never blocks shorter ones. Admission refusals keep one coherent taxonomy naming the limit kind that blocked:
+/// <see cref="EngineBusyException"/> for kv_capacity (the pool cannot back this request's prompt plus token budget) or for the model's
+/// concurrency quota (<c>max_concurrent_requests</c> fully held by admitted sequences), and <see cref="ContextLengthExceededException"/> for the
+/// resolved token-budget window; each names the served model.
 /// </summary>
 public sealed class GenerationService : IDisposable
 {
@@ -289,9 +291,15 @@ public sealed class GenerationService : IDisposable
                     case "models[0].placement.thread_quota":
                         int workersBefore = _backend.EffectiveWorkerCount;
                         int workersAfter = _backend.ApplyThreadQuota(candidate.Models[0].Placement.ThreadQuota);
+
+                        // The same live value re-resolves the stepping segment's quota headroom, so future merged steps bound against it
+                        // instead of stale load-time numbers: lowered participation retargets which candidates may join a later step rather than
+                        // preempting one already composed. Route identity and shape stay as load resolved them.
+                        _scheduler.ApplySteppingThreadQuota(candidate.Models[0].Placement.ThreadQuota);
+
                         effective = effective with { Models = [effective.Models[0] with { Placement = effective.Models[0].Placement with { ThreadQuota = candidate.Models[0].Placement.ThreadQuota } }] };
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
-                            $"effective workers {workersBefore} -> {workersAfter}; participation adjusts from the next kernel call (the scheduler's next step), lowered workers idle"));
+                            $"effective workers {workersBefore} -> {workersAfter}; participation adjusts from the next kernel call (the scheduler's next step), lowered workers idle; merged-step quota headroom follows the new value from the next composition on"));
                         break;
 
                     case "models[0].kv_blocks":
@@ -354,6 +362,13 @@ public sealed class GenerationService : IDisposable
                         effective = effective with { Models = [effective.Models[0] with { MaxResponseTokens = candidate.Models[0].MaxResponseTokens } ] };
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
                             $"response budget {change.OldValue} -> {change.NewValue}: the configuration in force carries it for requests admitted from now on; sequences already in flight are unaffected"));
+                        break;
+
+                    case "models[0].max_concurrent_requests":
+                        _scheduler.ApplyMaxConcurrentRequests(candidate.Models[0].MaxConcurrentRequests);
+                        effective = effective with { Models = [effective.Models[0] with { MaxConcurrentRequests = candidate.Models[0].MaxConcurrentRequests } ] };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"admission cap {change.OldValue} -> {change.NewValue}: submissions from now on are refused once every slot of the new cap is held; sequences already admitted keep their slots and finish normally"));
                         break;
 
                     case "ui.recent_requests":
@@ -555,7 +570,17 @@ public sealed class GenerationService : IDisposable
             pool.DeclareAttentionWindows(attentionWindows);
 
             PrefixCache cache = new(pool);
-            scheduler = new GenerationScheduler(model, pool, config.Engine.MaxBatchTokens, cache);
+
+            // The scheduler carries this model's admission cap and name: the configured concurrency limit bounds how many pipelines live at
+            // once (absent bounds nothing), refusals name the served model, and the route resolution above already landed placement quotas on
+            // the plan that composition steps against.
+            scheduler = new GenerationScheduler(
+                model,
+                pool,
+                config.Engine.MaxBatchTokens,
+                cache,
+                maxConcurrentRequests: modelConfig.MaxConcurrentRequests ?? GenerationScheduler.UncappedConcurrencyCap,
+                modelName: modelConfig.Name);
 
             // The chat template is parsed once here, at model load, and cached for the loaded instance's lifetime: no
             // per-request parse and no lazy first-request parse. An unparseable template fails model startup fast,
@@ -734,7 +759,7 @@ public sealed class GenerationService : IDisposable
 
         if (prompt.Count >= Model.ContextLength)
         {
-            throw new ContextLengthExceededException(prompt.Count, Model.ContextLength);
+            throw new ContextLengthExceededException(prompt.Count, Model.ContextLength, Model.Id);
         }
 
         ModelConfig modelConfig = EffectiveConfiguration.Models[0];
@@ -831,12 +856,18 @@ public sealed class GenerationService : IDisposable
         {
             handle = _scheduler.Submit(scheduled, stopSignal.Token);
         }
-        catch (SchedulerFullException)
+        catch (SchedulerFullException full)
         {
-            // The scheduler's capacity vocabulary is an engine-busy condition at this facade: surface it as the
-            // API-level EngineBusyException rather than leaking a scheduling type to callers. No lifecycle frames were
-            // published — a refused admission never entered the stream.
-            throw new EngineBusyException();
+            // The scheduler's capacity vocabulary is an engine-busy condition at this facade: surface it as the API-level EngineBusyException
+            // naming kv_capacity and the served model rather than leaking a scheduling type to callers. No lifecycle frames were published — a
+            // refused admission never entered the stream.
+            throw EngineBusyException.ForKvCapacity(Model.Id, full.FreeSlots);
+        }
+        catch (SchedulerConcurrencyFullException quota)
+        {
+            // A submission past this model's concurrency cap is the other engine-busy refusal: same bounded overload family at the wire, with a
+            // message naming max_concurrent_requests and the served model. Nothing already admitted was disturbed by it.
+            throw EngineBusyException.ForConcurrencyQuota(Model.Id, quota.MaxConcurrentRequests);
         }
 
         if (tracker is RequestTracker admitted)

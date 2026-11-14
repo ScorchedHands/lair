@@ -14,7 +14,8 @@ namespace Lair.Tests;
 /// the same sequences stepped alone, sharing one plan and its whole CPU-only route merges them rather than splitting them, and a candidate
 /// that cannot fit — past the segment's batch cap or out of quota headroom against it — is deferred with the blocking limit named in an
 /// internal reason while every pipeline still advances to its token budget. A deferral never reaches admission: submissions behind one are
-/// admitted, hold their slots and reservations, and ride a later step instead of being refused.
+/// admitted, hold their slots and reservations, and ride a later step instead of being refused (a submission past the scheduler's own
+/// concurrency cap is a separate refusal decided at admission — see the scheduling suite).
 /// </summary>
 [Trait("Category", "Scheduling")]
 [Trait("Category", "Concurrency")]
@@ -153,18 +154,87 @@ public sealed class RouteStepCompositionTests : IDisposable
         Assert.Equal(boundHarness.Scheduler.Stats.DecodeSteps, boundHarness.Scheduler.Stats.WindowSequenceSum);
     }
 
+    [Fact]
+    public async Task LiveThreadQuotaReResolution_RetargetsFutureCompositionHeadroom_WithoutPreemptingAdmittedWork()
+    {
+        string path = SyntheticLlamaGguf.Write("composition-live-quota");
+        _tempFiles.Add(path);
+
+        ModelRoute quotaBound = RouteWithThreadQuota("composition-live-quota", threads: 4);
+
+        ScheduledRequest[] soloRequests =
+        [
+            Request(Encode(path, "hello")),
+            Request(Encode(path, "world !")),
+            Request(Encode(path, "! hello world")),
+        ];
+
+        // The live run hooks every pipeline so their slots are certainly still held when the quota is re-resolved mid-serve on a busy box.
+        ScheduledRequest[] liveRequests =
+        [
+            Request(Encode(path, "hello"), HoldingPipelineHook()),
+            Request(Encode(path, "world !"), HoldingPipelineHook()),
+            Request(Encode(path, "! hello world"), HoldingPipelineHook()),
+        ];
+
+        using Harness baselineHarness = new(path);
+        SequenceOutcome[] alone = await RunSolo(baselineHarness, soloRequests);
+
+        using Harness liveHarness = new(path, route: quotaBound);
+        PipelineHandle[] handles = [.. liveRequests.Select(request => liveHarness.Scheduler.Submit(request, CancellationToken.None))];
+
+        // The load-resolved quota of 4 has headroom for all three pipelines: the early merged steps kept nothing out.
+        await WaitForDecodeStepsAsync(liveHarness.Scheduler, minimum: 2);
+        Assert.Equal(0, liveHarness.Scheduler.DeferredCompositionCandidates);
+
+        // Lowering the stepping segment's worker-thread quota mid-serve re-resolves headroom for future compositions only — pipelines already
+        // admitted keep their slots and ride on. From here a merged window fits one sequence, so later boundaries defer what will not fit.
+        liveHarness.Scheduler.ApplySteppingThreadQuota(1);
+
+        SequenceOutcome[] together = await Task.WhenAll(handles.Select(handle => handle.Completion));
+
+        AssertCompleteRuns(together); // nothing was preempted: every admitted pipeline still ran to its token budget
+        AssertOutcomesEqual(alone, together); // and a retargeted quota moved no sequence's tokens
+
+        Assert.True(
+            liveHarness.Scheduler.DeferredCompositionCandidates > 0,
+            "no candidate was kept out after the lowered quota: composition never read the re-resolved headroom");
+
+        Assert.Contains(
+            liveHarness.Scheduler.LastCompositionRefusals,
+            refusal => refusal.Block == CompositionBlock.ThreadQuota && refusal.Reason.Contains("'1'-thread quota is fully claimed", StringComparison.Ordinal));
+    }
+
+    private static async Task WaitForDecodeStepsAsync(GenerationScheduler scheduler, long minimum)
+    {
+        long deadline = Environment.TickCount64 + 25_000;
+        while (scheduler.Stats.DecodeSteps < minimum)
+        {
+            if (Environment.TickCount64 >= deadline)
+            {
+                Assert.Fail($"the run never reached {minimum} decode steps — the composition window to re-resolve inside never opened");
+            }
+
+            await Task.Delay(10);
+        }
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private static SamplingParams Greedy() => new() { Temperature = 0f };
 
-    private static ScheduledRequest Request(int[] promptTokens) => new()
+    private static ScheduledRequest Request(int[] promptTokens, Action<int>? onTokenId = null) => new()
     {
         PromptTokens = promptTokens,
         MaxTokens = GenerationCeiling,
         Sampling = Greedy(),
         // A stop id outside this synthetic vocabulary keeps every run on the length path instead of ending on the model's real EOS.
         EosId = 999,
+        OnTokenId = onTokenId,
     };
+
+    /// <summary>Keeps a pipeline live for a measurable window: its streaming hook parks the scheduler thread briefly at every sampled token, so mid-serve changes land while its slots are certainly still held on a busy box.</summary>
+    private static Action<int> HoldingPipelineHook() => _ => Thread.Sleep(15);
 
     private static int[] Encode(string modelPath, string text)
     {

@@ -1,6 +1,7 @@
 namespace Lair.Models.Scheduling;
 
 using System.Runtime.CompilerServices;
+using Lair.Models;
 
 /// <summary>
 /// What one advancing pipeline offers to step composition: its identity, the resolved model plan it advances under — whose route is
@@ -98,11 +99,13 @@ internal sealed record CompositionReport(
 /// share that plan's whole ordered route — a hybrid-shaped group merges as one step across its segments instead of splitting per
 /// device or per segment — and only while their KV residency is addressable by the segment being stepped, that segment's batch cap
 /// still has room for them, and they leave quota headroom against it (worker threads, pinned cores) for every pipeline already in
-/// the step. A candidate that cannot fit is deferred with a reason naming which cap or quota blocked it; deferral keeps its slot and
-/// reservation intact and simply rides no forward at this boundary, so nothing about merging can move another sequence's tokens: each
-/// pipeline samples from its own logits row whether the step advanced one sequence or many. Composition reads only what load resolved —
-/// plan geometry, route segments with their caps and quotas, candidate residency — claims nothing new against any device ledger, opens
-/// no backend, allocates no buffer, and never reorders a route's segments.
+    /// the step. A candidate that cannot fit is deferred with a reason naming which cap or quota blocked it; deferral keeps its slot and
+    /// reservation intact and simply rides no forward at this boundary, so nothing about merging can move another sequence's tokens: each
+    /// pipeline samples from its own logits row whether the step advanced one sequence or many. Composition reads only what load resolved —
+    /// plan geometry, route segments with their caps and quotas, candidate residency — plus a live re-resolution of the stepped segment's
+    /// quota when its scheduler carries one, claims nothing new against any device ledger, opens no backend, allocates no buffer, and never
+    /// reorders a route's segments.
+
 /// </summary>
 internal sealed class StepCompositionArbiter
 {
@@ -135,10 +138,12 @@ internal sealed class StepCompositionArbiter
     /// do not share a plan instance plus its whole route never ride one forward pass, whatever devices their routes name or how similar
     /// their geometry is. Inside a group, candidates are considered in the order given — ascending pipeline id is what keeps composition
     /// identical across runs — and each admission re-checks residency compatibility against the stepping segment, that segment's batch
-    /// cap, and its quota headroom for the pipelines already admitted. Every candidate left out lands in that group's deferral list with
-    /// the limit that blocked it named; a deferred candidate is refused nowhere else and composes again at the next boundary.
+    /// cap, and its quota headroom for the pipelines already admitted; <paramref name="steppingQuotaOverride"/> replaces only that last
+    /// check's numbers with a live re-resolution of the stepped segment's quota when one is in force, leaving route identity, caps, and
+    /// residency claims as load resolved them. Every candidate left out lands in that group's deferral list with the limit that blocked it
+    /// named; a deferred candidate is refused nowhere else and composes again at the next boundary.
     /// </summary>
-    public CompositionReport Compose(IReadOnlyList<StepCandidate> candidates, int steppingSegmentIndex)
+    public CompositionReport Compose(IReadOnlyList<StepCandidate> candidates, int steppingSegmentIndex, SegmentQuota? steppingQuotaOverride = null)
     {
         ArgumentNullException.ThrowIfNull(candidates);
 
@@ -175,10 +180,14 @@ internal sealed class StepCompositionArbiter
 
             // Quota ledger for this step alone: what the pipelines already admitted hold against the stepping segment. A segment that
             // declares no thread cap and pins no cores claims nothing, so composition over it is bounded by its batch cap alone — which
-            // is every model resolved without placement quotas today.
+            // is every model resolved without placement quotas today. The numbers here are load-resolved unless this call carries a live
+            // re-resolution of the stepped segment's quota, in which case headroom follows that value while everything else about the route
+            // stays as load resolved it.
+            SegmentQuota quota = namesSegment ? steppingQuotaOverride ?? route.Segments[steppingSegmentIndex].Quota : new();
+
             List<StepCandidate> admitted = [];
             List<DeferredStepCandidate> refused = [];
-            int[] pinnedCores = namesSegment ? OrderedCores(segment.Quota.Cores) : [];
+            int[] pinnedCores = namesSegment ? OrderedCores(quota.Cores) : [];
             int threadClaims = 0;
             int coreClaims = 0;
 
@@ -218,7 +227,7 @@ internal sealed class StepCompositionArbiter
                     continue;
                 }
 
-                if (segment.Quota.Threads is int threadCap && threadClaims >= threadCap)
+                if (quota.Threads is int threadCap && threadClaims >= threadCap)
                 {
                     refused.Add(new DeferredStepCandidate(
                         candidate,
@@ -243,8 +252,9 @@ internal sealed class StepCompositionArbiter
                 admitted.Add(candidate);
 
                 // Each pipeline joining a merged step holds one share of what the stepping segment declares against it: one worker thread
-                // against a declared cap, and one core from its pinned set. A segment declaring neither claims nothing for its sequences.
-                if (segment.Quota.Threads is not null)
+                // against a declared cap, and one core from its pinned set. A segment declaring neither claims nothing for its sequences —
+                // headroom is counted against this call's effective quota, live re-resolution included.
+                if (quota.Threads is not null)
                 {
                     threadClaims++;
                 }

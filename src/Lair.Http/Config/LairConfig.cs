@@ -95,6 +95,15 @@ public sealed record ModelConfig
     /// <summary>Per-model response-token budget carried with the model entry; null (absent) means unbudgeted and leaves request token limits at their existing semantics.</summary>
     public int? MaxResponseTokens { get; init; }
 
+    /// <summary>
+    /// Hard cap on how many requests this model may hold admitted at once. Null (absent) bounds nothing: every submission is
+    /// admitted as far as KV capacity reaches, exactly as before this key existed. A present value must be 1 or greater and is
+    /// enforced at admission — a submission that would exceed it is refused naming the model and its quota slot rather than
+    /// queued behind what already runs. Sequences already admitted keep their slots through a hot edit of this key; only later
+    /// submissions see the new cap.
+    /// </summary>
+    public int? MaxConcurrentRequests { get; init; }
+
     public PlacementConfig Placement { get; init; } = new();
 }
 

@@ -18,7 +18,7 @@ public static class YamlConfigLoader
     private static readonly string[] ServerKeys = ["bind", "port"];
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_kernel"];
     private static readonly string[] UiKeys = ["recent_requests"];
-    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens"];
+    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota"];
 
     /// <summary>Loads and validates <paramref name="filePath"/>; no file watching.</summary>
@@ -270,6 +270,16 @@ public static class YamlConfigLoader
                 $"models[{index}].max_response_tokens {maxResponseTokens} is invalid: 'max_response_tokens' must be 1 or greater.");
         }
 
+        // Per-model admission concurrency: absent bounds nothing — every submission reaches admission as far as capacity allows,
+        // exactly as before this key existed. A present value caps how many requests the model holds admitted at once and must
+        // be 1 or greater; a rejected value fails naming the model entry, key, and offending number like the other sized keys do.
+        int? maxConcurrentRequests = TryInteger(keys, "max_concurrent_requests", $"models[{index}].max_concurrent_requests");
+        if (maxConcurrentRequests is < 1)
+        {
+            throw new ConfigException(
+                $"models[{index}].max_concurrent_requests {maxConcurrentRequests} is invalid: 'max_concurrent_requests' must be 1 or greater.");
+        }
+
         return new ModelConfig
         {
             Name = name,
@@ -282,6 +292,7 @@ public static class YamlConfigLoader
             Reasoning = reasoning,
             MaxReasoningTokens = maxReasoningTokens,
             MaxResponseTokens = maxResponseTokens,
+            MaxConcurrentRequests = maxConcurrentRequests,
             Placement = ParsePlacement(keys, index),
         };
     }

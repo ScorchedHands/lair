@@ -71,8 +71,10 @@ public enum WeightTier
 /// <summary>
 /// The share of one segment's compute a step holds: for CPU segments that is its worker-thread cap and its pinned
 /// core set — the same two numbers placement declares today. A null thread cap leaves the segment at the engine's own
-/// thread choice; an empty core set claims no pinning, which is what every unpinned model resolves to now. Quota for a
-/// device class with no backend stays unclaimed rather than invented.
+/// thread choice; an empty core set claims no pinning, which is what every unpinned model resolves to now. The accelerator
+/// share fields are the matching vocabulary for a device-backed segment: a stream priority and a streaming-multiprocessor
+/// share carried on the route so later execution consumes them unchanged — null until something declares them, because quota
+/// for a device class with no backend stays unclaimed rather than invented.
 /// </summary>
 public sealed record SegmentQuota
 {
@@ -81,4 +83,10 @@ public sealed record SegmentQuota
 
     /// <summary>The logical cores pinned to this segment's workers: its core-set share. Empty means unpinned, and a non-empty set is what admission counts against another model's claim.</summary>
     public IReadOnlySet<int> Cores { get; init; } = new HashSet<int>();
+
+    /// <summary>A compute stream priority for an accelerator-backed segment (1 or greater); null claims no stream ordering. A CPU segment never carries one — the field names vocabulary a later device execution reads, not something this build enforces.</summary>
+    public int? StreamPriority { get; init; }
+
+    /// <summary>The share of an accelerator's streaming multiprocessors this segment holds (greater than 0 and at most 100); null claims none. As with the stream priority, a CPU segment leaves it unclaimed.</summary>
+    public double? SmSharePercent { get; init; }
 }

@@ -9,45 +9,53 @@ using Lair.Tokenizer;
 namespace Lair.Tests;
 
 /// <summary>
-/// Pipeline control-plane behavior on a synthetic tiny model: an admitted request is advanced as its own state machine, over-cap
-/// submissions wait for an advancement slot instead of being rejected or preempting work already running, and a pipeline's token stream
-/// is identical whether it stepped alone, rode in shared steps with other pipelines, or advanced under a cap that forces one-at-a-time
-/// stepping. Every request here runs greedy, so scheduling shape is the only thing these tests could move — which makes an unchanged
-/// token stream evidence rather than coincidence.
+/// Pipeline control-plane behavior on a synthetic tiny model: an admitted request is advanced as its own state machine, a submission past the
+/// scheduler's concurrency cap is refused naming the model and its quota rather than queued or preempting work already running, and a pipeline's
+/// token stream is identical whether it stepped alone, rode in shared steps with other pipelines, or was served strictly one at a time under a cap.
+/// Every request here runs greedy, so scheduling shape is the only thing these tests could move — which makes an unchanged token stream evidence
+/// rather than coincidence.
 /// </summary>
+
 [Trait("Category", "Scheduling")]
 [Collection("model-loaded")]
 public sealed class PipelineSchedulingTests : IDisposable
 {
     private const int GenerationCeiling = 12;
 
-    // A prompt long enough to need many chunk boundaries at this harness's chunk width, so it holds its advancement slot while other
-    // pipelines are still arriving and waiting behind the cap.
+    // A prompt long enough to need many chunk boundaries at this harness's chunk width, so it holds its admission slot while other
+    // pipelines are still arriving and sharing the cap with it.
     private const int AnchorPromptTokens = 30;
 
     private readonly List<string> _tempFiles = [];
 
     [Fact]
-    public async Task ConcurrencyCap_QueuesOverCapWithoutRejection_AndNeverAdvancesMoreThanTheCap()
+    public async Task ConcurrencyCap_RejectsSubmissionsPastTheCap_NamingModelAndQuotaSlot_AndAdmitsAgainOnceASlotFrees()
     {
         string path = SyntheticLlamaGguf.Write("pipeline-cap");
         _tempFiles.Add(path);
 
         const int cap = 2;
-        using PipelineHarness harness = new(path, capacityBlocks: 48, maxContextTokens: 64, maxBatchTokens: 2, maxConcurrentRequests: cap);
+        using PipelineHarness harness = new(path, capacityBlocks: 48, maxContextTokens: 64, maxBatchTokens: 2, maxConcurrentRequests: cap, modelName: "capped-model");
 
-        ScheduledRequest anchor = Request(BuildLongPrompt(harness.Tokenizer), GenerationCeiling);
-        ScheduledRequest shortA = Request(Encode(harness.Tokenizer, "hello world"), GenerationCeiling);
+        // The hooks park the scheduler thread briefly at every sampled token of both admitted pipelines, so their slots are certainly still held when the over-cap submission is attempted on a busy box.
+        ScheduledRequest anchor = Request(BuildLongPrompt(harness.Tokenizer), GenerationCeiling, HoldingPipelineHook());
+        ScheduledRequest shortA = Request(Encode(harness.Tokenizer, "hello world"), GenerationCeiling, HoldingPipelineHook());
         ScheduledRequest shortB = Request(Encode(harness.Tokenizer, "world !"), GenerationCeiling);
 
-        // The anchor's many chunk boundaries hold one slot; the two submissions behind it share whatever remains.
+        // The anchor's many chunk boundaries hold one slot; the next submission takes whatever remains. A third arrives while both are held:
+        // it is refused at admission naming this model and its quota rather than queued behind what already runs.
         PipelineHandle anchorHandle = harness.Scheduler.Submit(anchor, CancellationToken.None);
         PipelineHandle handleA = harness.Scheduler.Submit(shortA, CancellationToken.None);
-        PipelineHandle handleB = harness.Scheduler.Submit(shortB, CancellationToken.None);
 
-        SequenceOutcome[] outcomes = await Task.WhenAll(anchorHandle.Completion, handleA.Completion, handleB.Completion);
+        SchedulerConcurrencyFullException overCap = Assert.Throws<SchedulerConcurrencyFullException>(
+            () => harness.Scheduler.Submit(shortB, CancellationToken.None));
+        Assert.Equal(cap, overCap.MaxConcurrentRequests);
+        Assert.Contains("capped-model", overCap.Message, StringComparison.Ordinal);
+        Assert.Contains("max_concurrent_requests", overCap.Message, StringComparison.Ordinal);
 
-        // Submissions behind the cap were admitted and ran to their ceilings rather than refused.
+        SequenceOutcome[] outcomes = await Task.WhenAll(anchorHandle.Completion, handleA.Completion);
+
+        // The admitted pair ran to its ceilings; only the refused submission was turned away.
         Assert.All(outcomes, outcome =>
         {
             Assert.Equal(FinishReason.Length, outcome.FinishReason);
@@ -61,42 +69,52 @@ public sealed class PipelineSchedulingTests : IDisposable
             harness.Scheduler.Stats.WindowSequenceSum <= harness.Scheduler.Stats.DecodeSteps * cap,
             $"windows advanced {harness.Scheduler.Stats.WindowSequenceSum} pipeline steps across {harness.Scheduler.Stats.DecodeSteps} decode steps — past a cap of {cap}");
 
-        // The anchor's chunked prefill plus two short prompts guarantee at least one window held two pipelines: the cap bounds
+        // The anchor's chunked prefill alongside the short prompt guarantees at least one window held two pipelines: the cap bounds
         // concurrency, it does not serialize everything.
         Assert.True(
             harness.Scheduler.Stats.WindowSequenceSum > harness.Scheduler.Stats.DecodeSteps,
             "no step ever advanced more than one pipeline under a cap of 2 — advancement was serialized rather than capped");
 
         Assert.Equal(0, harness.Scheduler.AdvancingPipelineCount); // every slot came back as its pipeline finished
+
+        // The refusal governed admission, not the engine: once both pipelines finished and their slots returned, the submission that
+        // was refused is admitted normally.
+        SequenceOutcome refilled = await harness.Scheduler.Submit(shortB, CancellationToken.None).Completion;
+        Assert.Equal(FinishReason.Length, refilled.FinishReason);
+        Assert.Equal(GenerationCeiling, refilled.CompletionTokens);
     }
 
     [Fact]
-    public async Task QueuedPipeline_CancellingBeforeItEverAdvanced_FinishesCanceledWithNoTokens()
+    public async Task PipelineCancelledAtAdmission_FinishesCanceledWithNoTokens_WithoutDisturbingTheAdvancingOne()
     {
         string path = SyntheticLlamaGguf.Write("pipeline-queued-cancel");
         _tempFiles.Add(path);
 
-        using PipelineHarness harness = new(path, capacityBlocks: 48, maxContextTokens: 64, maxBatchTokens: 2, maxConcurrentRequests: 1);
+        // The cap no longer queues a third pipeline — an over-cap submission is refused at admission (see the test above) — so nothing here waits to be cancelled. An uncapped scheduler admits both submissions, and the second arrives on an already-cancelled token: its cancellation is observed at the step boundary before anything starts it advancing, exactly as a waiting pipeline's used to be.
+        using PipelineHarness harness = new(path, capacityBlocks: 48, maxContextTokens: 64, maxBatchTokens: 2, maxConcurrentRequests: null);
 
-        // The anchor holds the only slot across many chunk boundaries, so a pipeline submitted behind it waits at admission.
+        // The anchor holds its slot across many chunk boundaries throughout the run.
         PipelineHandle anchor = harness.Scheduler.Submit(Request(BuildLongPrompt(harness.Tokenizer), GenerationCeiling), CancellationToken.None);
 
         using var cancel = new CancellationTokenSource();
-        PipelineHandle queued = harness.Scheduler.Submit(Request(Encode(harness.Tokenizer, "hello"), GenerationCeiling), cancel.Token);
         cancel.Cancel();
+        PipelineHandle queued = harness.Scheduler.Submit(Request(Encode(harness.Tokenizer, "hello"), GenerationCeiling), cancel.Token);
 
         SequenceOutcome queuedOutcome = await queued.Completion;
         Assert.Equal(FinishReason.Canceled, queuedOutcome.FinishReason);
-        Assert.Empty(queuedOutcome.GeneratedTokens); // a waiting pipeline issued no forward before its cancellation was observed
+        Assert.Empty(queuedOutcome.GeneratedTokens); // a pipeline cancelled before its first boundary issued no forward at all
         Assert.Equal(0, queuedOutcome.PrefillCachedTokens);
 
         SequenceOutcome anchorOutcome = await anchor.Completion;
         Assert.Equal(FinishReason.Length, anchorOutcome.FinishReason);
         Assert.True(
             anchorOutcome.CompletionTokens == GenerationCeiling,
-            $"cancelling the waiting pipeline disturbed the advancing one: {anchorOutcome.FinishReason} after {anchorOutcome.CompletionTokens} tokens");
+            $"cancelling the admitted pipeline disturbed the advancing one: {anchorOutcome.FinishReason} after {anchorOutcome.CompletionTokens} tokens");
 
-        Assert.Equal(1, harness.Scheduler.PeakAdvancingPipelines); // nothing ever advanced alongside the anchor
+        // Nothing ever stepped alongside the anchor: every window held exactly one pipeline.
+        Assert.True(
+            harness.Scheduler.Stats.DecodeSteps == harness.Scheduler.Stats.WindowSequenceSum,
+            $"windows advanced {harness.Scheduler.Stats.WindowSequenceSum} pipelines across {harness.Scheduler.Stats.DecodeSteps} steps — a cancelled pipeline disturbed the stepping shape");
     }
 
     [Fact]
@@ -134,13 +152,25 @@ public sealed class PipelineSchedulingTests : IDisposable
         AssertOutcomesEqual(alone, together); // same tokens whether a pipeline stepped in a window of one or rode shared windows
 
         using PipelineHarness capped = new(path, capacityBlocks: 48, maxContextTokens: 64, maxBatchTokens: 2, maxConcurrentRequests: 1);
-        SequenceOutcome[] oneAtATime = await RunTogether(capped, requests);
 
-        AssertOutcomesEqual(alone, oneAtATime); // advancement forced through a cap of one changes nothing either
+        // A cap of one serves these sequences strictly one at a time — each admitted once the previous finished. Admission forced through
+        // that cap changes nothing about any pipeline's token stream either.
+        SequenceOutcome[] oneAtATime = await RunSolo(capped, requests);
+
+        AssertOutcomesEqual(alone, oneAtATime);
 
         Assert.True(
             capped.Scheduler.PeakAdvancingPipelines == 1 && capped.Scheduler.Stats.DecodeSteps == capped.Scheduler.Stats.WindowSequenceSum,
             $"the capped scheduler advanced {capped.Scheduler.Stats.WindowSequenceSum} pipelines across {capped.Scheduler.Stats.DecodeSteps} steps with peak {capped.Scheduler.PeakAdvancingPipelines} — expected one pipeline per step");
+
+        // And the cap is a refusal rather than a queue: while a long sequence holds the only slot, a submission arriving past it names its quota.
+        PipelineHandle held = capped.Scheduler.Submit(requests[^1] with { OnTokenId = HoldingPipelineHook() }, CancellationToken.None);
+        SchedulerConcurrencyFullException refused = Assert.Throws<SchedulerConcurrencyFullException>(
+            () => capped.Scheduler.Submit(requests[0], CancellationToken.None));
+        Assert.Contains("max_concurrent_requests", refused.Message, StringComparison.Ordinal);
+
+        SequenceOutcome heldOutcome = await held.Completion; // the slot returns when its pipeline finishes
+        Assert.Equal(FinishReason.Length, heldOutcome.FinishReason);
     }
 
     [Fact]
@@ -271,14 +301,18 @@ public sealed class PipelineSchedulingTests : IDisposable
 
     private static SamplingParams Greedy() => new() { Temperature = 0f };
 
-    private static ScheduledRequest Request(int[] promptTokens, int maxTokens) => new()
+    private static ScheduledRequest Request(int[] promptTokens, int maxTokens, Action<int>? onTokenId = null) => new()
     {
         PromptTokens = promptTokens,
         MaxTokens = maxTokens,
         Sampling = Greedy(),
         // A stop id outside this synthetic vocabulary keeps every run on the length path instead of ending on the model's real EOS.
         EosId = 999,
+        OnTokenId = onTokenId,
     };
+
+    /// <summary>Keeps a pipeline live for a measurable window: its streaming hook parks the scheduler thread briefly at every sampled token, so an over-cap submission arriving in that window is refused while the slot is certainly held.</summary>
+    private static Action<int> HoldingPipelineHook() => _ => Thread.Sleep(15);
 
     private static int[] Encode(GgufTokenizer tokenizer, string text) => [.. tokenizer.Encode(text)];
 
@@ -303,7 +337,7 @@ public sealed class PipelineSchedulingTests : IDisposable
         public BlockPool Pool { get; }
         public GenerationScheduler Scheduler { get; }
 
-        public PipelineHarness(string modelPath, int capacityBlocks, int maxContextTokens, int maxBatchTokens, int? maxConcurrentRequests)
+        public PipelineHarness(string modelPath, int capacityBlocks, int maxContextTokens, int maxBatchTokens, int? maxConcurrentRequests, string? modelName = null)
         {
             Gguf = GgufFile.Open(modelPath);
             Tokenizer = GgufTokenizer.FromGguf(Gguf);
@@ -318,8 +352,8 @@ public sealed class PipelineSchedulingTests : IDisposable
                 Backend);
 
             Scheduler = maxConcurrentRequests is int cap
-                ? new GenerationScheduler(Model, Pool, maxBatchTokens, cache: null, maxConcurrentRequests: cap)
-                : new GenerationScheduler(Model, Pool, maxBatchTokens);
+                ? new GenerationScheduler(Model, Pool, maxBatchTokens, cache: null, maxConcurrentRequests: cap, modelName: modelName)
+                : new GenerationScheduler(Model, Pool, maxBatchTokens, cache: null, modelName: modelName);
         }
 
         public void Dispose()
@@ -334,10 +368,11 @@ public sealed class PipelineSchedulingTests : IDisposable
 }
 
 /// <summary>
-/// Advancement-slot accounting on its own, with no engine behind it: the gate hands out at most one slot per advancing pipeline and as
-/// many of them as its cap allows, returns a slot when that pipeline finishes, lowers future acquisitions without taking anything back,
-/// and bounds nothing under an uncapped cap. These are the progress decisions the scheduler makes about pipelines; capacity limits stay
-/// where they were measured against real resources and never consult this accounting.
+/// Admission-slot accounting on its own, with no engine behind it: the gate hands out at most one slot per submitted pipeline and as many of them
+/// as its cap allows, returns a slot when that pipeline finishes, lowers future acquisitions without taking anything back, and bounds nothing under
+/// an uncapped cap. A submission arriving while every slot is held is refused by whoever consults this accounting — the scheduler's admission path;
+/// step-composition deferrals never consult it, since they bound which merged window an already-admitted pipeline rides rather than whether that
+/// pipeline exists.
 /// </summary>
 [Trait("Category", "Scheduling")]
 public sealed class PipelineConcurrencyGateTests
@@ -349,7 +384,7 @@ public sealed class PipelineConcurrencyGateTests
 
         Assert.True(gate.TryAcquireSlot());
         Assert.True(gate.TryAcquireSlot());
-        Assert.False(gate.TryAcquireSlot()); // cap fully held: the next pipeline waits rather than advancing
+        Assert.False(gate.TryAcquireSlot()); // cap fully held: a further acquisition fails, which is what admission turns into a refusal
 
         Assert.Equal(2, gate.HeldSlots);
         Assert.Equal(2, gate.PeakHeldSlots);

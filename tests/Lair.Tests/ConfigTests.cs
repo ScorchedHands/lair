@@ -514,6 +514,58 @@ public sealed class ConfigTests : IDisposable
     }
 
     [Fact]
+    public void Load_MaxConcurrentRequests_ParsesAndDefaultsToNull()
+    {
+        LairConfig capped = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_concurrent_requests: 3
+            """));
+
+        Assert.Equal(3, capped.Models[0].MaxConcurrentRequests);
+
+        LairConfig absent = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """));
+
+        Assert.Null(absent.Models[0].MaxConcurrentRequests); // absent bounds nothing, exactly as before this key existed
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-2)]
+    public void Load_MaxConcurrentRequestsTooSmall_Fails(int cap)
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_concurrent_requests: {cap}
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains($"models[0].max_concurrent_requests {cap}", error.Message);
+        Assert.Contains("'max_concurrent_requests' must be 1 or greater", error.Message);
+    }
+
+    [Fact]
+    public void Load_MaxConcurrentRequestsNonInteger_Fails()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_concurrent_requests: two
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].max_concurrent_requests must be an integer value.", error.Message);
+    }
+
+    [Fact]
     public void ValidateCoreSetsDisjoint_OverlappingModels_NamesBothModels()
     {
         List<ModelConfig> models =

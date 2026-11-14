@@ -11,8 +11,9 @@ namespace Lair.Tests;
 /// Load-time route resolution: the ordered device segments a model's execution path resolves to, from placement input
 /// alone. A CPU-only placement collapses its stages into one executable CPU segment carrying this model's thread cap and
 /// pinned core share; split and hybrid shapes keep their segments in stage order and resolve as value sets without any
-/// accelerator present; every unresolvable declaration fails naming the model and the offending segment, including a
-/// segment whose device no opened backend reports — which is what an engine open refuses too, never falling back to CPU.
+/// accelerator present — an accelerator-backed segment carries a declared stream priority or SM share unchanged, refused only when out of
+/// range, with nothing enforced against a device ledger yet; every unresolvable declaration fails naming the model and the offending segment,
+/// including a segment whose device no opened backend reports — which is what an engine open refuses too, never falling back to CPU.
 /// </summary>
 [Trait("Category", "Loader")]
 [Collection("model-loaded")] // shares one serialized lane with the other suites that open engines on this box
@@ -134,6 +135,74 @@ public sealed class ModelRouteTests : IDisposable
         {
             Assert.Equal(TransformerModel.MaxBatchSequences, segment.BatchCap);
         }
+    }
+
+    [Fact]
+    public void ModelRoutes_BackendedAcceleratorSegment_CarriesDeclaredStreamPriorityAndSmShare_Unchanged()
+    {
+        ModelRoute route = ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "route-accelerator-shares",
+            Stages =
+            [
+                new(ModelRoutes.PrefillStage, "cpu"),
+                new("split_block", AcceleratorDeviceId),
+                new(ModelRoutes.DecodeStage, "cpu"),
+            ],
+            AvailableDevices = ["cpu", AcceleratorDeviceId],
+            ThreadQuota = 2,
+            CoreSet = new HashSet<int> { 5 },
+            AcceleratorStreamPriority = 3,
+            AcceleratorSmSharePercent = 25.0,
+        });
+
+        // The declared accelerator shares land on the device-backed segment unchanged — vocabulary a later execution reads, claimed against no ledger now.
+        Assert.Equal(3, route.Segments[1].Quota.StreamPriority);
+        Assert.Equal(25.0, route.Segments[1].Quota.SmSharePercent);
+
+        // CPU segments keep their placement quota and carry neither accelerator field: the vocabulary names shares for a device they do not run on.
+        foreach (int index in new[] { 0, 2 })
+        {
+            Assert.Null(route.Segments[index].Quota.StreamPriority);
+            Assert.Null(route.Segments[index].Quota.SmSharePercent);
+        }
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-4)]
+    public void ModelRoutes_InvalidAcceleratorStreamPriority_Refuses_NamingModelAndSegment(int streamPriority)
+    {
+        ModelException error = Assert.Throws<ModelException>(() => ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "route-bad-stream-priority",
+            Stages = [new(ModelRoutes.DecodeStage, AcceleratorDeviceId)],
+            AvailableDevices = ["cpu", AcceleratorDeviceId],
+            AcceleratorStreamPriority = streamPriority,
+        }));
+
+        Assert.Contains("model 'route-bad-stream-priority'", error.Message);
+        Assert.Contains($"segment 0 ('{AcceleratorDeviceId}'", error.Message, StringComparison.Ordinal);
+        Assert.Contains("stream priority", error.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(0.0)]
+    [InlineData(-1.5)]
+    [InlineData(120.0)]
+    public void ModelRoutes_InvalidAcceleratorSmShare_Refuses_NamingModelAndSegment(double smShare)
+    {
+        ModelException error = Assert.Throws<ModelException>(() => ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "route-bad-sm-share",
+            Stages = [new(ModelRoutes.DecodeStage, AcceleratorDeviceId)],
+            AvailableDevices = ["cpu", AcceleratorDeviceId],
+            AcceleratorSmSharePercent = smShare,
+        }));
+
+        Assert.Contains("model 'route-bad-sm-share'", error.Message);
+        Assert.Contains($"segment 0 ('{AcceleratorDeviceId}'", error.Message, StringComparison.Ordinal);
+        Assert.Contains("streaming-multiprocessor share must be greater than 0 and at most 100", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]

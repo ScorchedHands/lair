@@ -162,6 +162,11 @@ public static class ConfigMutationTable
             changes.Add(new FieldChange("models[0].max_response_tokens", TextOrNone(oldModel.MaxResponseTokens), TextOrNone(newModel.MaxResponseTokens), ConfigMutationClass.NewRequestsOnly));
         }
 
+        if (newModel.MaxConcurrentRequests != oldModel.MaxConcurrentRequests)
+        {
+            changes.Add(new FieldChange("models[0].max_concurrent_requests", TextOrNone(oldModel.MaxConcurrentRequests), TextOrNone(newModel.MaxConcurrentRequests), ConfigMutationClass.NewRequestsOnly));
+        }
+
         PlacementConfig oldPlacement = oldModel.Placement;
         PlacementConfig newPlacement = newModel.Placement;
         Add(changes, "models[0].placement.device", oldPlacement.Device, newPlacement.Device);
@@ -248,6 +253,7 @@ public static class ConfigMutationTable
         "models[0].reasoning" => ConfigMutationClass.NewRequestsOnly,
         "models[0].max_reasoning_tokens" => ConfigMutationClass.NewRequestsOnly,
         "models[0].max_response_tokens" => ConfigMutationClass.NewRequestsOnly,
+        "models[0].max_concurrent_requests" => ConfigMutationClass.NewRequestsOnly,
         _ => ConfigMutationClass.RestartOnly,
     };
 
@@ -282,6 +288,7 @@ public static class ConfigMutationTable
         yield return ("models[0].reasoning", ScalarText(model, "reasoning"));
         yield return ("models[0].max_reasoning_tokens", ScalarText(model, "max_reasoning_tokens"));
         yield return ("models[0].max_response_tokens", ScalarText(model, "max_response_tokens"));
+        yield return ("models[0].max_concurrent_requests", ScalarText(model, "max_concurrent_requests"));
 
         YamlDotNet.RepresentationModel.YamlMappingNode? placement = Child(model, "placement");
         yield return ("models[0].placement.device", ScalarText(placement, "device"));
@@ -311,6 +318,7 @@ public static class ConfigMutationTable
         "models[0].reasoning" => current.Models[0].Reasoning,
         "models[0].max_reasoning_tokens" => TextOrNone(current.Models[0].MaxReasoningTokens),
         "models[0].max_response_tokens" => TextOrNone(current.Models[0].MaxResponseTokens),
+        "models[0].max_concurrent_requests" => TextOrNone(current.Models[0].MaxConcurrentRequests),
         "models[0].placement.device" => current.Models[0].Placement.Device,
         "models[0].placement.kv_residency" => current.Models[0].Placement.KvResidency,
         "models[0].placement.prefill" => current.Models[0].Placement.Prefill,
