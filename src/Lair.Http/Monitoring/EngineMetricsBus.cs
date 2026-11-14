@@ -40,6 +40,9 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     /// <summary>Request frames queued per subscriber before the oldest drop.</summary>
     internal const int RequestQueueCapacity = 200;
 
+    /// <summary>Admission refusals the ring retains — newest refusals replace older ones, so a burst of rejections stays visible without growing the snapshot payload.</summary>
+    public const int AdmissionRefusalRingCapacity = 10;
+
     private readonly string _modelId;
     private readonly SchedulerStats _stats;
     private readonly BlockPool _pool;
@@ -85,6 +88,12 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     // Model facts attached by the owning service; null until then, so snapshots carry nulls in those slots — the
     // v1 shape untouched. Re-pushed on hot reload when a live-applied field changes them (worker quota today).
     private ModelFacts? _modelFacts;
+
+    // Recent admission refusals recorded by the owning facade: oldest-drops ring under the fan-out lock, newest
+    // first in every read, so a snapshot's diagnostic array is one small deterministic slice of what admission
+    // refused most recently. The cumulative total counts every refusal since open, ring retention aside.
+    private readonly AdmissionRefusalEntry[] _admissionRefusals = new AdmissionRefusalEntry[AdmissionRefusalRingCapacity];
+    private long _admissionRefusalTotal;
 
     private readonly List<MonitorSubscription> _subscriptions = [];
     private long _subscriptionSeq;
@@ -197,6 +206,49 @@ public sealed class EngineMetricsBus : IAsyncDisposable
 
     /// <summary>Records a request that ended on a stop literal, so finish-reason tallies match HTTP outcomes.</summary>
     public void RecordStopCompletion() => Interlocked.Increment(ref _requestsStop);
+
+    /// <summary>
+    /// Records one admission refusal the owning facade observed: the limit kind that blocked the submission (from
+    /// <see cref="AdmissionRefusalKinds"/>), the model it was submitting to, and a concise reason. The entry lands in
+    /// the bounded recent-refusal ring newest-first — older refusals drop as newer arrive — while the cumulative total
+    /// counts every refusal since open. Recording never changes any request's own response; this is diagnostic state
+    /// for snapshots only.
+    /// </summary>
+    public void RecordAdmissionRefusal(string kind, string modelId, string reason)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(kind);
+        ArgumentException.ThrowIfNullOrWhiteSpace(modelId);
+        ArgumentNullException.ThrowIfNull(reason);
+
+        lock (_fanout)
+        {
+            _admissionRefusals[_admissionRefusalTotal % AdmissionRefusalRingCapacity] = new AdmissionRefusalEntry(kind, modelId, reason);
+            Volatile.Write(ref _admissionRefusalTotal, _admissionRefusalTotal + 1);
+        }
+    }
+
+    /// <summary>Admission refusals recorded since the bus opened, whatever their caller answered with.</summary>
+    public long AdmissionRefusalsTotal => Volatile.Read(ref _admissionRefusalTotal);
+
+    /// <summary>The retained recent admission refusals, newest first — at most <see cref="AdmissionRefusalRingCapacity"/> entries. Read under the fan-out lock because request threads write that ring.</summary>
+    public IReadOnlyList<AdmissionRefusalEntry> RecentAdmissionRefusals()
+    {
+        lock (_fanout)
+        {
+            long total = Volatile.Read(ref _admissionRefusalTotal);
+
+            List<AdmissionRefusalEntry> list = [];
+            for (long index = total - 1; index >= Math.Max(0, total - AdmissionRefusalRingCapacity); index--)
+            {
+                if (_admissionRefusals[index % AdmissionRefusalRingCapacity] is AdmissionRefusalEntry refusal)
+                {
+                    list.Add(refusal);
+                }
+            }
+
+            return list;
+        }
+    }
 
     /// <summary>
     /// Resizes the recent-request ring live. Shrinking drops the oldest entries by simply narrowing what reads
@@ -496,7 +548,23 @@ public sealed class EngineMetricsBus : IAsyncDisposable
 
                 WindowedLayers: _pool.DeclaredWindowedLayerCount,
                 KvReadFootprintBlocks: _pool.KvReadFootprintBlocksAtBudget,
-                SkippedKvReadBlocks: _pool.SkippedKvReadFootprintBlocksAtBudget);
+                SkippedKvReadBlocks: _pool.SkippedKvReadFootprintBlocksAtBudget,
+
+                // Additive quota/route/lane diagnostics and the recent admission-refusal slice (earlier shapes
+                // untouched): configuration- and lane-backed fields ride the attached facts; refusals are read from
+                // this bus's own ring under the same lock that publishes them.
+                MaxConcurrentRequests: facts?.MaxConcurrentRequests,
+                RouteSegments: facts?.RouteSegments,
+                PrefillLane: facts?.PrefillLane,
+                PrefillClaimThreads: facts?.PrefillClaimThreads ?? 0,
+                PrefillDecodeShareThreads: facts?.PrefillDecodeShareThreads ?? 0,
+                PrefillLaneShareThreads: facts?.PrefillLaneShareThreads ?? 0,
+                PrefillDecodeCoreSet: facts?.PrefillDecodeCoreSet,
+                PrefillLaneCoreSet: facts?.PrefillLaneCoreSet,
+                PrefillActivationBytes: facts?.PrefillActivationBytes ?? 0,
+
+                AdmissionRefusalsTotal: Volatile.Read(ref _admissionRefusalTotal),
+                AdmissionRefusals: RecentAdmissionRefusals()); // already holding the fan-out lock here; Monitor re-entry is safe on this thread
 
             long id = ++_eventSeq;
             frame = new MonitorFrame(id, MonitorEventNames.Snapshot, snapshot.ToJson());

@@ -96,7 +96,44 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_kv_read_footprint_blocks")] long KvReadFootprintBlocks = 0,
 
     /// <summary>Whole logical blocks excluded by declared windows at the current soft budget.</summary>
-    [property: JsonPropertyName("metrics_kv_skipped_read_blocks")] long SkippedKvReadBlocks = 0)
+    [property: JsonPropertyName("metrics_kv_skipped_read_blocks")] long SkippedKvReadBlocks = 0,
+
+    // Additive quota, route, and admission-diagnostic fields. Every one is a trailing optional parameter with an
+    // inert default, so earlier payloads and constructions read exactly as before; configuration-backed ones
+    // serialize null until the owning service attaches facts.
+
+    /// <summary>The configured admission concurrency cap for this model, or null when nothing bounds how many requests it may hold admitted at once.</summary>
+    [property: JsonPropertyName("metrics_max_concurrent_requests")] int? MaxConcurrentRequests = null,
+
+    /// <summary>The resolved execution route's segments in execution order — device identity, weight tier, batch cap, and resolved quota per segment — or null until the owning service attaches them.</summary>
+    [property: JsonPropertyName("metrics_route_segments")] IReadOnlyList<ModelRouteSegment>? RouteSegments = null,
+
+    /// <summary>Which prefill-lane posture this model opened with (<c>shared</c>, <c>dedicated</c>), or null until the owning service attaches facts.</summary>
+    [property: JsonPropertyName("metrics_prefill_lane")] string? PrefillLane = null,
+
+    /// <summary>The effective worker claim a dedicated split was derived from — zero when the posture shares one backend.</summary>
+    [property: JsonPropertyName("metrics_prefill_claim_threads")] int PrefillClaimThreads = 0,
+
+    /// <summary>The decode lane's worker cap as resolved — zero when shared.</summary>
+    [property: JsonPropertyName("metrics_prefill_decode_share_threads")] int PrefillDecodeShareThreads = 0,
+
+    /// <summary>The prefill lane's own worker cap — zero when shared.</summary>
+    [property: JsonPropertyName("metrics_prefill_lane_share_threads")] int PrefillLaneShareThreads = 0,
+
+    /// <summary>The decode lane's pinned core ids as compressed ranges, null when the posture pins nothing.</summary>
+    [property: JsonPropertyName("metrics_prefill_decode_core_set")] string? PrefillDecodeCoreSet = null,
+
+    /// <summary>The prefill lane's pinned core ids as compressed ranges, null when the posture pins nothing.</summary>
+    [property: JsonPropertyName("metrics_prefill_lane_core_set")] string? PrefillLaneCoreSet = null,
+
+    /// <summary>Total bytes of mutable activation storage the dedicated lane family holds at open — zero for a shared posture.</summary>
+    [property: JsonPropertyName("metrics_prefill_activation_bytes")] long PrefillActivationBytes = 0,
+
+    /// <summary>Submissions the admission control plane refused since this bus opened, whatever their caller answered with.</summary>
+    [property: JsonPropertyName("metrics_admission_refusals_total")] long AdmissionRefusalsTotal = 0,
+
+    /// <summary>The most recent admission refusals, newest first: each names the limit kind that blocked, the model, and a concise reason. Bounded to the latest <see cref="EngineMetricsBus.AdmissionRefusalRingCapacity"/>.</summary>
+    [property: JsonPropertyName("metrics_admission_refusals")] IReadOnlyList<AdmissionRefusalEntry>? AdmissionRefusals = null)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

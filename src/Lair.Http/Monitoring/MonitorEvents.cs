@@ -35,6 +35,25 @@ public static class MonitorEventSchema
 }
 
 /// <summary>
+/// The limit-kind vocabulary the monitor uses for recorded admission refusals, naming the same blocking limits the
+/// request layer's refusals name: the KV pool cannot back the request's prompt plus token budget, the resolved
+/// context window leaves no token free for generation, or every admission slot of the model's concurrency cap is
+/// held. A recorded refusal is a diagnostic copy of a refusal its caller already answered — these names describe
+/// which limit blocked, never a new error surface.
+/// </summary>
+public static class AdmissionRefusalKinds
+{
+    /// <summary>The submission's prompt plus token budget outruns the token slots the KV pool can back right now.</summary>
+    public const string KvCapacity = "kv_capacity";
+
+    /// <summary>The prompt does not fit the model's resolved context window with a token left free for generation.</summary>
+    public const string ContextLength = "context_length";
+
+    /// <summary>Every admission slot of the model's <c>max_concurrent_requests</c> cap is held by sequences already admitted.</summary>
+    public const string ConcurrencyQuota = "concurrency_quota";
+}
+
+/// <summary>
 /// One point of a request's tok/s series: at the moment its Nth token was produced, N tokens had taken this many
 /// milliseconds since generation began. Series are step-boundary tick samples over a small fixed window (oldest
 /// points drop first), so sparklines read recent speed rather than a full history.

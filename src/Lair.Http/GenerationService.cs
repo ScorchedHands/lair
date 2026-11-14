@@ -173,27 +173,59 @@ public sealed class GenerationService : IDisposable
     internal ModelRoute ResolvedRoute => _model.Plan.Route;
 
     // Snapshot identity/placement facts straight from the configuration in force, the backend's live worker count, and
-    // the formats the opened model's dense weight matrices actually carry.
+    // the formats the opened model's dense weight matrices actually carry. Quota posture rides too: the concurrency cap
+    // as configured now (a hot edit re-pushes it with everything else), the resolved route's segments in execution order,
+    // and — for a dedicated lane posture — the load-resolved split, each side's pinned mask, and what the engine sized
+    // its lane activation family from. A shared posture reports only the posture itself; nothing here re-derives what
+    // open already resolved.
     private ModelFacts BuildMonitorFacts(LairConfig config) => new(
         config.Models[0].Type,
         _backend.EffectiveWorkerCount,
-        FormatCoreSet(config.Models[0].Placement.CoreSet),
+        FormatCoreRanges(config.Models[0].Placement.CoreSet),
         config.Models[0].Placement.ThreadQuota,
         config.Models[0].Placement.Device,
         config.Models[0].Placement.Prefill,
         config.Models[0].Placement.KvResidency,
         config.Engine.PrefillKernel,
-        string.Join(", ", _model.MatmulWeightFormats));
+        string.Join(", ", _model.MatmulWeightFormats),
+        config.Models[0].MaxConcurrentRequests,
+        BuildRouteSegmentFacts(ResolvedRoute),
+        config.Models[0].Placement.PrefillLane == PlacementPrefillLaneValues.Dedicated
+            ? PlacementPrefillLaneValues.Dedicated
+            : PlacementPrefillLaneValues.Shared,
+        PrefillClaimThreads: _prefillsLane?.EffectiveClaimThreads ?? 0,
+        PrefillDecodeShareThreads: _prefillsLane?.DecodeShareThreads ?? 0,
+        PrefillLaneShareThreads: _prefillsBackend?.EffectiveWorkerCount ?? 0,
+        PrefillDecodeCoreSet: FormatCoreRanges(_prefillsLane?.DecodeCoreIds),
+        PrefillLaneCoreSet: FormatCoreRanges(_prefillsLane?.PrefillCoreIds),
+        PrefillActivationBytes: _model.PrefillLaneActivationBytes);
 
-    // Pinned core ids as compressed ranges ("0-23", "1, 4-6"); null when nothing is pinned.
-    private static string? FormatCoreSet(IReadOnlySet<int> cores)
+    // The resolved route as the monitor and the model listing report it: segments in execution order, each with its
+    // device identity, residency tier, batch cap, and quota exactly as load resolved them. Live edits move worker
+    // participation against a segment; they never rewrite which segments exist or what those carry.
+    private static IReadOnlyList<ModelRouteSegment> BuildRouteSegmentFacts(ModelRoute route) =>
+        [.. route.Segments.Select(segment => new ModelRouteSegment(
+            segment.DeviceId,
+            WeightTierNames.Of(segment.WeightTier),
+            segment.BatchCap,
+            segment.Quota.Threads,
+            FormatCoreRanges(segment.Quota.Cores)))];
+
+    // Pinned core ids as compressed ranges ("0-23", "1, 4-6"); null when nothing is pinned. Accepts any id set —
+    // a placement's own pins or one lane side of a dedicated split reads through the same formatter so every core fact
+    // on either surface renders alike.
+    internal static string? FormatCoreRanges(IEnumerable<int>? cores)
     {
-        if (cores.Count == 0)
+        if (cores is null)
         {
             return null;
         }
 
         int[] sorted = [.. cores];
+        if (sorted.Length == 0)
+        {
+            return null;
+        }
         Array.Sort(sorted);
 
         List<string> ranges = [];
@@ -412,7 +444,11 @@ public sealed class GenerationService : IDisposable
 
                     case "models[0].max_concurrent_requests":
                         _scheduler.ApplyMaxConcurrentRequests(candidate.Models[0].MaxConcurrentRequests);
+
+                        // The advertised cap rides the same swap as every other live-advertised fact, so /v1/models always
+                        // reports what submissions admitted now are bounded by.
                         effective = effective with { Models = [effective.Models[0] with { MaxConcurrentRequests = candidate.Models[0].MaxConcurrentRequests } ] };
+                        Volatile.Write(ref _modelInfo, _modelInfo with { MaxConcurrentRequests = candidate.Models[0].MaxConcurrentRequests });
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
                             $"admission cap {change.OldValue} -> {change.NewValue}: submissions from now on are refused once every slot of the new cap is held; sequences already admitted keep their slots and finish normally"));
                         break;
@@ -736,7 +772,8 @@ public sealed class GenerationService : IDisposable
                 model.Plan.VocabSize,
                 ToolParserNames.Of(outputParser.ToolParser),
                 ReasoningPolicyNames.Of(outputParser.Reasoning),
-                model.Plan.SparseFfnStrategy is { } strategy ? SparseFfnStrategyNames.Of(strategy) : null);
+                model.Plan.SparseFfnStrategy is { } strategy ? SparseFfnStrategyNames.Of(strategy) : null,
+                modelConfig.MaxConcurrentRequests);
 
             GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, markerPair, markersProven ? string.Empty : markerRefusal, logger, pool, scheduler, info, config, prefillsBackend, prefillsLane);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
@@ -830,7 +867,11 @@ public sealed class GenerationService : IDisposable
 
         if (prompt.Count >= Model.ContextLength)
         {
-            throw new ContextLengthExceededException(prompt.Count, Model.ContextLength, Model.Id);
+            // The token-budget refusal is recorded where it decides: the monitor's diagnostic ring sees exactly what
+            // admission turned away, while this request still answers through its own error shape.
+            ContextLengthExceededException contextRefusal = new(prompt.Count, Model.ContextLength, Model.Id);
+            _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.ContextLength, Model.Id, contextRefusal.Message);
+            throw contextRefusal;
         }
 
         ModelConfig modelConfig = EffectiveConfiguration.Models[0];
@@ -931,14 +972,19 @@ public sealed class GenerationService : IDisposable
         {
             // The scheduler's capacity vocabulary is an engine-busy condition at this facade: surface it as the API-level EngineBusyException
             // naming kv_capacity and the served model rather than leaking a scheduling type to callers. No lifecycle frames were published — a
-            // refused admission never entered the stream.
-            throw EngineBusyException.ForKvCapacity(Model.Id, full.FreeSlots);
+            // refused admission never entered the stream, but its refusal lands in the monitor's diagnostic ring so an operator sees what blocked.
+            EngineBusyException busy = EngineBusyException.ForKvCapacity(Model.Id, full.FreeSlots);
+            _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.KvCapacity, Model.Id, busy.Message);
+            throw busy;
         }
         catch (SchedulerConcurrencyFullException quota)
         {
             // A submission past this model's concurrency cap is the other engine-busy refusal: same bounded overload family at the wire, with a
-            // message naming max_concurrent_requests and the served model. Nothing already admitted was disturbed by it.
-            throw EngineBusyException.ForConcurrencyQuota(Model.Id, quota.MaxConcurrentRequests);
+            // message naming max_concurrent_requests and the served model. Nothing already admitted was disturbed by it; the monitor records the
+            // refusal for operators exactly as its kv_capacity sibling does.
+            EngineBusyException busy = EngineBusyException.ForConcurrencyQuota(Model.Id, quota.MaxConcurrentRequests);
+            _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.ConcurrencyQuota, Model.Id, busy.Message);
+            throw busy;
         }
 
         if (tracker is RequestTracker admitted)

@@ -1503,8 +1503,8 @@ public sealed class TransformerModel : IDisposable
     /// <summary>The resolved dedicated prefill-lane layout this engine opened with — null for every shared-posture model. Internal diagnostics for hosts and tests.</summary>
     internal PrefillLaneLayout? DedicatedPrefillLane => _prefillsLane;
 
-    /// <summary>Total bytes of mutable activation storage the dedicated lane family holds at open — weights, norms, rotation tables, and KV live outside it, and a shared-posture model sizes none of it. Internal diagnostics for hosts and tests.</summary>
-    internal long PrefillLaneActivationBytes => _prefillsLane is null ? 0 : _laneAct.ActivationBytes;
+    /// <summary>Total bytes of mutable activation storage the dedicated lane family holds at open — weights, norms, rotation tables, and KV live outside it, and a shared-posture model sizes none of it. Public diagnostics for hosts that report lane state.</summary>
+    public long PrefillLaneActivationBytes => _prefillsLane is null ? 0 : _laneAct.ActivationBytes;
 
     /// <summary>
     /// Advances up to <see cref="MaxBatchSequences"/> sequences by one token each in a single step: every dense

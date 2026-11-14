@@ -99,6 +99,17 @@ public static class ApiApp
 
         app.MapGet("/v1/models", () =>
         {
+            // The advertised concurrency cap is the value admissions enforce now (a live edit re-publishes it through
+            // the model facts swap); an uncapped model reports the posture explicitly so a reader never infers "no cap"
+            // from a missing key. Route segments ride in execution order, exactly as load resolved them.
+            int? concurrencyCap = gen.Model.MaxConcurrentRequests;
+            IReadOnlyList<ModelRouteSegment> routeSegments = [.. gen.ResolvedRoute.Segments.Select(segment => new ModelRouteSegment(
+                segment.DeviceId,
+                WeightTierNames.Of(segment.WeightTier),
+                segment.BatchCap,
+                segment.Quota.Threads,
+                GenerationService.FormatCoreRanges(segment.Quota.Cores)))];
+
             ModelsResponse models = new(
                 "list",
                 [new ModelEntry(
@@ -112,7 +123,10 @@ public static class ApiApp
                     gen.ModelType,
                     gen.Model.ToolParser,
                     gen.Model.Reasoning,
-                    gen.Model.SparseFfnStrategy)]);
+                    gen.Model.SparseFfnStrategy,
+                    concurrencyCap,
+                    concurrencyCap is null ? ConcurrencyCapPostures.Uncapped : "capped",
+                    routeSegments)]);
 
             return Results.Json(models, statusCode: 200);
         });

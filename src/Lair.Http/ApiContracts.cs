@@ -136,7 +136,13 @@ internal sealed record ChunkDelta(
 /// <summary><c>/v1/models</c> envelope.</summary>
 internal sealed record ModelsResponse(string Object, IReadOnlyList<ModelEntry> Data);
 
-/// <summary>One advertised model: OpenAI baseline fields plus the context/quant/architecture metadata, the configured model kind, the tool output parser resolved for the model at load, and the sparse-FFN strategy its plan resolved when it routes experts. The type field is additive payload so chat surfaces can exclude embed models on a fact; it defaults to "chat" because the config loader accepts no other value in this build. A model with no expert-routed block carries no strategy value, and the null-ignore serializer omits the key there.</summary>
+/// <summary>The wire name of an admission concurrency cap that bounds nothing: the key is always reported, and this value says no cap applies rather than leaving a reader to infer it from absence. The same posture string rides every uncapped model's entry.</summary>
+internal static class ConcurrencyCapPostures
+{
+    public const string Uncapped = "uncapped";
+}
+
+/// <summary>One advertised model: OpenAI baseline fields plus the context/quant/architecture metadata, the configured model kind, the tool output parser resolved for the model at load, and the sparse-FFN strategy its plan resolved when it routes experts. The type field is additive payload so chat surfaces can exclude embed models on a fact; it defaults to "chat" because the config loader accepts no other value in this build. A model with no expert-routed block carries no strategy value, and the null-ignore serializer omits the key there. The concurrency facts are always reported: <c>max_concurrent_requests</c> names the cap configured for admissions now (live hot edits included) or JSON null when nothing bounds it, paired with <c>concurrency_cap_posture</c> — that cap's name or <c>uncapped</c>; <c>route_segments</c> lists the resolved execution route in order, each segment naming its device, residency tier, batch cap, and resolved quota.</summary>
 internal sealed record ModelEntry(
     string Id,
     string Object,
@@ -148,7 +154,10 @@ internal sealed record ModelEntry(
     string Type = "chat",
     string ToolParser = "auto",
     string Reasoning = "keep",
-    string? SparseFfnStrategy = null);
+    string? SparseFfnStrategy = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.Never)] int? MaxConcurrentRequests = null,
+    string ConcurrencyCapPosture = ConcurrencyCapPostures.Uncapped,
+    IReadOnlyList<ModelRouteSegment>? RouteSegments = null);
 
 /// <summary><c>/healthz</c> body.</summary>
 internal sealed record HealthResponse(string Status, bool ModelReady);
