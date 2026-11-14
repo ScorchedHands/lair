@@ -1,4 +1,5 @@
 using Lair.Host.Config;
+using Lair.Models;
 
 namespace Lair.Tests;
 
@@ -198,6 +199,7 @@ public sealed class ConfigTests : IDisposable
 
         Assert.Contains("placement.device 'cuda'", error.Message);
         Assert.Contains("only accepted value for 'device' is 'cpu'", error.Message);
+        Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -208,6 +210,7 @@ public sealed class ConfigTests : IDisposable
 
         Assert.Contains("placement.kv_residency 'vram'", error.Message);
         Assert.Contains("only accepted value for 'kv_residency' is 'dram'", error.Message);
+        Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -218,6 +221,7 @@ public sealed class ConfigTests : IDisposable
 
         Assert.Contains("placement.prefill 'gpu'", error.Message);
         Assert.Contains("only accepted value for 'prefill' is 'cpu'", error.Message);
+        Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
     }
 
     [Fact]

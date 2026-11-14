@@ -144,6 +144,7 @@ public sealed class StepCompositionArbiterTests : IDisposable
     }
 
     [Fact]
+    [Trait("Category", "Budget")]
     public void Arbiter_KeepsCandidatePastTheSteppingSegmentsBatchCap_Out_NamingThatCap()
     {
         ModelPlan plan = ResolvePlanWith("arbiter-batch-cap", new RouteRequest
@@ -180,6 +181,7 @@ public sealed class StepCompositionArbiterTests : IDisposable
     }
 
     [Fact]
+    [Trait("Category", "Budget")]
     public void Arbiter_KeepsCandidatesOutWhenThreadQuotaOrPinnedCoresRunOut_NamingWhichDid()
     {
         ModelPlan basePlan = ResolvePlan("arbiter-quota");
@@ -239,6 +241,52 @@ public sealed class StepCompositionArbiterTests : IDisposable
         Assert.Equal(2, report.Deferrals.Count);
         Assert.All(report.Compositions, composition => Assert.Empty(composition.Composed));
         Assert.Contains("names 1 segment(s)", report.Deferrals[0].Reason, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    [Trait("Category", "Budget")]
+    public void Arbiter_LeavesAHybridRoutesResolvedValuesIntact_AcrossACompositionDeferral()
+    {
+        ModelPlan plan = ResolvePlanWith("arbiter-budget-retention", new RouteRequest
+        {
+            ModelName = "arbiter-budget-retention",
+            Stages = [new(ModelRoutes.PrefillStage, ModelRoute.CpuDeviceId), new("split_block", AcceleratorDeviceId), new(ModelRoutes.DecodeStage, ModelRoute.CpuDeviceId)],
+            AvailableDevices = [ModelRoute.CpuDeviceId, AcceleratorDeviceId],
+            ThreadQuota = 2,
+            CoreSet = new HashSet<int> { 3, 8 },
+            BatchCap = 2,
+            AcceleratorStreamPriority = 4,
+            AcceleratorSmSharePercent = 60.0,
+        });
+
+        Assert.Equal(ModelRoute.CpuDeviceId, plan.Route.Segments[2].DeviceId); // the CPU tail is what this composition steps on
+
+        CompositionReport report = new StepCompositionArbiter().Compose(
+            [Candidate(plan, 1), Candidate(plan, 2), Candidate(plan, 3)], steppingSegmentIndex: 2);
+
+        StepComposition composition = Assert.Single(report.Compositions);
+        Assert.Equal(2, composition.MergedSequenceCount); // the cap admitted two sequences and kept the third out of this step alone
+
+        DeferredStepCandidate refusal = Assert.Single(composition.Deferred);
+        Assert.Equal(CompositionBlock.BatchCap, refusal.Block);
+        Assert.Contains("already holds its batch cap of 2", refusal.Reason, StringComparison.Ordinal);
+
+        // What bounded the step is exactly what load resolved: one ceiling on every segment of this route, both device classes' claims untouched.
+        foreach (DeviceSegment segment in plan.Route.Segments)
+        {
+            Assert.Equal(2, segment.BatchCap);
+            Assert.Equal(WeightTier.Dram, segment.WeightTier);
+        }
+
+        DeviceSegment acceleratorSide = plan.Route.Segments[1];
+        Assert.Equal(AcceleratorDeviceId, acceleratorSide.DeviceId);
+        Assert.Equal(4, acceleratorSide.Quota.StreamPriority);
+        Assert.Equal(60.0, acceleratorSide.Quota.SmSharePercent);
+        Assert.Null(acceleratorSide.Quota.Threads);
+
+        DeviceSegment stepping = composition.SteppingSegment;
+        Assert.Equal(2, stepping.Quota.Threads);
+        Assert.True(stepping.Quota.Cores.IsSupersetOf([3, 8]));
     }
 
     // ---------------------------------------------------------------- helpers

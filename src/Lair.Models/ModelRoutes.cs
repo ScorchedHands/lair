@@ -145,7 +145,7 @@ public static class ModelRoutes
     private static WeightTier TierForStage(RouteRequest request, RouteStage stage) =>
         request.KvResidency == WeightTier.Vram && IsCpuDevice(stage.DeviceId)
             ? throw new ModelException(
-                $"model '{request.ModelName}', stage '{stage.Name}': residency 'vram' cannot be held by a segment on '{ModelRoute.CpuDeviceId}' — accelerator-resident weights need an accelerator-backed device, and only '{ModelRoute.CpuDeviceId}' is available to run this model")
+                $"model '{request.ModelName}', stage '{stage.Name}': residency 'vram' cannot be held by a segment on '{ModelRoute.CpuDeviceId}' — accelerator-resident weights need an accelerator-backed device, which runs in '{ModelRoute.CudaBackendSeam}' once one is opened for it, and only '{ModelRoute.CpuDeviceId}' is available to run this model")
             : request.KvResidency;
 
     // Every rule one resolved segment must satisfy before it can carry work: its batch cap inside the ceiling the engine's
@@ -202,7 +202,8 @@ public static class ModelRoutes
         {
             throw new ModelException(
                 $"model '{model}', {segment.Describe(index)}: no compute backend reports device '{segment.DeviceId}' — " +
-                $"this model has [{DescribeDevices(request.AvailableDevices)}] opened for it, and a route naming another device is refused rather than run on CPU");
+                $"accelerator-backed segments run in '{ModelRoute.CudaBackendSeam}', which this build does not carry, and " +
+                $"this model has [{DescribeDevices(request.AvailableDevices)}] opened for it; a route naming another device is refused rather than run on CPU");
         }
 
         // A non-CPU segment's worker-thread and core claims stay empty: this build cannot address that device's threads or cores, so

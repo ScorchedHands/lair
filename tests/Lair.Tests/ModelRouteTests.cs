@@ -321,7 +321,8 @@ public sealed class ModelRouteTests : IDisposable
     public void ModelRoutes_AcceleratorSegmentWithNoBackend_FailsNamingModelSegmentAndMissingBackend()
     {
         // The host-shaped call: only the CPU backend this service opens is available, so a stage naming another device
-        // refuses here instead of reaching an engine that would run the model somewhere else.
+        // refuses here instead of reaching an engine that would run the model somewhere else. The refusal names the seam
+        // accelerator execution lands in — declared vocabulary, not a backend this build carries.
         ModelException error = Assert.Throws<ModelException>(() => ModelRoutes.Resolve(new RouteRequest
         {
             ModelName = "route-missing-backend",
@@ -332,6 +333,137 @@ public sealed class ModelRouteTests : IDisposable
         Assert.Contains("model 'route-missing-backend'", error.Message);
         Assert.Contains("segment 0 ('cuda' at 'Dram')", error.Message);
         Assert.Contains("no compute backend reports device 'cuda'", error.Message);
+        Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
+    }
+
+    // ---------------------------------------------------------------- the accelerator seam as declared vocabulary
+
+    [Fact]
+    [Trait("Category", "Scheduling")]
+    [Trait("Category", "Budget")]
+    public void RouteSeam_CudaOnlyShape_ResolvesIntoAnUnchangedValueSet_RetainingBatchCapAndAcceleratorQuota()
+    {
+        // The synthetic availability seam: a caller that declares such a device opened resolves the shape into route values.
+        ModelRoute route = ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "seam-cuda-only",
+            Stages = [new(ModelRoutes.DecodeStage, AcceleratorDeviceId)],
+            AvailableDevices = ["cpu", AcceleratorDeviceId],
+            BatchCap = 3,
+            AcceleratorStreamPriority = 2,
+            AcceleratorSmSharePercent = 40.0,
+        });
+
+        DeviceSegment segment = Assert.Single(route.Segments);
+        Assert.Equal(AcceleratorDeviceId, segment.DeviceId);
+        Assert.Equal(WeightTier.Dram, segment.WeightTier);
+        Assert.Equal(3, segment.BatchCap);
+        Assert.Null(segment.Quota.Threads);
+        Assert.Empty(segment.Quota.Cores);
+
+        // The declared accelerator share lands on the resolved segment unchanged — a value set later execution consumes as-is.
+        Assert.Equal(2, segment.Quota.StreamPriority);
+        Assert.Equal(40.0, segment.Quota.SmSharePercent);
+    }
+
+    [Fact]
+    [Trait("Category", "Scheduling")]
+    [Trait("Category", "Budget")]
+    public void RouteSeam_HybridShape_ResolvesIntoAnUnchangedValueSet_AcrossBothDeviceClasses()
+    {
+        ModelRoute route = ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "seam-hybrid",
+            Stages =
+            [
+                new(ModelRoutes.PrefillStage, "cpu"),
+                new("split_block", AcceleratorDeviceId),
+                new(ModelRoutes.DecodeStage, "cpu"),
+            ],
+            AvailableDevices = ["cpu", AcceleratorDeviceId],
+            ThreadQuota = 2,
+            CoreSet = new HashSet<int> { 6 },
+            BatchCap = 3,
+            AcceleratorStreamPriority = 2,
+            AcceleratorSmSharePercent = 40.0,
+        });
+
+        Assert.Equal(3, route.Segments.Count);
+        Assert.Equal("cpu", route.Segments[0].DeviceId);
+        Assert.Equal(AcceleratorDeviceId, route.Segments[1].DeviceId);
+        Assert.Equal("cpu", route.Segments[2].DeviceId);
+
+        // The declared batch ceiling lands on every position of the resolved route: resolution neither narrows it to a device class nor widens some other buffer.
+        foreach (DeviceSegment segment in route.Segments)
+        {
+            Assert.Equal(3, segment.BatchCap);
+            Assert.Equal(WeightTier.Dram, segment.WeightTier);
+        }
+
+        // CPU positions keep the placement quota they were resolved from; the accelerator position keeps only its own share fields.
+        foreach (int index in new[] { 0, 2 })
+        {
+            Assert.Equal(2, route.Segments[index].Quota.Threads);
+            Assert.Contains(6, route.Segments[index].Quota.Cores);
+            Assert.Null(route.Segments[index].Quota.StreamPriority);
+            Assert.Null(route.Segments[index].Quota.SmSharePercent);
+        }
+
+        Assert.Equal(2, route.Segments[1].Quota.StreamPriority);
+        Assert.Equal(40.0, route.Segments[1].Quota.SmSharePercent);
+    }
+
+    [Fact]
+    [Trait("Category", "Scheduling")]
+    [Trait("Category", "Budget")]
+    public void RouteSeam_CudaOnlyShapeOnAHostWithoutThatBackend_RefusesNamingTheCudaSeam_AndClaimsNoResource()
+    {
+        ModelException error = Assert.Throws<ModelException>(() => ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "seam-cuda-only-host",
+            Stages = [new(ModelRoutes.DecodeStage, AcceleratorDeviceId)],
+            AvailableDevices = ["cpu"],
+            BatchCap = 3,
+            AcceleratorStreamPriority = 2,
+            AcceleratorSmSharePercent = 40.0,
+        }));
+
+        Assert.Contains("model 'seam-cuda-only-host'", error.Message);
+        Assert.Contains($"segment 0 ('{AcceleratorDeviceId}' at '{WeightTier.Dram}')", error.Message, StringComparison.Ordinal);
+        Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    [Trait("Category", "Scheduling")]
+    [Trait("Category", "Budget")]
+    public void RouteSeam_HybridShapeOnAHostWithoutThatBackend_RefusesAtTheCrossing_NamingTheCudaSeam_WhileTheSameStagesResolveAsCpuOnly()
+    {
+        ModelException error = Assert.Throws<ModelException>(() => ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "seam-hybrid-host",
+            Stages = [new(ModelRoutes.PrefillStage, "cpu"), new("split_block", AcceleratorDeviceId), new(ModelRoutes.DecodeStage, "cpu")],
+            AvailableDevices = ["cpu"],
+            BatchCap = 3,
+        }));
+
+        // The refusal lands on the crossing itself, not on either CPU half: no partial hybrid route is handed to a host that cannot run it.
+        Assert.Contains("model 'seam-hybrid-host'", error.Message);
+        Assert.Contains($"segment 1 ('{AcceleratorDeviceId}' at '{WeightTier.Dram}')", error.Message, StringComparison.Ordinal);
+        Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
+
+        // The same stages with no crossing resolve normally: the seam refusal is what an accelerator position costs, never a CPU-only model.
+        ModelRoute cpuOnly = ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "seam-hybrid-host",
+            Stages = [new(ModelRoutes.PrefillStage, "cpu"), new(ModelRoutes.DecodeStage, "cpu")],
+            AvailableDevices = ["cpu"],
+            BatchCap = 3,
+        });
+
+        DeviceSegment segment = Assert.Single(cpuOnly.Segments);
+        Assert.Equal("cpu", segment.DeviceId);
+        Assert.Equal(WeightTier.Dram, segment.WeightTier);
+        Assert.Equal(3, segment.BatchCap);
     }
 
     // ---------------------------------------------------------------- engine open against the resolved route
@@ -364,6 +496,8 @@ public sealed class ModelRouteTests : IDisposable
     }
 
     [Fact]
+    [Trait("Category", "Scheduling")]
+    [Trait("Category", "Budget")]
     public void EngineOpen_RouteCrossingToAnUnavailableDevice_FailsNamingTheSegment_AndNeverRunsOnCpu()
     {
         string path = SyntheticLlamaGguf.Write("route-engine-crossing");
@@ -375,6 +509,11 @@ public sealed class ModelRouteTests : IDisposable
             ModelName = "route-engine-crossing",
             Stages = [new(ModelRoutes.PrefillStage, "cpu"), new("split_block", AcceleratorDeviceId), new(ModelRoutes.DecodeStage, "cpu")],
             AvailableDevices = ["cpu", AcceleratorDeviceId],
+            ThreadQuota = 2,
+            CoreSet = new HashSet<int> { 6 },
+            BatchCap = 3,
+            AcceleratorStreamPriority = 2,
+            AcceleratorSmSharePercent = 40.0,
         });
 
         using GgufFile gguf = GgufFile.Open(path);
@@ -385,7 +524,26 @@ public sealed class ModelRouteTests : IDisposable
 
         Assert.Contains("segment 1 ('cuda' at 'Dram') names a device this engine has no backend for", error.Message);
         Assert.Contains("the opened compute backend reports 'cpu'", error.Message);
+        Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
         Assert.Contains("refused rather than run on CPU", error.Message);
+
+        // The refusal consumed nothing from the resolved value set: this route is still what load decided — same order, same caps,
+        // same quota claims — which is exactly what a backend that can address it would inherit unchanged.
+        Assert.Equal(3, route.Segments.Count);
+        foreach (DeviceSegment segment in route.Segments)
+        {
+            Assert.Equal(3, segment.BatchCap);
+        }
+
+        Assert.Equal("cpu", route.Segments[0].DeviceId);
+        Assert.Equal(AcceleratorDeviceId, route.Segments[1].DeviceId);
+        Assert.Equal("cpu", route.Segments[2].DeviceId);
+        Assert.Equal(2, route.Segments[0].Quota.Threads);
+        Assert.Contains(6, route.Segments[0].Quota.Cores);
+        Assert.Null(route.Segments[1].Quota.Threads);
+        Assert.Empty(route.Segments[1].Quota.Cores);
+        Assert.Equal(2, route.Segments[1].Quota.StreamPriority);
+        Assert.Equal(40.0, route.Segments[1].Quota.SmSharePercent);
     }
 
     // ---------------------------------------------------------------- host placement to resolved route values

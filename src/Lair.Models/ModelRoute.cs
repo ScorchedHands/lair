@@ -15,6 +15,14 @@ public sealed record ModelRoute
     public const string CpuDeviceId = "cpu";
 
     /// <summary>
+    /// The build target accelerator execution lands in. Every load-time refusal for a segment on a device no opened
+    /// backend reports — at route resolution, at engine open, and in the placement keys that name such a device today —
+    /// names this seam as what is missing rather than inventing one or falling back to CPU. Nothing in this build
+    /// carries it: naming it declares where an accelerator-backed segment will run, not that any does.
+    /// </summary>
+    public const string CudaBackendSeam = "lair.backends.cuda";
+
+    /// <summary>
     /// The segments in execution order: what a step advances first is <c>Segments[0]</c>, and each later segment's work
     /// follows it over the same batch. Never empty — a route naming no segment cannot be run, and only the resolution
     /// paths build one.

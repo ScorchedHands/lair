@@ -486,14 +486,16 @@ public sealed class TransformerModel : IDisposable
                 throw new ModelException(
                     $"{segment.Describe(index)} names a device this engine has no backend for: the opened compute backend reports " +
                     $"'{_backend.DeviceId}' and architecture '{Plan.Architecture}' resolves a route of {route.Segments.Count} segment(s) — " +
-                    $"a crossing to '{segment.DeviceId}' is refused rather than run on CPU");
+                    $"accelerator-backed segments run in '{ModelRoute.CudaBackendSeam}', which is not part of this build, so a crossing to " +
+                    $"'{segment.DeviceId}' is refused rather than run on CPU");
             }
 
             if (segment.WeightTier != WeightTier.Dram)
             {
                 throw new ModelException(
                     $"{segment.Describe(index)} holds its weights at tier '{segment.WeightTier}': the forward engine reads " +
-                    $"DRAM-resident weights only, so architecture '{Plan.Architecture}' is refused rather than run against a residency it cannot address");
+                    $"DRAM-resident weights only, and accelerator residency runs in '{ModelRoute.CudaBackendSeam}' once such a backend is opened — so architecture " +
+                    $"'{Plan.Architecture}' is refused rather than run against a residency it cannot address");
             }
         }
     }

@@ -321,21 +321,24 @@ public static class YamlConfigLoader
         if (device != "cpu")
         {
             throw new ConfigException(
-                $"models[{index}].placement.device '{device}' is invalid: the only accepted value for 'device' is 'cpu'.");
+                $"models[{index}].placement.device '{device}' is invalid: the only accepted value for 'device' is 'cpu'. " +
+                $"An accelerator device becomes placeable when a compute backend reports it in '{ModelRoute.CudaBackendSeam}'.");
         }
 
         string kvResidency = TryText(keys, "kv_residency", $"models[{index}].placement.kv_residency") ?? "dram";
         if (kvResidency != "dram")
         {
             throw new ConfigException(
-                $"models[{index}].placement.kv_residency '{kvResidency}' is invalid: the only accepted value for 'kv_residency' is 'dram'.");
+                $"models[{index}].placement.kv_residency '{kvResidency}' is invalid: the only accepted value for 'kv_residency' is 'dram'. " +
+                $"An accelerator residency becomes placeable when a compute backend reports that device in '{ModelRoute.CudaBackendSeam}'.");
         }
 
         string prefill = TryText(keys, "prefill", $"models[{index}].placement.prefill") ?? "cpu";
         if (prefill != "cpu")
         {
             throw new ConfigException(
-                $"models[{index}].placement.prefill '{prefill}' is invalid: the only accepted value for 'prefill' is 'cpu'.");
+                $"models[{index}].placement.prefill '{prefill}' is invalid: the only accepted value for 'prefill' is 'cpu'. " +
+                $"An accelerator prefill stage becomes placeable when a compute backend reports that device in '{ModelRoute.CudaBackendSeam}'.");
         }
 
         string? coreSetSpec = TryText(keys, "core_set", $"models[{index}].placement.core_set");

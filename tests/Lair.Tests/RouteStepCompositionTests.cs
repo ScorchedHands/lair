@@ -66,6 +66,7 @@ public sealed class RouteStepCompositionTests : IDisposable
     }
 
     [Fact]
+    [Trait("Category", "Budget")]
     public async Task CandidatePastTheSegmentsBatchCap_IsDeferred_NamingThatCap_AndEveryPipelineStillCompletes()
     {
         string path = SyntheticLlamaGguf.Write("composition-batch-cap");
@@ -120,6 +121,7 @@ public sealed class RouteStepCompositionTests : IDisposable
     }
 
     [Fact]
+    [Trait("Category", "Budget")]
     public async Task CandidateWithoutThreadQuotaHeadroom_IsDeferred_NamingTheQuota_AndNothingMergesOnThatSegment()
     {
         string path = SyntheticLlamaGguf.Write("composition-thread-quota");
@@ -152,6 +154,13 @@ public sealed class RouteStepCompositionTests : IDisposable
 
         // One sequence per window here: the quota claim was exhausted by the first pipeline every time composition offered more.
         Assert.Equal(boundHarness.Scheduler.Stats.DecodeSteps, boundHarness.Scheduler.Stats.WindowSequenceSum);
+
+        // Deferral read this segment's budget without consuming it: the route still carries what load resolved — same thread cap,
+        // no core claim, and the engine's own ceiling as its batch cap.
+        DeviceSegment stepping = boundHarness.Model.Plan.Route.Segments[boundHarness.Scheduler.SteppingSegmentIndex];
+        Assert.Equal(1, stepping.Quota.Threads);
+        Assert.Empty(stepping.Quota.Cores);
+        Assert.Equal(TransformerModel.MaxBatchSequences, stepping.BatchCap);
     }
 
     [Fact]
