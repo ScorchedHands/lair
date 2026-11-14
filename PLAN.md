@@ -1154,7 +1154,7 @@ Requests become independent pipelines advanced by a route-aware arbiter, so conc
 
 - [✓] Request pipeline control plane — pipeline state machine, per-pipeline sampler and quota, and admission independent of step composition (see DN-M314-1).
   - Verify: `dotnet test --filter Category=Scheduling -c Release` — pipelines advance independently up to the cap, and each pipeline's token stream is identical to the same sequence run alone.
-- [_] Route value set in the model plan — ordered device segments with compute device, weight tier, batch cap, and quota, resolved at load (see DN-M314-3).
+- [✓] Route value set in the model plan — ordered device segments with compute device, weight tier, batch cap, and quota, resolved at load (see DN-M314-3).
   - Verify: `dotnet test --filter Category=Loader|Config -c Release` — routes resolve for `cpu`, `cuda`, and `hybrid` model entries; an unresolvable segment fails naming the model and the segment.
 - [_] Route-aware arbiter — merge predicate on route identity, KV-residency compatibility, batch cap, and quota headroom (see DN-M314-2).
   - Verify: `dotnet test --filter Category=Scheduling|Concurrency -c Release` — merged steps equal unmerged results, hybrid-shaped routes merge rather than split, and a step that cannot fit is refused with the blocking quota named.

@@ -253,6 +253,17 @@ public sealed record ModelPlan
     /// </summary>
     public int PrefillRowWidth { get; init; } = Engine.TransformerModel.DefaultPrefillRowWidth;
 
+    /// <summary>
+    /// The resolved execution path this model runs on: an ordered set of device segments, each naming the compute device it
+    /// runs on, where its weights are resident while it does, the batch cap a step may advance on it, and the quota that step
+    /// holds against it. A plan resolved from a file alone carries one CPU segment over DRAM-resident weights — what every
+    /// model served today runs on — and a host resolves the segments its own placement declares onto this value when the
+    /// engine opens rather than carrying a separate device label beside the plan. The forward path reads nothing from it yet:
+    /// it is the resolved seam step composition consumes unchanged, and an accelerator segment reaches it only as vocabulary —
+    /// opening an engine over such a route refuses naming that missing backend instead of running the model on CPU.
+    /// </summary>
+    public required ModelRoute Route { get; init; }
+
     /// <summary>The flat scalar view of this plan's resolved geometry.</summary>
     public ModelDesc ToDesc() =>
         new(

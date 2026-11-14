@@ -301,6 +301,10 @@ public static class ModelPlans
             RopeRotaryDimensions = ropeRotaryDimensions,
             SparseFfn = sparseFfn,
             SparseFfnStrategy = ResolveSparseFfnStrategy(metadata, prefix, profile.DefaultSparseFfnStrategy, sparseFfn),
+            // The execution path a file declares nothing about runs on: one CPU segment over DRAM-resident weights. A host
+            // that knows its own placement resolves the segments it declares onto this value when it opens the engine; no
+            // metadata key selects any part of a route here.
+            Route = ModelRoute.CpuDefault(),
         };
     }
 

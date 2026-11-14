@@ -151,6 +151,10 @@ public sealed class GenerationService : IDisposable
         return bus;
     }
 
+    // The route load resolved for the served model, assembly-internal so loader-side validation can read what a host's
+    // placement became instead of re-deriving it: step composition reads this same value through the opened plan.
+    internal ModelRoute ResolvedRoute => _model.Plan.Route;
+
     // Snapshot identity/placement facts straight from the configuration in force, the backend's live worker count, and
     // the formats the opened model's dense weight matrices actually carry.
     private ModelFacts BuildMonitorFacts(LairConfig config) => new(
@@ -472,6 +476,20 @@ public sealed class GenerationService : IDisposable
         // The model's placement decides the backend's shape: the engine thread choice (0 = auto-sized from physical
         // cores) capped by the model's thread quota, and the model's core set pinned onto every pool worker.
         CpuBackend backend = new(config.Engine.Threads, modelConfig.Placement.CoreSet, modelConfig.Placement.ThreadQuota);
+        // The model's placement resolves to its route value set here, against the compute backend this service opens for it:
+        // consecutive stages naming 'cpu' collapse into one CPU segment carrying this model's thread cap and pinned core share,
+        // and a stage naming any other device fails now naming that segment and the missing backend rather than opening an
+        // engine that would run the model somewhere else. The resolved segments land on the plan at open unchanged — nothing
+        // re-derives them while the model stays open.
+        ModelRoute route = ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = modelConfig.Name,
+            Stages = [new(ModelRoutes.PrefillStage, modelConfig.Placement.Prefill), new(ModelRoutes.DecodeStage, modelConfig.Placement.Device)],
+            AvailableDevices = [backend.DeviceId],
+            ThreadQuota = modelConfig.Placement.ThreadQuota,
+            CoreSet = modelConfig.Placement.CoreSet,
+        });
+
         GgufFile? file = null;
         TransformerModel? model = null;
         BlockPool? pool = null;
@@ -510,7 +528,8 @@ public sealed class GenerationService : IDisposable
                     backend,
                     reservedSlots,
                     line => logger?.LogInformation("{ProfileLog}", line),
-                    ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel));
+                    ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel),
+                    route);
             }
             catch (ModelException ex) when (ex.Message.StartsWith("prefill kernel '", StringComparison.Ordinal))
             {

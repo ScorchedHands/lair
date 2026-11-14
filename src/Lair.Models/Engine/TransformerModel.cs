@@ -390,6 +390,16 @@ public sealed class TransformerModel : IDisposable
         new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel);
 
     /// <summary>
+    /// Opens the engine over a memory-mapped view of the file's own tensor payloads with an explicit prefill kernel
+    /// selection and the route its placement resolves to: the resolved segments land on the plan before any allocation, so
+    /// what step composition reads is exactly what load decided. A route this build cannot execute — any segment not on a
+    /// single DRAM-resident span of the device <paramref name="backend"/> reports — is refused at open naming that segment and
+    /// what is missing, never run somewhere else behind the selection that happens to work.
+    /// </summary>
+    public static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens, Action<string>? logLine, PrefillKernel prefillKernel, ModelRoute route) =>
+        new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel, prefillRowWidth: 0, route);
+
+    /// <summary>
     /// Opens the engine with weight payloads supplied by an alternate <see cref="IWeightSource"/>: every tensor read
     /// goes through that source instead of a mmap view. Tensor metadata (names, shapes, formats, offsets) still comes
     /// from <paramref name="file"/>, and the caller keeps ownership of the source — it must outlive the model and is
@@ -434,7 +444,37 @@ public sealed class TransformerModel : IDisposable
         GgufFile file, IWeightSource weights, IBackend backend, int maxContextTokens, PrefillKernel prefillKernel, int prefillRowWidth) =>
         new(file, backend, maxContextTokens, weights, logLine: null, profileOverride: null, prefillKernel, prefillRowWidth);
 
-    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV, int prefillRowWidth = 0)
+    // The route this engine can execute today: one DRAM-resident segment on the device its opened backend reports. A wider
+    // route is real material — split points and accelerator segments are decided where more backends exist to run them, and a
+    // resolved plan may carry one — but opening an engine over it refuses naming the first segment this build has no backend
+    // for rather than advancing part of the model on some device that happens to work. Nothing here executes a route: the check
+    // lands before any weight view is spent on a shape that cannot run, exactly as an unrunnable kernel selection does.
+    private void ValidateRoute()
+    {
+        ModelRoute route = Plan.Route;
+
+        for (int index = 0; index < route.Segments.Count; index++)
+        {
+            DeviceSegment segment = route.Segments[index];
+
+            if (!string.Equals(segment.DeviceId, _backend.DeviceId, StringComparison.Ordinal))
+            {
+                throw new ModelException(
+                    $"{segment.Describe(index)} names a device this engine has no backend for: the opened compute backend reports " +
+                    $"'{_backend.DeviceId}' and architecture '{Plan.Architecture}' resolves a route of {route.Segments.Count} segment(s) — " +
+                    $"a crossing to '{segment.DeviceId}' is refused rather than run on CPU");
+            }
+
+            if (segment.WeightTier != WeightTier.Dram)
+            {
+                throw new ModelException(
+                    $"{segment.Describe(index)} holds its weights at tier '{segment.WeightTier}': the forward engine reads " +
+                    $"DRAM-resident weights only, so architecture '{Plan.Architecture}' is refused rather than run against a residency it cannot address");
+            }
+        }
+    }
+
+    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV, int prefillRowWidth = 0, ModelRoute? route = null)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(backend);
@@ -476,6 +516,13 @@ public sealed class TransformerModel : IDisposable
         }
 
         Plan = prefillRowWidth == 0 ? Plan : Plan with { PrefillRowWidth = prefillRowWidth };
+
+        // The route a host resolved from its own placement lands on the plan before any allocation, so what step composition
+        // reads later is exactly what load decided. A file opened without one keeps the single CPU segment its own resolution
+        // put there — which is where every model served today runs.
+        Plan = route is null ? Plan : Plan with { Route = route };
+
+        ValidateRoute();
 
         // Row capacity of every batched stream: whichever forward family needs the wider sub-batch — never below what a
         // decode batch may advance, and above that only when the plan resolves wider prompt windows. Allocation is the
