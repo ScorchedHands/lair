@@ -12,6 +12,10 @@
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
       <_Parameter1>Lair.Tests</_Parameter1>
     </AssemblyAttribute>
+    <!-- The bench resolves candidate prefill row widths through the engine's internal open seam; no host path uses it. -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>Lair.Bench</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
 
   <PropertyGroup>

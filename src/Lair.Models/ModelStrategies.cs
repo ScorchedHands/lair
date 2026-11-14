@@ -262,9 +262,10 @@ public enum WindowInterleave
 public enum PrefillKernel
 {
     /// <summary>
-    /// The engine's batched row window: sub-batches of up to <see cref="Engine.TransformerModel.MaxBatchSequences"/>
-    /// rows, each row keeping its own residual stream, RoPE position, and causal attention while every dense weight
-    /// matrix is traversed once per sub-batch. This is the prefill route every model executes today.
+    /// The engine's batched row window: sub-batches of up to the plan's resolved <see cref="ModelPlan.PrefillRowWidth"/>
+    /// rows — its own count, not the decode batch ceiling — each row keeping its own residual stream, RoPE position, and
+    /// causal attention while every dense weight matrix is traversed once per sub-batch. This is the prefill route every
+    /// model executes today.
     /// </summary>
     GemV,
 

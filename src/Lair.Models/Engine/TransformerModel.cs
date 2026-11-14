@@ -51,8 +51,14 @@ namespace Lair.Models.Engine;
 
 public sealed class TransformerModel : IDisposable
 {
-    /// <summary>Row width of the engine's batched forwards: the largest number of sequences a single <see cref="DecodeBatch"/> call may advance, and the largest number of prompt rows a <see cref="Prefill"/> sub-batch carries.</summary>
+    /// <summary>Row ceiling of the engine's batched decode forwards: the largest number of sequences a single <see cref="DecodeBatch"/> call may advance. Prompt windows carry their own resolved row count — see <see cref="ModelPlan.PrefillRowWidth"/>.</summary>
     public const int MaxBatchSequences = 16;
+
+    /// <summary>Ceiling on the prefill row width an engine may resolve: the widest prompt sub-batch its batched streams are ever sized for. A resolved count outside <c>1..MaxPrefillRowWidth</c> is refused at open.</summary>
+    public const int MaxPrefillRowWidth = 64;
+
+    /// <summary>The row width a plan resolves when nothing says otherwise: the measured balance point across both reference shapes. It recovers most of the narrower default's deficit on the wider-hidden shape while staying within measurement noise of the narrower default on the other, and it avoids doubling to the engine ceiling where one fixture gains only slightly at twice the activation bytes.</summary>
+    public const int DefaultPrefillRowWidth = 32;
 
     private readonly IBackend _backend;
     private readonly IWeightSource _weights;
@@ -138,10 +144,10 @@ public sealed class TransformerModel : IDisposable
     private float[] _moeLogits = [];      // experts: router scores for one sequence, consumed during selection
     private int[] _moeIds = [];           // routedExpertsPerToken: selected expert indexes, ascending order
     private float[] _moeWeights = [];     // routedExpertsPerToken: the weight of each selected expert
-    private int[] _batchMoeIds = [];      // MaxBatchSequences * routedExpertsPerToken: per-sequence selections
+    private int[] _batchMoeIds = [];      // _rowCapacity * routedExpertsPerToken: per-sequence selections
     private float[] _batchMoeWeights = [];// same length, aligned with _batchMoeIds
-    private int[] _expertMembers = []; // MaxBatchSequences: member rows of the expert under execution
-    private float[] _moeSubsetIn = []; // MaxBatchSequences * hidden: one expert group's activations and down results, packed in place
+    private int[] _expertMembers = []; // _rowCapacity: member rows of the expert under execution
+    private float[] _moeSubsetIn = []; // _rowCapacity * hidden: one expert group's activations and down results, packed in place
 
     // Small FP32 vectors preloaded at Open: per-layer norm weights and any biases present in the file. Null
     // entries mean the tensor is absent (llama files carry no attention bias, qwen2 files may).
@@ -186,25 +192,27 @@ public sealed class TransformerModel : IDisposable
     private readonly float[] _up;      // intermediateSize: up GEMV result
     private readonly float[] _logits;  // vocabSize
 
-    // Batched decode buffers: sequence-major blocks of MaxBatchSequences copies of the single-token streams,
-    // allocated once at Open so a batched step adds no per-step heap pressure. Each sequence's block mirrors the
-    // same-sized buffer in its own single-token forward.
-    private readonly float[] _batchCur;     // MaxBatchSequences * hidden
-    private readonly float[] _batchNormed;  // MaxBatchSequences * hidden
-    private readonly float[] _batchQ;       // MaxBatchSequences * headCount * headDim
-    private readonly float[] _batchK;       // MaxBatchSequences * kvHeads * headDim
-    private readonly float[] _batchV;       // MaxBatchSequences * kvHeads * headDim
-    private readonly float[] _batchAttnOut; // MaxBatchSequences * headCount * headDim
-    private readonly float[] _batchProj;    // MaxBatchSequences * hidden
-    private readonly float[] _batchGateUp;  // MaxBatchSequences * intermediateSize
-    private readonly float[] _batchUp;      // MaxBatchSequences * intermediateSize
-    private readonly float[] _batchLogits;  // MaxBatchSequences * vocabSize
+    // Batched decode buffers: sequence-major blocks of _rowCapacity copies of the single-token streams, allocated once
+    // at Open so a batched step adds no per-step heap pressure. Each sequence's block mirrors the same-sized buffer in
+    // its own single-token forward; a wider prefill window widens these allocations and nothing else.
+    private readonly int _rowCapacity;
+
+    private readonly float[] _batchCur;     // _rowCapacity * hidden
+    private readonly float[] _batchNormed;  // _rowCapacity * hidden
+    private readonly float[] _batchQ;       // _rowCapacity * headCount * headDim
+    private readonly float[] _batchK;       // _rowCapacity * kvHeads * headDim
+    private readonly float[] _batchV;       // _rowCapacity * kvHeads * headDim
+    private readonly float[] _batchAttnOut; // _rowCapacity * headCount * headDim
+    private readonly float[] _batchProj;    // _rowCapacity * hidden
+    private readonly float[] _batchGateUp;  // _rowCapacity * intermediateSize
+    private readonly float[] _batchUp;      // _rowCapacity * intermediateSize
+    private readonly float[] _batchLogits;  // _rowCapacity * vocabSize
 
     // Row-tiled prefill attention state: one online-softmax entry per head for every row of a sub-batch — running max,
     // then weight sum — held across the tiled walk so each row advances its own state in exactly the order its per-row
     // kernel would. Sized once at Open for the widest window; the accumulators ride on _batchAttnOut's per-row head
     // regions, so a tiled window allocates nothing per call.
-    private readonly float[] _tiledRowMax;    // MaxBatchSequences * headCount: every row's per-head online max across the walk
+    private readonly float[] _tiledRowMax;    // _rowCapacity * headCount: every row's per-head online max across the walk
     private readonly float[] _tiledRowSumExp; // same shape: every row's per-head weight sum across the walk
 
     private readonly float[] _cos;          // maxContext * rope pair count
@@ -225,6 +233,9 @@ public sealed class TransformerModel : IDisposable
 
     /// <summary>The prefill kernel selection this engine forwards prompt windows through: resolved at open and re-read at every window boundary.</summary>
     public PrefillKernel ResolvedPrefillKernel => _prefillKernel;
+
+    /// <summary>The row count this engine's prompt windows forward in, held on the plan and read fresh at every prefill window boundary.</summary>
+    public int ResolvedPrefillRowWidth => Plan.PrefillRowWidth;
 
     /// <summary>
     /// Re-points the engine's prefill path selection. The new value is read fresh at the next prefill window
@@ -295,7 +306,27 @@ public sealed class TransformerModel : IDisposable
     internal static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens, ModelProfile profile, Action<string>? logLine = null) =>
         new(file, backend, maxContextTokens, weights: null, logLine, profile);
 
-    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV)
+    /// <summary>
+    /// Opens the engine over a memory-mapped view of the file's own tensor payloads with an explicit prefill row
+    /// width and kernel selection resolved onto the plan before any allocation: prompt windows forward in sub-batches
+    /// of exactly that many rows while decode keeps its own batch ceiling, and batched streams size for whichever
+    /// family needs them most. A row count outside <c>1..MaxPrefillRowWidth</c> is refused at open naming it and the
+    /// range; zero keeps the plan's resolved default in force. Assembly-internal so no host configuration path can
+    /// reach it — tests and bench resolve candidate widths through this seam.
+    /// </summary>
+    internal static TransformerModel Open(
+        GgufFile file, IBackend backend, int maxContextTokens, Action<string>? logLine, PrefillKernel prefillKernel, int prefillRowWidth) =>
+        new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel, prefillRowWidth);
+
+    /// <summary>
+    /// The alternate-<see cref="IWeightSource"/> form of the explicit row-width seam: same resolution as the memory-mapped
+    /// one, with every tensor read going through the supplied source and its ownership staying under the caller's rules.
+    /// </summary>
+    internal static TransformerModel Open(
+        GgufFile file, IWeightSource weights, IBackend backend, int maxContextTokens, PrefillKernel prefillKernel, int prefillRowWidth) =>
+        new(file, backend, maxContextTokens, weights, logLine: null, profileOverride: null, prefillKernel, prefillRowWidth);
+
+    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV, int prefillRowWidth = 0)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(backend);
@@ -305,9 +336,6 @@ public sealed class TransformerModel : IDisposable
         Plan = profileOverride is null ? ModelPlans.Resolve(file, logLine) : ModelPlans.Resolve(file, profileOverride, logLine);
         Desc = Plan.ToDesc();
         MaxContextTokens = maxContextTokens;
-        _ownsWeights = weights is null;
-        _weights = weights ?? new GgufMmapWeightSource(file);
-        _fileTensors = file.Tensors;
 
         // A prefill kernel selection this engine has no kernel for is refused at open, the posture every other
         // unimplemented capability takes: the selection stays visible in the resolved value's vocabulary, the
@@ -320,6 +348,31 @@ public sealed class TransformerModel : IDisposable
         }
 
         _prefillKernel = prefillKernel;
+
+        // A resolved row count outside the engine's allocation ceiling is refused at open naming it and the range, the
+        // posture every other unrunnable forward shape takes: nothing silently sizes some other width or forwards a
+        // different sub-batch than the plan names. Zero means no explicit resolution — the plan's own value stays in
+        // force, which for every file resolved today is the default row count. The check lands before any tensor maps,
+        // so an unusable width never spends a weight view on it.
+        if (prefillRowWidth != 0 && prefillRowWidth is not (> 0 and <= MaxPrefillRowWidth))
+        {
+            throw new ModelException(
+                $"prefill row width '{prefillRowWidth}' is outside the range 1..{MaxPrefillRowWidth} this engine sizes its batched streams for: " +
+                $"prompt windows forward in sub-batches of at most that many rows — omit it to keep the plan's resolved {Plan.PrefillRowWidth}.");
+        }
+
+        Plan = prefillRowWidth == 0 ? Plan : Plan with { PrefillRowWidth = prefillRowWidth };
+
+        // Row capacity of every batched stream: whichever forward family needs the wider sub-batch — never below what a
+        // decode batch may advance, and above that only when the plan resolves wider prompt windows. Allocation is the
+        // one thing width moves; no arithmetic in any forward reads it as an operand.
+        _rowCapacity = Math.Max(MaxBatchSequences, Plan.PrefillRowWidth);
+
+        // Only now does the weight view get created: a refused kernel selection or row count never spends one, which is
+        // what keeps a failed open from holding the file's mmap alive behind its own refusal.
+        _ownsWeights = weights is null;
+        _weights = weights ?? new GgufMmapWeightSource(file);
+        _fileTensors = file.Tensors;
 
         if (Plan.HeadDim % 2 != 0)
         {
@@ -430,10 +483,10 @@ public sealed class TransformerModel : IDisposable
             _moeLogits = new float[_sparseFfn.ExpertCount];
             _moeIds = new int[_sparseFfn.RoutedExpertsPerToken];
             _moeWeights = new float[_sparseFfn.RoutedExpertsPerToken];
-            _batchMoeIds = new int[MaxBatchSequences * _sparseFfn.RoutedExpertsPerToken];
-            _batchMoeWeights = new float[MaxBatchSequences * _sparseFfn.RoutedExpertsPerToken];
-            _expertMembers = new int[MaxBatchSequences];
-            _moeSubsetIn = new float[MaxBatchSequences * Plan.HiddenSize];
+            _batchMoeIds = new int[_rowCapacity * _sparseFfn.RoutedExpertsPerToken];
+            _batchMoeWeights = new float[_rowCapacity * _sparseFfn.RoutedExpertsPerToken];
+            _expertMembers = new int[_rowCapacity];
+            _moeSubsetIn = new float[_rowCapacity * Plan.HiddenSize];
 
             // A declared shared expert is one dense-shaped matrix triplet the routing adds to every token's output,
             // plus — for a family whose reference gates it — one selector vector per layer. An undeclared shared
@@ -622,19 +675,19 @@ public sealed class TransformerModel : IDisposable
         _up = new float[Plan.IntermediateSize];
         _logits = new float[Plan.VocabSize];
 
-        _batchCur = new float[MaxBatchSequences * hidden];
-        _batchNormed = new float[MaxBatchSequences * hidden];
-        _batchQ = new float[MaxBatchSequences * Plan.HeadCount * Plan.HeadDim];
-        _batchK = new float[MaxBatchSequences * Plan.KvHeadCount * Plan.HeadDim];
-        _batchV = new float[MaxBatchSequences * Plan.KvHeadCount * Plan.HeadDim];
-        _batchAttnOut = new float[MaxBatchSequences * Plan.HeadCount * Plan.HeadDim];
-        _batchProj = new float[MaxBatchSequences * hidden];
-        _batchGateUp = new float[MaxBatchSequences * Plan.IntermediateSize];
-        _batchUp = new float[MaxBatchSequences * Plan.IntermediateSize];
-        _batchLogits = new float[MaxBatchSequences * Plan.VocabSize];
+        _batchCur = new float[_rowCapacity * hidden];
+        _batchNormed = new float[_rowCapacity * hidden];
+        _batchQ = new float[_rowCapacity * Plan.HeadCount * Plan.HeadDim];
+        _batchK = new float[_rowCapacity * Plan.KvHeadCount * Plan.HeadDim];
+        _batchV = new float[_rowCapacity * Plan.KvHeadCount * Plan.HeadDim];
+        _batchAttnOut = new float[_rowCapacity * Plan.HeadCount * Plan.HeadDim];
+        _batchProj = new float[_rowCapacity * hidden];
+        _batchGateUp = new float[_rowCapacity * Plan.IntermediateSize];
+        _batchUp = new float[_rowCapacity * Plan.IntermediateSize];
+        _batchLogits = new float[_rowCapacity * Plan.VocabSize];
 
-        _tiledRowMax = new float[MaxBatchSequences * Plan.HeadCount];
-        _tiledRowSumExp = new float[MaxBatchSequences * Plan.HeadCount];
+        _tiledRowMax = new float[_rowCapacity * Plan.HeadCount];
+        _tiledRowSumExp = new float[_rowCapacity * Plan.HeadCount];
 
         // The rotation covers the declared rotary slice, or the full head dimension when the file declares none.
         _ropeHalf = (Plan.RopeRotaryDimensions > 0 ? Plan.RopeRotaryDimensions : Plan.HeadDim) / 2;
@@ -700,22 +753,22 @@ public sealed class TransformerModel : IDisposable
     }
 
     /// <summary>
-    /// Forwards a window of prompt positions in sub-batches of up to <see cref="MaxBatchSequences"/> rows and
-    /// returns the final row's logits. Each row seeds its own residual stream from its token's embedding row and
+    /// Forwards a window of prompt positions in sub-batches of up to the plan's resolved <see cref="ModelPlan.PrefillRowWidth"/>
+    /// rows and returns the final row's logits. Each row seeds its own residual stream from its token's embedding row and
     /// keeps its own norms, RoPE at its own absolute position, and its own causal attention, while every dense
     /// weight matrix (attention q/k/v/o, feed-forward gate/up/down) is traversed once per sub-batch through
-    /// <see cref="IBackend.GemvBatch"/> instead of once per token — a window of 16 rows pays one traversal per
-    /// matrix, not sixteen. Within a layer the window's K/V is written for every row before any row attends, so a
+    /// <see cref="IBackend.GemvBatch"/> instead of once per token — a window whose rows fill one sub-batch pays one traversal per
+    /// matrix, not one per row. Within a layer the window's K/V is written for every row before any row attends, so a
     /// row's causal selection covers exactly the positions at or before its own: earlier rows of the same
     /// sub-batch are in it, later rows are not, and the read set is the same one the single-token forward made at
     /// that position. Each row appends at its own position into <paramref name="kv"/>, exactly as stepping the
     /// tokens one at a time would, and every batched result is bit-identical to that stepping — the same
     /// guarantee <see cref="DecodeBatch"/> holds per sequence. The returned logits are the window's final row:
     /// the sequence's next-token distribution, held in the model's last-logits buffer as <see cref="LastLogits"/>
-    /// reports it, so sampling after a prefill needs no second forward. A window longer than
-    /// <see cref="MaxBatchSequences"/> is forwarded as consecutive sub-batches, each seeing the previous ones'
-    /// KV, so sub-batch boundaries move nothing: the sequence's KV bytes and final logits are what the same
-    /// tokens forwarded one at a time would leave.
+    /// reports it, so sampling after a prefill needs no second forward. A window longer than the resolved row width is
+    /// forwarded as consecutive sub-batches, each seeing the previous ones' KV, so sub-batch boundaries move nothing:
+    /// the sequence's KV bytes and final logits are what the same tokens forwarded one at a time would leave, whatever
+    /// the resolved width splits them at.
     /// </summary>
     /// <exception cref="ArgumentException">The window is empty.</exception>
     /// <exception cref="ArgumentOutOfRangeException">A token id is outside the vocabulary.</exception>
@@ -740,9 +793,14 @@ public sealed class TransformerModel : IDisposable
                 $"{n} prefill tokens starting at position {basePosition} exceed this model's max context of {MaxContextTokens} tokens.");
         }
 
-        for (int offset = 0; offset < n; offset += MaxBatchSequences)
+        // The plan's resolved row count splits the window: every width carries the same positions, KV bytes, and logits,
+        // so this is a throughput knob for batched weight traversals and nothing else. Read fresh per call like every
+        // other forward-shape value.
+        int prefillRows = Plan.PrefillRowWidth;
+
+        for (int offset = 0; offset < n; offset += prefillRows)
         {
-            RunPrefillWindow(tokens, offset, Math.Min(MaxBatchSequences, n - offset), basePosition, kv, emitLogits: offset + MaxBatchSequences >= n);
+            RunPrefillWindow(tokens, offset, Math.Min(prefillRows, n - offset), basePosition, kv, emitLogits: offset + prefillRows >= n);
         }
 
         return _logits.AsSpan();

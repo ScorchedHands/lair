@@ -1,0 +1,27 @@
+prefill-profile file=models/Qwen3-0.6B-Q8_0.gguf bytes=639446688 threads=8 maxBatchSequences=16
+  arch=qwen3 layers=28 hidden=1024 heads=16 kvHeads=8 headDim=128 vocab=151936 windowedLayers=0 avx2=True
+  traversalBytes=468185088 outputHeadBytes=0 kvBlocks=136 blockTokens=16 reps=1 perToken=off lengths=512,1024,2048 rowWidths=16,32,64
+prefill-profile rowWidth=16 subBatchActivationBytes=983040
+  weightFit=64.34 ms/traversal (least-squares fit over 3 lengths) impliedWeightGB/s=7.28
+  attentionFit=48.963 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 170
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         512            32        9154.7         55.93        2058.9        6430.2         665.6          7.28
+        1024            64       29314.4         34.93        4117.8       25695.7        -499.2          7.28
+        2048           128      111051.6         18.44        8235.7      102732.7          83.2          7.28
+prefill-profile rowWidth=32 subBatchActivationBytes=1966080
+  weightFit=150.40 ms/traversal (least-squares fit over 3 lengths) impliedWeightGB/s=3.11
+  attentionFit=48.096 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 209
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         512            16        9282.6         55.16        2406.4        6316.3         559.9          3.11
+        1024            32       29633.5         34.56        4812.8       25240.6        -419.9          3.11
+        2048            64      110608.8         18.52        9625.6      100913.2          70.0          3.11
+prefill-profile rowWidth=64 subBatchActivationBytes=3932160
+  weightFit=327.95 ms/traversal (least-squares fit over 3 lengths) impliedWeightGB/s=1.43
+  attentionFit=48.114 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 234
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         512             8        9258.8         55.30        2623.6        6318.7         316.5          1.43
+        1024            16       30260.1         33.84        5247.2       25250.2        -237.4          1.43
+        2048            32      111485.7         18.37       10494.5      100951.6          39.6          1.43

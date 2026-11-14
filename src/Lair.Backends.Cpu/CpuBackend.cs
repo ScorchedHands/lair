@@ -28,8 +28,10 @@ public sealed unsafe partial class CpuBackend : IBackend
     // Output rows per scheduling unit for threaded GEMV.
     private const int RowBlock = 64;
 
-    // Upper bound on activation vectors per batched GEMV call.
-    private const int MaxBatch = 16;
+    // Upper bound on activation vectors per batched GEMV call: the stack scratch of every batch kernel is sized for
+    // it, and it covers the widest sub-batch a forward engine may resolve — at least what a decode batch advances (16),
+    // widened to 64 so prompt windows resolved past the decode width stream their weights in one pass per matrix.
+    private const int MaxBatch = 64;
 
     // Below this row count the threading overhead is not worth paying.
     private const int ParallelRowThreshold = 256;
