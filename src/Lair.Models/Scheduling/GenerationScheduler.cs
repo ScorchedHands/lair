@@ -14,7 +14,10 @@ namespace Lair.Models.Scheduling;
 /// pipelines), with at most one prefill chunk interleaved into that boundary — so a long prompt never blocks short pipelines. A
 /// pipeline's progress is decided against <see cref="PipelineConcurrencyGate"/> slots, independently of which batch its math rides in:
 /// an over-cap pipeline waits admitted and idle until a slot frees, and a merged step hands each pipeline the logits row an unmerged
-/// step would have produced for it, so a pipeline's token stream is identical whether it advanced alone or inside a merged window.
+/// step would have produced for it, so a pipeline's token stream is identical whether it advanced alone or inside a merged window. Step
+/// composition is route-aware: advancing pipelines share one logical forward pass when they advance the same resolved model plan over its
+/// whole ordered route, hold KV the stepped segment can address, fit that segment's batch cap, and leave quota headroom against it for what
+/// already joined — so a group whose route spans several segments merges as one step rather than splitting per device or segment.
 /// Pipelines run in a fixed order (ascending id) on this thread, each with its own sampler. Admission counts the blocks a pipeline will
 /// cross over its whole lifetime, so an admitted pipeline never trips <see cref="KvFullException"/> mid-run; when the free list runs
 /// short and a prefix cache is attached, admission first reclaims cached prompt-prefix blocks (least-recently-used first, never
@@ -56,6 +59,24 @@ public sealed class GenerationScheduler : IDisposable
     private readonly List<int> _windowTokens = [];
     private readonly List<SequenceKv> _windowKvs = [];
 
+    // Route-aware step composition over this model's advancing pipelines: which candidates share one logical forward pass at a
+    // boundary, decided on shared plan-and-route identity plus KV residency against the segment being stepped, that segment's batch
+    // cap, and its quota headroom for what already joined. It is separate from progress selection — the gate above decides only whether
+    // a pipeline may advance at all, this decides which advancing pipelines ride one merged window — so an over-cap or over-quota
+    // candidate waits without disturbing anyone already stepping. Scheduler-thread only: composition runs under the gate.
+    private readonly StepCompositionArbiter _composition = new();
+
+    // The route position a merged decode step advances on for this model: the last segment of its resolved route, which is the single
+    // CPU span for every route this build can execute. A group whose route crosses devices stays one composition across that crossing
+    // rather than splitting per segment; what steps each side of such a crossing is the work that opens backends per device.
+    private readonly int _steppingSegment;
+
+    // Scratch for the current boundary's step candidates and their pipelines, cleared (never reallocated) per boundary, with an id map
+    // turning each composed candidate back into the pipeline whose math rides its window.
+    private readonly List<StepCandidate> _candidates = [];
+    private readonly List<RequestPipeline> _candidatePipelines = [];
+    private readonly Dictionary<long, int> _candidateIndex = new();
+
     // Step-boundary engine counters, written only on the scheduler thread while the gate is held and read as
     // volatile longs by observers — collection costs a handful of increments per step, never per token.
     private readonly Stopwatch _stepClock = new();
@@ -83,6 +104,12 @@ public sealed class GenerationScheduler : IDisposable
         _cache = cache;
         _maxBatchTokens = maxBatchTokens;
         _progress = new PipelineConcurrencyGate(maxConcurrentRequests);
+
+        // A merged decode step advances on this model's decode-side segment: the last position of its resolved route. For every route
+        // openable in this build that is its single CPU span, so composition bounds merged sequences by exactly the cap load resolved for
+        // it; a multi-segment route keeps its segments here as material to compose over even though no engine runs across them yet.
+        _steppingSegment = model.Plan.Route.Segments.Count - 1;
+
         _inbox = Channel.CreateUnbounded<RequestPipeline>();
 
         _thread = Task.Factory.StartNew(
@@ -100,6 +127,18 @@ public sealed class GenerationScheduler : IDisposable
 
     /// <summary>Highest concurrent pipeline count this scheduler has ever advanced in one window of boundaries — zero only when nothing ran.</summary>
     public int PeakAdvancingPipelines => _progress.PeakHeldSlots;
+
+    /// <summary>The compositions decided at the most recent step boundary: which candidates merged into one logical step over a shared route, and which were kept out with the cap or quota that blocked them named. Composition diagnostics for tests and internal accounting only — no admission decision, response shape, or forward path consults it.</summary>
+    internal CompositionReport LastStepComposition => _composition.LastReport;
+
+    /// <summary>Candidates this scheduler has kept out of a merged step since it opened because the stepping segment's batch cap or quota headroom was exhausted. Each one still advanced its pipeline at a later boundary, so this counts deferred compositions rather than refused submissions.</summary>
+    internal long DeferredCompositionCandidates => _composition.DeferredCandidateCount;
+
+    /// <summary>The refusals from the most recent boundary that kept any candidate out of a merged step, each naming the cap or quota that blocked it. Internal composition diagnostics: they report what bound a step and never turn into an admission refusal.</summary>
+    internal IReadOnlyList<DeferredStepCandidate> LastCompositionRefusals => _composition.MostRecentRefusals;
+
+    /// <summary>The route position merged decode steps compose on for this model: the last segment of its resolved execution path.</summary>
+    internal int SteppingSegmentIndex => _steppingSegment;
 
     /// <summary>
     /// Admits one request as a pipeline and returns its handle: the pipeline is admitted to the working set at the next step boundary,
@@ -384,14 +423,18 @@ public sealed class GenerationScheduler : IDisposable
             }
         }
 
-        // Decode step: every advancing decoding pipeline takes part in one shared batched forward. Pipelines whose next append
-        // would cross the pool's block limit or the engine's context limit are failed before the batch is issued, so
-        // the batched forward never fails halfway through and only the doomed pipelines fail. The window budget uses
-        // the pool's current allocation ceiling — under an open admission window that reaches past a hot-shrunk cap to what those
-        // admitted pipelines already reserved — sampled after this step's prefill (and any copy-on-write it performed), since those are
-        // the last pool changes visible to window accounting.
-        _window.Clear();
+        // Decode candidates for this boundary, in ascending pipeline id: every advancing decoding pipeline offers itself to step
+        // composition with the plan it advances under and where its KV lives. Pipelines whose next append would cross the engine's
+        // context limit are failed before they can be offered, so no forward ever runs one past the tables it has angles for. The window
+        // budget uses the pool's current allocation ceiling — under an open admission window that reaches past a hot-shrunk cap to what
+        // those admitted pipelines already reserved — sampled after this step's prefill (and any copy-on-write it performed), since those
+        // are the last pool changes visible to window accounting: one snapshot per boundary governs every composition stepped at it.
         int blocksLeft = Math.Max(Math.Min(_pool.FreeBlocks, _pool.AllocationCeiling - _pool.UsedBlocks), 0);
+
+        _candidates.Clear();
+        _candidatePipelines.Clear();
+        _candidateIndex.Clear();
+
         foreach (RequestPipeline pipeline in _active)
         {
             if (!pipeline.IsDecoding || pipeline.IsFinished)
@@ -406,25 +449,53 @@ public sealed class GenerationScheduler : IDisposable
                 continue;
             }
 
-            if (pipeline.Kv.Length % _pool.BlockTokens == 0)
-            {
-                if (blocksLeft == 0)
-                {
-                    Finish(pipeline, FinishReason.Failed, new KvFullException(
-                        $"KV block pool cannot extend this sequence: the sequence at position {pipeline.Kv.Length} " +
-                        $"needs a new block and only {_pool.EffectiveFreeBlocks} blocks are allocatable under the " +
-                        $"{_pool.EffectiveBudgetBlocks}-block budget on a pool of {_pool.CapacityBlocks}."));
-                    continue;
-                }
-
-                blocksLeft--;
-            }
-
-            _window.Add(pipeline);
+            int index = _candidatePipelines.Count;
+            _candidates.Add(new StepCandidate { PipelineId = pipeline.Id, Plan = _model.Plan });
+            _candidatePipelines.Add(pipeline);
+            _candidateIndex[pipeline.Id] = index;
         }
 
-        if (_window.Count > 0)
+        // Composition decides which of these candidates share one logical step: they merge when they advance this same plan over its
+        // whole route — a hybrid-shaped group stays whole rather than splitting per device or segment — and only while the stepping
+        // segment's batch cap has room for them, their KV residency is addressable by it, and they leave quota headroom against it for
+        // what already joined. A candidate kept out holds its slot and reservation, rides no forward at this boundary, and composes again
+        // at the next one; nothing about a merged window moves another pipeline's tokens, because each samples from its own logits row.
+        CompositionReport report = _composition.Compose(_candidates, _steppingSegment);
+
+        int advancedThisStep = 0;
+        foreach (StepComposition composition in report.Compositions)
         {
+            // One forward pass per composed step. Every append this window performs is accounted for here before the batch is issued, so
+            // a pipeline whose next token needs a block the pool cannot hand out fails rather than tripping halfway through a batch — and
+            // only that pipeline fails, exactly as it did when every advancing decoding pipeline shared one window unconditionally.
+            _window.Clear();
+
+            foreach (StepCandidate candidate in composition.Composed)
+            {
+                RequestPipeline pipeline = _candidatePipelines[_candidateIndex[candidate.PipelineId]];
+
+                if (pipeline.Kv.Length % _pool.BlockTokens == 0)
+                {
+                    if (blocksLeft == 0)
+                    {
+                        Finish(pipeline, FinishReason.Failed, new KvFullException(
+                            $"KV block pool cannot extend this sequence: the sequence at position {pipeline.Kv.Length} " +
+                            $"needs a new block and only {_pool.EffectiveFreeBlocks} blocks are allocatable under the " +
+                            $"{_pool.EffectiveBudgetBlocks}-block budget on a pool of {_pool.CapacityBlocks}."));
+                        continue;
+                    }
+
+                    blocksLeft--;
+                }
+
+                _window.Add(pipeline);
+            }
+
+            if (_window.Count == 0)
+            {
+                continue; // this composition's candidates all failed their append check: no forward is issued for them at this boundary
+            }
+
             // Step-boundary clock: one started/stopped shared Stopwatch per step measures the forward work of this
             // step's decode windows; no allocation and nothing inside the token loop.
             _stepClock.Restart();
@@ -433,9 +504,11 @@ public sealed class GenerationScheduler : IDisposable
             Stats.DecodeSteps++;
             Stats.DecodeWindowMicrosTotal += _stepClock.ElapsedTicks * 1_000_000 / Stopwatch.Frequency;
             Stats.WindowSequenceSum += _window.Count;
+
+            advancedThisStep += _window.Count;
         }
 
-        Stats.ActiveDecodingSequences = _window.Count;
+        Stats.ActiveDecodingSequences = advancedThisStep;
 
         for (int i = _active.Count - 1; i >= 0; i--)
         {

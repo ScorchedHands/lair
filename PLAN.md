@@ -1156,7 +1156,7 @@ Requests become independent pipelines advanced by a route-aware arbiter, so conc
   - Verify: `dotnet test --filter Category=Scheduling -c Release` — pipelines advance independently up to the cap, and each pipeline's token stream is identical to the same sequence run alone.
 - [✓] Route value set in the model plan — ordered device segments with compute device, weight tier, batch cap, and quota, resolved at load (see DN-M314-3).
   - Verify: `dotnet test --filter Category=Loader|Config -c Release` — routes resolve for `cpu`, `cuda`, and `hybrid` model entries; an unresolvable segment fails naming the model and the segment.
-- [_] Route-aware arbiter — merge predicate on route identity, KV-residency compatibility, batch cap, and quota headroom (see DN-M314-2).
+- [✓] Route-aware arbiter — merge predicate on route identity, KV-residency compatibility, batch cap, and quota headroom (see DN-M314-2).
   - Verify: `dotnet test --filter Category=Scheduling|Concurrency -c Release` — merged steps equal unmerged results, hybrid-shaped routes merge rather than split, and a step that cannot fit is refused with the blocking quota named.
 - [_] Concurrency cap and per-segment quota keys — `max_concurrent_requests` plus CPU core-set and GPU stream-priority fields with load-time validation and hot-reload classes (see DN-M314-4).
   - Verify: `dotnet test --filter Category=Config|Api -c Release` — the cap admits and rejects the expected request counts, and a rejection names which of KV capacity, token budget, or quota blocked and the model it belongs to.
