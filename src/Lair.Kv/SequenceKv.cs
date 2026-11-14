@@ -21,6 +21,11 @@ public sealed class SequenceKv : IDisposable
     // indistinguishable from still-shared ones.
     private readonly HashSet<int> _adopted = [];
 
+    // Blocks reserved ahead of the appends that will consume them (see <see cref="ReserveAppends"/>): taken in order by the next
+    // boundary-crossing append instead of reaching into the pool's free list again. A forward issued from another thread can then
+    // write every position it advances without a single pool mutation mid-flight; appends with no reservation behave exactly as before.
+    private readonly Queue<int> _reservedBlocks = [];
+
     private int _length;
     private bool _disposed;
 
@@ -45,7 +50,11 @@ public sealed class SequenceKv : IDisposable
     /// <summary>Tokens one logical block covers: the granularity this sequence's table is addressed at.</summary>
     public int BlockTokens => _pool.BlockTokens;
 
-    /// <summary>Appends one token, allocating a new block when the length crosses the block size.</summary>
+    /// <summary>
+    /// Appends one token, allocating a new block when the length crosses the block size. A crossing append first takes any block an
+    /// earlier <see cref="ReserveAppends"/> call already handed this sequence for it; with no reservation held the allocation reaches
+    /// into the pool exactly as it always has.
+    /// </summary>
     /// <returns>The slot the appended token lives in.</returns>
     /// <exception cref="KvFullException">The pool has no free blocks left for the crossing append.</exception>
     public SlotRef Append()
@@ -56,11 +65,38 @@ public sealed class SequenceKv : IDisposable
         if (pos % _pool.BlockTokens == 0)
         {
             // Appends always cross into a fresh private block: an adopted shared block is never extended by an append.
-            _blocks.Add(_pool.Allocate());
+            _blocks.Add(_reservedBlocks.Count > 0 ? _reservedBlocks.Dequeue() : _pool.Allocate());
         }
 
         _length = pos + 1;
         return new SlotRef(_blocks[pos / _pool.BlockTokens], pos % _pool.BlockTokens);
+    }
+
+    /// <summary>
+    /// Reserves, on the calling thread and right now, every fresh private block that appending <paramref name="positions"/> tokens at
+    /// this sequence's current length would cross into — allocated from the pool in exactly the order those appends would take them. The
+    /// crossing appends then consume these blocks instead of allocating, so a forward issued on another thread advances its own positions
+    /// without touching the pool's free list mid-flight: block ids, their sequence, and every byte they hold are decided here, before any
+    /// such forward starts. Reserving more positions than this model can address is not checked here; the forward that appends them still
+    /// fails at its own limit, and blocks a failed run never consumed return with <see cref="Dispose"/> like every other block this sequence holds.
+    /// </summary>
+    /// <exception cref="KvFullException">The pool cannot hand out as many new blocks as these appends would cross into.</exception>
+    public void ReserveAppends(int positions)
+    {
+        ThrowIfDisposed();
+
+        ArgumentOutOfRangeException.ThrowIfNegative(positions);
+
+        int blockTokens = _pool.BlockTokens;
+        int firstCrossing = ((_length + blockTokens - 1) / blockTokens) * blockTokens; // first appended position that crosses into a fresh block
+        if (firstCrossing < _length + positions)
+        {
+            int crossings = (_length + positions - 1 - firstCrossing) / blockTokens + 1;
+            for (int i = 0; i < crossings; i++)
+            {
+                _reservedBlocks.Enqueue(_pool.Allocate());
+            }
+        }
     }
 
     /// <summary>
@@ -272,6 +308,11 @@ public sealed class SequenceKv : IDisposable
         foreach (int block in _blocks)
         {
             _pool.Release(block); // private and adopted references are symmetric: every entry is one reference this sequence holds
+        }
+
+        while (_reservedBlocks.Count > 0)
+        {
+            _pool.Release(_reservedBlocks.Dequeue()); // reservations a failed or cancelled run never consumed come back too
         }
 
         _blocks.Clear();

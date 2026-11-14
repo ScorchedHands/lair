@@ -29,6 +29,11 @@ public sealed class GenerationService : IDisposable
 {
     private readonly GgufFile _file;
     private readonly CpuBackend _backend;
+
+    // The dedicated prefill lane this model opened with, when placement declared one: the second execution backend prompt windows run on and the load-resolved split that capped it. Worker pools, masks, activation buffers, and collision posture are facts of this pair for the engine's whole lifetime — a live thread-quota edit re-derives only the decode side from them, and an unmappable edit is refused against them rather than half-applied. Null for every shared-posture model, where nothing here changes behavior.
+    private readonly CpuBackend? _prefillsBackend;
+    private readonly PrefillLaneLayout? _prefillsLane;
+
     private readonly TransformerModel _model;
     private readonly GgufTokenizer _tokenizer;
     private readonly MinjaChatTemplate? _chatTemplate;
@@ -63,6 +68,12 @@ public sealed class GenerationService : IDisposable
     /// <summary>The metrics bus attached by the API host, if any — null for hosts that never attach one.</summary>
     internal EngineMetricsBus? Metrics => _metrics;
 
+    /// <summary>The resolved dedicated prefill-lane layout this model opened with — null for every shared-posture model. The load-resolved split live quota edits map against. Internal diagnostics for hosts and tests; monitor reporting is a later seam.</summary>
+    internal PrefillLaneLayout? DedicatedPrefillLanes => _prefillsLane;
+
+    /// <summary>The worker cap the lane's execution backend holds from open — null when the model shares its single backend. Internal diagnostics for hosts and tests.</summary>
+    internal int? DedicatedPrefillLaneWorkerCap => _prefillsBackend?.EffectiveWorkerCount;
+
     private bool _disposed;
 
     private GenerationService(
@@ -79,10 +90,14 @@ public sealed class GenerationService : IDisposable
         BlockPool pool,
         GenerationScheduler scheduler,
         ModelInfo info,
-        LairConfig config)
+        LairConfig config,
+        CpuBackend? prefillsBackend = null,
+        PrefillLaneLayout? prefillsLane = null)
     {
         _file = file;
         _backend = backend;
+        _prefillsBackend = prefillsBackend;
+        _prefillsLane = prefillsLane;
         _model = model;
         _tokenizer = tokenizer;
         _chatTemplate = chatTemplate;
@@ -298,6 +313,28 @@ public sealed class GenerationService : IDisposable
                         break;
 
                     case "models[0].placement.thread_quota":
+                        if (_prefillsLane is { } openLane)
+                        {
+                            // A dedicated posture maps this edit onto the decode side alone: the load-resolved prefill share keeps its pool, mask, activation buffers, and collision posture for the model's whole lifetime, while the decode cap re-derives from the new quota within the engine's own thread choice. An edit that cannot leave at least one worker on each side is a lane-layout change this seam cannot rewrite live — refused naming field, model, and what to do instead, with the effective quota untouched.
+                            int engineThreadsChoice = effective.Engine.Threads == 0 ? CpuBackend.AutoWorkerCount : effective.Engine.Threads;
+
+                            if (!ModelPrefillLanes.TryMapLiveThreadQuota(openLane, engineThreadsChoice, candidate.Models[0].Placement.ThreadQuota, out int mappedDecodeShare))
+                            {
+                                results.Add(new FieldResult(change, ConfigApplyOutcome.Refused,
+                                    $"{change.Field} refused for model '{effective.Models[0].Name}' while a dedicated prefill lane is open: the new quota leaves no decode-side worker once the load-resolved {openLane.PrefillShareThreads}-worker prefill share holds its side. Raise the quota to cover both lanes, set 'placement.prefill_lane' back to shared for a restart, or restart lair with a split this claim can carry."));
+                                break;
+                            }
+
+                            int dedicatedBefore = _backend.EffectiveWorkerCount;
+                            int dedicatedAfter = _backend.ApplyThreadQuota(mappedDecodeShare); // the mapped decode share caps this side within the engine's own thread choice — never re-splitting the lane itself
+                            _scheduler.ApplySteppingThreadQuota(candidate.Models[0].Placement.ThreadQuota);
+
+                            effective = effective with { Models = [effective.Models[0] with { Placement = effective.Models[0].Placement with { ThreadQuota = candidate.Models[0].Placement.ThreadQuota } }] };
+                            results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                                $"dedicated lane posture: decode-side workers {dedicatedBefore} -> {dedicatedAfter}, mapped from the new quota against the fixed {openLane.PrefillShareThreads}-worker prefill share; participation adjusts from the next kernel call (the scheduler's next step), lowered workers idle; merged-step quota headroom follows the new value from the next composition on"));
+                            break;
+                        }
+
                         int workersBefore = _backend.EffectiveWorkerCount;
                         int workersAfter = _backend.ApplyThreadQuota(candidate.Models[0].Placement.ThreadQuota);
 
@@ -498,8 +535,28 @@ public sealed class GenerationService : IDisposable
         int maxContext = Math.Min(modelConfig.MaxContextTokens, reservedSlots);
 
         // The model's placement decides the backend's shape: the engine thread choice (0 = auto-sized from physical
-        // cores) capped by the model's thread quota, and the model's core set pinned onto every pool worker.
-        CpuBackend backend = new(config.Engine.Threads, modelConfig.Placement.CoreSet, modelConfig.Placement.ThreadQuota);
+        // cores) capped by the model's thread quota, and the model's core set pinned onto every pool worker. A declared
+        // dedicated prefill lane resolves its split first — a refusal naming the model and key lands here before any
+        // backend exists, so no half-lane engine ever opens — and then each side gets its own cap: the decode-side
+        // backend runs on the full engine choice with this step's derived share as its starting quota (a live edit may
+        // retarget that cap within the same ceiling), while the lane backend is sized to its load-resolved share alone.
+        // A pinned posture hands each side a disjoint mask of the declared cores; an unpinned one bounds participation by worker count only.
+        PrefillLaneLayout? prefillsLane = null;
+        CpuBackend? prefillsBackend = null;
+        CpuBackend backend;
+
+        if (modelConfig.Placement.PrefillLane == PlacementPrefillLaneValues.Dedicated)
+        {
+            int engineThreadsChoice = config.Engine.Threads == 0 ? CpuBackend.AutoWorkerCount : config.Engine.Threads;
+            prefillsLane = ModelPrefillLanes.ResolveDedicated(modelConfig.Name, engineThreadsChoice, modelConfig.Placement.ThreadQuota, modelConfig.Placement.CoreSet);
+
+            backend = new(engineThreadsChoice, new HashSet<int>(prefillsLane.DecodeCoreIds), prefillsLane.DecodeShareThreads);
+            prefillsBackend = new(prefillsLane.PrefillShareThreads, new HashSet<int>(prefillsLane.PrefillCoreIds));
+        }
+        else
+        {
+            backend = new(config.Engine.Threads, modelConfig.Placement.CoreSet, modelConfig.Placement.ThreadQuota);
+        }
         // The model's placement resolves to its route value set here, against the compute backend this service opens for it:
         // consecutive stages naming 'cpu' collapse into one CPU segment carrying this model's thread cap and pinned core share,
         // and a stage naming any other device fails now naming that segment and the missing backend rather than opening an
@@ -553,7 +610,9 @@ public sealed class GenerationService : IDisposable
                     reservedSlots,
                     line => logger?.LogInformation("{ProfileLog}", line),
                     ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel),
-                    route);
+                    route,
+                    prefillsBackend,
+                    prefillsLane);
             }
             catch (ModelException ex) when (ex.Message.StartsWith("prefill kernel '", StringComparison.Ordinal))
             {
@@ -679,7 +738,7 @@ public sealed class GenerationService : IDisposable
                 ReasoningPolicyNames.Of(outputParser.Reasoning),
                 model.Plan.SparseFfnStrategy is { } strategy ? SparseFfnStrategyNames.Of(strategy) : null);
 
-            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, markerPair, markersProven ? string.Empty : markerRefusal, logger, pool, scheduler, info, config);
+            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, markerPair, markersProven ? string.Empty : markerRefusal, logger, pool, scheduler, info, config, prefillsBackend, prefillsLane);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
             file = null;
             model = null;
@@ -694,6 +753,7 @@ public sealed class GenerationService : IDisposable
             model?.Dispose();
             file?.Dispose();
             backend.Dispose();
+            prefillsBackend?.Dispose();
             throw;
         }
     }
@@ -1048,6 +1108,7 @@ public sealed class GenerationService : IDisposable
         _model.Dispose();
         _file.Dispose();
         _backend.Dispose();
+        _prefillsBackend?.Dispose(); // the lane's pool workers belong to this service exactly as the decode side's do
     }
 
     private IReadOnlyList<int> EncodeChat(GenerationRequest request, ToolPipeline tools, CancellationToken cancellationToken)

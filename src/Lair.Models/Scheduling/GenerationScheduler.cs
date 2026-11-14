@@ -554,15 +554,26 @@ public sealed class GenerationScheduler : IDisposable
 
         // At most one prefill chunk per step, oldest first: decode pipelines always run. A pipeline finished at this boundary
         // (cancellation) is skipped so no forward ever touches its released blocks, and a pipeline still waiting to start advancing issues
-        // none until it does.
+        // none until it does. Under a dedicated lane posture the chunk's KV blocks are reserved here on the scheduler thread and its
+        // prompt window runs concurrently with this step's decode windows; shared posture keeps forwarding inline exactly as before.
+        LanePrefillAttempt? lanePrefill = null;
         foreach (RequestPipeline pipeline in _active)
         {
             if (pipeline.IsPrefilling && !pipeline.IsFinished)
             {
-                PrefillChunk(pipeline);
+                if (_model.DedicatedPrefillLane is not null)
+                {
+                    lanePrefill = IssueLanePrefill(pipeline);
+                }
+                else
+                {
+                    PrefillChunk(pipeline);
+                }
+
                 break;
             }
         }
+
 
         // Decode candidates for this boundary, in ascending pipeline id: every advancing decoding pipeline offers itself to step
         // composition with the plan it advances under and where its KV lives. Pipelines whose next append would cross the engine's
@@ -652,7 +663,11 @@ public sealed class GenerationScheduler : IDisposable
             advancedThisStep += _window.Count;
         }
 
+        // A dedicated lane's chunk joined at this boundary: the prompt window ran beside every decode window above, and its logits are read here — after the join — so nothing samples from a forward still writing. The pipeline that finished prefilling starts decoding now and rides the next boundary's window; a shared-posture step already advanced it inline before composition began.
+        JoinLanePrefill(lanePrefill);
+
         Stats.ActiveDecodingSequences = advancedThisStep;
+
 
         for (int i = _active.Count - 1; i >= 0; i--)
         {
@@ -765,10 +780,6 @@ public sealed class GenerationScheduler : IDisposable
         int[] prompt = pipeline.Request.PromptTokens;
         int chunk = ChoosePrefillChunk(pipeline);
 
-        // The engine's own resolved row count splits this step into sub-batches underneath it. Reported apart from the step's token width —
-        // which a budget bounds by time, while rows are what the forward caps itself at — so neither number stands in for the other here.
-        int subBatchRows = Math.Min(chunk, _model.ResolvedPrefillRowWidth);
-
         try
         {
             // One chosen step, timed as one step: this is the measurement a step-time budget sizes future chunks from. No allocation and
@@ -777,63 +788,126 @@ public sealed class GenerationScheduler : IDisposable
             _model.Prefill(prompt[pipeline.PromptOffset..(pipeline.PromptOffset + chunk)], pipeline.Kv);
             _prefillClock.Stop();
 
-            long stepMicros = _prefillClock.ElapsedTicks * 1_000_000 / Stopwatch.Frequency;
-
-            // Recorded before the counters move, so an observer that sees a chunk counted also sees what that boundary chose and measured.
-            _lastPrefillChosenTokens = chunk;
-            _lastPrefillSubBatchRows = subBatchRows;
-            Volatile.Write(ref _lastPrefillStepMicros, stepMicros);
-
-            pipeline.PromptOffset += chunk;
-            Stats.PrefillChunksIssued++;
-            Stats.PrefillTokensForwarded += chunk;
-            Stats.PrefillStepMicrosTotal += stepMicros;
-            Stats.PrefillSubBatchSum += (chunk + subBatchRows - 1) / subBatchRows;
-            if (subBatchRows > Stats.PeakPrefillSubBatchRows)
-            {
-                Stats.PeakPrefillSubBatchRows = subBatchRows;
-            }
-
-            FeedBackMeasuredCost(chunk, stepMicros);
-
-
-            if (pipeline.IsPrefilling)
-            {
-                return; // more chunks remain; the next step forwards the next slice
-            }
-
-            if (_cache is not null)
-            {
-                // Prefill done: every full prompt-prefix block now has its KV fully written, so publish them in chain
-                // order. Blocks already under their key (adopted by this same pipeline, or published earlier by an
-                // identical prefix) are only renewed; the partial final block stays out of the cache.
-                int publishedBlocks = _cache.Publish(prompt, pipeline.Kv);
-                Stats.CachePublishedBlocksTotal += publishedBlocks;
-                Stats.CachePublishedTokensTotal += (long)publishedBlocks * _pool.BlockTokens;
-            }
-
-            // Prefill left the final prompt token's logits: this pipeline transforms and samples them on its own row, exactly as a
-            // solo run does. The token is reported now but forwarded on the next step.
-            pipeline.StartTransforming();
-            int first = pipeline.SampleFrom(_model.LastLogits());
-
-            if (first == pipeline.Request.EosId)
-            {
-                Finish(pipeline, FinishReason.Eos);
-                return;
-            }
-
-            pipeline.Generated.Add(first);
-            Stats.PrefillSampledTokens++;
-            pipeline.PendingToken = first;
-            pipeline.StartDecoding();
-            pipeline.Request.OnTokenId?.Invoke(first);
+            AdvanceAfterPrefillChunk(pipeline, chunk, _prefillClock.ElapsedTicks * 1_000_000 / Stopwatch.Frequency);
         }
         catch (Exception ex) when (ex is KvFullException || ex is InvalidOperationException)
         {
             Finish(pipeline, FinishReason.Failed, ex);
         }
     }
+
+    // What a completed chunk leaves behind, shared by both postures: the boundary's chosen width and sub-batch rows land in the counters before anything else moves, cost feeds back from this chunk's own forward duration, cache publication runs for every full prompt block, and — when no chunks remain — sampling starts decoding exactly as it always did. The logits read here are the prefill route's: an alias of the model-owned buffer under a shared posture, lane-owned storage that no decode-side window touched while the chunk ran beside this step's decode windows under a dedicated one.
+    private void AdvanceAfterPrefillChunk(RequestPipeline pipeline, int chunk, long forwardMicros)
+    {
+        // The engine's own resolved row count splits this step into sub-batches underneath it. Reported apart from the step's token width —
+        // which a budget bounds by time, while rows are what the forward caps itself at — so neither number stands in for the other here.
+        int subBatchRows = Math.Min(chunk, _model.ResolvedPrefillRowWidth);
+
+        // Recorded before the counters move, so an observer that sees a chunk counted also sees what that boundary chose and measured.
+        _lastPrefillChosenTokens = chunk;
+        _lastPrefillSubBatchRows = subBatchRows;
+        Volatile.Write(ref _lastPrefillStepMicros, forwardMicros);
+
+        pipeline.PromptOffset += chunk;
+        Stats.PrefillChunksIssued++;
+        Stats.PrefillTokensForwarded += chunk;
+        Stats.PrefillStepMicrosTotal += forwardMicros;
+        Stats.PrefillSubBatchSum += (chunk + subBatchRows - 1) / subBatchRows;
+        if (subBatchRows > Stats.PeakPrefillSubBatchRows)
+        {
+            Stats.PeakPrefillSubBatchRows = subBatchRows;
+        }
+
+        FeedBackMeasuredCost(chunk, forwardMicros);
+
+
+        if (pipeline.IsPrefilling)
+        {
+            return; // more chunks remain; the next step forwards the next slice
+        }
+
+        if (_cache is not null)
+        {
+            // Prefill done: every full prompt-prefix block now has its KV fully written, so publish them in chain
+            // order. Blocks already under their key (adopted by this same pipeline, or published earlier by an
+            // identical prefix) are only renewed; the partial final block stays out of the cache.
+            int publishedBlocks = _cache.Publish(pipeline.Request.PromptTokens, pipeline.Kv);
+            Stats.CachePublishedBlocksTotal += publishedBlocks;
+            Stats.CachePublishedTokensTotal += (long)publishedBlocks * _pool.BlockTokens;
+        }
+
+        // Prefill left the final prompt token's logits: this pipeline transforms and samples them on its own row, exactly as a
+        // solo run does. The token is reported now but forwarded on the next step.
+        pipeline.StartTransforming();
+        int first = pipeline.SampleFrom(_model.PrefillRouteLogits());
+
+        if (first == pipeline.Request.EosId)
+        {
+            Finish(pipeline, FinishReason.Eos);
+            return;
+        }
+
+        pipeline.Generated.Add(first);
+        Stats.PrefillSampledTokens++;
+        pipeline.PendingToken = first;
+        pipeline.StartDecoding();
+        pipeline.Request.OnTokenId?.Invoke(first);
+    }
+
+    // A dedicated lane's chunk issue, run on the scheduler thread before any concurrent work: the width is chosen exactly as an inline step would choose it, and every block those appends cross into is reserved here — so the prompt window running off-thread advances its sequence without a single pool mutation mid-flight. The forward itself runs on a worker thread against the model's lane backend; its own stopwatch times just that forward, which is what budget sizing feeds from below. A reservation the pool cannot satisfy fails this pipeline at this boundary exactly as an inline append trip did.
+    private LanePrefillAttempt? IssueLanePrefill(RequestPipeline pipeline)
+    {
+        int[] prompt = pipeline.Request.PromptTokens;
+        int chunk = ChoosePrefillChunk(pipeline);
+
+        try
+        {
+            pipeline.Kv.ReserveAppends(chunk);
+        }
+        catch (Exception ex) when (ex is KvFullException || ex is InvalidOperationException)
+        {
+            Finish(pipeline, FinishReason.Failed, ex);
+            return null;
+        }
+
+        int offset = pipeline.PromptOffset;
+        SequenceKv kv = pipeline.Kv;
+        System.Threading.Tasks.Task<long> forward = System.Threading.Tasks.Task.Run(() =>
+        {
+            Stopwatch clock = Stopwatch.StartNew();
+
+            // The model picks this route's own backend and activation family internally — the lane side of both was resolved when it opened.
+            _model.Prefill(prompt[offset..(offset + chunk)], kv);
+
+            clock.Stop();
+            return clock.ElapsedTicks * 1_000_000 / Stopwatch.Frequency;
+        });
+
+        return new LanePrefillAttempt(pipeline, chunk, forward);
+    }
+
+    // Joins the boundary's lane prefill once this step's decode windows have run. The logits sampled here are the lane family's — read only after the join, so no pipeline ever samples from a prompt window still writing. A fault in the off-thread forward surfaces as this pipeline's failure exactly like an inline one did; every other exception rides out of Step unchanged, as it already does for shared-posture forwards that trip outside the caught pair.
+    private void JoinLanePrefill(LanePrefillAttempt? attempt)
+    {
+        if (attempt is null)
+        {
+            return;
+        }
+
+        try
+        {
+            long forwardMicros = attempt.Forward.GetAwaiter().GetResult();
+            AdvanceAfterPrefillChunk(attempt.Pipeline, attempt.Chunk, forwardMicros);
+        }
+        catch (Exception ex) when (ex is KvFullException || ex is InvalidOperationException)
+        {
+            Finish(attempt.Pipeline, FinishReason.Failed, ex);
+        }
+    }
+
+    private sealed record LanePrefillAttempt(RequestPipeline Pipeline, int Chunk, System.Threading.Tasks.Task<long> Forward);
+
+
 
     /// <summary>
     /// Advances <paramref name="count"/> pipelines from <paramref name="window"/> by one token each in one batched

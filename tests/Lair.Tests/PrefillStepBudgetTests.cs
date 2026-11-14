@@ -31,8 +31,9 @@ public sealed class PrefillStepBudgetSelectionTests : IDisposable
 
     // Targets for the real fixture's mid-prefill edit case: one wide enough that its own ceiling pins every full boundary (so a pre-edit step lasts
     // long enough to be watched), and one narrow enough that measured cost has to pull future widths well below that ceiling.
-    private const int WideBudgetMs = 400;
+    private const int WideBudgetMs = 10_000;
     private const int NarrowBudgetMs = 4;
+    private const int MidPrefillMaxBatchTokens = 16;
 
     private readonly List<string> _tempFiles = [];
 
@@ -188,7 +189,7 @@ public sealed class PrefillStepBudgetSelectionTests : IDisposable
             return; // real-model tests skip when the fixture is absent
         }
 
-        int[] prompt = BuildRealPrompt(modelPath, 170);
+        int[] prompt = BuildRealPrompt(modelPath, 240);
 
         using GgufFile gguf = GgufFile.Open(modelPath);
         using CpuBackend backend = new(threads: 1);
@@ -206,19 +207,19 @@ public sealed class PrefillStepBudgetSelectionTests : IDisposable
 
             List<int> baselineTokens;
             {
-                using GenerationScheduler plain = new(model, pool, maxBatchTokens: MaxBatchTokens, cache: null);
+                using GenerationScheduler plain = new(model, pool, maxBatchTokens: MidPrefillMaxBatchTokens, cache: null);
                 SequenceOutcome baselineRun = await RunAsync(plain, Request(prompt, 8));
                 baselineTokens = [.. baselineRun.GeneratedTokens];
             }
 
             // Wide first: a target this engine cannot reach inside its own ceiling pins every full boundary at that ceiling. A step here costs tens of
             // milliseconds, which is what makes the moment mid-prefill observable — boundaries land slowly enough to be watched as they arrive.
-            using GenerationScheduler budgeted = new(model, pool, maxBatchTokens: MaxBatchTokens, cache: null, prefillStepBudgetMs: WideBudgetMs);
+            using GenerationScheduler budgeted = new(model, pool, maxBatchTokens: MidPrefillMaxBatchTokens, cache: null, prefillStepBudgetMs: WideBudgetMs);
 
             PipelineHandle handle = budgeted.Submit(Request(prompt, 8), CancellationToken.None);
 
             await WaitForAsync(
-                () => budgeted.Stats.PrefillChunksIssued >= 3 && budgeted.LastPrefillChosenTokens * 2 >= MaxBatchTokens,
+                () => budgeted.Stats.PrefillChunksIssued >= 3 && budgeted.LastPrefillChosenTokens * 2 >= MidPrefillMaxBatchTokens,
                 "the chunked prefill never grew its chosen width toward the ceiling while active");
 
             long chunksAtEdit = budgeted.Stats.PrefillChunksIssued;
@@ -264,7 +265,7 @@ public sealed class PrefillStepBudgetSelectionTests : IDisposable
             // stayed under this engine's own row window. A forward already issued when the target tightened runs whole at the width it was chosen
             // at — nothing here splits a step mid-forward, which is why the run's total forwarded tokens stay exactly the prompt's length below.
             Assert.NotEmpty(postEditChoices);
-            Assert.All(postEditChoices, choice => Assert.InRange(choice.Tokens, 1, MaxBatchTokens));
+            Assert.All(postEditChoices, choice => Assert.InRange(choice.Tokens, 1, MidPrefillMaxBatchTokens));
             Assert.All(postEditChoices, choice => Assert.Equal(Math.Min(choice.Tokens, model.ResolvedPrefillRowWidth), choice.SubBatchRows));
 
             // Step time followed the same drop as width did, and nothing was forwarded twice or dropped.

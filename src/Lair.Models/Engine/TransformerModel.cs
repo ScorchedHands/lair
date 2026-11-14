@@ -61,6 +61,11 @@ public sealed class TransformerModel : IDisposable
     public const int DefaultPrefillRowWidth = 32;
 
     private readonly IBackend _backend;
+
+    // The execution backend prompt windows run on: this model's own backend when prefill shares it, and a second CPU
+    // backend capped to its dedicated lane share when placement declares one. Decode-side forwards never consult the lane side.
+    private readonly IBackend _prefillsBackend;
+
     private readonly IWeightSource _weights;
 
     // The resolved prefill kernel selection: pinned at open, re-pointed only through ApplyPrefillKernel, and read
@@ -219,6 +224,19 @@ public sealed class TransformerModel : IDisposable
     // regions, so a tiled window allocates nothing per call.
     private readonly float[] _tiledRowMax;    // _rowCapacity * headCount: every row's per-head online max across the walk
     private readonly float[] _tiledRowSumExp; // same shape: every row's per-head weight sum across the walk
+
+    // The dedicated prefill-lane posture this engine forwards under, resolved at open from placement values — null for
+    // every shared-posture model. Worker pools, masks, activation buffers, and collision posture are load-time facts of it.
+    private readonly PrefillLaneLayout? _prefillsLane;
+
+    // The mutable-activation families each forward route writes into: decode-side paths (single-token forwards, batched
+    // decode windows, encoder passes) always use the default family — every buffer this block has always allocated — while
+    // prompt windows write through _laneAct. For a shared-posture model _laneAct is that same family, so nothing extra is
+    // sized and behavior is byte-for-byte what it was before any lane vocabulary existed; for a dedicated posture the lane
+    // gets its own buffers at the resolved prefill row width — separate storage per mutable path, while read-only weights,
+    // norms, rotation tables, and KV bytes stay shared. ActivationBytes reports what the lane family holds in total.
+    private readonly ActivationFamily _decodeAct;
+    private readonly ActivationFamily _laneAct;
 
     private readonly float[] _cos;          // maxContext * rope pair count
     private readonly float[] _sin;
@@ -395,9 +413,15 @@ public sealed class TransformerModel : IDisposable
     /// what step composition reads is exactly what load decided. A route this build cannot execute — any segment not on a
     /// single DRAM-resident span of the device <paramref name="backend"/> reports — is refused at open naming that segment and
     /// what is missing, never run somewhere else behind the selection that happens to work.
+    /// When placement declares a dedicated prefill lane, <paramref name="prefillsBackend"/> carries prompt windows on a second
+    /// execution backend capped to its lane share and <paramref name="prefillsLane"/> pins the resolved split — masks, worker caps,
+    /// and the activation buffers sized from it land at open; every decode-side forward stays on <paramref name="backend"/>. The two
+    /// must arrive together and report the same device this engine runs on: a half-declared lane posture is refused naming what is missing.
     /// </summary>
-    public static TransformerModel Open(GgufFile file, IBackend backend, int maxContextTokens, Action<string>? logLine, PrefillKernel prefillKernel, ModelRoute route) =>
-        new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel, prefillRowWidth: 0, route);
+    public static TransformerModel Open(
+        GgufFile file, IBackend backend, int maxContextTokens, Action<string>? logLine, PrefillKernel prefillKernel, ModelRoute route,
+        IBackend? prefillsBackend = null, PrefillLaneLayout? prefillsLane = null) =>
+        new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel, prefillRowWidth: 0, route, prefillsBackend, prefillsLane);
 
     /// <summary>
     /// Opens the engine with weight payloads supplied by an alternate <see cref="IWeightSource"/>: every tensor read
@@ -474,7 +498,7 @@ public sealed class TransformerModel : IDisposable
         }
     }
 
-    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV, int prefillRowWidth = 0, ModelRoute? route = null)
+    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV, int prefillRowWidth = 0, ModelRoute? route = null, IBackend? prefillsBackend = null, PrefillLaneLayout? prefillsLane = null)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(backend);
@@ -523,6 +547,39 @@ public sealed class TransformerModel : IDisposable
         Plan = route is null ? Plan : Plan with { Route = route };
 
         ValidateRoute();
+
+        // A dedicated lane posture arrives as a pair — the second execution backend prompt windows run on, plus the resolved split it was capped from.
+        // Half of it is refused at open naming what is missing; the backend must report this engine's own device, because weights, norms, rotation tables, and KV
+        // bytes are shared by construction and only exist resident where the route says they live — a lane on some other device would read tensors that
+        // were never mapped there. The split itself carries load-resolved worker caps; an engine refuses to open over shares one of which holds no worker.
+        if (prefillsBackend is null != prefillsLane is null)
+        {
+            throw new ModelException(
+                $"a dedicated prefill lane for model '{prefillsLane?.ModelName ?? "unspecified"}' arrives with only half of its pair: " +
+                $"{(prefillsBackend is null ? "no execution backend for the lane to run on" : "no resolved lane layout sizing its worker caps and activation buffers")} — pass both together, or neither.");
+        }
+
+        // The refusal above guarantees the two arrive together; this validation runs exactly when a posture was declared.
+        if (prefillsLane is { } declaredLane && prefillsBackend is not null)
+        {
+            if (prefillsBackend.DeviceId != backend.DeviceId)
+            {
+                throw new ModelException(
+                    $"model '{declaredLane.ModelName}' declares a dedicated prefill lane on device '{prefillsBackend.DeviceId}', but this engine runs its weights and KV on " +
+                    $"'{backend.DeviceId}': the lane shares those tensors, so it must run on the same device — resolve placement onto one device or open no lane.");
+            }
+
+            if (declaredLane.PrefillShareThreads < 1 || declaredLane.DecodeShareThreads < 1)
+            {
+                throw new ModelException(
+                    $"model '{declaredLane.ModelName}' opens a dedicated prefill lane over shares of {declaredLane.PrefillShareThreads} prefill and " +
+                    $"{declaredLane.DecodeShareThreads} decode workers: every lane needs at least one worker — resolve the split wider, or open no lane.");
+            }
+
+            _prefillsLane = declaredLane;
+        }
+
+        _prefillsBackend = prefillsBackend ?? backend;
 
         // Row capacity of every batched stream: whichever forward family needs the wider sub-batch — never below what a
         // decode batch may advance, and above that only when the plan resolves wider prompt windows. Allocation is the
@@ -850,6 +907,64 @@ public sealed class TransformerModel : IDisposable
         _tiledRowMax = new float[_rowCapacity * Plan.HeadCount];
         _tiledRowSumExp = new float[_rowCapacity * Plan.HeadCount];
 
+        // The activation families land here, at open: the default family aliases every mutable buffer this block has just sized — decode-side forwards keep writing through exactly those arrays — and a dedicated posture gives prompt windows their own family on top of it. A lane's streams are sized to the engine's whole window ceiling so any legal sub-batch fits its own storage whatever width placement resolved, while weights, norms, rotation tables, and KV bytes stay shared between the two routes.
+        _decodeAct = new ActivationFamily
+        {
+            BatchCur = _batchCur,
+            BatchNormed = _batchNormed,
+            BatchQ = _batchQ,
+            BatchK = _batchK,
+            BatchV = _batchV,
+            BatchAttnOut = _batchAttnOut,
+            BatchProj = _batchProj,
+            BatchGateUp = _batchGateUp,
+            BatchUp = _batchUp,
+            TiledRowMax = _tiledRowMax,
+            TiledRowSumExp = _tiledRowSumExp,
+            MoeScores = _moeLogits,
+            MoeIds = _moeIds,
+            MoeWeights = _moeWeights,
+            BatchMoeIds = _batchMoeIds,
+            BatchMoeWeights = _batchMoeWeights,
+            ExpertMembers = _expertMembers,
+            SubsetIn = _moeSubsetIn,
+            FinalNormed = _normed,
+            FinalLogits = _logits,
+        };
+
+        if (_prefillsLane is not null)
+        {
+            // A dedicated lane's own mutable storage: the same shapes as the default family at this engine's window ceiling, allocated once and never grown — an overlapped prompt window writes here while decode-side forwards read the arrays above.
+            _laneAct = new ActivationFamily
+            {
+                BatchCur = new float[_rowCapacity * hidden],
+                BatchNormed = new float[_rowCapacity * hidden],
+                BatchQ = new float[_rowCapacity * Plan.HeadCount * Plan.HeadDim],
+                BatchK = new float[_rowCapacity * Plan.KvHeadCount * Plan.HeadDim],
+                BatchV = new float[_rowCapacity * Plan.KvHeadCount * Plan.HeadDim],
+                BatchAttnOut = new float[_rowCapacity * Plan.HeadCount * Plan.HeadDim],
+                BatchProj = new float[_rowCapacity * hidden],
+                BatchGateUp = new float[_rowCapacity * Plan.IntermediateSize],
+                BatchUp = new float[_rowCapacity * Plan.IntermediateSize],
+                TiledRowMax = new float[_rowCapacity * Plan.HeadCount],
+                TiledRowSumExp = new float[_rowCapacity * Plan.HeadCount],
+                MoeScores = _moeLogits.Length > 0 ? new float[_moeLogits.Length] : [],
+                MoeIds = _moeIds.Length > 0 ? new int[_moeIds.Length] : [],
+                MoeWeights = _moeWeights.Length > 0 ? new float[_moeWeights.Length] : [],
+                BatchMoeIds = new int[_rowCapacity * (_sparseFfn?.RoutedExpertsPerToken ?? 0)],
+                BatchMoeWeights = new float[_rowCapacity * (_sparseFfn?.RoutedExpertsPerToken ?? 0)],
+                ExpertMembers = new int[_rowCapacity],
+                SubsetIn = new float[_rowCapacity * hidden],
+                FinalNormed = new float[hidden],
+                FinalLogits = new float[Plan.VocabSize],
+            };
+        }
+        else
+        {
+            // Shared posture: prompt windows write through the very family every forward has always used — nothing extra is sized, and behavior is byte-for-byte what it was before any lane vocabulary existed.
+            _laneAct = _decodeAct;
+        }
+
         // The rotation covers the declared rotary slice, or the full head dimension when the file declares none.
         _ropeHalf = (Plan.RopeRotaryDimensions > 0 ? Plan.RopeRotaryDimensions : Plan.HeadDim) / 2;
 
@@ -961,10 +1076,12 @@ public sealed class TransformerModel : IDisposable
 
         for (int offset = 0; offset < n; offset += prefillRows)
         {
-            RunPrefillWindow(tokens, offset, Math.Min(prefillRows, n - offset), basePosition, kv, emitLogits: offset + prefillRows >= n);
+            // Prompt windows run on this engine's prefill route: its own backend under a shared posture, the dedicated lane's capped second backend when placement declares one — writing through that route's activation family either way.
+            RunPrefillWindow(tokens, offset, Math.Min(prefillRows, n - offset), basePosition, kv, emitLogits: offset + prefillRows >= n, _laneAct, _prefillsBackend);
         }
 
-        return _logits.AsSpan();
+        // The logits left by the window's final row live in this route's family — an alias of the model-owned buffer for a shared posture, lane-owned storage when dedicated. Valid on whichever thread ran the forward until its next forward overwrites it.
+        return _laneAct.FinalLogits.AsSpan();
     }
 
     // The resolved kernel selection decides which window route runs, re-read at every sub-batch so a hot edit lands
@@ -972,20 +1089,20 @@ public sealed class TransformerModel : IDisposable
     // traversal all have kernels today, and a selection this build has no kernel for fails naming it rather than
     // running some other route behind it. The dense-matrix traversal is the row window with its weight passes handed
     // to the blocked matmul; attention stays on the same per-row causal kernel either way.
-    private void RunPrefillWindow(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits)
+    private void RunPrefillWindow(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits, ActivationFamily act, IBackend engine)
     {
         switch (_prefillKernel)
         {
             case PrefillKernel.GemV:
-                PrefillWindow(tokens, offset, rows, basePosition, kv, emitLogits, denseMatmul: false);
+                PrefillWindow(tokens, offset, rows, basePosition, kv, emitLogits, denseMatmul: false, act, engine);
                 break;
 
             case PrefillKernel.Tiled:
-                PrefillWindowTiled(tokens, offset, rows, basePosition, kv, emitLogits);
+                PrefillWindowTiled(tokens, offset, rows, basePosition, kv, emitLogits, act, engine);
                 break;
 
             case PrefillKernel.Gemm:
-                PrefillWindow(tokens, offset, rows, basePosition, kv, emitLogits, denseMatmul: true);
+                PrefillWindow(tokens, offset, rows, basePosition, kv, emitLogits, denseMatmul: true, act, engine);
                 break;
 
             default:
@@ -993,19 +1110,19 @@ public sealed class TransformerModel : IDisposable
         }
     }
 
-    // One dense weight pass over a whole sub-batch, handed to the route this window resolved: either backend traverses
+    // One dense weight pass over a whole sub-batch, handed the execution backend this window runs on: either route traverses
     // each matrix once for every activation vector of the window and writes the same <c>[batch * rows + row]</c> layout,
     // the batched GEMV walking one weight row per activation group and the blocked matmul dequantizing a weight tile
     // once for all of them. The choice is hoisted to this call so no per-row loop reads it as an operand.
-    private void WeightPass(ReadOnlySpan<float> inputs, int count, WeightRef weight, Span<float> outputs, bool denseMatmul)
+    private void WeightPass(IBackend engine, ReadOnlySpan<float> inputs, int count, WeightRef weight, Span<float> outputs, bool denseMatmul)
     {
         if (denseMatmul)
         {
-            _backend.GemmBatch(inputs, count, weight, outputs);
+            engine.GemmBatch(inputs, count, weight, outputs);
         }
         else
         {
-            _backend.GemvBatch(inputs, count, weight, outputs);
+            engine.GemvBatch(inputs, count, weight, outputs);
         }
     }
 
@@ -1019,13 +1136,24 @@ public sealed class TransformerModel : IDisposable
     // through the blocked matmul when <paramref name="denseMatmul"/> selects it. The two routes differ only in how a
     // weight tile reaches the arithmetic, so each output element lands byte-identical to the other and to the
     // single-vector reference.
-    private void PrefillWindow(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits, bool denseMatmul)
+    private void PrefillWindow(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits, bool denseMatmul, ActivationFamily act, IBackend engine)
     {
         int hidden = Plan.HiddenSize;
         int qkvRegion = Plan.HeadCount * Plan.HeadDim;
         int kvRegion = Plan.KvHeadCount * Plan.HeadDim;
         int inter = Plan.IntermediateSize;
         float attnScale = _attnScale;
+
+        // The window's mutable streams ride the activation family its route writes through — this model's default family for a shared posture, the dedicated lane's own when placement declares one — and every weight pass runs on that route's execution backend. Read-only weights, norms, rotation tables, and KV bytes stay outside both families.
+        float[] batchCur = act.BatchCur;
+        float[] batchNormed = act.BatchNormed;
+        float[] batchQ = act.BatchQ;
+        float[] batchK = act.BatchK;
+        float[] batchV = act.BatchV;
+        float[] batchAttnOut = act.BatchAttnOut;
+        float[] batchProj = act.BatchProj;
+        float[] batchGateUp = act.BatchGateUp;
+        float[] batchUp = act.BatchUp;
 
         // Embedding lookup: each token's dequantized token_embd row seeds that row's input stream.
         ReadOnlySpan<byte> embBytes = _weights.Resolve(_tokenEmbd);
@@ -1039,10 +1167,10 @@ public sealed class TransformerModel : IDisposable
                     nameof(tokens), $"token id {tokenId} at index {offset + r} is outside the vocabulary of {Plan.VocabSize}.");
             }
 
-            _backend.DequantRow(embRef, tokenId, _batchCur.AsSpan(r * hidden, hidden));
+            engine.DequantRow(embRef, tokenId, batchCur.AsSpan(r * hidden, hidden));
         }
 
-        ApplyInputEmbeddingScale(_batchCur.AsSpan(0, rows * hidden));
+        ApplyInputEmbeddingScale(batchCur.AsSpan(0, rows * hidden));
 
         // Reserve every row's slot in the sequence before any layer writes, mirroring the append each token made.
         for (int r = 0; r < rows; r++)
@@ -1057,16 +1185,16 @@ public sealed class TransformerModel : IDisposable
             // Pre-attention norm per row: identical op to the single-token forward.
             for (int r = 0; r < rows; r++)
             {
-                ApplyNorm(_batchCur.AsSpan(r * hidden, hidden), _attnNormWeight[l], _attnNormBias[l], _batchNormed.AsSpan(r * hidden, hidden));
+                ApplyNorm(batchCur.AsSpan(r * hidden, hidden), _attnNormWeight[l], _attnNormBias[l], batchNormed.AsSpan(r * hidden, hidden));
             }
 
             // One weight pass per matrix for the whole sub-batch; each row's result matches its single-vector GEMV on
             // either route this selection can take.
-            WeightPass(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionQueryWeight(l), _batchQ.AsSpan(0, rows * qkvRegion), denseMatmul);
+            WeightPass(engine, batchNormed.AsSpan(0, rows * hidden), rows, AttentionQueryWeight(l), batchQ.AsSpan(0, rows * qkvRegion), denseMatmul);
 
-            WeightPass(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionKeyWeight(l), _batchK.AsSpan(0, rows * kvRegion), denseMatmul);
+            WeightPass(engine, batchNormed.AsSpan(0, rows * hidden), rows, AttentionKeyWeight(l), batchK.AsSpan(0, rows * kvRegion), denseMatmul);
 
-            WeightPass(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionValueWeight(l), _batchV.AsSpan(0, rows * kvRegion), denseMatmul);
+            WeightPass(engine, batchNormed.AsSpan(0, rows * hidden), rows, AttentionValueWeight(l), batchV.AsSpan(0, rows * kvRegion), denseMatmul);
 
             // Bias, QK-norm, RoPE at the row's absolute position, and the K/V writes for every row complete
             // before any row attends, so each row's causal read sees exactly the prefix it would have alone.
@@ -1074,74 +1202,74 @@ public sealed class TransformerModel : IDisposable
             {
                 int position = basePosition + offset + r;
 
-                AddBias(_batchQ.AsSpan(r * qkvRegion, qkvRegion), _biasQ[l]);
-                AddBias(_batchK.AsSpan(r * kvRegion, kvRegion), _biasK[l]);
-                AddBias(_batchV.AsSpan(r * kvRegion, kvRegion), _biasV[l]);
+                AddBias(batchQ.AsSpan(r * qkvRegion, qkvRegion), _biasQ[l]);
+                AddBias(batchK.AsSpan(r * kvRegion, kvRegion), _biasK[l]);
+                AddBias(batchV.AsSpan(r * kvRegion, kvRegion), _biasV[l]);
 
-                ApplyQkNorm(_batchQ.AsSpan(r * qkvRegion, qkvRegion), _attnQNorm[l]);
-                ApplyQkNorm(_batchK.AsSpan(r * kvRegion, kvRegion), _attnKNorm[l]);
+                ApplyQkNorm(batchQ.AsSpan(r * qkvRegion, qkvRegion), _attnQNorm[l]);
+                ApplyQkNorm(batchK.AsSpan(r * kvRegion, kvRegion), _attnKNorm[l]);
 
-                ApplyRopeHeads(_batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, position, windowedLayer: layerWindow > 0);
-                ApplyRopeHeads(_batchK.AsSpan(r * kvRegion, kvRegion), Plan.KvHeadCount, position, windowedLayer: layerWindow > 0);
+                ApplyRopeHeads(batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, position, windowedLayer: layerWindow > 0);
+                ApplyRopeHeads(batchK.AsSpan(r * kvRegion, kvRegion), Plan.KvHeadCount, position, windowedLayer: layerWindow > 0);
 
-                kv.WriteK(position, l, _batchK.AsSpan(r * kvRegion, kvRegion));
-                kv.WriteV(position, l, _batchV.AsSpan(r * kvRegion, kvRegion));
+                kv.WriteK(position, l, batchK.AsSpan(r * kvRegion, kvRegion));
+                kv.WriteV(position, l, batchV.AsSpan(r * kvRegion, kvRegion));
             }
 
             for (int r = 0; r < rows; r++)
             {
-                LayerOps.CausalAttention(_backend, _batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, basePosition + offset + r, attnScale, Plan.AttentionSoftcap, layerWindow, _batchAttnOut.AsSpan(r * qkvRegion, qkvRegion));
+                LayerOps.CausalAttention(engine, batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, basePosition + offset + r, attnScale, Plan.AttentionSoftcap, layerWindow, batchAttnOut.AsSpan(r * qkvRegion, qkvRegion));
             }
 
             ReadOnlySpan<byte> bytes = _weights.Resolve(_wo[l]);
-            WeightPass(_batchAttnOut.AsSpan(0, rows * qkvRegion), rows, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _batchProj.AsSpan(0, rows * hidden), denseMatmul);
+            WeightPass(engine, batchAttnOut.AsSpan(0, rows * qkvRegion), rows, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), batchProj.AsSpan(0, rows * hidden), denseMatmul);
 
             for (int r = 0; r < rows; r++)
             {
-                AddBias(_batchProj.AsSpan(r * hidden, hidden), _biasO[l]);
+                AddBias(batchProj.AsSpan(r * hidden, hidden), _biasO[l]);
 
                 // Post-sublayer placement: this row's attention output joins its stream only after the post-attention norm.
-                ApplyPostSublayerNorm(_batchProj.AsSpan(r * hidden, hidden), _postAttnNorm[l]);
+                ApplyPostSublayerNorm(batchProj.AsSpan(r * hidden, hidden), _postAttnNorm[l]);
 
                 // ffn_inp add on the row's own stream, same order as the single-token forward.
-                Span<float> cur = _batchCur.AsSpan(r * hidden, hidden);
-                ReadOnlySpan<float> proj = _batchProj.AsSpan(r * hidden, hidden);
+                Span<float> cur = batchCur.AsSpan(r * hidden, hidden);
+                ReadOnlySpan<float> proj = batchProj.AsSpan(r * hidden, hidden);
                 for (int i = 0; i < hidden; i++)
                 {
                     cur[i] += proj[i];
                 }
 
-                ApplyNorm(cur, _ffnNormWeight[l], _ffnNormBias[l], _batchNormed.AsSpan(r * hidden, hidden));
+                ApplyNorm(cur, _ffnNormWeight[l], _ffnNormBias[l], batchNormed.AsSpan(r * hidden, hidden));
             }
 
             if (_sparseFfn is { } routing)
             {
-                ApplySparseFeedForwardBatch(routing, l, rows);
+                ApplySparseFeedForwardBatch(routing, l, rows, act, engine);
             }
             else
             {
-                WeightPass(_batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), _batchGateUp.AsSpan(0, rows * inter), denseMatmul);
+                WeightPass(engine, batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), batchGateUp.AsSpan(0, rows * inter), denseMatmul);
 
-                WeightPass(_batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardUpWeight(l), _batchUp.AsSpan(0, rows * inter), denseMatmul);
+                WeightPass(engine, batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardUpWeight(l), batchUp.AsSpan(0, rows * inter), denseMatmul);
 
                 // act = activation(gate) * up in place on each row's gate buffer.
                 for (int r = 0; r < rows; r++)
                 {
-                    ApplyActivation(_batchGateUp.AsSpan(r * inter, inter), _batchUp.AsSpan(r * inter, inter));
+                    ApplyActivation(batchGateUp.AsSpan(r * inter, inter), batchUp.AsSpan(r * inter, inter));
                 }
 
                 bytes = _weights.Resolve(_ffnDown[l]);
-                WeightPass(_batchGateUp.AsSpan(0, rows * inter), rows, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _batchProj.AsSpan(0, rows * hidden), denseMatmul);
+                WeightPass(engine, batchGateUp.AsSpan(0, rows * inter), rows, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), batchProj.AsSpan(0, rows * hidden), denseMatmul);
             }
 
             for (int r = 0; r < rows; r++)
             {
                 // Post-sublayer placement: this row's feed-forward output joins its stream only after the post-feed-forward norm.
-                ApplyPostSublayerNorm(_batchProj.AsSpan(r * hidden, hidden), _postFfnNorm[l]);
+                ApplyPostSublayerNorm(batchProj.AsSpan(r * hidden, hidden), _postFfnNorm[l]);
 
                 // ffn_out + ffn_inp: the input stream for this row's next layer.
-                Span<float> cur = _batchCur.AsSpan(r * hidden, hidden);
-                ReadOnlySpan<float> proj = _batchProj.AsSpan(r * hidden, hidden);
+                Span<float> cur = batchCur.AsSpan(r * hidden, hidden);
+                ReadOnlySpan<float> proj = batchProj.AsSpan(r * hidden, hidden);
                 for (int i = 0; i < hidden; i++)
                 {
                     cur[i] += proj[i];
@@ -1151,20 +1279,19 @@ public sealed class TransformerModel : IDisposable
 
         if (emitLogits)
         {
-            // The window's final row is the sequence's next-token distribution: its output norm and lm_head GEMV
-            // run alone over the single-token buffers, exactly the tail the single-token forward produced.
-            ApplyNorm(_batchCur.AsSpan((rows - 1) * hidden, hidden), _outputNormWeight, _outputNormBias, _normed);
+            // The window's final row is the sequence's next-token distribution: its output norm and lm_head GEMV run alone over this route's tail buffers — the default family's for a shared posture, the lane family's own when dedicated — exactly the tail the single-token forward produced.
+            ApplyNorm(batchCur.AsSpan((rows - 1) * hidden, hidden), _outputNormWeight, _outputNormBias, act.FinalNormed);
 
             LogicalTensor lmHead = _output ?? _tokenEmbd; // tied weights reuse the token-embedding rows as logits
             ReadOnlySpan<byte> headBytes = _weights.Resolve(lmHead);
-            _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(headBytes, lmHead.Shape, lmHead.Format), _logits);
+            engine.Gemv(act.FinalNormed.AsSpan(0, hidden), new WeightRef(headBytes, lmHead.Shape, lmHead.Format), act.FinalLogits);
 
             if (_outputBias is not null)
             {
-                AddBias(_logits, _outputBias);
+                AddBias(act.FinalLogits, _outputBias);
             }
 
-            ApplyFinalLogitSoftcap(_logits);
+            ApplyFinalLogitSoftcap(act.FinalLogits);
         }
     }
 
@@ -1175,13 +1302,24 @@ public sealed class TransformerModel : IDisposable
     // and applies it to every row whose own causal selection covers it, while each row advances its own online-softmax
     // state in the preallocated row-state buffers in exactly the order its per-row kernel would have run it. Only the
     // window's final row reaches the output head, exactly as on the batched-row route.
-    private void PrefillWindowTiled(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits)
+    private void PrefillWindowTiled(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits, ActivationFamily act, IBackend engine)
     {
         int hidden = Plan.HiddenSize;
         int qkvRegion = Plan.HeadCount * Plan.HeadDim;
         int kvRegion = Plan.KvHeadCount * Plan.HeadDim;
         int inter = Plan.IntermediateSize;
         float attnScale = _attnScale;
+
+        // The window's mutable streams ride the activation family its route writes through — this model's default family for a shared posture, the dedicated lane's own when placement declares one — and every weight pass runs on that route's execution backend. Read-only weights, norms, rotation tables, and KV bytes stay outside both families.
+        float[] batchCur = act.BatchCur;
+        float[] batchNormed = act.BatchNormed;
+        float[] batchQ = act.BatchQ;
+        float[] batchK = act.BatchK;
+        float[] batchV = act.BatchV;
+        float[] batchAttnOut = act.BatchAttnOut;
+        float[] batchProj = act.BatchProj;
+        float[] batchGateUp = act.BatchGateUp;
+        float[] batchUp = act.BatchUp;
 
         // Embedding lookup: each token's dequantized token_embd row seeds that row's input stream.
         ReadOnlySpan<byte> embBytes = _weights.Resolve(_tokenEmbd);
@@ -1195,10 +1333,10 @@ public sealed class TransformerModel : IDisposable
                     nameof(tokens), $"token id {tokenId} at index {offset + r} is outside the vocabulary of {Plan.VocabSize}.");
             }
 
-            _backend.DequantRow(embRef, tokenId, _batchCur.AsSpan(r * hidden, hidden));
+            engine.DequantRow(embRef, tokenId, batchCur.AsSpan(r * hidden, hidden));
         }
 
-        ApplyInputEmbeddingScale(_batchCur.AsSpan(0, rows * hidden));
+        ApplyInputEmbeddingScale(batchCur.AsSpan(0, rows * hidden));
 
         // Reserve every row's slot in the sequence before any layer writes, mirroring the append each token made.
         for (int r = 0; r < rows; r++)
@@ -1206,8 +1344,8 @@ public sealed class TransformerModel : IDisposable
             kv.Append();
         }
 
-        Span<float> tiledRowMax = _tiledRowMax.AsSpan(0, rows * Plan.HeadCount); // every row's per-head online max across the tiled walk
-        Span<float> tiledRowSumExp = _tiledRowSumExp.AsSpan(0, rows * Plan.HeadCount); // every row's per-head weight sum across the walk
+        Span<float> tiledRowMax = act.TiledRowMax.AsSpan(0, rows * Plan.HeadCount); // every row's per-head online max across the tiled walk
+        Span<float> tiledRowSumExp = act.TiledRowSumExp.AsSpan(0, rows * Plan.HeadCount); // every row's per-head weight sum across the walk
 
         for (int l = 0; l < Plan.LayerCount; l++)
         {
@@ -1216,15 +1354,15 @@ public sealed class TransformerModel : IDisposable
             // Pre-attention norm per row: identical op to the single-token forward.
             for (int r = 0; r < rows; r++)
             {
-                ApplyNorm(_batchCur.AsSpan(r * hidden, hidden), _attnNormWeight[l], _attnNormBias[l], _batchNormed.AsSpan(r * hidden, hidden));
+                ApplyNorm(batchCur.AsSpan(r * hidden, hidden), _attnNormWeight[l], _attnNormBias[l], batchNormed.AsSpan(r * hidden, hidden));
             }
 
             // One weight pass per matrix for the whole sub-batch; each row's result matches its single-vector GEMV.
-            _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionQueryWeight(l), _batchQ.AsSpan(0, rows * qkvRegion));
+            engine.GemvBatch(batchNormed.AsSpan(0, rows * hidden), rows, AttentionQueryWeight(l), batchQ.AsSpan(0, rows * qkvRegion));
 
-            _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionKeyWeight(l), _batchK.AsSpan(0, rows * kvRegion));
+            engine.GemvBatch(batchNormed.AsSpan(0, rows * hidden), rows, AttentionKeyWeight(l), batchK.AsSpan(0, rows * kvRegion));
 
-            _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, AttentionValueWeight(l), _batchV.AsSpan(0, rows * kvRegion));
+            engine.GemvBatch(batchNormed.AsSpan(0, rows * hidden), rows, AttentionValueWeight(l), batchV.AsSpan(0, rows * kvRegion));
 
             // Bias, QK-norm, RoPE at the row's absolute position, and the K/V writes for every row complete
             // before any row attends, so each row's causal read sees exactly the prefix it would have alone.
@@ -1232,18 +1370,18 @@ public sealed class TransformerModel : IDisposable
             {
                 int position = basePosition + offset + r;
 
-                AddBias(_batchQ.AsSpan(r * qkvRegion, qkvRegion), _biasQ[l]);
-                AddBias(_batchK.AsSpan(r * kvRegion, kvRegion), _biasK[l]);
-                AddBias(_batchV.AsSpan(r * kvRegion, kvRegion), _biasV[l]);
+                AddBias(batchQ.AsSpan(r * qkvRegion, qkvRegion), _biasQ[l]);
+                AddBias(batchK.AsSpan(r * kvRegion, kvRegion), _biasK[l]);
+                AddBias(batchV.AsSpan(r * kvRegion, kvRegion), _biasV[l]);
 
-                ApplyQkNorm(_batchQ.AsSpan(r * qkvRegion, qkvRegion), _attnQNorm[l]);
-                ApplyQkNorm(_batchK.AsSpan(r * kvRegion, kvRegion), _attnKNorm[l]);
+                ApplyQkNorm(batchQ.AsSpan(r * qkvRegion, qkvRegion), _attnQNorm[l]);
+                ApplyQkNorm(batchK.AsSpan(r * kvRegion, kvRegion), _attnKNorm[l]);
 
-                ApplyRopeHeads(_batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, position, windowedLayer: layerWindow > 0);
-                ApplyRopeHeads(_batchK.AsSpan(r * kvRegion, kvRegion), Plan.KvHeadCount, position, windowedLayer: layerWindow > 0);
+                ApplyRopeHeads(batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, position, windowedLayer: layerWindow > 0);
+                ApplyRopeHeads(batchK.AsSpan(r * kvRegion, kvRegion), Plan.KvHeadCount, position, windowedLayer: layerWindow > 0);
 
-                kv.WriteK(position, l, _batchK.AsSpan(r * kvRegion, kvRegion));
-                kv.WriteV(position, l, _batchV.AsSpan(r * kvRegion, kvRegion));
+                kv.WriteK(position, l, batchK.AsSpan(r * kvRegion, kvRegion));
+                kv.WriteV(position, l, batchV.AsSpan(r * kvRegion, kvRegion));
             }
 
             // Row-tiled attention for the whole sub-batch in one walk per layer: each selected position's K/V is read
@@ -1251,8 +1389,8 @@ public sealed class TransformerModel : IDisposable
             // limit or own selection excludes the position never touches that slot — while each row's online-softmax
             // state advances through the row-state buffers in exactly the ascending order its per-row kernel ran it.
             LayerOps.CausalAttentionTiledRows(
-                _backend,
-                _batchQ.AsSpan(0, rows * qkvRegion),
+                engine,
+                batchQ.AsSpan(0, rows * qkvRegion),
                 basePosition + offset,
                 rows,
                 Plan.HeadCount,
@@ -1265,57 +1403,57 @@ public sealed class TransformerModel : IDisposable
                 layerWindow,
                 tiledRowMax,
                 tiledRowSumExp,
-                _batchAttnOut.AsSpan(0, rows * qkvRegion));
+                batchAttnOut.AsSpan(0, rows * qkvRegion));
 
             ReadOnlySpan<byte> bytes = _weights.Resolve(_wo[l]);
-            _backend.GemvBatch(_batchAttnOut.AsSpan(0, rows * qkvRegion), rows, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _batchProj.AsSpan(0, rows * hidden));
+            engine.GemvBatch(batchAttnOut.AsSpan(0, rows * qkvRegion), rows, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), batchProj.AsSpan(0, rows * hidden));
 
             for (int r = 0; r < rows; r++)
             {
-                AddBias(_batchProj.AsSpan(r * hidden, hidden), _biasO[l]);
+                AddBias(batchProj.AsSpan(r * hidden, hidden), _biasO[l]);
 
                 // Post-sublayer placement: this row's attention output joins its stream only after the post-attention norm.
-                ApplyPostSublayerNorm(_batchProj.AsSpan(r * hidden, hidden), _postAttnNorm[l]);
+                ApplyPostSublayerNorm(batchProj.AsSpan(r * hidden, hidden), _postAttnNorm[l]);
 
                 // ffn_inp add on the row's own stream, same order as the single-token forward.
-                Span<float> cur = _batchCur.AsSpan(r * hidden, hidden);
-                ReadOnlySpan<float> proj = _batchProj.AsSpan(r * hidden, hidden);
+                Span<float> cur = batchCur.AsSpan(r * hidden, hidden);
+                ReadOnlySpan<float> proj = batchProj.AsSpan(r * hidden, hidden);
                 for (int i = 0; i < hidden; i++)
                 {
                     cur[i] += proj[i];
                 }
 
-                ApplyNorm(cur, _ffnNormWeight[l], _ffnNormBias[l], _batchNormed.AsSpan(r * hidden, hidden));
+                ApplyNorm(cur, _ffnNormWeight[l], _ffnNormBias[l], batchNormed.AsSpan(r * hidden, hidden));
             }
 
             if (_sparseFfn is { } routing)
             {
-                ApplySparseFeedForwardBatch(routing, l, rows);
+                ApplySparseFeedForwardBatch(routing, l, rows, act, engine);
             }
             else
             {
-                _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), _batchGateUp.AsSpan(0, rows * inter));
+                engine.GemvBatch(batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), batchGateUp.AsSpan(0, rows * inter));
 
-                _backend.GemvBatch(_batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardUpWeight(l), _batchUp.AsSpan(0, rows * inter));
+                engine.GemvBatch(batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardUpWeight(l), batchUp.AsSpan(0, rows * inter));
 
                 // act = activation(gate) * up in place on each row's gate buffer.
                 for (int r = 0; r < rows; r++)
                 {
-                    ApplyActivation(_batchGateUp.AsSpan(r * inter, inter), _batchUp.AsSpan(r * inter, inter));
+                    ApplyActivation(batchGateUp.AsSpan(r * inter, inter), batchUp.AsSpan(r * inter, inter));
                 }
 
                 bytes = _weights.Resolve(_ffnDown[l]);
-                _backend.GemvBatch(_batchGateUp.AsSpan(0, rows * inter), rows, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _batchProj.AsSpan(0, rows * hidden));
+                engine.GemvBatch(batchGateUp.AsSpan(0, rows * inter), rows, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), batchProj.AsSpan(0, rows * hidden));
             }
 
             for (int r = 0; r < rows; r++)
             {
                 // Post-sublayer placement: this row's feed-forward output joins its stream only after the post-feed-forward norm.
-                ApplyPostSublayerNorm(_batchProj.AsSpan(r * hidden, hidden), _postFfnNorm[l]);
+                ApplyPostSublayerNorm(batchProj.AsSpan(r * hidden, hidden), _postFfnNorm[l]);
 
                 // ffn_out + ffn_inp: the input stream for this row's next layer.
-                Span<float> cur = _batchCur.AsSpan(r * hidden, hidden);
-                ReadOnlySpan<float> proj = _batchProj.AsSpan(r * hidden, hidden);
+                Span<float> cur = batchCur.AsSpan(r * hidden, hidden);
+                ReadOnlySpan<float> proj = batchProj.AsSpan(r * hidden, hidden);
                 for (int i = 0; i < hidden; i++)
                 {
                     cur[i] += proj[i];
@@ -1325,20 +1463,19 @@ public sealed class TransformerModel : IDisposable
 
         if (emitLogits)
         {
-            // The window's final row is the sequence's next-token distribution: its output norm and lm_head GEMV
-            // run alone over the single-token buffers, exactly the tail the single-token forward produced.
-            ApplyNorm(_batchCur.AsSpan((rows - 1) * hidden, hidden), _outputNormWeight, _outputNormBias, _normed);
+            // The window's final row is the sequence's next-token distribution: its output norm and lm_head GEMV run alone over this route's tail buffers — the default family's for a shared posture, the lane family's own when dedicated — exactly the tail the single-token forward produced.
+            ApplyNorm(batchCur.AsSpan((rows - 1) * hidden, hidden), _outputNormWeight, _outputNormBias, act.FinalNormed);
 
             LogicalTensor lmHead = _output ?? _tokenEmbd; // tied weights reuse the token-embedding rows as logits
             ReadOnlySpan<byte> headBytes = _weights.Resolve(lmHead);
-            _backend.Gemv(_normed.AsSpan(0, hidden), new WeightRef(headBytes, lmHead.Shape, lmHead.Format), _logits);
+            engine.Gemv(act.FinalNormed.AsSpan(0, hidden), new WeightRef(headBytes, lmHead.Shape, lmHead.Format), act.FinalLogits);
 
             if (_outputBias is not null)
             {
-                AddBias(_logits, _outputBias);
+                AddBias(act.FinalLogits, _outputBias);
             }
 
-            ApplyFinalLogitSoftcap(_logits);
+            ApplyFinalLogitSoftcap(act.FinalLogits);
         }
     }
 
@@ -1356,6 +1493,18 @@ public sealed class TransformerModel : IDisposable
     /// sequence's final token — sampling them avoids re-forwarding (and double-appending) that token.
     /// </summary>
     public Span<float> LastLogits() => _logits.AsSpan();
+
+    /// <summary>
+    /// The logits left by this engine's most recent prompt window, read through the prefill route's activation family:
+    /// identical to <see cref="LastLogits"/> for a shared posture, and lane-owned storage that no decode-side forward ever writes when dedicated.
+    /// </summary>
+    internal Span<float> PrefillRouteLogits() => _laneAct.FinalLogits.AsSpan();
+
+    /// <summary>The resolved dedicated prefill-lane layout this engine opened with — null for every shared-posture model. Internal diagnostics for hosts and tests.</summary>
+    internal PrefillLaneLayout? DedicatedPrefillLane => _prefillsLane;
+
+    /// <summary>Total bytes of mutable activation storage the dedicated lane family holds at open — weights, norms, rotation tables, and KV live outside it, and a shared-posture model sizes none of it. Internal diagnostics for hosts and tests.</summary>
+    internal long PrefillLaneActivationBytes => _prefillsLane is null ? 0 : _laneAct.ActivationBytes;
 
     /// <summary>
     /// Advances up to <see cref="MaxBatchSequences"/> sequences by one token each in a single step: every dense
@@ -1485,7 +1634,7 @@ public sealed class TransformerModel : IDisposable
 
             if (_sparseFfn is { } routing)
             {
-                ApplySparseFeedForwardBatch(routing, l, n);
+                ApplySparseFeedForwardBatch(routing, l, n, _decodeAct, _backend);
             }
             else
             {
@@ -2456,14 +2605,18 @@ public sealed class TransformerModel : IDisposable
     // their weights. Normalization divides by the selected probability sum when declared, and a nonzero
     // ExpertWeightsScale multiplies every weight after that division. Scratch holds one routing at a time: batched
     // callers copy each selection before selecting the next sequence.
-    private void RouteSparseExperts(SparseFfnDescriptor sparse, int layer, ReadOnlySpan<float> input)
+    private void RouteSparseExperts(SparseFfnDescriptor sparse, int layer, ReadOnlySpan<float> input, ActivationFamily act, IBackend engine)
     {
         LogicalTensor router = _moeRouter[layer];
         ReadOnlySpan<byte> bytes = _weights.Resolve(router);
-        Span<float> scores = _moeLogits.AsSpan(0, sparse.ExpertCount);
+        Span<float> scores = act.MoeScores.AsSpan(0, sparse.ExpertCount);
+
+        // Scratch for one routing at a time lives in the calling route's family: batched callers copy each selection out of it before selecting the next sequence.
+        int[] moeIds = act.MoeIds;
+        float[] moeWeights = act.MoeWeights;
 
         // The router emits one score per declared expert before any selection or softmax runs.
-        _backend.Gemv(input, new WeightRef(bytes, router.Shape, router.Format), scores);
+        engine.Gemv(input, new WeightRef(bytes, router.Shape, router.Format), scores);
 
         float maxScore = float.NegativeInfinity;
         for (int e = 0; e < scores.Length; e++)
@@ -2506,33 +2659,33 @@ public sealed class TransformerModel : IDisposable
                 }
             }
 
-            _moeIds[pick] = best;
-            _moeWeights[pick] = bestScore;
+            moeIds[pick] = best;
+            moeWeights[pick] = bestScore;
             selectedSum += bestScore;
             scores[best] = float.NegativeInfinity; // consumed: later passes cannot re-pick this expert
         }
 
         for (int i = 1; i < routed; i++)
         {
-            int id = _moeIds[i];
-            float weight = _moeWeights[i];
+            int id = moeIds[i];
+            float weight = moeWeights[i];
             int j = i - 1;
-            while (j >= 0 && _moeIds[j] > id)
+            while (j >= 0 && moeIds[j] > id)
             {
-                _moeIds[j + 1] = _moeIds[j];
-                _moeWeights[j + 1] = _moeWeights[j];
+                moeIds[j + 1] = moeIds[j];
+                moeWeights[j + 1] = moeWeights[j];
                 j--;
             }
 
-            _moeIds[j + 1] = id;
-            _moeWeights[j + 1] = weight;
+            moeIds[j + 1] = id;
+            moeWeights[j + 1] = weight;
         }
 
         if (sparse.NormalizeExpertWeights && selectedSum > 0f)
         {
             for (int i = 0; i < routed; i++)
             {
-                _moeWeights[i] /= selectedSum;
+                moeWeights[i] /= selectedSum;
             }
         }
 
@@ -2540,7 +2693,7 @@ public sealed class TransformerModel : IDisposable
         {
             for (int i = 0; i < routed; i++)
             {
-                _moeWeights[i] *= sparse.ExpertWeightsScale;
+                moeWeights[i] *= sparse.ExpertWeightsScale;
             }
         }
     }
@@ -2587,7 +2740,7 @@ public sealed class TransformerModel : IDisposable
     // and residual add then run exactly as they do on the dense path.
     private void ApplySparseFeedForward(SparseFfnDescriptor sparse, int layer)
     {
-        RouteSparseExperts(sparse, layer, _normed.AsSpan(0, Plan.HiddenSize));
+        RouteSparseExperts(sparse, layer, _normed.AsSpan(0, Plan.HiddenSize), _decodeAct, _backend);
 
         int hidden = Plan.HiddenSize;
         Span<float> proj = _proj;
@@ -2654,23 +2807,23 @@ public sealed class TransformerModel : IDisposable
     // output exists — and because every sequence accumulates its own contributions in the same slot order a single
     // token does, each batched result is bit-identical to stepping that sequence alone. The caller's post-feed-forward
     // norm and residual add then run exactly as they do on the dense path.
-    private void ApplySparseFeedForwardBatch(SparseFfnDescriptor sparse, int layer, int n)
+    private void ApplySparseFeedForwardBatch(SparseFfnDescriptor sparse, int layer, int n, ActivationFamily act, IBackend engine)
     {
         int hidden = Plan.HiddenSize;
         int routed = sparse.RoutedExpertsPerToken;
 
         for (int s = 0; s < n; s++)
         {
-            RouteSparseExperts(sparse, layer, _batchNormed.AsSpan(s * hidden, hidden));
+            RouteSparseExperts(sparse, layer, act.BatchNormed.AsSpan(s * hidden, hidden), act, engine);
 
             for (int pick = 0; pick < routed; pick++)
             {
-                _batchMoeIds[s * routed + pick] = _moeIds[pick];
-                _batchMoeWeights[s * routed + pick] = _moeWeights[pick];
+                act.BatchMoeIds[s * routed + pick] = act.MoeIds[pick];
+                act.BatchMoeWeights[s * routed + pick] = act.MoeWeights[pick];
             }
         }
 
-        Span<float> batchProj = _batchProj.AsSpan(0, n * hidden);
+        Span<float> batchProj = act.BatchProj.AsSpan(0, n * hidden);
         batchProj.Clear(); // the routed and shared contributions accumulate from zero below
 
         for (int slot = 0; slot < routed; slot++)
@@ -2680,28 +2833,26 @@ public sealed class TransformerModel : IDisposable
                 int count = 0;
                 for (int s = 0; s < n; s++)
                 {
-                    if (_batchMoeIds[s * routed + slot] == expertIndex)
+                    if (act.BatchMoeIds[s * routed + slot] == expertIndex)
                     {
-                        _expertMembers[count++] = s;
+                        act.ExpertMembers[count++] = s;
                     }
                 }
 
-                ExecuteRoutedExpertBatch(layer, expertIndex, count, slot, routed);
+                ExecuteRoutedExpertBatch(layer, expertIndex, count, slot, routed, act, engine);
             }
         }
 
         if (sparse.HasSharedExpert)
         {
-            RunSharedExpertBatch(layer, n, hidden);
+            RunSharedExpertBatch(layer, n, hidden, act, engine);
         }
     }
 
     // One routed expert's gate/up/down chain over the packed member rows of one selection slot: a single batched pass
     // through its resident stack, bit-identical per row to the token path, with each member's down result accumulated
-    // into that sequence's projection stream under its routing weight as soon as the group completes. _moeSubsetIn
-    // carries this group's activations and then its contiguous down results in place; gate/up intermediates reuse the
-    // dense batch buffers. A slot no sequence selected runs nothing at all.
-    private void ExecuteRoutedExpertBatch(int layer, int expertIndex, int count, int slot, int routed)
+    // into that sequence's projection stream under its routing weight as soon as the group completes. The family this route writes through carries the packed subset buffer and gate/up intermediates — the default family's arrays for decode-side steps, the lane's own when a dedicated window runs them. A slot no sequence selected runs nothing at all.
+    private void ExecuteRoutedExpertBatch(int layer, int expertIndex, int count, int slot, int routed, ActivationFamily act, IBackend engine)
     {
         if (count == 0)
         {
@@ -2710,34 +2861,34 @@ public sealed class TransformerModel : IDisposable
 
         int hidden = Plan.HiddenSize;
         int inter = Plan.IntermediateSize;
-        Span<float> subsetIn = _moeSubsetIn.AsSpan(0, count * hidden);
+        Span<float> subsetIn = act.SubsetIn.AsSpan(0, count * hidden);
 
         for (int m = 0; m < count; m++)
         {
-            _batchNormed.AsSpan(_expertMembers[m] * hidden, hidden).CopyTo(subsetIn.Slice(m * hidden, hidden));
+            act.BatchNormed.AsSpan(act.ExpertMembers[m] * hidden, hidden).CopyTo(subsetIn.Slice(m * hidden, hidden));
         }
 
         LogicalTensor gate = _moeExpertGate[layer];
         ReadOnlySpan<byte> payload = _weights.Resolve(gate);
-        _backend.GemvBatch(subsetIn, count, ExpertWeightRef(payload, _moeExpertGateBytes[layer], expertIndex, _moeExpertGateShape, gate.Format), _batchGateUp.AsSpan(0, count * inter));
+        engine.GemvBatch(subsetIn, count, ExpertWeightRef(payload, _moeExpertGateBytes[layer], expertIndex, _moeExpertGateShape, gate.Format), act.BatchGateUp.AsSpan(0, count * inter));
 
         LogicalTensor up = _moeExpertUp[layer];
         payload = _weights.Resolve(up);
-        _backend.GemvBatch(subsetIn, count, ExpertWeightRef(payload, _moeExpertUpBytes[layer], expertIndex, _moeExpertUpShape, up.Format), _batchUp.AsSpan(0, count * inter));
+        engine.GemvBatch(subsetIn, count, ExpertWeightRef(payload, _moeExpertUpBytes[layer], expertIndex, _moeExpertUpShape, up.Format), act.BatchUp.AsSpan(0, count * inter));
 
         for (int m = 0; m < count; m++)
         {
-            ApplyActivation(_batchGateUp.AsSpan(m * inter, inter), _batchUp.AsSpan(m * inter, inter));
+            ApplyActivation(act.BatchGateUp.AsSpan(m * inter, inter), act.BatchUp.AsSpan(m * inter, inter));
         }
 
         LogicalTensor down = _moeExpertDown[layer];
         payload = _weights.Resolve(down);
-        _backend.GemvBatch(_batchGateUp.AsSpan(0, count * inter), count, ExpertWeightRef(payload, _moeExpertDownBytes[layer], expertIndex, _moeExpertDownShape, down.Format), subsetIn);
+        engine.GemvBatch(act.BatchGateUp.AsSpan(0, count * inter), count, ExpertWeightRef(payload, _moeExpertDownBytes[layer], expertIndex, _moeExpertDownShape, down.Format), subsetIn);
 
         for (int m = 0; m < count; m++)
         {
-            int s = _expertMembers[m];
-            AccumulateScaled(_batchProj.AsSpan(s * hidden, hidden), subsetIn.Slice(m * hidden, hidden), _batchMoeWeights[s * routed + slot]);
+            int s = act.ExpertMembers[m];
+            AccumulateScaled(act.BatchProj.AsSpan(s * hidden, hidden), subsetIn.Slice(m * hidden, hidden), act.BatchMoeWeights[s * routed + slot]);
         }
     }
 
@@ -2745,40 +2896,79 @@ public sealed class TransformerModel : IDisposable
     // GemvBatch traversal the dense block runs, accumulating each sequence's output into its projection stream under
     // that sequence's SharedExpertWeight — 1f for a file shipping no selector vectors. An undeclared shared expert
     // never reaches this path and reads none of these roles at all.
-    private void RunSharedExpertBatch(int layer, int n, int hidden)
+    private void RunSharedExpertBatch(int layer, int n, int hidden, ActivationFamily act, IBackend engine)
     {
         LogicalTensor gate = _sharedGate[layer];
         ReadOnlySpan<byte> bytes = _weights.Resolve(gate);
 
         for (int s = 0; s < n; s++)
         {
-            _batchNormed.AsSpan(s * hidden, hidden).CopyTo(_moeSubsetIn.AsSpan(s * hidden, hidden));
+            act.BatchNormed.AsSpan(s * hidden, hidden).CopyTo(act.SubsetIn.AsSpan(s * hidden, hidden));
         }
 
-        Span<float> subsetIn = _moeSubsetIn.AsSpan(0, n * hidden);
+        Span<float> subsetIn = act.SubsetIn.AsSpan(0, n * hidden);
         int inter = Plan.IntermediateSize;
 
-        _backend.GemvBatch(subsetIn, n, new WeightRef(bytes, gate.Shape, gate.Format), _batchGateUp.AsSpan(0, n * inter));
+        engine.GemvBatch(subsetIn, n, new WeightRef(bytes, gate.Shape, gate.Format), act.BatchGateUp.AsSpan(0, n * inter));
 
         LogicalTensor up = _sharedUp[layer];
         bytes = _weights.Resolve(up);
-        _backend.GemvBatch(subsetIn, n, new WeightRef(bytes, up.Shape, up.Format), _batchUp.AsSpan(0, n * inter));
+        engine.GemvBatch(subsetIn, n, new WeightRef(bytes, up.Shape, up.Format), act.BatchUp.AsSpan(0, n * inter));
 
         for (int s = 0; s < n; s++)
         {
-            ApplyActivation(_batchGateUp.AsSpan(s * inter, inter), _batchUp.AsSpan(s * inter, inter));
+            ApplyActivation(act.BatchGateUp.AsSpan(s * inter, inter), act.BatchUp.AsSpan(s * inter, inter));
         }
 
         LogicalTensor down = _sharedDown[layer];
         bytes = _weights.Resolve(down);
-        _backend.GemvBatch(_batchGateUp.AsSpan(0, n * inter), n, new WeightRef(bytes, down.Shape, down.Format), subsetIn);
+        engine.GemvBatch(act.BatchGateUp.AsSpan(0, n * inter), n, new WeightRef(bytes, down.Shape, down.Format), subsetIn);
 
         for (int s = 0; s < n; s++)
         {
-            AccumulateScaled(_batchProj.AsSpan(s * hidden, hidden), _moeSubsetIn.AsSpan(s * hidden, hidden), SharedExpertWeight(layer, _batchNormed.AsSpan(s * hidden, hidden)));
+            AccumulateScaled(act.BatchProj.AsSpan(s * hidden, hidden), act.SubsetIn.AsSpan(s * hidden, hidden), SharedExpertWeight(layer, act.BatchNormed.AsSpan(s * hidden, hidden)));
         }
     }
 
+
+    // The mutable activation storage one forward route writes through: every batched stream, routing scratch, and tail buffer a window or a batch step touches. The default family aliases the buffers this block has always allocated, so decode-side forwards read and write the very same arrays they did before any lane vocabulary existed; a dedicated posture gives prompt windows a second family of their own instead — separate storage per mutable path while weights, norms, rotation tables, KV bytes, and every other read-only structure stay shared between the two routes.
+    private sealed class ActivationFamily
+    {
+        public required float[] BatchCur;
+        public required float[] BatchNormed;
+        public required float[] BatchQ;
+        public required float[] BatchK;
+        public required float[] BatchV;
+        public required float[] BatchAttnOut;
+        public required float[] BatchProj;
+        public required float[] BatchGateUp;
+        public required float[] BatchUp;
+
+        /// <summary>Per-row online-softmax state for the row-tiled walk, sized to this family's widest window.</summary>
+        public required float[] TiledRowMax;
+        public required float[] TiledRowSumExp;
+
+        // Routing scratch for sparse feed-forward blocks: one selection at a time plus per-sequence copies across a batched step. Empty arrays when the model runs no expert routing at all — nothing reads them then.
+        public required float[] MoeScores;
+        public required int[] MoeIds;
+        public required float[] MoeWeights;
+        public required int[] BatchMoeIds;
+        public required float[] BatchMoeWeights;
+        public required int[] ExpertMembers;
+
+        /// <summary>Packed expert-group activations and down results, held in place across one group.</summary>
+        public required float[] SubsetIn;
+
+        // The window's tail buffers: the final row's normalized stream and its vocab-sized logits. For the default family these are the single-token buffers every forward has always used — the same arrays LastLogits reads — and a dedicated lane gets its own pair so an overlapped prompt window never writes where decode is reading.
+        public required float[] FinalNormed;
+        public required float[] FinalLogits;
+
+        /// <summary>Total bytes of mutable activation storage this family holds.</summary>
+        public long ActivationBytes =>
+            (long)(BatchCur.Length + BatchNormed.Length + BatchQ.Length + BatchK.Length + BatchV.Length + BatchAttnOut.Length + BatchProj.Length + BatchGateUp.Length + BatchUp.Length
+                + TiledRowMax.Length + TiledRowSumExp.Length + MoeScores.Length + MoeWeights.Length + BatchMoeWeights.Length + SubsetIn.Length + FinalNormed.Length + FinalLogits.Length) * sizeof(float)
+            + (long)(MoeIds.Length + BatchMoeIds.Length + ExpertMembers.Length) * sizeof(int);
+    }
 
     private static void RequireSingle(LogicalTensor tensor, int rows, long cols)
     {

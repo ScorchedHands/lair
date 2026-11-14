@@ -187,6 +187,8 @@ public static class ConfigMutationTable
             changes.Add(new FieldChange("models[0].placement.thread_quota", TextOrNone(oldPlacement.ThreadQuota), TextOrNone(newPlacement.ThreadQuota), ConfigMutationClass.Live));
         }
 
+        Add(changes, "models[0].placement.prefill_lane", oldPlacement.PrefillLane, newPlacement.PrefillLane);
+
         if (candidate.Ui.RecentRequests != current.Ui.RecentRequests)
         {
             changes.Add(new FieldChange("ui.recent_requests", Text(current.Ui.RecentRequests), Text(candidate.Ui.RecentRequests), ConfigMutationClass.Live));
@@ -302,6 +304,7 @@ public static class ConfigMutationTable
         yield return ("models[0].placement.kv_residency", ScalarText(placement, "kv_residency"));
         yield return ("models[0].placement.prefill", ScalarText(placement, "prefill"));
         yield return ("models[0].placement.thread_quota", ScalarText(placement, "thread_quota"));
+        yield return ("models[0].placement.prefill_lane", ScalarText(placement, "prefill_lane"));
 
         yield return ("ui.recent_requests", ScalarText(Child(root, "ui"), "recent_requests"));
     }
@@ -331,6 +334,7 @@ public static class ConfigMutationTable
         "models[0].placement.kv_residency" => current.Models[0].Placement.KvResidency,
         "models[0].placement.prefill" => current.Models[0].Placement.Prefill,
         "models[0].placement.thread_quota" => TextOrNone(current.Models[0].Placement.ThreadQuota),
+        "models[0].placement.prefill_lane" => current.Models[0].Placement.PrefillLane,
         "ui.recent_requests" => Text(current.Ui.RecentRequests),
         _ => string.Empty,
     };

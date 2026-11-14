@@ -116,7 +116,17 @@ public sealed record ModelConfig
     public PlacementConfig Placement { get; init; } = new();
 }
 
-/// <summary>Device, residency, and core-pinning choices for a model.</summary>
+/// <summary>The accepted values of <c>placement.prefill_lane</c>: one execution backend for every forward, or a dedicated worker lane for prompt forwards.</summary>
+public static class PlacementPrefillLaneValues
+{
+    /// <summary>Prefill and decode share the model's single execution posture — today's behavior, and what an absent key resolves to.</summary>
+    public const string Shared = "shared";
+
+    /// <summary>Prompt forwards run on a second CPU execution backend capped to its own lane share while decode composition keeps the rest of the claim.</summary>
+    public const string Dedicated = "dedicated";
+}
+
+/// <summary>Device, residency, core-pinning, and prefill-lane choices for a model.</summary>
 public sealed record PlacementConfig
 {
     public string Device { get; init; } = "cpu";
@@ -130,4 +140,7 @@ public sealed record PlacementConfig
 
     /// <summary>Hard cap on this model's worker threads (1 or greater); null leaves the engine thread choice uncapped.</summary>
     public int? ThreadQuota { get; init; }
+
+    /// <summary>Which prefill lane posture the model opens with: <c>shared</c> (default — prompt forwards ride the model's single execution backend, exactly as before this key existed) or <c>dedicated</c> (prompt forwards run on a second CPU execution backend capped to its own share of the worker claim). The split is resolved when the engine opens; changing it is a restart-only edit.</summary>
+    public string PrefillLane { get; init; } = PlacementPrefillLaneValues.Shared;
 }

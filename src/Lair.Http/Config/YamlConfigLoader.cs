@@ -19,7 +19,7 @@ public static class YamlConfigLoader
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel"];
     private static readonly string[] UiKeys = ["recent_requests"];
     private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests"];
-    private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota"];
+    private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane"];
 
     /// <summary>Loads and validates <paramref name="filePath"/>; no file watching.</summary>
     public static LairConfig Load(string filePath)
@@ -302,11 +302,11 @@ public static class YamlConfigLoader
             MaxReasoningTokens = maxReasoningTokens,
             MaxResponseTokens = maxResponseTokens,
             MaxConcurrentRequests = maxConcurrentRequests,
-            Placement = ParsePlacement(keys, index),
+            Placement = ParsePlacement(keys, index, name),
         };
     }
 
-    private static PlacementConfig ParsePlacement(Dictionary<string, YamlNode> modelKeys, int index)
+    private static PlacementConfig ParsePlacement(Dictionary<string, YamlNode> modelKeys, int index, string modelName)
     {
         string where = $"models[{index}].placement";
         if (!modelKeys.TryGetValue("placement", out YamlNode? node))
@@ -350,6 +350,16 @@ public static class YamlConfigLoader
                 $"models[{index}].placement.thread_quota {threadQuota} is invalid: 'thread_quota' must be 1 or greater.");
         }
 
+        // Prefill lane posture: shared (default — prompt forwards ride the model's single execution backend exactly as
+        // before this key existed) or dedicated (prompt forwards run on a second CPU execution backend capped to its own
+        // share of the worker claim). An unrecognized value fails naming the served model, the key, and the accepted set.
+        string prefillLane = TryText(keys, "prefill_lane", $"models[{index}].placement.prefill_lane") ?? PlacementPrefillLaneValues.Shared;
+        if (prefillLane is not (PlacementPrefillLaneValues.Shared or PlacementPrefillLaneValues.Dedicated))
+        {
+            throw new ConfigException(
+                $"models[{index}].placement.prefill_lane '{prefillLane}' is invalid for model '{modelName}': 'prefill_lane' accepts only '{PlacementPrefillLaneValues.Shared}' or '{PlacementPrefillLaneValues.Dedicated}'.");
+        }
+
         return new PlacementConfig
         {
             Device = device,
@@ -357,6 +367,7 @@ public static class YamlConfigLoader
             Prefill = prefill,
             CoreSet = coreSet,
             ThreadQuota = threadQuota,
+            PrefillLane = prefillLane,
         };
     }
 

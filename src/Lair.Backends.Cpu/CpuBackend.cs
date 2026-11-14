@@ -100,6 +100,9 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// <summary>Worker count this backend actually runs threaded GEMV with (dispatcher plus pool workers), after quota and auto-sizing.</summary>
     public int EffectiveWorkerCount => _effectiveThreads;
 
+    /// <summary>The engine's own thread choice this backend sizes from — the ceiling a live quota edit may restore participation up to. Internal so a host can re-derive lane shares against the same value this backend caps them with.</summary>
+    internal int UncappedThreadChoice => _uncappedThreads;
+
     /// <summary>
     /// Applies a new per-model thread quota at runtime: the effective worker count becomes min(engine thread choice,
     /// quota) — lowering it idles pool workers starting with the next kernel call (the scheduler's next step), and
