@@ -738,7 +738,7 @@ public sealed class GenerationService : IDisposable
         string streamed = string.Empty;
         int decodedChars = 0;
         bool stopped = false;
-        SequenceHandle? handle = null;
+        PipelineHandle? handle = null;
         BudgetStreamState? budgetState = budgets.ReasoningTokens is null && budgets.ResponseTokens is null ? null : new BudgetStreamState(plan.ReasoningRegion);
         bool budgetCeilingReached = false;
 

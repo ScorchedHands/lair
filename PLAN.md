@@ -1071,7 +1071,7 @@ Evidence carried in from the shipped measurement (`bench/reports/prefill-profile
 
 Gate posture: this phase changes no scheduling behavior, `Category=Prefill|Parity` bit-identity stays green across whatever the kernels do, and `Category=Concurrency` inter-token budgets are measured before and after each kernel lands.
 
-### MVP3.14 [v0.3.14] - Refined
+### MVP3.14 [v0.3.14] - In Progress
 
 Requests become independent pipelines advanced by a route-aware arbiter, so concurrency, device assignment, and batching are configured per model rather than fixed by the scheduler's shape. Settled on 2026-11-11 after re-opening: budgets are caps at each copy-holding (resource, tier) pair with chains declared per resource; contention is first-come-first-served for bytes and cores alike, spilling memory down its chain and granting compute partially; capacity is declared as totals while NUMA nodes are derived from reported topology under a `numa_spread: auto | local | interleave` preference with deterministic placement rules.
 
@@ -1152,7 +1152,7 @@ Requests become independent pipelines advanced by a route-aware arbiter, so conc
 
 #### Implementation Items
 
-- [_] Request pipeline control plane — pipeline state machine, per-pipeline sampler and quota, and admission independent of step composition (see DN-M314-1).
+- [✓] Request pipeline control plane — pipeline state machine, per-pipeline sampler and quota, and admission independent of step composition (see DN-M314-1).
   - Verify: `dotnet test --filter Category=Scheduling -c Release` — pipelines advance independently up to the cap, and each pipeline's token stream is identical to the same sequence run alone.
 - [_] Route value set in the model plan — ordered device segments with compute device, weight tier, batch cap, and quota, resolved at load (see DN-M314-3).
   - Verify: `dotnet test --filter Category=Loader|Config -c Release` — routes resolve for `cpu`, `cuda`, and `hybrid` model entries; an unresolvable segment fails naming the model and the segment.

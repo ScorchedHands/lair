@@ -13,7 +13,7 @@ namespace Lair.Tests;
 
 /// <summary>
 /// Scheduler-side token-budget math on a synthetic tiny model: a resolved reasoning-plus-response pair is what admission reserves
-/// and what decode stops at, an explicit <c>max_tokens</c> clamps that resolved ceiling without replacing either phase ceiling, and
+/// and what decode stops at, an explicit <c>max_tokens</c> clamps that resolved ceiling without replacing either ceiling, and
 /// a batched run under both ceilings is token-identical to the same sequences stepping alone.
 /// </summary>
 [Trait("Category", "Scheduling")]
@@ -72,8 +72,8 @@ public sealed class TokenBudgetSchedulingTests : IDisposable
         ScheduledRequest requestA = Request(promptA, maxTokens: 10, reasoning: 2, response: 2);
         ScheduledRequest requestB = Request(promptB, maxTokens: 10, reasoning: 2, response: 2);
 
-        SequenceHandle handleA = harness.Scheduler.Submit(requestA, CancellationToken.None);
-        SequenceHandle handleB = harness.Scheduler.Submit(requestB, CancellationToken.None);
+        PipelineHandle handleA = harness.Scheduler.Submit(requestA, CancellationToken.None);
+        PipelineHandle handleB = harness.Scheduler.Submit(requestB, CancellationToken.None);
         SequenceOutcome batchedA = await handleA.Completion;
         SequenceOutcome batchedB = await handleB.Completion;
 

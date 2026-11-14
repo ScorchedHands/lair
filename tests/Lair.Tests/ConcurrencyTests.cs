@@ -227,7 +227,7 @@ public sealed class ConcurrencyTests
         // A submission that fits the pool's blocks is admitted and runs. Whether it stops on EOS or on its
         // token budget is model behavior, so only the admitted-and-ran fact is asserted here; what this gate
         // owns is that an out-of-pool submission was rejected while a fitting one was not.
-        SequenceHandle handle = scheduler.Submit(
+        PipelineHandle handle = scheduler.Submit(
             new ScheduledRequest
             {
                 PromptTokens = prompt,

@@ -176,7 +176,7 @@ public sealed class WindowedKvBudgetTests : IDisposable
             scheduler = new GenerationScheduler(model, pool, maxBatchTokens: 8);
             bus = new EngineMetricsBus("windowed-kv-budget", scheduler, pool, cache: null, NullLoggerFactory.Instance, TimeSpan.FromMilliseconds(30));
 
-            SequenceHandle handle = scheduler.Submit(new ScheduledRequest
+            PipelineHandle handle = scheduler.Submit(new ScheduledRequest
             {
                 PromptTokens = [1, 4],
                 MaxTokens = 2,

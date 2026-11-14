@@ -140,7 +140,7 @@ public sealed class CancellationTests
         CancellationTokenSource abort = new();
         int streamed = 0;
 
-        SequenceHandle handle = harness.Scheduler.Submit(
+        PipelineHandle handle = harness.Scheduler.Submit(
             new ScheduledRequest
             {
                 PromptTokens = [.. harness.Tokenizer.Encode("Once upon a time in a land far away,")],
@@ -184,7 +184,7 @@ public sealed class CancellationTests
 
         // Eight prompt tokens per step: by the time the pool has handed this sequence three blocks its prefill is demonstrably
         // mid-chunk, while the short sequence alongside it has been admitted and is prefilled or decoding in the same steps.
-        SequenceHandle longHandle = harness.Scheduler.Submit(
+        PipelineHandle longHandle = harness.Scheduler.Submit(
             new ScheduledRequest
             {
                 PromptTokens = prompt,
@@ -195,7 +195,7 @@ public sealed class CancellationTests
             abort.Token);
 
         int[] shortPrompt = [.. harness.Tokenizer.Encode("My favorite food is")];
-        SequenceHandle shortHandle = harness.Scheduler.Submit(
+        PipelineHandle shortHandle = harness.Scheduler.Submit(
             new ScheduledRequest
             {
                 PromptTokens = shortPrompt,
@@ -253,7 +253,7 @@ public sealed class CancellationTests
 
         int[] prompt = [.. harness.Tokenizer.Encode("Once upon a time in a land far away,")];
 
-        SequenceHandle canceled = harness.Scheduler.Submit(
+        PipelineHandle canceled = harness.Scheduler.Submit(
             new ScheduledRequest
             {
                 PromptTokens = prompt,
