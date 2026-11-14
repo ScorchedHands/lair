@@ -4,8 +4,11 @@ namespace Lair.Models;
 /// The resolved execution path of one model: an ordered set of device segments, each naming the compute device it
 /// runs on, where its weights are held while it computes, the batch cap a step may advance on it, and the quota a
 /// step holds against it. A route is a value set resolved once at load — consecutive stages that land on one device
-/// collapse into a single segment, so every CPU-only model today carries exactly one CPU segment over DRAM-resident
-/// weights — and a hybrid shape keeps its segments in stage order rather than collapsing to a single device label.
+/// at one residency collapse into a single segment unless they name different boundaries of the ordered path, so every
+/// CPU-only model today carries exactly one CPU segment over DRAM-resident weights — and a hybrid shape keeps its
+/// segments in stage order rather than collapsing to a single device label. Two spans holding distinct boundary
+/// positions stay distinct even when their device and residency match: that position is what makes an ordered span its
+/// own range of layers instead of merging with the neighbour beside it.
 /// Nothing splits a sequence across segments: the whole batch of a step rides the same route, and the ordering says
 /// which segment's work runs first.
 /// </summary>
@@ -21,6 +24,15 @@ public sealed record ModelRoute
     /// carries it: naming it declares where an accelerator-backed segment will run, not that any does.
     /// </summary>
     public const string CudaBackendSeam = "lair.backends.cuda";
+
+    /// <summary>
+    /// The boundary position an unsplit route carries on every stage and segment it resolves: nothing names a split inside
+    /// the model, so consecutive stages landing on one device at one residency collapse into the single span they always did.
+    /// A declared boundary is the index of the layer its span starts at — zero or greater — and two spans naming distinct
+    /// boundaries stay separate positions of the ordered path even when their device and residency agree. Assembly-internal:
+    /// no placement key declares a boundary today, so every model served resolves this position alone.
+    /// </summary>
+    internal const int WholeModelSplitPosition = -1;
 
     /// <summary>
     /// The segments in execution order: what a step advances first is <c>Segments[0]</c>, and each later segment's work
@@ -45,8 +57,9 @@ public sealed record ModelRoute
 /// <summary>
 /// One device span of a model's execution path. A segment is whole-model material today and becomes one half of a
 /// split when a route names more than it: the identity says which compute backend runs this part, the tier says where
-/// its weights are resident while it does, the batch cap is how many sequences one step may advance on it at once,
-/// and the quota is what that step holds against it for as long as it runs.
+/// its weights are resident while it does, the boundary position says where its range of layers begins, the batch cap
+/// is how many sequences one step may advance on it at once, and the quota is what that step holds against it for as
+/// long as it runs.
 /// </summary>
 public sealed record DeviceSegment
 {
@@ -55,6 +68,9 @@ public sealed record DeviceSegment
 
     /// <summary>Where this segment's weights are held while it computes. DRAM-resident is the only residency any engine reads today.</summary>
     public WeightTier WeightTier { get; init; } = WeightTier.Dram;
+
+    /// <summary>The boundary of the ordered path this span starts at: the index of the first layer it runs, or <see cref="ModelRoute.WholeModelSplitPosition"/> when nothing splits the model. Two spans that agree on device and residency stay separate positions because they name distinct boundaries — which is what keeps an ordered pair of same-device spans addressable as two ranges of layers instead of collapsing into one.</summary>
+    internal int SplitPosition { get; init; } = ModelRoute.WholeModelSplitPosition;
 
     /// <summary>The largest number of sequences one step may advance on this segment at once: resolved from the engine's own batch ceiling, and a value outside it refuses rather than silently widening some other buffer.</summary>
     public required int BatchCap { get; init; }

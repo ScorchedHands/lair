@@ -1,8 +1,13 @@
 namespace Lair.Models;
 
 /// <summary>One execution stage a model's placement declares: the part of the path it names (<c>"prefill"</c>,
-/// <c>"decode"</c>) and the compute device that part runs on. Stages reach a route in declaration order.</summary>
-public sealed record RouteStage(string Name, string DeviceId);
+/// <c>"decode"</c>) and the compute device that part runs on. Stages reach a route in declaration order, and each may
+/// name the boundary of the ordered path its span starts at — an assembly-internal seam no placement key reaches today.</summary>
+public sealed record RouteStage(string Name, string DeviceId)
+{
+    /// <summary>The layer index this stage's span starts at. Left unset it carries <see cref="ModelRoute.WholeModelSplitPosition"/>, which is what every declared stage holds today and keeps consecutive same-device stages collapsing into one segment; a declared boundary separates this stage from the neighbour beside it so two spans that agree on device and residency stay distinct positions of the route.</summary>
+    internal int SplitPosition { get; init; } = ModelRoute.WholeModelSplitPosition;
+}
 
 /// <summary>What one model's placement resolution supplies to route resolution: its name for every message this owns,
 /// the ordered execution stages with the device each declares, the device ids the backends already opened report, and
@@ -12,7 +17,7 @@ public sealed record RouteRequest
 {
     public required string ModelName { get; init; }
 
-    /// <summary>The model's execution stages in declaration order: consecutive stages on one device collapse into one segment, and a stage after another device stays its own position of the route.</summary>
+    /// <summary>The model's execution stages in declaration order: consecutive stages on one device collapse into one segment unless they name different boundaries of the ordered path, and a stage after another device stays its own position of the route.</summary>
     public required IReadOnlyList<RouteStage> Stages { get; init; }
 
     /// <summary>The device ids the opened compute backends report. A stage naming any other device resolves structurally but refuses here naming that missing backend — nothing falls back to a device that happens to work.</summary>
@@ -39,9 +44,10 @@ public sealed record RouteRequest
 
 /// <summary>
 /// Resolves a model's declared placement stages into the route its execution path takes, and owns every rule that
-/// resolution enforces: consecutive stages landing on one device collapse into one CPU span so a CPU-only model names
-/// exactly one segment over DRAM-resident weights; stages landing on different devices stay separate segments in
-/// declaration order, which is how a split or hybrid shape reaches the vocabulary before any engine can run it. Each
+/// resolution enforces: consecutive stages landing on one device at one boundary position collapse into one CPU span so a
+/// CPU-only model names exactly one segment over DRAM-resident weights; stages landing on different devices, or naming
+/// distinct boundaries of the ordered path, stay separate segments in declaration order — which is how a split or hybrid
+/// shape reaches the vocabulary before any engine can run it. Each
 /// resolved segment carries its compute device identity, weight tier, batch cap against the engine's own ceiling, and
 /// quota taken from what placement declares today — plus any accelerator stream priority and SM share a caller declared on an
 /// accelerator-backed segment, landed unchanged for later execution to consume and refused here only when out of range. No new config key is
@@ -60,9 +66,9 @@ public static class ModelRoutes
     /// <summary>
     /// Resolves one model's placement into its route value set. Callers supply what their own configuration already
     /// states — the ordered execution stages with the device each declares, the model's thread cap and pinned core set,
-    /// and the device ids the backends they opened report — and this owns how those become segments: collapse by
-    /// consecutive same-device-and-tier stages, engine ceilings as batch caps, CPU quota from placement alone. An
-    /// unresolvable declaration (no stage, an unnamed or repeated stage, a blank device, a cap outside the engine's
+    /// and the device ids the backends they opened report — and this owns how those become segments: collapse by consecutive
+    /// stages agreeing on device, residency, and boundary position, engine ceilings as batch caps, CPU quota from placement
+    /// alone. An unresolvable declaration (no stage, an unnamed or repeated stage, a blank device, a cap outside the engine's
     /// range, a residency its device cannot hold, a device no backend reports) throws naming the model and the segment
     /// it belongs to.
     /// </summary>
@@ -111,11 +117,15 @@ public static class ModelRoutes
 
             WeightTier tier = TierForStage(request, stage);
 
-            // Consecutive stages landing on one device at one residency collapse into a single segment: today's prefill
-            // and decode both naming 'cpu' is one CPU span of the model, not two segments that would make every step
-            // look like a crossing. A repeat after another device stays its own position — that ordering is exactly what
-            // a split route means, and nothing here reorders it.
-            if (segments.Count > 0 && segments[^1].DeviceId == stage.DeviceId && segments[^1].WeightTier == tier)
+            // Consecutive stages landing on one device at one residency at the same boundary position collapse into a single
+            // segment: today's prefill and decode both naming 'cpu' is one CPU span of the model, not two segments that would
+            // make every step look like a crossing. A repeat after another device stays its own position — that ordering is
+            // exactly what a split route means, and nothing here reorders it. Two stages that name distinct boundaries stay
+            // distinct positions even when their device and residency agree: the boundary is part of what identifies a span.
+            if (segments.Count > 0
+                && segments[^1].DeviceId == stage.DeviceId
+                && segments[^1].WeightTier == tier
+                && segments[^1].SplitPosition == stage.SplitPosition)
             {
                 continue;
             }
@@ -124,6 +134,7 @@ public static class ModelRoutes
             {
                 DeviceId = stage.DeviceId,
                 WeightTier = tier,
+                SplitPosition = stage.SplitPosition,
                 BatchCap = request.BatchCap ?? Engine.TransformerModel.MaxBatchSequences,
                 Quota = IsCpuDevice(stage.DeviceId)
                     ? new SegmentQuota { Threads = request.ThreadQuota, Cores = request.CoreSet }
@@ -161,6 +172,14 @@ public static class ModelRoutes
             throw new ModelException(
                 $"model '{model}', {segment.Describe(index)}: batch cap '{segment.BatchCap}' is outside the range " +
                 $"1..{Engine.TransformerModel.MaxBatchSequences} a step may advance sequences on — omit it to take that ceiling");
+        }
+
+        // A declared boundary names the layer this span starts at, so anything else says nothing about where a split lands:
+        // the whole-model position is what an unsplit route carries, and every other value must be a real layer index.
+        if (segment.SplitPosition != ModelRoute.WholeModelSplitPosition && segment.SplitPosition < 0)
+        {
+            throw new ModelException(
+                $"model '{model}', {segment.Describe(index)}: split position '{segment.SplitPosition}' is invalid — a declared boundary names the layer its span starts at, or nothing to keep this model one span");
         }
 
         if (IsCpuDevice(segment.DeviceId))
