@@ -16,7 +16,7 @@ public static class YamlConfigLoader
 
     private static readonly string[] TopLevelKeys = ["server", "engine", "models", "ui"];
     private static readonly string[] ServerKeys = ["bind", "port"];
-    private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_kernel"];
+    private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel"];
     private static readonly string[] UiKeys = ["recent_requests"];
     private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota"];
@@ -149,6 +149,15 @@ public static class YamlConfigLoader
             throw new ConfigException($"engine.max_batch_tokens {maxBatchTokens} is invalid: 'max_batch_tokens' must be 1 or greater.");
         }
 
+        // Step-time prefill budget: absent means the scheduler keeps forwarding chunks at the configured width, and a present
+        // value gives that width from measured step cost instead. A rejected value fails naming the key and the offending
+        // number exactly as the other sized keys do.
+        int? prefillStepBudgetMs = TryInteger(keys, "prefill_step_budget_ms", "engine.prefill_step_budget_ms");
+        if (prefillStepBudgetMs is < 1)
+        {
+            throw new ConfigException($"engine.prefill_step_budget_ms {prefillStepBudgetMs} is invalid: 'prefill_step_budget_ms' must be 1 or greater.");
+        }
+
         // Prefill kernel selection: gemv (default — the batched row window this build runs), tiled, or gemm. All three
         // are accepted by the schema; whether one can run for the served file is the forward engine's answer at model
         // open. An unrecognized value fails naming the served model and the key with the accepted set, exactly as the
@@ -160,7 +169,7 @@ public static class YamlConfigLoader
                 $"engine.prefill_kernel '{prefillKernel}' is invalid for model '{models[0].Name}': 'prefill_kernel' accepts only '{PrefillKernelNames.GemV}', '{PrefillKernelNames.Tiled}', or '{PrefillKernelNames.Gemm}'.");
         }
 
-        return new EngineConfig { Threads = threads, BlockSize = blockSize, MaxBatchTokens = maxBatchTokens, PrefillKernel = prefillKernel };
+        return new EngineConfig { Threads = threads, BlockSize = blockSize, MaxBatchTokens = maxBatchTokens, PrefillStepBudgetMs = prefillStepBudgetMs, PrefillKernel = prefillKernel };
     }
 
     private static IReadOnlyList<ModelConfig> ParseModels(Dictionary<string, YamlNode> top)

@@ -33,6 +33,9 @@ public sealed class GenerationScheduler : IDisposable
     /// <summary>The cap value a scheduler runs with when nothing bounds how many pipelines it admits at once.</summary>
     public const int UncappedConcurrencyCap = PipelineConcurrencyGate.Uncapped;
 
+    /// <summary>Prompt tokens a budgeted scheduler forwards in its first chunks, before this engine's prefill cost has been measured or inferred from what already stepped. A deliberate probe: with no cost to size against, the first boundary starts narrow rather than guessing at a wide step.</summary>
+    internal const int InitialPrefillProbeTokens = 8;
+
     private readonly TransformerModel _model;
     private readonly BlockPool _pool;
     private readonly PrefixCache? _cache;
@@ -45,6 +48,32 @@ public sealed class GenerationScheduler : IDisposable
     // mid-chunk finishes that chunk at the old width. Volatile because the apply path writes it from a caller thread while only the
     // scheduler thread consumes it.
     private volatile int _maxBatchTokens;
+
+    // Wall-clock budget a prefill step aims at, in whole microseconds, or zero when no budget is configured and chunk width stays as set.
+    // Re-read at every chunk issue so a hot edit lands from the next chunk: a forward already running finishes at whatever width was chosen
+    // before the edit, never split mid-step. An apply path writes it from a caller thread and only this scheduler's own thread consumes it, so
+    // both sides go through Volatile — same publishing the step counters use.
+    private long _prefillStepBudgetMicros;
+
+    // Prefill cost reporting: measured microseconds per prompt token as an exponential moving average over issued chunks (zero until something has
+    // been timed), and the width of the last chunk that produced a measurement. Selection scales future boundaries from that last chunk's width and
+    // duration rather than from this per-token figure, whose job is to say what a measured step cost; both are written at boundaries on this
+    // scheduler's own thread only, and observers read them as volatile below.
+
+    private double _prefillMicrosPerToken;
+
+    private int _measuredPrefillWidthTokens;
+
+    // The most recent chunk selection and what it measured: the last boundary's width is read back by ChoosePrefillChunk when a budget scales the
+    // next one, and these values are reported apart from each other because they bound different things — one bounds this step's time, the other is
+    // the row window the engine splits it into. No admission decision or forward path consults them beyond that scaling.
+
+    private volatile int _lastPrefillChosenTokens;
+
+    private volatile int _lastPrefillSubBatchRows;
+
+
+    private long _lastPrefillStepMicros;
 
     // Admission authority over how many pipelines this scheduler holds admitted at once, decided per submission and independent of step
     // composition: pipeline slots here bound concurrency, KV capacity bounds admission against real blocks, and a composition deferral
@@ -99,6 +128,10 @@ public sealed class GenerationScheduler : IDisposable
     // volatile longs by observers — collection costs a handful of increments per step, never per token.
     private readonly Stopwatch _stepClock = new();
 
+    // One started/stopped shared Stopwatch per prefill chunk measures that chunk's forward work, which is what a step-time budget sizes the
+    // next chunk from: no allocation and nothing inside the token loop.
+    private readonly Stopwatch _prefillClock = new();
+
     /// <summary>Cumulative engine counters maintained live by the step loop; see <see cref="SchedulerStats"/>.</summary>
     public SchedulerStats Stats { get; } = new();
 
@@ -112,16 +145,22 @@ public sealed class GenerationScheduler : IDisposable
     /// <param name="cache">Optional prefix cache over the same pool: enables prompt-prefix adoption and publication. Without it, scheduling behaves exactly as without caching.</param>
     /// <param name="maxConcurrentRequests">How many pipelines this scheduler may hold admitted at once; must be at least 1, or <see cref="UncappedConcurrencyCap"/> to bound nothing. It caps admission: a submission arriving while every slot is held is refused with <see cref="SchedulerConcurrencyFullException"/> naming the model and its quota rather than queued behind what already runs.</param>
     /// <param name="modelName">The served model's id, named in every admission refusal so each one says which limit kind blocked it. Null keeps the generic wording.</param>
-    public GenerationScheduler(TransformerModel model, BlockPool pool, int maxBatchTokens, PrefixCache? cache = null, int maxConcurrentRequests = UncappedConcurrencyCap, string? modelName = null)
+    /// <param name="prefillStepBudgetMs">Wall-clock budget, in milliseconds (1 or greater), that future prefill steps aim at; null forwards chunks at <paramref name="maxBatchTokens"/> exactly as before this knob existed. A present value sizes each chunk from measured step cost instead — see <see cref="ApplyPrefillStepBudget"/>.</param>
+    public GenerationScheduler(TransformerModel model, BlockPool pool, int maxBatchTokens, PrefixCache? cache = null, int maxConcurrentRequests = UncappedConcurrencyCap, string? modelName = null, int? prefillStepBudgetMs = null)
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentNullException.ThrowIfNull(pool);
         ArgumentOutOfRangeException.ThrowIfLessThan(maxBatchTokens, 1);
+        if (prefillStepBudgetMs is < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(prefillStepBudgetMs), "a prefill step budget must be 1 millisecond or greater, or null to forward chunks at the configured width.");
+        }
 
         _model = model;
         _pool = pool;
         _cache = cache;
         _maxBatchTokens = maxBatchTokens;
+        _prefillStepBudgetMicros = prefillStepBudgetMs is int budget ? (long)budget * 1_000 : 0;
         _modelName = modelName;
         _progress = new PipelineConcurrencyGate(maxConcurrentRequests);
 
@@ -161,6 +200,24 @@ public sealed class GenerationScheduler : IDisposable
 
     /// <summary>The route position merged decode steps compose on for this model: the last segment of its resolved execution path.</summary>
     internal int SteppingSegmentIndex => _steppingSegment;
+
+    /// <summary>Prompt tokens the most recent prefill chunk forwarded — chosen from the step-time budget when one is configured and from the configured width otherwise. Internal selection diagnostics: they report what a boundary chose and never move a token.</summary>
+    internal int LastPrefillChosenTokens => _lastPrefillChosenTokens;
+
+    /// <summary>The widest sub-batch rows that chunk ran under this engine's resolved prefill row count, reported apart from the chunk's own token count because the two bound different things — width bounds step time, rows are what the engine splits it into and caps itself at. Internal diagnostics only.</summary>
+    internal int LastPrefillSubBatchRows => _lastPrefillSubBatchRows;
+
+    /// <summary>Wall-clock microseconds measured for the most recent prefill chunk's forward work, zero until a chunk has been timed. Internal diagnostics: this is the feedback a configured budget sizes future chunks from.</summary>
+    internal long LastPrefillStepMicros => Volatile.Read(ref _lastPrefillStepMicros);
+
+    /// <summary>The step-time prefill budget currently in force, in whole microseconds; zero when no budget is configured and chunk width stays as set. A hot edit lands here from the next chunk issue on.</summary>
+    internal long PrefillStepBudgetMicros => Volatile.Read(ref _prefillStepBudgetMicros);
+
+    /// <summary>The measured cost per prompt token across this scheduler's timed prefill chunks, zero until this engine has been timed for prefill. Internal diagnostics: reported so a host can see what a step cost, while budgeted choices scale from the last chunk's width and duration.</summary>
+    internal double EstimatedPrefillMicrosecondsPerToken => Volatile.Read(ref _prefillMicrosPerToken);
+
+    /// <summary>The chunk width measurement was fed back from — zero until a chunk has been timed, and the width the next budgeted boundary scales against. Internal diagnostics.</summary>
+    internal int MeasuredPrefillWidthTokens => _measuredPrefillWidthTokens;
 
     /// <summary>
     /// Admits one request as a pipeline and returns its handle: the submission first takes an admission slot from this scheduler's
@@ -290,7 +347,9 @@ public sealed class GenerationScheduler : IDisposable
     /// Applies a new prefill chunk width. The value is read fresh at every chunk issue, so the change takes effect at
     /// the next step boundary: pipelines already mid-chunk finish that chunk at the old width, and decode steps are
     /// untouched. Any in-flight pipeline's token stream stays deterministic either way — chunk boundaries never move
-    /// tokens, only where one forward stops and the next begins.
+    /// tokens, only where one forward stops and the next begins. With a step-time budget in force this value is the ceiling
+    /// a chosen width may reach rather than the width itself: the budget decides how wide future chunks are aimed to be
+    /// (see <see cref="ApplyPrefillStepBudget"/>), and lowering this cap narrows them from its next boundary on.
     /// </summary>
     public void ApplyMaxBatchTokens(int maxBatchTokens)
     {
@@ -299,6 +358,28 @@ public sealed class GenerationScheduler : IDisposable
 
         _maxBatchTokens = maxBatchTokens;
     }
+
+    /// <summary>
+    /// Applies a new wall-clock budget that future prefill steps aim at, or null to drop it and forward chunks at the configured width. The
+    /// value is read fresh at every chunk issue, so a change takes effect from the next prefill chunk this scheduler issues: a forward already
+    /// running finishes at whatever width was chosen before the edit — never split mid-step — decode steps are untouched, and any in-flight
+    /// pipeline's token stream stays identical either way because boundaries move forwards, not results. A present budget sizes each future chunk
+    /// from what this engine measured: floor one prompt token, ceiling <see cref="ApplyMaxBatchTokens"/> as configured here, with the width scaled
+    /// by how the last boundary's duration sat against the target, and the engine's own row ceilings keeping every sub-batch inside them whatever
+    /// width is chosen.
+    /// </summary>
+    public void ApplyPrefillStepBudget(int? prefillStepBudgetMs)
+    {
+        if (prefillStepBudgetMs is < 1)
+        {
+            throw new ArgumentOutOfRangeException(nameof(prefillStepBudgetMs), "a prefill step budget must be 1 millisecond or greater, or null to forward chunks at the configured width.");
+        }
+
+        ObjectDisposedException.ThrowIf(_disposed, typeof(GenerationScheduler));
+
+        Volatile.Write(ref _prefillStepBudgetMicros, prefillStepBudgetMs is int budget ? (long)budget * 1_000 : 0);
+    }
+
 
     /// <summary>
     /// Applies a new cap on how many pipelines this scheduler may hold admitted at once. It takes effect from the next submission on:
@@ -611,17 +692,110 @@ public sealed class GenerationScheduler : IDisposable
         }
     }
 
+    // How many prompt tokens this boundary forwards for one pipeline. With no step-time budget in force that is the configured width exactly as
+    // it always was; with one, the width is aimed at the budget from measured cost — never below a single token, never past the configured
+    // ceiling or whatever remains of this prompt. Selection lives here rather than in the forward path: which window a pipeline's math rides is
+    // scheduling, and the engine keeps enforcing its own row ceilings on top of whatever width lands here. Read fresh at every issue, so a hot
+    // edit changes future boundaries only — never the width a step already running was chosen at.
+    private int ChoosePrefillChunk(RequestPipeline pipeline)
+    {
+        int remaining = pipeline.Request.PromptTokens.Length - pipeline.PromptOffset;
+
+        long budgetMicros = Volatile.Read(ref _prefillStepBudgetMicros);
+
+        if (budgetMicros == 0)
+        {
+            return Math.Min(remaining, _maxBatchTokens);
+        }
+
+        int ceiling = Math.Min(remaining, _maxBatchTokens);
+
+        int measuredWidth = _measuredPrefillWidthTokens;
+        long measuredMicros = Volatile.Read(ref _lastPrefillStepMicros);
+
+        if (measuredWidth <= 0 || measuredMicros <= 0)
+        {
+            // Nothing has been timed on this engine for a chunk yet: forward the probe width rather than guess at a wide first step, so
+            // a budgeted scheduler's opening chunks cannot overshoot its own target badly before measurement arrives.
+            return Math.Min(InitialPrefillProbeTokens, ceiling);
+        }
+
+        // Scale the width that was just measured by how its duration sat against this target: the next boundary aims at the same wall clock time.
+        // Extrapolating a per-token cost instead would misread either direction of an engine's cost curve — a wide forward amortizes fixed work, so
+        // its cost per token predicts narrow steps too cheaply and pins selection at the ceiling no matter how tight the budget is. Proportional
+        // scaling from a width this engine actually ran converges on that curve wherever it sits.
+        double scaled = measuredWidth * (double)budgetMicros / measuredMicros;
+
+        if (scaled >= ceiling)
+        {
+            // Measured cost says this step can already forward everything left of the prompt inside its time target.
+            return ceiling;
+        }
+
+        int chosen = Math.Max(1, (int)(scaled + 0.5));
+
+        return chosen;
+    }
+
+    // Cost feedback recorded at this boundary: microseconds per prompt token of the chunk that just ran, smoothed over recent chunks so one noisy step
+    // does not retune everything at once. A forward too fast to register a microsecond counts as no evidence rather than as free work. This is what
+    // <see cref="EstimatedPrefillMicrosecondsPerToken"/> reports for observation; selection itself scales from the width and duration of the chunk
+    // that last ran (see ChoosePrefillChunk), because per-token cost moves with width on any engine whose forwards amortize fixed work. Width is fed
+    // back per token — never per sub-batch row — so the estimate carries the amortization a wide window enjoyed.
+    private void FeedBackMeasuredCost(int tokens, long stepMicros)
+    {
+        if (tokens <= 0 || stepMicros <= 0)
+        {
+            return;
+        }
+
+        double measured = stepMicros / (double)tokens;
+
+        Volatile.Write(
+            ref _prefillMicrosPerToken,
+            Volatile.Read(ref _prefillMicrosPerToken) <= 0.0
+                ? measured
+                : (Volatile.Read(ref _prefillMicrosPerToken) * 3.0 + measured) / 4.0);
+
+        _measuredPrefillWidthTokens = tokens;
+    }
+
     private void PrefillChunk(RequestPipeline pipeline)
     {
         int[] prompt = pipeline.Request.PromptTokens;
-        int chunk = Math.Min(prompt.Length - pipeline.PromptOffset, _maxBatchTokens);
+        int chunk = ChoosePrefillChunk(pipeline);
+
+        // The engine's own resolved row count splits this step into sub-batches underneath it. Reported apart from the step's token width —
+        // which a budget bounds by time, while rows are what the forward caps itself at — so neither number stands in for the other here.
+        int subBatchRows = Math.Min(chunk, _model.ResolvedPrefillRowWidth);
 
         try
         {
+            // One chosen step, timed as one step: this is the measurement a step-time budget sizes future chunks from. No allocation and
+            // nothing inside the token loop — the clock wraps the whole forward, sub-batches included.
+            _prefillClock.Restart();
             _model.Prefill(prompt[pipeline.PromptOffset..(pipeline.PromptOffset + chunk)], pipeline.Kv);
+            _prefillClock.Stop();
+
+            long stepMicros = _prefillClock.ElapsedTicks * 1_000_000 / Stopwatch.Frequency;
+
+            // Recorded before the counters move, so an observer that sees a chunk counted also sees what that boundary chose and measured.
+            _lastPrefillChosenTokens = chunk;
+            _lastPrefillSubBatchRows = subBatchRows;
+            Volatile.Write(ref _lastPrefillStepMicros, stepMicros);
+
             pipeline.PromptOffset += chunk;
             Stats.PrefillChunksIssued++;
             Stats.PrefillTokensForwarded += chunk;
+            Stats.PrefillStepMicrosTotal += stepMicros;
+            Stats.PrefillSubBatchSum += (chunk + subBatchRows - 1) / subBatchRows;
+            if (subBatchRows > Stats.PeakPrefillSubBatchRows)
+            {
+                Stats.PeakPrefillSubBatchRows = subBatchRows;
+            }
+
+            FeedBackMeasuredCost(chunk, stepMicros);
+
 
             if (pipeline.IsPrefilling)
             {

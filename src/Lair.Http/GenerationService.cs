@@ -288,6 +288,15 @@ public sealed class GenerationService : IDisposable
                             "prefill chunk width takes effect at the next step boundary; sequences mid-chunk finish that chunk at the old width"));
                         break;
 
+                    case "engine.prefill_step_budget_ms":
+                        _scheduler.ApplyPrefillStepBudget(candidate.Engine.PrefillStepBudgetMs);
+                        effective = effective with { Engine = effective.Engine with { PrefillStepBudgetMs = candidate.Engine.PrefillStepBudgetMs } };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            change.NewValue == "(unset)"
+                                ? "prefill chunk width returns to the configured ceiling from the next chunk issue; a forward already running finishes at whatever width was chosen before this edit"
+                                : $"future prefill chunks are sized from measured step cost toward {change.NewValue} ms within the configured ceiling, from the next chunk issue on; a forward already running finishes at whatever width was chosen before this edit"));
+                        break;
+
                     case "models[0].placement.thread_quota":
                         int workersBefore = _backend.EffectiveWorkerCount;
                         int workersAfter = _backend.ApplyThreadQuota(candidate.Models[0].Placement.ThreadQuota);
@@ -573,14 +582,16 @@ public sealed class GenerationService : IDisposable
 
             // The scheduler carries this model's admission cap and name: the configured concurrency limit bounds how many pipelines live at
             // once (absent bounds nothing), refusals name the served model, and the route resolution above already landed placement quotas on
-            // the plan that composition steps against.
+            // the plan that composition steps against. A configured step-time budget is carried along the same way: chunk width then comes from
+            // measured step cost within the configured ceiling instead of being the ceiling itself, and absent leaves it as the ceiling.
             scheduler = new GenerationScheduler(
                 model,
                 pool,
                 config.Engine.MaxBatchTokens,
                 cache,
                 maxConcurrentRequests: modelConfig.MaxConcurrentRequests ?? GenerationScheduler.UncappedConcurrencyCap,
-                modelName: modelConfig.Name);
+                modelName: modelConfig.Name,
+                prefillStepBudgetMs: config.Engine.PrefillStepBudgetMs);
 
             // The chat template is parsed once here, at model load, and cached for the loaded instance's lifetime: no
             // per-request parse and no lazy first-request parse. An unparseable template fails model startup fast,

@@ -112,6 +112,11 @@ public static class ConfigMutationTable
             changes.Add(new FieldChange("engine.max_batch_tokens", Text(oldEngine.MaxBatchTokens), Text(newEngine.MaxBatchTokens), ConfigMutationClass.Live));
         }
 
+        if (newEngine.PrefillStepBudgetMs != oldEngine.PrefillStepBudgetMs)
+        {
+            changes.Add(new FieldChange("engine.prefill_step_budget_ms", TextOrNone(oldEngine.PrefillStepBudgetMs), TextOrNone(newEngine.PrefillStepBudgetMs), ConfigMutationClass.Live));
+        }
+
         if (newEngine.PrefillKernel != oldEngine.PrefillKernel)
         {
             changes.Add(new FieldChange("engine.prefill_kernel", oldEngine.PrefillKernel, newEngine.PrefillKernel, ConfigMutationClass.NewRequestsOnly));
@@ -243,6 +248,7 @@ public static class ConfigMutationTable
     public static ConfigMutationClass Classify(string field) => field switch
     {
         "engine.max_batch_tokens" => ConfigMutationClass.Live,
+        "engine.prefill_step_budget_ms" => ConfigMutationClass.Live,
         "engine.prefill_kernel" => ConfigMutationClass.NewRequestsOnly,
         "models[0].kv_blocks" => ConfigMutationClass.Live,
         "models[0].placement.thread_quota" => ConfigMutationClass.Live,
@@ -275,6 +281,7 @@ public static class ConfigMutationTable
         yield return ("engine.threads", ScalarText(engine, "threads"));
         yield return ("engine.block_size", ScalarText(engine, "block_size"));
         yield return ("engine.max_batch_tokens", ScalarText(engine, "max_batch_tokens"));
+        yield return ("engine.prefill_step_budget_ms", ScalarText(engine, "prefill_step_budget_ms"));
         yield return ("engine.prefill_kernel", ScalarText(engine, "prefill_kernel"));
 
         YamlDotNet.RepresentationModel.YamlMappingNode? model = FirstModel(root);
@@ -307,6 +314,7 @@ public static class ConfigMutationTable
         "engine.threads" => Text(current.Engine.Threads),
         "engine.block_size" => Text(current.Engine.BlockSize),
         "engine.max_batch_tokens" => Text(current.Engine.MaxBatchTokens),
+        "engine.prefill_step_budget_ms" => TextOrNone(current.Engine.PrefillStepBudgetMs),
         "engine.prefill_kernel" => current.Engine.PrefillKernel,
         "models[0].name" => current.Models[0].Name,
         "models[0].path" => current.Models[0].Path,

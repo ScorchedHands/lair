@@ -43,6 +43,15 @@ public sealed record EngineConfig
     public int MaxBatchTokens { get; init; } = 512;
 
     /// <summary>
+    /// Wall-clock budget, in milliseconds (1 or greater), that a prefill step aims at. Null (absent) keeps the chunk width as
+    /// configured: every step forwards up to <see cref="MaxBatchTokens"/> prompt tokens. A present value lets the scheduler size
+    /// each future chunk from measured step cost so its forward work targets this budget, still capped by
+    /// <see cref="MaxBatchTokens"/> and never below one token; the engine's own row ceilings keep sub-batch rows bounded either
+    /// way. A hot edit takes effect from the next prefill chunk issue — a step already in flight finishes at its old width.
+    /// </summary>
+    public int? PrefillStepBudgetMs { get; init; }
+
+    /// <summary>
     /// Which attention/weight path the engine's prefill route selects: <c>gemv</c> (default — the batched row window),
     /// <c>tiled</c> (the same windows with row-tiled causal attention), or <c>gemm</c> (dense weight traversal by blocked
     /// matmul). The schema accepts all three; a selection this engine cannot run for the served file is refused at model

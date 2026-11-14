@@ -339,6 +339,39 @@ public sealed class ConfigTests : IDisposable
     }
 
     [Fact]
+    public void Load_PrefillStepBudgetMs_DefaultsValidatesAndRejects()
+    {
+        LairConfig defaulted = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """));
+        Assert.Null(defaulted.Engine.PrefillStepBudgetMs); // absent means chunk width keeps coming from max_batch_tokens alone
+
+        LairConfig configured = YamlConfigLoader.Load(WriteConfig($"""
+            engine:
+              prefill_step_budget_ms: 120
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """));
+        Assert.Equal(120, configured.Engine.PrefillStepBudgetMs);
+
+        foreach (int invalid in new[] { 0, -3 })
+        {
+            ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+                engine:
+                  prefill_step_budget_ms: {invalid}
+                models:
+                  - name: qwen-test
+                    path: '{TempModelFile()}'
+                """)));
+            Assert.Contains($"engine.prefill_step_budget_ms {invalid}", error.Message);
+            Assert.Contains("'prefill_step_budget_ms' must be 1 or greater", error.Message);
+        }
+    }
+
+    [Fact]
     public void Load_UnknownKeys_NamedWithAllowedKeysAtThatLevel()
     {
         string modelPath = TempModelFile();

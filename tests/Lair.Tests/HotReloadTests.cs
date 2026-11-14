@@ -94,6 +94,95 @@ public sealed class HotReloadTests
         Assert.True(result.FinishReason is "eos" or "length");
     }
 
+    /// <summary>
+    /// The step-time budget hot-reloading mid-prefill: a wide target leaves every boundary at the configured width, and tightening it while
+    /// prefill is running resizes only later chunks — the one already chosen finishes whole. An invalid value for the same key lands as a loud
+    /// per-field refusal naming its mutation class with nothing applied, and the engine keeps serving identical bytes either way.
+    /// </summary>
+    [Fact]
+    public async Task PrefillStepBudgetEditMidPrefill_ResizesSubsequentChunks_OutputUnchanged_AndInvalidValuesAreRefused()
+    {
+        if (ModelFixture.Resolve() is null)
+        {
+            return; // real-model tests skip when the fixture is absent
+        }
+
+        const int WideTargetMs = 200;   // far above one forward on this engine: selection pins each boundary at the configured width
+        const int NarrowTargetMs = 12;  // under a weight-bound forward's per-token cost, so later boundaries have to come narrower
+
+        string prompt = SharedPrefix(5) + " In a distant library, maps of imaginary cities lined every wall.";
+        string shortPrompt = "Describe the sea in one sentence.";
+
+        using GenerationService plain = OpenPlain(); // no watcher and no budget: the byte-for-byte anchor for both halves below
+        GenerationResult baselineShort = await plain.GenerateAsync(Completion(shortPrompt, 6), CancellationToken.None);
+        GenerationResult baselineLong = await plain.GenerateAsync(Completion(prompt, 16), CancellationToken.None);
+        Assert.False(string.IsNullOrEmpty(baselineLong.Text));
+
+        string wideYaml = BuildYaml(kvBlocks: 24, maxBatchTokens: 8, maxContextTokens: 512, prefillStepBudgetMs: WideTargetMs);
+        using LiveConfigHarness harness = new(wideYaml);
+
+        Task<GenerationResult> running = harness.Engine.GenerateAsync(Completion(prompt, 16), CancellationToken.None);
+
+        await WaitForAsync(
+            () => harness.Engine.Stats.PrefillChunksIssued >= 2 && harness.Engine.Stats.ActiveSequenceCount >= 1,
+            "the budgeted prefill never showed two issued chunks while active");
+
+        string narrowedYaml = BuildYaml(kvBlocks: 24, maxBatchTokens: 8, maxContextTokens: 512, prefillStepBudgetMs: NarrowTargetMs);
+        harness.EditYaml(narrowedYaml);
+
+        ReloadSummary applied = await harness.WaitForSummaryAsync(
+            s => s.ValidationOk && s.Results.Any(r => r.Field == "engine.prefill_step_budget_ms" && r.Outcome == "applied"),
+            "the prefill_step_budget_ms edit never reached the engine as an applied live change");
+
+        Assert.Contains(
+            applied.Results,
+            r => r.Field == "engine.prefill_step_budget_ms" && r.MutationClass == MutationClassNames.Live);
+
+        long chunksAtApply = harness.Engine.Stats.PrefillChunksIssued;
+        long tokensAtApply = harness.Engine.Stats.PrefillTokensForwarded;
+
+        GenerationResult result = await running;
+
+        // The reload landed mid-prefill: boundaries kept coming after it was applied, and they came narrower than the ones before it.
+        long chunksAfterApply = harness.Engine.Stats.PrefillChunksIssued - chunksAtApply;
+        Assert.True(
+            chunksAfterApply >= 2,
+            $"prefill finished before the edit applied (chunks at apply {chunksAtApply}, total {harness.Engine.Stats.PrefillChunksIssued}) — widen the fixture prompt");
+
+        double avgBefore = tokensAtApply / (double)chunksAtApply;
+        long tokensAfterApply = harness.Engine.Stats.PrefillTokensForwarded - tokensAtApply;
+        double avgAfter = tokensAfterApply / (double)chunksAfterApply;
+
+        Assert.True(avgBefore > 6.0 && avgBefore <= 8.0, $"pre-edit chunks averaged {avgBefore}, expected the configured width of 8");
+
+        // A step already chosen when the target tightened finishes at its old width: one boundary straddling the apply lands wide, and every
+        // later one came from measured cost under the new target — narrow enough that a pre-edit average could never produce it.
+        Assert.True(avgAfter <= 3.0, $"post-edit chunks averaged {avgAfter:F1} tokens wide — the tightened {NarrowTargetMs} ms step-time budget never reached prefill");
+
+        // Correctness invariant: boundaries move forwards, not results.
+        Assert.Equal(baselineLong.Text, result.Text);
+        Assert.Equal(baselineLong.CompletionTokens, result.CompletionTokens);
+        Assert.True(result.FinishReason is "eos" or "length");
+
+        // An invalid value for the same key mid-serve: loud per-field refusal naming its class, nothing applied, and serving unchanged.
+        harness.EditYaml(narrowedYaml.Replace($"prefill_step_budget_ms: {NarrowTargetMs}", "prefill_step_budget_ms: zero"));
+
+        ReloadSummary refused = await harness.WaitForSummaryAsync(
+            s => !s.ValidationOk && s.Results.Any(r => r.Field == "engine.prefill_step_budget_ms"),
+            "the invalid prefill_step_budget_ms edit never produced a rejected reload summary");
+
+        Assert.False(refused.ValidationOk);
+        ReloadFieldResult refusedAttempt = refused.Results.Single(r => r.Field == "engine.prefill_step_budget_ms");
+        Assert.Equal(MutationClassNames.Live, refusedAttempt.MutationClass);
+        Assert.Equal("refused", refusedAttempt.Outcome); // validation failure drops the candidate whole: even a live-class edit stays unapplied
+
+        GenerationResult afterRefusal = await harness.Engine.GenerateAsync(Completion(shortPrompt, 6), CancellationToken.None);
+        Assert.Equal(baselineShort.Text, afterRefusal.Text); // the engine kept serving on the values it had
+
+        harness.EditYaml(wideYaml);
+        await WaitForAsync(() => harness.Engine.LastReload?.ValidationOk == true, "the repaired configuration never validated");
+    }
+
     [Fact]
     public async Task ThreadQuotaEditMidServe_RetargetsWorkerParticipation_OutputUnchanged()
     {
@@ -471,7 +560,8 @@ public sealed class HotReloadTests
         int? threadQuota = null,
         int blockSize = 16,
         string? modelPathOverride = null,
-        int? maxConcurrentRequests = null)
+        int? maxConcurrentRequests = null,
+        int? prefillStepBudgetMs = null)
     {
         string modelPath = modelPathOverride ?? ModelFixture.Resolve()!;
 
@@ -492,6 +582,14 @@ public sealed class HotReloadTests
                 max_context_tokens: {maxContextTokens}
                 kv_blocks: {kvBlocks}
             """;
+
+        if (prefillStepBudgetMs is int budget)
+        {
+            // Inserted straight after the width it bounds, using the line ending this file's raw literals actually carry.
+            yaml = yaml.Replace(
+                $"max_batch_tokens: {maxBatchTokens}",
+                $"max_batch_tokens: {maxBatchTokens}{Environment.NewLine}  prefill_step_budget_ms: {budget}");
+        }
 
         if (maxConcurrentRequests is int cap)
         {

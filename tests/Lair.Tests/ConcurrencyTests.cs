@@ -280,7 +280,7 @@ public sealed class ConcurrencyTests
 
     // ---------------------------------------------------------------- helpers
 
-    internal static GenerationService OpenService(int kvBlocks, int maxContextTokens, int maxBatchTokens = 512, int? maxConcurrentRequests = null)
+    internal static GenerationService OpenService(int kvBlocks, int maxContextTokens, int maxBatchTokens = 512, int? maxConcurrentRequests = null, int? prefillStepBudgetMs = null)
     {
         string modelPath = ModelFixture.Resolve() ?? throw new InvalidOperationException(
             $"GGUF fixture '{ModelFixture.SmolLmRelativePath}' was not found walking up from the test assembly directory.");
@@ -288,7 +288,7 @@ public sealed class ConcurrencyTests
         return GenerationService.Open(new LairConfig
         {
             Server = new ServerConfig(),
-            Engine = new EngineConfig { MaxBatchTokens = maxBatchTokens, PrefillKernel = "tiled" },
+            Engine = new EngineConfig { MaxBatchTokens = maxBatchTokens, PrefillKernel = "tiled", PrefillStepBudgetMs = prefillStepBudgetMs },
             Models =
             [
                 new ModelConfig
@@ -371,6 +371,12 @@ public sealed class ConcurrencyTests
 public sealed class PrefillProtectionTests
 {
     private const int MaxBatchTokens = 8;
+
+    // This engine's shipped default chunk width, left untouched by the step-time gate below so measured cost is the only thing bounding a boundary.
+    private const int WideCeilingBatchTokens = 512;
+
+    // A target under one weight-bound forward on this fixture: whatever its width, a forward here costs tens of milliseconds, so selection has to keep boundaries small to aim at it.
+    private const int StepBudgetMs = 30;
     private const int LongMaxTokens = 32;
     private const int ShortMaxTokens = 32;
     private const long ItlBudgetMs = 400;
@@ -465,6 +471,113 @@ public sealed class PrefillProtectionTests
         GenerationResult longResult = await longRun;
         Assert.False(string.IsNullOrEmpty(longResult.Text), "the long-prompt request produced no text");
         Assert.Equal(LongMaxTokens, longResult.CompletionTokens);
+    }
+
+    /// <summary>
+    /// The same protection delivered by measured step time alone: the configured chunk width stays at this engine's wide default, and a
+    /// step-time budget sizes each future boundary from what the last one cost. A single forward on this fixture is weight-bound rather than
+    /// token-bound — tens of milliseconds whatever its width — so a target below that floor keeps boundaries small no matter how high the
+    /// configured ceiling is, which is what holds short-request gaps in budget here without any fixed chunk width.
+    /// </summary>
+    [Fact]
+    public async Task StepBudgetFromOpen_ChunksTheLongPrefillByMeasuredStepTime_KeepingShortRequestsInLatencyBudget()
+    {
+        string? modelPath = ModelFixture.Resolve();
+        if (modelPath is null)
+        {
+            return; // real-model tests skip when the fixture is absent
+        }
+
+        using GgufFile gguf = GgufFile.Open(modelPath);
+        GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
+        string longPrompt = BuildLongPrompt(tokenizer);
+        int longPromptTokens = tokenizer.Encode(longPrompt).Count;
+
+        using GenerationService service = ConcurrencyTests.OpenService(
+            kvBlocks: 256,
+            maxContextTokens: 4096,
+            maxBatchTokens: WideCeilingBatchTokens, // nothing bounds a chunk by count here — only measured step time does
+            prefillStepBudgetMs: StepBudgetMs);
+
+        Task<GenerationResult> longRun = service.GenerateAsync(
+            ConcurrencyTests.CompletionRequest(longPrompt, LongMaxTokens),
+            CancellationToken.None);
+
+        Stopwatch clock = Stopwatch.StartNew();
+        List<List<long>> gaps = [[], [], []];
+        Task<GenerationResult>[] shortRuns =
+        [
+            .. Enumerable.Range(0, ShortPrompts.Length).Select(index => service.GenerateAsync(
+                new GenerationRequest
+                {
+                    Model = "smollm-concurrency",
+                    IsChat = false,
+                    Prompt = ShortPrompts[index],
+                    MaxTokens = ShortMaxTokens,
+                    Temperature = 0f,
+                    Stream = true,
+                    OnToken = _ =>
+                    {
+                        List<long> sequenceGaps = gaps[index];
+                        long stamp = clock.ElapsedMilliseconds;
+                        if (sequenceGaps.Count > 0)
+                        {
+                            sequenceGaps[^1] = stamp - sequenceGaps[^1];
+                        }
+
+                        sequenceGaps.Add(stamp);
+                    },
+                },
+                CancellationToken.None)),
+        ];
+
+        GenerationResult[] shortResults = await Task.WhenAll(shortRuns);
+
+        List<long> allGaps = [];
+        for (int i = 0; i < ShortPrompts.Length; i++)
+        {
+            Assert.False(string.IsNullOrEmpty(shortResults[i].Text), $"short request {i} produced no text");
+            Assert.True(gaps[i].Count >= 2, $"short request {i} streamed only {gaps[i].Count} token(s)");
+            allGaps.AddRange(gaps[i][..^1]);
+        }
+
+        allGaps.Sort();
+        long p95 = allGaps[(allGaps.Count * 95) / 100];
+        Assert.True(
+            p95 <= ItlBudgetMs,
+            $"inter-token p95 was {p95} ms across {allGaps.Count} gaps at a {StepBudgetMs} ms step-time target; budget is {ItlBudgetMs} ms");
+
+        GenerationResult longResult = await longRun;
+        Assert.Equal(LongMaxTokens, longResult.CompletionTokens);
+
+        // Measured cost did the splitting: many narrow boundaries against this prompt, each one far below the configured ceiling it never used.
+        SchedulerStats stats = service.Stats;
+        double meanChunkWidth = (double)stats.PrefillTokensForwarded / stats.PrefillChunksIssued;
+        Assert.True(
+            stats.PrefillChunksIssued >= longPromptTokens / 16,
+            $"{stats.PrefillChunksIssued} prefill chunks for a {longPromptTokens}-token prompt — measured step time never split it");
+        Assert.True(
+            meanChunkWidth * 8 <= WideCeilingBatchTokens,
+            $"prefill chunks averaged {meanChunkWidth:F1} tokens at a configured ceiling of {WideCeilingBatchTokens} — the step-time target never reached selection");
+
+        // Correct outputs: every request on this engine matches the same request run alone on an un-budgeted one.
+        using GenerationService baseline = ConcurrencyTests.OpenService(kvBlocks: 256, maxContextTokens: 4096);
+        for (int i = 0; i < ShortPrompts.Length; i++)
+        {
+            GenerationResult expected = await baseline.GenerateAsync(
+                ConcurrencyTests.CompletionRequest(ShortPrompts[i], ShortMaxTokens),
+                CancellationToken.None);
+
+            Assert.Equal(expected.Text, shortResults[i].Text);
+            Assert.Equal(expected.FinishReason, shortResults[i].FinishReason);
+        }
+
+        GenerationResult expectedLong = await baseline.GenerateAsync(
+            ConcurrencyTests.CompletionRequest(longPrompt, LongMaxTokens),
+            CancellationToken.None);
+
+        Assert.Equal(expectedLong.Text, longResult.Text);
+        Assert.Equal(expectedLong.FinishReason, longResult.FinishReason);
     }
 
     private static string BuildLongPrompt(GgufTokenizer tokenizer)
