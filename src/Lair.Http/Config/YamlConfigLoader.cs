@@ -348,7 +348,7 @@ public static class YamlConfigLoader
         {
             throw new ConfigException($"models[{index}].path must be a non-empty path to the model file on disk.");
         }
-        if (!File.Exists(path))
+        if (!File.Exists(path) && !keys.ContainsKey("source"))
         {
             throw new ConfigException($"models[{index}].path '{path}' does not exist on disk.");
         }
