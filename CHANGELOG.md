@@ -4,6 +4,28 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.14] - 2026-11-15
+
+### Added
+
+- Request pipeline control plane: each request advances as an independent pipeline through transform, prefill, decode, and finish, with its own sampler, quota, and admission path independent from merged step composition. Token streams remain identical whether the pipeline is merged with a batch step or run alone.
+- Model execution routes: model plans resolve ordered device segments carrying compute device, weight tier, batch cap, and quota. CPU routes collapse to one segment; synthetic split routes resolve backend spans, staging arenas, and admission refusals without inventing public pseudo-device knobs.
+- Admission and quota reporting: optional per-model `max_concurrent_requests`; rejections name whether KV capacity, token budget, or quota blocked the request; `/v1/models` reports concurrency posture and resolved route segments; `/monitor/stream` carries per-segment quota, lane state, activation bytes, and a bounded recent admission-refusal ring.
+- Step-time prefill budget: optional `engine.prefill_step_budget_ms` sizes prompt-window token counts from measured per-row cost, clamps the chosen token count, keeps sub-batch rows inside the engine's row cap, and reports chosen tokens, sub-batched forwards, estimated cost, and last step time through scheduler diagnostics.
+- Dedicated prefill lanes: `placement.prefill_lane` accepts `shared` or `dedicated`. Dedicated posture sub-allocates a prefill worker share from the model's own claim, partitions pinned core ids disjointly, gives each lane its own activation buffers, and overlaps one prefill forward with decode while KV/cache mutations stay control-plane-reserved.
+- Per-resource budget chains: `weights`, `kv`, and `prefill_buffers` resolve independent caps and tier priority chains, with terminal uncapped disk origins for read-side resources, host-capability reporting for unopened tiers, and presence-tracked legacy `kv_blocks` aliasing.
+- Device ledger: opened models register weight and KV claims in config declaration order against host-scoped tier accounting. KV and prefill claims observe existing pool/scheduler admission, later claims spill or demote rather than preempting earlier claims, and exhausted admission reports model/resource/tier plus a breakdown under `budget_exhausted` / `engine_overloaded_error`.
+- Prefill working-buffer clamp: resolved `prefill_buffers` ceilings can narrow effective prompt-window row width while preserving token identity, reporting requested width, effective width, working-set bytes, clamp description, and clamped chunk counts separately from ordinary chunk/sub-batch stats.
+- Compute capacity ledger: top-level `tiers:` declares `dram_mb`, `dram_cores`, optional `nvme_path`, and per-node overrides; model worker claims are granted first-come against reported logical-processor capacity, oversubscribed later claims are clamped to the remainder, and monitor facts report requested versus granted worker counts, overcommit posture, and shared-core models.
+- NUMA placement derivation: `models[].placement.numa_spread` accepts `auto`, `local`, or `interleave`; placement maps are derived deterministically from reported topology, claim order, least-loaded node, and lowest node index; per-node allocations are reported, and pinned-set conflicts fail naming the model and conflict.
+
+### Changed
+
+- Scheduler admission now composes steps by route identity, KV-residency compatibility, batch cap, and quota headroom rather than assuming one global CPU step shape.
+- GPU-shaped route segments fail naming the missing `lair.backends.cuda` seam instead of silently falling back to CPU execution.
+- Dedicated-lane execution uses two CPU backends over one model/weight source rather than separate engine instances, preserving one weight source and one resident KV arena while providing disjoint worker pools and per-lane activation buffers.
+- Prefill diagnostics distinguish requested row width from clamped effective width and report lane buffer bytes beside step-time facts.
+
 ## [0.3.13] - 2026-11-14
 
 ### Added

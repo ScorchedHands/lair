@@ -11,6 +11,16 @@ engine:
   block_size: 16      # fixed to 16
   max_batch_tokens: 512  # largest prompt chunk prefilled in one scheduler step
   # prefill_kernel: gemv   # optional; gemv | tiled | gemm — which attention/weight path the engine's prefill route selects. All three run today; gemm serves only a model whose dense weight formats it has kernels for (Q8_0, Q4_K, IQ4_XS), and a file with any other format is refused at model open naming that format rather than falling back.
+  # prefill_step_budget_ms: 250  # optional; sizes prompt-window token counts from measured per-row cost, clamped by scheduler floor/ceiling and engine row caps.
+
+# tiers:
+#   dram_mb: 65536         # optional host DRAM byte total; reported warn-and-accept against OS topology when present
+#   dram_cores: 32         # optional host logical-processor total; compute grants are first-come against this posture
+#   # nvme_path: D:\       # optional presence-only NVMe tier marker
+#   # nodes:               # optional per-node overrides keyed by reported node index
+#   #   - index: 0
+#   #     dram_mb: 32768
+#   #     dram_cores: 16
 
 models:
   - name: smollm-135m-instruct-q8_0
@@ -23,12 +33,16 @@ models:
     # reasoning: keep            # optional; keep | strip — keep streams a recognized reasoning region through as visible content, strip withholds it
     # max_reasoning_tokens: 256  # optional; tokens a reasoning region may spend before it is closed; requires the model's tokenizer to carry <think>/</think> as whole tokens
     # max_response_tokens: 1024  # optional; tokens of visible output the model may generate
+    # max_concurrent_requests: 8 # optional; omitted is uncapped; admission rejections name the blocking KV/token/quota limit
     placement:
       device: cpu
       kv_residency: dram
       prefill: cpu
-      core_set: "0-15"   # optional; omit to leave the model unpinned; pinned models may not share core ids
+      # prefill_lane: shared   # optional; shared | dedicated — dedicated sub-allocates a prefill worker share and activation buffers from this model's claim
+      core_set: "0-15"   # optional; omit to leave the model unpinned; pinned models may not share core ids unless this model opts into core_overcommit
       thread_quota: 8    # optional; caps this model's workers at 8 regardless of engine threads
+      # core_overcommit: false # optional; restart-only; relaxes pinned core-set disjointness for this model only
+      # numa_spread: auto      # optional; auto | local | interleave — auto chooses least-loaded node, local follows a pinned set, interleave spreads across reported nodes
 
   # - name: smollm-135m-instruct-q4_k_m
   #   path: models/smollm-135m-instruct-q4_k_m.gguf   # requires Q4_K_M family support — v0.3.1
