@@ -1294,7 +1294,7 @@ Model acquisition: published GGUF packs fetched from Hugging Face, pinned by rep
 - [✓] Manual Offline Proof: disconnect the network (or point the resolver at a black hole) with a verified cache present — serving continues byte-identically; with the cache absent — load refuses naming repo/revision/file/reason.
   - Measured live by pointing `HTTP_PROXY`/`HTTPS_PROXY` at `http://127.0.0.1:1`: with the verified cached manifest/file present, serve logged `update_candidate model='manual-fetch-smollm' check skipped: No connection could be made because the target machine actively refused it. (127.0.0.1:1)`, served `/v1/models` normally, and the same greedy chat request returned the same completion text. With a manifest-less absent pinned source, serve refused with `Revision 'main' for repo 'scorchedhands/lair-offline-proof-missing' is gated and the hub refused the access offered (HTTP 401); set LAIR_HF_TOKEN to a token allowed to read this repo.` — naming repo and reason rather than substituting a revision.
 
-### MVP4 [v0.4.0] - Refined
+### MVP4 [v0.4.0] - In Progress
 
 CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the PCIe-frac seam where GPU compute runs over DRAM-resident weights.
 
@@ -1341,7 +1341,7 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the PCIe-
 
 #### Implementation Items
 
-- [_] CPU GEMV flake diagnosis — reproduce or rule out the intermittent AVX2 `Q4_K` GEMV `AccessViolationException` under resident-engine load before CUDA parity gates run, so a CPU-path crash is not misattributed to the CUDA backend.
+- [✓] CPU GEMV flake diagnosis — reproduce or rule out the intermittent AVX2 `Q4_K` GEMV `AccessViolationException` under resident-engine load before CUDA parity gates run, so a CPU-path crash is not misattributed to the CUDA backend.
   - Verify: targeted `dotnet test --filter Category=Kernel|Concurrency|Cancel -c Release` repeat runs, plus a named failure/stack when the flake is reproduced.
 - [_] Binding spike — CUDA Driver API + embedded PTX smoke (see DN-M4-10)
   - Verify: host loads a PTX kernel through `nvcuda.dll` and a smoke GEMM matches the CPU reference within FP tolerance, with no `nvcc` or cuBLASLt dependency.
