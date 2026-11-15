@@ -62,8 +62,11 @@ public sealed class TransformerModel : IDisposable
 
     private readonly IBackend _backend;
 
-    // The execution backend prompt windows run on: this model's own backend when prefill shares it, and a second CPU
-    // backend capped to its dedicated lane share when placement declares one. Decode-side forwards never consult the lane side.
+    // The execution backend prompt windows run on: this model's own backend when prefill shares it, a second CPU
+    // backend capped to its dedicated lane share when placement declares one, and an offload posture where a supplied
+    // backend arrives without a layout — allowed only over the single DRAM-resident span every unsplit route resolves
+    // to, because that shape reads host-resident weight bytes directly from whichever device it reports. Decode-side
+    // forwards never consult the lane side.
     private readonly IBackend _prefillsBackend;
 
     private readonly IWeightSource _weights;
@@ -457,6 +460,8 @@ public sealed class TransformerModel : IDisposable
     /// execution backend capped to its lane share and <paramref name="prefillsLane"/> pins the resolved split — masks, worker caps,
     /// and the activation buffers sized from it land at open; every decode-side forward stays on <paramref name="backend"/>. The two
     /// must arrive together and report the same device this engine runs on: a half-declared lane posture is refused naming what is missing.
+    /// A backend arriving alone with no layout opens an offload posture instead — prompt windows run on it while decode stays on
+    /// <paramref name="backend"/>, allowed only over the single DRAM-resident span every unsplit route resolves to, since that shape reads host-resident weight bytes across whatever device it reports; a split route refuses naming what lands short, and formats that backend has no kernel for are refused by it at forward time rather than run on some other device.
     /// A host that resolved per-resource budgets against its own opened pools supplies them through <paramref name="budgets"/>, and they land
     /// on the plan unchanged beside the route — a declared prefill-buffer ceiling narrows this engine's row window to what it allows (requested
     /// width stays stated on the plan, effective width reported apart), while no capacity claim or relocation runs here. Omitting it keeps the
@@ -705,16 +710,15 @@ public sealed class TransformerModel : IDisposable
         // Half of it is refused at open naming what is missing; the backend must report this engine's own device, because weights, norms, rotation tables, and KV
         // bytes are shared by construction and only exist resident where the route says they live — a lane on some other device would read tensors that
         // were never mapped there. The split itself carries load-resolved worker caps; an engine refuses to open over shares one of which holds no worker.
-        if (prefillsBackend is null != prefillsLane is null)
+        if (prefillsLane is { } declaredLane)
         {
-            throw new ModelException(
-                $"a dedicated prefill lane for model '{prefillsLane?.ModelName ?? "unspecified"}' arrives with only half of its pair: " +
-                $"{(prefillsBackend is null ? "no execution backend for the lane to run on" : "no resolved lane layout sizing its worker caps and activation buffers")} — pass both together, or neither.");
-        }
+            if (prefillsBackend is null)
+            {
+                throw new ModelException(
+                    $"a dedicated prefill lane for model '{declaredLane.ModelName}' arrives with only half of its pair: " +
+                    "no execution backend for the lane to run on — pass both together, or neither.");
+            }
 
-        // The refusal above guarantees the two arrive together; this validation runs exactly when a posture was declared.
-        if (prefillsLane is { } declaredLane && prefillsBackend is not null)
-        {
             if (prefillsBackend.DeviceId != backend.DeviceId)
             {
                 throw new ModelException(
@@ -730,6 +734,18 @@ public sealed class TransformerModel : IDisposable
             }
 
             _prefillsLane = declaredLane;
+        }
+        else if (prefillsBackend is not null)
+        {
+            // A prefill offload posture arrives as a backend alone: prompt windows run on it while every decode-side forward stays on this engine's own. It caps no worker share, so it carries no layout — and this build runs that shape only over the single DRAM-resident span every unsplit route resolves to, which is where reading host-resident weight bytes from another device holds. A split route refuses naming what lands short rather than staging an unsized lane through crossings; a residency other than DRAM was already refused against each segment's own backend below, and formats this backend has no kernel for are refused by it at forward time, never run on some other device behind the selection that happens to work.
+            ModelRoute offloadRoute = Plan.Route;
+
+            if (offloadRoute.Segments.Count > 1)
+            {
+                throw new ModelException(
+                    $"an offloaded prefill backend on device '{prefillsBackend.DeviceId}' arrives with no lane layout over a route of {offloadRoute.Segments.Count} segments: " +
+                    "prompt windows run across host-resident weights only where the model resolves to one DRAM-resident span — declare placement.prefill_lane 'dedicated' for a same-device lane pair, or supply crossing backends as their own posture.");
+            }
         }
 
         _prefillsBackend = prefillsBackend ?? backend;

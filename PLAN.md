@@ -1347,7 +1347,7 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the PCIe-
   - Verify: host loads a PTX kernel through `nvcuda.dll` and a smoke GEMM matches the CPU reference within FP tolerance, with no `nvcc` or cuBLASLt dependency.
 - [✓] CudaBackend — dense decode + prefill kernels behind `IBackend` (see DN-M4-1)
   - Verify: `dotnet test --filter Category=Parity` — same F16 model decodes token-identical on CPU, CUDA, and hybrid per DN-M4-9: argmax agreement plus identical token stream, not raw-byte logits.
-- [_] Prefill offload — GPU prefill, CPU/hybrid decode (see DN-M4-5)
+- [✓] Prefill offload — GPU prefill, CPU/hybrid decode (see DN-M4-5)
   - Verify: automated parity/scheduling gate proves a prompt window can run on CUDA while the same model's decode continues on CPU or hybrid route token-identically; bench records remain owner-deferred and do not block correctness.
 - [_] Layer split — `gpu_layers` placement policy (see DN-M4-2)
   - Verify: split-point sweep (0..N) on Qwen2-1.5B; parity holds at every split point; bench records decode tok/s curve. *(parity gate active; bench deferred)*
