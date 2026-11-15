@@ -421,7 +421,7 @@ public sealed class MonitorStreamTests
 
         while (bus.PublishedTotal <= 12 && clock.Elapsed < TimeSpan.FromSeconds(90))
         {
-            SequenceHandle handle = harness.Scheduler.Submit(new ScheduledRequest
+            PipelineHandle handle = harness.Scheduler.Submit(new ScheduledRequest
             {
                 PromptTokens = promptTokens,
                 MaxTokens = 3,

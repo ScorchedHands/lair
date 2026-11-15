@@ -99,6 +99,17 @@ public static class ApiApp
 
         app.MapGet("/v1/models", () =>
         {
+            // The advertised concurrency cap is the value admissions enforce now (a live edit re-publishes it through
+            // the model facts swap); an uncapped model reports the posture explicitly so a reader never infers "no cap"
+            // from a missing key. Route segments ride in execution order, exactly as load resolved them.
+            int? concurrencyCap = gen.Model.MaxConcurrentRequests;
+            IReadOnlyList<ModelRouteSegment> routeSegments = [.. gen.ResolvedRoute.Segments.Select(segment => new ModelRouteSegment(
+                segment.DeviceId,
+                WeightTierNames.Of(segment.WeightTier),
+                segment.BatchCap,
+                segment.Quota.Threads,
+                GenerationService.FormatCoreRanges(segment.Quota.Cores)))];
+
             ModelsResponse models = new(
                 "list",
                 [new ModelEntry(
@@ -112,7 +123,10 @@ public static class ApiApp
                     gen.ModelType,
                     gen.Model.ToolParser,
                     gen.Model.Reasoning,
-                    gen.Model.SparseFfnStrategy)]);
+                    gen.Model.SparseFfnStrategy,
+                    concurrencyCap,
+                    concurrencyCap is null ? ConcurrencyCapPostures.Uncapped : "capped",
+                    routeSegments)]);
 
             return Results.Json(models, statusCode: 200);
         });
@@ -625,7 +639,7 @@ public static class ApiApp
         {
             ModelNotFoundException => (404, "invalid_request_error", "model_not_found"),
             ContextLengthExceededException => (400, "invalid_request_error", "context_length_exceeded"),
-            EngineBusyException => (503, "engine_overloaded_error", "engine_overloaded"),
+            EngineBusyException busy => (503, "engine_overloaded_error", busy.Code),
             TemplateRenderFailedException => (400, "invalid_request_error", "invalid_request"),
             ArgumentException or JsonException => (400, "invalid_request_error", "invalid_request"),
             BadHttpRequestException => (400, "invalid_request_error", "invalid_request"),

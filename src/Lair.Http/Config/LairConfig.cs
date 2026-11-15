@@ -1,3 +1,5 @@
+using Lair.Models;
+
 namespace Lair.Host.Config;
 
 /// <summary>
@@ -13,6 +15,47 @@ public sealed record LairConfig
     public required IReadOnlyList<ModelConfig> Models { get; init; }
 
     public UiConfig Ui { get; init; } = new();
+
+    /// <summary>
+    /// The resident capacity an operator declares for this host — byte and core totals per tier, with optional per-node overrides — or
+    /// null when the configuration says nothing about any of it. These are declared values exactly as the loader parsed them: what a host
+    /// actually carries is what its reported topology states, and a declaration that disagrees with it is accepted with a warning rather
+    /// than rejected. Internal today: compute accounting reads these totals against the reported posture when an engine opens.
+    /// </summary>
+    internal TierCapacityConfig? Tiers { get; init; }
+}
+
+/// <summary>
+/// Declared resident capacity for one host's tiers, in flat keys: system-memory bytes and logical processors, the disk path a read-side
+/// tier reads from, and optional per-node overrides keyed by node position. Every value is declared posture — an absent key declares no
+/// total rather than zero, and a per-node override states only what its entry names.
+/// </summary>
+public sealed record TierCapacityConfig
+{
+    /// <summary>Megabytes the operator declares at system memory; null (absent) declares no byte total.</summary>
+    public long? DramMb { get; init; }
+
+    /// <summary>Logical processors the operator declares at system memory — the unit a core set or thread quota counts in; null (absent) declares no core total.</summary>
+    public int? DramCores { get; init; }
+
+    /// <summary>The disk path this host reads from, declared as presence and path only. No byte ceiling belongs to that position: the model file already is the complete set.</summary>
+    public string? NvmePath { get; init; }
+
+    /// <summary>Per-node overrides keyed by node position, each stating its own bytes and/or cores. An override never replaces the reported posture — it disagrees with it.</summary>
+    public IReadOnlyList<NodeCapacityOverride> Nodes { get; init; } = [];
+}
+
+/// <summary>One declared per-node override: which node position it names, and only the totals that entry states.</summary>
+public sealed record NodeCapacityOverride
+{
+    /// <summary>The node position this override names, counting the nodes a host posture reports from zero.</summary>
+    public required int Index { get; init; }
+
+    /// <summary>Megabytes declared for this node; null (absent) declares nothing about its bytes.</summary>
+    public long? Mb { get; init; }
+
+    /// <summary>Logical processors declared for this node; null (absent) declares nothing about its cores.</summary>
+    public int? Cores { get; init; }
 }
 
 /// <summary>Monitor surface settings — what the live stats stream retains and replays.</summary>
@@ -43,6 +86,15 @@ public sealed record EngineConfig
     public int MaxBatchTokens { get; init; } = 512;
 
     /// <summary>
+    /// Wall-clock budget, in milliseconds (1 or greater), that a prefill step aims at. Null (absent) keeps the chunk width as
+    /// configured: every step forwards up to <see cref="MaxBatchTokens"/> prompt tokens. A present value lets the scheduler size
+    /// each future chunk from measured step cost so its forward work targets this budget, still capped by
+    /// <see cref="MaxBatchTokens"/> and never below one token; the engine's own row ceilings keep sub-batch rows bounded either
+    /// way. A hot edit takes effect from the next prefill chunk issue — a step already in flight finishes at its old width.
+    /// </summary>
+    public int? PrefillStepBudgetMs { get; init; }
+
+    /// <summary>
     /// Which attention/weight path the engine's prefill route selects: <c>gemv</c> (default — the batched row window),
     /// <c>tiled</c> (the same windows with row-tiled causal attention), or <c>gemm</c> (dense weight traversal by blocked
     /// matmul). The schema accepts all three; a selection this engine cannot run for the served file is refused at model
@@ -63,6 +115,18 @@ public sealed record ModelConfig
     public int MaxContextTokens { get; init; } = 4096;
 
     public int KvBlocks { get; init; } = 256;
+
+    /// <summary>
+    /// The per-resource budgets this model entry declares — weights, KV blocks, and prefill buffers each with their own ordered
+    /// tier chain and ceilings — or null when the entry says nothing about any of them. These are declared values exactly as the
+    /// loader parsed them; what a host can actually carry is resolved against its opened pools at engine open, not here. Internal:
+    /// no monitor or API surface reports budget claims yet, while hosts resolve these chains onto the model's plan and reload
+    /// classification routes each ceiling by its own mutation class.
+    /// </summary>
+    internal IReadOnlyList<BudgetChain>? Budgets { get; init; }
+
+    /// <summary>True when this entry wrote <c>kv_blocks</c> explicitly — presence is what separates a spelled-out number from today's default where the legacy ceiling and budgets' system-memory ceiling must state the same thing.</summary>
+    internal bool LegacyKvBlocksDeclared { get; init; }
 
     /// <summary>
     /// Tool-precedence override. When true, chat requests with declared tools always receive LAIR's fenced tool
@@ -95,10 +159,29 @@ public sealed record ModelConfig
     /// <summary>Per-model response-token budget carried with the model entry; null (absent) means unbudgeted and leaves request token limits at their existing semantics.</summary>
     public int? MaxResponseTokens { get; init; }
 
+    /// <summary>
+    /// Hard cap on how many requests this model may hold admitted at once. Null (absent) bounds nothing: every submission is
+    /// admitted as far as KV capacity reaches, exactly as before this key existed. A present value must be 1 or greater and is
+    /// enforced at admission — a submission that would exceed it is refused naming the model and its quota slot rather than
+    /// queued behind what already runs. Sequences already admitted keep their slots through a hot edit of this key; only later
+    /// submissions see the new cap.
+    /// </summary>
+    public int? MaxConcurrentRequests { get; init; }
+
     public PlacementConfig Placement { get; init; } = new();
 }
 
-/// <summary>Device, residency, and core-pinning choices for a model.</summary>
+/// <summary>The accepted values of <c>placement.prefill_lane</c>: one execution backend for every forward, or a dedicated worker lane for prompt forwards.</summary>
+public static class PlacementPrefillLaneValues
+{
+    /// <summary>Prefill and decode share the model's single execution posture — today's behavior, and what an absent key resolves to.</summary>
+    public const string Shared = "shared";
+
+    /// <summary>Prompt forwards run on a second CPU execution backend capped to its own lane share while decode composition keeps the rest of the claim.</summary>
+    public const string Dedicated = "dedicated";
+}
+
+/// <summary>Device, residency, core-pinning, and prefill-lane choices for a model.</summary>
 public sealed record PlacementConfig
 {
     public string Device { get; init; } = "cpu";
@@ -112,4 +195,24 @@ public sealed record PlacementConfig
 
     /// <summary>Hard cap on this model's worker threads (1 or greater); null leaves the engine thread choice uncapped.</summary>
     public int? ThreadQuota { get; init; }
+
+    /// <summary>Which prefill lane posture the model opens with: <c>shared</c> (default — prompt forwards ride the model's single execution backend, exactly as before this key existed) or <c>dedicated</c> (prompt forwards run on a second CPU execution backend capped to its own share of the worker claim). The split is resolved when the engine opens; changing it is a restart-only edit.</summary>
+    public string PrefillLane { get; init; } = PlacementPrefillLaneValues.Shared;
+
+    /// <summary>
+    /// Whether this model's core-set claim may overlap cores another model already claims. Default false keeps today's posture: pinned
+    /// core sets partition the machine disjointly and an overlap is refused at load naming both models. True relaxes it for this model's
+    /// own claim, which then shares held cores under the compute grant rules instead of being refused. Overlap changes what a running
+    /// engine's workers contend for, so this key is established when the engine opens — a restart-only edit like <c>core_set</c>.
+    /// </summary>
+    public bool CoreOvercommit { get; init; }
+
+    /// <summary>
+    /// The NUMA spread posture this model's placement declares: <c>auto</c> (default — placement chooses the least-loaded node the
+    /// host reports, lowest node index as tiebreak, and a pinned core set resolves to the node carrying it), <c>local</c> (one node
+    /// carries the model), or <c>interleave</c> (a spread posture across the reported nodes). The posture is decided when the engine
+    /// opens: which node its workers run on and what its weight pages first-touch to are established then, so a live edit records the
+    /// preference for later placement decisions without re-binding an opened worker pool.
+    /// </summary>
+    public string NumaSpread { get; init; } = "auto";
 }

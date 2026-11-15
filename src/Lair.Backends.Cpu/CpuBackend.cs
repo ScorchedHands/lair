@@ -100,6 +100,9 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// <summary>Worker count this backend actually runs threaded GEMV with (dispatcher plus pool workers), after quota and auto-sizing.</summary>
     public int EffectiveWorkerCount => _effectiveThreads;
 
+    /// <summary>The engine's own thread choice this backend sizes from — the ceiling a live quota edit may restore participation up to. Internal so a host can re-derive lane shares against the same value this backend caps them with.</summary>
+    internal int UncappedThreadChoice => _uncappedThreads;
+
     /// <summary>
     /// Applies a new per-model thread quota at runtime: the effective worker count becomes min(engine thread choice,
     /// quota) — lowering it idles pool workers starting with the next kernel call (the scheduler's next step), and
@@ -125,6 +128,12 @@ public sealed unsafe partial class CpuBackend : IBackend
 
     /// <summary>Physical cores detected on the machine by the topology probe (0 when detection is unavailable); see <see cref="AutoWorkerCount"/>.</summary>
     public static int DetectedPhysicalCoreCount => ThreadAffinity.DetectPhysicalCoreCount();
+
+    /// <summary>Whether this host has a real affinity seam for pool workers (Windows-only in this build; elsewhere a configured mask is the documented no-op). A host consults this before deriving a node mask for an unpinned model.</summary>
+    public static bool SupportsCorePinning => ThreadAffinity.SupportsPinning;
+
+    /// <summary>The highest logical core id a processor mask can express; ids above it cannot be pinned through this seam.</summary>
+    public const int MaxMaskableCoreId = ThreadAffinity.MaxCoreId;
 
     /// <summary>
     /// Turns on lightweight per-block execution sampling: each worker block records which logical processor it ran on, readable

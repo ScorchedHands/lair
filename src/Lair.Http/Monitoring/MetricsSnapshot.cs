@@ -96,7 +96,94 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_kv_read_footprint_blocks")] long KvReadFootprintBlocks = 0,
 
     /// <summary>Whole logical blocks excluded by declared windows at the current soft budget.</summary>
-    [property: JsonPropertyName("metrics_kv_skipped_read_blocks")] long SkippedKvReadBlocks = 0)
+    [property: JsonPropertyName("metrics_kv_skipped_read_blocks")] long SkippedKvReadBlocks = 0,
+
+    // Additive quota, route, and admission-diagnostic fields. Every one is a trailing optional parameter with an
+    // inert default, so earlier payloads and constructions read exactly as before; configuration-backed ones
+    // serialize null until the owning service attaches facts.
+
+    /// <summary>The configured admission concurrency cap for this model, or null when nothing bounds how many requests it may hold admitted at once.</summary>
+    [property: JsonPropertyName("metrics_max_concurrent_requests")] int? MaxConcurrentRequests = null,
+
+    /// <summary>The resolved execution route's segments in execution order — device identity, weight tier, batch cap, and resolved quota per segment — or null until the owning service attaches them.</summary>
+    [property: JsonPropertyName("metrics_route_segments")] IReadOnlyList<ModelRouteSegment>? RouteSegments = null,
+
+    /// <summary>Which prefill-lane posture this model opened with (<c>shared</c>, <c>dedicated</c>), or null until the owning service attaches facts.</summary>
+    [property: JsonPropertyName("metrics_prefill_lane")] string? PrefillLane = null,
+
+    /// <summary>The effective worker claim a dedicated split was derived from — zero when the posture shares one backend.</summary>
+    [property: JsonPropertyName("metrics_prefill_claim_threads")] int PrefillClaimThreads = 0,
+
+    /// <summary>The decode lane's worker cap as resolved — zero when shared.</summary>
+    [property: JsonPropertyName("metrics_prefill_decode_share_threads")] int PrefillDecodeShareThreads = 0,
+
+    /// <summary>The prefill lane's own worker cap — zero when shared.</summary>
+    [property: JsonPropertyName("metrics_prefill_lane_share_threads")] int PrefillLaneShareThreads = 0,
+
+    /// <summary>The decode lane's pinned core ids as compressed ranges, null when the posture pins nothing.</summary>
+    [property: JsonPropertyName("metrics_prefill_decode_core_set")] string? PrefillDecodeCoreSet = null,
+
+    /// <summary>The prefill lane's pinned core ids as compressed ranges, null when the posture pins nothing.</summary>
+    [property: JsonPropertyName("metrics_prefill_lane_core_set")] string? PrefillLaneCoreSet = null,
+
+    /// <summary>Total bytes of mutable activation storage the dedicated lane family holds at open — zero for a shared posture.</summary>
+    [property: JsonPropertyName("metrics_prefill_activation_bytes")] long PrefillActivationBytes = 0,
+
+    /// <summary>The row width the opened engine resolved for its prompt windows, before any declared prefill-buffer ceiling — reported beside the lane's activation bytes so a step-time fact and a buffer-bound fact read together.</summary>
+    [property: JsonPropertyName("metrics_prefill_row_width")] int PrefillRowWidth = 0,
+
+    /// <summary>The row width the opened engine actually runs its prompt windows at: the resolved width when nothing declared bounds it, narrowed to what a prefill-buffer ceiling allows otherwise.</summary>
+    [property: JsonPropertyName("metrics_effective_prefill_row_width")] int EffectivePrefillRowWidth = 0,
+
+    /// <summary>Total mutable activation bytes the opened engine holds for its prompt windows' working set — what a prefill-buffer claim states against its chain.</summary>
+    [property: JsonPropertyName("metrics_prefill_working_set_bytes")] long PrefillWorkingSetBytes = 0,
+
+    /// <summary>What narrowed the engine's row window, in the binding ceiling's own words — tier and cap, one sub-batch row's activation bytes, requested against allowed width; null when no declared ceiling bound the window.</summary>
+    [property: JsonPropertyName("metrics_prefill_row_clamp")] string? PrefillRowClamp = null,
+
+    /// <summary>Submissions the admission control plane refused since this bus opened, whatever their caller answered with.</summary>
+    [property: JsonPropertyName("metrics_admission_refusals_total")] long AdmissionRefusalsTotal = 0,
+
+    /// <summary>The most recent admission refusals, newest first: each names the limit kind that blocked, the model, and a concise reason. Bounded to the latest <see cref="EngineMetricsBus.AdmissionRefusalRingCapacity"/>.</summary>
+    [property: JsonPropertyName("metrics_admission_refusals")] IReadOnlyList<AdmissionRefusalEntry>? AdmissionRefusals = null,
+
+    /// <summary>Host device-ledger occupancy: one entry per tier position a seated claim holds, each with the tier's capacity posture and contested holders where several claimants share it; null until the owning service attaches facts and whenever no claim has seated.</summary>
+    [property: JsonPropertyName("metrics_ledger_occupancy")] IReadOnlyList<LedgerOccupancyEntry>? LedgerOccupancy = null,
+
+    /// <summary>The worker share this model asked to run with (engine thread choice capped by its own quota); null until the owning service attaches compute facts.</summary>
+    [property: JsonPropertyName("metrics_compute_requested_threads")] int? ComputeRequestedThreads = null,
+
+    /// <summary>The logical processors that claim was granted — below requested where an earlier seat clamped it; null until compute facts attach.</summary>
+    [property: JsonPropertyName("metrics_compute_granted_threads")] int? ComputeGrantedThreads = null,
+
+    /// <summary>True when this model opted into sharing cores another claim holds; null while the disjoint posture stands or before compute facts attach.</summary>
+    [property: JsonPropertyName("metrics_core_overcommit")] bool? CoreOvercommit = null,
+
+    /// <summary>The models whose participation rides logical processors a grant already holds — null whenever every seated share is its own.</summary>
+    [property: JsonPropertyName("metrics_shared_cores_models")] IReadOnlyList<string>? SharedCoreModels = null,
+
+    // Additive placement facts (earlier shapes untouched): the node an opened engine seated its worker claim on beside the
+    // posture placement applied and the posture the configuration declared, the per-node share the grant seated, and any
+    // advisory stating why a posture could not be honoured from what the host reported. A live edit of the spread key
+    // records the preference for later placement decisions; these stay as the open resolved them.
+
+    /// <summary>The single node this engine's worker claim seated on; null for a posture that spread across nodes or until placement facts attach.</summary>
+    [property: JsonPropertyName("metrics_placement_node")] int? PlacementNode = null,
+
+    /// <summary>Every node the opened placement chose, as a comma-separated list of node positions.</summary>
+    [property: JsonPropertyName("metrics_placement_nodes")] string? PlacementNodes = null,
+
+    /// <summary>The spread posture placement applied at open (<c>auto</c>, <c>local</c>, <c>interleave</c>); null until placement facts attach.</summary>
+    [property: JsonPropertyName("metrics_placement_spread")] string? PlacementSpread = null,
+
+    /// <summary>The spread posture the model's configuration declared, beside the posture placement resolved it to.</summary>
+    [property: JsonPropertyName("metrics_placement_spread_requested")] string? PlacementSpreadRequested = null,
+
+    /// <summary>The logical processors this model's grant seated as its own on each node, as <c>node:cores</c> pairs; null until compute facts attach or when the claim seated none.</summary>
+    [property: JsonPropertyName("metrics_compute_node_allocations")] string? PlacementNodeAllocations = null,
+
+    /// <summary>Why the opened posture could not be honoured whole from what the host reported; null when it was honoured.</summary>
+    [property: JsonPropertyName("metrics_placement_advisory")] string? PlacementAdvisory = null)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

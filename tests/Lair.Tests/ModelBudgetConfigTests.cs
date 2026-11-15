@@ -1,0 +1,390 @@
+using Lair.Host.Config;
+using Lair.Models;
+
+namespace Lair.Tests;
+
+[Trait("Category", "Config")]
+public sealed class ModelBudgetConfigTests : IDisposable
+{
+    private readonly List<string> _tempPaths = [];
+
+    public void Dispose()
+    {
+        foreach (string path in _tempPaths)
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (IOException)
+            {
+                // Best-effort cleanup of temp fixtures.
+            }
+        }
+    }
+
+    [Fact]
+    public void Load_BudgetChains_ParseDeclaredOrdersAndCeilings()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  weights:
+                    order: [dram, nvme]
+                    caps:
+                      dram_mb: 2048
+                  kv:
+                    order: [dram]
+                    caps:
+                      dram_blocks: 512
+                  prefill_buffers:
+                    order: [dram]
+
+            """;
+
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+        ModelConfig model = Assert.Single(config.Models);
+
+        Assert.NotNull(model.Budgets);
+        Assert.Equal(3, model.Budgets.Count);
+
+        BudgetChain weights = ChainOf(model.Budgets, BudgetResource.Weights);
+        Assert.Equal([BudgetTier.Dram, BudgetTier.Nvme], weights.Order);
+        Assert.Equal(2048L, weights.Caps[BudgetTier.Dram]);
+        Assert.False(weights.Caps.ContainsKey(BudgetTier.Nvme)); // an uncapped position states no ceiling rather than some default one.
+
+        BudgetChain kv = ChainOf(model.Budgets, BudgetResource.Kv);
+        Assert.Equal([BudgetTier.Dram], kv.Order);
+        Assert.Equal(512L, kv.Caps[BudgetTier.Dram]);
+
+        BudgetChain buffers = ChainOf(model.Budgets, BudgetResource.PrefillBuffers);
+        Assert.Equal([BudgetTier.Dram], buffers.Order);
+        Assert.Empty(buffers.Caps);
+
+        // The declared system-memory KV ceiling is what sizes the reservation here: budgets alone carry it exactly as 'kv_blocks' did.
+        Assert.Equal(512, model.KvBlocks);
+        Assert.False(model.LegacyKvBlocksDeclared);
+    }
+
+    [Fact]
+    public void Load_BothSpellingsAgree_AcceptsAndRecordsLegacyPresence()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                kv_blocks: 512
+                budgets:
+                  kv:
+                    order: [dram]
+                    caps:
+                      dram_blocks: 512
+
+            """;
+
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+        ModelConfig model = Assert.Single(config.Models);
+
+        Assert.Equal(512, model.KvBlocks); // startup sizing stays exactly what it was today.
+        Assert.True(model.LegacyKvBlocksDeclared);
+    }
+
+    [Fact]
+    public void Load_BothSpellingsDisagree_FailsNamingModelAndEachPathValue()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                kv_blocks: 640
+                budgets:
+                  kv:
+                    order: [dram]
+                    caps:
+                      dram_blocks: 512
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("model 'qwen-test'", error.Message);
+        Assert.Contains("models[0].kv_blocks 640", error.Message);
+        Assert.Contains("models[0].budgets.kv.caps.dram_blocks 512", error.Message);
+    }
+
+    [Fact]
+    public void Load_LegacyKeyAlone_BehavesExactlyAsBefore()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                kv_blocks: 320
+            """;
+
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+        ModelConfig model = Assert.Single(config.Models);
+
+        Assert.Equal(320, model.KvBlocks);
+        Assert.True(model.LegacyKvBlocksDeclared);
+        Assert.Null(model.Budgets); // no budgets block declares nothing: today's behavior is the empty posture.
+    }
+
+    [Fact]
+    public void Load_BudgetedCeilingBelowLegacyFloor_FailsWithTheSameFloorAsKvBlocks()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  kv:
+                    order: [dram]
+                    caps:
+                      dram_blocks: 4
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].budgets.kv.caps.dram_blocks 4", error.Message);
+        Assert.Contains("8 or greater", error.Message);
+    }
+
+    [Fact]
+    public void Load_UnknownResourceKey_FailsNamingPathAndAcceptedResources()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  layers:
+                    order: [dram]
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("Unknown key 'layers' under models[0].budgets", error.Message);
+        Assert.Contains("weights, kv, prefill_buffers", error.Message);
+    }
+
+    [Fact]
+    public void Load_CapKeyInWrongUnit_FailsNamingResourceVocabulary()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  weights:
+                    order: [dram]
+                    caps:
+                      dram_blocks: 256
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].budgets.weights.caps.dram_blocks", error.Message);
+        Assert.Contains("'weights' ceilings are named 'dram_mb', 'vram_mb', 'nvme_mb'", error.Message);
+    }
+
+    [Fact]
+    public void Load_UnknownTierInOrder_FailsNamingValueAndAcceptedTiers()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  kv:
+                    order: [disk]
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].budgets.kv.order 'disk' is invalid for model 'qwen-test'", error.Message);
+        Assert.Contains("'dram', 'vram', 'nvme'", error.Message);
+    }
+
+    [Fact]
+    public void Load_OutOfOrderChain_FailsNamingTheOffendingChain()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  weights:
+                    order: [nvme, dram]
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].budgets.weights.order 'nvme', 'dram' is out of order for model 'qwen-test'", error.Message);
+    }
+
+    [Fact]
+    public void Load_RepeatedTierInOrder_Fails()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  kv:
+                    order: [dram, vram, dram]
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("names each tier exactly once", error.Message);
+    }
+
+    [Fact]
+    public void Load_EmptyOrder_FailsNamingResourceToOmit()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  prefill_buffers:
+                    order: []
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].budgets.prefill_buffers.order is empty for model 'qwen-test'", error.Message);
+        Assert.Contains("omit 'prefill_buffers' entirely", error.Message);
+    }
+
+    [Fact]
+    public void Load_OrderKeyMissing_FailsNamingSubmapping()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  kv:
+                    caps:
+                      dram_blocks: 256
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("Missing required key 'order' under models[0].budgets.kv", error.Message);
+    }
+
+    [Fact]
+    public void Load_NonPositiveCeiling_FailsNamingPathAndValue()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  prefill_buffers:
+                    order: [dram]
+                    caps:
+                      dram_mb: 0
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].budgets.prefill_buffers.caps.dram_mb 0", error.Message);
+        Assert.Contains("must be 1 or greater", error.Message);
+    }
+
+    [Fact]
+    public void Load_CeilingBindsTierChainDoesNotName_FailsPointingAtOrder()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  weights:
+                    order: [dram]
+                    caps:
+                      vram_mb: 512
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].budgets.weights.caps.vram_mb", error.Message);
+        Assert.Contains("declare 'vram' there to cap it", error.Message);
+    }
+
+    [Fact]
+    public void Load_WeightCeilingAtOriginStore_RefusedAsNotYetMeaningful()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  weights:
+                    order: [dram, nvme]
+                    caps:
+                      dram_mb: 1024
+                      nvme_mb: 2048
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].budgets.weights.caps.nvme_mb", error.Message);
+        Assert.Contains("no model-level ceiling describes that position", error.Message);
+    }
+
+    [Fact]
+    public void Load_FutureShapedChain_AcceptsStructurallyWhereNothingNeedsItYet()
+    {
+        // A declared accelerator tier is vocabulary before anything resident sits there — the posture refusal belongs to resolution against opened pools, not to parsing a declaration.
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  kv:
+                    order: [dram, vram]
+
+            """;
+
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+        ModelConfig model = Assert.Single(config.Models);
+
+        BudgetChain kv = ChainOf(model.Budgets!, BudgetResource.Kv);
+        Assert.Equal([BudgetTier.Dram, BudgetTier.Vram], kv.Order);
+    }
+
+    private static BudgetChain ChainOf(IReadOnlyList<BudgetChain> chains, BudgetResource resource)
+    {
+        foreach (BudgetChain chain in chains)
+        {
+            if (chain.Resource == resource)
+            {
+                return chain;
+            }
+        }
+
+        throw new InvalidOperationException($"the configuration declared no chain for '{resource}'");
+    }
+
+    private string WriteConfig(string yaml)
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"lair-budget-config-{Guid.NewGuid():N}.yaml");
+        File.WriteAllText(path, yaml);
+        _tempPaths.Add(path);
+        return path;
+    }
+
+    private string TempModelFile()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"lair-budget-model-{Guid.NewGuid():N}.gguf");
+        File.WriteAllBytes(path, [0x47, 0x47, 0x55, 0x46]);
+        _tempPaths.Add(path);
+        return path;
+    }
+}

@@ -27,6 +27,18 @@ public sealed class SchedulerStats
     /// <summary>Prompt tokens prefilled (forwarded through the engine) across all those chunks.</summary>
     public long PrefillTokensForwarded;
 
+    /// <summary>Total microseconds spent inside prefill chunk forwards across all executed steps — the step-time side of the same accounting <see cref="DecodeWindowMicrosTotal"/> carries for decode windows.</summary>
+    public long PrefillStepMicrosTotal;
+
+    /// <summary>Sum over prefill chunks of how many sub-batched forwards each one ran under this engine's row window — divide by <see cref="PrefillChunksIssued"/> for average sub-batches per step. Kept apart from chunk token count because a budget bounds the width and a buffer ceiling bounds the rows.</summary>
+    public long PrefillSubBatchSum;
+
+    /// <summary>Prefill chunks this scheduler issued under an engine whose row window is narrowed by a declared prefill-buffer ceiling — zero whenever no such ceiling binds, so it reads apart from <see cref="PrefillChunksIssued"/> without reshaping it.</summary>
+    public long ClampedPrefillChunksIssued;
+
+    /// <summary>Widest prefill sub-batch this scheduler has ever handed the engine, sampled at each issued chunk — never past what that engine's row window allows, a declared prefill-buffer ceiling included.</summary>
+    public int PeakPrefillSubBatchRows;
+
     /// <summary>Tokens advanced by decode steps — every generated token except a final eos, so it matches outcomes' completion counts.</summary>
     public long DecodeTokensAdvanced;
 

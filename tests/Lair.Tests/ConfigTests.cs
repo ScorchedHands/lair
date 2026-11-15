@@ -1,4 +1,5 @@
 using Lair.Host.Config;
+using Lair.Models;
 
 namespace Lair.Tests;
 
@@ -198,6 +199,7 @@ public sealed class ConfigTests : IDisposable
 
         Assert.Contains("placement.device 'cuda'", error.Message);
         Assert.Contains("only accepted value for 'device' is 'cpu'", error.Message);
+        Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -208,6 +210,7 @@ public sealed class ConfigTests : IDisposable
 
         Assert.Contains("placement.kv_residency 'vram'", error.Message);
         Assert.Contains("only accepted value for 'kv_residency' is 'dram'", error.Message);
+        Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -218,6 +221,7 @@ public sealed class ConfigTests : IDisposable
 
         Assert.Contains("placement.prefill 'gpu'", error.Message);
         Assert.Contains("only accepted value for 'prefill' is 'cpu'", error.Message);
+        Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -335,6 +339,39 @@ public sealed class ConfigTests : IDisposable
                 """)));
             Assert.Contains($"engine.max_batch_tokens {invalid}", error.Message);
             Assert.Contains("'max_batch_tokens' must be 1 or greater", error.Message);
+        }
+    }
+
+    [Fact]
+    public void Load_PrefillStepBudgetMs_DefaultsValidatesAndRejects()
+    {
+        LairConfig defaulted = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """));
+        Assert.Null(defaulted.Engine.PrefillStepBudgetMs); // absent means chunk width keeps coming from max_batch_tokens alone
+
+        LairConfig configured = YamlConfigLoader.Load(WriteConfig($"""
+            engine:
+              prefill_step_budget_ms: 120
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """));
+        Assert.Equal(120, configured.Engine.PrefillStepBudgetMs);
+
+        foreach (int invalid in new[] { 0, -3 })
+        {
+            ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+                engine:
+                  prefill_step_budget_ms: {invalid}
+                models:
+                  - name: qwen-test
+                    path: '{TempModelFile()}'
+                """)));
+            Assert.Contains($"engine.prefill_step_budget_ms {invalid}", error.Message);
+            Assert.Contains("'prefill_step_budget_ms' must be 1 or greater", error.Message);
         }
     }
 
@@ -511,6 +548,58 @@ public sealed class ConfigTests : IDisposable
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
         Assert.Contains($"models[0].placement.thread_quota {quota}", error.Message);
         Assert.Contains("'thread_quota' must be 1 or greater", error.Message);
+    }
+
+    [Fact]
+    public void Load_MaxConcurrentRequests_ParsesAndDefaultsToNull()
+    {
+        LairConfig capped = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_concurrent_requests: 3
+            """));
+
+        Assert.Equal(3, capped.Models[0].MaxConcurrentRequests);
+
+        LairConfig absent = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """));
+
+        Assert.Null(absent.Models[0].MaxConcurrentRequests); // absent bounds nothing, exactly as before this key existed
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-2)]
+    public void Load_MaxConcurrentRequestsTooSmall_Fails(int cap)
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_concurrent_requests: {cap}
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains($"models[0].max_concurrent_requests {cap}", error.Message);
+        Assert.Contains("'max_concurrent_requests' must be 1 or greater", error.Message);
+    }
+
+    [Fact]
+    public void Load_MaxConcurrentRequestsNonInteger_Fails()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_concurrent_requests: two
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].max_concurrent_requests must be an integer value.", error.Message);
     }
 
     [Fact]

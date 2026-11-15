@@ -17,16 +17,18 @@ public sealed class ModelNotFoundException : Exception
 }
 
 /// <summary>
-/// The prompt alone does not fit the model's context window, so generation cannot start.
+/// The prompt alone does not fit the model's context window, so generation cannot start. This is the request layer's token-budget refusal:
+/// it names the model and the limit kind that blocked — the resolved context window — alongside the counts a caller can act on. A null model id
+/// keeps the generic wording for callers that have no named model to report.
 /// </summary>
 public sealed class ContextLengthExceededException : Exception
 {
-    public ContextLengthExceededException(long promptTokens, long limit)
-        : base($"prompt is {promptTokens} tokens but the model context is {limit} tokens, and at least one token " +
-               "must stay free for generation. Shorten the prompt or raise max_context_tokens and kv_blocks in the config.")
+    public ContextLengthExceededException(long promptTokens, long limit, string? modelId = null)
+        : base(BuildMessage(promptTokens, limit, modelId))
     {
         PromptTokens = promptTokens;
         Limit = limit;
+        ModelId = modelId;
     }
 
     /// <summary>Token count of the rejected prompt.</summary>
@@ -34,10 +36,23 @@ public sealed class ContextLengthExceededException : Exception
 
     /// <summary>The context limit the prompt was measured against.</summary>
     public long Limit { get; }
+
+    /// <summary>The served model id, when its caller named one: every refusal then names it alongside the token-budget limit that blocked.</summary>
+    public string? ModelId { get; }
+
+    private static string BuildMessage(long promptTokens, long limit, string? modelId) =>
+        (modelId is null ? "" : $"model '{modelId}' cannot start this generation: ") +
+        $"prompt is {promptTokens} tokens but the context window is {limit} tokens, and at least one token " +
+        "must stay free for generation. Shorten the prompt or raise max_context_tokens and kv_blocks in the config.";
 }
 
 /// <summary>
-/// The KV pool cannot back this request's prompt plus token budget alongside what is already running.
+/// The engine cannot admit this request right now: either its prompt plus token budget exceeds what the KV pool can back (kv_capacity), or every
+/// admission slot of the model's concurrency cap is held by sequences already admitted (max_concurrent_requests), or the host device ledger's shared
+/// copy-holding chain exhausted before this submission's reservation could be seated anywhere (budget exhaustion). All refusals surface through
+/// this one overload-family type so callers keep a single bounded error shape; each factory names the limit kind, the model it belongs to, and the
+/// wire code that distinguishes it — the capacity and quota refusals keep the code they have always answered with, and a ledger exhaustion answers
+/// with its own. The default form covers an engine-side failure observed mid-run, where no fresh admission decision exists to name.
 /// </summary>
 public sealed class EngineBusyException : Exception
 {
@@ -45,7 +60,36 @@ public sealed class EngineBusyException : Exception
         : base("the engine cannot admit this request: its prompt plus token budget exceeds the token slots the " +
                "KV pool can back. Retry once the running generations finish, or raise kv_blocks in the config.")
     {
+        Code = "engine_overloaded";
     }
+
+    private EngineBusyException(string message, string code)
+        : base(message)
+    {
+        Code = code;
+    }
+
+    /// <summary>The wire error code this refusal answers with: <c>engine_overloaded</c> for the capacity and quota refusals, <c>budget_exhausted</c> for a host-ledger chain exhaustion.</summary>
+    public string Code { get; }
+
+    /// <summary>The refusal for a submission whose prompt plus token budget outruns the KV pool's free slots (kv_capacity).</summary>
+    public static EngineBusyException ForKvCapacity(string modelId, long freeSlots) =>
+        new($"model '{modelId}' cannot admit this request against its kv_capacity: its prompt plus token budget exceeds " +
+            $"the {freeSlots} token slots the KV pool can back right now. Retry once the running generations finish, or raise kv_blocks in the config.",
+            "engine_overloaded");
+
+    /// <summary>The refusal for a submission arriving while every admission slot of the model's concurrency cap is held (max_concurrent_requests).</summary>
+    public static EngineBusyException ForConcurrencyQuota(string modelId, int maxConcurrentRequests) =>
+        new($"model '{modelId}' cannot admit this request against its concurrency quota: all {maxConcurrentRequests} admission slots of " +
+            "'max_concurrent_requests' are held by sequences already admitted. Retry once a running generation finishes, or raise " +
+            "max_concurrent_requests in the config.",
+            "engine_overloaded");
+
+    /// <summary>The refusal for a submission the host device ledger's shared copy-holding chain could not seat: the chain is exhausted at the named tier, and the breakdown says what every consulted position holds. The ledger's exhaustion is host-scoped accounting across opened pools — never a re-decision of this engine's own KV cap — so it rides the same bounded overload family with its own code.</summary>
+    public static EngineBusyException ForBudgetExhaustion(string modelId, Lair.Models.BudgetResource resource, Lair.Models.BudgetTier tier, string breakdown) =>
+        new($"model '{modelId}' cannot admit this request against its budgets: the host ledger exhausted the '{Lair.Models.BudgetResourceNames.Of(resource)}' copy-holding chain at tier " +
+            $"'{Lair.Models.BudgetTierNames.Of(tier)}'. {breakdown}. Retry once the running generations finish, or raise the ceiling this chain declares in the config.",
+            "budget_exhausted");
 }
 
 /// <summary>

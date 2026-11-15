@@ -213,7 +213,7 @@ public sealed class MetricsTests
 
         while (bus.PublishedTotal <= EngineMetricsBus.RingCapacity && clock.Elapsed < TimeSpan.FromSeconds(60))
         {
-            SequenceHandle handle = harness.Scheduler.Submit(new ScheduledRequest
+            PipelineHandle handle = harness.Scheduler.Submit(new ScheduledRequest
             {
                 PromptTokens = promptTokens,
                 MaxTokens = 3,

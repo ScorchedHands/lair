@@ -20,13 +20,20 @@ namespace Lair.Http;
 /// Single-model generation facade: opens one configured GGUF model (weights, forward engine, tokenizer,
 /// chat template, paged KV pool) and runs <see cref="GenerationRequest"/>s against it. Requests are admitted
 /// to a continuous-batching scheduler, so admitted sequences decode together in shared steps and a long
-/// prompt never blocks shorter ones. A request is refused with <see cref="EngineBusyException"/> only when
-/// the KV pool cannot back its prompt plus token budget.
+/// prompt never blocks shorter ones. Admission refusals keep one coherent taxonomy naming the limit kind that blocked:
+/// <see cref="EngineBusyException"/> for kv_capacity (the pool cannot back this request's prompt plus token budget) or for the model's
+/// concurrency quota (<c>max_concurrent_requests</c> fully held by admitted sequences), and <see cref="ContextLengthExceededException"/> for the
+/// resolved token-budget window; each names the served model.
 /// </summary>
 public sealed class GenerationService : IDisposable
 {
     private readonly GgufFile _file;
     private readonly CpuBackend _backend;
+
+    // The dedicated prefill lane this model opened with, when placement declared one: the second execution backend prompt windows run on and the load-resolved split that capped it. Worker pools, masks, activation buffers, and collision posture are facts of this pair for the engine's whole lifetime — a live thread-quota edit re-derives only the decode side from them, and an unmappable edit is refused against them rather than half-applied. Null for every shared-posture model, where nothing here changes behavior.
+    private readonly CpuBackend? _prefillsBackend;
+    private readonly PrefillLaneLayout? _prefillsLane;
+
     private readonly TransformerModel _model;
     private readonly GgufTokenizer _tokenizer;
     private readonly MinjaChatTemplate? _chatTemplate;
@@ -46,6 +53,26 @@ public sealed class GenerationService : IDisposable
     private readonly GenerationScheduler _scheduler;
     private EngineMetricsBus? _metrics;
 
+    // The host device ledger this engine's claims register against. Supplied by hosts that keep host-scoped accounting
+    // across several opened engines; otherwise the ledger a host opens over the tiers its pools back, with each opened
+    // tier stating the explicit unbounded capacity posture — a public total no one declared is never invented. Weight,
+    // KV, and prefill claims land here in registration order; the ledger records what the chains decided and bounds
+    // nothing that the existing pool and scheduler seams do not already bound.
+    private DeviceLedger? _ledger;
+
+    // The host compute accounting this engine's worker claim registered against, and the share its own backend runs with. Supplied by hosts
+    // that keep capacity accounting across several opened engines — then earlier claims cap this model's participation rather than refusing
+    // it — and otherwise derived from this process's reported topology over an empty ledger. The grant is what monitor facts report as
+    // requested against granted, so a partial seat reads the same way on every surface that reports worker counts.
+    private ComputeCapacityLedger? _compute;
+    private ComputeGrant? _computeGrant;
+
+    // The placement this engine's worker claim seated on: the node (or nodes) placement chose for this model beside the posture it
+    // declared and the posture placement applied. Established when the engine opens — a live edit of the spread key records the new
+    // preference for later placement decisions while this value, the opened worker pool, and the posture its weight pages first-touched
+    // to stay exactly as the open resolved them.
+    private NumaPlacement? _placement;
+
     // Generations currently publishing monitor lifecycle frames, keyed by their stream request id — the in-flight
     // half of a resync state dump. Trackers are added at admission and removed when their completion frame publishes.
     private readonly ConcurrentDictionary<string, RequestTracker> _monitoredRequests = new(StringComparer.Ordinal);
@@ -60,6 +87,15 @@ public sealed class GenerationService : IDisposable
 
     /// <summary>The metrics bus attached by the API host, if any — null for hosts that never attach one.</summary>
     internal EngineMetricsBus? Metrics => _metrics;
+
+    /// <summary>The resolved dedicated prefill-lane layout this model opened with — null for every shared-posture model. The load-resolved split live quota edits map against. Internal diagnostics for hosts and tests; monitor reporting is a later seam.</summary>
+    internal PrefillLaneLayout? DedicatedPrefillLanes => _prefillsLane;
+
+    /// <summary>The worker cap the lane's execution backend holds from open — null when the model shares its single backend. Internal diagnostics for hosts and tests.</summary>
+    internal int? DedicatedPrefillLaneWorkerCap => _prefillsBackend?.EffectiveWorkerCount;
+
+    /// <summary>The placement this engine's worker claim seated on, resolved when the engine opened — null until then. Internal diagnostics for hosts and tests.</summary>
+    internal NumaPlacement? ResolvedPlacement => _placement;
 
     private bool _disposed;
 
@@ -77,10 +113,14 @@ public sealed class GenerationService : IDisposable
         BlockPool pool,
         GenerationScheduler scheduler,
         ModelInfo info,
-        LairConfig config)
+        LairConfig config,
+        CpuBackend? prefillsBackend = null,
+        PrefillLaneLayout? prefillsLane = null)
     {
         _file = file;
         _backend = backend;
+        _prefillsBackend = prefillsBackend;
+        _prefillsLane = prefillsLane;
         _model = model;
         _tokenizer = tokenizer;
         _chatTemplate = chatTemplate;
@@ -151,28 +191,139 @@ public sealed class GenerationService : IDisposable
         return bus;
     }
 
+    // The route load resolved for the served model, assembly-internal so loader-side validation can read what a host's
+    // placement became instead of re-deriving it: step composition reads this same value through the opened plan.
+    internal ModelRoute ResolvedRoute => _model.Plan.Route;
+
     // Snapshot identity/placement facts straight from the configuration in force, the backend's live worker count, and
-    // the formats the opened model's dense weight matrices actually carry.
+    // the formats the opened model's dense weight matrices actually carry. Quota posture rides too: the concurrency cap
+    // as configured now (a hot edit re-pushes it with everything else), the resolved route's segments in execution order,
+    // and — for a dedicated lane posture — the load-resolved split, each side's pinned mask, and what the engine sized
+    // its lane activation family from. A shared posture reports only the posture itself; nothing here re-derives what
+    // open already resolved.
     private ModelFacts BuildMonitorFacts(LairConfig config) => new(
         config.Models[0].Type,
         _backend.EffectiveWorkerCount,
-        FormatCoreSet(config.Models[0].Placement.CoreSet),
+        FormatCoreRanges(config.Models[0].Placement.CoreSet),
         config.Models[0].Placement.ThreadQuota,
         config.Models[0].Placement.Device,
         config.Models[0].Placement.Prefill,
         config.Models[0].Placement.KvResidency,
         config.Engine.PrefillKernel,
-        string.Join(", ", _model.MatmulWeightFormats));
+        string.Join(", ", _model.MatmulWeightFormats),
+        config.Models[0].MaxConcurrentRequests,
+        BuildRouteSegmentFacts(ResolvedRoute),
+        config.Models[0].Placement.PrefillLane == PlacementPrefillLaneValues.Dedicated
+            ? PlacementPrefillLaneValues.Dedicated
+            : PlacementPrefillLaneValues.Shared,
+        PrefillClaimThreads: _prefillsLane?.EffectiveClaimThreads ?? 0,
+        PrefillDecodeShareThreads: _prefillsLane?.DecodeShareThreads ?? 0,
+        PrefillLaneShareThreads: _prefillsBackend?.EffectiveWorkerCount ?? 0,
+        PrefillDecodeCoreSet: FormatCoreRanges(_prefillsLane?.DecodeCoreIds),
+        PrefillLaneCoreSet: FormatCoreRanges(_prefillsLane?.PrefillCoreIds),
+        PrefillActivationBytes: _model.PrefillLaneActivationBytes,
+        PrefillRowWidth: _model.ResolvedPrefillRowWidth,
+        EffectivePrefillRowWidth: _model.EffectivePrefillRowWidth,
+        PrefillWorkingSetBytes: _model.PrefillWorkingSetBytes,
+        PrefillRowClamp: _model.PrefillRowClamp?.Describe(),
+        LedgerOccupancy: BuildLedgerOccupancy(_ledger),
+        ComputeRequestedThreads: _computeGrant?.RequestedCores,
+        ComputeGrantedThreads: _computeGrant?.GrantedCores,
+        CoreOvercommit: config.Models[0].Placement.CoreOvercommit ? true : null,
+        SharedCoreModels: BuildSharedCoreFacts(_compute, _computeGrant),
+        PlacementNode: _placement is { NodeIndices.Count: 1 } openedPlacement ? openedPlacement.NodeIndices[0] : null,
+        PlacementNodes: _placement is null ? null : string.Join(",", _placement.NodeIndices),
+        PlacementSpread: _placement is null ? null : NumaSpreadNames.Of(_placement.Applied),
+        PlacementSpreadRequested: _placement is null ? null : NumaSpreadNames.Of(_placement.Requested),
+        PlacementNodeAllocations: _computeGrant is { NodeAllocations.Count: > 0 } seatedGrant ? seatedGrant.NodeAllocationText() : null,
+        PlacementAdvisory: _placement?.Advisory);
 
-    // Pinned core ids as compressed ranges ("0-23", "1, 4-6"); null when nothing is pinned.
-    private static string? FormatCoreSet(IReadOnlySet<int> cores)
+    // Which seated compute grants ride logical processors another grant already holds — the models an operator needs to see together when a
+    // share was clamped or opted into overlap. Nothing shared reports null, so snapshots of a host where every grant is its own read exactly as they did before this fact existed.
+    private static IReadOnlyList<string>? BuildSharedCoreFacts(ComputeCapacityLedger? compute, ComputeGrant? grant)
     {
-        if (cores.Count == 0)
+        if (compute is null || grant is null || !grant.SharesHeldCores)
+        {
+            return null;
+        }
+
+        List<string> models = [.. compute.ModelsSharingHeldCores];
+        if (!models.Contains(grant.Model))
+        {
+            models.Add(grant.Model);
+        }
+
+        return models;
+    }
+
+    // The resolved route as the monitor and the model listing report it: segments in execution order, each with its
+    // device identity, residency tier, batch cap, and quota exactly as load resolved them. Live edits move worker
+    // participation against a segment; they never rewrite which segments exist or what those carry.
+    private static IReadOnlyList<ModelRouteSegment> BuildRouteSegmentFacts(ModelRoute route) =>
+        [.. route.Segments.Select(segment => new ModelRouteSegment(
+            segment.DeviceId,
+            WeightTierNames.Of(segment.WeightTier),
+            segment.BatchCap,
+            segment.Quota.Threads,
+            FormatCoreRanges(segment.Quota.Cores)))];
+
+    // Additive ledger occupancy for operator views: one entry per tier position a seated claim holds, carrying the
+    // opened seam's capacity posture, what the claims hold against it, and the contested holders only where several
+    // claimants share a tier. A ledger that seated no claims reports nothing, so snapshots of an engine that claims
+    // nothing — every model declaring no budgets today — read exactly as they did before the ledger seam existed.
+    private static IReadOnlyList<LedgerOccupancyEntry>? BuildLedgerOccupancy(DeviceLedger? ledger)
+    {
+        if (ledger is null)
+        {
+            return null;
+        }
+
+        IReadOnlyList<DeviceLedgerClaim> claims = ledger.Claims;
+        if (claims.Count == 0)
+        {
+            return null;
+        }
+
+        List<LedgerOccupancyEntry> entries = [];
+        foreach (DeviceLedgerClaim claim in claims)
+        {
+            if (entries.Exists(entry => entry.Resource == BudgetResourceNames.Of(claim.Resource) && entry.Tier == BudgetTierNames.Of(claim.Tier)))
+            {
+                continue;
+            }
+
+            CapacitySeam? seam = ledger.SeamFor(claim.Tier, claim.Resource);
+            IReadOnlyList<DeviceLedgerClaim> holders = ledger.ClaimsAt(claim.Tier, claim.Resource);
+            bool contested = holders.Count > 1;
+
+            entries.Add(new LedgerOccupancyEntry(
+                BudgetResourceNames.Of(claim.Resource),
+                BudgetTierNames.Of(claim.Tier),
+                DeviceLedger.UnitName(claim.Resource),
+                seam?.Capacity,
+                holders.Sum(holder => holder.Amount),
+                contested,
+                contested ? [.. holders.Select(holder => new LedgerHolderEntry(holder.Model, holder.Amount))] : null));
+        }
+
+        return [.. entries];
+    }
+
+    // Pinned core ids as compressed ranges ("0-23", "1, 4-6"); null when nothing is pinned. Accepts any id set —
+    // a placement's own pins or one lane side of a dedicated split reads through the same formatter so every core fact
+    // on either surface renders alike.
+    internal static string? FormatCoreRanges(IEnumerable<int>? cores)
+    {
+        if (cores is null)
         {
             return null;
         }
 
         int[] sorted = [.. cores];
+        if (sorted.Length == 0)
+        {
+            return null;
+        }
         Array.Sort(sorted);
 
         List<string> ranges = [];
@@ -282,16 +433,54 @@ public sealed class GenerationService : IDisposable
                             "prefill chunk width takes effect at the next step boundary; sequences mid-chunk finish that chunk at the old width"));
                         break;
 
+                    case "engine.prefill_step_budget_ms":
+                        _scheduler.ApplyPrefillStepBudget(candidate.Engine.PrefillStepBudgetMs);
+                        effective = effective with { Engine = effective.Engine with { PrefillStepBudgetMs = candidate.Engine.PrefillStepBudgetMs } };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            change.NewValue == "(unset)"
+                                ? "prefill chunk width returns to the configured ceiling from the next chunk issue; a forward already running finishes at whatever width was chosen before this edit"
+                                : $"future prefill chunks are sized from measured step cost toward {change.NewValue} ms within the configured ceiling, from the next chunk issue on; a forward already running finishes at whatever width was chosen before this edit"));
+                        break;
+
                     case "models[0].placement.thread_quota":
+                        if (_prefillsLane is { } openLane)
+                        {
+                            // A dedicated posture maps this edit onto the decode side alone: the load-resolved prefill share keeps its pool, mask, activation buffers, and collision posture for the model's whole lifetime, while the decode cap re-derives from the new quota within the engine's own thread choice. An edit that cannot leave at least one worker on each side is a lane-layout change this seam cannot rewrite live — refused naming field, model, and what to do instead, with the effective quota untouched.
+                            int engineThreadsChoice = effective.Engine.Threads == 0 ? CpuBackend.AutoWorkerCount : effective.Engine.Threads;
+
+                            if (!ModelPrefillLanes.TryMapLiveThreadQuota(openLane, engineThreadsChoice, candidate.Models[0].Placement.ThreadQuota, out int mappedDecodeShare))
+                            {
+                                results.Add(new FieldResult(change, ConfigApplyOutcome.Refused,
+                                    $"{change.Field} refused for model '{effective.Models[0].Name}' while a dedicated prefill lane is open: the new quota leaves no decode-side worker once the load-resolved {openLane.PrefillShareThreads}-worker prefill share holds its side. Raise the quota to cover both lanes, set 'placement.prefill_lane' back to shared for a restart, or restart lair with a split this claim can carry."));
+                                break;
+                            }
+
+                            int dedicatedBefore = _backend.EffectiveWorkerCount;
+                            int dedicatedAfter = _backend.ApplyThreadQuota(mappedDecodeShare); // the mapped decode share caps this side within the engine's own thread choice — never re-splitting the lane itself
+                            _scheduler.ApplySteppingThreadQuota(candidate.Models[0].Placement.ThreadQuota);
+
+                            effective = effective with { Models = [effective.Models[0] with { Placement = effective.Models[0].Placement with { ThreadQuota = candidate.Models[0].Placement.ThreadQuota } }] };
+                            results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                                $"dedicated lane posture: decode-side workers {dedicatedBefore} -> {dedicatedAfter}, mapped from the new quota against the fixed {openLane.PrefillShareThreads}-worker prefill share; participation adjusts from the next kernel call (the scheduler's next step), lowered workers idle; merged-step quota headroom follows the new value from the next composition on"));
+                            break;
+                        }
+
                         int workersBefore = _backend.EffectiveWorkerCount;
                         int workersAfter = _backend.ApplyThreadQuota(candidate.Models[0].Placement.ThreadQuota);
+
+                        // The same live value re-resolves the stepping segment's quota headroom, so future merged steps bound against it
+                        // instead of stale load-time numbers: lowered participation retargets which candidates may join a later step rather than
+                        // preempting one already composed. Route identity and shape stay as load resolved them.
+                        _scheduler.ApplySteppingThreadQuota(candidate.Models[0].Placement.ThreadQuota);
+
                         effective = effective with { Models = [effective.Models[0] with { Placement = effective.Models[0].Placement with { ThreadQuota = candidate.Models[0].Placement.ThreadQuota } }] };
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
-                            $"effective workers {workersBefore} -> {workersAfter}; participation adjusts from the next kernel call (the scheduler's next step), lowered workers idle"));
+                            $"effective workers {workersBefore} -> {workersAfter}; participation adjusts from the next kernel call (the scheduler's next step), lowered workers idle; merged-step quota headroom follows the new value from the next composition on"));
                         break;
 
                     case "models[0].kv_blocks":
                         GenerationScheduler.KvBudgetApply budget = _scheduler.ApplyKvBudget(candidate.Models[0].KvBlocks);
+                        RecordAppliedKvClaim(budget);
                         effective = effective with { Models = [effective.Models[0] with { KvBlocks = candidate.Models[0].KvBlocks } ] };
                         RefreshAdvertisedModel(effective);
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
@@ -352,6 +541,31 @@ public sealed class GenerationService : IDisposable
                             $"response budget {change.OldValue} -> {change.NewValue}: the configuration in force carries it for requests admitted from now on; sequences already in flight are unaffected"));
                         break;
 
+                    case "models[0].max_concurrent_requests":
+                        _scheduler.ApplyMaxConcurrentRequests(candidate.Models[0].MaxConcurrentRequests);
+
+                        // The advertised cap rides the same swap as every other live-advertised fact, so /v1/models always
+                        // reports what submissions admitted now are bounded by.
+                        effective = effective with { Models = [effective.Models[0] with { MaxConcurrentRequests = candidate.Models[0].MaxConcurrentRequests } ] };
+                        Volatile.Write(ref _modelInfo, _modelInfo with { MaxConcurrentRequests = candidate.Models[0].MaxConcurrentRequests });
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"admission cap {change.OldValue} -> {change.NewValue}: submissions from now on are refused once every slot of the new cap is held; sequences already admitted keep their slots and finish normally"));
+                        break;
+
+                    case "models[0].placement.numa_spread":
+                        // The preference is recorded for later placement decisions; the node this engine opened on, the posture its
+                        // worker pool masks to, and the posture its weight pages first-touched to stay as the open resolved them.
+                        // Re-binding an opened engine's placement is what a restart is for, and nothing here claims otherwise.
+                        effective = effective with { Models = [effective.Models[0] with { Placement = effective.Models[0].Placement with { NumaSpread = candidate.Models[0].Placement.NumaSpread } }] };
+                        _logger?.LogInformation(
+                            "numa_placement_reload model='{Model}' opened_spread={OpenedSpread} preference={Preference} opened_posture=established",
+                            Model.Id,
+                            _placement is null ? "(unresolved)" : NumaSpreadNames.Of(_placement.Applied),
+                            candidate.Models[0].Placement.NumaSpread);
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"spread posture {change.OldValue} -> {change.NewValue}: the preference is recorded for later placement decisions; the node this engine opened on and the posture its worker pool and weight pages established remain as the open resolved them — re-binding an opened engine's placement takes a restart"));
+                        break;
+
                     case "ui.recent_requests":
                         _metrics?.SetRecentRequestCapacity(candidate.Ui.RecentRequests);
                         effective = effective with { Ui = candidate.Ui };
@@ -379,6 +593,35 @@ public sealed class GenerationService : IDisposable
                             $"prefill route selection {change.OldValue} -> {change.NewValue}: the engine re-reads it at every prefill window boundary; sequences already mid-window finish that window on the route they started with"));
                         break;
 
+                    // A budgeted system-memory KV ceiling is the same live cap 'kv_blocks' has always been: it routes through this engine's one
+                    // enforcement seam rather than adding a second, and what reaches the scheduler is the canonical block count every other KV edit uses.
+                    case "models[0].budgets.kv.caps.dram_blocks":
+                        if (!CarriesSystemMemoryKvTier(effective.Models[0]))
+                        {
+                            results.Add(new FieldResult(change, ConfigApplyOutcome.Refused,
+                                $"{change.Field} refused for model '{effective.Models[0].Name}': the chain this ceiling binds was established when the engine opened, and nothing live holds working copies at 'dram' to retarget. Restart with 'dram' named in 'models[].budgets.kv.order', or edit 'kv_blocks' on a model that declares no budgets."));
+                            break;
+                        }
+
+                        long ceiling = CandidateSystemMemoryKvCeiling(candidate.Models[0]) ?? candidate.Models[0].KvBlocks;
+                        GenerationScheduler.KvBudgetApply budgeted = _scheduler.ApplyKvBudget(checked((int)ceiling));
+                        RecordAppliedKvClaim(budgeted);
+                        effective = effective with { Models = [MergeAppliedKvCeiling(effective.Models[0], ceiling)] };
+                        RefreshAdvertisedModel(effective);
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"KV budget {change.OldValue} -> {budgeted.AppliedBlocks} blocks within the {_pool.CapacityBlocks}-block physical reservation; drained {budgeted.EvictedCacheEntries} cached prefix blocks above the new cap (active sequences untouched)"));
+                        break;
+
+                    case "models[0].budgets.weights.caps.dram_mb" or "models[0].budgets.weights.caps.vram_mb":
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Refused,
+                            $"{change.Field} refused for model '{effective.Models[0].Name}' (restart-only): a weight ceiling binds what every forward reads, and retargeting it means re-reading slabs from the model file — that migration is not implemented in this build. Change it by restarting lair."));
+                        break;
+
+                    case "models[0].budgets.prefill_buffers.caps.dram_mb" or "models[0].budgets.prefill_buffers.caps.vram_mb":
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Refused,
+                            $"{change.Field} refused for model '{effective.Models[0].Name}' (new-requests): a ceiling on prefill working buffers classifies for later requests only — the physical clamp is where this value lands, when the engine opens its row window, and a live edit cannot re-size the window or activation buffers already established. Nothing in force changed."));
+                        break;
+
                     default:
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Refused, RefusalDetail(change)));
                         break;
@@ -396,6 +639,18 @@ public sealed class GenerationService : IDisposable
             }
 
             return results;
+        }
+    }
+
+    /// <summary>Records a live KV soft-cap application on the host ledger when this engine has a standing claim for that resource.</summary>
+    private void RecordAppliedKvClaim(GenerationScheduler.KvBudgetApply budget)
+    {
+        if (_ledger?.UpdateStandingClaimAmount(Model.Id, BudgetResource.Kv, budget.AppliedBlocks) == true)
+        {
+            _logger?.LogInformation(
+                "ledger_claim_update model='{Model}' resource='kv' amount_blocks={AmountBlocks}",
+                Model.Id,
+                budget.AppliedBlocks);
         }
     }
 
@@ -432,6 +687,193 @@ public sealed class GenerationService : IDisposable
             $"model '{modelName}' declares engine.prefill_kernel '{value}': 'prefill_kernel' accepts only '{PrefillKernelNames.GemV}', '{PrefillKernelNames.Tiled}', or '{PrefillKernelNames.Gemm}'."),
     };
 
+    // The spread posture one configuration resolves to for placement: only the three accepted names map, and anything
+    // else — reachable only on a programmatically built configuration — fails naming model and value instead of defaulting
+    // onto some other posture. Which node the mapped posture became on this host's reported topology is placement's answer
+    // at open, not this resolver's.
+    private static NumaSpreadPreference ResolveNumaSpread(string modelName, string value) =>
+        NumaSpreadNames.TryParse(value, out NumaSpreadPreference preference)
+            ? preference
+            : throw new InvalidOperationException(
+                $"model '{modelName}' declares 'placement.numa_spread' '{value}': 'numa_spread' accepts {NumaSpreadNames.AcceptedVocabulary}.");
+
+    // The core ids the backends this open builds pin to. A declared core set is authoritative and passes through untouched.
+    // An unpinned posture bounds its worker pool to the single node placement chose when that node reports its core ids and
+    // this host has a real affinity seam: the mask is the node's own reported ids, never a guess. On a host whose affinity
+    // seam is the documented no-op, an unpinned model stays unpinned rather than carrying a mask that pins nothing; a posture
+    // that spread across nodes names nodes rather than cores, and ids outside what a processor mask can express are not
+    // invented into a partial pin.
+    private static IReadOnlySet<int> EffectiveBackendCoreSet(HostTopology topology, NumaPlacement placement, IReadOnlySet<int> declaredCoreSet)
+    {
+        if (declaredCoreSet.Count > 0 || placement.NodeIndices.Count != 1 || !CpuBackend.SupportsCorePinning)
+        {
+            return declaredCoreSet;
+        }
+
+        HostNodeCapacity? node = topology.Nodes.FirstOrDefault(candidate => candidate.Index == placement.NodeIndices[0]);
+        if (node is null || node.CoreIds.Count == 0 || node.CoreIds.Any(core => core < 0 || core > CpuBackend.MaxMaskableCoreId))
+        {
+            return declaredCoreSet; // a node this posture does not report, one that states no ids, or one whose ids a mask cannot express: nothing to derive
+        }
+
+        return new HashSet<int>(node.CoreIds);
+    }
+
+    // A byte count stated in the megabyte unit weight and prefill-buffer claims and ceilings count in, rounded up so
+    // a claim never under-reports what it holds against a ceiling declared in that unit.
+    private static long WeightClaimMegabytes(long bytes) => (bytes + 1024 * 1024 - 1) / (1024 * 1024);
+
+    // Declared capacity totals read against the posture this host reported. A disagreement is logged and accepted rather than refused: an
+    // operator may state a number detection could not see, which is exactly what a per-node override exists for, while byte totals no node stated
+    // read as incomparable rather than as a mismatch with what was declared. The posture itself is always reported so the comparison has a source.
+    private static void ReportDeclaredCapacity(string modelName, TierCapacityConfig? tiers, ComputeCapacityLedger compute, ILogger? logger)
+    {
+        HostTopology topology = compute.Topology;
+
+        logger?.LogInformation(
+            "compute_topology model='{Model}' nodes={NodeCount} logical_processors={TotalLogicalProcessors}{Bytes}",
+            modelName,
+            topology.Nodes.Count,
+            topology.TotalLogicalProcessors,
+            topology.ReportedMemoryMb is long reportedMb ? $" node_mb_total={reportedMb}" : " node_bytes=unreported");
+
+        if (tiers is null)
+        {
+            return; // nothing declared: today's posture states no public totals and compares against none.
+        }
+
+        DeclaredTotalsReport totals = compute.CheckDeclaredTotals(tiers.DramCores, tiers.DramMb);
+        if (totals.ReportsCoreMismatch || totals.ReportsByteMismatch)
+        {
+            logger?.LogWarning(
+                "tiers_capacity model='{Model}' {Detail} — accepted against reported topology",
+                modelName,
+                totals.Describe());
+        }
+
+        foreach (NodeCapacityOverride nodeOverride in tiers.Nodes)
+        {
+            HostNodeCapacity? reported = topology.Nodes.FirstOrDefault(node => node.Index == nodeOverride.Index);
+            if (reported is null)
+            {
+                logger?.LogWarning(
+                    "tiers_capacity model='{Model}' declares node index {DeclaredIndex} this posture does not report ({Posture}) — accepted as an override of detection",
+                    modelName,
+                    nodeOverride.Index,
+                    topology.Describe());
+                continue;
+            }
+
+            if (nodeOverride.Cores is int declaredCores && declaredCores != reported.LogicalProcessors)
+            {
+                logger?.LogWarning(
+                    "tiers_capacity model='{Model}' declares cores={DeclaredCores} for node index {NodeIndex} against reported {ReportedCores} — accepted as an override of detection",
+                    modelName,
+                    declaredCores,
+                    nodeOverride.Index,
+                    reported.LogicalProcessors);
+            }
+
+            // A posture that stated no per-node bytes has nothing to compare a declared override against; accepting silently is the honest reading there.
+            if (nodeOverride.Mb is long declaredMb && reported.MemoryMb is long reportedNodeMb && declaredMb != reportedNodeMb)
+            {
+                logger?.LogWarning(
+                    "tiers_capacity model='{Model}' declares megabytes={DeclaredMegabytes} for node index {NodeIndex} against reported {ReportedMegabytes} — accepted as an override of detection",
+                    modelName,
+                    declaredMb,
+                    nodeOverride.Index,
+                    reportedNodeMb);
+            }
+        }
+    }
+
+    // Whether this model's budgets declare a ceiling at the system-memory tier of their KV chain — the one budgeted ceiling that is
+    // canonical for today's reservation and live soft cap, so its agreement with the legacy key is what opening reports once.
+    private static bool DeclaresSystemMemoryKvCeiling(ModelConfig model)
+    {
+        if (model.Budgets is null)
+        {
+            return false;
+        }
+
+        foreach (BudgetChain chain in model.Budgets)
+        {
+            if (chain.Resource == BudgetResource.Kv && chain.Caps.ContainsKey(BudgetTier.Dram))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Whether this configuration's KV chain names the system-memory tier at all: only such a chain has live working copies for a budgeted
+    // ceiling to retarget, and one that does not was established as something else when the engine opened.
+    private static bool CarriesSystemMemoryKvTier(ModelConfig model) => DeclaresChainAtTier(model, BudgetResource.Kv, BudgetTier.Dram);
+
+    private static long? CandidateSystemMemoryKvCeiling(ModelConfig model)
+    {
+        if (model.Budgets is null)
+        {
+            return null;
+        }
+
+        foreach (BudgetChain chain in model.Budgets)
+        {
+            if (chain.Resource == BudgetResource.Kv && chain.Caps.TryGetValue(BudgetTier.Dram, out long ceiling))
+            {
+                return ceiling;
+            }
+        }
+
+        return null;
+    }
+
+    // Merges one applied system-memory KV ceiling into the configuration in force: this model's other declared chains and every other tier of
+    // its own chain stay exactly as load resolved them, so a refused sibling edit in the same candidate cannot ride along on this merge.
+    private static ModelConfig MergeAppliedKvCeiling(ModelConfig current, long newDramBlocks)
+    {
+        List<BudgetChain> merged = [];
+
+        foreach (BudgetChain chain in current.Budgets ?? [])
+        {
+            if (chain.Resource == BudgetResource.Kv && chain.Order.Contains(BudgetTier.Dram))
+            {
+                Dictionary<BudgetTier, long> caps = [];
+                foreach (KeyValuePair<BudgetTier, long> cap in chain.Caps)
+                {
+                    caps[cap.Key] = cap.Value;
+                }
+
+                caps[BudgetTier.Dram] = newDramBlocks;
+                merged.Add(chain with { Caps = caps });
+                continue;
+            }
+
+            merged.Add(chain);
+        }
+
+        return current with { KvBlocks = checked((int)newDramBlocks), Budgets = [.. merged] };
+    }
+
+    private static bool DeclaresChainAtTier(ModelConfig model, BudgetResource resource, BudgetTier tier)
+    {
+        if (model.Budgets is null)
+        {
+            return false;
+        }
+
+        foreach (BudgetChain chain in model.Budgets)
+        {
+            if (chain.Resource == resource && chain.Order.Contains(tier))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private string MarkerRefusalForReload(FieldChange change) =>
         $"{change.Field} refused: {_markerRefusalDetail}. The loaded model's vocabulary cannot carry the reasoning markers a 'max_reasoning_tokens' budget would bound; remove the key from this model entry or serve a model whose vocabulary carries them.";
 
@@ -448,9 +890,33 @@ public sealed class GenerationService : IDisposable
     /// forward engine, tokenizer, chat template, a KV pool sized by the model entry, a prefix cache over that pool,
     /// and the batch scheduler over them. The prefix cache lives exactly as long as the pool, so each opened
     /// service starts with an empty cache. The effective context is the smaller of the configured max context and
-    /// the token slots the KV pool can hold.
+    /// the token slots the KV pool can hold. Weight, KV, and prefill claims this model declares register on the
+    /// ledger a host opens over the tiers its pools back — each opened tier stating the explicit unbounded capacity
+    /// posture, since a public total no configuration declared is never invented.
     /// </summary>
-    public static GenerationService Open(LairConfig config, ILogger? logger = null)
+    public static GenerationService Open(LairConfig config, ILogger? logger = null) =>
+        Open(config, logger, ledger: null);
+
+    /// <summary>
+    /// The shared-ledger form of the same open: <paramref name="ledger"/> is the host-scoped accounting several
+    /// programmatically opened engines share, so their claims register against one set of capacity seams in the order
+    /// the opens happen — first-come-first-served across engines, earlier claims never revoked or displaced. A null
+    /// ledger is today's posture: this engine gets its own ledger over the tiers its pools back, bounded nowhere a
+    /// public total was not stated. No host configuration path reaches a supplied ledger — it is a programmatic seam.
+    /// </summary>
+    public static GenerationService Open(LairConfig config, ILogger? logger, DeviceLedger? ledger) =>
+        Open(config, logger, ledger, compute: null);
+
+    /// <summary>
+    /// The shared-accounting form of the same open. <paramref name="ledger"/> is host-scoped byte accounting several programmatically opened
+    /// engines share, so their claims register against one set of capacity seams in the order the opens happen — first-come-first-served across
+    /// engines, earlier claims never revoked or displaced; a null ledger is today's posture, this engine's own ledger over the tiers its pools
+    /// back with each stating the explicit unbounded capacity posture. <paramref name="compute"/> is host-scoped core accounting shared the same
+    /// way: an injected one carries both what the host reported about nodes and every share seated ahead of this model, so a later claim is
+    /// clamped to what its predecessors left instead of being refused or preempting them; a null one opens fresh accounting over this process's
+    /// reported topology. No host configuration path reaches either seam — they are programmatic seams.
+    /// </summary>
+    public static GenerationService Open(LairConfig config, ILogger? logger, DeviceLedger? ledger, ComputeCapacityLedger? compute)
     {
         ArgumentNullException.ThrowIfNull(config);
         if (config.Models.Count == 0)
@@ -470,8 +936,126 @@ public sealed class GenerationService : IDisposable
         int maxContext = Math.Min(modelConfig.MaxContextTokens, reservedSlots);
 
         // The model's placement decides the backend's shape: the engine thread choice (0 = auto-sized from physical
-        // cores) capped by the model's thread quota, and the model's core set pinned onto every pool worker.
-        CpuBackend backend = new(config.Engine.Threads, modelConfig.Placement.CoreSet, modelConfig.Placement.ThreadQuota);
+        // cores) capped by the model's thread quota, and the model's core set pinned onto every pool worker. A declared
+        // dedicated prefill lane resolves its split first — a refusal naming the model and key lands here before any
+        // backend exists, so no half-lane engine ever opens — and then each side gets its own cap: the decode-side
+        // backend runs on the full engine choice with this step's derived share as its starting quota (a live edit may
+        // retarget that cap within the same ceiling), while the lane backend is sized to its load-resolved share alone.
+        // A pinned posture hands each side a disjoint mask of the declared cores; an unpinned one bounds participation by worker count,
+        // bounded to the node placement chose where this host can pin.
+        PrefillLaneLayout? prefillsLane = null;
+        CpuBackend? prefillsBackend = null;
+        CpuBackend backend;
+
+        // The host posture this engine's worker claim accounts against: an injected compute ledger carries both what the host reported about
+        // its nodes and every share seated ahead of this model, so a later oversubscribed claim is clamped to what its predecessors left rather
+        // than refused or allowed to preempt them; without one, this open derives the process posture once — nodes and logical processors as the
+        // OS reports them, byte totals reported where stated — and seats claims against that host total. Which node a share draws from belongs to placement, not accounting.
+        compute ??= new ComputeCapacityLedger(HostTopologyProbe.Detect());
+
+        ReportDeclaredCapacity(modelConfig.Name, config.Tiers, compute, logger); // warn-and-accept: an operator's declared totals read against what this posture reported.
+
+        int engineThreadsChoice = config.Engine.Threads == 0 ? CpuBackend.AutoWorkerCount : config.Engine.Threads;
+        int requestedShare = modelConfig.Placement.ThreadQuota is { } declaredQuota
+            ? Math.Min(engineThreadsChoice, declaredQuota)
+            : engineThreadsChoice;
+
+        // Placement derives before any backend opens: this model's declared spread posture resolves against the posture the host
+        // reported and the per-node load earlier claims seated, so the node its workers run on is decided while no worker pool exists.
+        // A posture the reported topology cannot honour — a pinned set beside a spread posture, or a pinned set spanning nodes — refuses
+        // the open naming model, key, and conflict, exactly like a half-lane posture does: no half-placed engine ever opens.
+        NumaPlacement placement = NumaPlacementResolver.Resolve(
+            compute.Topology,
+            [new NumaClaim
+            {
+                Model = modelConfig.Name,
+                RequestedCores = requestedShare,
+                Spread = ResolveNumaSpread(modelConfig.Name, modelConfig.Placement.NumaSpread),
+                CoreSet = modelConfig.Placement.CoreSet,
+            }],
+            compute.NodeAllocations)[0];
+
+        logger?.LogInformation(
+            "numa_placement model='{Model}' {NodeFact} spread={Requested}→{Applied}{CoreIds}{Advisory}",
+            modelConfig.Name,
+            placement.NodeIndices.Count == 1 ? $"node={placement.NodeIndices[0]}" : $"nodes={string.Join(",", placement.NodeIndices)}",
+            NumaSpreadNames.Of(placement.Requested),
+            NumaSpreadNames.Of(placement.Applied),
+            placement.CoreIds.Count > 0 ? $" core_set='{FormatCoreRanges(placement.CoreIds)}'" : string.Empty,
+            placement.Advisory is null ? string.Empty : $" advisory='{placement.Advisory}'");
+
+        // The claim registers before any backend opens, in this open's order, on the nodes placement chose: earlier seats cap this
+        // participation instead of refusing it, the grant logs requested against granted beside the per-node share it seated, and a
+        // partial seat is visible at load rather than inferred from a worker count.
+        ComputeGrant computeGrant = compute.RegisterClaim(modelConfig.Name, requestedShare, placement, modelConfig.Placement.CoreOvercommit);
+
+        logger?.LogInformation(
+            "compute_grant model='{Model}' requested={Requested} granted={Granted} exclusive_cores={ExclusiveCores} shared_cores={SharedCores} node_allocations={NodeAllocations} nodes={NodeCount} logical_processors={TotalLogicalProcessors}",
+            modelConfig.Name,
+            computeGrant.RequestedCores,
+            computeGrant.GrantedCores,
+            computeGrant.ExclusiveCores,
+            computeGrant.SharesHeldCores,
+            computeGrant.NodeAllocationText(),
+            compute.Topology.Nodes.Count,
+            compute.TotalCores);
+
+        // A full grant leaves today's construction untouched: the engine thread choice and this model's quota stand exactly as configured. Only a partial grant adds a cap, it caps participation inside what this model itself asked to run with, and how auto-sizing chose its count stays as it was — live worker edits keep their existing semantics against the engine's own choice.
+        int? grantedQuota = computeGrant.GrantedCores >= requestedShare
+            ? modelConfig.Placement.ThreadQuota
+            : Math.Min(modelConfig.Placement.ThreadQuota ?? computeGrant.GrantedCores, computeGrant.GrantedCores);
+
+        // The core ids every backend this open builds pins to: a declared core set is authoritative and stands exactly as configured.
+        // An unpinned posture bounds its worker pool to the node placement chose when that node reports core ids and this host's
+        // affinity seam is real — a node-derived mask, never a guess. Where the seam is a documented no-op or a posture spread across
+        // nodes, nothing is masked and the posture bounds participation by worker count alone, as it always did.
+        IReadOnlySet<int> backendCoreSet = EffectiveBackendCoreSet(compute.Topology, placement, modelConfig.Placement.CoreSet);
+
+        if (modelConfig.Placement.PrefillLane == PlacementPrefillLaneValues.Dedicated)
+        {
+            // A dedicated posture sub-allocates both lane sides from this model's granted share, so a clamped claim narrows the split instead of letting one side reach past what the host seated for it. A node-derived core set splits inside the chosen node: each lane claims its side of that node's reported ids.
+            prefillsLane = ModelPrefillLanes.ResolveDedicated(modelConfig.Name, engineThreadsChoice, grantedQuota, backendCoreSet);
+
+            backend = new(engineThreadsChoice, new HashSet<int>(prefillsLane.DecodeCoreIds), prefillsLane.DecodeShareThreads);
+            prefillsBackend = new(prefillsLane.PrefillShareThreads, new HashSet<int>(prefillsLane.PrefillCoreIds));
+        }
+        else
+        {
+            backend = new(config.Engine.Threads, backendCoreSet, grantedQuota);
+        }
+        // The model's placement resolves to its route value set here, against the compute backend this service opens for it:
+        // consecutive stages naming 'cpu' collapse into one CPU segment carrying this model's thread cap and pinned core share,
+        // and a stage naming any other device fails now naming that segment and the missing backend rather than opening an
+        // engine that would run the model somewhere else. The resolved segments land on the plan at open unchanged — nothing
+        // re-derives them while the model stays open.
+        ModelRoute route = ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = modelConfig.Name,
+            Stages = [new(ModelRoutes.PrefillStage, modelConfig.Placement.Prefill), new(ModelRoutes.DecodeStage, modelConfig.Placement.Device)],
+            AvailableDevices = [backend.DeviceId],
+            ThreadQuota = modelConfig.Placement.ThreadQuota,
+            CoreSet = modelConfig.Placement.CoreSet,
+        });
+
+        // The model's declared budgets resolve against the pools this service opens for it, here and once: each chain lands as what an
+        // opened host can actually carry, and a claim nothing backs fails now naming the model, the resource, the tier, and the missing
+        // capability — before any weight view or reservation is spent on posture that cannot hold it. What every backend this build opens
+        // holds working copies in is system memory; disk-backed write-side pools are vocabulary those chains may name but nothing here carries yet.
+        ResolvedBudgetSet budgets = ModelBudgets.Resolve(new BudgetRequest
+        {
+            ModelName = modelConfig.Name,
+            Declared = modelConfig.Budgets ?? [],
+            OpenedPoolTiers = [BudgetTier.Dram],
+        });
+
+        // The ledger this engine's claims account against: a supplied one is a host's shared accounting across several
+        // programmatically opened engines, so their claims register against one set of capacity seams in the order the
+        // opens happen; an omitted one is this engine's own ledger over the tiers its pools back, each stating the
+        // explicit unbounded capacity posture — the answer a host gives when it backs a tier but states no public total.
+        // Claims register in this open's order: weights once the tensor table is read, prefill from the activation
+        // posture the engine families hold, and the KV reservation as the pool opens.
+        ledger ??= DeviceLedger.OpenedTiersUnbounded([BudgetTier.Dram]);
+
         GgufFile? file = null;
         TransformerModel? model = null;
         BlockPool? pool = null;
@@ -510,13 +1094,77 @@ public sealed class GenerationService : IDisposable
                     backend,
                     reservedSlots,
                     line => logger?.LogInformation("{ProfileLog}", line),
-                    ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel));
+                    ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel),
+                    route,
+                    prefillsBackend,
+                    prefillsLane,
+                    budgets);
             }
             catch (ModelException ex) when (ex.Message.StartsWith("prefill kernel '", StringComparison.Ordinal))
             {
                 // The engine names the selection and the weight formats it has no dense-matrix path for; this service
                 // adds which served model the refusal is about, so a load failure says what to change in the config.
                 throw new ModelException($"model '{modelConfig.Name}': {ex.Message}");
+            }
+
+            // Weight claims register at model open, once the tensor table has been read: the amount is the summed
+            // logical tensor bytes the forward reads, stated in this resource's megabyte unit, against the first
+            // copy-holding position the resolved weights chain names that an opened capacity seam backs. A claim that
+            // lands below the chain's first copy-holding position records the chain's own demotion — an earlier claim
+            // is never revoked, preempted, or displaced to seat it — and a chain whose every position is held reports
+            // its exhaustion here, as a load failure naming the model, the resource, the tier, and the ledger breakdown.
+            if (budgets.For(BudgetResource.Weights) is { } weightsChain)
+            {
+                long logicalWeightBytes = 0;
+                foreach (LogicalTensor tensor in file.Tensors.Tensors)
+                {
+                    logicalWeightBytes += tensor.SizeBytes;
+                }
+
+                ClaimOutcome weightClaim = ledger.RegisterClaim(modelConfig.Name, weightsChain, WeightClaimMegabytes(logicalWeightBytes));
+                if (!weightClaim.Seated)
+                {
+                    throw new BudgetExhaustedException(modelConfig.Name, BudgetResource.Weights, weightClaim.ExhaustedAtTier!.Value, weightClaim.Breakdown);
+                }
+
+                logger?.LogInformation(
+                    "ledger_claim model='{Model}' resource='weights' tier='{Tier}' amount_mb={AmountMb} chain_position={ChainPosition} demoted={Demoted} logical_bytes={LogicalBytes}",
+                    modelConfig.Name,
+                    BudgetTierNames.Of(weightClaim.Claim!.Tier),
+                    weightClaim.Claim.Amount,
+                    weightClaim.Claim.ChainPosition,
+                    weightClaim.Claim.Demoted,
+                    logicalWeightBytes);
+            }
+
+            // The prefill claim records the activation posture the opened engine actually holds for its prompt windows — the dedicated lane
+            // family's bytes where a lane opened, the effective row window's per-row cost beside its fixed tail where one backend serves both
+            // paths — beside the row width the plan resolved and the width the engine runs under a declared ceiling. The engine's physical clamp
+            // already narrowed that window to what the chain's own ceilings allow; the claim states what the narrowed posture holds, and a chain
+            // whose every position is held — including one too small for even a single row's bytes — reports its exhaustion here as a load failure.
+            if (budgets.For(BudgetResource.PrefillBuffers) is { } prefillChain)
+            {
+                long activationBytes = model.PrefillWorkingSetBytes;
+                ClaimOutcome prefillClaim = ledger.RegisterClaim(modelConfig.Name, prefillChain, model.PrefillWorkingSetMegabytes);
+                if (!prefillClaim.Seated)
+                {
+                    throw new BudgetExhaustedException(modelConfig.Name, BudgetResource.PrefillBuffers, prefillClaim.ExhaustedAtTier!.Value, prefillClaim.Breakdown);
+                }
+
+                string clampDetail = model.PrefillRowClamp is { } clamp
+                    ? $" clamp_tier='{BudgetTierNames.Of(clamp.Tier)}' clamp_cap_mb={clamp.CapMegabytes} row_bytes={clamp.RowActivationBytes} clamp={clamp.AllowsPositiveWidth}"
+                    : string.Empty;
+                logger?.LogInformation(
+                    "ledger_claim model='{Model}' resource='prefill_buffers' tier='{Tier}' amount_mb={AmountMb} chain_position={ChainPosition} demoted={Demoted} row_width={RowWidth} effective_row_width={EffectiveRowWidth} activation_bytes={ActivationBytes}{ClampDetail}",
+                    modelConfig.Name,
+                    BudgetTierNames.Of(prefillClaim.Claim!.Tier),
+                    prefillClaim.Claim.Amount,
+                    prefillClaim.Claim.ChainPosition,
+                    prefillClaim.Claim.Demoted,
+                    model.ResolvedPrefillRowWidth,
+                    model.EffectivePrefillRowWidth,
+                    activationBytes,
+                    clampDetail);
             }
 
             pool = new BlockPool(
@@ -527,6 +1175,28 @@ public sealed class GenerationService : IDisposable
                 modelConfig.KvBlocks,
                 backend);
 
+            // The KV claim observes the pool opening that already happened: the reservation the pool reserved at open,
+            // stated in this resource's block unit, against the first copy-holding position the resolved KV chain names
+            // that an opened capacity seam backs. The pool's own soft cap stays the enforcement seam — this claim
+            // records where the chain seated the reservation, and a chain held end-to-end by claims registered ahead
+            // refuses the open as a load failure rather than shrinking the reservation.
+            if (budgets.For(BudgetResource.Kv) is { } kvChain)
+            {
+                ClaimOutcome kvClaim = ledger.RegisterClaim(modelConfig.Name, kvChain, modelConfig.KvBlocks);
+                if (!kvClaim.Seated)
+                {
+                    throw new BudgetExhaustedException(modelConfig.Name, BudgetResource.Kv, kvClaim.ExhaustedAtTier!.Value, kvClaim.Breakdown);
+                }
+
+                logger?.LogInformation(
+                    "ledger_claim model='{Model}' resource='kv' tier='{Tier}' amount_blocks={AmountBlocks} chain_position={ChainPosition} demoted={Demoted}",
+                    modelConfig.Name,
+                    BudgetTierNames.Of(kvClaim.Claim!.Tier),
+                    kvClaim.Claim.Amount,
+                    kvClaim.Claim.ChainPosition,
+                    kvClaim.Claim.Demoted);
+            }
+
             int[] attentionWindows = new int[model.Plan.LayerCount];
             for (int layer = 0; layer < model.Plan.LayerCount; layer++)
             {
@@ -536,7 +1206,20 @@ public sealed class GenerationService : IDisposable
             pool.DeclareAttentionWindows(attentionWindows);
 
             PrefixCache cache = new(pool);
-            scheduler = new GenerationScheduler(model, pool, config.Engine.MaxBatchTokens, cache);
+
+            // The scheduler carries this model's admission cap and name: the configured concurrency limit bounds how many pipelines live at
+            // once (absent bounds nothing), refusals name the served model, and the route resolution above already landed placement quotas on
+            // the plan that composition steps against. A configured step-time budget is carried along the same way: chunk width then comes from
+            // measured step cost within the configured ceiling instead of being the ceiling itself, and absent leaves it as the ceiling.
+            scheduler = new GenerationScheduler(
+                model,
+                pool,
+                config.Engine.MaxBatchTokens,
+                cache,
+                maxConcurrentRequests: modelConfig.MaxConcurrentRequests ?? GenerationScheduler.UncappedConcurrencyCap,
+                modelName: modelConfig.Name,
+                prefillStepBudgetMs: config.Engine.PrefillStepBudgetMs,
+                ledger: ledger);
 
             // The chat template is parsed once here, at model load, and cached for the loaded instance's lifetime: no
             // per-request parse and no lazy first-request parse. An unparseable template fails model startup fast,
@@ -601,6 +1284,15 @@ public sealed class GenerationService : IDisposable
                 modelConfig.Name,
                 PrefillKernelNames.Of(model.ResolvedPrefillKernel));
 
+            // Both spellings of this model's system-memory KV ceiling arrived and agreed — the loader refuses any other combination — so startup sizing is unchanged and one line says which spelling carries it forward. A legacy key alone or budgets alone log nothing here, exactly as they behaved before.
+            if (modelConfig.LegacyKvBlocksDeclared && DeclaresSystemMemoryKvCeiling(modelConfig))
+            {
+                logger?.LogInformation(
+                    "kv_blocks model='{Model}' value={Value} deprecated: 'budgets.kv.caps.dram_blocks' states the same ceiling, and budgets are canonical for what LAIR holds at system memory",
+                    modelConfig.Name,
+                    modelConfig.KvBlocks);
+            }
+
             // The sparse-FFN facts a routed block resolves to are reported the same way: they come straight from the
             // model's plan, and only a file that declares experts carries them. A dense model advertises nothing here.
             if (model.Plan.SparseFfn is { } sparsePlan)
@@ -622,10 +1314,15 @@ public sealed class GenerationService : IDisposable
                 model.Plan.VocabSize,
                 ToolParserNames.Of(outputParser.ToolParser),
                 ReasoningPolicyNames.Of(outputParser.Reasoning),
-                model.Plan.SparseFfnStrategy is { } strategy ? SparseFfnStrategyNames.Of(strategy) : null);
+                model.Plan.SparseFfnStrategy is { } strategy ? SparseFfnStrategyNames.Of(strategy) : null,
+                modelConfig.MaxConcurrentRequests);
 
-            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, markerPair, markersProven ? string.Empty : markerRefusal, logger, pool, scheduler, info, config);
+            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, markerPair, markersProven ? string.Empty : markerRefusal, logger, pool, scheduler, info, config, prefillsBackend, prefillsLane);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
+            service._ledger = ledger; // the claims this open registered ride the same ledger the scheduler reports admissions to
+            service._compute = compute; // the core accounting this model's grant seated against, shared with any engine opened beside it
+            service._computeGrant = computeGrant; // requested against granted, reported on monitor facts beside the live worker count
+            service._placement = placement; // the node this engine seated on, reported on monitor facts beside its grant
             file = null;
             model = null;
             pool = null;
@@ -639,6 +1336,7 @@ public sealed class GenerationService : IDisposable
             model?.Dispose();
             file?.Dispose();
             backend.Dispose();
+            prefillsBackend?.Dispose();
             throw;
         }
     }
@@ -715,7 +1413,11 @@ public sealed class GenerationService : IDisposable
 
         if (prompt.Count >= Model.ContextLength)
         {
-            throw new ContextLengthExceededException(prompt.Count, Model.ContextLength);
+            // The token-budget refusal is recorded where it decides: the monitor's diagnostic ring sees exactly what
+            // admission turned away, while this request still answers through its own error shape.
+            ContextLengthExceededException contextRefusal = new(prompt.Count, Model.ContextLength, Model.Id);
+            _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.ContextLength, Model.Id, contextRefusal.Message);
+            throw contextRefusal;
         }
 
         ModelConfig modelConfig = EffectiveConfiguration.Models[0];
@@ -738,7 +1440,7 @@ public sealed class GenerationService : IDisposable
         string streamed = string.Empty;
         int decodedChars = 0;
         bool stopped = false;
-        SequenceHandle? handle = null;
+        PipelineHandle? handle = null;
         BudgetStreamState? budgetState = budgets.ReasoningTokens is null && budgets.ResponseTokens is null ? null : new BudgetStreamState(plan.ReasoningRegion);
         bool budgetCeilingReached = false;
 
@@ -812,12 +1514,33 @@ public sealed class GenerationService : IDisposable
         {
             handle = _scheduler.Submit(scheduled, stopSignal.Token);
         }
-        catch (SchedulerFullException)
+        catch (SchedulerFullException full)
         {
-            // The scheduler's capacity vocabulary is an engine-busy condition at this facade: surface it as the
-            // API-level EngineBusyException rather than leaking a scheduling type to callers. No lifecycle frames were
-            // published — a refused admission never entered the stream.
-            throw new EngineBusyException();
+            // The scheduler's capacity vocabulary is an engine-busy condition at this facade: surface it as the API-level EngineBusyException
+            // naming kv_capacity and the served model rather than leaking a scheduling type to callers. No lifecycle frames were published — a
+            // refused admission never entered the stream, but its refusal lands in the monitor's diagnostic ring so an operator sees what blocked.
+            EngineBusyException busy = EngineBusyException.ForKvCapacity(Model.Id, full.FreeSlots);
+            _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.KvCapacity, Model.Id, busy.Message);
+            throw busy;
+        }
+        catch (SchedulerConcurrencyFullException quota)
+        {
+            // A submission past this model's concurrency cap is the other engine-busy refusal: same bounded overload family at the wire, with a
+            // message naming max_concurrent_requests and the served model. Nothing already admitted was disturbed by it; the monitor records the
+            // refusal for operators exactly as its kv_capacity sibling does.
+            EngineBusyException busy = EngineBusyException.ForConcurrencyQuota(Model.Id, quota.MaxConcurrentRequests);
+            _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.ConcurrencyQuota, Model.Id, busy.Message);
+            throw busy;
+        }
+        catch (BudgetExhaustedException exhausted)
+        {
+            // A submission the host ledger's shared chain could not seat anywhere is the third bounded overload refusal: the exhausted chain is
+            // host accounting across opened pools, not this engine's own KV cap re-deciding anything, so it surfaces through the same overload
+            // family at the wire with the budget-exhaustion code. Nothing already admitted was disturbed; the monitor records the refusal exactly
+            // as its kv_capacity and quota siblings do.
+            EngineBusyException busy = EngineBusyException.ForBudgetExhaustion(Model.Id, exhausted.Resource, exhausted.Tier, exhausted.Breakdown);
+            _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.BudgetExhaustion, Model.Id, busy.Message);
+            throw busy;
         }
 
         if (tracker is RequestTracker admitted)
@@ -987,6 +1710,7 @@ public sealed class GenerationService : IDisposable
         _model.Dispose();
         _file.Dispose();
         _backend.Dispose();
+        _prefillsBackend?.Dispose(); // the lane's pool workers belong to this service exactly as the decode side's do
     }
 
     private IReadOnlyList<int> EncodeChat(GenerationRequest request, ToolPipeline tools, CancellationToken cancellationToken)
