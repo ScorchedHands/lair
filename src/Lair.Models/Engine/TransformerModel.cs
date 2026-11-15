@@ -542,6 +542,19 @@ public sealed class TransformerModel : IDisposable
         IReadOnlyList<IBackend> crossingBackends, ResolvedBudgetSet budgets) =>
         new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel, prefillRowWidth: 0, route, prefillsBackend: null, prefillsLane: null, crossingBackends, budgets);
 
+    /// <summary>
+    /// The alternate-<see cref="IWeightSource"/> form of the split-route seam: every tensor read goes through the supplied
+    /// source instead of a mmap view, while each resolved segment still runs on the backend supplied for its position and
+    /// the first span's posture follows the same ordered-set rules as the seam above. Tensor metadata (names, shapes,
+    /// formats, offsets) still comes from <paramref name="file"/>, and the caller keeps ownership of the source — it must
+    /// outlive the model and is disposed by the caller, not here. Assembly-internal: hosts resolve placement onto the
+    /// memory-mapped seam; this one lets a caller open a split over a weight source the engine never created.
+    /// </summary>
+    internal static TransformerModel Open(
+        GgufFile file, IWeightSource weights, IBackend backend, int maxContextTokens, Action<string>? logLine, PrefillKernel prefillKernel,
+        ModelRoute route, IReadOnlyList<IBackend> crossingBackends) =>
+        new(file, backend, maxContextTokens, weights, logLine, profileOverride: null, prefillKernel, prefillRowWidth: 0, route, prefillsBackend: null, prefillsLane: null, crossingBackends);
+
     // The execution spans this engine runs its route over, resolved positionally from the segments and the compute backends opened for them.
     // One span holding every layer on the device its own backend reports is what every model served today resolves to; a segment naming another
     // device refuses naming that segment and the seam accelerator execution lands in rather than advancing part of the model on some device that

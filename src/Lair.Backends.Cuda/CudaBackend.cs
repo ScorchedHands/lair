@@ -1,262 +1,30 @@
 using System.Buffers;
 using System.Runtime.InteropServices;
-using System.Text;
 
 using Lair.Contracts;
 
 namespace Lair.Backends.Cuda;
 
 /// <summary>
-/// CUDA compute backend: packed weight tensors are copied to device memory once per instance and every dense GEMV,
-/// single or batched, runs as an embedded PTX kernel against those copies for F32, F16, and BF16 weights. Formats with
-/// no kernel here refuse naming this backend rather than run through some other route; the blocked matmul has no CUDA
-/// path at all yet. Activation vectors and outputs cross the PCIe seam per call, so KV arenas and split-route staging
-/// stay host-resident aligned memory under this device id until accelerator residency lands elsewhere.
+/// CUDA compute backend: packed weight tensors reach device memory one of two ways per instance. The default posture
+/// copies each tensor to device memory once per instance and every dense GEMV, single or batched, runs as an embedded
+/// PTX kernel against those copies for F32, F16, and BF16 weights. The host-mapped posture instead registers each
+/// tensor's live host region with the driver and launches the same kernels against the device pointer the registration
+/// answers with, so no weight tensor is ever copied into persistent device memory and the weights stay resident exactly
+/// where the weight source holds them. Formats with no kernel here refuse naming this backend rather than run through
+/// some other route; the blocked matmul has no CUDA path at all yet. Activation vectors and outputs cross the PCIe
+/// seam per call in either posture, so KV arenas and split-route staging stay host-resident aligned memory under this
+/// device id until accelerator residency lands elsewhere.
 /// </summary>
-public sealed class CudaBackend : IBackend
+public sealed partial class CudaBackend : IBackend
 {
     /// <summary>The accelerator device id every CUDA-backed route segment names.</summary>
     public const string DeviceIdValue = "cuda";
 
     private const int KernelThreads = 128;
 
-    // Address arithmetic stays in computed-register form throughout: this driver seam rejects [base+reg] load forms, so
-    // each element address is mad'd from its index, widened, shifted by the element size, and added to the base. Half
-    // and bf16 weights widen through integer bit math into a per-thread local slot reloaded as f32; cvt.f16 forms are
-    // rejected outright (CUDA_ERROR_INVALID_PTX) on this seam. Accumulation is plain mul then add in ascending column
-    // order - the same chain the scalar CPU reference uses, so one device result matches one host dot bit for bit.
-    private const string Ptx =
-        ".version 7.0\n" +
-        ".target sm_50\n" +
-        ".address_size 64\n" +
-        "\n" +
-        ".visible .entry gemv_f32(\n" +
-        "    .param .u64 w_ptr,\n" +
-        "    .param .u64 x_ptr,\n" +
-        "    .param .u64 out_ptr,\n" +
-        "    .param .u32 rows_arg,\n" +
-        "    .param .u32 cols_arg,\n" +
-        "    .param .u32 count_arg\n" +
-        ") {\n" +
-        "    .reg .u64 w, xin, o, addr;\n" +
-        "    .reg .u32 row, col, bb, rows_, cols_, cnt_, tid, t0;\n" +
-        "    .reg .pred p;\n" +
-        "    .reg .f32 acc, wv, xv;\n" +
-        "\n" +
-        "    ld.param.u64 w, [w_ptr];\n" +
-        "    ld.param.u64 xin, [x_ptr];\n" +
-        "    ld.param.u64 o, [out_ptr];\n" +
-        "    ld.param.u32 rows_, [rows_arg];\n" +
-        "    ld.param.u32 cols_, [cols_arg];\n" +
-        "    ld.param.u32 cnt_, [count_arg];\n" +
-        "\n" +
-        "    mov.u32 tid, %ctaid.x;\n" +
-        "    mov.u32 t0, %ntid.x;\n" +
-        "    mul.lo.u32 tid, tid, t0;\n" +
-        "    mov.u32 t0, %tid.x;\n" +
-        "    add.u32 row, tid, t0;\n" +
-        "    setp.ge.u32 p, row, rows_;\n" +
-        "    @p bra done;\n" +
-        "\n" +
-        "    mov.u32 bb, 0;\n" +
-        "batch:\n" +
-        "    setp.ge.u32 p, bb, cnt_;\n" +
-        "    @p bra done;\n" +
-        "    mov.f32 acc, 0f00000000;\n" +
-        "    mov.u32 col, 0;\n" +
-        "_loop_col:\n" +
-        "    setp.ge.u32 p, col, cols_;\n" +
-        "    @p bra store;\n" +
-        "    mad.lo.u32 t0, row, cols_, col;\n" +
-        "    cvt.u64.u32 addr, t0;\n" +
-        "    shl.b64 addr, addr, 2;\n" +
-        "    add.u64 addr, w, addr;\n" +
-        "    ld.global.f32 wv, [addr];\n" +
-        "    mad.lo.u32 t0, bb, cols_, col;\n" +
-        "    cvt.u64.u32 addr, t0;\n" +
-        "    shl.b64 addr, addr, 2;\n" +
-        "    add.u64 addr, xin, addr;\n" +
-        "    ld.global.f32 xv, [addr];\n" +
-        "    mul.f32 wv, wv, xv;\n" +
-        "    add.f32 acc, acc, wv;\n" +
-        "    add.u32 col, col, 1;\n" +
-        "    bra _loop_col;\n" +
-        "store:\n" +
-        "    mad.lo.u32 t0, bb, rows_, row;\n" +
-        "    cvt.u64.u32 addr, t0;\n" +
-        "    shl.b64 addr, addr, 2;\n" +
-        "    add.u64 addr, o, addr;\n" +
-        "    st.global.f32 [addr], acc;\n" +
-        "    add.u32 bb, bb, 1;\n" +
-        "    bra batch;\n" +
-        "done:\n" +
-        "    ret;\n" +
-        "}\n" +
-        "\n" +
-        ".visible .entry gemv_f16(\n" +
-        "    .param .u64 w_ptr,\n" +
-        "    .param .u64 x_ptr,\n" +
-        "    .param .u64 out_ptr,\n" +
-        "    .param .u32 rows_arg,\n" +
-        "    .param .u32 cols_arg,\n" +
-        "    .param .u32 count_arg\n" +
-        ") {\n" +
-        "    .reg .u64 w, xin, o, addr;\n" +
-        "    .reg .u32 row, col, bb, rows_, cols_, cnt_, tid, t0;\n" +
-        "    .reg .u32 bits, payload, exp, mant, sign, fbits;\n" +
-        "    .reg .b16 hw;\n" +
-        "    .reg .pred p;\n" +
-        "    .reg .f32 acc, wv, xv, subv;\n" +
-        "    .local .align 4 .b8 slot[4];\n" +
-        "\n" +
-        "    ld.param.u64 w, [w_ptr];\n" +
-        "    ld.param.u64 xin, [x_ptr];\n" +
-        "    ld.param.u64 o, [out_ptr];\n" +
-        "    ld.param.u32 rows_, [rows_arg];\n" +
-        "    ld.param.u32 cols_, [cols_arg];\n" +
-        "    ld.param.u32 cnt_, [count_arg];\n" +
-        "\n" +
-        "    mov.u32 tid, %ctaid.x;\n" +
-        "    mov.u32 t0, %ntid.x;\n" +
-        "    mul.lo.u32 tid, tid, t0;\n" +
-        "    mov.u32 t0, %tid.x;\n" +
-        "    add.u32 row, tid, t0;\n" +
-        "    setp.ge.u32 p, row, rows_;\n" +
-        "    @p bra done;\n" +
-        "\n" +
-        "    mov.u32 bb, 0;\n" +
-        "batch:\n" +
-        "    setp.ge.u32 p, bb, cnt_;\n" +
-        "    @p bra done;\n" +
-        "    mov.f32 acc, 0f00000000;\n" +
-        "    mov.u32 col, 0;\n" +
-        "_loop_col:\n" +
-        "    setp.ge.u32 p, col, cols_;\n" +
-        "    @p bra store;\n" +
-        "    mad.lo.u32 t0, row, cols_, col;\n" +
-        "    cvt.u64.u32 addr, t0;\n" +
-        "    shl.b64 addr, addr, 1;\n" +
-        "    add.u64 addr, w, addr;\n" +
-        "    ld.global.b16 hw, [addr];\n" +
-        "    mov.b32 bits, {hw, 0};\n" +
-        "    and.b32 sign, bits, 32768;\n" +
-        "    and.b32 payload, bits, 32767;\n" +
-        "    shr.u32 exp, payload, 10;\n" +
-        "    and.b32 mant, payload, 1023;\n" +
-        "    shl.b32 sign, sign, 16;\n" +
-        "    setp.le.u32 p, exp, 0;\n" +
-        "    @p bra widen_sub;\n" +
-        "    add.u32 fbits, exp, 112;\n" +
-        "    shl.b32 fbits, fbits, 23;\n" +
-        "    shl.b32 mant, mant, 13;\n" +
-        "    or.b32 fbits, fbits, mant;\n" +
-        "    xor.b32 fbits, fbits, sign;\n" +
-        "    st.local.u32 [slot], fbits;\n" +
-        "    ld.local.f32 wv, [slot];\n" +
-        "    bra widen_done;\n" +
-        "widen_sub:\n" +
-        "    cvt.rn.f32.u32 subv, mant;\n" +
-        "    mul.f32 wv, subv, 0f33800000;\n" +
-        "    setp.eq.u32 p, sign, 32768;\n" +
-        "    @!p bra widen_done;\n" +
-        "    mul.f32 wv, wv, 0f80000000;\n" +
-        "widen_done:\n" +
-        "    mad.lo.u32 t0, bb, cols_, col;\n" +
-        "    cvt.u64.u32 addr, t0;\n" +
-        "    shl.b64 addr, addr, 2;\n" +
-        "    add.u64 addr, xin, addr;\n" +
-        "    ld.global.f32 xv, [addr];\n" +
-        "    mul.f32 wv, wv, xv;\n" +
-        "    add.f32 acc, acc, wv;\n" +
-        "    add.u32 col, col, 1;\n" +
-        "    bra _loop_col;\n" +
-        "store:\n" +
-        "    mad.lo.u32 t0, bb, rows_, row;\n" +
-        "    cvt.u64.u32 addr, t0;\n" +
-        "    shl.b64 addr, addr, 2;\n" +
-        "    add.u64 addr, o, addr;\n" +
-        "    st.global.f32 [addr], acc;\n" +
-        "    add.u32 bb, bb, 1;\n" +
-        "    bra batch;\n" +
-        "done:\n" +
-        "    ret;\n" +
-        "}\n" +
-        "\n" +
-        ".visible .entry gemv_bf16(\n" +
-        "    .param .u64 w_ptr,\n" +
-        "    .param .u64 x_ptr,\n" +
-        "    .param .u64 out_ptr,\n" +
-        "    .param .u32 rows_arg,\n" +
-        "    .param .u32 cols_arg,\n" +
-        "    .param .u32 count_arg\n" +
-        ") {\n" +
-        "    .reg .u64 w, xin, o, addr;\n" +
-        "    .reg .u32 row, col, bb, rows_, cols_, cnt_, tid, t0;\n" +
-        "    .reg .u32 bits;\n" +
-        "    .reg .b16 hw;\n" +
-        "    .reg .pred p;\n" +
-        "    .reg .f32 acc, wv, xv;\n" +
-        "    .local .align 4 .b8 slot[4];\n" +
-        "\n" +
-        "    ld.param.u64 w, [w_ptr];\n" +
-        "    ld.param.u64 xin, [x_ptr];\n" +
-        "    ld.param.u64 o, [out_ptr];\n" +
-        "    ld.param.u32 rows_, [rows_arg];\n" +
-        "    ld.param.u32 cols_, [cols_arg];\n" +
-        "    ld.param.u32 cnt_, [count_arg];\n" +
-        "\n" +
-        "    mov.u32 tid, %ctaid.x;\n" +
-        "    mov.u32 t0, %ntid.x;\n" +
-        "    mul.lo.u32 tid, tid, t0;\n" +
-        "    mov.u32 t0, %tid.x;\n" +
-        "    add.u32 row, tid, t0;\n" +
-        "    setp.ge.u32 p, row, rows_;\n" +
-        "    @p bra done;\n" +
-        "\n" +
-        "    mov.u32 bb, 0;\n" +
-        "batch:\n" +
-        "    setp.ge.u32 p, bb, cnt_;\n" +
-        "    @p bra done;\n" +
-        "    mov.f32 acc, 0f00000000;\n" +
-        "    mov.u32 col, 0;\n" +
-        "_loop_col:\n" +
-        "    setp.ge.u32 p, col, cols_;\n" +
-        "    @p bra store;\n" +
-        "    mad.lo.u32 t0, row, cols_, col;\n" +
-        "    cvt.u64.u32 addr, t0;\n" +
-        "    shl.b64 addr, addr, 1;\n" +
-        "    add.u64 addr, w, addr;\n" +
-        "    ld.global.b16 hw, [addr];\n" +
-        "    mov.b32 bits, {hw, 0};\n" +
-        "    shl.b32 t0, bits, 16;\n" +
-        "    st.local.u32 [slot], t0;\n" +
-        "    ld.local.f32 wv, [slot];\n" +
-        "    mad.lo.u32 t0, bb, cols_, col;\n" +
-        "    cvt.u64.u32 addr, t0;\n" +
-        "    shl.b64 addr, addr, 2;\n" +
-        "    add.u64 addr, xin, addr;\n" +
-        "    ld.global.f32 xv, [addr];\n" +
-        "    mul.f32 wv, wv, xv;\n" +
-        "    add.f32 acc, acc, wv;\n" +
-        "    add.u32 col, col, 1;\n" +
-        "    bra _loop_col;\n" +
-        "store:\n" +
-        "    mad.lo.u32 t0, bb, rows_, row;\n" +
-        "    cvt.u64.u32 addr, t0;\n" +
-        "    shl.b64 addr, addr, 2;\n" +
-        "    add.u64 addr, o, addr;\n" +
-        "    st.global.f32 [addr], acc;\n" +
-        "    add.u32 bb, bb, 1;\n" +
-        "    bra batch;\n" +
-        "done:\n" +
-        "    ret;\n" +
-        "}\n";
-
-    private static readonly byte[] PtxBytes = Encoding.UTF8.GetBytes(Ptx + "\0");
-
     private readonly object _gate = new();
-    private readonly Dictionary<(nint Pointer, long Length), ulong> _deviceWeights = [];
-    private readonly List<ulong> _weightAllocations = [];
+    private readonly CudaWeightResidency _weightResidency;
     private readonly int _device;
     private readonly IntPtr _context;
     private readonly IntPtr _module;
@@ -266,13 +34,28 @@ public sealed class CudaBackend : IBackend
 
     private bool _disposed;
 
-    /// <summary>Weight tensors this instance has copied to device memory so far.</summary>
-    public int DeviceWeightCopies => _deviceWeights.Count;
+    /// <summary>The weight residency posture this instance runs: the persistent device copy it opens with by default, or the host-mapped seam that launches against registered host regions.</summary>
+    public CudaWeightResidency WeightResidency => _weightResidency;
 
     public string DeviceId => DeviceIdValue;
 
     public CudaBackend()
+        : this(CudaWeightResidency.DeviceCopy)
     {
+    }
+
+    /// <summary>
+    /// Opens the backend with an explicit weight residency posture. The default posture copies each weight tensor to
+    /// device memory once per instance; <see cref="CudaWeightResidency.HostMapped"/> never copies weight tensors into
+    /// persistent device memory — it registers each tensor's live host region with the driver and launches against the
+    /// device pointer the registration answers with, so the weights stay resident in the host memory the weight source
+    /// owns. A mapped region must stay valid and page-aligned for the backend's whole lifetime, and no other
+    /// registration may cover its pages while it is registered.
+    /// </summary>
+    public CudaBackend(CudaWeightResidency weightResidency)
+    {
+        _weightResidency = weightResidency;
+
         CudaException.ThrowIf("cuInit", CudaNative.cuInit(0));
         CudaException.ThrowIf("cuDeviceGetCount", CudaNative.cuDeviceGetCount(out int deviceCount));
         if (deviceCount < 1)
@@ -409,21 +192,13 @@ public sealed class CudaBackend : IBackend
             switch (w.Format)
             {
                 case QuantFormat.F32:
-                    new ReadOnlySpan<float>(rowPtr, cols).CopyTo(output);
+                    DequantF32Row(rowPtr, cols, output);
                     break;
                 case QuantFormat.F16:
-                    for (int i = 0; i < cols; i++)
-                    {
-                        output[i] = ReadHalfLE(rowPtr + 2 * i);
-                    }
-
+                    DequantF16Row(rowPtr, cols, output);
                     break;
                 case QuantFormat.BF16:
-                    for (int i = 0; i < cols; i++)
-                    {
-                        output[i] = ReadBf16LE(rowPtr + 2 * i);
-                    }
-
+                    DequantBf16Row(rowPtr, cols, output);
                     break;
                 default:
                     throw Unsupported(w.Format, "row dequantization");
@@ -493,13 +268,8 @@ public sealed class CudaBackend : IBackend
             _disposed = true;
             SetCurrentContext();
 
-            foreach (ulong devicePointer in _weightAllocations)
-            {
-                CudaNative.cuMemFree(devicePointer);
-            }
-
-            _weightAllocations.Clear();
-            _deviceWeights.Clear();
+            FreeDeviceWeightAllocations();
+            ReleaseHostMappedRegions();
         }
 
         CudaException.ThrowIf("cuModuleUnload", CudaNative.cuModuleUnload(_module));
@@ -532,7 +302,10 @@ public sealed class CudaBackend : IBackend
             {
                 fixed (byte* wBytes = w.Bytes)
                 {
-                    deviceWeights = EnsureDeviceWeights((nint)wBytes, weightBytes); // pinned for exactly this call; the copy runs now and never again per tensor
+                    // The mapped posture launches against the device pointer of a registered host region; the default posture keeps its once-copied device buffer. Either answer is pinned for exactly this call and cached per tensor for the instance's lifetime.
+                    deviceWeights = _weightResidency == CudaWeightResidency.HostMapped
+                        ? EnsureHostMappedWeights((nint)wBytes, weightBytes)
+                        : EnsureDeviceWeights((nint)wBytes, weightBytes); // pinned for exactly this call; the copy runs now and never again per tensor
                 }
             }
 
@@ -586,25 +359,6 @@ public sealed class CudaBackend : IBackend
         }
     }
 
-    private ulong EnsureDeviceWeights(nint hostPointer, nuint bytes)
-    {
-        if (_deviceWeights.TryGetValue((hostPointer, (long)bytes), out ulong existing))
-        {
-            return existing;
-        }
-
-        CudaException.ThrowIf("cuMemAlloc_v2", CudaNative.cuMemAlloc(out ulong devicePointer, bytes));
-        _weightAllocations.Add(devicePointer);
-        _deviceWeights[(hostPointer, (long)bytes)] = devicePointer;
-
-        unsafe
-        {
-            CudaException.ThrowIf("cuMemcpyHtoD_v2", CudaNative.cuMemcpyHtoD(devicePointer, (byte*)hostPointer, bytes));
-        }
-
-        return devicePointer;
-    }
-
     private IntPtr KernelFor(QuantFormat format) => format switch
     {
         QuantFormat.F32 => _gemvF32,
@@ -647,12 +401,4 @@ public sealed class CudaBackend : IBackend
     }
 
     private void SetCurrentContext() => CudaException.ThrowIf("cuCtxSetCurrent", CudaNative.cuCtxSetCurrent(_context));
-
-    // Little-endian half-float load widened to float.
-    private static unsafe float ReadHalfLE(byte* p) => (float)BitConverter.Int16BitsToHalf((short)(*p | (p[1] << 8)));
-
-    // Little-endian bf16 load widened to float: the 16 bits land in the f32 high half.
-    private static unsafe float ReadBf16LE(byte* p) => BitConverter.UInt32BitsToSingle((uint)((p[0] | (p[1] << 8)) << 16));
 }
-
-

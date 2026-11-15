@@ -46,6 +46,15 @@ internal static partial class CudaNative
     [LibraryImport("nvcuda", EntryPoint = "cuMemFree_v2")]
     public static partial CudaResult cuMemFree(ulong devicePointer);
 
+    [LibraryImport("nvcuda", EntryPoint = "cuMemHostRegister_v2")]
+    public static unsafe partial CudaResult cuMemHostRegister(void* hostPointer, nuint bytes, uint flags);
+
+    [LibraryImport("nvcuda", EntryPoint = "cuMemHostGetDevicePointer_v2")]
+    public static unsafe partial CudaResult cuMemHostGetDevicePointer(out ulong devicePointer, void* hostPointer, uint flags);
+
+    [LibraryImport("nvcuda", EntryPoint = "cuMemHostUnregister")]
+    public static unsafe partial CudaResult cuMemHostUnregister(void* hostPointer);
+
     [LibraryImport("nvcuda", EntryPoint = "cuModuleUnload")]
     public static partial CudaResult cuModuleUnload(IntPtr module);
 }

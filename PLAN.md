@@ -1352,8 +1352,9 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the PCIe-
 - [✓] Layer split — `gpu_layers` placement policy (see DN-M4-2)
   - Landed: synthetic F16 split-point sweep covers every boundary through the model's layer count, including the zero-layer CPU head tail; host serve smoke proves hybrid route shape, token identity against CPU-only serving, decode-side facts on CPU, refusal past the model's layers, dedicated-lane incompatibility refusal, and CUDA fail-fast posture. Config parsing/reload classification proves `gpu_layers` parses as a restart-only placement key and refuses invalid values naming model/key/value. Bench decode tok/s curves remain owner-deferred.
   - Verify gates: `dotnet test --filter "Category=Cuda" -c Release`; `dotnet test --filter "FullyQualifiedName~GpuLayersConfigTests|FullyQualifiedName~SplitRouteExecutionTests|FullyQualifiedName~ModelRouteTests|FullyQualifiedName~GenerationServiceTests" -c Release`.
-- [_] Frac spike — a CUDA segment computing over DRAM-resident weights on a model fully resident in RAM (see DN-M4-7, DN-M314-6)
-  - Verify: `dotnet test --filter Category=Parity|Scheduling` — the frac route decodes token-identical to the CPU-resident route with no persistent weight copy into VRAM. In this window the exit criterion is identity plus backend residency accounting through a mapped-host CUDA seam over an anonymous host-resident weight source; full PCIe throughput records remain owner-deferred unless bench is reopened or expert gather lands in MVP6. *(identity gate active; bench deferral applies)*
+- [✓] Frac spike — a CUDA segment computing over DRAM-resident weights on a model fully resident in RAM (see DN-M4-7, DN-M314-6)
+  - Landed: mapped-host residency is proven through anonymous host-resident weight sources and a host-mapped CUDA posture that registers live host regions with the driver instead of copying tensors into persistent device memory. Synthetic F16 gates prove token identity across CPU-only baseline, hybrid CUDA-transformer/CPU-tail/head routes, and whole-model default-copy vs mapped-host modes; copy accounting proves zero persistent weight copies for mapped mode while mapping counters name every registered region. Explicit double-buffered PCIe overlap remains deferred by the current bench/toolchain window.
+  - Verify gates: `dotnet test --filter "Category=Cuda" -c Release`; `dotnet test --filter "FullyQualifiedName~CudaFracSpikeTests|FullyQualifiedName~SplitRouteExecutionTests|FullyQualifiedName~ModelRouteTests|FullyQualifiedName~GpuLayersServeTests|FullyQualifiedName~GpuLayersConfigTests|FullyQualifiedName~GenerationServiceTests" -c Release`.
 - [_] VRAM residency — models fitting 24 GB resident on device
   - Verify: full-VRAM Q4_K_M 1.5B run; over-budget load rejected with ledger breakdown in the error.
 - [_] KV device pools — `dram` | `vram` | `split` residency policies (see DN-M4-4)
@@ -1365,7 +1366,7 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the PCIe-
 
 - [_] Automated Parity-Hybrid: token match across cpu / cuda / hybrid configurations
 - [_] Automated Budget: per-resource VRAM tier caps admitted or refused with a ledger breakdown naming model, resource, and tier. Verify: `dotnet test --filter Category=Config|Budget -c Release`
-- [_] Automated Frac Identity: a CUDA segment over DRAM-resident weights decodes token-identical to the CPU-resident route with no weight copy into VRAM. Verify: `dotnet test --filter Category=Parity|Scheduling -c Release`.
+- [✓] Automated Frac Identity: a CUDA segment over DRAM-resident weights decodes token-identical to the CPU-resident route with no persistent weight copy into VRAM. Verify gates landed through `Category=Cuda` and targeted frac/split-route/config/host filters in Release; full PCIe throughput records remain deferred by the current bench/toolchain window.
 - [_] Automated Kernel: CUDA fused dequant GEMV vs scalar reference
 - [_] Manual Hybrid Serve: monitor shows GPU utilization and PCIe transfer counters during hybrid decode *(GPU tiles arrive with MVP3's UI; counters require the CUDA phase)*
 
