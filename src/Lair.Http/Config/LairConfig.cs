@@ -15,6 +15,47 @@ public sealed record LairConfig
     public required IReadOnlyList<ModelConfig> Models { get; init; }
 
     public UiConfig Ui { get; init; } = new();
+
+    /// <summary>
+    /// The resident capacity an operator declares for this host — byte and core totals per tier, with optional per-node overrides — or
+    /// null when the configuration says nothing about any of it. These are declared values exactly as the loader parsed them: what a host
+    /// actually carries is what its reported topology states, and a declaration that disagrees with it is accepted with a warning rather
+    /// than rejected. Internal today: compute accounting reads these totals against the reported posture when an engine opens.
+    /// </summary>
+    internal TierCapacityConfig? Tiers { get; init; }
+}
+
+/// <summary>
+/// Declared resident capacity for one host's tiers, in flat keys: system-memory bytes and logical processors, the disk path a read-side
+/// tier reads from, and optional per-node overrides keyed by node position. Every value is declared posture — an absent key declares no
+/// total rather than zero, and a per-node override states only what its entry names.
+/// </summary>
+public sealed record TierCapacityConfig
+{
+    /// <summary>Megabytes the operator declares at system memory; null (absent) declares no byte total.</summary>
+    public long? DramMb { get; init; }
+
+    /// <summary>Logical processors the operator declares at system memory — the unit a core set or thread quota counts in; null (absent) declares no core total.</summary>
+    public int? DramCores { get; init; }
+
+    /// <summary>The disk path this host reads from, declared as presence and path only. No byte ceiling belongs to that position: the model file already is the complete set.</summary>
+    public string? NvmePath { get; init; }
+
+    /// <summary>Per-node overrides keyed by node position, each stating its own bytes and/or cores. An override never replaces the reported posture — it disagrees with it.</summary>
+    public IReadOnlyList<NodeCapacityOverride> Nodes { get; init; } = [];
+}
+
+/// <summary>One declared per-node override: which node position it names, and only the totals that entry states.</summary>
+public sealed record NodeCapacityOverride
+{
+    /// <summary>The node position this override names, counting the nodes a host posture reports from zero.</summary>
+    public required int Index { get; init; }
+
+    /// <summary>Megabytes declared for this node; null (absent) declares nothing about its bytes.</summary>
+    public long? Mb { get; init; }
+
+    /// <summary>Logical processors declared for this node; null (absent) declares nothing about its cores.</summary>
+    public int? Cores { get; init; }
 }
 
 /// <summary>Monitor surface settings — what the live stats stream retains and replays.</summary>
@@ -157,4 +198,12 @@ public sealed record PlacementConfig
 
     /// <summary>Which prefill lane posture the model opens with: <c>shared</c> (default — prompt forwards ride the model's single execution backend, exactly as before this key existed) or <c>dedicated</c> (prompt forwards run on a second CPU execution backend capped to its own share of the worker claim). The split is resolved when the engine opens; changing it is a restart-only edit.</summary>
     public string PrefillLane { get; init; } = PlacementPrefillLaneValues.Shared;
+
+    /// <summary>
+    /// Whether this model's core-set claim may overlap cores another model already claims. Default false keeps today's posture: pinned
+    /// core sets partition the machine disjointly and an overlap is refused at load naming both models. True relaxes it for this model's
+    /// own claim, which then shares held cores under the compute grant rules instead of being refused. Overlap changes what a running
+    /// engine's workers contend for, so this key is established when the engine opens — a restart-only edit like <c>core_set</c>.
+    /// </summary>
+    public bool CoreOvercommit { get; init; }
 }

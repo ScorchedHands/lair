@@ -62,4 +62,16 @@ public sealed record ModelFacts(
     string? PrefillRowClamp = null,
 
     /// <summary>What the host device ledger has seated claims against, one entry per tier position, or null when the ledger has seated none.</summary>
-    IReadOnlyList<LedgerOccupancyEntry>? LedgerOccupancy = null);
+    IReadOnlyList<LedgerOccupancyEntry>? LedgerOccupancy = null,
+
+    /// <summary>The worker share this model asked to run with — its engine thread choice capped by its own quota — or null until the owning service attaches compute facts.</summary>
+    int? ComputeRequestedThreads = null,
+
+    /// <summary>The logical processors that claim was granted: below requested where an earlier seat clamped it, equal when nothing contended for the host's capacity.</summary>
+    int? ComputeGrantedThreads = null,
+
+    /// <summary>True when this model opted into sharing cores another claim holds; null until facts attach or while the disjoint posture stands.</summary>
+    bool? CoreOvercommit = null,
+
+    /// <summary>The models whose participation rides logical processors a grant already holds — null when every seated share is its own.</summary>
+    IReadOnlyList<string>? SharedCoreModels = null);

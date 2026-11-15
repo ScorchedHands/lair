@@ -569,7 +569,14 @@ public sealed class EngineMetricsBus : IAsyncDisposable
 
                 AdmissionRefusalsTotal: Volatile.Read(ref _admissionRefusalTotal),
                 AdmissionRefusals: RecentAdmissionRefusals(), // already holding the fan-out lock here; Monitor re-entry is safe on this thread
-                LedgerOccupancy: facts?.LedgerOccupancy);
+                LedgerOccupancy: facts?.LedgerOccupancy,
+
+                // Additive compute-grant facts (earlier shapes untouched): requested against granted rides the attached facts so a model
+                // running below what it asked for reads that way on every surface that reports worker counts.
+                ComputeRequestedThreads: facts?.ComputeRequestedThreads,
+                ComputeGrantedThreads: facts?.ComputeGrantedThreads,
+                CoreOvercommit: facts?.CoreOvercommit,
+                SharedCoreModels: facts?.SharedCoreModels);
 
             long id = ++_eventSeq;
             frame = new MonitorFrame(id, MonitorEventNames.Snapshot, snapshot.ToJson());

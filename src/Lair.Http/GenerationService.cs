@@ -60,6 +60,13 @@ public sealed class GenerationService : IDisposable
     // nothing that the existing pool and scheduler seams do not already bound.
     private DeviceLedger? _ledger;
 
+    // The host compute accounting this engine's worker claim registered against, and the share its own backend runs with. Supplied by hosts
+    // that keep capacity accounting across several opened engines — then earlier claims cap this model's participation rather than refusing
+    // it — and otherwise derived from this process's reported topology over an empty ledger. The grant is what monitor facts report as
+    // requested against granted, so a partial seat reads the same way on every surface that reports worker counts.
+    private ComputeCapacityLedger? _compute;
+    private ComputeGrant? _computeGrant;
+
     // Generations currently publishing monitor lifecycle frames, keyed by their stream request id — the in-flight
     // half of a resync state dump. Trackers are added at admission and removed when their completion frame publishes.
     private readonly ConcurrentDictionary<string, RequestTracker> _monitoredRequests = new(StringComparer.Ordinal);
@@ -210,7 +217,29 @@ public sealed class GenerationService : IDisposable
         EffectivePrefillRowWidth: _model.EffectivePrefillRowWidth,
         PrefillWorkingSetBytes: _model.PrefillWorkingSetBytes,
         PrefillRowClamp: _model.PrefillRowClamp?.Describe(),
-        LedgerOccupancy: BuildLedgerOccupancy(_ledger));
+        LedgerOccupancy: BuildLedgerOccupancy(_ledger),
+        ComputeRequestedThreads: _computeGrant?.RequestedCores,
+        ComputeGrantedThreads: _computeGrant?.GrantedCores,
+        CoreOvercommit: config.Models[0].Placement.CoreOvercommit ? true : null,
+        SharedCoreModels: BuildSharedCoreFacts(_compute, _computeGrant));
+
+    // Which seated compute grants ride logical processors another grant already holds — the models an operator needs to see together when a
+    // share was clamped or opted into overlap. Nothing shared reports null, so snapshots of a host where every grant is its own read exactly as they did before this fact existed.
+    private static IReadOnlyList<string>? BuildSharedCoreFacts(ComputeCapacityLedger? compute, ComputeGrant? grant)
+    {
+        if (compute is null || grant is null || !grant.SharesHeldCores)
+        {
+            return null;
+        }
+
+        List<string> models = [.. compute.ModelsSharingHeldCores];
+        if (!models.Contains(grant.Model))
+        {
+            models.Add(grant.Model);
+        }
+
+        return models;
+    }
 
     // The resolved route as the monitor and the model listing report it: segments in execution order, each with its
     // device identity, residency tier, batch cap, and quota exactly as load resolved them. Live edits move worker
@@ -633,6 +662,70 @@ public sealed class GenerationService : IDisposable
     // a claim never under-reports what it holds against a ceiling declared in that unit.
     private static long WeightClaimMegabytes(long bytes) => (bytes + 1024 * 1024 - 1) / (1024 * 1024);
 
+    // Declared capacity totals read against the posture this host reported. A disagreement is logged and accepted rather than refused: an
+    // operator may state a number detection could not see, which is exactly what a per-node override exists for, while byte totals no node stated
+    // read as incomparable rather than as a mismatch with what was declared. The posture itself is always reported so the comparison has a source.
+    private static void ReportDeclaredCapacity(string modelName, TierCapacityConfig? tiers, ComputeCapacityLedger compute, ILogger? logger)
+    {
+        HostTopology topology = compute.Topology;
+
+        logger?.LogInformation(
+            "compute_topology model='{Model}' nodes={NodeCount} logical_processors={TotalLogicalProcessors}{Bytes}",
+            modelName,
+            topology.Nodes.Count,
+            topology.TotalLogicalProcessors,
+            topology.ReportedMemoryMb is long reportedMb ? $" node_mb_total={reportedMb}" : " node_bytes=unreported");
+
+        if (tiers is null)
+        {
+            return; // nothing declared: today's posture states no public totals and compares against none.
+        }
+
+        DeclaredTotalsReport totals = compute.CheckDeclaredTotals(tiers.DramCores, tiers.DramMb);
+        if (totals.ReportsCoreMismatch || totals.ReportsByteMismatch)
+        {
+            logger?.LogWarning(
+                "tiers_capacity model='{Model}' {Detail} — accepted against reported topology",
+                modelName,
+                totals.Describe());
+        }
+
+        foreach (NodeCapacityOverride nodeOverride in tiers.Nodes)
+        {
+            HostNodeCapacity? reported = topology.Nodes.FirstOrDefault(node => node.Index == nodeOverride.Index);
+            if (reported is null)
+            {
+                logger?.LogWarning(
+                    "tiers_capacity model='{Model}' declares node index {DeclaredIndex} this posture does not report ({Posture}) — accepted as an override of detection",
+                    modelName,
+                    nodeOverride.Index,
+                    topology.Describe());
+                continue;
+            }
+
+            if (nodeOverride.Cores is int declaredCores && declaredCores != reported.LogicalProcessors)
+            {
+                logger?.LogWarning(
+                    "tiers_capacity model='{Model}' declares cores={DeclaredCores} for node index {NodeIndex} against reported {ReportedCores} — accepted as an override of detection",
+                    modelName,
+                    declaredCores,
+                    nodeOverride.Index,
+                    reported.LogicalProcessors);
+            }
+
+            // A posture that stated no per-node bytes has nothing to compare a declared override against; accepting silently is the honest reading there.
+            if (nodeOverride.Mb is long declaredMb && reported.MemoryMb is long reportedNodeMb && declaredMb != reportedNodeMb)
+            {
+                logger?.LogWarning(
+                    "tiers_capacity model='{Model}' declares megabytes={DeclaredMegabytes} for node index {NodeIndex} against reported {ReportedMegabytes} — accepted as an override of detection",
+                    modelName,
+                    declaredMb,
+                    nodeOverride.Index,
+                    reportedNodeMb);
+            }
+        }
+    }
+
     // Whether this model's budgets declare a ceiling at the system-memory tier of their KV chain — the one budgeted ceiling that is
     // canonical for today's reservation and live soft cap, so its agreement with the legacy key is what opening reports once.
     private static bool DeclaresSystemMemoryKvCeiling(ModelConfig model)
@@ -750,7 +843,19 @@ public sealed class GenerationService : IDisposable
     /// ledger is today's posture: this engine gets its own ledger over the tiers its pools back, bounded nowhere a
     /// public total was not stated. No host configuration path reaches a supplied ledger — it is a programmatic seam.
     /// </summary>
-    public static GenerationService Open(LairConfig config, ILogger? logger, DeviceLedger? ledger)
+    public static GenerationService Open(LairConfig config, ILogger? logger, DeviceLedger? ledger) =>
+        Open(config, logger, ledger, compute: null);
+
+    /// <summary>
+    /// The shared-accounting form of the same open. <paramref name="ledger"/> is host-scoped byte accounting several programmatically opened
+    /// engines share, so their claims register against one set of capacity seams in the order the opens happen — first-come-first-served across
+    /// engines, earlier claims never revoked or displaced; a null ledger is today's posture, this engine's own ledger over the tiers its pools
+    /// back with each stating the explicit unbounded capacity posture. <paramref name="compute"/> is host-scoped core accounting shared the same
+    /// way: an injected one carries both what the host reported about nodes and every share seated ahead of this model, so a later claim is
+    /// clamped to what its predecessors left instead of being refused or preempting them; a null one opens fresh accounting over this process's
+    /// reported topology. No host configuration path reaches either seam — they are programmatic seams.
+    /// </summary>
+    public static GenerationService Open(LairConfig config, ILogger? logger, DeviceLedger? ledger, ComputeCapacityLedger? compute)
     {
         ArgumentNullException.ThrowIfNull(config);
         if (config.Models.Count == 0)
@@ -780,17 +885,48 @@ public sealed class GenerationService : IDisposable
         CpuBackend? prefillsBackend = null;
         CpuBackend backend;
 
+        // The host posture this engine's worker claim accounts against: an injected compute ledger carries both what the host reported about
+        // its nodes and every share seated ahead of this model, so a later oversubscribed claim is clamped to what its predecessors left rather
+        // than refused or allowed to preempt them; without one, this open derives the process posture once — nodes and logical processors as the
+        // OS reports them, byte totals reported where stated — and seats claims against that host total. Which node a share draws from belongs to placement, not accounting.
+        compute ??= new ComputeCapacityLedger(HostTopologyProbe.Detect());
+
+        ReportDeclaredCapacity(modelConfig.Name, config.Tiers, compute, logger); // warn-and-accept: an operator's declared totals read against what this posture reported.
+
+        int engineThreadsChoice = config.Engine.Threads == 0 ? CpuBackend.AutoWorkerCount : config.Engine.Threads;
+        int requestedShare = modelConfig.Placement.ThreadQuota is { } declaredQuota
+            ? Math.Min(engineThreadsChoice, declaredQuota)
+            : engineThreadsChoice;
+
+        // The claim registers before any backend opens, in this open's order: earlier seats cap this participation instead of refusing it, and the grant logs requested against granted so a partial seat is visible at load rather than inferred from a worker count.
+        ComputeGrant computeGrant = compute.RegisterClaim(modelConfig.Name, requestedShare, modelConfig.Placement.CoreOvercommit);
+
+        logger?.LogInformation(
+            "compute_grant model='{Model}' requested={Requested} granted={Granted} exclusive_cores={ExclusiveCores} shared_cores={SharedCores} nodes={NodeCount} logical_processors={TotalLogicalProcessors}",
+            modelConfig.Name,
+            computeGrant.RequestedCores,
+            computeGrant.GrantedCores,
+            computeGrant.ExclusiveCores,
+            computeGrant.SharesHeldCores,
+            compute.Topology.Nodes.Count,
+            compute.TotalCores);
+
+        // A full grant leaves today's construction untouched: the engine thread choice and this model's quota stand exactly as configured. Only a partial grant adds a cap, it caps participation inside what this model itself asked to run with, and how auto-sizing chose its count stays as it was — live worker edits keep their existing semantics against the engine's own choice.
+        int? grantedQuota = computeGrant.GrantedCores >= requestedShare
+            ? modelConfig.Placement.ThreadQuota
+            : Math.Min(modelConfig.Placement.ThreadQuota ?? computeGrant.GrantedCores, computeGrant.GrantedCores);
+
         if (modelConfig.Placement.PrefillLane == PlacementPrefillLaneValues.Dedicated)
         {
-            int engineThreadsChoice = config.Engine.Threads == 0 ? CpuBackend.AutoWorkerCount : config.Engine.Threads;
-            prefillsLane = ModelPrefillLanes.ResolveDedicated(modelConfig.Name, engineThreadsChoice, modelConfig.Placement.ThreadQuota, modelConfig.Placement.CoreSet);
+            // A dedicated posture sub-allocates both lane sides from this model's granted share, so a clamped claim narrows the split instead of letting one side reach past what the host seated for it.
+            prefillsLane = ModelPrefillLanes.ResolveDedicated(modelConfig.Name, engineThreadsChoice, grantedQuota, modelConfig.Placement.CoreSet);
 
             backend = new(engineThreadsChoice, new HashSet<int>(prefillsLane.DecodeCoreIds), prefillsLane.DecodeShareThreads);
             prefillsBackend = new(prefillsLane.PrefillShareThreads, new HashSet<int>(prefillsLane.PrefillCoreIds));
         }
         else
         {
-            backend = new(config.Engine.Threads, modelConfig.Placement.CoreSet, modelConfig.Placement.ThreadQuota);
+            backend = new(config.Engine.Threads, modelConfig.Placement.CoreSet, grantedQuota);
         }
         // The model's placement resolves to its route value set here, against the compute backend this service opens for it:
         // consecutive stages naming 'cpu' collapse into one CPU segment carrying this model's thread cap and pinned core share,
@@ -1089,6 +1225,8 @@ public sealed class GenerationService : IDisposable
             GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, markerPair, markersProven ? string.Empty : markerRefusal, logger, pool, scheduler, info, config, prefillsBackend, prefillsLane);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
             service._ledger = ledger; // the claims this open registered ride the same ledger the scheduler reports admissions to
+            service._compute = compute; // the core accounting this model's grant seated against, shared with any engine opened beside it
+            service._computeGrant = computeGrant; // requested against granted, reported on monitor facts beside the live worker count
             file = null;
             model = null;
             pool = null;

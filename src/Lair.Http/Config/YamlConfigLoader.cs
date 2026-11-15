@@ -14,12 +14,18 @@ public static class YamlConfigLoader
 {
     private const string TopLevel = "the top level";
 
-    private static readonly string[] TopLevelKeys = ["server", "engine", "models", "ui"];
+    private static readonly string[] TopLevelKeys = ["server", "engine", "models", "ui", "tiers"];
     private static readonly string[] ServerKeys = ["bind", "port"];
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel"];
     private static readonly string[] UiKeys = ["recent_requests"];
     private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "budgets"];
-    private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane"];
+    private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit"];
+
+    /// <summary>The resident capacity keys a top-level tiers block may declare, in the order a refusal reports them.</summary>
+    private static readonly IReadOnlyList<string> TierKeys = ["dram_mb", "dram_cores", "nvme_path", "nodes"];
+
+    /// <summary>The keys one per-node override entry may declare beside the node position it names.</summary>
+    private static readonly IReadOnlyList<string> NodeOverrideKeys = ["index", "mb", "cores"];
 
     /// <summary>The resource keys a model's budgets block may declare, in the order a refusal reports them.</summary>
     private static readonly IReadOnlyList<string> BudgetResourceKeys = [BudgetResourceNames.Weights, BudgetResourceNames.Kv, BudgetResourceNames.PrefillBuffers];
@@ -47,6 +53,7 @@ public static class YamlConfigLoader
             Engine = ParseEngine(top, models),
             Models = models,
             Ui = ParseUi(top),
+            Tiers = ParseTiers(top),
         };
     }
 
@@ -121,6 +128,122 @@ public static class YamlConfigLoader
         }
 
         return new UiConfig { RecentRequests = recentRequests };
+    }
+
+    /// <summary>
+    /// Parses the top-level tiers block: flat resident capacity keys for system memory, a disk path declared as presence and path only,
+    /// and an optional list of per-node overrides keyed by node position. Shape is validated here — every known key that expects a number
+    /// must state one, positive where it states anything, and a refusal names the qualified key with the offending value (naming the node
+    /// index too for a per-node override). Whether declared totals agree with what a host reports is answered when an engine opens,
+    /// warn-and-accept: this loader never consults topology. A disk byte ceiling is not accepted here because that position already holds
+    /// the complete set; accelerator ceilings are not this block's vocabulary at all.
+    /// </summary>
+    private static TierCapacityConfig? ParseTiers(Dictionary<string, YamlNode> top)
+    {
+        if (!top.TryGetValue("tiers", out YamlNode? node))
+        {
+            return null; // no tiers block declares nothing: today's posture states no public totals.
+        }
+
+        const string where = "'tiers'";
+        Dictionary<string, YamlNode> keys = KeysOf(AsMapping(node, where), where);
+        RejectUnknownKeys(keys, where, TierKeys);
+
+        long? dramMb = TryLong(keys, "dram_mb", "tiers.dram_mb");
+        if (dramMb is < 1)
+        {
+            throw new ConfigException($"tiers.dram_mb {dramMb} is invalid: 'dram_mb' must be 1 or greater — omit the key to declare no byte total.");
+        }
+
+        int? dramCores = TryInteger(keys, "dram_cores", "tiers.dram_cores");
+        if (dramCores is < 1)
+        {
+            throw new ConfigException($"tiers.dram_cores {dramCores} is invalid: 'dram_cores' must be 1 or greater — omit the key to declare no core total.");
+        }
+
+        // A disk path declares only that this host reads from one. No ceiling belongs at that position, so nothing here reads a number beside it.
+        string? nvmePath = TryText(keys, "nvme_path", "tiers.nvme_path");
+        if (nvmePath is not null && string.IsNullOrWhiteSpace(nvmePath))
+        {
+            throw new ConfigException("tiers.nvme_path must name a non-empty path this host reads from — omit the key to say nothing about disk storage.");
+        }
+
+        IReadOnlyList<NodeCapacityOverride> nodes = ParseNodeOverrides(keys);
+
+        if (dramMb is null && dramCores is null && nvmePath is null && nodes.Count == 0)
+        {
+            throw new ConfigException(
+                $"{where} declares nothing: a tiers block states at least one of {Vocabulary(TierKeys)} — omit 'tiers' entirely to declare no capacity.");
+        }
+
+        return new TierCapacityConfig { DramMb = dramMb, DramCores = dramCores, NvmePath = nvmePath, Nodes = nodes };
+    }
+
+    // Per-node overrides: each entry names the node position it disagrees with and states its own bytes and/or cores. A malformed value
+    // fails naming key, value, and the index that entry names; a duplicate or out-of-range index cannot name one node position at all.
+    private static IReadOnlyList<NodeCapacityOverride> ParseNodeOverrides(Dictionary<string, YamlNode> tierKeys)
+    {
+        if (!tierKeys.TryGetValue("nodes", out YamlNode? node))
+        {
+            return [];
+        }
+
+        const string where = "'tiers.nodes'";
+        if (node.NodeType != YamlNodeType.Sequence)
+        {
+            throw new ConfigException($"{where} must be a list of per-node overrides, each naming an index and stating 'mb' and/or 'cores'.");
+        }
+
+        List<NodeCapacityOverride> overrides = [];
+        HashSet<int> declaredIndexes = [];
+        int position = 0;
+
+        foreach (YamlNode entry in ((YamlSequenceNode)node).Children)
+        {
+            string entryWhere = $"{where}[{position}]";
+            Dictionary<string, YamlNode> keys = KeysOf(AsMapping(entry, entryWhere), entryWhere);
+            RejectUnknownKeys(keys, entryWhere, NodeOverrideKeys);
+
+            int? index = TryInteger(keys, "index", $"{entryWhere}.index");
+            if (index is null)
+            {
+                throw new ConfigException($"Missing required key 'index' under {entryWhere}; allowed keys are: {Allowed(NodeOverrideKeys)}.");
+            }
+
+            if (index.Value < 0)
+            {
+                throw new ConfigException(
+                    $"{entryWhere}.index {index} is invalid for node index {index}: a per-node override names the position a host posture reports, counting from 0.");
+            }
+
+            long? mb = TryLong(keys, "mb", $"{entryWhere}.mb");
+            if (mb is < 1)
+            {
+                throw new ConfigException($"{entryWhere}.mb {mb} is invalid for node index {index}: a per-node byte override must be 1 or greater.");
+            }
+
+            int? cores = TryInteger(keys, "cores", $"{entryWhere}.cores");
+            if (cores is < 1)
+            {
+                throw new ConfigException($"{entryWhere}.cores {cores} is invalid for node index {index}: a per-node core override must be 1 or greater.");
+            }
+
+            if (mb is null && cores is null)
+            {
+                throw new ConfigException(
+                    $"{entryWhere} states nothing about node index {index}: an override declares 'mb' and/or 'cores' — omit the entry to state no override there.");
+            }
+
+            if (!declaredIndexes.Add(index.Value))
+            {
+                throw new ConfigException($"{where} names node index {index} more than once (at position {position}): one entry overrides what one node position states.");
+            }
+
+            overrides.Add(new NodeCapacityOverride { Index = index.Value, Mb = mb, Cores = cores });
+            position++;
+        }
+
+        return [.. overrides];
     }
 
     private static EngineConfig ParseEngine(Dictionary<string, YamlNode> top, IReadOnlyList<ModelConfig> models)
@@ -397,6 +520,11 @@ public static class YamlConfigLoader
                 $"models[{index}].placement.prefill_lane '{prefillLane}' is invalid for model '{modelName}': 'prefill_lane' accepts only '{PlacementPrefillLaneValues.Shared}' or '{PlacementPrefillLaneValues.Dedicated}'.");
         }
 
+        // Core-set overcommit: absent means today's disjoint partition, and a present value opts this model's own claim into sharing cores
+        // another model already claims. A non-boolean fails naming the key exactly as the other choice keys do; what the value costs a
+        // running engine is decided when the engine opens, so the loader only reads the posture.
+        bool coreOvercommit = TryBoolean(keys, "core_overcommit", $"models[{index}].placement.core_overcommit") ?? false;
+
         return new PlacementConfig
         {
             Device = device,
@@ -405,6 +533,7 @@ public static class YamlConfigLoader
             CoreSet = coreSet,
             ThreadQuota = threadQuota,
             PrefillLane = prefillLane,
+            CoreOvercommit = coreOvercommit,
         };
     }
 
@@ -464,7 +593,8 @@ public static class YamlConfigLoader
         // Two pinned models sharing a core id contend for the same execution resources and make the pinning contract
         // meaningless. The current build serves exactly one model, so this rule guards the multi-model path that the
         // placement vocabulary is written for; it validates parsed model objects directly so callers without a YAML
-        // document apply the same rule.
+        // document apply the same rule. A model that opts into core overcommit relaxes the rule for its own claim only:
+        // it may share cores an earlier claim already holds, while every other pair keeps today's refusal naming both models.
         Dictionary<int, string> owners = [];
         for (int index = 0; index < models.Count; index++)
         {
@@ -473,6 +603,11 @@ public static class YamlConfigLoader
             {
                 if (!owners.TryAdd(core, model.Name))
                 {
+                    if (model.Placement.CoreOvercommit)
+                    {
+                        continue; // this claim opted into sharing held cores: the owner keeps its seat and nothing is refused.
+                    }
+
                     throw new ConfigException(
                         $"models '{owners[core]}' and '{model.Name}' both pin core {core}: placement core sets must " +
                         "disjointly partition the machine so pinned models never share a core.");
@@ -556,8 +691,26 @@ public static class YamlConfigLoader
         return value;
     }
 
-    private static bool? TryBoolean(Dictionary<string, YamlNode> keys, string key, string qualifiedKey)
+    // The same read as TryInteger for the byte totals a tiers block declares: capacity ceilings count in whole megabytes and can name a
+    // number larger than an int carries, so these keys parse wide while still refusing anything that is not an integer.
+    private static long? TryLong(Dictionary<string, YamlNode> keys, string key, string qualifiedKey)
     {
+        if (!keys.TryGetValue(key, out YamlNode? node))
+        {
+            return null;
+        }
+
+        if (node.NodeType != YamlNodeType.Scalar ||
+            ((YamlScalarNode)node).Value is not string text ||
+            !long.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out long value))
+        {
+            throw new ConfigException($"{qualifiedKey} must be an integer value.");
+        }
+
+        return value;
+    }
+
+    private static bool? TryBoolean(Dictionary<string, YamlNode> keys, string key, string qualifiedKey)    {
         if (!keys.TryGetValue(key, out YamlNode? node))
         {
             return null;

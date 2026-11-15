@@ -148,7 +148,19 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_admission_refusals")] IReadOnlyList<AdmissionRefusalEntry>? AdmissionRefusals = null,
 
     /// <summary>Host device-ledger occupancy: one entry per tier position a seated claim holds, each with the tier's capacity posture and contested holders where several claimants share it; null until the owning service attaches facts and whenever no claim has seated.</summary>
-    [property: JsonPropertyName("metrics_ledger_occupancy")] IReadOnlyList<LedgerOccupancyEntry>? LedgerOccupancy = null)
+    [property: JsonPropertyName("metrics_ledger_occupancy")] IReadOnlyList<LedgerOccupancyEntry>? LedgerOccupancy = null,
+
+    /// <summary>The worker share this model asked to run with (engine thread choice capped by its own quota); null until the owning service attaches compute facts.</summary>
+    [property: JsonPropertyName("metrics_compute_requested_threads")] int? ComputeRequestedThreads = null,
+
+    /// <summary>The logical processors that claim was granted — below requested where an earlier seat clamped it; null until compute facts attach.</summary>
+    [property: JsonPropertyName("metrics_compute_granted_threads")] int? ComputeGrantedThreads = null,
+
+    /// <summary>True when this model opted into sharing cores another claim holds; null while the disjoint posture stands or before compute facts attach.</summary>
+    [property: JsonPropertyName("metrics_core_overcommit")] bool? CoreOvercommit = null,
+
+    /// <summary>The models whose participation rides logical processors a grant already holds — null whenever every seated share is its own.</summary>
+    [property: JsonPropertyName("metrics_shared_cores_models")] IReadOnlyList<string>? SharedCoreModels = null)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);
