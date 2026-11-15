@@ -176,6 +176,16 @@ public static class ConfigMutationTable
 
         AddBudgetChanges(changes, oldModel, newModel);
 
+        // The source block is a structural pin like budgets' chain orders and per-node overrides: it reports through one
+        // canonical field carrying the whole declared posture, and every edit to it is restart-only because loadability
+        // depends on the manifest and fetch behavior established when the model opened — a live edit cannot move a pin.
+        string currentSource = CanonicalSource(oldModel);
+        string candidateSource = CanonicalSource(newModel);
+        if (currentSource != candidateSource)
+        {
+            changes.Add(new FieldChange("models[0].source", currentSource, candidateSource, ConfigMutationClass.RestartOnly));
+        }
+
         PlacementConfig oldPlacement = oldModel.Placement;
         PlacementConfig newPlacement = newModel.Placement;
         Add(changes, "models[0].placement.device", oldPlacement.Device, newPlacement.Device);
@@ -282,6 +292,7 @@ public static class ConfigMutationTable
         "models[0].max_concurrent_requests" => ConfigMutationClass.NewRequestsOnly,
         "models[0].placement.numa_spread" => ConfigMutationClass.NewRequestsOnly,
         "models[0].placement.core_overcommit" => ConfigMutationClass.RestartOnly,
+        "models[0].source" => ConfigMutationClass.RestartOnly, // loadability depends on the manifest and fetch behavior established at open.
         "tiers.dram_mb" or "tiers.dram_cores" or "tiers.nvme_path" or "tiers.nodes" => ConfigMutationClass.RestartOnly,
         _ => BudgetFieldClass(field) ?? ConfigMutationClass.RestartOnly,
     };
@@ -304,6 +315,22 @@ public static class ConfigMutationTable
     }
 
     private static string NumberOrNone(long? value) => value is null ? "(unset)" : value.Value.ToString(CultureInfo.InvariantCulture);
+
+    // The declared source posture in one canonical text so two pins compare like-for-like: the repo and revision, then each
+    // declared file with its pinned hash and size in declared order. An absent source block reads as no pin at all.
+    private static string CanonicalSource(ModelConfig model)
+    {
+        if (model.Source is null)
+        {
+            return "(unset)";
+        }
+
+        string files = string.Join(
+            ";",
+            model.Source.Files.Select(file => $"path={file.Path}:sha256={(file.Sha256 is string sha ? sha : "unset")}:size={(file.Size is long size ? size.ToString(CultureInfo.InvariantCulture) : "unset")}"));
+
+        return $"repo={model.Source.Repo};revision={model.Source.Revision};files[{files}]";
+    }
 
     // The declared per-node overrides in one canonical text so two postures compare like-for-like: each entry keyed by the node position it names.
     private static string CanonicalNodeOverrides(TierCapacityConfig? tiers) => tiers?.Nodes is not { Count: > 0 }
@@ -402,7 +429,7 @@ public static class ConfigMutationTable
         yield return ("tiers.dram_cores", ScalarText(tiers, "dram_cores"));
         yield return ("tiers.nvme_path", ScalarText(tiers, "nvme_path"));
 
-        // Budget chain order lists are skipped here exactly as 'placement.core_set' is: a structural list has no single canonical text to compare against, and a semantic chain change on a file that does validate surfaces through the full Diff instead. Each ceiling is a plain scalar carrying its own qualified key below.
+        // Budget chain order lists are skipped here exactly as 'placement.core_set' is: a structural list has no single canonical text to compare against, and a semantic chain change on a file that does validate surfaces through the full Diff instead. Each ceiling is a plain scalar carrying its own qualified key below. The source block is skipped for the same reason — a structural pin with no single canonical scalar — and a semantic source edit on a file that does validate surfaces through the full Diff as one restart-only field.
         YamlDotNet.RepresentationModel.YamlMappingNode? budgets = Child(model, "budgets");
 
         foreach (string resourceKey in BudgetResourceNames.DeclaredKeys)

@@ -168,7 +168,42 @@ public sealed record ModelConfig
     /// </summary>
     public int? MaxConcurrentRequests { get; init; }
 
+    /// <summary>
+    /// The published source this model's files are pinned to — the repo, the revision as declared, and the file set with each
+    /// file's pinned hash and size — or null when the entry says nothing about provenance, which serves the declared local
+    /// path exactly as every model does today. The loader validates this block's shape at load like every other block;
+    /// whether the bytes on disk match the pin is the pack manifest's answer, and a live edit of this posture is
+    /// restart-only because loadability depends on what the manifest and fetch behavior established at open.
+    /// </summary>
+    public ModelSourceConfig? Source { get; init; }
+
     public PlacementConfig Placement { get; init; } = new();
+}
+
+/// <summary>Where a served model's files come from: the published repo, the revision pinned as declared, and the model files the pack carries.</summary>
+public sealed record ModelSourceConfig
+{
+    /// <summary>The Hugging Face repo slug the files are fetched from.</summary>
+    public required string Repo { get; init; }
+
+    /// <summary>The commit sha or branch name the entry pins, stored exactly as declared: a branch becomes a commit sha when fetch resolves it into the manifest.</summary>
+    public required string Revision { get; init; }
+
+    /// <summary>The model files the source declares, in declared order, each with its pinned hash and size when the entry states them.</summary>
+    public required IReadOnlyList<SourceFileConfig> Files { get; init; }
+}
+
+/// <summary>One file a source block declares: a GGUF path/name beside the repo, with the pinned sha256 and declared size when the entry states them.</summary>
+public sealed record SourceFileConfig
+{
+    /// <summary>The file's path/name within the repo, kept as a readable name in the pack directory.</summary>
+    public required string Path { get; init; }
+
+    /// <summary>The pinned sha256 of this file's bytes, 64 lowercase hex characters; null (absent) pins no hash yet.</summary>
+    public string? Sha256 { get; init; }
+
+    /// <summary>The declared byte size of this file; null (absent) declares no size.</summary>
+    public long? Size { get; init; }
 }
 
 /// <summary>The accepted values of <c>placement.prefill_lane</c>: one execution backend for every forward, or a dedicated worker lane for prompt forwards.</summary>
