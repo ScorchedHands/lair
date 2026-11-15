@@ -1355,8 +1355,10 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the PCIe-
 - [✓] Frac spike — a CUDA segment computing over DRAM-resident weights on a model fully resident in RAM (see DN-M4-7, DN-M314-6)
   - Landed: mapped-host residency is proven through anonymous host-resident weight sources and a host-mapped CUDA posture that registers live host regions with the driver instead of copying tensors into persistent device memory. Synthetic F16 gates prove token identity across CPU-only baseline, hybrid CUDA-transformer/CPU-tail/head routes, and whole-model default-copy vs mapped-host modes; copy accounting proves zero persistent weight copies for mapped mode while mapping counters name every registered region. Explicit double-buffered PCIe overlap remains deferred by the current bench/toolchain window.
   - Verify gates: `dotnet test --filter "Category=Cuda" -c Release`; `dotnet test --filter "FullyQualifiedName~CudaFracSpikeTests|FullyQualifiedName~SplitRouteExecutionTests|FullyQualifiedName~ModelRouteTests|FullyQualifiedName~GpuLayersServeTests|FullyQualifiedName~GpuLayersConfigTests|FullyQualifiedName~GenerationServiceTests" -c Release`.
+- [_] CUDA GEMV quantized formats — packed GGUF weight matrices run through embedded PTX (see DN-M4-1)
+  - Verify gates: `dotnet test --filter "Category=Cuda" -c Release` plus targeted synthetic Q4_K_M parity against scalar/CPU reference math, with unsupported packed formats still refusing naming this backend rather than running elsewhere.
 - [_] VRAM residency — models fitting 24 GB resident on device
-  - Verify: full-VRAM Q4_K_M 1.5B run; over-budget load rejected with ledger breakdown in the error.
+  - Verify: a pinned local `models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` run stays fully device-resident and token-identical against its CPU-resident baseline when the fixture is present; an over-budget load is refused with ledger breakdown naming model, resource, tier, and amounts.
 - [_] KV device pools — `dram` | `vram` | `split` residency policies (see DN-M4-4)
   - Verify: parity across all three residencies; bench records the split-vs-follow cost curve. *(parity gate active; bench deferred)*
 - [_] VRAM tier budgets — `vram` caps for weights, KV, and prefill buffers become valid values in the DN-M314-9 schema, admitted through the DN-M314-10 ledger (see DN-M4-8).
@@ -1567,6 +1569,8 @@ Vision input on chat models.
 | idea | `auto` device fallback | silent CPU fallback when a configured CUDA device is absent — deliberately not a default (DN-M4-3) |
 
 ## Decision Log
+
+- **2026-11-15 — MVP4 full-device residency gates use the available pinned Q4_K_M fixture, not a missing 1.5B file.** The local model directory carries `models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` as its pinned Q4_K_M serve fixture; it fits VRAM and already has recorded parity fixtures, while no exact 1.5B Q4_K_M copy is present in this window. The gate now proves full-device residency on the available Q4_K_M fixture plus an over-budget refusal against a declared smaller cap rather than inventing a model download or claiming an absent file.
 
 - **2026-11-13 — Prefill row width resolves to 32, and its automated identity gate stays synthetic.** Measurements on both pinned fixtures put Llama-class prompt windows clearly ahead at row count `32` versus `16`, while Qwen remains within noise across widths; raising to the engine ceiling `64` doubles activation bytes for only small gains on one fixture. A first whole-suite run with real-fixture row-width cases failed an unrelated budget-attribution case under model-loaded contention, and a diagnostic excluding only that new test class passed the full suite while production width changes were active, so the `Category=Prefill` identity sweep stays synthetic while pinned cost curves live in `bench/reports/prefill-rowwidth-2026-11-13.md`.
 
