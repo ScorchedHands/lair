@@ -22,7 +22,9 @@ if (args.Length == 3 && args[0] == "serve" && args[1] == "-c")
     try
     {
         config = YamlConfigLoader.Load(args[2]);
-        engine = GenerationService.Open(config, loggerFactory.CreateLogger("Lair.Http.GenerationService"));
+        // A model that declares a published source is verified against its pack manifest (and fetched if absent) through
+        // the live hub seam before its GGUF opens; a model without a source is untouched by this seam.
+        engine = GenerationService.Open(config, loggerFactory.CreateLogger("Lair.Http.GenerationService"), ledger: null, compute: null, transport: new HuggingFaceHubTransport());
     }
     catch (Exception ex)
     {

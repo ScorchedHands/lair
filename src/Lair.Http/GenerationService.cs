@@ -916,7 +916,7 @@ public sealed class GenerationService : IDisposable
     /// clamped to what its predecessors left instead of being refused or preempting them; a null one opens fresh accounting over this process's
     /// reported topology. No host configuration path reaches either seam — they are programmatic seams.
     /// </summary>
-    public static GenerationService Open(LairConfig config, ILogger? logger, DeviceLedger? ledger, ComputeCapacityLedger? compute)
+    public static GenerationService Open(LairConfig config, ILogger? logger, DeviceLedger? ledger, ComputeCapacityLedger? compute, IModelHubTransport? transport = null)
     {
         ArgumentNullException.ThrowIfNull(config);
         if (config.Models.Count == 0)
@@ -1062,6 +1062,16 @@ public sealed class GenerationService : IDisposable
         GenerationScheduler? scheduler = null;
         try
         {
+            // A model that declares a published source is verified against its pack manifest before any byte of the
+            // GGUF is opened: a present artifact verifies with no transport call, an absent pinned file fetches exactly
+            // the pinned revision, and a disagreement or a failed fetch refuses the open here — before a model starts
+            // serving — rather than after. A model with no source, and every host that supplies no transport, keeps
+            // today's local-path posture untouched.
+            if (transport is not null && modelConfig.Source is not null)
+            {
+                new ModelArtifactResolver(transport).ResolveAsync(modelConfig, CancellationToken.None).GetAwaiter().GetResult();
+            }
+
             file = GgufFile.Open(modelConfig.Path);
             // Profile-scoped tokenizer defaults applied at load (absent BOS/EOS keys) surface as structured
             // log lines on the host logger.
