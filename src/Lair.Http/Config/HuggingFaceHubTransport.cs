@@ -28,7 +28,7 @@ public sealed class HuggingFaceHubTransport : IModelHubTransport
     public HuggingFaceHubTransport(IHubTokenProvider? tokenProvider = null, HttpClient? httpClient = null)
     {
         _tokenProvider = tokenProvider;
-        _http = httpClient ?? new HttpClient();
+        _http = httpClient ?? new HttpClient(new HttpClientHandler { AllowAutoRedirect = false });
     }
 
     /// <inheritdoc />
@@ -84,43 +84,67 @@ public sealed class HuggingFaceHubTransport : IModelHubTransport
         ArgumentOutOfRangeException.ThrowIfNegative(resumeFrom);
 
         string url = $"{HubBase}/{repo}/resolve/{revision}/{path}";
-        using HttpRequestMessage request = new(HttpMethod.Get, url);
-        if (resumeFrom > 0)
+        for (int redirects = 0; redirects < 5; redirects++)
         {
-            request.Headers.Range = new RangeHeaderValue(resumeFrom, null);
+            using HttpRequestMessage request = new(HttpMethod.Get, url);
+            if (resumeFrom > 0)
+            {
+                request.Headers.Range = new RangeHeaderValue(resumeFrom, null);
+            }
+            ApplyHubAuth(request);
+
+            HttpResponseMessage response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+
+            if (IsRedirect(response.StatusCode))
+            {
+                Uri? location = response.Headers.Location;
+                if (location is null)
+                {
+                    response.Dispose();
+                    throw new ModelFetchException($"File '{path}' in repo '{repo}' at revision {revision} redirected without a target location.");
+                }
+
+                Uri absolute = location.IsAbsoluteUri ? location : new Uri(new Uri(HubBase), location);
+                response.Dispose();
+                url = absolute.ToString();
+                continue;
+            }
+
+            if (response.StatusCode == HttpStatusCode.NotFound)
+            {
+                response.Dispose();
+                return null; // not present at this revision — the fetch path refuses the artifact.
+            }
+
+            if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
+            {
+                // The resume offset is at or past the end: the bytes already on disk are the whole file.
+                long? total = ParseContentRangeTotal(response.Content.Headers.ContentRange);
+                response.Dispose();
+                return new HubFile(Stream.Null, total);
+            }
+
+            if (IsGatedStatus(response.StatusCode))
+            {
+                response.Dispose();
+                throw GatedAccessRefusal($"File '{path}' in repo '{repo}' at revision {revision}", response.StatusCode);
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                response.Dispose();
+                throw new ModelFetchException($"File '{path}' in repo '{repo}' at revision {revision} could not be fetched (HTTP {(int)response.StatusCode}).");
+            }
+
+            long? totalSize = response.Content.Headers.ContentRange is { } range
+                ? range.Length
+                : response.Content.Headers.ContentLength;
+
+            Stream content = await response.Content.ReadAsStreamAsync(cancellationToken);
+            return new HubFile(new HubResponseStream(response, content), totalSize);
         }
-        ApplyHubAuth(request);
 
-        using HttpResponseMessage response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-
-        if (response.StatusCode == HttpStatusCode.NotFound)
-        {
-            return null; // not present at this revision — the fetch path refuses the artifact.
-        }
-
-        if (response.StatusCode == HttpStatusCode.RequestedRangeNotSatisfiable)
-        {
-            // The resume offset is at or past the end: the bytes already on disk are the whole file.
-            long? total = ParseContentRangeTotal(response.Content.Headers.ContentRange);
-            return new HubFile(Stream.Null, total);
-        }
-
-        if (IsGatedStatus(response.StatusCode))
-        {
-            throw GatedAccessRefusal($"File '{path}' in repo '{repo}' at revision {revision}", response.StatusCode);
-        }
-
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new ModelFetchException($"File '{path}' in repo '{repo}' at revision {revision} could not be fetched (HTTP {(int)response.StatusCode}).");
-        }
-
-        long? totalSize = response.Content.Headers.ContentRange is { } range
-            ? range.Length
-            : response.Content.Headers.ContentLength;
-
-        Stream content = await response.Content.ReadAsStreamAsync(cancellationToken);
-        return new HubFile(content, totalSize);
+        throw new ModelFetchException($"File '{path}' in repo '{repo}' at revision {revision} redirected too many times.");
     }
 
     /// <inheritdoc />
@@ -220,6 +244,10 @@ public sealed class HuggingFaceHubTransport : IModelHubTransport
         }
     }
 
+    private static bool IsRedirect(HttpStatusCode status) =>
+        status is HttpStatusCode.Moved or HttpStatusCode.Redirect or HttpStatusCode.SeeOther or
+            HttpStatusCode.TemporaryRedirect or HttpStatusCode.PermanentRedirect;
+
     private static bool IsHubRequest(Uri? uri) =>
         uri is not null && string.Equals(uri.Host, HubHost, StringComparison.OrdinalIgnoreCase);
 
@@ -289,6 +317,54 @@ public sealed class HuggingFaceHubTransport : IModelHubTransport
 
     private static bool IsCommitSha(string value) =>
         value.Length == 40 && value.All(ch => ch is >= '0' and <= '9' or >= 'a' and <= 'f');
+
+    private sealed class HubResponseStream : Stream
+    {
+        private readonly HttpResponseMessage _response;
+        private readonly Stream _inner;
+
+        public HubResponseStream(HttpResponseMessage response, Stream inner)
+        {
+            _response = response;
+            _inner = inner;
+        }
+
+        public override bool CanRead => _inner.CanRead;
+        public override bool CanSeek => _inner.CanSeek;
+        public override bool CanWrite => _inner.CanWrite;
+        public override long Length => _inner.Length;
+        public override long Position
+        {
+            get => _inner.Position;
+            set => _inner.Position = value;
+        }
+
+        public override void Flush() => _inner.Flush();
+        public override int Read(byte[] buffer, int offset, int count) => _inner.Read(buffer, offset, count);
+        public override long Seek(long offset, SeekOrigin origin) => _inner.Seek(offset, origin);
+        public override void SetLength(long value) => _inner.SetLength(value);
+        public override void Write(byte[] buffer, int offset, int count) => _inner.Write(buffer, offset, count);
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            _inner.ReadAsync(buffer, offset, count, cancellationToken);
+
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+            _inner.WriteAsync(buffer, offset, count, cancellationToken);
+
+        public override Task CopyToAsync(Stream destination, int bufferSize, CancellationToken cancellationToken) =>
+            _inner.CopyToAsync(destination, bufferSize, cancellationToken);
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _inner.Dispose();
+                _response.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+    }
 }
 
 /// <summary>
