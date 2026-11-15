@@ -1343,7 +1343,7 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the PCIe-
 
 - [✓] CPU GEMV flake diagnosis — reproduce or rule out the intermittent AVX2 `Q4_K` GEMV `AccessViolationException` under resident-engine load before CUDA parity gates run, so a CPU-path crash is not misattributed to the CUDA backend.
   - Verify: targeted `dotnet test --filter Category=Kernel|Concurrency|Cancel -c Release` repeat runs, plus a named failure/stack when the flake is reproduced.
-- [_] Binding spike — CUDA Driver API + embedded PTX smoke (see DN-M4-10)
+- [✓] Binding spike — CUDA Driver API + embedded PTX smoke (see DN-M4-10)
   - Verify: host loads a PTX kernel through `nvcuda.dll` and a smoke GEMM matches the CPU reference within FP tolerance, with no `nvcc` or cuBLASLt dependency.
 - [_] CudaBackend — dense decode + prefill kernels behind `IBackend` (see DN-M4-1)
   - Verify: `dotnet test --filter Category=Parity` — same F16 model decodes token-identical on CPU, CUDA, and hybrid per DN-M4-9: argmax agreement plus identical token stream, not raw-byte logits.

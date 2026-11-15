@@ -22,6 +22,7 @@
     <ProjectReference Include="..\..\src\Lair.Templating.Minja\Lair.Templating.Minja.csproj" />
     <ProjectReference Include="..\..\src\Lair.Loader\Lair.Loader.csproj" />
     <ProjectReference Include="..\..\src\Lair.Backends.Cpu\Lair.Backends.Cpu.csproj" />
+    <ProjectReference Include="..\..\src\Lair.Backends.Cuda\Lair.Backends.Cuda.csproj" />
     <ProjectReference Include="..\..\src\Lair.Kv\Lair.Kv.csproj" />
     <ProjectReference Include="..\..\src\Lair.Tokenizer\Lair.Tokenizer.csproj" />
     <ProjectReference Include="..\..\src\Lair.Sampling\Lair.Sampling.csproj" />
