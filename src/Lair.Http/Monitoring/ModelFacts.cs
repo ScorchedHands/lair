@@ -47,4 +47,7 @@ public sealed record ModelFacts(
     string? PrefillLaneCoreSet = null,
 
     /// <summary>Total bytes of mutable activation storage the dedicated lane family holds at open — zero for a shared posture.</summary>
-    long PrefillActivationBytes = 0);
+    long PrefillActivationBytes = 0,
+
+    /// <summary>What the host device ledger has seated claims against, one entry per tier position, or null when the ledger has seated none.</summary>
+    IReadOnlyList<LedgerOccupancyEntry>? LedgerOccupancy = null);

@@ -639,7 +639,7 @@ public static class ApiApp
         {
             ModelNotFoundException => (404, "invalid_request_error", "model_not_found"),
             ContextLengthExceededException => (400, "invalid_request_error", "context_length_exceeded"),
-            EngineBusyException => (503, "engine_overloaded_error", "engine_overloaded"),
+            EngineBusyException busy => (503, "engine_overloaded_error", busy.Code),
             TemplateRenderFailedException => (400, "invalid_request_error", "invalid_request"),
             ArgumentException or JsonException => (400, "invalid_request_error", "invalid_request"),
             BadHttpRequestException => (400, "invalid_request_error", "invalid_request"),

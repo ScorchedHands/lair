@@ -53,6 +53,13 @@ public sealed class GenerationService : IDisposable
     private readonly GenerationScheduler _scheduler;
     private EngineMetricsBus? _metrics;
 
+    // The host device ledger this engine's claims register against. Supplied by hosts that keep host-scoped accounting
+    // across several opened engines; otherwise the ledger a host opens over the tiers its pools back, with each opened
+    // tier stating the explicit unbounded capacity posture — a public total no one declared is never invented. Weight,
+    // KV, and prefill claims land here in registration order; the ledger records what the chains decided and bounds
+    // nothing that the existing pool and scheduler seams do not already bound.
+    private DeviceLedger? _ledger;
+
     // Generations currently publishing monitor lifecycle frames, keyed by their stream request id — the in-flight
     // half of a resync state dump. Trackers are added at admission and removed when their completion frame publishes.
     private readonly ConcurrentDictionary<string, RequestTracker> _monitoredRequests = new(StringComparer.Ordinal);
@@ -198,7 +205,8 @@ public sealed class GenerationService : IDisposable
         PrefillLaneShareThreads: _prefillsBackend?.EffectiveWorkerCount ?? 0,
         PrefillDecodeCoreSet: FormatCoreRanges(_prefillsLane?.DecodeCoreIds),
         PrefillLaneCoreSet: FormatCoreRanges(_prefillsLane?.PrefillCoreIds),
-        PrefillActivationBytes: _model.PrefillLaneActivationBytes);
+        PrefillActivationBytes: _model.PrefillLaneActivationBytes,
+        LedgerOccupancy: BuildLedgerOccupancy(_ledger));
 
     // The resolved route as the monitor and the model listing report it: segments in execution order, each with its
     // device identity, residency tier, batch cap, and quota exactly as load resolved them. Live edits move worker
@@ -210,6 +218,48 @@ public sealed class GenerationService : IDisposable
             segment.BatchCap,
             segment.Quota.Threads,
             FormatCoreRanges(segment.Quota.Cores)))];
+
+    // Additive ledger occupancy for operator views: one entry per tier position a seated claim holds, carrying the
+    // opened seam's capacity posture, what the claims hold against it, and the contested holders only where several
+    // claimants share a tier. A ledger that seated no claims reports nothing, so snapshots of an engine that claims
+    // nothing — every model declaring no budgets today — read exactly as they did before the ledger seam existed.
+    private static IReadOnlyList<LedgerOccupancyEntry>? BuildLedgerOccupancy(DeviceLedger? ledger)
+    {
+        if (ledger is null)
+        {
+            return null;
+        }
+
+        IReadOnlyList<DeviceLedgerClaim> claims = ledger.Claims;
+        if (claims.Count == 0)
+        {
+            return null;
+        }
+
+        List<LedgerOccupancyEntry> entries = [];
+        foreach (DeviceLedgerClaim claim in claims)
+        {
+            if (entries.Exists(entry => entry.Resource == BudgetResourceNames.Of(claim.Resource) && entry.Tier == BudgetTierNames.Of(claim.Tier)))
+            {
+                continue;
+            }
+
+            CapacitySeam? seam = ledger.SeamFor(claim.Tier, claim.Resource);
+            IReadOnlyList<DeviceLedgerClaim> holders = ledger.ClaimsAt(claim.Tier, claim.Resource);
+            bool contested = holders.Count > 1;
+
+            entries.Add(new LedgerOccupancyEntry(
+                BudgetResourceNames.Of(claim.Resource),
+                BudgetTierNames.Of(claim.Tier),
+                DeviceLedger.UnitName(claim.Resource),
+                seam?.Capacity,
+                holders.Sum(holder => holder.Amount),
+                contested,
+                contested ? [.. holders.Select(holder => new LedgerHolderEntry(holder.Model, holder.Amount))] : null));
+        }
+
+        return [.. entries];
+    }
 
     // Pinned core ids as compressed ranges ("0-23", "1, 4-6"); null when nothing is pinned. Accepts any id set —
     // a placement's own pins or one lane side of a dedicated split reads through the same formatter so every core fact
@@ -382,6 +432,7 @@ public sealed class GenerationService : IDisposable
 
                     case "models[0].kv_blocks":
                         GenerationScheduler.KvBudgetApply budget = _scheduler.ApplyKvBudget(candidate.Models[0].KvBlocks);
+                        RecordAppliedKvClaim(budget);
                         effective = effective with { Models = [effective.Models[0] with { KvBlocks = candidate.Models[0].KvBlocks } ] };
                         RefreshAdvertisedModel(effective);
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
@@ -492,6 +543,7 @@ public sealed class GenerationService : IDisposable
 
                         long ceiling = CandidateSystemMemoryKvCeiling(candidate.Models[0]) ?? candidate.Models[0].KvBlocks;
                         GenerationScheduler.KvBudgetApply budgeted = _scheduler.ApplyKvBudget(checked((int)ceiling));
+                        RecordAppliedKvClaim(budgeted);
                         effective = effective with { Models = [MergeAppliedKvCeiling(effective.Models[0], ceiling)] };
                         RefreshAdvertisedModel(effective);
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
@@ -528,6 +580,18 @@ public sealed class GenerationService : IDisposable
         }
     }
 
+    /// <summary>Records a live KV soft-cap application on the host ledger when this engine has a standing claim for that resource.</summary>
+    private void RecordAppliedKvClaim(GenerationScheduler.KvBudgetApply budget)
+    {
+        if (_ledger?.UpdateStandingClaimAmount(Model.Id, BudgetResource.Kv, budget.AppliedBlocks) == true)
+        {
+            _logger?.LogInformation(
+                "ledger_claim_update model='{Model}' resource='kv' amount_blocks={AmountBlocks}",
+                Model.Id,
+                budget.AppliedBlocks);
+        }
+    }
+
     // Advertised model facts recomputed from the effective configuration and live pool state: the window admission
     // validates against is the smallest of configured max context, what the forward engine can actually address
     // (its precomputed RoPE extent), and the token slots the current KV budget can back. A raise beyond the engine's
@@ -560,6 +624,10 @@ public sealed class GenerationService : IDisposable
         _ => throw new InvalidOperationException(
             $"model '{modelName}' declares engine.prefill_kernel '{value}': 'prefill_kernel' accepts only '{PrefillKernelNames.GemV}', '{PrefillKernelNames.Tiled}', or '{PrefillKernelNames.Gemm}'."),
     };
+
+    // A byte count stated in the megabyte unit weight and prefill-buffer claims and ceilings count in, rounded up so
+    // a claim never under-reports what it holds against a ceiling declared in that unit.
+    private static long WeightClaimMegabytes(long bytes) => (bytes + 1024 * 1024 - 1) / (1024 * 1024);
 
     // Whether this model's budgets declare a ceiling at the system-memory tier of their KV chain — the one budgeted ceiling that is
     // canonical for today's reservation and live soft cap, so its agreement with the legacy key is what opening reports once.
@@ -664,9 +732,21 @@ public sealed class GenerationService : IDisposable
     /// forward engine, tokenizer, chat template, a KV pool sized by the model entry, a prefix cache over that pool,
     /// and the batch scheduler over them. The prefix cache lives exactly as long as the pool, so each opened
     /// service starts with an empty cache. The effective context is the smaller of the configured max context and
-    /// the token slots the KV pool can hold.
+    /// the token slots the KV pool can hold. Weight, KV, and prefill claims this model declares register on the
+    /// ledger a host opens over the tiers its pools back — each opened tier stating the explicit unbounded capacity
+    /// posture, since a public total no configuration declared is never invented.
     /// </summary>
-    public static GenerationService Open(LairConfig config, ILogger? logger = null)
+    public static GenerationService Open(LairConfig config, ILogger? logger = null) =>
+        Open(config, logger, ledger: null);
+
+    /// <summary>
+    /// The shared-ledger form of the same open: <paramref name="ledger"/> is the host-scoped accounting several
+    /// programmatically opened engines share, so their claims register against one set of capacity seams in the order
+    /// the opens happen — first-come-first-served across engines, earlier claims never revoked or displaced. A null
+    /// ledger is today's posture: this engine gets its own ledger over the tiers its pools back, bounded nowhere a
+    /// public total was not stated. No host configuration path reaches a supplied ledger — it is a programmatic seam.
+    /// </summary>
+    public static GenerationService Open(LairConfig config, ILogger? logger, DeviceLedger? ledger)
     {
         ArgumentNullException.ThrowIfNull(config);
         if (config.Models.Count == 0)
@@ -733,6 +813,14 @@ public sealed class GenerationService : IDisposable
             OpenedPoolTiers = [BudgetTier.Dram],
         });
 
+        // The ledger this engine's claims account against: a supplied one is a host's shared accounting across several
+        // programmatically opened engines, so their claims register against one set of capacity seams in the order the
+        // opens happen; an omitted one is this engine's own ledger over the tiers its pools back, each stating the
+        // explicit unbounded capacity posture — the answer a host gives when it backs a tier but states no public total.
+        // Claims register in this open's order: weights once the tensor table is read, prefill from the activation
+        // posture the engine families hold, and the KV reservation as the pool opens.
+        ledger ??= DeviceLedger.OpenedTiersUnbounded([BudgetTier.Dram]);
+
         GgufFile? file = null;
         TransformerModel? model = null;
         BlockPool? pool = null;
@@ -784,6 +872,60 @@ public sealed class GenerationService : IDisposable
                 throw new ModelException($"model '{modelConfig.Name}': {ex.Message}");
             }
 
+            // Weight claims register at model open, once the tensor table has been read: the amount is the summed
+            // logical tensor bytes the forward reads, stated in this resource's megabyte unit, against the first
+            // copy-holding position the resolved weights chain names that an opened capacity seam backs. A claim that
+            // lands below the chain's first copy-holding position records the chain's own demotion — an earlier claim
+            // is never revoked, preempted, or displaced to seat it — and a chain whose every position is held reports
+            // its exhaustion here, as a load failure naming the model, the resource, the tier, and the ledger breakdown.
+            if (budgets.For(BudgetResource.Weights) is { } weightsChain)
+            {
+                long logicalWeightBytes = 0;
+                foreach (LogicalTensor tensor in file.Tensors.Tensors)
+                {
+                    logicalWeightBytes += tensor.SizeBytes;
+                }
+
+                ClaimOutcome weightClaim = ledger.RegisterClaim(modelConfig.Name, weightsChain, WeightClaimMegabytes(logicalWeightBytes));
+                if (!weightClaim.Seated)
+                {
+                    throw new BudgetExhaustedException(modelConfig.Name, BudgetResource.Weights, weightClaim.ExhaustedAtTier!.Value, weightClaim.Breakdown);
+                }
+
+                logger?.LogInformation(
+                    "ledger_claim model='{Model}' resource='weights' tier='{Tier}' amount_mb={AmountMb} chain_position={ChainPosition} demoted={Demoted} logical_bytes={LogicalBytes}",
+                    modelConfig.Name,
+                    BudgetTierNames.Of(weightClaim.Claim!.Tier),
+                    weightClaim.Claim.Amount,
+                    weightClaim.Claim.ChainPosition,
+                    weightClaim.Claim.Demoted,
+                    logicalWeightBytes);
+            }
+
+            // The prefill claim records the activation posture the opened engine families actually hold — the dedicated
+            // lane family's bytes where a lane opened, the shared posture's zero where one backend serves both paths —
+            // beside the row width the plan resolved. It states what the engine sized; it clamps no row width: the
+            // physical clamp is where a declared prefill ceiling lands, and that consumer is not part of this build.
+            if (budgets.For(BudgetResource.PrefillBuffers) is { } prefillChain)
+            {
+                long activationBytes = model.PrefillLaneActivationBytes;
+                ClaimOutcome prefillClaim = ledger.RegisterClaim(modelConfig.Name, prefillChain, WeightClaimMegabytes(activationBytes));
+                if (!prefillClaim.Seated)
+                {
+                    throw new BudgetExhaustedException(modelConfig.Name, BudgetResource.PrefillBuffers, prefillClaim.ExhaustedAtTier!.Value, prefillClaim.Breakdown);
+                }
+
+                logger?.LogInformation(
+                    "ledger_claim model='{Model}' resource='prefill_buffers' tier='{Tier}' amount_mb={AmountMb} chain_position={ChainPosition} demoted={Demoted} row_width={RowWidth} activation_bytes={ActivationBytes}",
+                    modelConfig.Name,
+                    BudgetTierNames.Of(prefillClaim.Claim!.Tier),
+                    prefillClaim.Claim.Amount,
+                    prefillClaim.Claim.ChainPosition,
+                    prefillClaim.Claim.Demoted,
+                    model.ResolvedPrefillRowWidth,
+                    activationBytes);
+            }
+
             pool = new BlockPool(
                 blockTokens,
                 model.Plan.LayerCount,
@@ -791,6 +933,28 @@ public sealed class GenerationService : IDisposable
                 model.Plan.HeadDim,
                 modelConfig.KvBlocks,
                 backend);
+
+            // The KV claim observes the pool opening that already happened: the reservation the pool reserved at open,
+            // stated in this resource's block unit, against the first copy-holding position the resolved KV chain names
+            // that an opened capacity seam backs. The pool's own soft cap stays the enforcement seam — this claim
+            // records where the chain seated the reservation, and a chain held end-to-end by claims registered ahead
+            // refuses the open as a load failure rather than shrinking the reservation.
+            if (budgets.For(BudgetResource.Kv) is { } kvChain)
+            {
+                ClaimOutcome kvClaim = ledger.RegisterClaim(modelConfig.Name, kvChain, modelConfig.KvBlocks);
+                if (!kvClaim.Seated)
+                {
+                    throw new BudgetExhaustedException(modelConfig.Name, BudgetResource.Kv, kvClaim.ExhaustedAtTier!.Value, kvClaim.Breakdown);
+                }
+
+                logger?.LogInformation(
+                    "ledger_claim model='{Model}' resource='kv' tier='{Tier}' amount_blocks={AmountBlocks} chain_position={ChainPosition} demoted={Demoted}",
+                    modelConfig.Name,
+                    BudgetTierNames.Of(kvClaim.Claim!.Tier),
+                    kvClaim.Claim.Amount,
+                    kvClaim.Claim.ChainPosition,
+                    kvClaim.Claim.Demoted);
+            }
 
             int[] attentionWindows = new int[model.Plan.LayerCount];
             for (int layer = 0; layer < model.Plan.LayerCount; layer++)
@@ -813,7 +977,8 @@ public sealed class GenerationService : IDisposable
                 cache,
                 maxConcurrentRequests: modelConfig.MaxConcurrentRequests ?? GenerationScheduler.UncappedConcurrencyCap,
                 modelName: modelConfig.Name,
-                prefillStepBudgetMs: config.Engine.PrefillStepBudgetMs);
+                prefillStepBudgetMs: config.Engine.PrefillStepBudgetMs,
+                ledger: ledger);
 
             // The chat template is parsed once here, at model load, and cached for the loaded instance's lifetime: no
             // per-request parse and no lazy first-request parse. An unparseable template fails model startup fast,
@@ -913,6 +1078,7 @@ public sealed class GenerationService : IDisposable
 
             GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, markerPair, markersProven ? string.Empty : markerRefusal, logger, pool, scheduler, info, config, prefillsBackend, prefillsLane);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
+            service._ledger = ledger; // the claims this open registered ride the same ledger the scheduler reports admissions to
             file = null;
             model = null;
             pool = null;
@@ -1120,6 +1286,16 @@ public sealed class GenerationService : IDisposable
             // refusal for operators exactly as its kv_capacity sibling does.
             EngineBusyException busy = EngineBusyException.ForConcurrencyQuota(Model.Id, quota.MaxConcurrentRequests);
             _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.ConcurrencyQuota, Model.Id, busy.Message);
+            throw busy;
+        }
+        catch (BudgetExhaustedException exhausted)
+        {
+            // A submission the host ledger's shared chain could not seat anywhere is the third bounded overload refusal: the exhausted chain is
+            // host accounting across opened pools, not this engine's own KV cap re-deciding anything, so it surfaces through the same overload
+            // family at the wire with the budget-exhaustion code. Nothing already admitted was disturbed; the monitor records the refusal exactly
+            // as its kv_capacity and quota siblings do.
+            EngineBusyException busy = EngineBusyException.ForBudgetExhaustion(Model.Id, exhausted.Resource, exhausted.Tier, exhausted.Breakdown);
+            _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.BudgetExhaustion, Model.Id, busy.Message);
             throw busy;
         }
 

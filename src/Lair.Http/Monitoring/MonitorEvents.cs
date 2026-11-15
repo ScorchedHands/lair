@@ -51,6 +51,9 @@ public static class AdmissionRefusalKinds
 
     /// <summary>Every admission slot of the model's <c>max_concurrent_requests</c> cap is held by sequences already admitted.</summary>
     public const string ConcurrencyQuota = "concurrency_quota";
+
+    /// <summary>The host ledger's shared copy-holding chain could not seat this submission's reservation anywhere — host accounting across opened pools, not the pool's own cap.</summary>
+    public const string BudgetExhaustion = "budget_exhaustion";
 }
 
 /// <summary>

@@ -564,7 +564,8 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 PrefillActivationBytes: facts?.PrefillActivationBytes ?? 0,
 
                 AdmissionRefusalsTotal: Volatile.Read(ref _admissionRefusalTotal),
-                AdmissionRefusals: RecentAdmissionRefusals()); // already holding the fan-out lock here; Monitor re-entry is safe on this thread
+                AdmissionRefusals: RecentAdmissionRefusals(), // already holding the fan-out lock here; Monitor re-entry is safe on this thread
+                LedgerOccupancy: facts?.LedgerOccupancy);
 
             long id = ++_eventSeq;
             frame = new MonitorFrame(id, MonitorEventNames.Snapshot, snapshot.ToJson());

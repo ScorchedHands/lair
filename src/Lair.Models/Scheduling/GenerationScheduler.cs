@@ -80,6 +80,13 @@ public sealed class GenerationScheduler : IDisposable
     // consults neither — it only decides which merged window an already-admitted pipeline rides.
     private readonly PipelineConcurrencyGate _progress;
 
+    // The host ledger this scheduler reports its landed KV reservations to, when its caller supplied one. Purely an observer of
+    // decisions the existing seams already made: a submission is admitted exactly as the concurrency gate and the pool's own
+    // capacity accounting admit it, and only then does the claim record where the model's KV chain seated the reservation. A
+    // claim the shared chain cannot seat refuses this submission naming the exhausted chain — host-scoped accounting across
+    // opened pools, not a re-decision of the pool's soft cap or this gate — and never disturbs an admitted pipeline.
+    private readonly DeviceLedger? _ledger;
+
     // Serializes every mutation of the pool and cache that is not issued from the scheduler thread: admission-time
     // eviction runs on caller threads, while all forwards, adoptions, publications, releases, slot handovers, and shutdown finishes
     // run under this gate. Holding it across a whole step keeps those paths disjoint without finer-grained locking;
@@ -146,7 +153,8 @@ public sealed class GenerationScheduler : IDisposable
     /// <param name="maxConcurrentRequests">How many pipelines this scheduler may hold admitted at once; must be at least 1, or <see cref="UncappedConcurrencyCap"/> to bound nothing. It caps admission: a submission arriving while every slot is held is refused with <see cref="SchedulerConcurrencyFullException"/> naming the model and its quota rather than queued behind what already runs.</param>
     /// <param name="modelName">The served model's id, named in every admission refusal so each one says which limit kind blocked it. Null keeps the generic wording.</param>
     /// <param name="prefillStepBudgetMs">Wall-clock budget, in milliseconds (1 or greater), that future prefill steps aim at; null forwards chunks at <paramref name="maxBatchTokens"/> exactly as before this knob existed. A present value sizes each chunk from measured step cost instead — see <see cref="ApplyPrefillStepBudget"/>.</param>
-    public GenerationScheduler(TransformerModel model, BlockPool pool, int maxBatchTokens, PrefixCache? cache = null, int maxConcurrentRequests = UncappedConcurrencyCap, string? modelName = null, int? prefillStepBudgetMs = null)
+    /// <param name="ledger">The host device ledger this scheduler reports its landed KV reservations to, when its caller keeps host-scoped accounting. Supplying one observes chain decisions after the existing admission seams decide — a landed sequence rides inside what its model already seats, so no step is bounded and nothing admitted is disturbed; only a chain every position of which other models hold refuses that submission with <see cref="BudgetExhaustedException"/>. Null — what every scheduler built without host accounting uses — behaves exactly as before the ledger seam existed.</param>
+    public GenerationScheduler(TransformerModel model, BlockPool pool, int maxBatchTokens, PrefixCache? cache = null, int maxConcurrentRequests = UncappedConcurrencyCap, string? modelName = null, int? prefillStepBudgetMs = null, DeviceLedger? ledger = null)
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentNullException.ThrowIfNull(pool);
@@ -163,6 +171,7 @@ public sealed class GenerationScheduler : IDisposable
         _prefillStepBudgetMicros = prefillStepBudgetMs is int budget ? (long)budget * 1_000 : 0;
         _modelName = modelName;
         _progress = new PipelineConcurrencyGate(maxConcurrentRequests);
+        _ledger = ledger;
 
         // A merged decode step advances on this model's decode-side segment: the last position of its resolved route. For every route
         // openable in this build that is its single CPU span, so composition bounds merged sequences by exactly the cap load resolved for
@@ -295,6 +304,23 @@ public sealed class GenerationScheduler : IDisposable
                 // A refused capacity check gives its slot straight back: only the rejected submission is affected.
                 _progress.ReleaseSlot();
                 throw;
+            }
+
+            // The host ledger reports this admission's landed reservation only after the concurrency slot and the pool's own
+            // capacity accounting already admitted the submission — the observation follows the existing seams, it never
+            // re-decides them. A landed sequence rides inside what its model's standing claim already seats; only other
+            // models' seated claims compete for a tier, so nothing here double-counts one engine's own memory or displaces
+            // an earlier seating. A chain whose every position is held by others refuses this submission naming the
+            // exhausted chain, and gives its slot straight back exactly as a refused capacity check did; every
+            // already-admitted pipeline stays whole either way.
+            if (_ledger is not null && _model.Plan.Budgets.For(BudgetResource.Kv) is { } kvChain)
+            {
+                ClaimOutcome observation = _ledger.ObserveAdmission(_modelName ?? "engine", kvChain, needed);
+                if (!observation.Seated)
+                {
+                    _progress.ReleaseSlot();
+                    throw new BudgetExhaustedException(_modelName ?? "engine", BudgetResource.Kv, observation.ExhaustedAtTier!.Value, observation.Breakdown);
+                }
             }
 
             Stats.SequencesAdmitted++;

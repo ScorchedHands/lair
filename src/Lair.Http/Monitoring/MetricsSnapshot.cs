@@ -133,7 +133,10 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_admission_refusals_total")] long AdmissionRefusalsTotal = 0,
 
     /// <summary>The most recent admission refusals, newest first: each names the limit kind that blocked, the model, and a concise reason. Bounded to the latest <see cref="EngineMetricsBus.AdmissionRefusalRingCapacity"/>.</summary>
-    [property: JsonPropertyName("metrics_admission_refusals")] IReadOnlyList<AdmissionRefusalEntry>? AdmissionRefusals = null)
+    [property: JsonPropertyName("metrics_admission_refusals")] IReadOnlyList<AdmissionRefusalEntry>? AdmissionRefusals = null,
+
+    /// <summary>Host device-ledger occupancy: one entry per tier position a seated claim holds, each with the tier's capacity posture and contested holders where several claimants share it; null until the owning service attaches facts and whenever no claim has seated.</summary>
+    [property: JsonPropertyName("metrics_ledger_occupancy")] IReadOnlyList<LedgerOccupancyEntry>? LedgerOccupancy = null)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);
