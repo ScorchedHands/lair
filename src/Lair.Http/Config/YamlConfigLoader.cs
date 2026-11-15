@@ -19,7 +19,7 @@ public static class YamlConfigLoader
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel"];
     private static readonly string[] UiKeys = ["recent_requests"];
     private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "budgets", "source"];
-    private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit", "numa_spread"];
+    private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit", "numa_spread", "gpu_layers"];
 
     /// <summary>The keys one model entry's source block may declare, beside exactly one of the two file spellings.</summary>
     private static readonly string[] SourceKeys = ["repo", "revision", "file", "files"];
@@ -542,6 +542,18 @@ public static class YamlConfigLoader
                 $"models[{index}].placement.numa_spread '{numaSpread}' is invalid for model '{modelName}': 'numa_spread' accepts {NumaSpreadNames.AcceptedVocabulary}.");
         }
 
+        // Layer split: absent means today's CPU-only posture, and a present value names how many transformer layers execution
+        // opens on device 'cuda', counted from layer 0. A negative count says nothing about where a split lands, so it fails
+        // naming the model, key, and value like every other out-of-range integer here; what the split actually opens is decided
+        // when the engine opens — including refusing an open that names more layers than this file carries.
+        int gpuLayers = TryInteger(keys, "gpu_layers", $"models[{index}].placement.gpu_layers") ?? 0;
+        if (gpuLayers < 0)
+        {
+            throw new ConfigException(
+                $"models[{index}].placement.gpu_layers {gpuLayers} is invalid for model '{modelName}': 'gpu_layers' must be a non-negative integer — " +
+                "the count of this model's transformer layers execution opens on device 'cuda', counted from layer 0.");
+        }
+
         return new PlacementConfig
         {
             Device = device,
@@ -552,6 +564,7 @@ public static class YamlConfigLoader
             PrefillLane = prefillLane,
             CoreOvercommit = coreOvercommit,
             NumaSpread = numaSpread,
+            GpuLayers = gpuLayers,
         };
     }
 

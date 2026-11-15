@@ -2,10 +2,9 @@ namespace Lair.Models;
 
 /// <summary>One execution stage a model's placement declares: the part of the path it names (<c>"prefill"</c>,
 /// <c>"decode"</c>) and the compute device that part runs on. Stages reach a route in declaration order, and each may
-/// name the boundary of the ordered path its span starts at — an assembly-internal seam no placement key reaches today.</summary>
+/// name the boundary of the ordered path its span starts at — what a host's placement resolves onto when it splits a model across devices.</summary>
 public sealed record RouteStage(string Name, string DeviceId)
 {
-    /// <summary>The layer index this stage's span starts at. Left unset it carries <see cref="ModelRoute.WholeModelSplitPosition"/>, which is what every declared stage holds today and keeps consecutive same-device stages collapsing into one segment; a declared boundary separates this stage from the neighbour beside it so two spans that agree on device and residency stay distinct positions of the route.</summary>
     internal int SplitPosition { get; init; } = ModelRoute.WholeModelSplitPosition;
 }
 
@@ -46,8 +45,8 @@ public sealed record RouteRequest
 /// Resolves a model's declared placement stages into the route its execution path takes, and owns every rule that
 /// resolution enforces: consecutive stages landing on one device at one boundary position collapse into one CPU span so a
 /// CPU-only model names exactly one segment over DRAM-resident weights; stages landing on different devices, or naming
-/// distinct boundaries of the ordered path, stay separate segments in declaration order — which is how a split or hybrid
-/// shape reaches the vocabulary before any engine can run it. Each
+/// distinct boundaries of the ordered path, stay separate segments in declaration order — which is how a host's layer split
+/// reaches execution. Each
 /// resolved segment carries its compute device identity, weight tier, batch cap against the engine's own ceiling, and
 /// quota taken from what placement declares today — plus any accelerator stream priority and SM share a caller declared on an
 /// accelerator-backed segment, landed unchanged for later execution to consume and refused here only when out of range. No new config key is
@@ -175,7 +174,7 @@ public static class ModelRoutes
         }
 
         // A declared boundary names the layer this span starts at, so anything else says nothing about where a split lands:
-        // the whole-model position is what an unsplit route carries, and every other value must be a real layer index.
+        // the whole-model position is what an unsplit route carries; every other value must be a real layer index or — for a final segment only, standing on no transformer layers of its own while the output head still runs there — exactly this model's layer count. The engine bounds it against the file it opens over as it always has.
         if (segment.SplitPosition != ModelRoute.WholeModelSplitPosition && segment.SplitPosition < 0)
         {
             throw new ModelException(

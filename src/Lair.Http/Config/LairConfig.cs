@@ -250,4 +250,12 @@ public sealed record PlacementConfig
     /// preference for later placement decisions without re-binding an opened worker pool.
     /// </summary>
     public string NumaSpread { get; init; } = "auto";
+
+    /// <summary>
+    /// How many of this model's transformer layers execution opens on device <c>cuda</c>, counted from layer 0, with every later
+    /// layer and the output head staying on CPU. Zero (absent) keeps today's posture: every layer runs on this service's own CPU
+    /// backend and no accelerator seam is opened at all. A present value must be 0 or greater; a split opens its CUDA compute backend
+    /// when the engine opens, so changing it — like any key that decides which backends and route segments exist — is a restart-only edit.
+    /// </summary>
+    public int GpuLayers { get; init; }
 }

@@ -4,6 +4,8 @@
     <ProjectReference Include="..\Lair.Contracts\Lair.Contracts.csproj" />
     <ProjectReference Include="..\Lair.Loader\Lair.Loader.csproj" />
     <ProjectReference Include="..\Lair.Backends.Cpu\Lair.Backends.Cpu.csproj" />
+    <!-- A declared layer split opens the accelerator compute backend beside this service's decode-side CPU backend. -->
+    <ProjectReference Include="..\Lair.Backends.Cuda\Lair.Backends.Cuda.csproj" />
     <ProjectReference Include="..\Lair.Kv\Lair.Kv.csproj" />
     <ProjectReference Include="..\Lair.Tokenizer\Lair.Tokenizer.csproj" />
     <ProjectReference Include="..\Lair.Sampling\Lair.Sampling.csproj" />

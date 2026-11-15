@@ -30,7 +30,8 @@ public sealed record ModelRoute
     /// the model, so consecutive stages landing on one device at one residency collapse into the single span they always did.
     /// A declared boundary is the index of the layer its span starts at — zero or greater — and two spans naming distinct
     /// boundaries stay separate positions of the ordered path even when their device and residency agree. Assembly-internal:
-    /// no placement key declares a boundary today, so every model served resolves this position alone.
+    /// a host's placement resolves a split onto these positions through <see cref="RouteStage"/>; every posture without one
+    /// carries this position alone.
     /// </summary>
     internal const int WholeModelSplitPosition = -1;
 

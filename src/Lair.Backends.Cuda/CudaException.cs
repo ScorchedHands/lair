@@ -1,6 +1,7 @@
 namespace Lair.Backends.Cuda;
 
-internal enum CudaResult
+/// <summary>The driver's own result vocabulary, named unchanged on a failure report.</summary>
+public enum CudaResult
 {
     Success = 0,
     InvalidValue = 1,
@@ -29,7 +30,8 @@ internal enum CudaResult
     Unknown = 999,
 }
 
-internal sealed class CudaException : Exception
+/// <summary>The driver seam's own failure report: a CUDA call reached the driver and answered with an error. A host that opens this backend for a declared layer split names it when no usable device stands behind the seam.</summary>
+public sealed class CudaException : Exception
 {
     public CudaException(string function, CudaResult result)
         : base($"CUDA driver seam failure in {function}: {Describe(result)} ({(int)result}). nvcuda.dll was loaded but the call failed; ensure a CUDA-capable device and a driver exposing the CUDA Driver API are present.")

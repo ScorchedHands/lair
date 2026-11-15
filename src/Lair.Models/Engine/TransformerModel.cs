@@ -518,27 +518,37 @@ public sealed class TransformerModel : IDisposable
         new(file, backend, maxContextTokens, weights, logLine: null, profileOverride: null, prefillKernel, prefillRowWidth);
 
     /// <summary>
-    /// Opens the engine over a resolved route whose segments after the first run on compute backends supplied for them positionally:
-    /// element <c>i</c> of <paramref name="crossingBackends"/> is the backend segment <c>i + 1</c> executes on, so two spans that agree on
-    /// device and residency stay distinct ranges of layers rather than collapsing into one pass. The first span keeps running on
-    /// <paramref name="backend"/>, which is what every unsplit route — and therefore every host configuration today — resolves to. Each segment
+    /// Opens the engine over a resolved route whose execution positions are answered by compute backends supplied for them. Element
+    /// <c>i</c> of <paramref name="crossingBackends"/> answers position <c>i + 1</c> when the set covers every position after the first — so two
+    /// spans that agree on device and residency stay distinct ranges of layers rather than collapsing into one pass, and the first span keeps
+    /// running on <paramref name="backend"/>, which is what every unsplit route resolves to. A set covering every resolved segment in order answers
+    /// position 0 too, which is how a host opens a split whose first span runs somewhere other than its decode-side backend: each segment
     /// is validated against the backend resolved for it, a boundary that fails to cover this file's layers once refuses naming what lands short,
     /// and a dedicated lane posture over a split route refuses naming the stage-side crossing this build does not carry rather than running the
-    /// model on one span. Assembly-internal: no host configuration path reaches this seam.
+    /// model on one span. Assembly-internal: hosts resolve placement onto these seams when they open a layer split.
     /// </summary>
     internal static TransformerModel Open(
         GgufFile file, IBackend backend, int maxContextTokens, Action<string>? logLine, PrefillKernel prefillKernel, ModelRoute route,
         IReadOnlyList<IBackend> crossingBackends) =>
         new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel, prefillRowWidth: 0, route, prefillsBackend: null, prefillsLane: null, crossingBackends);
 
+    /// <summary>
+    /// The same split-route seam a host opens with, carrying the stage-side posture and resolved budgets the public open carries too: an ordered
+    /// execution-backend set covering every resolved segment in order lets each span run on the backend its own placement named while this service's
+    /// decode-side backend stays the engine's default. Assembly-internal for hosts that resolve a layer split at model open.
+    /// </summary>
+    internal static TransformerModel Open(
+        GgufFile file, IBackend backend, int maxContextTokens, Action<string>? logLine, PrefillKernel prefillKernel, ModelRoute route,
+        IReadOnlyList<IBackend> crossingBackends, ResolvedBudgetSet budgets) =>
+        new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel, prefillRowWidth: 0, route, prefillsBackend: null, prefillsLane: null, crossingBackends, budgets);
+
     // The execution spans this engine runs its route over, resolved positionally from the segments and the compute backends opened for them.
     // One span holding every layer on the device its own backend reports is what every model served today resolves to; a segment naming another
     // device refuses naming that segment and the seam accelerator execution lands in rather than advancing part of the model on some device that
     // happens to work, exactly as it always did — where no crossing was supplied for a position, this engine's own opened backend is what answers
-    // for it. A split route then needs one backend per position after the first and boundaries that ascend from layer 0 inside this file's layers,
-    // so every layer lands in exactly one span; anything missing or out of order refuses naming what lands short. The check lands before any weight
-    // view is spent on a shape that cannot run, exactly as an unrunnable kernel selection does.
-    private (ExecutionSpan[] DecodeSide, ExecutionSpan[] PrefillSide) ResolveExecutionSpans(IReadOnlyList<IBackend>? crossingBackends)
+    // for it. A split route then needs boundaries that ascend from layer 0 and cover every layer exactly once; anything missing or out of order
+    // refuses naming what lands short. The check lands before any weight view is spent on a shape that cannot run, exactly as an unrunnable kernel selection does.
+    private (ExecutionSpan[] DecodeSide, ExecutionSpan[] PrefillSide) ResolveExecutionSpans(IReadOnlyList<IBackend>? crossingBackends, IBackend? stageSidePrefills)
     {
         ModelRoute route = Plan.Route;
 
@@ -550,9 +560,12 @@ public sealed class TransformerModel : IDisposable
 
         // A position answers with the backend supplied for it, and with nothing where none was supplied yet. Each segment meets that answer first:
         // a named device this build cannot run is refused naming the segment before anything else about the shape is examined, exactly as an
-        // unsupplied crossing to 'cuda' always was.
+        // unsupplied crossing to 'cuda' always was. A supplied set covers either every position after the first — where this engine's own backend answers position 0 — or every resolved position in order, which is how a host opens a split whose first span runs on a backend other than its decode-side one.
+        bool fullSet = crossingBackends is not null && crossingBackends.Count == route.Segments.Count;
+
         IBackend? BackendAt(int position) =>
-            position == 0 || (crossingBackends is not null && position - 1 < crossingBackends.Count)
+            fullSet ? (position < crossingBackends!.Count ? crossingBackends[position] : null)
+            : position == 0 || (crossingBackends is not null && position - 1 < crossingBackends.Count)
                 ? (position == 0 ? _backend : crossingBackends![position - 1])
                 : null;
 
@@ -582,16 +595,16 @@ public sealed class TransformerModel : IDisposable
         }
 
         int supplied = crossingBackends?.Count ?? 0;
-        if (supplied != route.Segments.Count - 1)
+        if (supplied != route.Segments.Count - 1 && !fullSet)
         {
             throw new ModelException(
-                $"architecture '{Plan.Architecture}' resolves a route of {route.Segments.Count} segment(s), which needs one execution backend for every position after the first, and this open supplied {supplied} — supply exactly {route.Segments.Count - 1}, or keep this model one span");
+                $"architecture '{Plan.Architecture}' resolves a route of {route.Segments.Count} segment(s), which needs one execution backend for every position after the first, and this open supplied {supplied} — supply exactly {route.Segments.Count - 1}, or all {route.Segments.Count} backends covering every resolved position in order, or keep this model one span");
         }
 
         int layers = Plan.LayerCount;
         bool split = route.Segments.Count > 1;
 
-        // The boundary chain is settled next: a split route names where each span's layers begin, ascending from layer 0 and ending inside this file's own range so the spans cover every layer exactly once.
+        // The boundary chain is settled next: a split route names where each span's layers begin, ascending from layer 0 and ending inside this file's own range so the spans cover every layer exactly once — except that the final span may start exactly at the layer count and run nothing, which hands every transformer layer to an earlier span while the output head still runs on the backend that finished it.
         int[] boundaries = new int[route.Segments.Count];
 
         if (split)
@@ -621,11 +634,11 @@ public sealed class TransformerModel : IDisposable
                         $"'{boundaries[index - 1]}': a split route hands every layer to exactly one span");
                 }
 
-                if (boundary > layers - 1)
+                if (boundary > layers || (index < route.Segments.Count - 1 && boundary >= layers))
                 {
                     throw new ModelException(
                         $"{segment.Describe(index)} starts at boundary '{boundary}', past this file's last layer {layers - 1}: architecture " +
-                        $"'{Plan.Architecture}' resolves {layers} layer(s), and a span that begins outside them runs nothing");
+                        $"'{Plan.Architecture}' resolves {layers} layer(s), and a span that begins outside them runs nothing — only the final span may start exactly at the layer count");
                 }
 
                 boundaries[index] = boundary;
@@ -643,7 +656,9 @@ public sealed class TransformerModel : IDisposable
             int end = split && index + 1 < route.Segments.Count ? boundaries[index + 1] : layers;
 
             decodeSide[index] = new ExecutionSpan { Backend = engine, LayerStart = start, LayerEnd = end };
-            prefillSide[index] = new ExecutionSpan { Backend = index == 0 ? _prefillsBackend : engine, LayerStart = start, LayerEnd = end };
+
+            // Prompt windows run the first span on their stage-side backend where one was supplied — a lane's capped second backend or an offloaded prompt side — and otherwise on whatever execution answers this route's first position: this engine's own backend today, and the split's accelerator-backed first span when a full ordered set covers it.
+            prefillSide[index] = new ExecutionSpan { Backend = index == 0 ? stageSidePrefills ?? engine : engine, LayerStart = start, LayerEnd = end };
         }
 
         return (decodeSide, prefillSide);
@@ -750,8 +765,8 @@ public sealed class TransformerModel : IDisposable
 
         _prefillsBackend = prefillsBackend ?? backend;
 
-        // The resolved segments become the execution spans every forward walks: one range holding this model's whole layer count on this engine's own device is what every route served today resolves to, and a supplied crossing backend takes each later position. Each segment lands against its own backend here — before any weight view or activation storage exists behind it.
-        (_mainSpans, _prefillSpans) = ResolveExecutionSpans(crossingBackends);
+        // The resolved segments become the execution spans every forward walks: one range holding this model's whole layer count on this engine's own device is what every route served today resolves to, and a supplied crossing backend takes each position it covers. Each segment lands against its own backend here — before any weight view or activation storage exists behind it.
+        (_mainSpans, _prefillSpans) = ResolveExecutionSpans(crossingBackends, prefillsBackend);
 
         // Row capacity of every batched stream: whichever forward family needs the wider sub-batch — never below what a
         // decode batch may advance, and above that only when the plan resolves wider prompt windows. Allocation is the

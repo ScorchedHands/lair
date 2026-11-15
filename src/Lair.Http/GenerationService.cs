@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using Lair.Http.Monitoring;
 using Lair.Backends.Cpu;
+using Lair.Backends.Cuda;
 using Lair.Contracts;
 using Lair.Host.Config;
 using Lair.Kv;
@@ -33,6 +34,9 @@ public sealed class GenerationService : IDisposable
     // The dedicated prefill lane this model opened with, when placement declared one: the second execution backend prompt windows run on and the load-resolved split that capped it. Worker pools, masks, activation buffers, and collision posture are facts of this pair for the engine's whole lifetime — a live thread-quota edit re-derives only the decode side from them, and an unmappable edit is refused against them rather than half-applied. Null for every shared-posture model, where nothing here changes behavior.
     private readonly CpuBackend? _prefillsBackend;
     private readonly PrefillLaneLayout? _prefillsLane;
+
+    // The accelerator compute backend a declared layer split opened beside this service's decode-side CPU backend: the execution backend resolved for the route segment that names device 'cuda'. It holds no worker pool and answers no scheduler or monitor fact — the decode-side CPU backend keeps every one of those. Null whenever no split was declared, which is every model served today.
+    private readonly CudaBackend? _splitExecution;
 
     private readonly TransformerModel _model;
     private readonly GgufTokenizer _tokenizer;
@@ -120,12 +124,16 @@ public sealed class GenerationService : IDisposable
         ModelInfo info,
         LairConfig config,
         CpuBackend? prefillsBackend = null,
-        PrefillLaneLayout? prefillsLane = null)
+        PrefillLaneLayout? prefillsLane = null,
+        CudaBackend? splitExecution = null)
     {
         _file = file;
         _backend = backend;
         _prefillsBackend = prefillsBackend;
         _prefillsLane = prefillsLane;
+
+        // The accelerator side a declared layer split opened arrives as a fact of this open, held for the engine's whole lifetime.
+        _splitExecution = splitExecution;
         _model = model;
         _tokenizer = tokenizer;
         _chatTemplate = chatTemplate;
@@ -1075,31 +1083,81 @@ public sealed class GenerationService : IDisposable
         {
             backend = new(config.Engine.Threads, backendCoreSet, grantedQuota);
         }
-        // The model's placement resolves to its route value set here, against the compute backend this service opens for it:
+
+        // The placement's layer split opens the accelerator compute backend beside this service's decode-side CPU backend — and only when a model declares one: an absent or zero key never touches the CUDA seam at all. A declared split with no usable driver or device behind it fails here naming the model, the key as declared, and where accelerator-backed segments run; nothing falls back to some other posture that happens to work.
+        CudaBackend? splitExecution = null;
+
+        if (modelConfig.Placement.GpuLayers > 0 && modelConfig.Placement.PrefillLane == PlacementPrefillLaneValues.Dedicated)
+        {
+            throw new ModelException(
+                $"model '{modelConfig.Name}' declares 'placement.gpu_layers' {modelConfig.Placement.GpuLayers} beside " +
+                $"'placement.prefill_lane' '{PlacementPrefillLaneValues.Dedicated}': a dedicated prefill lane carries one stage-side execution backend, and this build has no crossing across a split route — resolve placement onto one segment or open no lane.");
+        }
+
+        if (modelConfig.Placement.GpuLayers > 0)
+        {
+            try
+            {
+                splitExecution = new();
+            }
+            catch (Exception ex) when (ex is CudaException or DllNotFoundException or EntryPointNotFoundException or TypeInitializationException)
+            {
+                throw new InvalidOperationException(
+                    $"model '{modelConfig.Name}' declares 'placement.gpu_layers' {modelConfig.Placement.GpuLayers}: the split opens a compute backend on device '{CudaBackend.DeviceIdValue}', accelerator-backed segments run in '{ModelRoute.CudaBackendSeam}', and this host opened no usable CUDA driver or device behind that seam — refusing rather than running this model's layers somewhere else.",
+                    ex);
+            }
+
+            logger?.LogInformation(
+                "gpu_layers model='{Model}' cuda_layers={GpuLayers} device={Device}",
+                modelConfig.Name,
+                modelConfig.Placement.GpuLayers,
+                CudaBackend.DeviceIdValue);
+        }
+
+        // The model's placement resolves to its route value set here, against the compute backends this service opens for it:
         // consecutive stages naming 'cpu' collapse into one CPU segment carrying this model's thread cap and pinned core share,
-        // and a stage naming any other device fails now naming that segment and the missing backend rather than opening an
-        // engine that would run the model somewhere else. The resolved segments land on the plan at open unchanged — nothing
-        // re-derives them while the model stays open.
-        ModelRoute route = ModelRoutes.Resolve(new RouteRequest
-        {
-            ModelName = modelConfig.Name,
-            Stages = [new(ModelRoutes.PrefillStage, modelConfig.Placement.Prefill), new(ModelRoutes.DecodeStage, modelConfig.Placement.Device)],
-            AvailableDevices = [backend.DeviceId],
-            ThreadQuota = modelConfig.Placement.ThreadQuota,
-            CoreSet = modelConfig.Placement.CoreSet,
-        });
+        // a declared split lands its first span on device 'cuda' from layer 0 with every later layer — through the last one, where
+        // the output head runs — back on cpu at boundary gpu_layers, and a stage naming any other backend fails now naming that
+        // segment and what is missing rather than opening an engine that would run the model somewhere else. The resolved segments
+        // land on the plan at open unchanged — nothing re-derives them while the model stays open.
+        ModelRoute route;
+        ResolvedBudgetSet budgets;
 
-        // The model's declared budgets resolve against the pools this service opens for it, here and once: each chain lands as what an
-        // opened host can actually carry, and a claim nothing backs fails now naming the model, the resource, the tier, and the missing
-        // capability — before any weight view or reservation is spent on posture that cannot hold it. What every backend this build opens
-        // holds working copies in is system memory; disk-backed write-side pools are vocabulary those chains may name but nothing here carries yet.
-        ResolvedBudgetSet budgets = ModelBudgets.Resolve(new BudgetRequest
+        try
         {
-            ModelName = modelConfig.Name,
-            Declared = modelConfig.Budgets ?? [],
-            OpenedPoolTiers = [BudgetTier.Dram],
-        });
+            List<RouteStage> stages = splitExecution is null
+                ? [new(ModelRoutes.PrefillStage, modelConfig.Placement.Prefill), new(ModelRoutes.DecodeStage, modelConfig.Placement.Device)]
+                :
+                [
+                    new RouteStage(ModelRoutes.PrefillStage, CudaBackend.DeviceIdValue) { SplitPosition = 0 },
+                    new RouteStage(ModelRoutes.DecodeStage, ModelRoute.CpuDeviceId) { SplitPosition = modelConfig.Placement.GpuLayers },
+                ];
 
+            route = ModelRoutes.Resolve(new RouteRequest
+            {
+                ModelName = modelConfig.Name,
+                Stages = stages,
+                AvailableDevices = splitExecution is null ? [backend.DeviceId] : [backend.DeviceId, splitExecution.DeviceId],
+                ThreadQuota = modelConfig.Placement.ThreadQuota,
+                CoreSet = modelConfig.Placement.CoreSet,
+            });
+
+            // The model's declared budgets resolve against the pools this service opens for it, here and once: each chain lands as what an
+            // opened host can actually carry, and a claim nothing backs fails now naming the model, the resource, the tier, and the missing
+            // capability — before any weight view or reservation is spent on posture that cannot hold it. What every backend this build opens
+            // holds working copies in is system memory; disk-backed write-side pools are vocabulary those chains may name but nothing here carries yet.
+            budgets = ModelBudgets.Resolve(new BudgetRequest
+            {
+                ModelName = modelConfig.Name,
+                Declared = modelConfig.Budgets ?? [],
+                OpenedPoolTiers = [BudgetTier.Dram],
+            });
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
+        {
+            splitExecution?.Dispose(); // a route or budget this configuration cannot resolve must not leave an opened accelerator backend standing.
+            throw;
+        }
         // The ledger this engine's claims account against: a supplied one is a host's shared accounting across several
         // programmatically opened engines, so their claims register against one set of capacity seams in the order the
         // opens happen; an omitted one is this engine's own ledger over the tiers its pools back, each stating the
@@ -1157,16 +1215,26 @@ public sealed class GenerationService : IDisposable
             // unimplemented capability takes — and nothing lands on a route that was not selected.
             try
             {
-                model = TransformerModel.Open(
-                    file,
-                    backend,
-                    reservedSlots,
-                    line => logger?.LogInformation("{ProfileLog}", line),
-                    ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel),
-                    route,
-                    prefillsBackend,
-                    prefillsLane,
-                    budgets);
+                model = splitExecution is null
+                    ? TransformerModel.Open(
+                        file,
+                        backend,
+                        reservedSlots,
+                        line => logger?.LogInformation("{ProfileLog}", line),
+                        ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel),
+                        route,
+                        prefillsBackend,
+                        prefillsLane,
+                        budgets)
+                    : TransformerModel.Open(
+                        file,
+                        backend,
+                        reservedSlots,
+                        line => logger?.LogInformation("{ProfileLog}", line),
+                        ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel),
+                        route,
+                        [splitExecution, backend], // the resolved execution set answers every segment position in order: 'cuda' first, this service's decode-side CPU backend after it.
+                        budgets);
             }
             catch (ModelException ex) when (ex.Message.StartsWith("prefill kernel '", StringComparison.Ordinal))
             {
@@ -1385,7 +1453,7 @@ public sealed class GenerationService : IDisposable
                 model.Plan.SparseFfnStrategy is { } strategy ? SparseFfnStrategyNames.Of(strategy) : null,
                 modelConfig.MaxConcurrentRequests);
 
-            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, markerPair, markersProven ? string.Empty : markerRefusal, logger, pool, scheduler, info, config, prefillsBackend, prefillsLane);
+            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, markerPair, markersProven ? string.Empty : markerRefusal, logger, pool, scheduler, info, config, prefillsBackend, prefillsLane, splitExecution);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
             service._ledger = ledger; // the claims this open registered ride the same ledger the scheduler reports admissions to
             service._compute = compute; // the core accounting this model's grant seated against, shared with any engine opened beside it
@@ -1406,6 +1474,7 @@ public sealed class GenerationService : IDisposable
             file?.Dispose();
             backend.Dispose();
             prefillsBackend?.Dispose();
+            splitExecution?.Dispose(); // the accelerator side of a declared layer split belongs to this open exactly as the CPU backends do.
             throw;
         }
     }
@@ -1776,10 +1845,11 @@ public sealed class GenerationService : IDisposable
         // engine's mmap view must be released before the file handle it maps.
         _scheduler.Dispose();
         _pool.Dispose();
-        _model.Dispose();
+        _model.Dispose(); // the engine releases every staging arena to the backend that allocated it before any backend goes away.
         _file.Dispose();
         _backend.Dispose();
         _prefillsBackend?.Dispose(); // the lane's pool workers belong to this service exactly as the decode side's do
+        _splitExecution?.Dispose();  // and so does the accelerator compute backend a declared layer split opened beside them
     }
 
     private IReadOnlyList<int> EncodeChat(GenerationRequest request, ToolPipeline tools, CancellationToken cancellationToken)

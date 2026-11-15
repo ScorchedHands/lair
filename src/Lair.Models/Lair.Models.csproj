@@ -16,6 +16,10 @@
     <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
       <_Parameter1>Lair.Bench</_Parameter1>
     </AssemblyAttribute>
+    <!-- A host that opens a layer split resolves placement onto route boundaries and the engine's execution-backend seam at model open. -->
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleTo">
+      <_Parameter1>Lair.Http</_Parameter1>
+    </AssemblyAttribute>
   </ItemGroup>
 
   <PropertyGroup>
