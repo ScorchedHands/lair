@@ -26,13 +26,20 @@ public sealed record ComputeGrant
     /// <summary>True when some or all of this claim's participation rides logical processors another grant already holds — an opt-in overlap, or a share seated after capacity ran out.</summary>
     public bool SharesHeldCores { get; init; }
 
+    /// <summary>The logical processors this claim took as its own on each reported node, keyed by node index and ordered by node. Empty when the claim seated none as its own.</summary>
+    public IReadOnlyDictionary<int, int> NodeAllocations { get; init; } = new Dictionary<int, int>();
+
     /// <summary>The model as the text a diagnostic names this grant by: requested against granted, with its own share and overlap posture stated.</summary>
     public string Describe() =>
         $"'{Model}' requested {RequestedCores} core{(RequestedCores == 1 ? "" : "s")} / granted {GrantedCores}" +
-        (SharesHeldCores ? $" ({ExclusiveCores} exclusive, shared with earlier grants)" : string.Empty);
+        (SharesHeldCores ? $" ({ExclusiveCores} exclusive, shared with earlier grants)" : string.Empty) +
+        (NodeAllocations.Count > 0 ? $" [{NodeAllocationText()}]" : string.Empty);
 
     /// <summary>Grant-versus-request as one report field: what was asked for against what this claim runs with.</summary>
     public string GrantVersusRequest() => $"{RequestedCores}/{GrantedCores}";
+
+    /// <summary>The per-node share as one report field: each node this claim seated on beside what it took there.</summary>
+    public string NodeAllocationText() => string.Join(",", NodeAllocations.OrderBy(entry => entry.Key).Select(entry => $"{entry.Key}:{entry.Value}"));
 }
 
 /// <summary>
@@ -89,16 +96,20 @@ public sealed record DeclaredTotalsReport(
 }
 
 /// <summary>
-/// Host-scoped compute accounting over the logical processors a host reports: every model's worker claim registers against that
-/// total in registration order, first-come-first-served. Earlier claims are never revoked, preempted, or displaced — an oversubscribed
-/// later claim is clamped to what its predecessors left (a partial grant), and only a model that opts into core overcommit keeps the
-/// whole share it asked for while overlapping cores another grant holds. Per-node capacity stays reported through <see cref="Topology"/>;
-/// which node each share draws from is placement's decision, so this ledger seats shares against the host total without choosing nodes.
+/// Host-scoped compute accounting over the logical processors a host reports: every model's worker claim registers in
+/// registration order, first-come-first-served. Earlier claims are never revoked, preempted, or displaced — an oversubscribed
+/// later claim is clamped to what its predecessors left (a partial grant), and only a model that opts into core overcommit keeps
+/// the whole share it asked for while overlapping cores another grant holds. Claims seat on the nodes their placement chose:
+/// a placement names the node or nodes a share draws from, capacity is tracked per reported node, and a claim clamps to what
+/// its chosen nodes left. A claim registered without a placement spreads across every reported node in node order, which is
+/// exactly the host-total accounting this ledger had before per-node seats existed — on a one-node posture the two readings
+/// are the same numbers.
 /// </summary>
 public sealed class ComputeCapacityLedger
 {
     private readonly object _gate = new();
     private readonly List<ComputeGrant> _grants = [];
+    private readonly Dictionary<int, int> _nodeExclusive = [];
     private int _exclusiveCores;
 
     /// <summary>Opens accounting over one reported compute posture.</summary>
@@ -117,6 +128,8 @@ public sealed class ComputeCapacityLedger
             {
                 throw new ModelException($"reported node {node.Index} carries no logical processors: a reported posture names what each node holds.");
             }
+
+            _nodeExclusive[node.Index] = 0;
         }
 
         Topology = topology;
@@ -136,6 +149,34 @@ public sealed class ComputeCapacityLedger
             lock (_gate)
             {
                 return Math.Max(TotalCores - _exclusiveCores, 0);
+            }
+        }
+    }
+
+    /// <summary>The logical processors no seated grant has taken as its own on one reported node. A node this posture does not report holds nothing.</summary>
+    public int RemainingCoresForNode(int nodeIndex)
+    {
+        lock (_gate)
+        {
+            HostNodeCapacity? node = Topology.Nodes.FirstOrDefault(candidate => candidate.Index == nodeIndex);
+            return node is null ? 0 : Math.Max(node.LogicalProcessors - _nodeExclusive[nodeIndex], 0);
+        }
+    }
+
+    /// <summary>Every reported node beside the logical processors seated grants have taken as their own on it, in node order — what placement reads as load when it chooses a node.</summary>
+    public IReadOnlyDictionary<int, int> NodeAllocations
+    {
+        get
+        {
+            lock (_gate)
+            {
+                Dictionary<int, int> held = [];
+                foreach (HostNodeCapacity node in Topology.Nodes)
+                {
+                    held[node.Index] = _nodeExclusive[node.Index];
+                }
+
+                return held;
             }
         }
     }
@@ -176,16 +217,35 @@ public sealed class ComputeCapacityLedger
     }
 
     /// <summary>
-    /// Registers one model's worker claim, in the caller's registration order. The claim takes what earlier claims left as its own share;
-    /// asking for more than that is a partial grant naming requested against granted, never a refusal and never a displacement of an
+    /// Registers one model's worker claim without a placement, in the caller's registration order: the claim spreads across
+    /// every reported node in node order, which is the host-total accounting this ledger has always done — on a one-node
+    /// posture, the same numbers a placement would produce. The claim takes what earlier claims left as its own share; asking
+    /// for more than that is a partial grant naming requested against granted, never a refusal and never a displacement of an
     /// earlier claim. A claim that opts into overcommit keeps the whole share it asked for and records the overlap with standing grants.
     /// When nothing is left to seat, the model still runs — at one worker riding what stands there — because compute accounting has no
     /// authority to refuse a served model, only to report what its participation costs the host.
     /// </summary>
-    public ComputeGrant RegisterClaim(string model, int requestedCores, bool allowOvercommit = false)
+    public ComputeGrant RegisterClaim(string model, int requestedCores, bool allowOvercommit = false) =>
+        RegisterClaim(model, requestedCores, placement: null, allowOvercommit);
+
+    /// <summary>
+    /// Registers one model's worker claim on the nodes its placement chose. Capacity is tracked per reported node: the claim
+    /// fills its chosen nodes in node order, clamping to what each of those nodes still has unclaimed, so a later claim
+    /// never displaces an earlier seat — it clamps to what its chosen nodes left, and a claim whose chosen nodes are full runs
+    /// at one worker riding what stands there. A pinned posture's node is authoritative: this seam moves a claim to another
+    /// node for neither a full seat nor a partial one. Every node the claim seated on is recorded in the grant. A null placement
+    /// registers today's host-total spread across every reported node.
+    /// </summary>
+    public ComputeGrant RegisterClaim(string model, int requestedCores, NumaPlacement? placement, bool allowOvercommit = false)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(model);
         ArgumentOutOfRangeException.ThrowIfLessThan(requestedCores, 1);
+
+        if (placement is not null && placement.Model != model)
+        {
+            throw new ModelException(
+                $"model '{model}' registers a claim against the placement derived for '{placement.Model}': a claim seats on the placement resolved for it.");
+        }
 
         lock (_gate)
         {
@@ -194,14 +254,46 @@ public sealed class ComputeCapacityLedger
                 throw new ModelException($"model '{model}' already holds a compute grant on this ledger: one model claims its worker share once.");
             }
 
-            int remaining = Math.Max(TotalCores - _exclusiveCores, 0);
-            int exclusive = Math.Min(requestedCores, remaining);
+            List<int> chosen = placement?.NodeIndices.Count > 0
+                ? [.. placement.NodeIndices]
+                : [.. Topology.Nodes.Select(node => node.Index)]; // no placement named: today's posture spreads across every reported node
+
+            foreach (int nodeIndex in chosen)
+            {
+                if (!_nodeExclusive.ContainsKey(nodeIndex))
+                {
+                    throw new ModelException(
+                        $"model '{model}' places on node {nodeIndex} this posture does not report ({Topology.Describe()}): a claim seats on nodes the host named.");
+                }
+            }
+
+            int left = requestedCores;
+            Dictionary<int, int> allocations = [];
+            int exclusive = 0;
+
+            // The claim fills its chosen nodes in node order, taking what each still has unclaimed and handing the rest to the
+            // next chosen node: the same first-come-first-served clamp this ledger has always done, now stated node by node.
+            foreach (int nodeIndex in chosen)
+            {
+                int room = Math.Max(Topology.Nodes.First(node => node.Index == nodeIndex).LogicalProcessors - _nodeExclusive[nodeIndex], 0);
+                int taken = Math.Min(left, room);
+
+                if (taken == 0)
+                {
+                    continue;
+                }
+
+                allocations[nodeIndex] = taken;
+                exclusive += taken;
+                left -= taken;
+            }
+
             bool sharesHeldCores;
             int granted;
 
             if (allowOvercommit)
             {
-                // An opted-in claim keeps what it asked for: whatever capacity left could not seat comes from cores standing grants already hold.
+                // An opted-in claim keeps what it asked for: whatever capacity its chosen nodes left could not seat comes from cores standing grants already hold.
                 granted = requestedCores;
                 sharesHeldCores = exclusive < requestedCores && _grants.Count > 0;
             }
@@ -225,10 +317,16 @@ public sealed class ComputeCapacityLedger
                 GrantedCores = granted,
                 ExclusiveCores = exclusive,
                 SharesHeldCores = sharesHeldCores,
+                NodeAllocations = allocations,
             };
 
             _grants.Add(seated);
             _exclusiveCores += exclusive;
+            foreach (KeyValuePair<int, int> allocation in allocations)
+            {
+                _nodeExclusive[allocation.Key] += allocation.Value;
+            }
+
             return seated;
         }
     }

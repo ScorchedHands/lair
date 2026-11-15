@@ -206,4 +206,13 @@ public sealed record PlacementConfig
     /// engine's workers contend for, so this key is established when the engine opens — a restart-only edit like <c>core_set</c>.
     /// </summary>
     public bool CoreOvercommit { get; init; }
+
+    /// <summary>
+    /// The NUMA spread posture this model's placement declares: <c>auto</c> (default — placement chooses the least-loaded node the
+    /// host reports, lowest node index as tiebreak, and a pinned core set resolves to the node carrying it), <c>local</c> (one node
+    /// carries the model), or <c>interleave</c> (a spread posture across the reported nodes). The posture is decided when the engine
+    /// opens: which node its workers run on and what its weight pages first-touch to are established then, so a live edit records the
+    /// preference for later placement decisions without re-binding an opened worker pool.
+    /// </summary>
+    public string NumaSpread { get; init; } = "auto";
 }

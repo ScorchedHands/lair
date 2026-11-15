@@ -67,6 +67,12 @@ public sealed class GenerationService : IDisposable
     private ComputeCapacityLedger? _compute;
     private ComputeGrant? _computeGrant;
 
+    // The placement this engine's worker claim seated on: the node (or nodes) placement chose for this model beside the posture it
+    // declared and the posture placement applied. Established when the engine opens — a live edit of the spread key records the new
+    // preference for later placement decisions while this value, the opened worker pool, and the posture its weight pages first-touched
+    // to stay exactly as the open resolved them.
+    private NumaPlacement? _placement;
+
     // Generations currently publishing monitor lifecycle frames, keyed by their stream request id — the in-flight
     // half of a resync state dump. Trackers are added at admission and removed when their completion frame publishes.
     private readonly ConcurrentDictionary<string, RequestTracker> _monitoredRequests = new(StringComparer.Ordinal);
@@ -87,6 +93,9 @@ public sealed class GenerationService : IDisposable
 
     /// <summary>The worker cap the lane's execution backend holds from open — null when the model shares its single backend. Internal diagnostics for hosts and tests.</summary>
     internal int? DedicatedPrefillLaneWorkerCap => _prefillsBackend?.EffectiveWorkerCount;
+
+    /// <summary>The placement this engine's worker claim seated on, resolved when the engine opened — null until then. Internal diagnostics for hosts and tests.</summary>
+    internal NumaPlacement? ResolvedPlacement => _placement;
 
     private bool _disposed;
 
@@ -221,7 +230,13 @@ public sealed class GenerationService : IDisposable
         ComputeRequestedThreads: _computeGrant?.RequestedCores,
         ComputeGrantedThreads: _computeGrant?.GrantedCores,
         CoreOvercommit: config.Models[0].Placement.CoreOvercommit ? true : null,
-        SharedCoreModels: BuildSharedCoreFacts(_compute, _computeGrant));
+        SharedCoreModels: BuildSharedCoreFacts(_compute, _computeGrant),
+        PlacementNode: _placement is { NodeIndices.Count: 1 } openedPlacement ? openedPlacement.NodeIndices[0] : null,
+        PlacementNodes: _placement is null ? null : string.Join(",", _placement.NodeIndices),
+        PlacementSpread: _placement is null ? null : NumaSpreadNames.Of(_placement.Applied),
+        PlacementSpreadRequested: _placement is null ? null : NumaSpreadNames.Of(_placement.Requested),
+        PlacementNodeAllocations: _computeGrant is { NodeAllocations.Count: > 0 } seatedGrant ? seatedGrant.NodeAllocationText() : null,
+        PlacementAdvisory: _placement?.Advisory);
 
     // Which seated compute grants ride logical processors another grant already holds — the models an operator needs to see together when a
     // share was clamped or opted into overlap. Nothing shared reports null, so snapshots of a host where every grant is its own read exactly as they did before this fact existed.
@@ -537,6 +552,20 @@ public sealed class GenerationService : IDisposable
                             $"admission cap {change.OldValue} -> {change.NewValue}: submissions from now on are refused once every slot of the new cap is held; sequences already admitted keep their slots and finish normally"));
                         break;
 
+                    case "models[0].placement.numa_spread":
+                        // The preference is recorded for later placement decisions; the node this engine opened on, the posture its
+                        // worker pool masks to, and the posture its weight pages first-touched to stay as the open resolved them.
+                        // Re-binding an opened engine's placement is what a restart is for, and nothing here claims otherwise.
+                        effective = effective with { Models = [effective.Models[0] with { Placement = effective.Models[0].Placement with { NumaSpread = candidate.Models[0].Placement.NumaSpread } }] };
+                        _logger?.LogInformation(
+                            "numa_placement_reload model='{Model}' opened_spread={OpenedSpread} preference={Preference} opened_posture=established",
+                            Model.Id,
+                            _placement is null ? "(unresolved)" : NumaSpreadNames.Of(_placement.Applied),
+                            candidate.Models[0].Placement.NumaSpread);
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"spread posture {change.OldValue} -> {change.NewValue}: the preference is recorded for later placement decisions; the node this engine opened on and the posture its worker pool and weight pages established remain as the open resolved them — re-binding an opened engine's placement takes a restart"));
+                        break;
+
                     case "ui.recent_requests":
                         _metrics?.SetRecentRequestCapacity(candidate.Ui.RecentRequests);
                         effective = effective with { Ui = candidate.Ui };
@@ -657,6 +686,38 @@ public sealed class GenerationService : IDisposable
         _ => throw new InvalidOperationException(
             $"model '{modelName}' declares engine.prefill_kernel '{value}': 'prefill_kernel' accepts only '{PrefillKernelNames.GemV}', '{PrefillKernelNames.Tiled}', or '{PrefillKernelNames.Gemm}'."),
     };
+
+    // The spread posture one configuration resolves to for placement: only the three accepted names map, and anything
+    // else — reachable only on a programmatically built configuration — fails naming model and value instead of defaulting
+    // onto some other posture. Which node the mapped posture became on this host's reported topology is placement's answer
+    // at open, not this resolver's.
+    private static NumaSpreadPreference ResolveNumaSpread(string modelName, string value) =>
+        NumaSpreadNames.TryParse(value, out NumaSpreadPreference preference)
+            ? preference
+            : throw new InvalidOperationException(
+                $"model '{modelName}' declares 'placement.numa_spread' '{value}': 'numa_spread' accepts {NumaSpreadNames.AcceptedVocabulary}.");
+
+    // The core ids the backends this open builds pin to. A declared core set is authoritative and passes through untouched.
+    // An unpinned posture bounds its worker pool to the single node placement chose when that node reports its core ids and
+    // this host has a real affinity seam: the mask is the node's own reported ids, never a guess. On a host whose affinity
+    // seam is the documented no-op, an unpinned model stays unpinned rather than carrying a mask that pins nothing; a posture
+    // that spread across nodes names nodes rather than cores, and ids outside what a processor mask can express are not
+    // invented into a partial pin.
+    private static IReadOnlySet<int> EffectiveBackendCoreSet(HostTopology topology, NumaPlacement placement, IReadOnlySet<int> declaredCoreSet)
+    {
+        if (declaredCoreSet.Count > 0 || placement.NodeIndices.Count != 1 || !CpuBackend.SupportsCorePinning)
+        {
+            return declaredCoreSet;
+        }
+
+        HostNodeCapacity? node = topology.Nodes.FirstOrDefault(candidate => candidate.Index == placement.NodeIndices[0]);
+        if (node is null || node.CoreIds.Count == 0 || node.CoreIds.Any(core => core < 0 || core > CpuBackend.MaxMaskableCoreId))
+        {
+            return declaredCoreSet; // a node this posture does not report, one that states no ids, or one whose ids a mask cannot express: nothing to derive
+        }
+
+        return new HashSet<int>(node.CoreIds);
+    }
 
     // A byte count stated in the megabyte unit weight and prefill-buffer claims and ceilings count in, rounded up so
     // a claim never under-reports what it holds against a ceiling declared in that unit.
@@ -880,7 +941,8 @@ public sealed class GenerationService : IDisposable
         // backend exists, so no half-lane engine ever opens — and then each side gets its own cap: the decode-side
         // backend runs on the full engine choice with this step's derived share as its starting quota (a live edit may
         // retarget that cap within the same ceiling), while the lane backend is sized to its load-resolved share alone.
-        // A pinned posture hands each side a disjoint mask of the declared cores; an unpinned one bounds participation by worker count only.
+        // A pinned posture hands each side a disjoint mask of the declared cores; an unpinned one bounds participation by worker count,
+        // bounded to the node placement chose where this host can pin.
         PrefillLaneLayout? prefillsLane = null;
         CpuBackend? prefillsBackend = null;
         CpuBackend backend;
@@ -898,16 +960,43 @@ public sealed class GenerationService : IDisposable
             ? Math.Min(engineThreadsChoice, declaredQuota)
             : engineThreadsChoice;
 
-        // The claim registers before any backend opens, in this open's order: earlier seats cap this participation instead of refusing it, and the grant logs requested against granted so a partial seat is visible at load rather than inferred from a worker count.
-        ComputeGrant computeGrant = compute.RegisterClaim(modelConfig.Name, requestedShare, modelConfig.Placement.CoreOvercommit);
+        // Placement derives before any backend opens: this model's declared spread posture resolves against the posture the host
+        // reported and the per-node load earlier claims seated, so the node its workers run on is decided while no worker pool exists.
+        // A posture the reported topology cannot honour — a pinned set beside a spread posture, or a pinned set spanning nodes — refuses
+        // the open naming model, key, and conflict, exactly like a half-lane posture does: no half-placed engine ever opens.
+        NumaPlacement placement = NumaPlacementResolver.Resolve(
+            compute.Topology,
+            [new NumaClaim
+            {
+                Model = modelConfig.Name,
+                RequestedCores = requestedShare,
+                Spread = ResolveNumaSpread(modelConfig.Name, modelConfig.Placement.NumaSpread),
+                CoreSet = modelConfig.Placement.CoreSet,
+            }],
+            compute.NodeAllocations)[0];
 
         logger?.LogInformation(
-            "compute_grant model='{Model}' requested={Requested} granted={Granted} exclusive_cores={ExclusiveCores} shared_cores={SharedCores} nodes={NodeCount} logical_processors={TotalLogicalProcessors}",
+            "numa_placement model='{Model}' {NodeFact} spread={Requested}→{Applied}{CoreIds}{Advisory}",
+            modelConfig.Name,
+            placement.NodeIndices.Count == 1 ? $"node={placement.NodeIndices[0]}" : $"nodes={string.Join(",", placement.NodeIndices)}",
+            NumaSpreadNames.Of(placement.Requested),
+            NumaSpreadNames.Of(placement.Applied),
+            placement.CoreIds.Count > 0 ? $" core_set='{FormatCoreRanges(placement.CoreIds)}'" : string.Empty,
+            placement.Advisory is null ? string.Empty : $" advisory='{placement.Advisory}'");
+
+        // The claim registers before any backend opens, in this open's order, on the nodes placement chose: earlier seats cap this
+        // participation instead of refusing it, the grant logs requested against granted beside the per-node share it seated, and a
+        // partial seat is visible at load rather than inferred from a worker count.
+        ComputeGrant computeGrant = compute.RegisterClaim(modelConfig.Name, requestedShare, placement, modelConfig.Placement.CoreOvercommit);
+
+        logger?.LogInformation(
+            "compute_grant model='{Model}' requested={Requested} granted={Granted} exclusive_cores={ExclusiveCores} shared_cores={SharedCores} node_allocations={NodeAllocations} nodes={NodeCount} logical_processors={TotalLogicalProcessors}",
             modelConfig.Name,
             computeGrant.RequestedCores,
             computeGrant.GrantedCores,
             computeGrant.ExclusiveCores,
             computeGrant.SharesHeldCores,
+            computeGrant.NodeAllocationText(),
             compute.Topology.Nodes.Count,
             compute.TotalCores);
 
@@ -916,17 +1005,23 @@ public sealed class GenerationService : IDisposable
             ? modelConfig.Placement.ThreadQuota
             : Math.Min(modelConfig.Placement.ThreadQuota ?? computeGrant.GrantedCores, computeGrant.GrantedCores);
 
+        // The core ids every backend this open builds pins to: a declared core set is authoritative and stands exactly as configured.
+        // An unpinned posture bounds its worker pool to the node placement chose when that node reports core ids and this host's
+        // affinity seam is real — a node-derived mask, never a guess. Where the seam is a documented no-op or a posture spread across
+        // nodes, nothing is masked and the posture bounds participation by worker count alone, as it always did.
+        IReadOnlySet<int> backendCoreSet = EffectiveBackendCoreSet(compute.Topology, placement, modelConfig.Placement.CoreSet);
+
         if (modelConfig.Placement.PrefillLane == PlacementPrefillLaneValues.Dedicated)
         {
-            // A dedicated posture sub-allocates both lane sides from this model's granted share, so a clamped claim narrows the split instead of letting one side reach past what the host seated for it.
-            prefillsLane = ModelPrefillLanes.ResolveDedicated(modelConfig.Name, engineThreadsChoice, grantedQuota, modelConfig.Placement.CoreSet);
+            // A dedicated posture sub-allocates both lane sides from this model's granted share, so a clamped claim narrows the split instead of letting one side reach past what the host seated for it. A node-derived core set splits inside the chosen node: each lane claims its side of that node's reported ids.
+            prefillsLane = ModelPrefillLanes.ResolveDedicated(modelConfig.Name, engineThreadsChoice, grantedQuota, backendCoreSet);
 
             backend = new(engineThreadsChoice, new HashSet<int>(prefillsLane.DecodeCoreIds), prefillsLane.DecodeShareThreads);
             prefillsBackend = new(prefillsLane.PrefillShareThreads, new HashSet<int>(prefillsLane.PrefillCoreIds));
         }
         else
         {
-            backend = new(config.Engine.Threads, modelConfig.Placement.CoreSet, grantedQuota);
+            backend = new(config.Engine.Threads, backendCoreSet, grantedQuota);
         }
         // The model's placement resolves to its route value set here, against the compute backend this service opens for it:
         // consecutive stages naming 'cpu' collapse into one CPU segment carrying this model's thread cap and pinned core share,
@@ -1227,6 +1322,7 @@ public sealed class GenerationService : IDisposable
             service._ledger = ledger; // the claims this open registered ride the same ledger the scheduler reports admissions to
             service._compute = compute; // the core accounting this model's grant seated against, shared with any engine opened beside it
             service._computeGrant = computeGrant; // requested against granted, reported on monitor facts beside the live worker count
+            service._placement = placement; // the node this engine seated on, reported on monitor facts beside its grant
             file = null;
             model = null;
             pool = null;

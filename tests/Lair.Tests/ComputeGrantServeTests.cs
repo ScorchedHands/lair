@@ -49,28 +49,38 @@ public sealed class ComputeGrantServeTests : IDisposable
         using GenerationService first = OpenEngine(path, "grant-first", threads: 4, logger: firstLog, compute: compute);
 
         Assert.Contains(
-            "compute_grant model='grant-first' requested=4 granted=4 exclusive_cores=4 shared_cores=False nodes=2 logical_processors=6",
-            firstLog.Messages(LogLevel.Information));
-        Assert.Equal(4, first.EffectiveWorkerCount); // a full grant leaves today's construction untouched.
+            "numa_placement model='grant-first' node=0 spread=auto→auto",
+            firstLog.Messages(LogLevel.Information)); // an unpinned auto posture seats on the least-loaded node, lowest index first.
+        Assert.Contains(
+            "compute_grant model='grant-first' requested=4 granted=3 exclusive_cores=3 shared_cores=False node_allocations=0:3 nodes=2 logical_processors=6",
+            firstLog.Messages(LogLevel.Information)); // a claim seats on its chosen node only: node 0 reported three processors, so four asked for clamps to three.
+        Assert.Equal(3, first.EffectiveWorkerCount); // participation rides inside what its chosen node holds, not past it.
 
         CapturingLogger secondLog = new();
         using GenerationService second = OpenEngine(path, "grant-second", threads: 4, logger: secondLog, compute: compute);
 
         Assert.Contains(
-            "compute_grant model='grant-second' requested=4 granted=2 exclusive_cores=2 shared_cores=False nodes=2 logical_processors=6",
+            "numa_placement model='grant-second' node=1 spread=auto→auto",
+            secondLog.Messages(LogLevel.Information)); // node 0 stands loaded, so the least-loaded node is node 1.
+        Assert.Contains(
+            "compute_grant model='grant-second' requested=4 granted=3 exclusive_cores=3 shared_cores=False node_allocations=1:3 nodes=2 logical_processors=6",
             secondLog.Messages(LogLevel.Information)); // the clamp is reported at load, not inferred from a worker count.
-        Assert.Equal(2, second.EffectiveWorkerCount); // participation rides inside what its predecessors left, below this model's own choice.
+        Assert.Equal(3, second.EffectiveWorkerCount); // participation rides inside what its own chosen node left, below this model's own choice.
 
         ComputeGrant standing = compute.GrantFor("grant-first")!;
-        Assert.Equal(4, standing.GrantedCores); // the earlier seat keeps everything it was granted: partial grants never displace it.
+        Assert.Equal(3, standing.GrantedCores); // the earlier seat keeps everything it was granted: partial grants never displace it.
+        Assert.Equal(new Dictionary<int, int> { [0] = 3 }, standing.NodeAllocations); // its seat is recorded on the node it seated on.
 
         _ = Generate(first, "hello world");
         _ = Generate(second, "hello world");
 
         MetricsSnapshot snapshot = NewestSnapshotAfterLoad(second);
-        Assert.Equal(2, snapshot.WorkerThreads);          // the effective count already on the monitor surface.
+        Assert.Equal(3, snapshot.WorkerThreads);          // the effective count already on the monitor surface.
         Assert.Equal(4, snapshot.ComputeRequestedThreads); // beside it: what this model asked to run with.
-        Assert.Equal(2, snapshot.ComputeGrantedThreads);   // against what the host seated for it.
+        Assert.Equal(3, snapshot.ComputeGrantedThreads);   // against what its chosen node seated for it.
+        Assert.Equal(1, snapshot.PlacementNode);           // the node this engine seated on.
+        Assert.Equal("auto", snapshot.PlacementSpread);    // beside the posture placement applied.
+        Assert.Equal("1:3", snapshot.PlacementNodeAllocations); // and the per-node share its grant seated.
         Assert.Null(snapshot.CoreOvercommit);              // a clamped share is not an overlap: nothing opted in here.
         Assert.Null(snapshot.SharedCoreModels);            // and its own cores stay reported as unshared.
 
@@ -85,26 +95,29 @@ public sealed class ComputeGrantServeTests : IDisposable
         ComputeCapacityLedger compute = new(SyntheticTwoNodePosture(processorsPerNode: 2, memoryMb: null)); // four logical processors reported.
 
         using GenerationService first = OpenEngine(path, "grant-full", threads: 4, logger: new CapturingLogger(), compute: compute);
-        Assert.Equal(0, compute.RemainingCores); // the whole posture is held by this one claim.
+        using GenerationService second = OpenEngine(path, "grant-second", threads: 4, logger: new CapturingLogger(), compute: compute);
+        Assert.Equal(0, compute.RemainingCores); // every reported node is held by the two seats ahead of this claim.
 
-        CapturingLogger secondLog = new();
-        using GenerationService second = OpenEngine(path, "grant-after", threads: 3, logger: secondLog, compute: compute);
+        CapturingLogger thirdLog = new();
+        using GenerationService third = OpenEngine(path, "grant-after", threads: 3, logger: thirdLog, compute: compute);
 
         Assert.Contains(
-            "compute_grant model='grant-after' requested=3 granted=1 exclusive_cores=0 shared_cores=True nodes=2 logical_processors=4",
-            secondLog.Messages(LogLevel.Information)); // a claim that finds nothing left is admitted beside what stands there.
-        Assert.Equal(1, second.EffectiveWorkerCount);
+            "compute_grant model='grant-after' requested=3 granted=1 exclusive_cores=0 shared_cores=True node_allocations= nodes=2 logical_processors=4",
+            thirdLog.Messages(LogLevel.Information)); // a claim whose chosen nodes hold nothing left is admitted beside what stands there.
+        Assert.Equal(1, third.EffectiveWorkerCount);
 
-        _ = Generate(first, "hello world");   // the standing model keeps serving after later claims seat.
+        _ = Generate(first, "hello world");   // the standing models keep serving after later claims seat.
         _ = Generate(second, "hello world");
+        _ = Generate(third, "hello world");
 
-        MetricsSnapshot snapshot = NewestSnapshotAfterLoad(second);
+        MetricsSnapshot snapshot = NewestSnapshotAfterLoad(third);
         Assert.Equal(3, snapshot.ComputeRequestedThreads);
         Assert.Equal(1, snapshot.ComputeGrantedThreads);
         Assert.Contains("grant-after", snapshot.SharedCoreModels!); // the overlap is named on the same surface worker counts use.
 
         first.Dispose();
         second.Dispose();
+        third.Dispose();
     }
 
     [Fact]
@@ -185,7 +198,10 @@ public sealed class ComputeGrantServeTests : IDisposable
         JsonElement root = document.RootElement;
 
         Assert.Equal(JsonValueKind.Number, root.GetProperty("metrics_compute_requested_threads").ValueKind);
-        Assert.Equal(3, root.GetProperty("metrics_compute_granted_threads").GetInt32()); // a fresh posture seats this whole request.
+        Assert.Equal(2, root.GetProperty("metrics_compute_granted_threads").GetInt32()); // the claim seats on its chosen node, which reports two processors.
+        Assert.Equal(0, root.GetProperty("metrics_placement_node").GetInt32());          // the node placement chose for this engine.
+        Assert.Equal("auto", root.GetProperty("metrics_placement_spread").GetString());  // the posture it applied, beside the one it applied it through.
+        Assert.Equal("0:2", root.GetProperty("metrics_compute_node_allocations").GetString()); // and the per-node share the grant seated.
         Assert.True(root.TryGetProperty("metrics_core_overcommit", out JsonElement overcommit)); // trailing optional fields serialize inert like their neighbors.
         Assert.Equal(JsonValueKind.Null, overcommit.ValueKind);
 

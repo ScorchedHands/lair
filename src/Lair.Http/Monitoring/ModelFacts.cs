@@ -74,4 +74,22 @@ public sealed record ModelFacts(
     bool? CoreOvercommit = null,
 
     /// <summary>The models whose participation rides logical processors a grant already holds — null when every seated share is its own.</summary>
-    IReadOnlyList<string>? SharedCoreModels = null);
+    IReadOnlyList<string>? SharedCoreModels = null,
+
+    /// <summary>The single node this engine's worker claim seated on, or null for a posture that spread across nodes and until the owning service attaches placement facts.</summary>
+    int? PlacementNode = null,
+
+    /// <summary>Every node the opened placement chose, as a comma-separated list of node positions — the same reading a spread posture reports.</summary>
+    string? PlacementNodes = null,
+
+    /// <summary>The spread posture placement applied when the engine opened (<c>auto</c>, <c>local</c>, <c>interleave</c>), or null until placement facts attach.</summary>
+    string? PlacementSpread = null,
+
+    /// <summary>The spread posture the model's configuration declared, beside the posture placement resolved it to.</summary>
+    string? PlacementSpreadRequested = null,
+
+    /// <summary>The logical processors this model's grant seated as its own on each node, as <c>node:cores</c> pairs — null until compute facts attach or when the claim seated none.</summary>
+    string? PlacementNodeAllocations = null,
+
+    /// <summary>Why the opened posture could not be honoured whole from what the host reported, or null when it was honoured.</summary>
+    string? PlacementAdvisory = null);

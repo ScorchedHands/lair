@@ -129,6 +129,12 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// <summary>Physical cores detected on the machine by the topology probe (0 when detection is unavailable); see <see cref="AutoWorkerCount"/>.</summary>
     public static int DetectedPhysicalCoreCount => ThreadAffinity.DetectPhysicalCoreCount();
 
+    /// <summary>Whether this host has a real affinity seam for pool workers (Windows-only in this build; elsewhere a configured mask is the documented no-op). A host consults this before deriving a node mask for an unpinned model.</summary>
+    public static bool SupportsCorePinning => ThreadAffinity.SupportsPinning;
+
+    /// <summary>The highest logical core id a processor mask can express; ids above it cannot be pinned through this seam.</summary>
+    public const int MaxMaskableCoreId = ThreadAffinity.MaxCoreId;
+
     /// <summary>
     /// Turns on lightweight per-block execution sampling: each worker block records which logical processor it ran on, readable
     /// through <see cref="ExecutionSamples"/>. Off by default so production runs pay no instrumentation cost beyond one field read.

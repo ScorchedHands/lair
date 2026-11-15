@@ -160,7 +160,30 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_core_overcommit")] bool? CoreOvercommit = null,
 
     /// <summary>The models whose participation rides logical processors a grant already holds — null whenever every seated share is its own.</summary>
-    [property: JsonPropertyName("metrics_shared_cores_models")] IReadOnlyList<string>? SharedCoreModels = null)
+    [property: JsonPropertyName("metrics_shared_cores_models")] IReadOnlyList<string>? SharedCoreModels = null,
+
+    // Additive placement facts (earlier shapes untouched): the node an opened engine seated its worker claim on beside the
+    // posture placement applied and the posture the configuration declared, the per-node share the grant seated, and any
+    // advisory stating why a posture could not be honoured from what the host reported. A live edit of the spread key
+    // records the preference for later placement decisions; these stay as the open resolved them.
+
+    /// <summary>The single node this engine's worker claim seated on; null for a posture that spread across nodes or until placement facts attach.</summary>
+    [property: JsonPropertyName("metrics_placement_node")] int? PlacementNode = null,
+
+    /// <summary>Every node the opened placement chose, as a comma-separated list of node positions.</summary>
+    [property: JsonPropertyName("metrics_placement_nodes")] string? PlacementNodes = null,
+
+    /// <summary>The spread posture placement applied at open (<c>auto</c>, <c>local</c>, <c>interleave</c>); null until placement facts attach.</summary>
+    [property: JsonPropertyName("metrics_placement_spread")] string? PlacementSpread = null,
+
+    /// <summary>The spread posture the model's configuration declared, beside the posture placement resolved it to.</summary>
+    [property: JsonPropertyName("metrics_placement_spread_requested")] string? PlacementSpreadRequested = null,
+
+    /// <summary>The logical processors this model's grant seated as its own on each node, as <c>node:cores</c> pairs; null until compute facts attach or when the claim seated none.</summary>
+    [property: JsonPropertyName("metrics_compute_node_allocations")] string? PlacementNodeAllocations = null,
+
+    /// <summary>Why the opened posture could not be honoured whole from what the host reported; null when it was honoured.</summary>
+    [property: JsonPropertyName("metrics_placement_advisory")] string? PlacementAdvisory = null)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

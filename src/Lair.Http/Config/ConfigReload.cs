@@ -193,6 +193,11 @@ public static class ConfigMutationTable
 
         Add(changes, "models[0].placement.prefill_lane", oldPlacement.PrefillLane, newPlacement.PrefillLane);
 
+        // The NUMA spread posture classifies as new-requests-only: it records the preference later placement decisions read,
+        // while the node an opened engine's workers run on and the posture its weight pages first-touched to stay as the open
+        // established them — nothing here re-binds an opened worker pool or its weight pages.
+        Add(changes, "models[0].placement.numa_spread", oldPlacement.NumaSpread, newPlacement.NumaSpread);
+
         // Core-set overcommit changes what a running engine's workers contend for, so it is established when the engine opens: refused live,
         // exactly like the pinned set it relaxes. Declared capacity totals bind accounting at open for the same reason.
         if (newPlacement.CoreOvercommit != oldPlacement.CoreOvercommit)
@@ -275,6 +280,7 @@ public static class ConfigMutationTable
         "models[0].max_reasoning_tokens" => ConfigMutationClass.NewRequestsOnly,
         "models[0].max_response_tokens" => ConfigMutationClass.NewRequestsOnly,
         "models[0].max_concurrent_requests" => ConfigMutationClass.NewRequestsOnly,
+        "models[0].placement.numa_spread" => ConfigMutationClass.NewRequestsOnly,
         "models[0].placement.core_overcommit" => ConfigMutationClass.RestartOnly,
         "tiers.dram_mb" or "tiers.dram_cores" or "tiers.nvme_path" or "tiers.nodes" => ConfigMutationClass.RestartOnly,
         _ => BudgetFieldClass(field) ?? ConfigMutationClass.RestartOnly,
@@ -384,6 +390,7 @@ public static class ConfigMutationTable
         yield return ("models[0].placement.prefill", ScalarText(placement, "prefill"));
         yield return ("models[0].placement.thread_quota", ScalarText(placement, "thread_quota"));
         yield return ("models[0].placement.prefill_lane", ScalarText(placement, "prefill_lane"));
+        yield return ("models[0].placement.numa_spread", ScalarText(placement, "numa_spread"));
 
         // Core-set overcommit is a plain scalar beside the pinned set it relaxes. Declared capacity totals are plain scalars too; per-node
         // override lists skip here exactly as 'placement.core_set' and budget chain orders do — a structural list has no single canonical text,
@@ -442,6 +449,7 @@ public static class ConfigMutationTable
         "models[0].placement.prefill" => current.Models[0].Placement.Prefill,
         "models[0].placement.thread_quota" => TextOrNone(current.Models[0].Placement.ThreadQuota),
         "models[0].placement.prefill_lane" => current.Models[0].Placement.PrefillLane,
+        "models[0].placement.numa_spread" => current.Models[0].Placement.NumaSpread,
         "models[0].placement.core_overcommit" => Text(current.Models[0].Placement.CoreOvercommit),
         "tiers.dram_mb" => NumberOrNone(current.Tiers?.DramMb),
         "tiers.dram_cores" => NumberOrNone(current.Tiers?.DramCores),

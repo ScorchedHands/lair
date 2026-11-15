@@ -576,7 +576,13 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 ComputeRequestedThreads: facts?.ComputeRequestedThreads,
                 ComputeGrantedThreads: facts?.ComputeGrantedThreads,
                 CoreOvercommit: facts?.CoreOvercommit,
-                SharedCoreModels: facts?.SharedCoreModels);
+                SharedCoreModels: facts?.SharedCoreModels,
+                PlacementNode: facts?.PlacementNode,
+                PlacementNodes: facts?.PlacementNodes,
+                PlacementSpread: facts?.PlacementSpread,
+                PlacementSpreadRequested: facts?.PlacementSpreadRequested,
+                PlacementNodeAllocations: facts?.PlacementNodeAllocations,
+                PlacementAdvisory: facts?.PlacementAdvisory);
 
             long id = ++_eventSeq;
             frame = new MonitorFrame(id, MonitorEventNames.Snapshot, snapshot.ToJson());

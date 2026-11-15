@@ -19,7 +19,7 @@ public static class YamlConfigLoader
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel"];
     private static readonly string[] UiKeys = ["recent_requests"];
     private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "budgets"];
-    private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit"];
+    private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit", "numa_spread"];
 
     /// <summary>The resident capacity keys a top-level tiers block may declare, in the order a refusal reports them.</summary>
     private static readonly IReadOnlyList<string> TierKeys = ["dram_mb", "dram_cores", "nvme_path", "nodes"];
@@ -525,6 +525,16 @@ public static class YamlConfigLoader
         // running engine is decided when the engine opens, so the loader only reads the posture.
         bool coreOvercommit = TryBoolean(keys, "core_overcommit", $"models[{index}].placement.core_overcommit") ?? false;
 
+        // NUMA spread posture: auto (default — placement chooses the node) or local (one node carries the model) or interleave
+        // (a spread posture across the reported nodes). An unrecognized value fails naming the served model, the key, and the
+        // accepted set; what the posture resolves to on this host's reported topology is decided when the engine opens.
+        string numaSpread = TryText(keys, "numa_spread", $"models[{index}].placement.numa_spread") ?? NumaSpreadNames.Auto;
+        if (!NumaSpreadNames.TryParse(numaSpread, out _))
+        {
+            throw new ConfigException(
+                $"models[{index}].placement.numa_spread '{numaSpread}' is invalid for model '{modelName}': 'numa_spread' accepts {NumaSpreadNames.AcceptedVocabulary}.");
+        }
+
         return new PlacementConfig
         {
             Device = device,
@@ -534,6 +544,7 @@ public static class YamlConfigLoader
             ThreadQuota = threadQuota,
             PrefillLane = prefillLane,
             CoreOvercommit = coreOvercommit,
+            NumaSpread = numaSpread,
         };
     }
 
