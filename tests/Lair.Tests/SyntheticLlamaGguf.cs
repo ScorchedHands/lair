@@ -1,5 +1,7 @@
 using System.Text;
 
+using Lair.Contracts;
+
 namespace Lair.Tests;
 
 internal static class SyntheticLlamaGguf
@@ -11,8 +13,10 @@ internal static class SyntheticLlamaGguf
     /// Writes one tiny synthetic llama-shaped GGUF. With <paramref name="withReasoningMarkers"/> the vocabulary carries
     /// <c>&lt;think&gt;</c> and <c>&lt;/think&gt;</c> as ordinary entries, so a reasoning budget declared on this model has
     /// whole-marker tokens to bind; without them the vocabulary carries none, which is the shape a budget gate must refuse.
+    /// Every tensor ships in <paramref name="format"/>: F32 keeps the original byte pattern exactly, while F16 and BF16
+    /// payloads carry quarter-scale values that survive both stored formats unchanged.
     /// </summary>
-    public static string Write(string modelName, bool withReasoningMarkers = true)
+    public static string Write(string modelName, bool withReasoningMarkers = true, QuantFormat format = QuantFormat.F32)
     {
         using MemoryStream stream = new();
         using BinaryWriter writer = new(stream, Encoding.UTF8, leaveOpen: true);
@@ -76,7 +80,7 @@ internal static class SyntheticLlamaGguf
                 writer.Write((ulong)dims[d]);
             }
 
-            writer.Write(0u); // ggml type F32
+            writer.Write(GgmlTypeId(format));
             writer.Write((ulong)offset);
 
             long elements = 1;
@@ -85,7 +89,7 @@ internal static class SyntheticLlamaGguf
                 elements *= dim;
             }
 
-            offset += elements * 4;
+            offset += elements * ElementBytes(format);
         }
 
         long headerLength = stream.Position;
@@ -106,7 +110,19 @@ internal static class SyntheticLlamaGguf
 
             for (long e = 0; e < elements; e++)
             {
-                writer.Write(ordinal % 2 == 1 ? 1.25f : MathF.Sin((ordinal * 17 + e) * 0.13f));
+                float value = SampleValue(ordinal, e, format);
+                switch (format)
+                {
+                    case QuantFormat.F32:
+                        writer.Write(value);
+                        break;
+                    case QuantFormat.F16:
+                        writer.Write(BitConverter.HalfToInt16Bits((Half)value));
+                        break;
+                    default: // BF16: the f32 high half written little-endian.
+                        writer.Write((ushort)(BitConverter.SingleToUInt32Bits(value) >> 16));
+                        break;
+                }
             }
 
             ordinal++;
@@ -118,6 +134,21 @@ internal static class SyntheticLlamaGguf
         File.WriteAllBytes(path, stream.ToArray());
         return path;
     }
+
+    private static uint GgmlTypeId(QuantFormat format) => format switch
+    {
+        QuantFormat.F32 => 0u,
+        QuantFormat.F16 => 1u,
+        _ => 30u, // BF16
+    };
+
+    private static int ElementBytes(QuantFormat format) => format == QuantFormat.F32 ? 4 : 2;
+
+    private static float SampleValue(int ordinal, long e, QuantFormat format) => format switch
+    {
+        QuantFormat.F32 => ordinal % 2 == 1 ? 1.25f : MathF.Sin((ordinal * 17 + e) * 0.13f),
+        _ => ((ordinal * 7 + (int)(e % 9)) % 9 - 4) / 4f, // quarter-scale values exact in both stored formats
+    };
 
     private static void WriteString(BinaryWriter writer, string value)
     {

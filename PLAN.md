@@ -1345,7 +1345,7 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the PCIe-
   - Verify: targeted `dotnet test --filter Category=Kernel|Concurrency|Cancel -c Release` repeat runs, plus a named failure/stack when the flake is reproduced.
 - [✓] Binding spike — CUDA Driver API + embedded PTX smoke (see DN-M4-10)
   - Verify: host loads a PTX kernel through `nvcuda.dll` and a smoke GEMM matches the CPU reference within FP tolerance, with no `nvcc` or cuBLASLt dependency.
-- [_] CudaBackend — dense decode + prefill kernels behind `IBackend` (see DN-M4-1)
+- [✓] CudaBackend — dense decode + prefill kernels behind `IBackend` (see DN-M4-1)
   - Verify: `dotnet test --filter Category=Parity` — same F16 model decodes token-identical on CPU, CUDA, and hybrid per DN-M4-9: argmax agreement plus identical token stream, not raw-byte logits.
 - [_] Prefill offload — GPU prefill, CPU/hybrid decode (see DN-M4-5)
   - Verify: bench records ≥2× prefill tok/s on the 4090 vs CPU for the reference model. *(bench deferred — see Open Items)*
