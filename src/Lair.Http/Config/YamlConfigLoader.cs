@@ -18,8 +18,14 @@ public static class YamlConfigLoader
     private static readonly string[] ServerKeys = ["bind", "port"];
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel"];
     private static readonly string[] UiKeys = ["recent_requests"];
-    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "budgets"];
+    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "budgets", "source"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit", "numa_spread"];
+
+    /// <summary>The keys one model entry's source block may declare, beside exactly one of the two file spellings.</summary>
+    private static readonly string[] SourceKeys = ["repo", "revision", "file", "files"];
+
+    /// <summary>The keys one source file mapping may declare beside the path it names.</summary>
+    private static readonly string[] SourceFileKeys = ["path", "sha256", "size"];
 
     /// <summary>The resident capacity keys a top-level tiers block may declare, in the order a refusal reports them.</summary>
     private static readonly IReadOnlyList<string> TierKeys = ["dram_mb", "dram_cores", "nvme_path", "nodes"];
@@ -342,7 +348,7 @@ public static class YamlConfigLoader
         {
             throw new ConfigException($"models[{index}].path must be a non-empty path to the model file on disk.");
         }
-        if (!File.Exists(path))
+        if (!File.Exists(path) && !keys.ContainsKey("source"))
         {
             throw new ConfigException($"models[{index}].path '{path}' does not exist on disk.");
         }
@@ -459,6 +465,7 @@ public static class YamlConfigLoader
             MaxConcurrentRequests = maxConcurrentRequests,
             Budgets = budgets,
             LegacyKvBlocksDeclared = declaredKvBlocks is not null,
+            Source = ParseSource(keys, index, name),
             Placement = ParsePlacement(keys, index, name),
         };
     }
@@ -546,6 +553,159 @@ public static class YamlConfigLoader
             CoreOvercommit = coreOvercommit,
             NumaSpread = numaSpread,
         };
+    }
+
+    /// <summary>
+    /// Parses one model entry's source block: the published repo, the revision pinned as declared, and exactly one of
+    /// <c>file</c> or <c>files</c> naming the model files the pack carries. Shape is validated here — every refusal names
+    /// the qualified config path and the offending value exactly as the other blocks do — and an absent block preserves
+    /// the local-path posture: the declared path is served with no provenance at all. A declared revision is stored
+    /// verbatim; a branch name becomes a commit sha only when fetch resolves it into the manifest.
+    /// </summary>
+    private static ModelSourceConfig? ParseSource(Dictionary<string, YamlNode> modelKeys, int index, string modelName)
+    {
+        if (!modelKeys.TryGetValue("source", out YamlNode? node))
+        {
+            return null; // no source block: today's posture serves the declared local path exactly as before.
+        }
+
+        string where = $"models[{index}].source";
+        Dictionary<string, YamlNode> keys = KeysOf(AsMapping(node, where), where);
+        RejectUnknownKeys(keys, where, SourceKeys);
+
+        string? repo = TryText(keys, "repo", $"{where}.repo");
+        if (repo is null)
+        {
+            throw new ConfigException($"Missing required key 'repo' under {where}; allowed keys are: {Allowed(SourceKeys)}.");
+        }
+
+        if (string.IsNullOrWhiteSpace(repo))
+        {
+            throw new ConfigException($"{where}.repo must be a non-empty Hugging Face repo slug.");
+        }
+
+        // The revision is stored as declared: a commit sha is already the pin, and a branch name becomes one when fetch resolves it.
+        string? revision = TryText(keys, "revision", $"{where}.revision");
+        if (revision is null)
+        {
+            throw new ConfigException($"Missing required key 'revision' under {where}; allowed keys are: {Allowed(SourceKeys)}.");
+        }
+
+        if (string.IsNullOrWhiteSpace(revision))
+        {
+            throw new ConfigException($"{where}.revision must name a commit sha or branch to pin.");
+        }
+
+        if (keys.ContainsKey("file") && keys.ContainsKey("files"))
+        {
+            throw new ConfigException($"{where} declares both 'file' and 'files': the source block states exactly one of them.");
+        }
+
+        List<SourceFileConfig> files;
+        if (keys.TryGetValue("file", out YamlNode? fileNode))
+        {
+            files = [ParseSourceFile(fileNode, $"{where}.file", index, modelName)];
+        }
+        else if (keys.TryGetValue("files", out YamlNode? filesNode))
+        {
+            files = ParseSourceFiles(filesNode, where, index, modelName);
+        }
+        else
+        {
+            throw new ConfigException($"{where} declares no model file: state exactly one of 'file' or 'files' — omit 'source' entirely to serve the declared local path.");
+        }
+
+        return new ModelSourceConfig { Repo = repo, Revision = revision, Files = [.. files] };
+    }
+
+    // One declared file entry: a plain path/name string, or a mapping stating the path beside its pinned hash and size.
+    // A malformed value fails naming the qualified entry path and the offending value; an entry that is neither a string
+    // nor a mapping cannot name a file at all.
+    private static SourceFileConfig ParseSourceFile(YamlNode entry, string where, int index, string modelName)
+    {
+        if (entry.NodeType == YamlNodeType.Scalar)
+        {
+            if (((YamlScalarNode)entry).Value is not string barePath || string.IsNullOrWhiteSpace(barePath))
+            {
+                throw new ConfigException($"{where} must be a non-empty model file path/name.");
+            }
+
+            return new SourceFileConfig { Path = barePath };
+        }
+
+        Dictionary<string, YamlNode> keys = KeysOf(AsMapping(entry, where), where);
+        RejectUnknownKeys(keys, where, SourceFileKeys);
+
+        string? declaredPath = TryText(keys, "path", $"{where}.path");
+        if (declaredPath is null)
+        {
+            throw new ConfigException($"Missing required key 'path' under {where}; allowed keys are: {Allowed(SourceFileKeys)}.");
+        }
+
+        if (string.IsNullOrWhiteSpace(declaredPath))
+        {
+            throw new ConfigException($"{where}.path must be a non-empty model file path/name.");
+        }
+
+        string? sha256 = TryText(keys, "sha256", $"{where}.sha256");
+        if (sha256 is not null && !IsSha256Hex(sha256))
+        {
+            throw new ConfigException(
+                $"{where}.sha256 '{sha256}' is invalid for model '{modelName}': 'sha256' must be 64 lowercase hex characters.");
+        }
+
+        long? size = TryLong(keys, "size", $"{where}.size");
+        if (size is < 0)
+        {
+            throw new ConfigException(
+                $"{where}.size {size} is invalid for model '{modelName}': 'size' must be a non-negative integer — omit the key to declare no size.");
+        }
+
+        return new SourceFileConfig { Path = declaredPath, Sha256 = sha256, Size = size };
+    }
+
+    private static List<SourceFileConfig> ParseSourceFiles(YamlNode node, string where, int index, string modelName)
+    {
+        string listWhere = $"{where}.files";
+        if (node.NodeType != YamlNodeType.Sequence)
+        {
+            throw new ConfigException($"{listWhere} must be a list of model file entries, each a path/name string or a mapping stating 'path' with optional 'sha256' and 'size'.");
+        }
+
+        List<YamlNode> entries = [.. ((YamlSequenceNode)node).Children];
+        if (entries.Count == 0)
+        {
+            throw new ConfigException(
+                $"{listWhere} is empty for model '{modelName}': a source block names at least one model file — omit 'source' entirely to serve the declared local path.");
+        }
+
+        List<SourceFileConfig> files = [];
+        int position = 0;
+        foreach (YamlNode entry in entries)
+        {
+            files.Add(ParseSourceFile(entry, $"{listWhere}[{position}]", index, modelName));
+            position++;
+        }
+
+        return files;
+    }
+
+    private static bool IsSha256Hex(string value)
+    {
+        if (value.Length != 64)
+        {
+            return false;
+        }
+
+        foreach (char ch in value)
+        {
+            if (!(ch is >= '0' and <= '9' or >= 'a' and <= 'f'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>

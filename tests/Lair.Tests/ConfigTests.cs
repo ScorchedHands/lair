@@ -149,6 +149,26 @@ public sealed class ConfigTests : IDisposable
     }
 
     [Fact]
+    public void Load_SourceModelPathMayBeAbsentForFetch()
+    {
+        string missing = Path.Combine(Path.GetTempPath(), $"lair-source-{Guid.NewGuid():N}.gguf");
+        string yaml = $"""
+            models:
+              - name: source-test
+                path: '{missing}'
+                source:
+                  repo: owner/repo
+                  revision: main
+                  file: model.gguf
+            """;
+
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+
+        Assert.NotNull(config.Models[0].Source);
+        Assert.Equal("owner/repo", config.Models[0].Source!.Repo);
+    }
+
+    [Fact]
     public void Load_EmptyModelPath_Fails()
     {
         string yaml = """

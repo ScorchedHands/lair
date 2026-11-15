@@ -4,6 +4,25 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.15] - 2026-11-15
+
+### Added
+
+- Published model acquisition: optional `models[].source` pins a repo, revision, and GGUF file/files. Load verifies the pack manifest and fetches the pinned artifact only when it is absent, downloading to `.part`, computing sha256 before atomic rename, and refusing partial shard sets or hash mismatches naming repo, revision, file, and reason.
+- Model pack manifest: `models/manifest.json` records model, repo, resolved revision, file path, LAIR-computed sha256, size, fetched timestamp, and shard metadata. Branch revisions are resolved once at fetch and stored as commit shas; load never re-resolves them.
+- `lair model fetch|check|list` CLI with bounded exit codes `0` success, `1` refusal, and `2` usage. `fetch` is idempotent on a verified pinned artifact; `check` reports candidate deltas against hub HEAD without downloading, repinning, or touching the load path.
+- Gated repo authentication through `LAIR_HF_TOKEN`, with `HUGGING_FACE_HUB_TOKEN` fallback. The token is sent only to `huggingface.co` and is never written to logs, error text, or the manifest.
+- Report-only update candidates: serve consults the hub HEAD once for source-pinned models and exposes optional `metrics_update_candidate` on `/monitor/stream` when a candidate exists. Offline, gated, or failed candidate checks are logged as skipped and do not block serving from a verified cache.
+
+### Changed
+
+- A model entry with `source:` may name a path that does not exist yet; the load-time resolver creates it only by fetching the pinned revision and verifying the manifest first.
+- `/monitor/stream` snapshots gained the additive optional `metrics_update_candidate` field. Models without a candidate keep the previous snapshot shape.
+
+### Fixed
+
+- Live hub fetches stream redirected files correctly: the production transport disables auto-redirect, follows redirects manually, and ties the HTTP response lifetime to the returned content stream.
+
 ## [0.3.14] - 2026-11-15
 
 ### Added

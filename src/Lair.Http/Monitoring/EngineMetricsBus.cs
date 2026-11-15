@@ -582,7 +582,8 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 PlacementSpread: facts?.PlacementSpread,
                 PlacementSpreadRequested: facts?.PlacementSpreadRequested,
                 PlacementNodeAllocations: facts?.PlacementNodeAllocations,
-                PlacementAdvisory: facts?.PlacementAdvisory);
+                PlacementAdvisory: facts?.PlacementAdvisory,
+                UpdateCandidate: facts?.UpdateCandidate);
 
             long id = ++_eventSeq;
             frame = new MonitorFrame(id, MonitorEventNames.Snapshot, snapshot.ToJson());

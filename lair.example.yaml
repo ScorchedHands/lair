@@ -34,6 +34,14 @@ models:
     # max_reasoning_tokens: 256  # optional; tokens a reasoning region may spend before it is closed; requires the model's tokenizer to carry <think>/</think> as whole tokens
     # max_response_tokens: 1024  # optional; tokens of visible output the model may generate
     # max_concurrent_requests: 8 # optional; omitted is uncapped; admission rejections name the blocking KV/token/quota limit
+    # source:                    # optional published-source pin; with source present, path may name a file that fetch-if-absent will create
+    #   repo: QuantFactory/SmolLM-135M-Instruct-GGUF
+    #   revision: main           # commit sha or branch; fetch resolves a branch once and records the resolved sha in manifest.json
+    #   file: SmolLM-135M-Instruct.Q8_0.gguf
+    #   # files:                 # optional list spelling instead of a single file; each entry may declare path, sha256, and size
+    #   #   - path: model-00001-of-00002.gguf
+    #   #     sha256: 0000000000000000000000000000000000000000000000000000000000000000
+    #   #     size: 144810912
     placement:
       device: cpu
       kv_residency: dram

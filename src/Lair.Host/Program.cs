@@ -22,7 +22,10 @@ if (args.Length == 3 && args[0] == "serve" && args[1] == "-c")
     try
     {
         config = YamlConfigLoader.Load(args[2]);
-        engine = GenerationService.Open(config, loggerFactory.CreateLogger("Lair.Http.GenerationService"));
+        // A model that declares a published source is verified against its pack manifest (and fetched if absent) through
+        // the live hub seam before its GGUF opens; a model without a source is untouched by this seam. A gated repo is
+        // read with the operator's environment-supplied token, which the seam keeps out of the manifest and the logs.
+        engine = GenerationService.Open(config, loggerFactory.CreateLogger("Lair.Http.GenerationService"), ledger: null, compute: null, transport: new HuggingFaceHubTransport(new EnvironmentHubTokenProvider()));
     }
     catch (Exception ex)
     {
@@ -128,11 +131,56 @@ if (args.Length >= 2 && args[0] == "monitor")
     }
 }
 
+if (args.Length >= 1 && args[0] == "model")
+{
+    // The model CLI reads pack manifests beside the model files it names: with -c it takes each config model's own
+    // pack directory, and without one it defaults to the models directory beside the executable. HEAD is consulted
+    // through the live hub seam for candidate reporting only. A gated repo is read with the operator's
+    // environment-supplied token, which the seam keeps out of the manifest and the CLI output.
+    string? modelConfigPath = null;
+    List<string> modelArgs = [];
+
+    for (int i = 1; i < args.Length; i++)
+    {
+        if (args[i] == "-c")
+        {
+            if (i + 1 >= args.Length)
+            {
+                Console.Error.WriteLine("lair: model -c needs a config path");
+                return 2;
+            }
+
+            modelConfigPath = args[++i];
+            continue;
+        }
+
+        modelArgs.Add(args[i]);
+    }
+
+    LairConfig? modelConfig = null;
+    if (modelConfigPath is not null)
+    {
+        try
+        {
+            modelConfig = YamlConfigLoader.Load(modelConfigPath);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"lair: {ex.Message}");
+            return 1;
+        }
+    }
+
+    ModelCliRunner modelRunner = new(new HuggingFaceHubTransport(new EnvironmentHubTokenProvider()), Path.Combine(AppContext.BaseDirectory, "models"), Console.Out, modelConfig);
+    return await modelRunner.RunAsync(modelArgs, CancellationToken.None);
+}
+
 Console.Error.WriteLine("""
     usage:
       lair serve -c <configPath>   serve the configured model over the OpenAI-compatible HTTP API
       lair chat -c <configPath>    chat with the configured model in an interactive REPL
       lair monitor [-u URL] [--interval ms]  render live engine stats from a serving server (default http://127.0.0.1:8080)
+      lair model fetch|check|list [-c <configPath>]  fetch, report update candidates for, and list pinned model packs
       lair --version               print the lair version
     """);
 return 1;

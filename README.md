@@ -60,9 +60,33 @@ dotnet run --project src/Lair.Host -- monitor -u http://127.0.0.1:8080 --interva
 
 Live table per model: tok/s, step time, batch occupancy, cache-hit rate, KV utilization, active sequences.
 
+## Model acquisition
+
+A model entry may declare a published source:
+
+```yaml
+models:
+  - name: manual-fetch-smollm
+    path: models/SmolLM-135M-Instruct.Q8_0.gguf
+    source:
+      repo: QuantFactory/SmolLM-135M-Instruct-GGUF
+      revision: d36054e030c66b4be24b0c65513ece348db06ba5
+      file: SmolLM-135M-Instruct.Q8_0.gguf
+```
+
+`source:` pins a repo, a revision, and one or more GGUF files. A branch revision is resolved once at fetch and recorded as a commit sha in `models/manifest.json`; load verifies the manifest and fetches the pinned artifact only when it is absent. Hashes are computed by LAIR after download, and a `.part` file is never loadable.
+
+```powershell
+dotnet run --project src/Lair.Host -- model fetch QuantFactory/SmolLM-135M-Instruct-GGUF -c lair.yaml
+dotnet run --project src/Lair.Host -- model check manual-fetch-smollm -c lair.yaml
+dotnet run --project src/Lair.Host -- model list -c lair.yaml
+```
+
+`model check` is report-only: it prints candidate deltas against the hub's current HEAD without downloading, repinning, or changing the load path. `/monitor/stream` carries the same candidate as optional `metrics_update_candidate` when a served model has a source pin and a candidate is found. Gated repos authenticate through `LAIR_HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN` fallback); the token is sent only to `huggingface.co` and is never written to logs, errors, or the manifest.
+
 ## Configuration
 
-One YAML file (`lair.example.yaml` shows every knob): server bind/port, engine `threads`, `max_batch_tokens`, optional `prefill_kernel`, optional `prefill_step_budget_ms`, block size, optional top-level `tiers:` capacity totals with per-node overrides, exactly one model with path, name, type, `max_context_tokens`, `kv_blocks`, optional `max_concurrent_requests`, optional `force_fenced_tools`, optional `tool_parser` and `reasoning`, optional token budgets (`max_reasoning_tokens`, `max_response_tokens`), optional placement policy (`prefill_lane`, `core_set`, `thread_quota`, `core_overcommit`, `numa_spread`), and the UI ring size `ui.recent_requests`.
+One YAML file (`lair.example.yaml` shows every knob): server bind/port, engine `threads`, `max_batch_tokens`, optional `prefill_kernel`, optional `prefill_step_budget_ms`, block size, optional top-level `tiers:` capacity totals with per-node overrides, exactly one model with path, name, type, `max_context_tokens`, `kv_blocks`, optional `max_concurrent_requests`, optional `force_fenced_tools`, optional `tool_parser` and `reasoning`, optional token budgets (`max_reasoning_tokens`, `max_response_tokens`), optional `source:` model acquisition, optional placement policy (`prefill_lane`, `core_set`, `thread_quota`, `core_overcommit`, `numa_spread`), and the UI ring size `ui.recent_requests`.
 
 A running server watches the config file and applies edits automatically: batch width, thread quota, KV budget, and the step-time prefill budget take effect live; context length, the token budgets, the prefill-kernel selection, and `numa_spread` apply to new requests (a kernel edit re-points the engine's prompt-window route from its next window); block size, model path, quant geometry, `prefill_lane`, and `core_overcommit` are refused with a message telling you to restart. Invalid edits are rejected without touching the running engine. Prompt windows resolve a measured default of 32 rows independently from `max_batch_tokens`; `prefill_kernel` selects `gemv`, `tiled`, or `gemm`, and `gemm` is accepted only when every dense weight matrix in the served file has a blocked matmul format (`Q8_0`, `Q4_K`, `IQ4_XS`) — otherwise model open refuses naming those formats. `prefill_step_budget_ms` sizes prompt-window token counts from measured per-row cost, `prefill_buffers` caps can narrow the effective prompt-window row width while reporting requested versus effective width, and `tiers:` plus per-model placement keys drive capacity, worker-grant, and placement reporting through the monitor stream.
 

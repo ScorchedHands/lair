@@ -183,7 +183,10 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_compute_node_allocations")] string? PlacementNodeAllocations = null,
 
     /// <summary>Why the opened posture could not be honoured whole from what the host reported; null when it was honoured.</summary>
-    [property: JsonPropertyName("metrics_placement_advisory")] string? PlacementAdvisory = null)
+    [property: JsonPropertyName("metrics_placement_advisory")] string? PlacementAdvisory = null,
+
+    /// <summary>The report-only update candidate the served model's pinned pack has against the hub's current HEAD — the candidate revision and its delta summary — or null when the model declares no published source, when a check found no candidate, or when a check could not be consulted. A trailing optional field: snapshots of a model with no candidate read exactly as they did before it existed.</summary>
+    [property: JsonPropertyName("metrics_update_candidate")] string? UpdateCandidate = null)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

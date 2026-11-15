@@ -92,4 +92,7 @@ public sealed record ModelFacts(
     string? PlacementNodeAllocations = null,
 
     /// <summary>Why the opened posture could not be honoured whole from what the host reported, or null when it was honoured.</summary>
-    string? PlacementAdvisory = null);
+    string? PlacementAdvisory = null,
+
+    /// <summary>The report-only update candidate this model's pinned pack has against the hub's current HEAD — the candidate revision and its delta summary — or null when the model declares no published source, when a check found no candidate, or when a check could not be consulted. Additive: a snapshot of a model with no candidate reads exactly as it did before this fact existed.</summary>
+    string? UpdateCandidate = null);
