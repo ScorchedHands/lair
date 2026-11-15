@@ -385,5 +385,10 @@ public sealed class ModelFetchTests : IDisposable
 
             return Task.FromResult<HubFile?>(new HubFile(new MemoryStream(full[(int)resumeFrom..]), full.Length));
         }
+
+        public Task<string> ResolveHeadRevisionAsync(string repo, CancellationToken cancellationToken) => Task.FromResult(ResolvedSha);
+
+        public Task<IReadOnlyList<HubTreeEntry>> ListTreeAsync(string repo, string revision, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<HubTreeEntry>>([.. Files.Select(file => new HubTreeEntry(file.Key, file.Value.Length))]);
     }
 }

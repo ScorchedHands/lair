@@ -104,9 +104,47 @@ public sealed class HuggingFaceHubTransport : IModelHubTransport
         return new HubFile(content, totalSize);
     }
 
+    /// <inheritdoc />
+    public async Task<string> ResolveHeadRevisionAsync(string repo, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(repo);
+
+        // The model-info endpoint reports the default branch's current commit sha — the tip a candidate report
+        // compares against. Nothing on the fetch or load path calls this.
+        string url = $"{HubBase}/api/models/{repo}";
+        using HttpResponseMessage response = await _http.GetAsync(url, cancellationToken);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new ModelFetchException($"HEAD for repo '{repo}' could not be resolved from the hub (HTTP {(int)response.StatusCode}).");
+        }
+
+        string body = await response.Content.ReadAsStringAsync(cancellationToken);
+        string head;
+        try
+        {
+            using System.Text.Json.JsonDocument document = System.Text.Json.JsonDocument.Parse(body);
+            head = document.RootElement.TryGetProperty("sha", out System.Text.Json.JsonElement shaElement)
+                ? shaElement.GetString() ?? string.Empty
+                : string.Empty;
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            throw new ModelFetchException($"HEAD for repo '{repo}' could not be read from the hub response: {ex.Message}", ex);
+        }
+
+        if (!IsCommitSha(head))
+        {
+            throw new ModelFetchException($"HEAD for repo '{repo}' reported '{head}', which is not a 40-character commit sha.");
+        }
+
+        return head;
+    }
+
     /// <summary>
-    /// Every file path under <paramref name="revision"/> in <paramref name="repo"/>, following the hub's
-    /// <c>Link</c> pagination so a large tree is read whole rather than one page at a time.
+    /// The files <paramref name="repo"/> carries at <paramref name="revision"/>, following the hub's <c>Link</c>
+    /// pagination so a large tree is read whole rather than one page at a time. Candidate reporting only: the fetch
+    /// path never lists a tree.
     /// </summary>
     public async Task<IReadOnlyList<HubTreeEntry>> ListTreeAsync(string repo, string revision, CancellationToken cancellationToken)
     {
@@ -150,7 +188,8 @@ public sealed class HuggingFaceHubTransport : IModelHubTransport
 
     private static IEnumerable<HubTreeEntry> ParseTreeEntries(string body)
     {
-        // The hub returns a JSON array of { type, path, size } objects; only the path and size are read here.
+        // The hub returns a JSON array of { type, path, size, lfs } objects; the path and size are read here, plus
+        // the LFS pointer's oid as an advisory hash — LAIR never gates loadability on a hub-reported hash.
         using System.Text.Json.JsonDocument document = System.Text.Json.JsonDocument.Parse(body);
         List<HubTreeEntry> entries = [];
 
@@ -165,7 +204,15 @@ public sealed class HuggingFaceHubTransport : IModelHubTransport
                     ? declared
                     : null;
 
-                entries.Add(new HubTreeEntry(path, size));
+                string? hubHash = item.TryGetProperty("lfs", out System.Text.Json.JsonElement lfs) &&
+                                  lfs.ValueKind == System.Text.Json.JsonValueKind.Object &&
+                                  lfs.TryGetProperty("oid", out System.Text.Json.JsonElement oid) &&
+                                  oid.GetString() is string hash &&
+                                  !string.IsNullOrWhiteSpace(hash)
+                    ? hash.ToLowerInvariant()
+                    : null;
+
+                entries.Add(new HubTreeEntry(path, size, hubHash));
             }
         }
 
@@ -179,5 +226,9 @@ public sealed class HuggingFaceHubTransport : IModelHubTransport
         value.Length == 40 && value.All(ch => ch is >= '0' and <= '9' or >= 'a' and <= 'f');
 }
 
-/// <summary>One file a tree listing reports at a revision: its repo-relative path and its size when the hub states one.</summary>
-public sealed record HubTreeEntry(string Path, long? Size);
+/// <summary>
+/// One file a tree listing reports at a revision: its repo-relative path, its size when the hub states one, and
+/// the hub-stated hash when the hub states one (an LFS pointer's oid — advisory for candidate reporting, never a
+/// loadability gate). A null is an unreported value, not a zero.
+/// </summary>
+public sealed record HubTreeEntry(string Path, long? Size, string? HubHash = null);

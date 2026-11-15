@@ -35,8 +35,10 @@ public sealed class ModelFetcher
     /// Fetches <paramref name="model"/>'s declared source into <paramref name="packDirectory"/> and records the
     /// fetched model in the pack manifest. Returns the manifest entry the fetch recorded. A refusal leaves the
     /// manifest untouched: no partial entry is written, so nothing half-fetched is loadable.
+    /// <paramref name="modelName"/> re-keys the recorded entry when a CLI fetch names the pack entry directly;
+    /// the declared source stays the pin either way.
     /// </summary>
-    public async Task<ModelManifestEntry> FetchAsync(ModelConfig model, string packDirectory, CancellationToken cancellationToken)
+    public async Task<ModelManifestEntry> FetchAsync(ModelConfig model, string packDirectory, CancellationToken cancellationToken, string? modelName = null)
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentException.ThrowIfNullOrWhiteSpace(packDirectory);
@@ -55,7 +57,7 @@ public sealed class ModelFetcher
 
         ModelManifestEntry entry = new()
         {
-            Model = model.Name,
+            Model = string.IsNullOrWhiteSpace(modelName) ? model.Name : modelName,
             Repo = source.Repo,
             ResolvedRevision = resolvedRevision,
             Files = [.. fetched],

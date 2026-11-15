@@ -356,5 +356,11 @@ public sealed class ModelArtifactResolverTests : IDisposable
 
             return Task.FromResult<HubFile?>(new HubFile(new MemoryStream(full[(int)resumeFrom..]), full.Length));
         }
+
+        // The resolver never consults HEAD or a tree listing; these stand in for the seam's reporting-only members.
+        public Task<string> ResolveHeadRevisionAsync(string repo, CancellationToken cancellationToken) => Task.FromResult(ResolvedSha);
+
+        public Task<IReadOnlyList<HubTreeEntry>> ListTreeAsync(string repo, string revision, CancellationToken cancellationToken) =>
+            Task.FromResult<IReadOnlyList<HubTreeEntry>>([.. Files.Select(file => new HubTreeEntry(file.Key, file.Value.Length))]);
     }
 }

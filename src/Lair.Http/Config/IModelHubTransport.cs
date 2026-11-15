@@ -23,6 +23,20 @@ public interface IModelHubTransport
     /// confirm a resumed transfer reached the end before it records anything as loadable.
     /// </summary>
     Task<HubFile?> OpenFileAsync(string repo, string revision, string path, long resumeFrom, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The commit sha HEAD currently points at in <paramref name="repo"/> — the tip an update check reports a
+    /// candidate against. Only reporting consults it: fetch and load never re-resolve a pin through this seam,
+    /// and a check that reads HEAD still repins nothing.
+    /// </summary>
+    Task<string> ResolveHeadRevisionAsync(string repo, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The files <paramref name="repo"/> carries at <paramref name="revision"/>, with each file's size and the
+    /// hub-stated hash when the hub reports one. Read only for candidate reporting: a fetch downloads declared
+    /// paths straight from the resolve endpoint without listing a tree, so nothing loadable depends on this call.
+    /// </summary>
+    Task<IReadOnlyList<HubTreeEntry>> ListTreeAsync(string repo, string revision, CancellationToken cancellationToken);
 }
 
 /// <summary>
