@@ -293,14 +293,14 @@ public sealed class ModelCliRunner
             return ExitSuccess;
         }
 
-        // Reporting only: HEAD is consulted through the seam, and nothing here downloads, rewrites a manifest, or
-        // runs the resolver — a candidate stays a candidate until an operator adopts it behind a restart.
+        // Reporting only: the shared checker consults HEAD through the seam and diffs the pinned file set against it,
+        // and nothing here downloads, rewrites a manifest, or runs the resolver — a candidate stays a candidate until
+        // an operator adopts it behind a restart.
+        ModelUpdateChecker checker = new(_transport);
         int candidates = 0;
         foreach (ModelManifestEntry entry in entries)
         {
-            string head = await _transport.ResolveHeadRevisionAsync(entry.Repo, cancellationToken);
-            IReadOnlyList<HubTreeEntry> tree = await _transport.ListTreeAsync(entry.Repo, head, cancellationToken);
-            candidates += await ReportCandidateAsync(entry, head, tree);
+            candidates += await ReportCandidateAsync(await checker.CheckAsync(entry, cancellationToken));
         }
 
         await _output.WriteLineAsync(candidates > 0
@@ -310,68 +310,23 @@ public sealed class ModelCliRunner
         return ExitSuccess;
     }
 
-    private async Task<int> ReportCandidateAsync(ModelManifestEntry entry, string head, IReadOnlyList<HubTreeEntry> tree)
+    private async Task<int> ReportCandidateAsync(ModelUpdateCandidate candidate)
     {
-        await _output.WriteLineAsync($"model: {entry.Model}");
-        await _output.WriteLineAsync($"  repo: {entry.Repo}");
-        await _output.WriteLineAsync($"  pinned: {entry.ResolvedRevision}");
-        await _output.WriteLineAsync($"  head: {head}");
+        await _output.WriteLineAsync($"model: {candidate.Model}");
+        await _output.WriteLineAsync($"  repo: {candidate.Repo}");
+        await _output.WriteLineAsync($"  pinned: {candidate.PinnedRevision}");
+        await _output.WriteLineAsync($"  head: {candidate.CandidateRevision}");
 
-        int deltas = 0;
-
-        if (!string.Equals(entry.ResolvedRevision, head, StringComparison.OrdinalIgnoreCase))
+        foreach (UpdateDelta delta in candidate.Deltas)
         {
-            deltas++;
-            await _output.WriteLineAsync($"  revision delta: {entry.ResolvedRevision} -> {head}");
+            await _output.WriteLineAsync($"  {delta.Detail}");
         }
 
-        Dictionary<string, HubTreeEntry> headFiles = new(StringComparer.Ordinal);
-        foreach (HubTreeEntry file in tree)
-        {
-            headFiles[Normalize(file.Path)] = file;
-        }
-
-        HashSet<string> pinnedPaths = [];
-        foreach (ModelManifestFile file in entry.Files)
-        {
-            string path = Normalize(file.Path);
-            pinnedPaths.Add(path);
-
-            if (!headFiles.TryGetValue(path, out HubTreeEntry? headFile))
-            {
-                deltas++;
-                await _output.WriteLineAsync($"  file delta: '{path}' pinned in the manifest but no longer present at head");
-                continue;
-            }
-
-            if (headFile.HubHash is string hubHash && !string.Equals(hubHash, file.Sha256, StringComparison.OrdinalIgnoreCase))
-            {
-                deltas++;
-                await _output.WriteLineAsync($"  hash delta: '{path}' pinned {file.Sha256} -> head {hubHash}");
-            }
-
-            if (headFile.Size is long headSize && file.Size is long pinnedSize && headSize != pinnedSize)
-            {
-                deltas++;
-                await _output.WriteLineAsync($"  size delta: '{path}' pinned {pinnedSize} -> head {headSize}");
-            }
-        }
-
-        foreach (HubTreeEntry headFile in tree)
-        {
-            string path = Normalize(headFile.Path);
-            if (!pinnedPaths.Contains(path))
-            {
-                deltas++;
-                await _output.WriteLineAsync($"  file delta: '{path}' present at head but not in the pinned file set");
-            }
-        }
-
-        await _output.WriteLineAsync(deltas > 0
-            ? $"  candidate: {deltas} delta(s) against head"
+        await _output.WriteLineAsync(candidate.HasCandidate
+            ? $"  candidate: {candidate.DeltaCount} delta(s) against head"
             : "  current: pinned matches head");
 
-        return deltas;
+        return candidate.DeltaCount;
     }
 
     private async Task<int> ListManifests(IReadOnlyList<string> args)
@@ -485,8 +440,6 @@ public sealed class ModelCliRunner
 
         return directory;
     }
-
-    private static string Normalize(string path) => path.Replace('\\', '/');
 
     private static string RepoName(string repo)
     {

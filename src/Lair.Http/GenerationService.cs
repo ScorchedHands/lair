@@ -73,6 +73,11 @@ public sealed class GenerationService : IDisposable
     // to stay exactly as the open resolved them.
     private NumaPlacement? _placement;
 
+    // The report-only update candidate this model's pinned pack has against the hub's current HEAD, resolved once at
+    // open through the transport seam. Null for a model with no published source, no candidate, or a check that could
+    // not be consulted. It feeds only the monitor's additive candidate fact — never the load path, a fetch, or a pin.
+    private string? _updateCandidate;
+
     // Generations currently publishing monitor lifecycle frames, keyed by their stream request id — the in-flight
     // half of a resync state dump. Trackers are added at admission and removed when their completion frame publishes.
     private readonly ConcurrentDictionary<string, RequestTracker> _monitoredRequests = new(StringComparer.Ordinal);
@@ -236,7 +241,54 @@ public sealed class GenerationService : IDisposable
         PlacementSpread: _placement is null ? null : NumaSpreadNames.Of(_placement.Applied),
         PlacementSpreadRequested: _placement is null ? null : NumaSpreadNames.Of(_placement.Requested),
         PlacementNodeAllocations: _computeGrant is { NodeAllocations.Count: > 0 } seatedGrant ? seatedGrant.NodeAllocationText() : null,
-        PlacementAdvisory: _placement?.Advisory);
+        PlacementAdvisory: _placement?.Advisory,
+        UpdateCandidate: _updateCandidate);
+
+    // The report-only candidate a pinned model pack has against hub HEAD, resolved once at open: load the pack's pin
+    // for this model, consult HEAD and its tree through the seam, and report the candidate summary only when HEAD
+    // separates from the pin. A model with no manifest entry to report against, a candidate-free check, or a check the
+    // hub could not answer (offline, gated, unreachable) all report nothing — and a failed check never blocks the
+    // open, re-pins, downloads, or rewrites the manifest. This is monitor reporting only; the load path already ran.
+    private static string? ResolveUpdateCandidate(ModelConfig model, IModelHubTransport transport, ILogger? logger)
+    {
+        try
+        {
+            string packDirectory = PackDirectoryOf(model);
+            ModelManifest? manifest = ModelManifestStore.Load(packDirectory);
+            ModelManifestEntry? entry = manifest?.Models.FirstOrDefault(candidate => string.Equals(candidate.Model, model.Name, StringComparison.Ordinal));
+            if (entry is null)
+            {
+                return null; // no pinned entry to report a candidate against.
+            }
+
+            ModelUpdateCandidate candidate = new ModelUpdateChecker(transport).CheckAsync(entry, CancellationToken.None).GetAwaiter().GetResult();
+            return candidate.HasCandidate ? candidate.Summary : null;
+        }
+        catch (Exception ex) when (ex is HttpRequestException or IOException or UnauthorizedAccessException or ModelFetchException or ConfigException)
+        {
+            logger?.LogWarning(
+                "update_candidate model='{Model}' check skipped: {Reason}",
+                model.Name,
+                ex.Message);
+            return null;
+        }
+    }
+
+    // Mirrors the resolver's pack layout: the pack directory is the directory beside the model's declared file, which
+    // is where its manifest pin — and so its candidate report — lives.
+    private static string PackDirectoryOf(ModelConfig model)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(model.Path);
+
+        string full = Path.GetFullPath(model.Path);
+        string? directory = Path.GetDirectoryName(full);
+        if (string.IsNullOrWhiteSpace(directory))
+        {
+            throw new ModelFetchException($"Model '{model.Name}' path '{model.Path}' names no pack directory to read its manifest from.");
+        }
+
+        return directory;
+    }
 
     // Which seated compute grants ride logical processors another grant already holds — the models an operator needs to see together when a
     // share was clamped or opted into overlap. Nothing shared reports null, so snapshots of a host where every grant is its own read exactly as they did before this fact existed.
@@ -1060,6 +1112,7 @@ public sealed class GenerationService : IDisposable
         TransformerModel? model = null;
         BlockPool? pool = null;
         GenerationScheduler? scheduler = null;
+        string? updateCandidate = null;
         try
         {
             // A model that declares a published source is verified against its pack manifest before any byte of the
@@ -1070,6 +1123,11 @@ public sealed class GenerationService : IDisposable
             if (transport is not null && modelConfig.Source is not null)
             {
                 new ModelArtifactResolver(transport).ResolveAsync(modelConfig, CancellationToken.None).GetAwaiter().GetResult();
+
+                // Report-only candidate reporting rides the same seam the load gate used: a model with a published
+                // source gets one HEAD/tree consult against its pinned pack. A candidate-free or failed check omits
+                // the monitor fact — a report never blocks the open, re-pins, or touches the load path.
+                updateCandidate = ResolveUpdateCandidate(modelConfig, transport, logger);
             }
 
             file = GgufFile.Open(modelConfig.Path);
@@ -1333,6 +1391,7 @@ public sealed class GenerationService : IDisposable
             service._compute = compute; // the core accounting this model's grant seated against, shared with any engine opened beside it
             service._computeGrant = computeGrant; // requested against granted, reported on monitor facts beside the live worker count
             service._placement = placement; // the node this engine seated on, reported on monitor facts beside its grant
+            service._updateCandidate = updateCandidate; // the report-only candidate this pinned pack has against hub HEAD, reported additively on the monitor
             file = null;
             model = null;
             pool = null;
