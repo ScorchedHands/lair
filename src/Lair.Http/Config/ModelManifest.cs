@@ -28,8 +28,11 @@ public sealed record ModelManifestEntry
     /// <summary>The commit sha the declared revision resolved to at fetch — the pin load gates on, whether the config named a branch or a sha.</summary>
     [property: JsonPropertyName("resolved_revision")] public required string ResolvedRevision { get; init; }
 
-    /// <summary>The files this model's bytes are carried by, in fetch order.</summary>
+    /// <summary>The files this model's bytes are carried by, in fetch order — for a shard set this is the whole declared set, fetched together at one revision.</summary>
     [property: JsonPropertyName("files")] public required IReadOnlyList<ModelManifestFile> Files { get; init; }
+
+    /// <summary>True when this entry's bytes are carried by a declared shard set rather than a single file; the fetch path records a shard set only as a complete set.</summary>
+    [property: JsonPropertyName("sharded")] public bool Sharded { get; init; }
 }
 
 /// <summary>One fetched file in the pack: its path/name beside the repo, the sha256 LAIR computed over its bytes, its size, and when it landed.</summary>
@@ -46,6 +49,9 @@ public sealed record ModelManifestFile
 
     /// <summary>When this file landed in the pack, recorded as an instant.</summary>
     [property: JsonPropertyName("fetched_at")] public required DateTimeOffset FetchedAt { get; init; }
+
+    /// <summary>The GGUF <c>split.tensors.count</c> this shard reports when the fetched file carries it; null (absent) when the file is not a sharded GGUF or the key is missing — never invented.</summary>
+    [property: JsonPropertyName("split_tensors_count")] public long? SplitTensorsCount { get; init; }
 }
 
 /// <summary>
