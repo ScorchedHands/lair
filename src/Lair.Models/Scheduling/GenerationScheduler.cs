@@ -216,6 +216,13 @@ public sealed class GenerationScheduler : IDisposable
     /// <summary>The widest sub-batch rows that chunk ran under this engine's resolved prefill row count, reported apart from the chunk's own token count because the two bound different things — width bounds step time, rows are what the engine splits it into and caps itself at. Internal diagnostics only.</summary>
     internal int LastPrefillSubBatchRows => _lastPrefillSubBatchRows;
 
+    /// <summary>The row width every prompt window this scheduler hands its engine is capped at: the resolved count when nothing declared bounds it, narrowed to what a prefill-buffer ceiling allows when one binds. Internal selection diagnostics read apart from <see cref="LastPrefillChosenTokens"/> and <see cref="LastPrefillSubBatchRows"/> because they describe what caps rows across boundaries rather than what one boundary chose or ran.</summary>
+    internal int EffectivePrefillRowWidth => _model.EffectivePrefillRowWidth;
+
+    /// <summary>What this scheduler's engine resolved its row window against a declared prefill-buffer ceiling — the binding tier and cap, one sub-batch row's activation cost, requested beside allowed width, or null when no ceiling binds. Internal diagnostics: they report why rows narrowed and never move a token.</summary>
+    internal PrefillRowWidthClamp? ResolvedPrefillRowClamp => _model.PrefillRowClamp;
+
+
     /// <summary>Wall-clock microseconds measured for the most recent prefill chunk's forward work, zero until a chunk has been timed. Internal diagnostics: this is the feedback a configured budget sizes future chunks from.</summary>
     internal long LastPrefillStepMicros => Volatile.Read(ref _lastPrefillStepMicros);
 
@@ -320,6 +327,21 @@ public sealed class GenerationScheduler : IDisposable
                 {
                     _progress.ReleaseSlot();
                     throw new BudgetExhaustedException(_modelName ?? "engine", BudgetResource.Kv, observation.ExhaustedAtTier!.Value, observation.Breakdown);
+                }
+            }
+
+            // The same observation reports this admission's prompt-window working set against the model's resolved prefill-buffer chain: the
+            // engine already narrowed its row window to what its own declared ceilings allow, and the standing seat for that narrowed working
+            // set was registered when the model opened. A landing rides inside that seat — nothing admitted is displaced and no live block moves —
+            // while a chain whose every host-backed position other claims now fill refuses this submission naming the exhausted chain, exactly
+            // as the KV landing above does. A model declaring no prefill-buffer chain never consults one.
+            if (_ledger is not null && _model.Plan.Budgets.For(BudgetResource.PrefillBuffers) is { } prefillChain)
+            {
+                ClaimOutcome prefillObservation = _ledger.ObserveAdmission(_modelName ?? "engine", prefillChain, _model.PrefillWorkingSetMegabytes);
+                if (!prefillObservation.Seated)
+                {
+                    _progress.ReleaseSlot();
+                    throw new BudgetExhaustedException(_modelName ?? "engine", BudgetResource.PrefillBuffers, prefillObservation.ExhaustedAtTier!.Value, prefillObservation.Breakdown);
                 }
             }
 
@@ -825,9 +847,10 @@ public sealed class GenerationScheduler : IDisposable
     // What a completed chunk leaves behind, shared by both postures: the boundary's chosen width and sub-batch rows land in the counters before anything else moves, cost feeds back from this chunk's own forward duration, cache publication runs for every full prompt block, and — when no chunks remain — sampling starts decoding exactly as it always did. The logits read here are the prefill route's: an alias of the model-owned buffer under a shared posture, lane-owned storage that no decode-side window touched while the chunk ran beside this step's decode windows under a dedicated one.
     private void AdvanceAfterPrefillChunk(RequestPipeline pipeline, int chunk, long forwardMicros)
     {
-        // The engine's own resolved row count splits this step into sub-batches underneath it. Reported apart from the step's token width —
-        // which a budget bounds by time, while rows are what the forward caps itself at — so neither number stands in for the other here.
-        int subBatchRows = Math.Min(chunk, _model.ResolvedPrefillRowWidth);
+        // The engine's own row window splits this step into sub-batches underneath it — its resolved count, narrowed by a declared prefill-buffer
+        // ceiling when one binds. Reported apart from the step's token width — which a budget bounds by time and a buffer cap bounds by rows,
+        // while these are what the forward actually ran under — so neither number stands in for the other here.
+        int subBatchRows = Math.Min(chunk, _model.EffectivePrefillRowWidth);
 
         // Recorded before the counters move, so an observer that sees a chunk counted also sees what that boundary chose and measured.
         _lastPrefillChosenTokens = chunk;
@@ -839,6 +862,11 @@ public sealed class GenerationScheduler : IDisposable
         Stats.PrefillTokensForwarded += chunk;
         Stats.PrefillStepMicrosTotal += forwardMicros;
         Stats.PrefillSubBatchSum += (chunk + subBatchRows - 1) / subBatchRows;
+        if (_model.PrefillRowClamp is not null)
+        {
+            // A ceiling-bound window counts its chunks apart from the total so a clamp's effect on step count reads beside what it did to rows.
+            Stats.ClampedPrefillChunksIssued++;
+        }
         if (subBatchRows > Stats.PeakPrefillSubBatchRows)
         {
             Stats.PeakPrefillSubBatchRows = subBatchRows;

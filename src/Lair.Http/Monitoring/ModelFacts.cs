@@ -49,5 +49,17 @@ public sealed record ModelFacts(
     /// <summary>Total bytes of mutable activation storage the dedicated lane family holds at open — zero for a shared posture.</summary>
     long PrefillActivationBytes = 0,
 
+    /// <summary>The row width the opened engine resolved for its prompt windows, before any declared prefill-buffer ceiling.</summary>
+    int PrefillRowWidth = 0,
+
+    /// <summary>The row width the opened engine actually runs its prompt windows at: the resolved width when nothing declared bounds it, narrowed to what a prefill-buffer ceiling allows otherwise.</summary>
+    int EffectivePrefillRowWidth = 0,
+
+    /// <summary>Total mutable activation bytes the opened engine holds for its prompt windows' working set — the lane family where one opened, the effective row window's cost beside its fixed tail where the posture shares one backend.</summary>
+    long PrefillWorkingSetBytes = 0,
+
+    /// <summary>What narrowed the engine's row window, stated by the ceiling that binds it: tier and cap, one sub-batch row's activation bytes, and requested against allowed width — null when no declared ceiling bound the window.</summary>
+    string? PrefillRowClamp = null,
+
     /// <summary>What the host device ledger has seated claims against, one entry per tier position, or null when the ledger has seated none.</summary>
     IReadOnlyList<LedgerOccupancyEntry>? LedgerOccupancy = null);

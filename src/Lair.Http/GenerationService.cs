@@ -206,6 +206,10 @@ public sealed class GenerationService : IDisposable
         PrefillDecodeCoreSet: FormatCoreRanges(_prefillsLane?.DecodeCoreIds),
         PrefillLaneCoreSet: FormatCoreRanges(_prefillsLane?.PrefillCoreIds),
         PrefillActivationBytes: _model.PrefillLaneActivationBytes,
+        PrefillRowWidth: _model.ResolvedPrefillRowWidth,
+        EffectivePrefillRowWidth: _model.EffectivePrefillRowWidth,
+        PrefillWorkingSetBytes: _model.PrefillWorkingSetBytes,
+        PrefillRowClamp: _model.PrefillRowClamp?.Describe(),
         LedgerOccupancy: BuildLedgerOccupancy(_ledger));
 
     // The resolved route as the monitor and the model listing report it: segments in execution order, each with its
@@ -557,7 +561,7 @@ public sealed class GenerationService : IDisposable
 
                     case "models[0].budgets.prefill_buffers.caps.dram_mb" or "models[0].budgets.prefill_buffers.caps.vram_mb":
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Refused,
-                            $"{change.Field} refused for model '{effective.Models[0].Name}' (new-requests): a ceiling on prefill working buffers classifies for later requests only, and no request-path consumer clamps to it in this build — the physical clamp is where this value lands. Nothing in force changed."));
+                            $"{change.Field} refused for model '{effective.Models[0].Name}' (new-requests): a ceiling on prefill working buffers classifies for later requests only — the physical clamp is where this value lands, when the engine opens its row window, and a live edit cannot re-size the window or activation buffers already established. Nothing in force changed."));
                         break;
 
                     default:
@@ -902,28 +906,34 @@ public sealed class GenerationService : IDisposable
                     logicalWeightBytes);
             }
 
-            // The prefill claim records the activation posture the opened engine families actually hold — the dedicated
-            // lane family's bytes where a lane opened, the shared posture's zero where one backend serves both paths —
-            // beside the row width the plan resolved. It states what the engine sized; it clamps no row width: the
-            // physical clamp is where a declared prefill ceiling lands, and that consumer is not part of this build.
+            // The prefill claim records the activation posture the opened engine actually holds for its prompt windows — the dedicated lane
+            // family's bytes where a lane opened, the effective row window's per-row cost beside its fixed tail where one backend serves both
+            // paths — beside the row width the plan resolved and the width the engine runs under a declared ceiling. The engine's physical clamp
+            // already narrowed that window to what the chain's own ceilings allow; the claim states what the narrowed posture holds, and a chain
+            // whose every position is held — including one too small for even a single row's bytes — reports its exhaustion here as a load failure.
             if (budgets.For(BudgetResource.PrefillBuffers) is { } prefillChain)
             {
-                long activationBytes = model.PrefillLaneActivationBytes;
-                ClaimOutcome prefillClaim = ledger.RegisterClaim(modelConfig.Name, prefillChain, WeightClaimMegabytes(activationBytes));
+                long activationBytes = model.PrefillWorkingSetBytes;
+                ClaimOutcome prefillClaim = ledger.RegisterClaim(modelConfig.Name, prefillChain, model.PrefillWorkingSetMegabytes);
                 if (!prefillClaim.Seated)
                 {
                     throw new BudgetExhaustedException(modelConfig.Name, BudgetResource.PrefillBuffers, prefillClaim.ExhaustedAtTier!.Value, prefillClaim.Breakdown);
                 }
 
+                string clampDetail = model.PrefillRowClamp is { } clamp
+                    ? $" clamp_tier='{BudgetTierNames.Of(clamp.Tier)}' clamp_cap_mb={clamp.CapMegabytes} row_bytes={clamp.RowActivationBytes} clamp={clamp.AllowsPositiveWidth}"
+                    : string.Empty;
                 logger?.LogInformation(
-                    "ledger_claim model='{Model}' resource='prefill_buffers' tier='{Tier}' amount_mb={AmountMb} chain_position={ChainPosition} demoted={Demoted} row_width={RowWidth} activation_bytes={ActivationBytes}",
+                    "ledger_claim model='{Model}' resource='prefill_buffers' tier='{Tier}' amount_mb={AmountMb} chain_position={ChainPosition} demoted={Demoted} row_width={RowWidth} effective_row_width={EffectiveRowWidth} activation_bytes={ActivationBytes}{ClampDetail}",
                     modelConfig.Name,
                     BudgetTierNames.Of(prefillClaim.Claim!.Tier),
                     prefillClaim.Claim.Amount,
                     prefillClaim.Claim.ChainPosition,
                     prefillClaim.Claim.Demoted,
                     model.ResolvedPrefillRowWidth,
-                    activationBytes);
+                    model.EffectivePrefillRowWidth,
+                    activationBytes,
+                    clampDetail);
             }
 
             pool = new BlockPool(

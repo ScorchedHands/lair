@@ -562,6 +562,10 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 PrefillDecodeCoreSet: facts?.PrefillDecodeCoreSet,
                 PrefillLaneCoreSet: facts?.PrefillLaneCoreSet,
                 PrefillActivationBytes: facts?.PrefillActivationBytes ?? 0,
+                PrefillRowWidth: facts?.PrefillRowWidth ?? 0,
+                EffectivePrefillRowWidth: facts?.EffectivePrefillRowWidth ?? 0,
+                PrefillWorkingSetBytes: facts?.PrefillWorkingSetBytes ?? 0,
+                PrefillRowClamp: facts?.PrefillRowClamp,
 
                 AdmissionRefusalsTotal: Volatile.Read(ref _admissionRefusalTotal),
                 AdmissionRefusals: RecentAdmissionRefusals(), // already holding the fan-out lock here; Monitor re-entry is safe on this thread

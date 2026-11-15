@@ -249,7 +249,9 @@ public sealed record ModelPlan
     /// A resolved value must land in <c>1..MaxPrefillRowWidth</c>, the ceiling the engine sizes its batched streams for;
     /// anything outside fails at engine open naming the value rather than silently sizing other buffers or forwarding a
     /// different row count. Sub-batch boundaries move nothing: every width carries the same positions, KV bytes, and
-    /// logits as any other over the same tokens.
+    /// logits as any other over the same tokens. A declared prefill-buffer ceiling in <see cref="Budgets"/> can narrow
+    /// what runs below this resolved count — the engine reports requested and effective widths apart rather than rewriting
+    /// this value.
     /// </summary>
     public int PrefillRowWidth { get; init; } = Engine.TransformerModel.DefaultPrefillRowWidth;
 
@@ -268,8 +270,10 @@ public sealed record ModelPlan
     /// The resolved per-resource budget sets this model carries: every resource its configuration declared, each with its own chain of
     /// tiers landed against the pools the host opened. A plan resolved from a file alone carries the empty set — today's behavior, where
     /// only KV block counts bound anything — and a host resolves what its own placement declares onto this value when the engine opens
-    /// rather than carrying budget claims beside the plan. Nothing on the forward path reads it yet: it is the resolved seam later
-    /// capacity accounting consumes unchanged, exactly as <see cref="Route"/> is the seam step composition consumes.
+    /// rather than carrying budget claims beside the plan. The forward path consults it for one thing: a declared prefill-buffer ceiling
+    /// narrows <see cref="PrefillRowWidth"/> to the widest sub-batch those ceilings allow (the engine reports requested and effective widths
+    /// apart), exactly as <see cref="Route"/> is the seam step composition consumes. It claims no capacity and relocates nothing itself —
+    /// ledger accounting decides what seats beside other models' claims.
     /// </summary>
     public ResolvedBudgetSet Budgets { get; init; } = ResolvedBudgetSet.Empty;
 

@@ -93,7 +93,7 @@ public sealed class ModelBudgetApplyTests : IDisposable
     }
 
     [Fact]
-    public void ApplyConfiguration_PrefillBufferCeiling_ClassifiesNewRequests_RefusedUntilTheClampLands()
+    public void ApplyConfiguration_PrefillBufferCeiling_ClassifiesNewRequests_RefusedBecauseOpenedWindowsStayEstablished()
     {
         string path = SyntheticModel();
 
@@ -111,7 +111,7 @@ public sealed class ModelBudgetApplyTests : IDisposable
         Assert.Equal("models[0].budgets.prefill_buffers.caps.dram_mb", refused.Change.Field);
         Assert.Equal(ConfigMutationClass.NewRequestsOnly, refused.Change.MutationClass); // a class is what the field belongs to, not an enforcement promise.
         Assert.Equal(ConfigApplyOutcome.Refused, refused.Outcome);
-        Assert.Contains("the physical clamp is where this value lands", refused.Detail);
+        Assert.Contains("the physical clamp is where this value lands", refused.Detail); // the ceiling binds when the engine opens its row window; a live edit re-resolves neither it nor opened buffers
 
         Assert.Equal(64L, ChainOf(engine.EffectiveConfiguration.Models[0].Budgets!, BudgetResource.PrefillBuffers).Caps[BudgetTier.Dram]); // nothing in force changed.
     }

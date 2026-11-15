@@ -207,6 +207,14 @@ public sealed class TransformerModel : IDisposable
     // its own single-token forward; a wider prefill window widens these allocations and nothing else.
     private readonly int _rowCapacity;
 
+    // The row window a resolved prefill-buffer ceiling leaves this engine running: the clamp itself (null when nothing declared bounds it),
+    // the width every prompt route splits at after it, the lane family's own capacity beside it, and one sub-batch row's activation cost —
+    // what the clamp measures rows against. Resolved once at open like every other forward-shape value; no arithmetic in any forward reads them.
+    private readonly PrefillRowWidthClamp? _prefillClamp;
+    private readonly int _effectivePrefillRowWidth;
+    private readonly int _laneRowCapacity;
+    private readonly long _prefillRowActivationBytes;
+
     private readonly float[] _batchCur;     // _rowCapacity * hidden
     private readonly float[] _batchNormed;  // _rowCapacity * hidden
     private readonly float[] _batchQ;       // _rowCapacity * headCount * headDim
@@ -273,6 +281,24 @@ public sealed class TransformerModel : IDisposable
 
     /// <summary>The row count this engine's prompt windows forward in, held on the plan and read fresh at every prefill window boundary.</summary>
     public int ResolvedPrefillRowWidth => Plan.PrefillRowWidth;
+
+    /// <summary>
+    /// The widest sub-batch this engine's prompt windows actually run: the resolved row count when no declared prefill-buffer ceiling binds,
+    /// and the narrowest width the chain's own ceilings allow otherwise. A shared-posture engine keeps its batched streams sized for the
+    /// resolved width whatever this narrows — the clamp bounds what a window runs, never reallocates shared storage; a dedicated lane sizes its
+    /// own family beside this value.
+    /// </summary>
+    public int EffectivePrefillRowWidth => _effectivePrefillRowWidth;
+
+    /// <summary>
+    /// The clamp the resolved prefill-buffer chain applied to this engine's row window at open — null when no declared ceiling bound the
+    /// resolved width, which is every model carrying no prefill-buffer budgets today. Public diagnostics: hosts and tests read what a clamp
+    /// decided beside what the window runs.
+    /// </summary>
+    public PrefillRowWidthClamp? PrefillRowClamp => _prefillClamp;
+
+    /// <summary>Total mutable activation bytes one prompt-window sub-batch row carries on this engine's prompt route — what a declared prefill-buffer ceiling measures rows against.</summary>
+    public long PrefillRowActivationBytes => _prefillRowActivationBytes;
 
     /// <summary>
     /// Re-points the engine's prefill path selection. The new value is read fresh at the next prefill window
@@ -432,7 +458,8 @@ public sealed class TransformerModel : IDisposable
     /// and the activation buffers sized from it land at open; every decode-side forward stays on <paramref name="backend"/>. The two
     /// must arrive together and report the same device this engine runs on: a half-declared lane posture is refused naming what is missing.
     /// A host that resolved per-resource budgets against its own opened pools supplies them through <paramref name="budgets"/>, and they land
-    /// on the plan unchanged beside the route — this engine neither re-derives ceilings nor claims capacity from them. Omitting it keeps the
+    /// on the plan unchanged beside the route — a declared prefill-buffer ceiling narrows this engine's row window to what it allows (requested
+    /// width stays stated on the plan, effective width reported apart), while no capacity claim or relocation runs here. Omitting it keeps the
     /// empty set, which is what every model carrying no budget declarations runs on today.
     /// </summary>
     public static TransformerModel Open(
@@ -714,6 +741,23 @@ public sealed class TransformerModel : IDisposable
         // decode batch may advance, and above that only when the plan resolves wider prompt windows. Allocation is the
         // one thing width moves; no arithmetic in any forward reads it as an operand.
         _rowCapacity = Math.Max(MaxBatchSequences, Plan.PrefillRowWidth);
+
+        // A resolved prefill-buffer ceiling clamps the row window this engine runs: the widest sub-batch whose per-row activation cost fits
+        // what this model's own declared ceilings allow. No chain, or a chain whose every capped position already fits the resolved width,
+        // clamps nothing — today's shape exactly. A binding that allows no positive row still narrows to the engine's minimum one-row window
+        // and reports itself unfit: what capacity accounting then seats names why, rather than a window running over its ceiling quietly.
+        _prefillRowActivationBytes = PrefillRouteRowActivationBytes(Plan);
+        _prefillClamp = Plan.Budgets.For(BudgetResource.PrefillBuffers) is { } prefillChain
+            ? PrefillBufferClamp.Compute(prefillChain, _prefillRowActivationBytes, Plan.PrefillRowWidth)
+            : null;
+        _effectivePrefillRowWidth = _prefillClamp is null ? Plan.PrefillRowWidth : Math.Max(1, _prefillClamp.AllowedRowWidth);
+
+        // A clamped dedicated lane sizes its own family beside its own ceiling rather than holding storage wider than anything may run on
+        // it; an unclamped posture sizes at this engine's row capacity exactly as before any clamp existed. Shared-posture streams stay the
+        // shared batched arrays sized for the resolved width — a clamp bounds what a window runs there, it never reallocates shared storage.
+        _laneRowCapacity = _prefillsLane is null
+            ? 0
+            : _prefillClamp is null ? _rowCapacity : Math.Min(_rowCapacity, Math.Max(1, _prefillClamp.AllowedRowWidth));
 
         // Only now does the weight view get created: a refused kernel selection or row count never spends one, which is
         // what keeps a failed open from holding the file's mmap alive behind its own refusal.
@@ -1063,27 +1107,29 @@ public sealed class TransformerModel : IDisposable
 
         if (_prefillsLane is not null)
         {
-            // A dedicated lane's own mutable storage: the same shapes as the default family at this engine's window ceiling, allocated once and never grown — an overlapped prompt window writes here while decode-side forwards read the arrays above.
+            // A dedicated lane's own mutable storage: the same shapes as the default family at the window width this engine runs — the resolved
+            // capacity unclamped, a clamped lane sized to its ceiling instead — allocated once and never grown. An overlapped prompt window
+            // writes here while decode-side forwards read the arrays above.
             _laneAct = new ActivationFamily
             {
-                BatchCur = new float[_rowCapacity * hidden],
-                BatchNormed = new float[_rowCapacity * hidden],
-                BatchQ = new float[_rowCapacity * Plan.HeadCount * Plan.HeadDim],
-                BatchK = new float[_rowCapacity * Plan.KvHeadCount * Plan.HeadDim],
-                BatchV = new float[_rowCapacity * Plan.KvHeadCount * Plan.HeadDim],
-                BatchAttnOut = new float[_rowCapacity * Plan.HeadCount * Plan.HeadDim],
-                BatchProj = new float[_rowCapacity * hidden],
-                BatchGateUp = new float[_rowCapacity * Plan.IntermediateSize],
-                BatchUp = new float[_rowCapacity * Plan.IntermediateSize],
-                TiledRowMax = new float[_rowCapacity * Plan.HeadCount],
-                TiledRowSumExp = new float[_rowCapacity * Plan.HeadCount],
+                BatchCur = new float[_laneRowCapacity * hidden],
+                BatchNormed = new float[_laneRowCapacity * hidden],
+                BatchQ = new float[_laneRowCapacity * Plan.HeadCount * Plan.HeadDim],
+                BatchK = new float[_laneRowCapacity * Plan.KvHeadCount * Plan.HeadDim],
+                BatchV = new float[_laneRowCapacity * Plan.KvHeadCount * Plan.HeadDim],
+                BatchAttnOut = new float[_laneRowCapacity * Plan.HeadCount * Plan.HeadDim],
+                BatchProj = new float[_laneRowCapacity * hidden],
+                BatchGateUp = new float[_laneRowCapacity * Plan.IntermediateSize],
+                BatchUp = new float[_laneRowCapacity * Plan.IntermediateSize],
+                TiledRowMax = new float[_laneRowCapacity * Plan.HeadCount],
+                TiledRowSumExp = new float[_laneRowCapacity * Plan.HeadCount],
                 MoeScores = _moeLogits.Length > 0 ? new float[_moeLogits.Length] : [],
                 MoeIds = _moeIds.Length > 0 ? new int[_moeIds.Length] : [],
                 MoeWeights = _moeWeights.Length > 0 ? new float[_moeWeights.Length] : [],
-                BatchMoeIds = new int[_rowCapacity * (_sparseFfn?.RoutedExpertsPerToken ?? 0)],
-                BatchMoeWeights = new float[_rowCapacity * (_sparseFfn?.RoutedExpertsPerToken ?? 0)],
-                ExpertMembers = new int[_rowCapacity],
-                SubsetIn = new float[_rowCapacity * hidden],
+                BatchMoeIds = new int[_laneRowCapacity * (_sparseFfn?.RoutedExpertsPerToken ?? 0)],
+                BatchMoeWeights = new float[_laneRowCapacity * (_sparseFfn?.RoutedExpertsPerToken ?? 0)],
+                ExpertMembers = new int[_laneRowCapacity],
+                SubsetIn = new float[_laneRowCapacity * hidden],
                 FinalNormed = new float[hidden],
                 FinalLogits = new float[Plan.VocabSize],
             };
@@ -1186,8 +1232,8 @@ public sealed class TransformerModel : IDisposable
     }
 
     /// <summary>
-    /// Forwards a window of prompt positions in sub-batches of up to the plan's resolved <see cref="ModelPlan.PrefillRowWidth"/>
-    /// rows and returns the final row's logits. Each row seeds its own residual stream from its token's embedding row and
+    /// Forwards a window of prompt positions in sub-batches of up to this engine's effective row width — the plan's resolved
+    /// <see cref="ModelPlan.PrefillRowWidth"/> narrowed by a declared prefill-buffer ceiling when one binds — and returns the final row's logits. Each row seeds its own residual stream from its token's embedding row and
     /// keeps its own norms, RoPE at its own absolute position, and its own causal attention, while every dense
     /// weight matrix (attention q/k/v/o, feed-forward gate/up/down) is traversed once per sub-batch through
     /// <see cref="IBackend.GemvBatch"/> instead of once per token — a window whose rows fill one sub-batch pays one traversal per
@@ -1226,10 +1272,10 @@ public sealed class TransformerModel : IDisposable
                 $"{n} prefill tokens starting at position {basePosition} exceed this model's max context of {MaxContextTokens} tokens.");
         }
 
-        // The plan's resolved row count splits the window: every width carries the same positions, KV bytes, and logits,
-        // so this is a throughput knob for batched weight traversals and nothing else. Read fresh per call like every
-        // other forward-shape value.
-        int prefillRows = Plan.PrefillRowWidth;
+        // The row window this engine runs splits at: the plan's resolved count when no declared prefill-buffer ceiling binds, or the widest
+        // sub-batch those ceilings allow otherwise. Every width carries the same positions, KV bytes, and logits — a clamp narrows batched weight
+        // traversals and nothing else. Read fresh per call like every other forward-shape value.
+        int prefillRows = _effectivePrefillRowWidth;
 
         for (int offset = 0; offset < n; offset += prefillRows)
         {
@@ -1696,8 +1742,46 @@ public sealed class TransformerModel : IDisposable
     /// <summary>The resolved dedicated prefill-lane layout this engine opened with — null for every shared-posture model. Internal diagnostics for hosts and tests.</summary>
     internal PrefillLaneLayout? DedicatedPrefillLane => _prefillsLane;
 
-    /// <summary>Total bytes of mutable activation storage the dedicated lane family holds at open — weights, norms, rotation tables, and KV live outside it, and a shared-posture model sizes none of it. Public diagnostics for hosts that report lane state.</summary>
+    /// <summary>Total bytes of mutable activation storage the dedicated lane family holds at open — weights, norms, rotation tables, and KV live outside it, a shared-posture model sizes none of it, and a resolved prefill-buffer ceiling narrows what this engine allocates for the lane beside its own window. Public diagnostics for hosts that report lane state.</summary>
     public long PrefillLaneActivationBytes => _prefillsLane is null ? 0 : _laneAct.ActivationBytes;
+
+    /// <summary>
+    /// The activation bytes this engine's prompt route holds for the working set a declared prefill-buffer ceiling bounds: what the dedicated
+    /// lane family carries when one opened, and the effective row window's per-row cost beside its fixed tail buffers when the posture shares
+    /// one backend. What capacity accounting claims against a chain in this resource's unit; zero is never reported for an engine that runs
+    /// prompt windows at all.
+    /// </summary>
+    public long PrefillWorkingSetBytes => _prefillsLane is null
+        ? (long)_effectivePrefillRowWidth * _prefillRowActivationBytes + sizeof(float) * (Plan.HiddenSize + Plan.VocabSize)
+        : _laneAct.ActivationBytes;
+
+    /// <summary>The working set stated in the megabyte unit prefill-buffer claims and ceilings count in, rounded up so a claim never under-reports what it holds against a ceiling.</summary>
+    public long PrefillWorkingSetMegabytes => (PrefillWorkingSetBytes + PrefillBufferClamp.Megabytes - 1) / PrefillBufferClamp.Megabytes;
+
+    /// <summary>
+    /// The mutable activation bytes one prompt-window sub-batch row costs on this engine's route: the per-row streams every batched forward
+    /// family carries — residual, norm, projection, and expert-group carrier; query/key/value/head regions for both attention shapes; gate/up
+    /// halves; online-softmax state; and routing scratch beside a sparse block — counted per row rather than across any sized allocation. A
+    /// declared prefill-buffer ceiling measures rows against this figure; the window's single fixed tail pair rides beside it whatever width splits.
+    /// </summary>
+    private static long PrefillRouteRowActivationBytes(ModelPlan plan)
+    {
+        int routed = plan.SparseFfn?.RoutedExpertsPerToken ?? 0;
+
+        // Each row-scaled stream of every batched family, in element counts per sub-batch row: four hidden-sized carriers (residual, normed,
+        // projection, packed expert group), the q/attn-out pair over head regions, the k/v pair over kv-head regions, gate/up halves, and the
+        // tiled walk's per-row online-softmax state. Routing rides one selection per row for sparse blocks — its scratch arrays as a batched step carries them.
+        long floats = 4L * plan.HiddenSize
+            + 2L * plan.HeadCount * plan.HeadDim
+            + 2L * plan.KvHeadCount * plan.HeadDim
+            + 2L * plan.IntermediateSize
+            + 2L * plan.HeadCount
+            + routed;
+
+        long ints = (long)routed + 1; // one member-row selector and its expert ids per row, whatever the block routes
+
+        return floats * sizeof(float) + ints * sizeof(int);
+    }
 
     /// <summary>
     /// Advances up to <see cref="MaxBatchSequences"/> sequences by one token each in a single step: every dense

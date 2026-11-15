@@ -129,6 +129,18 @@ public sealed record MetricsSnapshot(
     /// <summary>Total bytes of mutable activation storage the dedicated lane family holds at open — zero for a shared posture.</summary>
     [property: JsonPropertyName("metrics_prefill_activation_bytes")] long PrefillActivationBytes = 0,
 
+    /// <summary>The row width the opened engine resolved for its prompt windows, before any declared prefill-buffer ceiling — reported beside the lane's activation bytes so a step-time fact and a buffer-bound fact read together.</summary>
+    [property: JsonPropertyName("metrics_prefill_row_width")] int PrefillRowWidth = 0,
+
+    /// <summary>The row width the opened engine actually runs its prompt windows at: the resolved width when nothing declared bounds it, narrowed to what a prefill-buffer ceiling allows otherwise.</summary>
+    [property: JsonPropertyName("metrics_effective_prefill_row_width")] int EffectivePrefillRowWidth = 0,
+
+    /// <summary>Total mutable activation bytes the opened engine holds for its prompt windows' working set — what a prefill-buffer claim states against its chain.</summary>
+    [property: JsonPropertyName("metrics_prefill_working_set_bytes")] long PrefillWorkingSetBytes = 0,
+
+    /// <summary>What narrowed the engine's row window, in the binding ceiling's own words — tier and cap, one sub-batch row's activation bytes, requested against allowed width; null when no declared ceiling bound the window.</summary>
+    [property: JsonPropertyName("metrics_prefill_row_clamp")] string? PrefillRowClamp = null,
+
     /// <summary>Submissions the admission control plane refused since this bus opened, whatever their caller answered with.</summary>
     [property: JsonPropertyName("metrics_admission_refusals_total")] long AdmissionRefusalsTotal = 0,
 
