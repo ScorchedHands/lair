@@ -1,3 +1,5 @@
+using Lair.Models;
+
 namespace Lair.Host.Config;
 
 /// <summary>
@@ -72,6 +74,18 @@ public sealed record ModelConfig
     public int MaxContextTokens { get; init; } = 4096;
 
     public int KvBlocks { get; init; } = 256;
+
+    /// <summary>
+    /// The per-resource budgets this model entry declares — weights, KV blocks, and prefill buffers each with their own ordered
+    /// tier chain and ceilings — or null when the entry says nothing about any of them. These are declared values exactly as the
+    /// loader parsed them; what a host can actually carry is resolved against its opened pools at engine open, not here. Internal:
+    /// no monitor or API surface reports budget claims yet, while hosts resolve these chains onto the model's plan and reload
+    /// classification routes each ceiling by its own mutation class.
+    /// </summary>
+    internal IReadOnlyList<BudgetChain>? Budgets { get; init; }
+
+    /// <summary>True when this entry wrote <c>kv_blocks</c> explicitly — presence is what separates a spelled-out number from today's default where the legacy ceiling and budgets' system-memory ceiling must state the same thing.</summary>
+    internal bool LegacyKvBlocksDeclared { get; init; }
 
     /// <summary>
     /// Tool-precedence override. When true, chat requests with declared tools always receive LAIR's fenced tool

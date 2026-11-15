@@ -480,6 +480,34 @@ public sealed class GenerationService : IDisposable
                             $"prefill route selection {change.OldValue} -> {change.NewValue}: the engine re-reads it at every prefill window boundary; sequences already mid-window finish that window on the route they started with"));
                         break;
 
+                    // A budgeted system-memory KV ceiling is the same live cap 'kv_blocks' has always been: it routes through this engine's one
+                    // enforcement seam rather than adding a second, and what reaches the scheduler is the canonical block count every other KV edit uses.
+                    case "models[0].budgets.kv.caps.dram_blocks":
+                        if (!CarriesSystemMemoryKvTier(effective.Models[0]))
+                        {
+                            results.Add(new FieldResult(change, ConfigApplyOutcome.Refused,
+                                $"{change.Field} refused for model '{effective.Models[0].Name}': the chain this ceiling binds was established when the engine opened, and nothing live holds working copies at 'dram' to retarget. Restart with 'dram' named in 'models[].budgets.kv.order', or edit 'kv_blocks' on a model that declares no budgets."));
+                            break;
+                        }
+
+                        long ceiling = CandidateSystemMemoryKvCeiling(candidate.Models[0]) ?? candidate.Models[0].KvBlocks;
+                        GenerationScheduler.KvBudgetApply budgeted = _scheduler.ApplyKvBudget(checked((int)ceiling));
+                        effective = effective with { Models = [MergeAppliedKvCeiling(effective.Models[0], ceiling)] };
+                        RefreshAdvertisedModel(effective);
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"KV budget {change.OldValue} -> {budgeted.AppliedBlocks} blocks within the {_pool.CapacityBlocks}-block physical reservation; drained {budgeted.EvictedCacheEntries} cached prefix blocks above the new cap (active sequences untouched)"));
+                        break;
+
+                    case "models[0].budgets.weights.caps.dram_mb" or "models[0].budgets.weights.caps.vram_mb":
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Refused,
+                            $"{change.Field} refused for model '{effective.Models[0].Name}' (restart-only): a weight ceiling binds what every forward reads, and retargeting it means re-reading slabs from the model file — that migration is not implemented in this build. Change it by restarting lair."));
+                        break;
+
+                    case "models[0].budgets.prefill_buffers.caps.dram_mb" or "models[0].budgets.prefill_buffers.caps.vram_mb":
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Refused,
+                            $"{change.Field} refused for model '{effective.Models[0].Name}' (new-requests): a ceiling on prefill working buffers classifies for later requests only, and no request-path consumer clamps to it in this build — the physical clamp is where this value lands. Nothing in force changed."));
+                        break;
+
                     default:
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Refused, RefusalDetail(change)));
                         break;
@@ -532,6 +560,93 @@ public sealed class GenerationService : IDisposable
         _ => throw new InvalidOperationException(
             $"model '{modelName}' declares engine.prefill_kernel '{value}': 'prefill_kernel' accepts only '{PrefillKernelNames.GemV}', '{PrefillKernelNames.Tiled}', or '{PrefillKernelNames.Gemm}'."),
     };
+
+    // Whether this model's budgets declare a ceiling at the system-memory tier of their KV chain — the one budgeted ceiling that is
+    // canonical for today's reservation and live soft cap, so its agreement with the legacy key is what opening reports once.
+    private static bool DeclaresSystemMemoryKvCeiling(ModelConfig model)
+    {
+        if (model.Budgets is null)
+        {
+            return false;
+        }
+
+        foreach (BudgetChain chain in model.Budgets)
+        {
+            if (chain.Resource == BudgetResource.Kv && chain.Caps.ContainsKey(BudgetTier.Dram))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Whether this configuration's KV chain names the system-memory tier at all: only such a chain has live working copies for a budgeted
+    // ceiling to retarget, and one that does not was established as something else when the engine opened.
+    private static bool CarriesSystemMemoryKvTier(ModelConfig model) => DeclaresChainAtTier(model, BudgetResource.Kv, BudgetTier.Dram);
+
+    private static long? CandidateSystemMemoryKvCeiling(ModelConfig model)
+    {
+        if (model.Budgets is null)
+        {
+            return null;
+        }
+
+        foreach (BudgetChain chain in model.Budgets)
+        {
+            if (chain.Resource == BudgetResource.Kv && chain.Caps.TryGetValue(BudgetTier.Dram, out long ceiling))
+            {
+                return ceiling;
+            }
+        }
+
+        return null;
+    }
+
+    // Merges one applied system-memory KV ceiling into the configuration in force: this model's other declared chains and every other tier of
+    // its own chain stay exactly as load resolved them, so a refused sibling edit in the same candidate cannot ride along on this merge.
+    private static ModelConfig MergeAppliedKvCeiling(ModelConfig current, long newDramBlocks)
+    {
+        List<BudgetChain> merged = [];
+
+        foreach (BudgetChain chain in current.Budgets ?? [])
+        {
+            if (chain.Resource == BudgetResource.Kv && chain.Order.Contains(BudgetTier.Dram))
+            {
+                Dictionary<BudgetTier, long> caps = [];
+                foreach (KeyValuePair<BudgetTier, long> cap in chain.Caps)
+                {
+                    caps[cap.Key] = cap.Value;
+                }
+
+                caps[BudgetTier.Dram] = newDramBlocks;
+                merged.Add(chain with { Caps = caps });
+                continue;
+            }
+
+            merged.Add(chain);
+        }
+
+        return current with { KvBlocks = checked((int)newDramBlocks), Budgets = [.. merged] };
+    }
+
+    private static bool DeclaresChainAtTier(ModelConfig model, BudgetResource resource, BudgetTier tier)
+    {
+        if (model.Budgets is null)
+        {
+            return false;
+        }
+
+        foreach (BudgetChain chain in model.Budgets)
+        {
+            if (chain.Resource == resource && chain.Order.Contains(tier))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     private string MarkerRefusalForReload(FieldChange change) =>
         $"{change.Field} refused: {_markerRefusalDetail}. The loaded model's vocabulary cannot carry the reasoning markers a 'max_reasoning_tokens' budget would bound; remove the key from this model entry or serve a model whose vocabulary carries them.";
@@ -607,6 +722,17 @@ public sealed class GenerationService : IDisposable
             CoreSet = modelConfig.Placement.CoreSet,
         });
 
+        // The model's declared budgets resolve against the pools this service opens for it, here and once: each chain lands as what an
+        // opened host can actually carry, and a claim nothing backs fails now naming the model, the resource, the tier, and the missing
+        // capability — before any weight view or reservation is spent on posture that cannot hold it. What every backend this build opens
+        // holds working copies in is system memory; disk-backed write-side pools are vocabulary those chains may name but nothing here carries yet.
+        ResolvedBudgetSet budgets = ModelBudgets.Resolve(new BudgetRequest
+        {
+            ModelName = modelConfig.Name,
+            Declared = modelConfig.Budgets ?? [],
+            OpenedPoolTiers = [BudgetTier.Dram],
+        });
+
         GgufFile? file = null;
         TransformerModel? model = null;
         BlockPool? pool = null;
@@ -648,7 +774,8 @@ public sealed class GenerationService : IDisposable
                     ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel),
                     route,
                     prefillsBackend,
-                    prefillsLane);
+                    prefillsLane,
+                    budgets);
             }
             catch (ModelException ex) when (ex.Message.StartsWith("prefill kernel '", StringComparison.Ordinal))
             {
@@ -750,6 +877,15 @@ public sealed class GenerationService : IDisposable
                 "prefill_kernel model='{Model}' kernel={Kernel}",
                 modelConfig.Name,
                 PrefillKernelNames.Of(model.ResolvedPrefillKernel));
+
+            // Both spellings of this model's system-memory KV ceiling arrived and agreed — the loader refuses any other combination — so startup sizing is unchanged and one line says which spelling carries it forward. A legacy key alone or budgets alone log nothing here, exactly as they behaved before.
+            if (modelConfig.LegacyKvBlocksDeclared && DeclaresSystemMemoryKvCeiling(modelConfig))
+            {
+                logger?.LogInformation(
+                    "kv_blocks model='{Model}' value={Value} deprecated: 'budgets.kv.caps.dram_blocks' states the same ceiling, and budgets are canonical for what LAIR holds at system memory",
+                    modelConfig.Name,
+                    modelConfig.KvBlocks);
+            }
 
             // The sparse-FFN facts a routed block resolves to are reported the same way: they come straight from the
             // model's plan, and only a file that declares experts carries them. A dense model advertises nothing here.

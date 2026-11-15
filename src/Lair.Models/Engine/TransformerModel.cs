@@ -431,11 +431,14 @@ public sealed class TransformerModel : IDisposable
     /// execution backend capped to its lane share and <paramref name="prefillsLane"/> pins the resolved split — masks, worker caps,
     /// and the activation buffers sized from it land at open; every decode-side forward stays on <paramref name="backend"/>. The two
     /// must arrive together and report the same device this engine runs on: a half-declared lane posture is refused naming what is missing.
+    /// A host that resolved per-resource budgets against its own opened pools supplies them through <paramref name="budgets"/>, and they land
+    /// on the plan unchanged beside the route — this engine neither re-derives ceilings nor claims capacity from them. Omitting it keeps the
+    /// empty set, which is what every model carrying no budget declarations runs on today.
     /// </summary>
     public static TransformerModel Open(
         GgufFile file, IBackend backend, int maxContextTokens, Action<string>? logLine, PrefillKernel prefillKernel, ModelRoute route,
-        IBackend? prefillsBackend = null, PrefillLaneLayout? prefillsLane = null) =>
-        new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel, prefillRowWidth: 0, route, prefillsBackend, prefillsLane);
+        IBackend? prefillsBackend = null, PrefillLaneLayout? prefillsLane = null, ResolvedBudgetSet? budgets = null) =>
+        new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel, prefillRowWidth: 0, route, prefillsBackend, prefillsLane, crossingBackends: null, budgets);
 
     /// <summary>
     /// Opens the engine with weight payloads supplied by an alternate <see cref="IWeightSource"/>: every tensor read
@@ -614,7 +617,7 @@ public sealed class TransformerModel : IDisposable
         return (decodeSide, prefillSide);
     }
 
-    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV, int prefillRowWidth = 0, ModelRoute? route = null, IBackend? prefillsBackend = null, PrefillLaneLayout? prefillsLane = null, IReadOnlyList<IBackend>? crossingBackends = null)
+    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV, int prefillRowWidth = 0, ModelRoute? route = null, IBackend? prefillsBackend = null, PrefillLaneLayout? prefillsLane = null, IReadOnlyList<IBackend>? crossingBackends = null, ResolvedBudgetSet? budgets = null)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(backend);
@@ -659,10 +662,17 @@ public sealed class TransformerModel : IDisposable
 
         // The route a host resolved from its own placement lands on the plan before any allocation, so what step composition
         // reads later is exactly what load decided. A file opened without one keeps the single CPU segment its own resolution
-        // put there — which is where every model served today runs.
-        Plan = route is null ? Plan : Plan with { Route = route };
+        // put there — which is where every model served today runs. Resolved budget sets land the same way: a host resolves what
+        // it declares against the pools it actually opened, and this engine carries that shape unchanged rather than re-deriving
+        // ceilings from some other source while the model stays open. A file opened without budgets keeps the empty set — today's
+        // behavior, where only KV block counts bound anything.
+                Plan = route is null ? Plan : Plan with { Route = route };
 
         // The execution spans this engine runs that route over resolve below, once the stage-side posture has landed — each segment is checked against the backend resolved to run it.
+
+        // Budgets land on the plan exactly as the route did above: what a host resolved against its opened pools arrives unchanged here.
+        Plan = budgets is null ? Plan : Plan with { Budgets = budgets };
+
 
         // A dedicated lane posture arrives as a pair — the second execution backend prompt windows run on, plus the resolved split it was capped from.
         // Half of it is refused at open naming what is missing; the backend must report this engine's own device, because weights, norms, rotation tables, and KV

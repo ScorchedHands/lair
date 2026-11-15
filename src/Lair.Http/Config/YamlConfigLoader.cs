@@ -18,8 +18,11 @@ public static class YamlConfigLoader
     private static readonly string[] ServerKeys = ["bind", "port"];
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel"];
     private static readonly string[] UiKeys = ["recent_requests"];
-    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests"];
+    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "budgets"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane"];
+
+    /// <summary>The resource keys a model's budgets block may declare, in the order a refusal reports them.</summary>
+    private static readonly IReadOnlyList<string> BudgetResourceKeys = [BudgetResourceNames.Weights, BudgetResourceNames.Kv, BudgetResourceNames.PrefillBuffers];
 
     /// <summary>Loads and validates <paramref name="filePath"/>; no file watching.</summary>
     public static LairConfig Load(string filePath)
@@ -235,10 +238,39 @@ public static class YamlConfigLoader
                 $"models[{index}].max_context_tokens {maxContextTokens} is invalid: 'max_context_tokens' must be 128 or greater.");
         }
 
-        int kvBlocks = TryInteger(keys, "kv_blocks", $"models[{index}].kv_blocks") ?? 256;
-        if (kvBlocks < 8)
+        // Per-resource budgets parse before either spelling of the system-memory KV ceiling decides anything: a declared
+        // 'budgets.kv.caps.dram_blocks' becomes canonical for what LAIR reserves and caps at that tier exactly as 'kv_blocks'
+        // does today, so both spellings have to be in hand — and agree — before the reservation is sized. A legacy key alone
+        // behaves exactly as it always did; budgets alone carry their own value; neither keeps today's default of 256.
+        IReadOnlyList<BudgetChain>? budgets = ParseBudgets(keys, index, name);
+
+        int? declaredKvBlocks = TryInteger(keys, "kv_blocks", $"models[{index}].kv_blocks");
+        if (declaredKvBlocks is < 8)
         {
-            throw new ConfigException($"models[{index}].kv_blocks {kvBlocks} is invalid: 'kv_blocks' must be 8 or greater.");
+            throw new ConfigException($"models[{index}].kv_blocks {declaredKvBlocks} is invalid: 'kv_blocks' must be 8 or greater.");
+        }
+
+        long? budgetedKvCeiling = SystemMemoryKvCeiling(budgets);
+
+        int kvBlocks;
+        if (budgetedKvCeiling is not null && declaredKvBlocks is not null)
+        {
+            if (declaredKvBlocks.Value != budgetedKvCeiling.Value)
+            {
+                throw new ConfigException(
+                    $"model '{name}' declares models[{index}].kv_blocks {declaredKvBlocks.Value} and models[{index}].budgets.kv.caps.dram_blocks {budgetedKvCeiling.Value}: " +
+                    "both spell the same system-memory KV ceiling, so they must state the same number — keep one key or make them agree.");
+            }
+
+            kvBlocks = declaredKvBlocks.Value; // equal spellings: startup sizing stays exactly what it was today, and model open reports once that the legacy key is deprecated in favor of budgets.
+        }
+        else if (budgetedKvCeiling is not null)
+        {
+            kvBlocks = checked((int)budgetedKvCeiling.Value); // a budgeted ceiling alone sizes the reservation through the same path every other KV block count does.
+        }
+        else
+        {
+            kvBlocks = declaredKvBlocks ?? 256;
         }
 
         // Minimal tool-precedence override: when true, LAIR's fenced tool block is used for declared tools even when
@@ -302,6 +334,8 @@ public static class YamlConfigLoader
             MaxReasoningTokens = maxReasoningTokens,
             MaxResponseTokens = maxResponseTokens,
             MaxConcurrentRequests = maxConcurrentRequests,
+            Budgets = budgets,
+            LegacyKvBlocksDeclared = declaredKvBlocks is not null,
             Placement = ParsePlacement(keys, index, name),
         };
     }
@@ -479,11 +513,11 @@ public static class YamlConfigLoader
         return keys;
     }
 
-    private static void RejectUnknownKeys(Dictionary<string, YamlNode> keys, string where, string[] allowed)
+    private static void RejectUnknownKeys(Dictionary<string, YamlNode> keys, string where, IReadOnlyList<string> allowed)
     {
         foreach (string key in keys.Keys)
         {
-            if (Array.IndexOf(allowed, key) < 0)
+            if (!IsKnown(key, allowed))
             {
                 throw new ConfigException($"Unknown key '{key}' under {where}; allowed keys are: {Allowed(allowed)}.");
             }
@@ -539,5 +573,217 @@ public static class YamlConfigLoader
         return value;
     }
 
-    private static string Allowed(string[] keys) => string.Join(", ", keys);
+    /// <summary>Parses one model entry's budgets block: every declared resource names its own ordered tier chain and the ceilings it declares along that chain, each refusal naming the qualified config path, the offending value, and the accepted vocabulary exactly as the other choice keys do. Chain shape — a known tier at each position, priority order, no repeats — is enforced here in config-path wording; ceiling ranges are checked against what each key sizes: a system-memory KV ceiling carries <c>kv_blocks</c>' floor of 8 because it reserves physical blocks exactly as the legacy key does, every other ceiling must be positive where it states one, and the read-side origin store takes no ceiling at all because that storage already holds the complete set. Nothing here consults capacity or opened pools — which claims a host can carry is resolution's answer when the engine opens.</summary>
+    private static IReadOnlyList<BudgetChain>? ParseBudgets(Dictionary<string, YamlNode> modelKeys, int index, string modelName)
+    {
+        if (!modelKeys.TryGetValue("budgets", out YamlNode? node))
+        {
+            return null;
+        }
+
+        string where = $"models[{index}].budgets";
+        Dictionary<string, YamlNode> resources = KeysOf(AsMapping(node, where), where);
+        RejectUnknownKeys(resources, where, BudgetResourceKeys);
+
+        List<BudgetChain> chains = [];
+        foreach (string resourceKey in BudgetResourceKeys)
+        {
+            if (!resources.TryGetValue(resourceKey, out YamlNode? resourceNode))
+            {
+                continue; // a resource this entry says nothing about declares no chain at all.
+            }
+
+            chains.Add(ParseBudgetChain(index, modelName, resourceKey, resourceNode));
+        }
+
+        return [.. chains];
+    }
+
+    private static BudgetChain ParseBudgetChain(int index, string modelName, string resourceKey, YamlNode node)
+    {
+        if (!BudgetResourceNames.TryParse(resourceKey, out BudgetResource resource))
+        {
+            throw new ConfigException(
+                $"models[{index}].budgets.{resourceKey} is invalid for model '{modelName}': budgets declare only {Vocabulary(BudgetResourceKeys)}.");
+        }
+
+        string where = $"models[{index}].budgets.{resourceKey}";
+        Dictionary<string, YamlNode> keys = KeysOf(AsMapping(node, where), where);
+        RejectUnknownKeys(keys, where, ["order", "caps"]);
+
+        if (!keys.TryGetValue("order", out YamlNode? orderNode))
+        {
+            throw new ConfigException($"Missing required key 'order' under {where}; allowed keys are: {Allowed(["order", "caps"])}.");
+        }
+
+        if (orderNode.NodeType != YamlNodeType.Sequence)
+        {
+            throw new ConfigException($"{where}.order must be a list of tier names ({Vocabulary(BudgetTierNames.DeclaredNames)}).");
+        }
+
+        List<BudgetTier> order = [];
+        foreach (YamlNode item in ((YamlSequenceNode)orderNode).Children)
+        {
+            if (item.NodeType != YamlNodeType.Scalar || ((YamlScalarNode)item).Value is not string tierName)
+            {
+                throw new ConfigException($"{where}.order must be a list of tier names ({Vocabulary(BudgetTierNames.DeclaredNames)}).");
+            }
+
+            if (!BudgetTierNames.TryParse(tierName, out BudgetTier tier))
+            {
+                throw new ConfigException(
+                    $"{where}.order '{tierName}' is invalid for model '{modelName}': 'order' accepts only {Vocabulary(BudgetTierNames.DeclaredNames)}, highest-priority residency first.");
+            }
+
+            order.Add(tier);
+        }
+
+        ValidateChainShape(modelName, where, resourceKey, order);
+
+        Dictionary<BudgetTier, long> caps = [];
+        if (keys.TryGetValue("caps", out YamlNode? capsNode))
+        {
+            string capsWhere = $"{where}.caps";
+            foreach (KeyValuePair<string, YamlNode> capEntry in KeysOf(AsMapping(capsNode, capsWhere), capsWhere))
+            {
+                string capKey = capEntry.Key;
+                YamlNode value = capEntry.Value;
+                if (!BudgetCapKeys.TryParse(capKey, resource, out BudgetTier tier))
+                {
+                    throw new ConfigException(
+                        $"{capsWhere}.{capKey} is invalid for model '{modelName}': '{resourceKey}' ceilings are named {Vocabulary(BudgetCapKeys.For(resource))}, each binding a tier its own 'order' names.");
+                }
+
+                if (value.NodeType != YamlNodeType.Scalar || ((YamlScalarNode)value).Value is not string text)
+                {
+                    throw new ConfigException($"{capsWhere}.{capKey} must be an integer value.");
+                }
+
+                long declared;
+                bool parsed = resource == BudgetResource.Kv && tier == BudgetTier.Dram
+                    ? long.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out declared) && declared <= int.MaxValue
+                    : long.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out declared);
+
+                if (!parsed)
+                {
+                    throw new ConfigException(
+                        $"{capsWhere}.{capKey} '{text}' is invalid for model '{modelName}': a system-memory KV ceiling sizes the physical reservation and must be an integer no larger than {int.MaxValue}.");
+                }
+
+                ValidateCap(modelName, capsWhere, capKey, resource, tier, declared, order);
+                caps[tier] = declared;
+            }
+        }
+
+        return new BudgetChain { Resource = resource, Order = [.. order], Caps = caps };
+    }
+
+    private static void ValidateChainShape(string modelName, string where, string resourceKey, List<BudgetTier> order)
+    {
+        if (order.Count == 0)
+        {
+            throw new ConfigException(
+                $"{where}.order is empty for model '{modelName}': a chain must name at least the tier its copies start on — omit '{resourceKey}' entirely to declare nothing about it.");
+        }
+
+        HashSet<BudgetTier> seen = [];
+        int previousPriority = -1;
+        foreach (BudgetTier tier in order)
+        {
+            if (!seen.Add(tier))
+            {
+                throw new ConfigException(
+                    $"{where}.order {DescribeTiers(order)} is invalid for model '{modelName}': a chain names each tier exactly once.");
+            }
+
+            int priority = RankOf(tier);
+            if (priority <= previousPriority)
+            {
+                throw new ConfigException(
+                    $"{where}.order {DescribeTiers(order)} is out of order for model '{modelName}': tiers must run from the highest-priority residency to " +
+                    $"the lowest ({string.Join(" then ", BudgetTierNames.DeclaredNames.Select(name => $"'{name}'"))}), skipping any tier this resource does not use.");
+            }
+
+            previousPriority = priority;
+        }
+    }
+
+    private static void ValidateCap(string modelName, string capsWhere, string capKey, BudgetResource resource, BudgetTier tier, long declared, List<BudgetTier> order)
+    {
+        if (!order.Contains(tier))
+        {
+            throw new ConfigException(
+                $"{capsWhere}.{capKey} is invalid for model '{modelName}': a ceiling binds only tiers its own 'order' names — declare '{BudgetTierNames.Of(tier)}' there to cap it.");
+        }
+
+        if (resource == BudgetResource.Weights && tier == BudgetTier.Nvme)
+        {
+            throw new ConfigException(
+                $"{capsWhere}.{capKey} is invalid for model '{modelName}': weights read their complete set from disk storage already, so no model-level ceiling describes that position.");
+        }
+
+        if (resource == BudgetResource.Kv && tier == BudgetTier.Dram)
+        {
+            if (declared < 8)
+            {
+                throw new ConfigException(
+                    $"{capsWhere}.{capKey} {declared} is invalid for model '{modelName}': a system-memory KV ceiling reserves physical blocks exactly as 'kv_blocks' does and must be 8 or greater.");
+            }
+
+            return;
+        }
+
+        if (declared < 1)
+        {
+            throw new ConfigException(
+                $"{capsWhere}.{capKey} {declared} is invalid for model '{modelName}': a ceiling must be 1 or greater — omit the key to declare no ceiling at that tier.");
+        }
+    }
+
+    /// <summary>The declared system-memory KV ceiling of these chains, if any: what both spellings of this model's physical reservation and live cap have to agree on.</summary>
+    private static long? SystemMemoryKvCeiling(IReadOnlyList<BudgetChain>? budgets)
+    {
+        if (budgets is null)
+        {
+            return null;
+        }
+
+        foreach (BudgetChain chain in budgets)
+        {
+            if (chain.Resource == BudgetResource.Kv && chain.Caps.TryGetValue(BudgetTier.Dram, out long declared))
+            {
+                return declared;
+            }
+        }
+
+        return null;
+    }
+
+    private static int RankOf(BudgetTier tier) => tier switch
+    {
+        BudgetTier.Dram => 0,
+        BudgetTier.Vram => 1,
+        _ => 2,
+    };
+
+    private static string DescribeTiers(IReadOnlyList<BudgetTier> order) =>
+        string.Join(", ", order.Select(tier => $"'{BudgetTierNames.Of(tier)}'"));
+
+    private static bool IsKnown(string key, IReadOnlyList<string> allowed)
+    {
+        foreach (string candidate in allowed)
+        {
+            if (string.Equals(candidate, key, StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static string Vocabulary(IReadOnlyList<string> names) =>
+        string.Join(", ", names.Select(name => $"'{name}'"));
+
+    private static string Allowed(IReadOnlyList<string> keys) => string.Join(", ", keys);
 }

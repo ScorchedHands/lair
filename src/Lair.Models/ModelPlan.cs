@@ -264,6 +264,15 @@ public sealed record ModelPlan
     /// </summary>
     public required ModelRoute Route { get; init; }
 
+    /// <summary>
+    /// The resolved per-resource budget sets this model carries: every resource its configuration declared, each with its own chain of
+    /// tiers landed against the pools the host opened. A plan resolved from a file alone carries the empty set — today's behavior, where
+    /// only KV block counts bound anything — and a host resolves what its own placement declares onto this value when the engine opens
+    /// rather than carrying budget claims beside the plan. Nothing on the forward path reads it yet: it is the resolved seam later
+    /// capacity accounting consumes unchanged, exactly as <see cref="Route"/> is the seam step composition consumes.
+    /// </summary>
+    public ResolvedBudgetSet Budgets { get; init; } = ResolvedBudgetSet.Empty;
+
     /// <summary>The flat scalar view of this plan's resolved geometry.</summary>
     public ModelDesc ToDesc() =>
         new(
