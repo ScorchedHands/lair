@@ -1315,7 +1315,7 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the host-
   - Contract: host startup validation, consistent with DN-M1-9.
 - **DN-M4-4** — KV device pools: separate VRAM and DRAM block pools; `split` residency = device-tagged blocks, attention executed as two passes (VRAM set, then DRAM set); default residency follows the decode device.
   - Rationale: attention reads all KV every token — placement follows the reader unless the user pays the measured split cost.
-  - Contract: `lair.kv` device-backed pools.
+  - Contract: `lair.kv` device-backed pools. Amended for this box's current CPU attention seam: MVP4 lands `vram` and `split` as persistent VRAM block arenas plus pinned host mirrors/staging read by today's attention kernels, ordered by device tag; GPU-side GQA/attention kernels remain a later measured upgrade path rather than an MVP4 gate.
 - **DN-M4-5** — Prefill offload: `prefill: gpu` runs prompt processing on CUDA; produced KV lands per `kv_residency`; decode continues per `device`.
   - Contract: scheduler step composition per model policy; a dedicated prefill lane (DN-M314-8) may name its prefill segment as the CUDA segment, the lane's prefill quota then riding that segment's GPU stream/SM share, and its activation buffers land in the prefill budget set's `vram` cap (DN-M314-9, DN-M4-8).
 - **DN-M4-6** — Pinned host staging buffers for activations crossing the split; transfers overlapped with compute where measurement justifies it.
@@ -1340,6 +1340,10 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the host-
   - Rationale: stock CUDA gives stream priority and concurrent-kernel control, while real SM partitioning needs MPS or green contexts. A config knob that names a partition nothing enforces would make a measured claim impossible to honor.
   - Rejected: inventing `sm_share` config values now; pretending stream priority equals SM reservation; leaving GPU quotas unreported while route segments already carry quota values.
   - Contract: route segments report GPU stream-slot posture and presence only; budget/admission gates for `vram` bytes remain enforceable, while GPU compute-share enforcement stays out of MVP4 until a backend reports a real partitioning primitive.
+- **DN-M4-12** — KV residency is a separate placement axis from compute/weight tier: `kv_residency: dram | vram | split` controls block pools and merge eligibility, while route segment weight tiers come from the opened backends and layer-split posture rather than being conflated with KV placement.
+  - Rationale: MVP3's independent device/tier axes already reject one model-wide residency label; a whole-model CUDA transformer span can hold dense weights in VRAM while its KV lands at `dram`, `vram`, or both, and split attention needs block tags rather than a single tier carried by every stage.
+  - Rejected: reusing `RouteRequest.KvResidency` as the weight tier for every segment (it cannot express weights-in-VRAM beside KV-on-DRAM); inventing separate top-level VRAM knobs outside DN-M314-9's budget vocabulary; claiming device-addressed GPU attention before a CUDA GQA kernel exists.
+  - Contract: `models[].placement.kv_residency` accepts `dram`, `vram`, and `split`; resolved KV claims bind to the pool tier(s) that actually hold blocks, while weight/prefill claims continue through their own chains. A merged step may compose only pipelines whose block residency is addressable by the stepped segment; split candidates carry both tags rather than inventing a third weight tier.
 
 #### Implementation Items
 
@@ -1360,10 +1364,10 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the host-
 - [✓] CUDA GEMV quantized formats — packed GGUF weight matrices run through embedded PTX (see DN-M4-1)
   - Landed: Q4_K dense and batched GEMV run as unrolled embedded PTX kernels against device or host-mapped weight bytes, with synthetic hand-built blocks proving exact/partial/group-tail/batch/mapped-host parity plus split-header scale/min codes; unsupported packed formats still refuse naming the CUDA backend. Release gates ran targeted Q4_K synthetic parity 12/12, `Category=Cuda` 27/27, and affected split/config/host filters 66/66.
   - Verify gates: `dotnet test --filter "Category=Cuda" -c Release` plus targeted synthetic Q4_K_M parity against scalar/CPU reference math, with unsupported packed formats still refusing naming this backend rather than running elsewhere.
-- [_] VRAM residency — models fitting 24 GB resident on device
-  - Verify: a pinned local `models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` run stays fully device-resident and token-identical against its CPU-resident baseline when the fixture is present; an over-budget load is refused with ledger breakdown naming model, resource, tier, and amounts.
-- [_] KV device pools — `dram` | `vram` | `split` residency policies (see DN-M4-4)
-  - Verify: parity across all three residencies; bench records the split-vs-follow cost curve. *(parity gate active; bench deferred)*
+- [_] VRAM residency — models fitting 24 GB resident on device (see DN-M4-12)
+  - Verify: a whole-model CUDA transformer span over the pinned local `models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` fixture keeps every dense weight matrix used by that GPU segment in persistent VRAM and decodes token-identically against its CPU-resident baseline when present; default posture still leaves the output head host-side unless an explicit whole-model device policy lands later, and over-budget loads refuse with ledger breakdown naming model, resource, tier, and amounts.
+- [_] KV device pools — `dram` | `vram` | `split` residency policies (see DN-M4-4, DN-M4-12)
+  - Verify: parity across all three residencies through the current attention seam with persistent VRAM storage plus pinned host mirrors/staging and copy accounting; bench records the split-vs-follow cost curve. *(parity gate active; bench deferred)*
 - [_] VRAM tier budgets — `vram` caps for weights, KV, and prefill buffers become valid values in the DN-M314-9 schema, admitted through the DN-M314-10 ledger (see DN-M4-8).
   - Verify: `dotnet test --filter Category=Config|Budget -c Release` — a model declaring weights-in-DRAM with KV-on-VRAM resolves without new config keys, an over-budget load is refused naming model/resource/tier plus the breakdown, and MVP3.14's rejected-tier error messages disappear only for tiers that now have pools.
 
@@ -1696,6 +1700,8 @@ Vision input on chat models.
 | idea | `auto` device fallback | silent CPU fallback when a configured CUDA device is absent — deliberately not a default (DN-M4-3) |
 
 ## Decision Log
+
+- **2026-11-16 — MVP4's remaining device-pool work is scoped as storage/residency and accounting first; GPU-side attention kernels are deferred.** `vram` and `split` KV land through persistent VRAM block arenas plus pinned host mirrors/staging read by today's CPU attention seam, because this box has CUDA GEMV PTX but no CUDA GQA/attention kernel path. The residency vocabulary splits from the compute route: `kv_residency: dram | vram | split` controls pools and merge eligibility while segment weight tiers come from opened backends and layer-split posture. Full-device residency means every dense weight matrix used by the GPU transformer span is persistent VRAM while the default output head remains host-side unless an explicit whole-model device policy lands later; over-budget loads refuse through declared finite `vram` seams, and `kv.caps.vram_blocks` classify restart-only because physical device-pool reseating is not live in MVP4.
 
 - **2026-11-16 — MVP5.1 refined: the quantized-KV mechanism is committed as a static-abstract generic hot path with a measured demotion path, and quantized modes are validated against the matching llama/ik cache-type output (DN-M51-6, DN-M51-7).** The generics-vs-records question is settled as "generic `LayerOps<TK,TV>` primary, gated by a de-risk spike that can switch to hand-specialized per-combo kernels" rather than left open; each quantized KV mode (`fp16`/`q8`/`k8v4`/q4) gets a per-mode parity band measured against llama/ik run with the same cache-type pair, cross-checked against the MoE cross-tool band, with `f32/f32` staying bit-identical and no dense-family band widened. `q4/q4` stays in the named set only if a q4-K viability spike clears its band, else it is dropped and recorded. Rejected: betting the phase on the generic seam with no fallback; validating quantized modes only against LAIR's own `f32` output; folding quantized-KV drift into the dense-family band.
 
