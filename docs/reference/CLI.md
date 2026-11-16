@@ -4,21 +4,30 @@ Every command line LAIR accepts, what each flag does, and what the command print
 
 ## Invocation
 
-LAIR is one executable with one verb. Today it runs through the .NET SDK from a checkout:
+LAIR is one executable with one verb. Every example below runs the compiled executable — `lair` (`lair.exe` on Windows):
 
 ```powershell
-dotnet run --project src/Lair.Host -- <command> <args>
+lair serve -c lair.yaml
 ```
 
-`dotnet build Lair.sln` produces the same program as `lair.exe` (the host assembly is named `lair`) at `src/Lair.Host/bin/<Configuration>/net10.0/lair.exe`, so a built checkout can also be driven directly:
+### Getting the executable
+
+A release build produces a self-contained single-file executable that carries the .NET runtime, so nothing else has to be installed to run it:
 
 ```powershell
-.\src\Lair.Host\bin\Release\net10.0\lair.exe serve -c lair.yaml
+dotnet publish src/Lair.Host -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o release
 ```
 
-A self-contained single-file publish is **not** configured on this branch: there is no publish profile, no `PublishSingleFile`/`SelfContained` setting in `Directory.Build.props` or any `.csproj`, and nothing in the build produces a standalone `lair.exe` with the runtime bundled. See "Planned CLI surface" at the end.
+That writes `release\lair.exe` (about 100 MB) with `wwwroot\` beside it — the Web UI bundle the host serves at `/ui` — plus `aspnetcorev2_inprocess.dll` (a native library that stays unpacked beside the executable) and `.pdb` sidecar files. Publishing with `-p:SkipWebUi=true` omits the Web UI and needs no Node; publishing with the UI bundled needs Node 22 / npm 11 on the build machine.
 
-Everything below writes `lair <args>` as shorthand for one of those two forms.
+A checkout can also be driven without publishing:
+
+```powershell
+dotnet build Lair.sln                                  # src\Lair.Host\bin\Release\net10.0\lair.exe (framework-dependent)
+dotnet run --project src/Lair.Host -- <command> <args> # the same program, run from source
+```
+
+No publish profile is committed in the repository yet: the publish command above is the packaging shape the project intends to ship, and CI packaging is planned (see "Planned CLI surface" at the end). Everything below writes `lair <args>` as shorthand for whichever executable you are running.
 
 ### Choosing the config file
 
@@ -66,7 +75,7 @@ usage:
 ## `serve`
 
 ```powershell
-dotnet run --project src/Lair.Host -- serve -c lair.yaml
+lair serve -c lair.yaml
 ```
 
 Loads the config, opens the model, and serves the OpenAI-compatible HTTP API until interrupted.
@@ -136,7 +145,7 @@ The first `Ctrl+C` shuts the server down gracefully (in-flight work is cancelled
 ## `chat`
 
 ```powershell
-dotnet run --project src/Lair.Host -- chat -c lair.yaml
+lair chat -c lair.yaml
 ```
 
 An interactive REPL over the configured model. It opens its own engine — it does not talk to a running `serve` process, and it never watches the config file.
@@ -178,7 +187,7 @@ Conversation history is rolling: when a turn no longer fits the model's context 
 ## `monitor`
 
 ```powershell
-dotnet run --project src/Lair.Host -- monitor -u http://127.0.0.1:8080 --interval 1000
+lair monitor -u http://127.0.0.1:8080 --interval 1000
 ```
 
 Follows a running server's `GET /monitor/stream` SSE snapshots and re-renders one table row per snapshot. It reads a live server; it does not read a config file.
@@ -226,16 +235,16 @@ Known limitation: if the serving process is killed while `monitor` is attached, 
 ## `model`
 
 ```powershell
-dotnet run --project src/Lair.Host -- model fetch QuantFactory/SmolLM-135M-Instruct-GGUF -c lair.yaml
-dotnet run --project src/Lair.Host -- model check manual-fetch-smollm -c lair.yaml
-dotnet run --project src/Lair.Host -- model list -c lair.yaml
+lair model fetch QuantFactory/SmolLM-135M-Instruct-GGUF -c lair.yaml
+lair model check manual-fetch-smollm -c lair.yaml
+lair model list -c lair.yaml
 ```
 
 Fetch, report update candidates for, and list pinned model packs. `-c <path>` is optional and changes which pack directories the command works on.
 
 | Flag | Meaning |
 |---|---|
-| `-c <configPath>` | Read the pack directory beside each config model's `path`. Without it, the pack directory is a `models` directory beside the executable (for a `dotnet run` invocation that is `src/Lair.Host/bin/<Configuration>/net10.0/models`). A missing config is reported as `lair: Configuration file '<path>' does not exist.` and exits `1`; a `-c` with no value exits `2`. |
+| `-c <configPath>` | Read the pack directory beside each config model's `path`. Without it, the pack directory is a `models` directory beside the executable you ran — the publish directory for a released `lair.exe`, or `src/Lair.Host/bin/<Configuration>/net10.0/models` for a built checkout. A missing config is reported as `lair: Configuration file '<path>' does not exist.` and exits `1`; a `-c` with no value exits `2`. |
 
 ### `model fetch`
 
@@ -326,7 +335,7 @@ A pack with no manifest prints `no manifest in pack '<directory>'`; a manifest w
 
 ```powershell
 $env:LAIR_HF_TOKEN = "hf_..."
-dotnet run --project src/Lair.Host -- model fetch org/gated-model -c lair.yaml
+lair model fetch org/gated-model -c lair.yaml
 ```
 
 - The token is read from the process environment only. It is never accepted in `lair.yaml`, never accepted as a command-line argument, and never written to a pack manifest.
@@ -356,7 +365,7 @@ These are **not available on this branch**. Each is listed with its status so a 
 
 | Feature | Status | Notes |
 |---|---|---|
-| Self-contained single-file `win-x64` publish | planned | Named as the intended packaging shape, but no publish profile or single-file setting exists in this build. Use `dotnet run` or the framework-dependent `lair.exe` from `bin/`. |
+| Packaged release artifacts: a committed publish profile, CI packaging, and a distributable archive | planned | The self-contained single-file `win-x64` publish documented under "Getting the executable" works today, but no publish profile or packaging step is committed in the repository, so a release has to be built locally. |
 | Native AOT packaging | planned | Backlog idea (startup cost reduction); nothing implemented. |
 | Multi-model serving, so `serve`/`chat`/`model` operate on more than one model | planned | This build serves exactly one model; `models:` must list exactly one entry, and `model check`/`list` iterate packs accordingly. |
 | Monitor rows for accelerator and tier counters (GPU utilisation, PCIe transfer bytes, per-tier occupancy) | planned | The snapshot vocabulary is being extended; the `monitor` table columns documented above are the shipped set. |
