@@ -121,6 +121,12 @@ public sealed class GenerationService : IDisposable
     /// <summary>The allocation count behind that residency — one per weight tensor the copy posture has cached. Internal diagnostics for hosts and tests.</summary>
     internal int? SplitExecutionPersistentDeviceWeightAllocations => _splitExecution?.PersistentDeviceWeightAllocations;
 
+    // Engine-side accelerator accounting across every compute backend this open holds: device-measured kernel busy time,
+    // runtime copy tallies, and the default-copy weight residency currently held, summed across instances. A host-mapped
+    // instance contributes its own zero weight residency rather than a fabricated reading, and an open with no accelerator
+    // backend answers nothing at all — which is how CPU-only snapshots keep these facts absent instead of zero-filled.
+    internal AcceleratorAccounting? OpenedAcceleratorAccounting => BuildAcceleratorAccounting();
+
     // The tier the ledger seated this model's whole-reservation KV claim at — what a live soft-cap edit retargets there, leaving any device-backed range claimed beside it on its own standing seat. Null when the model declared no KV chain to register.
     private BudgetTier? _reservationKvClaimTier;
 
@@ -220,6 +226,11 @@ public sealed class GenerationService : IDisposable
         bus.AttachInFlightProvider(InFlightRequestViews);
         bus.AttachModelFacts(BuildMonitorFacts(_current));
 
+        // The monitor's accelerator facts ride the compute backends this open holds, read from their own accounting as
+        // each tick samples. An engine that opened no accelerator backend attaches a provider that answers null, so its
+        // snapshots carry nothing in those slots rather than an idle-hardware reading.
+        bus.AttachAcceleratorProvider(BuildAcceleratorAccounting);
+
         _metrics = bus;
         return bus;
     }
@@ -272,6 +283,43 @@ public sealed class GenerationService : IDisposable
         PlacementNodeAllocations: _computeGrant is { NodeAllocations.Count: > 0 } seatedGrant ? seatedGrant.NodeAllocationText() : null,
         PlacementAdvisory: _placement?.Advisory,
         UpdateCandidate: _updateCandidate);
+
+    // Sums what each compute backend this open owns answers about its own device work: cumulative kernel busy time and
+    // runtime copy tallies since that instance opened, plus the weight residency it holds in persistent device memory now.
+    // Both instances are fixed at construction, so a sampling tick reads two fields and one small record — no re-derivation.
+    private AcceleratorAccounting? BuildAcceleratorAccounting()
+    {
+        CudaBackend? split = _splitExecution;
+        CudaBackend? mirror = _kvMirrorExecution;
+
+        if (split is null && mirror is null)
+        {
+            return null; // this serve runs no accelerator backend: there is no device-side fact to report.
+        }
+
+        long kernelBusyMicroseconds = 0;
+        long runtimeTransferBytes = 0;
+        long runtimeTransferCalls = 0;
+        long persistentDeviceWeightBytes = 0;
+
+        if (split is CudaBackend splitInstance)
+        {
+            kernelBusyMicroseconds += splitInstance.KernelBusyMicrosecondsTotal;
+            runtimeTransferBytes += splitInstance.RuntimeTransferBytesTotal;
+            runtimeTransferCalls += splitInstance.RuntimeTransferCallsTotal;
+            persistentDeviceWeightBytes += splitInstance.PersistentDeviceWeightBytes;
+        }
+
+        if (mirror is CudaBackend mirrorInstance)
+        {
+            kernelBusyMicroseconds += mirrorInstance.KernelBusyMicrosecondsTotal;
+            runtimeTransferBytes += mirrorInstance.RuntimeTransferBytesTotal;
+            runtimeTransferCalls += mirrorInstance.RuntimeTransferCallsTotal;
+            persistentDeviceWeightBytes += mirrorInstance.PersistentDeviceWeightBytes; // a mapped posture caches no device weight copy, so it adds nothing here
+        }
+
+        return new AcceleratorAccounting(kernelBusyMicroseconds, runtimeTransferBytes, runtimeTransferCalls, persistentDeviceWeightBytes);
+    }
 
     // The report-only candidate a pinned model pack has against hub HEAD, resolved once at open: load the pack's pin
     // for this model, consult HEAD and its tree through the seam, and report the candidate summary only when HEAD

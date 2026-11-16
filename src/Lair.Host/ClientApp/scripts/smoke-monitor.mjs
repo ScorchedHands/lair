@@ -224,6 +224,11 @@ check("prefill · decode · kv residency cell from placement facts", detailVals(
 check("cache blocks by location derived (prefix/active/free)", detailVals().some((v) => v.includes("prefix 18") && v.includes("active 54") && v.includes("free 42")));
 check("finish tallies from snapshot totals", detailVals().some((v) => v === "stop 1 · eos 12 · length 5 · abort 1 · failed 1"));
 
+// A CPU-only snapshot carries no accelerator facts: the device cards keep their placeholder reading rather than showing zeros.
+check("GPU util card stays em dash on a CPU-only serve", $text("#gpuutil") === "—" && doc.querySelector("#gpuutil").closest(".card").classList.contains("placeholder"));
+check("PCIe transfer card stays em dash on a CPU-only serve", $text("#pcie") === "—" && doc.querySelector("#pcie").closest(".card").classList.contains("placeholder"));
+check("model row VRAM column stays reserved-marked without device residency", rowsOf("Configured models")[0].textContent.includes("reserved —"));
+
 // expand/collapse still works on live rows
 modelRow.querySelector("td.expand").click();
 await wait(80);
@@ -316,6 +321,32 @@ check("manual backoff reopens the stream", retried !== closedStream && retried.r
 retried.emitOpen();
 await wait(80);
 check("retry reconnects back to live", $text("header.app .badge") === "live" && !doc.querySelector("header.app .badge").classList.contains("down"));
+
+// ---- 6b. accelerator facts: device cards and residency column come live from a CUDA-backed snapshot --------------
+
+es.emit("snapshot", {
+  ...snapshot,
+  metrics_model: "hybrid-cuda-model",
+  metrics_event_seq: 42,
+  metrics_decode_device: "cuda",
+  metrics_gpu_utilization_percent: 41.5,
+  metrics_pcie_transfer_bytes_total: 3_145_728,
+  metrics_pcie_transfers_total: 640,
+  metrics_persistent_vram_bytes: 78_643_200,
+});
+await wait(150);
+
+check("GPU util card reads the windowed kernel busy share", $text("#gpuutil") === "41.5%" && !doc.querySelector("#gpuutil").closest(".card").classList.contains("placeholder"));
+check("PCIe transfer card totals runtime copies beside resident weights", $text("#pcie") === "3.0 MiB" && [...doc.querySelectorAll(".card .sub")].some((el) => el.textContent === "640 runtime copies · 75.0 MiB resident"));
+
+const hybridRow = rowsOf("Configured models").find((row) => row.textContent.includes("hybrid-cuda-model"));
+check("model row VRAM column reads device residency from the engine's own accounting", hybridRow?.textContent.includes("75.0 MiB resident") ?? false);
+
+const hybridDetail = rowsOf("Configured models")[rowsOf("Configured models").indexOf(hybridRow) + 1];
+check(
+  "detail row carries kernel busy beside runtime transfer totals",
+  [...(hybridDetail?.querySelectorAll(".val") ?? [])].some((v) => v.textContent === "41.5% · 3.0 MiB over 640 copies"),
+);
 
 // ---- teardown ----------------------------------------------------------------------------------------
 

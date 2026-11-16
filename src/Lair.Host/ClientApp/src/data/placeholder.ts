@@ -1,6 +1,8 @@
 // Empty-state defaults for the monitor surface (values read as em dashes until live stream frames arrive) and the
-// static tiles that stay placeholders by design. All measured monitor data now comes from src/monitor/live.ts;
-// the chat tab is fully wired to /v1/models + /v1/chat/completions (src/chat/client.ts), so nothing here feeds it.
+// tiles that stay placeholders by design. All measured monitor data now comes from src/monitor/live.ts; accelerator
+// cards keep these readings until a snapshot carries the facts an opened CUDA backend publishes, so a CPU-only serve
+// never shows device zeros it has no fact for. The chat tab is fully wired to /v1/models + /v1/chat/completions
+// (src/chat/client.ts), so nothing here feeds it.
 
 export interface KpiCardData {
   id: string;
@@ -17,8 +19,8 @@ export const kpiCards: KpiCardData[] = [
 ];
 
 export const placeholderCards: KpiCardData[] = [
-  { id: "gpuutil", label: "GPU util", value: "—", sub: "awaiting CUDA phase" },
-  { id: "pcie", label: "PCIe transfer", value: "—", sub: "awaiting CUDA phase" },
+  { id: "gpuutil", label: "GPU util", value: "—", sub: "no CUDA backend open" },
+  { id: "pcie", label: "PCIe transfer", value: "—", sub: "runtime copies · resident weights" },
   { id: "ram", label: "process RAM", value: "—", sub: "engine working set" },
   { id: "cpupower", label: "CPU power", value: "—", sub: "not exposed on Windows (backlog)" },
 ];

@@ -186,7 +186,24 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_placement_advisory")] string? PlacementAdvisory = null,
 
     /// <summary>The report-only update candidate the served model's pinned pack has against the hub's current HEAD — the candidate revision and its delta summary — or null when the model declares no published source, when a check found no candidate, or when a check could not be consulted. A trailing optional field: snapshots of a model with no candidate read exactly as they did before it existed.</summary>
-    [property: JsonPropertyName("metrics_update_candidate")] string? UpdateCandidate = null)
+    [property: JsonPropertyName("metrics_update_candidate")] string? UpdateCandidate = null,
+
+    // Additive accelerator facts (earlier shapes untouched): every one reads from what an opened compute backend answers
+    // on the device side — driver-measured kernel time and its own copy tallies — never from OS or hardware telemetry. A
+    // serve with no accelerator backend attached leaves all four null, so a CPU-only snapshot carries them as nothing at
+    // all rather than as zeros an operator could mistake for idle hardware.
+
+    /// <summary>Windowed share of this window the opened accelerator backends' kernels were busy on the device — delta device-measured kernel microseconds over elapsed wall milliseconds, summed across every backend instance this serve holds open; null until such a backend stands here.</summary>
+    [property: JsonPropertyName("metrics_gpu_utilization_percent")] double? GpuUtilizationPercent = null,
+
+    /// <summary>Cumulative bytes the opened accelerator backends crossed with runtime copies — activation inputs going to the device and kernel outputs coming back. One-time persistent weight uploads, host-region registrations, and KV mirror residency crossings stay outside this tally; null on a serve holding no accelerator backend.</summary>
+    [property: JsonPropertyName("metrics_pcie_transfer_bytes_total")] long? PcieTransferBytesTotal = null,
+
+    /// <summary>Cumulative count of those runtime copy operations — one per activation input and one per kernel output, whatever their sizes; null on a serve holding no accelerator backend.</summary>
+    [property: JsonPropertyName("metrics_pcie_transfers_total")] long? PcieTransfersTotal = null,
+
+    /// <summary>Device bytes the opened default-copy postures hold open for resident weights right now — host-mapped weight residency and transient activation buffers stay outside this reading, which drops as an instance releases its allocations; null on a serve holding no accelerator backend.</summary>
+    [property: JsonPropertyName("metrics_persistent_vram_bytes")] long? PersistentVramBytes = null)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

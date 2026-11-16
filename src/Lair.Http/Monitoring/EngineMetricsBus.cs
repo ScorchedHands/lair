@@ -89,6 +89,11 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     // v1 shape untouched. Re-pushed on hot reload when a live-applied field changes them (worker quota today).
     private ModelFacts? _modelFacts;
 
+    // The owning engine's accelerator accounting seam: read once per tick, and only ever answers null for a serve that
+    // holds no opened compute backend. Null provider means the bus never asks — CPU-only hosts keep publishing exactly the
+    // snapshot shape they had before this seam existed, with these slots reading as nothing rather than zero-filled.
+    private Func<AcceleratorAccounting?>? _acceleratorProvider;
+
     // Recent admission refusals recorded by the owning facade: oldest-drops ring under the fan-out lock, newest
     // first in every read, so a snapshot's diagnostic array is one small deterministic slice of what admission
     // refused most recently. The cumulative total counts every refusal since open, ring retention aside.
@@ -308,6 +313,18 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     }
 
     /// <summary>
+    /// Wires the accelerator accounting seam an opened engine answers from its compute backends. One volatile delegate
+    /// swap read once per tick: with no provider attached — every CPU-only host — sampling never asks and snapshots keep
+    /// reading exactly as they did before this seam existed. A serve holding no opened accelerator backend attaches a
+    /// provider that reports null, which publishes the same nothing.
+    /// </summary>
+    public void AttachAcceleratorProvider(Func<AcceleratorAccounting?> provider)
+    {
+        ArgumentNullException.ThrowIfNull(provider);
+        Volatile.Write(ref _acceleratorProvider, provider);
+    }
+
+    /// <summary>
     /// Opens an independent subscription: snapshots published from now on coalesce into the subscriber's latest-
     /// pending slot (a slow reader only ever sees the newest one) and request frames queue on a bounded channel.
     /// Callers hand it back through <see cref="Unsubscribe"/> when their stream ends; the bus completes every open
@@ -496,6 +513,25 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         long occupancySumDelta = current.WindowSequenceSum - _previous.WindowSequenceSum;
         double cpuMs = current.ProcessCpuMs - _previous.ProcessCpuMs;
 
+        // Additive accelerator facts (earlier shapes untouched): kernel busy is windowed like every other rate here —
+        // device-measured microseconds advanced within this interval over the interval's own wall time — while runtime
+        // transfer tallies read cumulative-since-open and persistent weight residency reads as what each opened backend
+        // holds right now. A serve answering no accelerator accounting leaves all four null instead of publishing zeros.
+        AcceleratorAccounting? currentAccelerator = current.Accelerator;
+        double? gpuUtilizationPercent = null;
+        long? transferBytesTotal = null;
+        long? transferCallsTotal = null;
+        long? persistentVramBytes = null;
+
+        if (currentAccelerator is AcceleratorAccounting accelerator)
+        {
+            long busyDeltaMicroseconds = Math.Max(0, accelerator.KernelBusyMicrosecondsTotal - (_previous.Accelerator?.KernelBusyMicrosecondsTotal ?? 0));
+            gpuUtilizationPercent = Math.Round(busyDeltaMicroseconds * 100.0 / (windowMs * 1000.0), 2);
+            transferBytesTotal = accelerator.RuntimeTransferBytesTotal;
+            transferCallsTotal = accelerator.RuntimeTransferCallsTotal;
+            persistentVramBytes = accelerator.PersistentDeviceWeightBytes;
+        }
+
         MonitorFrame frame;
         lock (_fanout)
         {
@@ -583,7 +619,14 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 PlacementSpreadRequested: facts?.PlacementSpreadRequested,
                 PlacementNodeAllocations: facts?.PlacementNodeAllocations,
                 PlacementAdvisory: facts?.PlacementAdvisory,
-                UpdateCandidate: facts?.UpdateCandidate);
+                UpdateCandidate: facts?.UpdateCandidate,
+
+                // Additive accelerator facts read from this engine's own compute backends above — null on a serve that
+                // holds none open, so nothing about a CPU-only snapshot changes.
+                GpuUtilizationPercent: gpuUtilizationPercent,
+                PcieTransferBytesTotal: transferBytesTotal,
+                PcieTransfersTotal: transferCallsTotal,
+                PersistentVramBytes: persistentVramBytes);
 
             long id = ++_eventSeq;
             frame = new MonitorFrame(id, MonitorEventNames.Snapshot, snapshot.ToJson());
@@ -616,6 +659,7 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     private EngineSample Sample()
     {
         Process process = Process.GetCurrentProcess();
+        Func<AcceleratorAccounting?>? provider = Volatile.Read(ref _acceleratorProvider);
         return new EngineSample(
             Volatile.Read(ref _stats.DecodeSteps),
             Volatile.Read(ref _stats.DecodeWindowMicrosTotal),
@@ -634,8 +678,11 @@ public sealed class EngineMetricsBus : IAsyncDisposable
             WorkingSetMb = process.WorkingSet64 / (1024.0 * 1024.0),
 
             // CPU time through System.Diagnostics only; OS- and hardware-level telemetry beyond working set and
-            // process CPU share is out of scope for this surface.
+            // process CPU share is out of scope for this surface — accelerator facts ride the engine's own accounting
+            // seam instead, read from what its opened compute backends answer about their device work.
             ProcessCpuMs = process.TotalProcessorTime.TotalMilliseconds,
+
+            Accelerator = provider?.Invoke(),
         };
     }
 
@@ -661,5 +708,10 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         public double WorkingSetMb { get; init; }
 
         public double ProcessCpuMs { get; init; }
+
+        // One read of the engine's accelerator accounting for this sample point, or null when no provider is attached.
+        // Cumulative fields delta against the previous sample like every other counter here; persistent weight bytes are
+        // a current reading taken straight from what each opened backend holds right now.
+        public AcceleratorAccounting? Accelerator { get; init; }
     }
 }

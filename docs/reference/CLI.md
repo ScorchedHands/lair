@@ -40,6 +40,8 @@ The accepted syntax is exactly `chat -c <configPath>`. The REPL supports `/exit`
 
 Accepted syntax is `monitor [-u <absolute URL>] [--interval <milliseconds>]`. The default base URL is `http://127.0.0.1:8080`, so pass `-u` when the server uses a different bind or port. An invalid absolute URL, negative interval, or unknown monitor option exits 1.
 
+Monitor rows show tok/s, step time, batch occupancy, cache-hit share, KV usage/capacity, and active sequences. When a served engine has opened a CUDA backend, each row appends an accelerator tail: `gpu <kernel busy %>`, runtime PCIe copy bytes/calls (`pcie … over N copies`), and persistent device weight residency (`persistent-vram … MiB`). CPU-only serves omit the tail rather than showing idle-hardware zeros. The same facts arrive additively on `/monitor/stream` as optional snapshot fields: `metrics_gpu_utilization_percent`, `metrics_pcie_transfer_bytes_total`, `metrics_pcie_transfers_total`, and `metrics_persistent_vram_bytes`; they are omitted when no CUDA backend is open.
+
 ## Model CLI
 
 ```powershell

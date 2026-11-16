@@ -16,7 +16,10 @@ public sealed partial class CudaBackend
     public long PersistentDeviceWeightBytes => _deviceWeights.Sum(entry => entry.Key.Length);
 
     // The copy residency: each (pointer, length) tensor is allocated once on the device and filled by one host-to-device
-    // copy, cached for the instance's lifetime, and freed at dispose.
+    // copy, cached for the instance's lifetime, and freed at dispose. This upload is persistent weight residency, not a
+    // compute call's traffic — it is deliberately absent from the runtime transfer tallies, which answer only activation
+    // inputs and kernel outputs crossing during a GEMV. Every byte held here reads off PersistentDeviceWeightBytes for as
+    // long as its allocation stands, and drops out of that reading when the instance releases it.
     private ulong EnsureDeviceWeights(nint hostPointer, nuint bytes)
     {
         if (_deviceWeights.TryGetValue((hostPointer, (long)bytes), out ulong existing))

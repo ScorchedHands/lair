@@ -287,6 +287,7 @@ public sealed partial class CudaBackend : IBackend
             ReleaseKvMirrors(); // mirrors flush and release their pins while this instance's context is still current
             FreeDeviceWeightAllocations();
             ReleaseHostMappedRegions();
+            ReleaseTimingEvents(); // the launch-timing pair belongs to this context too, so it goes before the context does
         }
 
         CudaException.ThrowIf("cuModuleUnload", CudaNative.cuModuleUnload(_module));
@@ -338,6 +339,7 @@ public sealed partial class CudaBackend : IBackend
                     fixed (float* pIn = activations)
                     {
                         CudaException.ThrowIf("cuMemcpyHtoD_v2", CudaNative.cuMemcpyHtoD(deviceX, (byte*)pIn, xBytes));
+                        AccountRuntimeCopy((long)xBytes); // this call's activation input crossing the seam
                     }
 
                     uint rowsU = (uint)rows;
@@ -352,12 +354,23 @@ public sealed partial class CudaBackend : IBackend
                     kernelParams[5] = &countU;
 
                     uint blocks = (uint)((rows + KernelThreads - 1) / KernelThreads);
+                    bool timed = BeginKernelTiming(); // device-measured busy time for exactly this launch, when the seam is open here
                     CudaException.ThrowIf("cuLaunchKernel", CudaNative.cuLaunchKernel(function, blocks, 1, 1, KernelThreads, 1, 1, 0, IntPtr.Zero, kernelParams, null));
+                    if (timed)
+                    {
+                        StampKernelEnd();
+                    }
+
                     CudaException.ThrowIf("cuCtxSynchronize", CudaNative.cuCtxSynchronize());
+                    if (timed)
+                    {
+                        FoldKernelElapsed(); // both stamps have completed by the time this instance's context synchronize returns
+                    }
 
                     fixed (float* pOut = output)
                     {
                         CudaException.ThrowIf("cuMemcpyDtoH_v2", CudaNative.cuMemcpyDtoH((byte*)pOut, deviceOut, outBytes));
+                        AccountRuntimeCopy((long)outBytes); // this call's kernel output crossing back to host memory
                     }
                 }
             }

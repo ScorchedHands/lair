@@ -57,4 +57,18 @@ internal static partial class CudaNative
 
     [LibraryImport("nvcuda", EntryPoint = "cuModuleUnload")]
     public static partial CudaResult cuModuleUnload(IntPtr module);
+
+    // Device-side event timing, recorded on the same stream every launch here already uses. These answer how long a
+    // kernel ran as the device measured it — the seam engine accounting reads instead of any OS-level utilization view.
+    [LibraryImport("nvcuda", EntryPoint = "cuEventCreate")]
+    public static partial CudaResult cuEventCreate(out IntPtr handle, uint flags);
+
+    [LibraryImport("nvcuda", EntryPoint = "cuEventRecord")]
+    public static partial CudaResult cuEventRecord(IntPtr handle, IntPtr stream);
+
+    [LibraryImport("nvcuda", EntryPoint = "cuEventElapsedTime")]
+    public static partial CudaResult cuEventElapsedTime(out float milliseconds, IntPtr start, IntPtr end);
+
+    [LibraryImport("nvcuda", EntryPoint = "cuEventDestroy")]
+    public static partial CudaResult cuEventDestroy(IntPtr handle);
 }

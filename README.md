@@ -39,7 +39,7 @@ $LAIR = ".\src\Lair.Host\bin\Release\net10.0\lair.exe"
 | `POST /v1/chat/completions` | JSON or SSE streaming (`"stream": true`); supports `tools`/`tool_choice`, `logprobs`/`top_logprobs`, `presence_penalty`, `frequency_penalty`, `logit_bias`, `seed` |
 | `POST /v1/completions` | legacy text completions, JSON or SSE |
 | `GET /v1/models` | model list including `context_length` and quant metadata |
-| `GET /monitor/stream` | SSE stream of engine metrics snapshots and request lifecycle events (versioned schema) |
+| `GET /monitor/stream` | SSE stream of engine metrics snapshots and request lifecycle events (versioned schema; CUDA-backed serves also publish GPU-busy, PCIe transfer totals, persistent device VRAM bytes) |
 | `GET /healthz` | liveness + model readiness |
 
 Any OpenAI SDK works by pointing `base_url` at your configured API root, e.g. `http://127.0.0.1:8080/v1`. Errors use the OpenAI error shape with codes `invalid_request`, `model_not_found`, `context_length_exceeded`, `engine_overloaded`, `internal`. Every response carries `x-lair-request-id`.
@@ -54,7 +54,7 @@ Model token budgets bound a generation on both surfaces: `max_reasoning_tokens` 
 
 ## Monitor UI
 
-Point a browser at your server's `/ui`, e.g. `http://127.0.0.1:8080/ui` when default settings are used: a tabbed web UI with live engine stats — configured models (expandable for config and state), in-flight requests, per-request throughput sparklines, recent request log — plus a built-in chat client for exercising the model directly from the browser (streaming replies, mid-stream stop, tool-call display).
+Point a browser at your server's `/ui`, e.g. `http://127.0.0.1:8080/ui` when default settings are used: a tabbed web UI with live engine stats — configured models (expandable for config and state), in-flight requests, per-request throughput sparklines, recent request log — plus a built-in chat client for exercising the model directly from the browser (streaming replies, mid-stream stop, tool-call display). GPU utilization and PCIe transfer cards appear for CUDA-backed serves, while CPU-only rows stay reserved placeholders.
 
 ## Monitor CLI
 
@@ -63,7 +63,7 @@ Point a browser at your server's `/ui`, e.g. `http://127.0.0.1:8080/ui` when def
 & $LAIR monitor -u http://127.0.0.1:8181 --interval 1000
 ```
 
-Live table per model: tok/s, step time, batch occupancy, cache-hit rate, KV utilization, active sequences.
+Live table per model: tok/s, step time, batch occupancy, cache-hit rate, KV utilization, active sequences. When a CUDA-backed engine is serving, rows append `gpu <kernel busy %>`, runtime PCIe copy bytes/calls (`pcie … over N copies`), and persistent device weight residency (`persistent-vram … MiB`). CPU-only serves omit those columns; the same facts arrive on `/monitor/stream` as optional additive fields.
 
 ## Model acquisition
 
