@@ -598,11 +598,12 @@ public sealed class TransformerModel : IDisposable
                     $"'{segment.DeviceId}' is refused rather than run on CPU");
             }
 
-            if (segment.WeightTier != WeightTier.Dram)
+            // A segment resident in accelerator memory is answered only by the backend that reports reading weights from device memory it owns: a crossing whose backend states the other posture would run the span against a residency nothing here addresses, so it refuses naming the segment, both postures, and the seam device residency runs in. A host-resident segment is answered by any backend opened for its device, exactly as every unsplit route resolved until now.
+            if (segment.WeightTier == WeightTier.Vram && engine.WeightTier != Lair.Contracts.WeightTier.Vram)
             {
                 throw new ModelException(
-                    $"{segment.Describe(index)} holds its weights at tier '{segment.WeightTier}': the forward engine reads " +
-                    $"DRAM-resident weights only, and accelerator residency runs in '{ModelRoute.CudaBackendSeam}' once such a backend is opened — so architecture " +
+                    $"{segment.Describe(index)} holds its weights at tier '{segment.WeightTier}': {owner} reports the " +
+                    $"'{engine.WeightTier}' weight tier, so accelerator-resident weights run in '{ModelRoute.CudaBackendSeam}' only behind a backend opened with device-resident weight copies — architecture " +
                     $"'{Plan.Architecture}' is refused rather than run against a residency it cannot address");
             }
         }

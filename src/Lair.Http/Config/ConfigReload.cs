@@ -296,7 +296,7 @@ public static class ConfigMutationTable
         "models[0].placement.numa_spread" => ConfigMutationClass.NewRequestsOnly,
         "models[0].placement.core_overcommit" => ConfigMutationClass.RestartOnly,
         "models[0].source" => ConfigMutationClass.RestartOnly, // loadability depends on the manifest and fetch behavior established at open.
-        "tiers.dram_mb" or "tiers.dram_cores" or "tiers.nvme_path" or "tiers.nodes" => ConfigMutationClass.RestartOnly,
+        "tiers.dram_mb" or "tiers.vram_mb" or "tiers.dram_cores" or "tiers.nvme_path" or "tiers.nodes" => ConfigMutationClass.RestartOnly,
         _ => BudgetFieldClass(field) ?? ConfigMutationClass.RestartOnly,
     };
 
@@ -306,6 +306,7 @@ public static class ConfigMutationTable
     private static void AddTierChanges(List<FieldChange> changes, TierCapacityConfig? currentTiers, TierCapacityConfig? candidateTiers)
     {
         Add(changes, "tiers.dram_mb", NumberOrNone(currentTiers?.DramMb), NumberOrNone(candidateTiers?.DramMb));
+        Add(changes, "tiers.vram_mb", NumberOrNone(currentTiers?.VramMb), NumberOrNone(candidateTiers?.VramMb));
         Add(changes, "tiers.dram_cores", NumberOrNone(currentTiers?.DramCores), NumberOrNone(candidateTiers?.DramCores));
         Add(changes, "tiers.nvme_path", currentTiers?.NvmePath ?? "(unset)", candidateTiers?.NvmePath ?? "(unset)");
 
@@ -432,6 +433,7 @@ public static class ConfigMutationTable
 
         YamlDotNet.RepresentationModel.YamlMappingNode? tiers = Child(root, "tiers");
         yield return ("tiers.dram_mb", ScalarText(tiers, "dram_mb"));
+        yield return ("tiers.vram_mb", ScalarText(tiers, "vram_mb"));
         yield return ("tiers.dram_cores", ScalarText(tiers, "dram_cores"));
         yield return ("tiers.nvme_path", ScalarText(tiers, "nvme_path"));
 
@@ -486,6 +488,7 @@ public static class ConfigMutationTable
         "models[0].placement.gpu_layers" => Text(current.Models[0].Placement.GpuLayers),
         "models[0].placement.core_overcommit" => Text(current.Models[0].Placement.CoreOvercommit),
         "tiers.dram_mb" => NumberOrNone(current.Tiers?.DramMb),
+        "tiers.vram_mb" => NumberOrNone(current.Tiers?.VramMb),
         "tiers.dram_cores" => NumberOrNone(current.Tiers?.DramCores),
         "tiers.nvme_path" => current.Tiers?.NvmePath ?? "(unset)",
         "ui.recent_requests" => Text(current.Ui.RecentRequests),

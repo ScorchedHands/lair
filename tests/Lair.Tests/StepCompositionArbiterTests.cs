@@ -1,3 +1,4 @@
+using Lair.Contracts;
 using Lair.Loader;
 using Lair.Models;
 using Lair.Models.Engine;

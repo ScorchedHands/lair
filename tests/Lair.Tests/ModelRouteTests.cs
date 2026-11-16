@@ -1,4 +1,5 @@
 using Lair.Backends.Cpu;
+using Lair.Contracts;
 using Lair.Host.Config;
 using Lair.Http;
 using Lair.Loader;
@@ -213,12 +214,14 @@ public sealed class ModelRouteTests : IDisposable
             ModelName = "route-accelerator-only",
             Stages = [new(ModelRoutes.DecodeStage, AcceleratorDeviceId)],
             AvailableDevices = ["cpu", AcceleratorDeviceId],
+            DeviceWeightTiers = new Dictionary<string, WeightTier> { [AcceleratorDeviceId] = WeightTier.Vram },
             KvResidency = WeightTier.Vram,
         });
 
         DeviceSegment segment = Assert.Single(route.Segments);
         Assert.Equal(AcceleratorDeviceId, segment.DeviceId);
-        Assert.Equal(WeightTier.Vram, segment.WeightTier);
+        Assert.Equal(WeightTier.Vram, segment.WeightTier); // the opened backend posture for this device's weights
+        Assert.Contains(WeightTier.Vram, segment.BlockResidencyTiers); // KV residency is a separate axis on that same segment
     }
 
     [Fact]
@@ -235,6 +238,22 @@ public sealed class ModelRouteTests : IDisposable
         Assert.Contains("model 'route-vram-on-cpu'", error.Message);
         Assert.Contains("stage 'decode'", error.Message);
         Assert.Contains("'vram' cannot be held by a segment on 'cpu'", error.Message);
+    }
+
+    [Fact]
+    public void ModelRoutes_AcceleratorKvResidencyWithoutDeviceWeightPosture_KeepsSegmentWeightsHostResident()
+    {
+        ModelRoute route = ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "route-accelerator-kv-residency",
+            Stages = [new(ModelRoutes.DecodeStage, AcceleratorDeviceId)],
+            AvailableDevices = ["cpu", AcceleratorDeviceId],
+            KvResidency = WeightTier.Vram,
+        });
+
+        DeviceSegment segment = Assert.Single(route.Segments);
+        Assert.Equal(WeightTier.Dram, segment.WeightTier); // no opened backend posture says these weights live in device memory
+        Assert.Contains(WeightTier.Vram, segment.BlockResidencyTiers); // the KV axis still names where this model's blocks step
     }
 
     // ---------------------------------------------------------------- unresolvable declarations

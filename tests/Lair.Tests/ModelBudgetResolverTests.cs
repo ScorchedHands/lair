@@ -62,6 +62,50 @@ public sealed class ModelBudgetResolverTests
     }
 
     [Fact]
+    public void Resolve_WeightsAcceleratorClaimWithoutDeviceCopies_ReportsTheMissingWeightCopyPosture()
+    {
+        ModelException error = Assert.Throws<ModelException>(() => ModelBudgets.Resolve(new BudgetRequest
+        {
+            ModelName = "qwen-test",
+            Declared = [new BudgetChain { Resource = BudgetResource.Weights, Order = [BudgetTier.Vram] }],
+            OpenedPoolTiers = [BudgetTier.Dram],
+        }));
+
+        Assert.Contains("model 'qwen-test'", error.Message);
+        Assert.Contains("budgets for resource 'weights'", error.Message);
+        Assert.Contains("no opened pool backs working copies at tier 'vram'", error.Message);
+        Assert.Contains("device-resident weight copies", error.Message);
+    }
+
+    [Fact]
+    public void Resolve_WeightsChainAtAcceleratorTier_LandsWithDeclaredCeilingWhenDeviceCopiesAreOpened()
+    {
+        ResolvedBudgetSet resolved = ModelBudgets.Resolve(new BudgetRequest
+        {
+            ModelName = "qwen-test",
+            Declared =
+            [
+                new BudgetChain
+                {
+                    Resource = BudgetResource.Weights,
+                    Order = [BudgetTier.Vram],
+                    Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Vram] = 2048 },
+                },
+            ],
+            OpenedPoolTiers = [BudgetTier.Dram, BudgetTier.Vram],
+        });
+
+        ResolvedBudgetChain weights = resolved.For(BudgetResource.Weights)!;
+        ResolvedBudgetTier position = Assert.Single(weights.Tiers);
+        Assert.Equal(BudgetTier.Vram, position.Tier);
+        Assert.False(position.IsOriginStore);
+        Assert.Equal(2048L, position.Cap);
+
+        ResolvedBudgetTier firstCopyHolding = weights.FirstCopyHoldingTier()!;
+        Assert.Equal(BudgetTier.Vram, firstCopyHolding.Tier);
+    }
+
+    [Fact]
     public void Resolve_WriteSideDiskClaim_ReportsTheMissingWritingMachinery()
     {
         ModelException error = Assert.Throws<ModelException>(() => ModelBudgets.Resolve(new BudgetRequest

@@ -74,6 +74,7 @@ public sealed class CoreOvercommitHotReloadTests : IDisposable
         Assert.Equal("16", cores.NewValue);
 
         Assert.Equal(ConfigMutationClass.RestartOnly, ConfigMutationTable.Classify("tiers.dram_mb"));
+        Assert.Equal(ConfigMutationClass.RestartOnly, ConfigMutationTable.Classify("tiers.vram_mb"));
         Assert.Equal(ConfigMutationClass.RestartOnly, ConfigMutationTable.Classify("tiers.nvme_path"));
     }
 
@@ -124,6 +125,44 @@ public sealed class CoreOvercommitHotReloadTests : IDisposable
         """));
 
         Assert.Empty(ConfigMutationTable.Diff(candidate, samePosture)); // the same declared posture written in a different key order is no change at all.
+    }
+
+    [Fact]
+    public void AcceleratorTotalEdits_ClassifyAsRestartOnly_NamingOldAgainstNew()
+    {
+        string modelPath = TempModelFile();
+
+        LairConfig current = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{modelPath}'
+            tiers:
+              vram_mb: 1024
+        """));
+
+        LairConfig candidate = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{modelPath}'
+            tiers:
+              vram_mb: 2048
+        """));
+
+        FieldChange bytes = Assert.Single(ConfigMutationTable.Diff(current, candidate)); // the accelerator ceiling binds accounting at open.
+        Assert.Equal("tiers.vram_mb", bytes.Field);
+        Assert.Equal(ConfigMutationClass.RestartOnly, bytes.MutationClass);
+        Assert.Equal("1024", bytes.OldValue);
+        Assert.Equal("2048", bytes.NewValue);
+
+        LairConfig samePosture = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{modelPath}'
+            tiers:
+              vram_mb: 1024
+        """));
+
+        Assert.Empty(ConfigMutationTable.Diff(current, samePosture)); // the same declared ceiling is no change.
     }
 
     [Fact]

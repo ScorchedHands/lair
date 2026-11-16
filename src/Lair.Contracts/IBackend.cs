@@ -10,6 +10,14 @@ public interface IBackend : IDisposable
 {
     string DeviceId { get; }
 
+    /// <summary>
+    /// The weight tier this backend's kernels read weight bytes from while they compute: system memory where a weight
+    /// source's host regions live, or persistent device memory this backend owns and copies each tensor into once. A
+    /// route segment naming the device-resident tier is answered only by a backend reporting it; a backend reporting
+    /// system memory answers host-resident segments on any device it runs.
+    /// </summary>
+    WeightTier WeightTier { get; }
+
     MemoryHandle AllocateAligned(long bytes, int alignment);
 
     void FreeAligned(MemoryHandle handle);

@@ -83,6 +83,24 @@ public sealed class DeviceLedgerTests
     }
 
     [Fact]
+    public void RegisterClaim_FiniteAcceleratorWeightSeam_ExhaustsAgainstDeclaredCapacity_NamingModelResourceTierAndAmounts()
+    {
+        ResolvedBudgetChain chain = WeightsChain([BudgetTier.Vram]);
+        using TestLedger ledger = new(Capacity(BudgetTier.Vram, BudgetResource.Weights, 4));
+
+        Assert.True(ledger.Ledger.RegisterClaim("model-a", chain, amount: 3).Seated);
+
+        ClaimOutcome exhausted = ledger.Ledger.RegisterClaim("model-b", chain, amount: 2);
+        Assert.False(exhausted.Seated);
+        Assert.Equal(BudgetTier.Vram, exhausted.ExhaustedAtTier);
+
+        Assert.Contains("model 'model-b'", exhausted.Breakdown);
+        Assert.Contains("'weights'", exhausted.Breakdown);
+        Assert.Contains("'vram' holds 3 of 4 megabytes", exhausted.Breakdown);
+        Assert.Contains("'model-a' 3 megabytes", exhausted.Breakdown);
+    }
+
+    [Fact]
     public void RegisterClaim_ChainWithNoOpenedSeam_ReportsWhatThisHostDoesNotOpen()
     {
         using TestLedger ledger = new(); // a ledger with no capacity seams at all: nothing is guessed into existence

@@ -486,13 +486,18 @@ public static class ModelBudgets
         return new ResolvedBudgetChain { Resource = chain.Resource, Tiers = [.. positions] };
     }
 
-    // What a claim against an unopened residency is missing: the accelerator seam for a compute-backed tier (the same seam route
-    // resolution names), and, for write-side bytes at the disk tier, whether this host writes them out at all — declared vocabulary
-    // in every case, never a silent drop.
+    // What a claim against an unopened residency is missing: for the accelerator tier, whether the resource needs a compute backend opened
+    // with device-resident weight copies or a device-backed pool that residency does not hold yet (the same seam route resolution names), and
+    // for write-side bytes at the disk tier, whether this host writes them out at all — declared vocabulary in every case, never a silent drop.
     private static string DescribeMissingCapability(string resource, BudgetTier tier, bool diskWrites) => tier switch
     {
+        BudgetTier.Vram when resource == BudgetResourceNames.Weights =>
+            $"'{resource}' resident in accelerator memory needs a compute backend opened with device-resident weight copies in " +
+            $"'{ModelRoute.CudaBackendSeam}', which this open has none",
+
         BudgetTier.Vram =>
-            $"accelerator-resident working copies run in '{ModelRoute.CudaBackendSeam}', which this build does not carry",
+            $"'{resource}' has no device-backed pool opened for it — accelerator memory holds weight copies today, and device-backed pools " +
+            $"for '{resource}' run in '{ModelRoute.CudaBackendSeam}' once they are opened",
 
         _ when !diskWrites =>
             $"'{resource}' has no disk-backed pool opened for it — write-side bytes reach storage only where something writes them, " +

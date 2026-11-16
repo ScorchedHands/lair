@@ -28,7 +28,7 @@ public static class YamlConfigLoader
     private static readonly string[] SourceFileKeys = ["path", "sha256", "size"];
 
     /// <summary>The resident capacity keys a top-level tiers block may declare, in the order a refusal reports them.</summary>
-    private static readonly IReadOnlyList<string> TierKeys = ["dram_mb", "dram_cores", "nvme_path", "nodes"];
+    private static readonly IReadOnlyList<string> TierKeys = ["dram_mb", "vram_mb", "dram_cores", "nvme_path", "nodes"];
 
     /// <summary>The keys one per-node override entry may declare beside the node position it names.</summary>
     private static readonly IReadOnlyList<string> NodeOverrideKeys = ["index", "mb", "cores"];
@@ -137,12 +137,13 @@ public static class YamlConfigLoader
     }
 
     /// <summary>
-    /// Parses the top-level tiers block: flat resident capacity keys for system memory, a disk path declared as presence and path only,
-    /// and an optional list of per-node overrides keyed by node position. Shape is validated here — every known key that expects a number
-    /// must state one, positive where it states anything, and a refusal names the qualified key with the offending value (naming the node
-    /// index too for a per-node override). Whether declared totals agree with what a host reports is answered when an engine opens,
-    /// warn-and-accept: this loader never consults topology. A disk byte ceiling is not accepted here because that position already holds
-    /// the complete set; accelerator ceilings are not this block's vocabulary at all.
+    /// Parses the top-level tiers block: flat resident capacity keys for system and accelerator memory, a disk path declared as presence
+    /// and path only, and an optional list of per-node overrides keyed by node position. Shape is validated here — every known key that
+    /// expects a number must state one, positive where it states anything, and a refusal names the qualified key with the offending value
+    /// (naming the node index too for a per-node override). Whether a declared system-memory total agrees with what a host reports is
+    /// answered when an engine opens, warn-and-accept: this loader never consults topology, and an accelerator total is declared posture
+    /// alone because no driver-detected budget is consulted. A disk byte ceiling is not accepted here because that position already holds
+    /// the complete set.
     /// </summary>
     private static TierCapacityConfig? ParseTiers(Dictionary<string, YamlNode> top)
     {
@@ -161,6 +162,14 @@ public static class YamlConfigLoader
             throw new ConfigException($"tiers.dram_mb {dramMb} is invalid: 'dram_mb' must be 1 or greater — omit the key to declare no byte total.");
         }
 
+        // An accelerator total is the ceiling a device-resident weight claim seats against, stated by the operator rather than read
+        // off any device: what a host backs without stating a size keeps the posture that states no public total.
+        long? vramMb = TryLong(keys, "vram_mb", "tiers.vram_mb");
+        if (vramMb is < 1)
+        {
+            throw new ConfigException($"tiers.vram_mb {vramMb} is invalid: 'vram_mb' must be 1 or greater — omit the key to declare no byte total.");
+        }
+
         int? dramCores = TryInteger(keys, "dram_cores", "tiers.dram_cores");
         if (dramCores is < 1)
         {
@@ -176,13 +185,13 @@ public static class YamlConfigLoader
 
         IReadOnlyList<NodeCapacityOverride> nodes = ParseNodeOverrides(keys);
 
-        if (dramMb is null && dramCores is null && nvmePath is null && nodes.Count == 0)
+        if (dramMb is null && vramMb is null && dramCores is null && nvmePath is null && nodes.Count == 0)
         {
             throw new ConfigException(
                 $"{where} declares nothing: a tiers block states at least one of {Vocabulary(TierKeys)} — omit 'tiers' entirely to declare no capacity.");
         }
 
-        return new TierCapacityConfig { DramMb = dramMb, DramCores = dramCores, NvmePath = nvmePath, Nodes = nodes };
+        return new TierCapacityConfig { DramMb = dramMb, VramMb = vramMb, DramCores = dramCores, NvmePath = nvmePath, Nodes = nodes };
     }
 
     // Per-node overrides: each entry names the node position it disagrees with and states its own bytes and/or cores. A malformed value

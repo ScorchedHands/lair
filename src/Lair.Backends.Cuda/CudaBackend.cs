@@ -38,6 +38,11 @@ public sealed partial class CudaBackend : IBackend
     /// <summary>The weight residency posture this instance runs: the persistent device copy it opens with by default, or the host-mapped seam that launches against registered host regions.</summary>
     public CudaWeightResidency WeightResidency => _weightResidency;
 
+    /// <summary>The tier this instance's kernels read weight bytes from: the device copies the default posture owns are the accelerator tier, and the mapped posture reads the host regions a weight source owns, so it reports the system-memory tier.</summary>
+    public WeightTier WeightTier => _weightResidency == CudaWeightResidency.DeviceCopy
+        ? Lair.Contracts.WeightTier.Vram
+        : Lair.Contracts.WeightTier.Dram;
+
     public string DeviceId => DeviceIdValue;
 
     public CudaBackend()

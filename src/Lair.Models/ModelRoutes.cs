@@ -1,5 +1,7 @@
 namespace Lair.Models;
 
+using Lair.Contracts;
+
 /// <summary>One execution stage a model's placement declares: the part of the path it names (<c>"prefill"</c>,
 /// <c>"decode"</c>) and the compute device that part runs on. Stages reach a route in declaration order, and each may
 /// name the boundary of the ordered path its span starts at — what a host's placement resolves onto when it splits a model across devices.</summary>
@@ -22,7 +24,10 @@ public sealed record RouteRequest
     /// <summary>The device ids the opened compute backends report. A stage naming any other device resolves structurally but refuses here naming that missing backend — nothing falls back to a device that happens to work.</summary>
     public required IReadOnlyList<string> AvailableDevices { get; init; }
 
-    /// <summary>Residency placement declares for this model's KV, matched against every resolved segment: an accelerator residency with no accelerator-backed segment refuses naming the model and what is missing. DRAM is what every engine path holds today.</summary>
+    /// <summary>The weight tier each opened backend reports for the device id it answers. A device named in <see cref="AvailableDevices"/> with no entry here states no device-resident posture, so its segments read host-resident weights — the posture every backend without persistent device copies reports. This is where a resolved segment's weight tier comes from; the model's KV residency names no segment tier.</summary>
+    public IReadOnlyDictionary<string, WeightTier> DeviceWeightTiers { get; init; } = new Dictionary<string, WeightTier>();
+
+    /// <summary>Residency placement declares for this model's KV, matched against every resolved segment: an accelerator residency with no accelerator-backed segment refuses naming the model and what is missing. DRAM is what every engine path holds today. This axis is independent of a segment's weight tier — a whole-model accelerator span over device-resident weights still steps sequences whose blocks live in system memory.</summary>
     public WeightTier KvResidency { get; init; } = WeightTier.Dram;
 
     /// <summary>The model's hard cap on worker threads (1 or greater); null leaves each CPU segment at the engine's own thread choice.</summary>
@@ -133,6 +138,7 @@ public static class ModelRoutes
             {
                 DeviceId = stage.DeviceId,
                 WeightTier = tier,
+                BlockResidencyTiers = [request.KvResidency],
                 SplitPosition = stage.SplitPosition,
                 BatchCap = request.BatchCap ?? Engine.TransformerModel.MaxBatchSequences,
                 Quota = IsCpuDevice(stage.DeviceId)
@@ -147,16 +153,23 @@ public static class ModelRoutes
         return new ModelRoute { Segments = [.. segments] };
     }
 
-    // The residency a stage's weights are held at: placement declares one residency for the model today, and every
-    // resolved stage inherits it. An accelerator residency reaches only stages whose device can hold it — there is no path
-    // that reads weights out of system memory instead, so a placement asking for accelerator residency on 'cpu' names both
-    // sides of that mismatch here rather than quietly running the model somewhere else. A segment naming another device
-    // keeps the tier it was declared at and is checked against an opened backend below.
-    private static WeightTier TierForStage(RouteRequest request, RouteStage stage) =>
-        request.KvResidency == WeightTier.Vram && IsCpuDevice(stage.DeviceId)
-            ? throw new ModelException(
-                $"model '{request.ModelName}', stage '{stage.Name}': residency 'vram' cannot be held by a segment on '{ModelRoute.CpuDeviceId}' — accelerator-resident weights need an accelerator-backed device, which runs in '{ModelRoute.CudaBackendSeam}' once one is opened for it, and only '{ModelRoute.CpuDeviceId}' is available to run this model")
-            : request.KvResidency;
+    // The tier a stage's weights land at: the weight tier the opened compute backend on that stage's device reports. A
+    // device whose opened backend states no device-resident posture reads host-resident weights, which is what every
+    // backend without persistent device copies reports today. The model's KV residency is a separate axis: it decides
+    // which pools hold a sequence's blocks, never which tier a segment's weights sit at. An accelerator KV residency on
+    // a stage whose device reads blocks from host pools is what this refuses — the two axes cannot be satisfied there.
+    private static WeightTier TierForStage(RouteRequest request, RouteStage stage)
+    {
+        if (request.KvResidency == WeightTier.Vram && IsCpuDevice(stage.DeviceId))
+        {
+            throw new ModelException(
+                $"model '{request.ModelName}', stage '{stage.Name}': kv residency 'vram' cannot be held by a segment on '{ModelRoute.CpuDeviceId}' — " +
+                $"sequences whose KV blocks live in accelerator memory need a device-backed block pool, those pools run in " +
+                $"'{ModelRoute.CudaBackendSeam}' once one is opened for them, and only '{ModelRoute.CpuDeviceId}' is available to run this model");
+        }
+
+        return request.DeviceWeightTiers.TryGetValue(stage.DeviceId, out WeightTier tier) ? tier : WeightTier.Dram;
+    }
 
     // Every rule one resolved segment must satisfy before it can carry work: its batch cap inside the ceiling the engine's
     // own step math honors, a quota whose numbers mean something for the device class they name, and a compute backend

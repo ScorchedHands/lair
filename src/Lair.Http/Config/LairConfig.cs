@@ -35,6 +35,9 @@ public sealed record TierCapacityConfig
     /// <summary>Megabytes the operator declares at system memory; null (absent) declares no byte total.</summary>
     public long? DramMb { get; init; }
 
+    /// <summary>Megabytes the operator declares at accelerator memory — the ceiling a device-resident weight claim seats against when a compute backend opened with device-resident weight copies backs that tier. No driver-detected total is consulted: an absent key states no public total, which is the posture a host gives when it backs a tier without naming its size.</summary>
+    public long? VramMb { get; init; }
+
     /// <summary>Logical processors the operator declares at system memory — the unit a core set or thread quota counts in; null (absent) declares no core total.</summary>
     public int? DramCores { get; init; }
 

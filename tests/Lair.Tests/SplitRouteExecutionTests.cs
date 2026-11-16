@@ -474,6 +474,8 @@ public sealed class SplitRouteExecutionTests : IDisposable
 
         public string DeviceId => _inner.DeviceId;
 
+        public Lair.Contracts.WeightTier WeightTier => _inner.WeightTier;
+
         public MemoryHandle AllocateAligned(long bytes, int alignment)
         {
             AllocateCalls++;

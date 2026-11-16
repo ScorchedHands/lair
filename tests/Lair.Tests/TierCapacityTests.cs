@@ -54,6 +54,7 @@ public sealed class TierCapacityTests : IDisposable
 
         TierCapacityConfig tiers = config.Tiers!;
         Assert.Equal(65536L, tiers.DramMb);
+        Assert.Null(tiers.VramMb); // absent accelerator posture stays undeclared, not zero
         Assert.Equal(32, tiers.DramCores);
         Assert.Equal("models", tiers.NvmePath);
 
@@ -81,6 +82,38 @@ public sealed class TierCapacityTests : IDisposable
     }
 
     [Fact]
+    public void Load_TiersBlock_ParsesAcceleratorTotal()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            tiers:
+              vram_mb: 24576
+        """;
+
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+
+        TierCapacityConfig tiers = config.Tiers!;
+        Assert.Null(tiers.DramMb);
+        Assert.Equal(24576L, tiers.VramMb);
+    }
+
+    [Fact]
+    public void Load_NonPositiveAcceleratorTotal_FailsNamingKeyAndValue()
+    {
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            tiers:
+              vram_mb: 0
+        """)));
+
+        Assert.Contains("tiers.vram_mb 0 is invalid", error.Message);
+    }
+
+    [Fact]
     public void Load_UnknownKeyUnderTiers_FailsNamingTheOffendingKey()
     {
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
@@ -92,7 +125,7 @@ public sealed class TierCapacityTests : IDisposable
         """)));
 
         Assert.Contains("Unknown key 'ddr_mb' under 'tiers'", error.Message);
-        Assert.Contains("dram_mb, dram_cores, nvme_path, nodes", error.Message);
+        Assert.Contains("dram_mb, vram_mb, dram_cores, nvme_path, nodes", error.Message);
     }
 
     [Fact]

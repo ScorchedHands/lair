@@ -783,6 +783,53 @@ public sealed class GenerationService : IDisposable
     // a claim never under-reports what it holds against a ceiling declared in that unit.
     private static long WeightClaimMegabytes(long bytes) => (bytes + 1024 * 1024 - 1) / (1024 * 1024);
 
+    // The residency tiers this open's pools back working copies at: system memory always, plus accelerator memory when the
+    // accelerator backend it opened reads weights from device copies it owns. A backend launched against registered host regions
+    // opens no such tier — its weights never enter persistent device memory — and no placement of any other resource gains a
+    // residency here.
+    private static IReadOnlyList<BudgetTier> OpenedPoolTiersFor(CudaBackend? splitExecution) =>
+        splitExecution is not null && splitExecution.WeightTier == Lair.Contracts.WeightTier.Vram
+            ? [BudgetTier.Dram, BudgetTier.Vram]
+            : [BudgetTier.Dram];
+
+    // The ledger an engine opens when it carries no shared accounting: every tier its pools back for every budgetable resource, each
+    // stating the explicit unbounded capacity posture — a public total no configuration declared is never invented. Accelerator memory
+    // holding weight copies is the exception: opening that tier states the ceiling 'tiers.vram_mb' declares for it when the configuration
+    // names one, and keeps the unbounded posture where it does not, because nothing here consults a driver-detected device total. No seam
+    // opens at accelerator memory for any other resource: block pools and activation buffers live in system memory until something backs them elsewhere.
+    private static DeviceLedger OpenHostLedger(string modelName, TierCapacityConfig? tiers, CudaBackend? splitExecution, ILogger? logger)
+    {
+        BudgetResource[] resources = [BudgetResource.Weights, BudgetResource.Kv, BudgetResource.PrefillBuffers];
+        List<CapacitySeam> seams = [];
+
+        foreach (BudgetTier tier in OpenedPoolTiersFor(splitExecution))
+        {
+            foreach (BudgetResource resource in resources)
+            {
+                if (tier == BudgetTier.Vram && resource != BudgetResource.Weights)
+                {
+                    continue; // no device-backed pool for this resource is opened here, so nothing accounts against that position
+                }
+
+                seams.Add(new CapacitySeam { Tier = tier, Resource = resource, Capacity = null });
+            }
+        }
+
+        if (splitExecution is not null && splitExecution.WeightTier == Lair.Contracts.WeightTier.Vram)
+        {
+            long? declaredMb = tiers?.VramMb;
+            seams.Add(new CapacitySeam { Tier = BudgetTier.Vram, Resource = BudgetResource.Weights, Capacity = declaredMb });
+
+            logger?.LogInformation(
+                "vram_capacity model='{Model}' device={Device} vram_mb={VramMb}",
+                modelName,
+                splitExecution.DeviceId,
+                declaredMb is long mb ? mb.ToString(CultureInfo.InvariantCulture) : "(undeclared: unbounded capacity posture)");
+        }
+
+        return new DeviceLedger(seams);
+    }
+
     // Declared capacity totals read against the posture this host reported. A disagreement is logged and accepted rather than refused: an
     // operator may state a number detection could not see, which is exactly what a per-node override exists for, while byte totals no node stated
     // read as incomparable rather than as a mismatch with what was declared. The posture itself is always reported so the comparison has a source.
@@ -1119,7 +1166,10 @@ public sealed class GenerationService : IDisposable
         // a declared split lands its first span on device 'cuda' from layer 0 with every later layer — through the last one, where
         // the output head runs — back on cpu at boundary gpu_layers, and a stage naming any other backend fails now naming that
         // segment and what is missing rather than opening an engine that would run the model somewhere else. The resolved segments
-        // land on the plan at open unchanged — nothing re-derives them while the model stays open.
+        // land on the plan at open unchanged — nothing re-derives them while the model stays open. Each segment's weight tier is
+        // what the backend opened for its position reports: a default-opened accelerator backend reads the device copies it owns,
+        // so its span resolves at the accelerator tier, while every host-resident posture — CPU kernels and an accelerator backend
+        // launched against registered host regions — resolves at system memory.
         ModelRoute route;
         ResolvedBudgetSet budgets;
 
@@ -1133,11 +1183,18 @@ public sealed class GenerationService : IDisposable
                     new RouteStage(ModelRoutes.DecodeStage, ModelRoute.CpuDeviceId) { SplitPosition = modelConfig.Placement.GpuLayers },
                 ];
 
+            Dictionary<string, Lair.Contracts.WeightTier> deviceWeightTiers = new() { [backend.DeviceId] = backend.WeightTier };
+            if (splitExecution is not null)
+            {
+                deviceWeightTiers[splitExecution.DeviceId] = splitExecution.WeightTier;
+            }
+
             route = ModelRoutes.Resolve(new RouteRequest
             {
                 ModelName = modelConfig.Name,
                 Stages = stages,
                 AvailableDevices = splitExecution is null ? [backend.DeviceId] : [backend.DeviceId, splitExecution.DeviceId],
+                DeviceWeightTiers = deviceWeightTiers,
                 ThreadQuota = modelConfig.Placement.ThreadQuota,
                 CoreSet = modelConfig.Placement.CoreSet,
             });
@@ -1145,12 +1202,13 @@ public sealed class GenerationService : IDisposable
             // The model's declared budgets resolve against the pools this service opens for it, here and once: each chain lands as what an
             // opened host can actually carry, and a claim nothing backs fails now naming the model, the resource, the tier, and the missing
             // capability — before any weight view or reservation is spent on posture that cannot hold it. What every backend this build opens
-            // holds working copies in is system memory; disk-backed write-side pools are vocabulary those chains may name but nothing here carries yet.
+            // holds working copies in is system memory; an accelerator backend opened with device-resident weight copies opens that tier for
+            // weight claims too, and disk-backed write-side pools remain vocabulary those chains may name but nothing here carries yet.
             budgets = ModelBudgets.Resolve(new BudgetRequest
             {
                 ModelName = modelConfig.Name,
                 Declared = modelConfig.Budgets ?? [],
-                OpenedPoolTiers = [BudgetTier.Dram],
+                OpenedPoolTiers = OpenedPoolTiersFor(splitExecution),
             });
         }
         catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
@@ -1164,7 +1222,7 @@ public sealed class GenerationService : IDisposable
         // explicit unbounded capacity posture — the answer a host gives when it backs a tier but states no public total.
         // Claims register in this open's order: weights once the tensor table is read, prefill from the activation
         // posture the engine families hold, and the KV reservation as the pool opens.
-        ledger ??= DeviceLedger.OpenedTiersUnbounded([BudgetTier.Dram]);
+        ledger ??= OpenHostLedger(modelConfig.Name, config.Tiers, splitExecution, logger);
 
         GgufFile? file = null;
         TransformerModel? model = null;

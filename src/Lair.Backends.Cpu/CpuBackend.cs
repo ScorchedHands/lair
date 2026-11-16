@@ -97,6 +97,9 @@ public sealed unsafe partial class CpuBackend : IBackend
 
     public string DeviceId => "cpu";
 
+    /// <summary>Every kernel here reads weight bytes from host memory the weight source owns: the system-memory tier.</summary>
+    public WeightTier WeightTier => Lair.Contracts.WeightTier.Dram;
+
     /// <summary>Worker count this backend actually runs threaded GEMV with (dispatcher plus pool workers), after quota and auto-sizing.</summary>
     public int EffectiveWorkerCount => _effectiveThreads;
 

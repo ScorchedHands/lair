@@ -1,6 +1,7 @@
 namespace Lair.Models.Scheduling;
 
 using System.Runtime.CompilerServices;
+using Lair.Contracts;
 using Lair.Models;
 
 /// <summary>
@@ -204,14 +205,14 @@ internal sealed class StepCompositionArbiter
                     continue;
                 }
 
-                if (candidate.KvResidency != segment.WeightTier)
+                if (!segment.BlockResidencyTiers.Contains(candidate.KvResidency))
                 {
                     refused.Add(new DeferredStepCandidate(
                         candidate,
                         steppingSegmentIndex,
                         CompositionBlock.KvResidency,
                         $"pipeline {candidate.PipelineId} holds its KV at tier '{candidate.KvResidency}', which " +
-                        $"{segment.Describe(steppingSegmentIndex)} cannot address — a merged step advances the residency that segment " +
+                        $"{segment.Describe(steppingSegmentIndex)} cannot address — a merged step advances the block residency that segment " +
                         $"reads, so this pipeline steps on its own instead."));
                     continue;
                 }

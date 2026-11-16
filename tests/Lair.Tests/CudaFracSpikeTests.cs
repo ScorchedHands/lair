@@ -368,6 +368,8 @@ public sealed class CudaFracSpikeTests : IDisposable
 
         public string DeviceId => _inner.DeviceId;
 
+        public Lair.Contracts.WeightTier WeightTier => Lair.Contracts.WeightTier.Dram;
+
         public MemoryHandle AllocateAligned(long bytes, int alignment) => _inner.AllocateAligned(bytes, alignment);
 
         public void FreeAligned(MemoryHandle handle) => _inner.FreeAligned(handle);
