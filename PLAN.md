@@ -23,7 +23,7 @@ LAIR is a C#/.NET inference runtime for local LLMs on x64 hardware, serving CPU/
 - Per-resource tier budgets with overflow order: every model declares caps at each copy-holding (resource, tier) pair for weights/layers, KV, and the prefill working set; each resource carries its own tier priority (`dram` → `vram` → `disk`) so an exceeded cap demotes **that resource** into the next lower-priority tier rather than moving the whole model — read-side chains end at disk with no ceiling there. Cross-model contention is first-come-first-served for bytes and core quotas alike (spill down a chain, partial grants for compute), capacity is declared as host totals while NUMA nodes are derived from topology under a per-model `numa_spread: auto | local | interleave` preference
 - Dense weight tiering — dense (non-MoE) weight slabs are promotable/demorable across DRAM/VRAM/disk while serving; disk-resident dense weights are a capacity mechanism for multi-model residency on the 128 GB target, not a speed path
 - Config-file hot-reload for every runtime knob; no admin API
-- CUDA backend with Strata-style hybrid CPU/GPU inference
+- CUDA backend with Strata-style hybrid CPU/GPU inference: the same GGUF quant-format coverage as the CPU backend for weight GEMV/GEMM (MVP5.2/MVP5.3), an on-device dense prefill step (MVP5.4), concurrent multi-model device compute on one accelerator (MVP6.1), and the same GPU-compute feature set for flagship MoE models (MVP7.1-7.3)
 - MoE residency for Qwen3.8-Flash-Next: router, expert gather, RAM hot tier, pageable PLE with indexed disk gather, MTP drafting
 - Tiered residency: disk cold expert tier, VRAM hot expert tier
 - Host-resident compute: DRAM-resident expert slabs executed on the GPU (Strata's `pcie-frac`) — GPU compute without spending VRAM on weights, streamed over PCIe with double-buffered prefetch
@@ -1534,6 +1534,125 @@ KV cache becomes a configurable per-side format pair (`fp32`, `fp16`, `int8`/k8v
 - [_] Automated Spike: generic-vs-hand-written attention delta on a pinned fixture records primary vs fallback, and q4-K drift vs llama `q4_0` records keep/drop of `q4/q4`
 - [_] Manual Quant Recommendation: read the measured per-mode bench and confirm the documented KV default follows the parity/quality decision, not the smallest footprint
 
+### MVP5.2 [v0.5.2] - Refined
+
+CUDA reaches CPU parity on GGUF quant-format coverage for weight GEMV: the 13 formats CUDA lacks (`Q8_0`, `Q5_0`, `Q5_K`, `Q2_K`, `Q3_K`, `Q2_0`, `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`/`IQ2_XS`/`IQ2_S`, `IQ3_XXS`/`IQ3_S`) get CUDA GEMV kernels validated against the CPU oracle **within a per-format measured band, not bit-for-bit**, so the new kernels are written to be fast rather than last-bit-equal. Ordered after MVP5 and MVP5.1 because it reuses their activation-quant machinery; scope is weight GEMV only — dense matmul/prefill land in MVP5.3/MVP5.4.
+
+#### Design Notes
+
+- **DN-M5.2-1** — CUDA GEMV is validated against the CPU oracle (ik-pinned integer-dot for i-quants, scalar float for block quants) within a per-format measured band rather than bit-for-bit; this unlocks `dp4a`, coalesced loads, `fma`, and tree reduction that the existing "device == host scalar bit-for-bit" invariant forbids. The new band is **CUDA-only** — CPU parity stays bit-identical (`scalar==AVX2==VNNI`) and no dense-family band is widened (the 2026-11-11 posture holds). Consequence: CUDA-served vs CPU-served output may diverge on near-tie tokens, guarded by a documented behavior note plus a Parity near-tie argmax fixture.
+  - Rationale: bit-identity forecloses every technique that makes GPU GEMV win; precedented by the lossy-mode bands already in DN-M51-7/DN-M7-9.
+  - Rejected: keeping bit-identity (the whole reason this phase exists); dequant-to-f32 for i-quants (6–9× drift per DN-M5-2, forfeits `dp4a`); a LAIR-authored CUDA-only oracle (consistently-wrong risk).
+  - Contract: the Parity category gains a recorded per-format CUDA band; dense-family bands are never widened.
+- **DN-M5.2-2** — Sub-4-bit i-quant CUDA = `dp4a` int8×int8 against a `Q8_K` activation crossed over PCIe (bytes + scales, host-quantized once per forward), reusing MVP5's machinery rather than a dequant-to-f32 dot.
+  - Rationale: the CPU oracle for these formats is an integer-dot against `Q8_K`; matching it on CUDA needs that activation on-device — bandwidth-neutral-or-better versus today's f32 crossing.
+  - Rejected: FP activation (DN-M5-2 numerics bug); dequant-to-f32 (6–9× drift, forfeits the integer-dot win).
+  - Contract: a new `Q8_K`-over-PCIe seam feeding per-format CUDA dot kernels.
+- **DN-M5.2-3** — Load-time capability gate: a route naming a format CUDA cannot execute refuses at load naming model/format/backend, replacing today's mid-decode `Unsupported` throw; extends the existing `FormatsWithoutKernels`/`SupportsGemm` refusal wording.
+  - Rationale: surfacing an unsupported format after work has dispatched wastes a partial decode; refusing at load is zero runtime cost.
+  - Rejected: keeping the mid-decode throw; silently falling back to CPU for a `cuda`-named segment (hides that the route cannot run as asked).
+  - Contract: backend capability queried during route resolution/load, not per token.
+- **DN-M5.2-4** — Bench gate first and GEMV-only scope boundary: CUDA-vs-CPU GEMV measured per format on pinned fixtures before any "GPU is faster" claim; each band width and the GPU/CPU delta are recorded numbers, losses kept non-default. Dense matmul stays out (deferred to MVP5.3).
+  - Rationale: nothing in this phase has been benchmarked yet — speed claims must be measured against known CPU costs, not asserted from kernel shape.
+  - Rejected: shipping a format as the CUDA default without measurement; scoping dense GEMM here (it unblocks but defers it to MVP5.3).
+  - Contract: a committed `bench/` report gates every per-format speed claim in this phase.
+
+#### Implementation Items
+
+- [_] Load-time capability gate — refuse a `cuda`/`hybrid` segment naming an unsupported format at load, naming model/format/backend (see DN-M5.2-3)
+  - Verify: `dotnet test --filter Category=Config|Loader -c Release` — a route naming e.g. `IQ3_S` on CUDA refuses at load with the offending named; supported formats resolve unchanged.
+- [_] Block-quant CUDA GEMV (`Q8_0`, `Q5_0`, `Q5_K`, `Q2_K`, `Q3_K`, `Q2_0`) — dequant+dot kernels mirroring the scalar reference math within band (see DN-M5.2-1)
+  - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — output lands inside each format's recorded band vs the CPU oracle; batch==solo, no mid-decode `Unsupported`.
+- [_] i-quant CUDA GEMV (`IQ4_NL`, `IQ4_XS`, `IQ2_XXS/XS/S`, `IQ3_XXS/S`) — `dp4a` against a `Q8_K` activation crossed over PCIe (see DN-M5.2-1, DN-M5.2-2)
+  - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — integer-dot output within band vs the ik-pinned reference; near-tie argmax fixture holds or is recorded as a documented divergence (see DN-M5.2-1).
+- [_] Bench gate report — per-format CUDA-vs-CPU GEMV measured on pinned fixtures before defaults flip (see DN-M5.2-4)
+  - Verify: committed `bench/reports/cuda-gemv-parity-<date>.md` recording each format's band width and GPU/CPU delta; a measured loss keeps that format non-default rather than asserting a win.
+
+#### Tests
+
+- [_] Automated Kernel/Parity: CUDA GEMV for every newly covered format lands within its recorded per-format band vs the CPU oracle (batch==solo), with the near-tie argmax fixture
+- [_] Automated Config/Loader: an unsupported `cuda`-named format refuses at load naming model/format/backend
+- [_] Manual Quant Recommendation: read the bench report and confirm each CUDA default follows measured speed, not assertion
+
+### MVP5.3 [v0.5.3] - Refined
+
+CUDA dense matmul (`GemmBatch`) plus the toolchain decision — flips `SupportsGemm` true per supported format so `PrefillKernel.Gemm` can run on a CUDA segment. Self-contained and verifiable as GEMM parity, but **not yet fast prefill** (attention + device KV land in MVP5.4). Ordered after MVP5.2 because it reuses its dequant+dot primitives; before MVP5.4/MVP6.
+
+#### Design Notes
+
+- **DN-M5.3-1** — Blocked GEMM reuses MVP5.2's per-format dequant+dot primitives with register/shared-memory tiling so each quantized weight element is dequantized once per tile and reused across the activation-row window — that amortization is exactly why prefill wants GEMM over N×GEMV. Band parity inherits DN-M5.2-1.
+  - Rationale: re-dequantizing weights per token forfeits the matmul win; tiling is where a dense step beats repeated single-token dots.
+  - Rejected: naive device-side N×GEMV loop (re-dequantizes every token); a new quant scheme for GEMM (breaks format coverage/parity with MVP5.2).
+  - Contract: `GemmBatch`/`PrefillKernel.Gemm` kernel family over the same `IWeightSource` descriptors; `SupportsGemm` flips true per supported-format set.
+- **DN-M5.3-2** — Toolchain posture stays managed-first hand-written PTX, including WMMA inside the embedded-PTX seam for unquantized `f32`/`f16` dense matmul; cuBLAS/cuBLASLt is not linked and is reconsidered only if a measured bench shows our kernels cannot close the gap **and** the owner accepts relaxing managed-first.
+  - Rationale: as-built CUDA links no native library today (embedded PTX only) and the plan repeatedly rejects native shims; dense unquantized matmul is where cuBLAS would win, so it is a measured escalation, not an assumption in either direction.
+  - Rejected: linking cuBLAS/cuBLASLt now (native dependency + packaging against the managed-first posture); betting on hand-written WMMA with no bench fallback (may underperform).
+  - Contract: dense matmul stays in the `CudaBackend+Ptx` seam; any toolchain change is recorded only against measured evidence.
+- **DN-M5.3-3** — The load-time capability gate extends to `PrefillKernel.Gemm`, reusing TransformerModel's existing `FormatsWithoutKernels`/`SupportsGemm` refusal so a CUDA segment naming GEMM on an unsupported format refuses at load rather than throwing per layer.
+  - Rationale: prefill already selects GemV/Tiled/Gemm; the gate must decide before dispatch, not after work starts.
+  - Rejected: runtime fallback from `Gemm` to `GemV` mid-prefill (a silent perf cliff); choosing `Gemm` against CUDA today then throwing `Unsupported` per layer.
+  - Contract: prefill kernel selection consults the capability gate before dispatching a step.
+- **DN-M5.3-4** — Bench gate first: CUDA-GEMM vs CPU-prefill measured per format on pinned fixtures; "faster" is a recorded number, losses kept non-default. This bench is also where the cuBLAS-vs-hand-written decision (DN-M5.3-2) gets its answer.
+  - Rationale: GEMM alone is not fast prefill and tensor-core wins are unproven for our kernels until measured against CPU-prefill on real fixtures.
+  - Rejected: shipping `SupportsGemm=true` as the default without measurement; assuming a WMMA win before benchmarking it (the escalation trigger lives here).
+  - Contract: a committed `bench/` report gates both the GEMM default and any toolchain change.
+
+#### Implementation Items
+
+- [_] CUDA dense matmul kernel family — tiled dequant-once + dot/reuse for supported formats; flip `SupportsGemm` per set (see DN-M5.3-1)
+  - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — `GemmBatch` output lands within the inherited band vs the CPU reference, batch==solo.
+- [_] Prefill GEMM capability gate + selection — `PrefillKernel.Gemm` dispatches only for formats with kernels; unsupported refuses at load naming them (see DN-M5.3-3)
+  - Verify: `dotnet test --filter Category=Config|Loader -c Release` — a CUDA route selecting `Gemm` on an unsupported format refuses at load; supported routes select it without per-layer throws.
+- [_] Hand-written WMMA dense matmul for unquantized f32/f16 in the PTX seam (see DN-M5.3-2)
+  - Verify: `dotnet test --filter Category=Kernel -c Release` on CUDA — WMMA path within band vs scalar reference; no native library linked (`CudaBackend+Ptx` only).
+
+#### Tests
+
+- [_] Automated Kernel/Parity: CUDA GEMM for supported formats within the inherited band (batch==solo)
+- [_] Automated Config/Loader: `PrefillKernel.Gemm` on an unsupported format refuses at load naming it; supported formats select it cleanly
+- [_] Manual Bench Gate: read the committed report and confirm both the GEMM default and any cuBLAS reconsideration follow measured numbers
+
+#### Open Items
+
+- [_] **Toolchain escalation** — whether hand-written WMMA closes the dense-matmul gap is settled by the DN-M5.3-4 bench before any cuBLAS/cuBLASLt reconsideration; a measured shortfall records the escalation trigger rather than adopting a library on assumption (see DN-M5.3-2). Resolve during MVP5.3 build.
+
+### MVP5.4 [v0.5.4] - Refined
+
+CUDA attention + device-resident KV for the GPU step — where **fast dense GPU prefill is actually demonstrated**, because it composes MVP5.3's matmul with on-device `softmax(QKᵀ)V`/RoPE/KV write instead of staging attention back over PCIe per layer. This owns MVP4's deferred GPU-attention kernels and reconciles its "CPU seam reads VRAM arenas" posture to device-side execution. Dense families only — flagship MoE device execution is gated in MVP7.*. Ordered after MVP5.3, before MVP6.
+
+#### Design Notes
+
+- **DN-M5.4-1** — A full on-device transformer step (`softmax(QKᵀ)V` causal + RoPE + KV write) composed with MVP5.3's matmul, so the prefill step does not stage attention back over PCIe per layer; this is where fast GPU prefill is demonstrated rather than relocated work.
+  - Rationale: GEMM alone leaves attention on CPU — weight projections on device with a per-layer PCIe round-trip is not faster prefill.
+  - Rejected: an incremental "matmul-on-device, attention-staged-to-CPU" bridge (relocated work, no speedup); deferring GPU-attention again (the whole reason this phase exists).
+  - Contract: on-device step kernels composing MVP5.3 matmul with causal attention + RoPE over the model's layers; owns MVP4's deferred attention path.
+- **DN-M5.4-2** — Device-resident KV: same `vram`/`split` config vocabulary, but executed device-side (read/write by the GPU step) instead of VRAM arenas read back by the CPU seam (MVP4 posture) — a reconciliation of MVP4, recorded not silently contradicted.
+  - Rationale: an on-device attention step needs its own KV resident and readable on the device; keeping it host-read reintroduces the PCIe tax per layer.
+  - Rejected: leaving `vram` arenas read by the CPU seam (PCIe round-trip); a new residency vocabulary (reuse MVP4/MVP5.1 config axes).
+  - Contract: KV block pools/`.Slice` reads served on-device for GPU steps; host-resident modes unchanged.
+- **DN-M5.4-3** — Prefill parity is a generation-seeded lossy band, measured against a CPU-prefill reference over full generations (GPU-prefill divergence seeds every later token), like DN-M7-9/DN-M51-7 — never bit-identical, no existing bands widened.
+  - Rationale: GPU attention reorders accumulation and shifts logits; comparing a whole generation against the CPU-prefill reference is what makes that drift honest.
+  - Rejected: demanding bit-identity on device prefill (the posture MVP5.2 already retired for CUDA); folding prefill drift into dense-family bands (forbidden widening).
+  - Contract: a per-fixture GPU-vs-CPU generation band recorded in the parity report; solo determinism preserved within that band.
+
+#### Implementation Items
+
+- [_] On-device step composition — causal `softmax(QKᵀ)V` + RoPE + KV write composed with MVP5.3 matmul, no per-layer PCIe attention staging (see DN-M5.4-1)
+  - Verify: `dotnet test --filter Category=Parity|Prefill -c Release` on CUDA — a dense prefill generation lands within its recorded band vs the CPU-prefill reference; monitor shows device-side step, not per-layer host attention.
+- [_] Device-resident KV read/write for GPU steps (see DN-M5.4-2)
+  - Verify: `dotnet test --filter Category=Kv|Prefill -c Release` on CUDA — the GPU step reads/writes its own resident blocks; host-read arena mode still works unchanged as a non-default.
+- [_] Prefill payoff + parity bench — measure end-to-end dense GPU prefill vs CPU prefill and record the generation band (see DN-M5.4-3)
+  - Verify: committed `bench/reports/cuda-prefill-<date>.md` showing device-vs-CPU dense prefill tok/s; a measured no-win records it rather than asserting fast prefill, and the parity band is recorded for each fixture.
+
+#### Tests
+
+- [_] Automated Parity/Prefill: dense GPU-prefill generations within their recorded band vs CPU-prefill reference; solo determinism holds
+- [_] Manual Flash Dense Prefill: run a pinned dense model on CUDA and confirm from monitor/bench that prefill is device-side and measurably faster than the CPU path
+
+#### Open Items
+
+- [_] **GPU-prefill payoff gate** — whether composing matmul + attention + KV on-device actually beats CPU prefill on pinned fixtures is settled by DN-M5.4-3 measurement before GPU prefill becomes a default; a measured no-win keeps CPU prefill and records it (premise-falsification pattern). Resolve during MVP5.4 build.
+
 ### MVP6 [v0.6.0] - Refined
 
 Many models at once, each with its own placement policy.
@@ -1556,6 +1675,10 @@ Many models at once, each with its own placement policy.
   - Rationale: OpenAI clients expect either a normal completion or an OpenAI-shaped error, not a queued response. Blocking preserves wire compatibility while making server-side backpressure explicit and bounded.
   - Rejected: returning a queued/pending status; reserving KV or token budgets for queued requests; unbounded queue growth; indefinite blocking when a timeout can be configured.
   - Contract: `max_queued_requests` defaults to `0` (today's fail-fast posture), `queue_timeout_ms` defaults to a bounded wait when queueing is enabled, queue keys are new-request-only, `/v1/models` reports active/queued posture, `/monitor/stream` carries queue depth and recent queue-timeout/queue-full refusals, and queue-full or timeout maps to `engine_overloaded` with an actionable message.
+- **DN-M6-7** — MVP6's device budgets partition **capacity** (VRAM/DRAM/core claims through the `DeviceLedger`), not device compute concurrency: on the single CUDA device today, multiple resident models run their own per-model schedulers and their kernels serialize through one primary context rather than sharing the device concurrently. Concurrent multi-model device compute is deferred to MVP6.1; MVP6's flagship scenario pairs one GPU model with a CPU model and never exercises two models on the device.
+  - Rationale: MVP6's deliverable is registry + admission + fairness accounting; making GPU kernels actually overlap across models is a backend/scheduler capability with its own invariants, so it earns its own phase rather than being silently assumed by the ledger.
+  - Rejected: treating the memory ledger as if it delivered concurrent GPU throughput (it does not); reopening already-Refined MVP6 to own device-stream co-scheduling (a capability that deserves its own phase).
+  - Contract: `DeviceLedger` bounds VRAM/DRAM/core claims and refuses over-budget chains; it makes no claim about device-compute overlap, which MVP6.1 owns.
 
 #### Implementation Items
 
@@ -1579,6 +1702,51 @@ Many models at once, each with its own placement policy.
 - [_] Automated Fairness: cross-model ITL isolation
 - [_] Automated Queue: queue-full, queue timeout, no pre-admission KV/token reservation, and queue-depth reporting
 - [_] Automated Embeddings: pooling parity vs reference fixtures
+
+### MVP6.1 [v0.6.1] - Refined
+
+Concurrent multi-model device compute on the single CUDA accelerator: per-model CUDA streams on the shared primary context plus a cross-model co-scheduling seam, so two GPU-resident models advance concurrently instead of serializing every kernel launch through one context — the capability MVP6's "serve multiple models concurrently" promise needs but its ledger (DN-M6-7) does not provide. Single-device scope; multi-GPU placement stays in Backlog. Depends on MVP6. Ordered after MVP6, before MVP7.
+
+#### Design Notes
+
+- **DN-M61-1** — Multi-model device concurrency is per-model CUDA streams on the shared primary context plus a host-level co-scheduling seam that advances each model's own scheduler; not CUDA MPS, per-model sub-contexts, or time-slicing.
+  - Rationale: streams are the minimal overlap mechanism on a context the process already retains (`cuDevicePrimaryCtxRetain`), need no new native dependency, and keep the managed-first posture; separate contexts or MPS add process/daemon and memory overhead a single-process engine does not need.
+  - Rejected: per-model CUDA sub-contexts (primary context is process-wide; subcontexts add complexity and VRAM overhead); CUDA MPS (an extra daemon/packaging concern, not warranted for one in-process engine); "concurrency" delivered as time-sliced serialization (that is the status quo, not overlap).
+  - Contract: each model's `CudaBackend` launches on its own `CUstream`; a host co-scheduling seam decides step boundaries across per-model schedulers so device kernels overlap while the control plane stays per-model.
+- **DN-M61-2** — GPU fair-share bounds each model's device use through the existing per-segment batch cap and quota headroom extended to device segments, plus an optional `models[].compute_share` priority; it never preempts in-flight work (MVP6 no-preempt posture holds).
+  - Rationale: without a fairness bound a heavy coding model can starve a small embedding model on the same device; caps + an explicit share give bounded fairness without the hardware-specific machinery a 4090 lacks.
+  - Rejected: MIG/SM hardware partitioning (not available on the 4090 dev target); FIFO with no fairness (starves small models); preemption to rebalance (forbidden until MVP8 tiers).
+  - Contract: a per-model device quota/`compute_share` value consumed at step composition; an over-subscribed candidate defers naming the cap, mirroring the existing composition-refusal posture.
+- **DN-M61-3** — Determinism holds under overlap: a model's token stream is identical whether its step ran solo or overlapped another model's kernels, and cross-model shared batch steps stay non-default.
+  - Rationale: the plan's parity/no-preempt and per-pipeline RNG isolation invariants require that co-scheduling never interleave model state; overlap is a scheduling/launch concern, not a merge of two models' math.
+  - Rejected: merging two models into one batch step by default (Backlog posture — never default); shared mutable state across models during a step (breaks per-model determinism).
+  - Contract: composition merges only same-plan pipelines as today; streams change *when* kernels run, never whose logits a pipeline produces.
+- **DN-M61-4** — Single-device scope: the fleet carries exactly one CUDA device (`cuDeviceGet(..., 0)`), so MVP6.1 delivers concurrency on one accelerator; partitioning across >1 GPU is out of scope and stays Backlog.
+  - Rationale: multi-GPU placement is unmeasurable on this fleet, and the plan defers untestable features (the AVX-512/Zen precedent) rather than planning them as phases.
+  - Rejected: designing multi-GPU placement now (no target hardware to validate against); assuming a single context can span devices.
+  - Contract: MVP6.1 kernels/streams bind to the one primary context; the multi-GPU seam is recorded only as a Backlog question.
+
+#### Implementation Items
+
+- [_] Co-scheduling payoff bench — measure two-model overlapped tok/s vs serialized single-context on pinned fixtures (see DN-M61-1)
+  - Verify: committed `bench/reports/multi-model-device-concurrency-<date>.md` comparing overlapped vs serialized two-model GPU serving; a measured no-win keeps serialize-per-context as the recorded default rather than asserting a concurrency win.
+- [_] Per-model CUDA streams in `CudaBackend` — each model's launches on its own `CUstream` on the shared primary context (see DN-M61-1)
+  - Verify: `dotnet test --filter Category=Serve -c Release` on CUDA — two models' forwards enqueue on distinct streams and both make progress concurrently (monitor shows overlapping device steps), and each model's outputs are identical to its solo run.
+- [_] Cross-model co-scheduling seam + GPU fair-share — a host seam bounds per-model device use via per-segment batch/quota caps and optional `models[].compute_share`, never preempting in-flight (see DN-M61-2)
+  - Verify: `dotnet test --filter Category=Scheduling|Config -c Release` on CUDA — a GPU-heavy model and a small embedding model resident on the same device keep per-model ITL within budget while both advance, an over-subscribed candidate defers naming the cap, and no running sequence is preempted.
+- [_] Determinism under overlap — a model's token stream identical solo vs overlapped; cross-model shared batch steps remain non-default (see DN-M61-3)
+  - Verify: `dotnet test --filter Category=Parity|Serve -c Release` on CUDA — token streams identical whether overlapped or solo, and default composition never merges two models into one batch step.
+
+#### Tests
+
+- [_] Automated Serve (CUDA): two models overlap on distinct streams with outputs identical to solo
+- [_] Automated Scheduling/Config (CUDA): fair-share bounds, no preemption, and deferral naming the cap
+- [_] Automated Parity (CUDA): token-stream determinism solo vs overlapped
+- [_] Manual Serve (CUDA): flagship scenario extended to two GPU models on the 4090 with the monitor showing overlapping device steps and per-model tok/s
+
+#### Open Items
+
+- [_] **Co-scheduling payoff gate** — whether stream overlap beats serialized launches on the single-device fleet is settled by the DN-M61-1 bench item before streams become default; a measured no-win keeps serialize-per-context and records it. Resolve before MVP6.1 build.
 
 ### MVP7 [v0.7.0] - Refined
 
@@ -1681,6 +1849,102 @@ Qwen3.8-Flash-Next runs: sparse MoE with residency management.
 - [_] **PLE placement & access-scheduling viability** — whether PLE prefetch/hot-tier residency (DN-M7-10) earns its build cost depends on a direct layer-2 stall measurement plus a policy comparison: exact computed-address prefetch first, then frequency-sketch / static hot-slot vs any learned predictor for working-set selection. A cheap non-neural variant closing the stall closes the item without building a network; NUMA-local placement is confirmed against derived `numa_spread` and CAT/RDT L3 partitioning stays out unless measurement on the target SKU justifies it. Resolve alongside the Host-resident and Low-rank viability decisions before the MVP7 gather items are built.
 - [_] **MoE cross-tool parity window** — the Backlog defect row "MoE decode logprobs drift past the cross-tool band on 2-bit and 4-bit expert stacks" (near-tie drift 1.46–2.9971 nats at Q2_K and 1.02–2.54 nats at Q4_K_M while argmax holds) must be settled by the DN-M7-1 reality-check report before the Flash-Next parity item can gate: either a per-fixture window for routed families or an expert-tier measurement design, recorded as tolerance rules rather than inherited dense-family bands.
 
+### MVP7.1 [v0.7.1] - Refined
+
+CUDA quant GEMV coverage for gather/host-resident experts — the MoE counterpart of MVP5.2, reusing its kernels and `Q8_K` seam on gathered expert slabs rather than a new decode path. Ordered after MVP7 (and reusing MVP5.2). Design posture is settled, but build is **gated** on the DN-M7-1 reality-check, the qwen4exp layout open item, and the host-resident viability decision — refined in intent, not build-ready until those measured numbers exist.
+
+#### Design Notes
+
+- **DN-M71-1** — CUDA expert GEMV reuses MVP5.2's per-format dot kernels + `Q8_K`-over-PCIe seam applied to gathered slabs; no separate MoE decode path, so parity stays a single surface.
+  - Rationale: gather is already the expert execution model (DN-M7-4); only the device-side dot kernel and activation crossing are new, and reusing MVP5.2 avoids a second CUDA quant family to keep in lockstep.
+  - Rejected: a distinct MoE-specific CUDA GEMV (duplicate parity surface for the same formats); running routed experts as dense matmul (defeats residency and DN-M7-3 union-set streaming).
+  - Contract: `IGatherKernel`/`IWeightSource` feed the same per-format CUDA dot kernels through the route's segment.
+- **DN-M71-2** — Expert-slab format set follows DN-M7-2 (`IQ3_XXS` primary, `Q4_K_M` baseline) re-measured via MVP5; band parity inherits DN-M5.2-1 and the DN-M7-9 lossy tolerance rather than bit-identity.
+  - Rationale: expert residency is a quant-format decision already made in MVP7; CUDA coverage rides that same format set, measured against known CPU cost (DN-M7-2), not an imagined one.
+  - Rejected: inventing a new MoE quant family here; asserting expert-GEMV speed before the DN-M7-1 numbers exist.
+  - Contract: per-format CUDA gather kernels validated within recorded bands on pinned Flash-Next fixtures.
+
+#### Implementation Items
+
+- [_] CUDA GEMV for gathered/host-resident expert slabs — reuse MVP5.2 dot + `Q8_K` seam through the route's segment (see DN-M71-1)
+  - Verify: `dotnet test --filter Category=Moe|Kernel -c Release` on CUDA — gathered expert output lands within its recorded band vs the dense-equivalent reference, batch==solo. *(build gated on DN-M7-1 measurements)*
+- [_] Bench parity for expert GEMV — measure device-vs-CPU gather decode per format before any default (see DN-M71-2)
+  - Verify: committed `bench/reports/` entry recording band width and GPU/CPU delta; a measured loss keeps the mode non-default. *(gate active under the standing bench-deferral decision)*
+
+#### Tests
+
+- [_] Automated Moe/Kernel: CUDA expert GEMV within recorded bands vs dense-equivalent reference
+- [_] Manual Flash-Next Serve (gated): confirm from monitor/bench that device-side expert GEMV matches measured expectations once DN-M7-1 numbers exist
+
+#### Open Items
+
+- [_] **DN-M7-1 reality-check gate** — no CUDA gather-kernel build until the llama.cpp/ik measurements on the target Flash-Next GGUF are recorded (shared with MVP7). Resolve before this phase builds.
+- [_] **qwen4exp layout & host-resident viability** — expert tensor geometry and whether host-resident compute is worth it decide which slabs these kernels serve; inherited from MVP7's Open Items. Resolve alongside them.
+
+### MVP7.2 [v0.7.2] - Refined
+
+CUDA GEMM for the **non-expert** matrices only — projections, hyper-connections (`hc_*`), the BF16 indexer, and shared FFN get device matmul reusing MVP5.3's kernels and capability gate; routed experts stay gather-slabbed so union-set streaming survives. The MoE counterpart of MVP5.3, ordered after MVP7.1. Gated on DN-M7-1 + the qwen4exp layout open item before build.
+
+#### Design Notes
+
+- **DN-M72-1** — CUDA GEMM applies only to dense non-expert matrices; routed experts remain gather slabs (DN-M7-3/DN-M7-4) so residency and union-set amortization survive. Reuses MVP5.3's tiled dequant+dot and load-time capability gate.
+  - Rationale: the projections/hyper-connections/indexer/shared FFN are dense matmuls that benefit from GEMM exactly as dense models do, while experts must stay gathered to preserve the MoE residency win — so only half of Flash-Next's matrices convert to GEMM.
+  - Rejected: turning routed experts into GEMM (kills residency and union-set streaming); a separate MoE matmul kernel family (duplicate parity with MVP5.3).
+  - Contract: dense MoE matrices select `PrefillKernel.Gemm` on CUDA per supported-format set; experts keep the `IGatherKernel` path unchanged.
+- **DN-M72-2** — Toolchain posture inherits DN-M5.3-2 hand-written PTX/WMMA under managed-first; no new cuBLAS/cuBLASLt surface is introduced for MoE specifically, and any escalation follows the same measured MVP5.3 (DN-M5.3-4) trigger.
+  - Rationale: the dense-model toolchain decision already governs these matrices; a per-family exception would fork a posture the plan keeps unified across backends.
+  - Rejected: a separate MoE toolchain decision; adopting cuBLAS here independently of DN-M5.3-4's bench result.
+  - Contract: non-expert matmul stays in the shared `CudaBackend+Ptx` seam with dense models.
+
+#### Implementation Items
+
+- [_] CUDA GEMM for projections / hyper-connections / indexer / shared FFN — reuse MVP5.3 kernels + capability gate (see DN-M72-1)
+  - Verify: `dotnet test --filter Category=Moe|Kernel -c Release` on CUDA — non-expert matmul output within band vs dense-equivalent reference; experts unchanged. *(gated on qwen4exp layout)*
+- [_] Prefill GEMM capability gate for MoE matrices (see DN-M72-1)
+  - Verify: `dotnet test --filter Category=Config|Loader -c Release` — a CUDA route selecting `Gemm` on an unsupported non-expert format refuses at load naming it.
+
+#### Tests
+
+- [_] Automated Moe/Kernel: dense MoE matmul within band vs reference; experts remain gather
+- [_] Automated Config/Loader: GEMM capability gate refuses an unsupported non-expert format at load
+
+#### Open Items
+
+- [_] **qwen4exp matrix layout** — exact tensor naming/shaping for `hc_*`, the BF16 indexer, and shared FFN (shared with MVP7's qwen4exp open item) decides which matrices GEMM covers. Resolve before this phase builds.
+- [_] **DN-M7-1 reality-check gate** — inherited from MVP7; measurements precede kernel work here too.
+
+### MVP7.3 [v0.7.3] - Refined
+
+On-device Flash-Next step composing matmul + gather with the model's own attention family (linear/SSM, QSA sparse) and hyper-connections plus device KV/recurrent-state residency — the MoE counterpart of MVP5.4 where flagship GPU prefill is *demonstrated*, gated behind DN-M7-1. PLE deliberately stays host/disk-gathered. Ordered after MVP7.2; dense-only fast prefill already landed in MVP5.4, so this closes the flagship gap.
+
+#### Design Notes
+
+- **DN-M73-1** — An on-device Flash-Next step composes MVP5.3 matmul + gather with qwen4exp's own attention family (`ssm_*`/linear, QSA sparse, `hc_*` hyper-connections) and device KV/recurrent-state residency; it owns the device kernels for that family that MVP5.4 deliberately left "gated in MVP7." PLE stays host/disk-gathered (a ~28 GB ngram table with no measured device-residency benefit).
+  - Rationale: dense GPU prefill needed matmul + attention on-device; Flash-Next needs the equivalent for a *different* family, and only an integrated step (not per-layer PCIe staging) makes it faster rather than relocated.
+  - Rejected: reusing dense MHA/GQA GPU-attention kernels for Flash-Next's SSM/QSA/hc family (wrong math); staging attention back over PCIe per layer; moving PLE onto the device without a measured residency win.
+  - Contract: on-device step kernels composing matmul + gather + QSA/SSM/hyper-connection with device KV/state pools; PLE excluded from the device step.
+- **DN-M73-2** — Flagship prefill parity is a generation-seeded lossy band measured against a CPU-prefill reference over full generations (the DN-M5.4-3 pattern) and must respect the MoE cross-tool drift window settled by DN-M7-1; never bit-identical, no existing bands widened.
+  - Rationale: GPU prefill reorders accumulation *and* Flash-Next already carries expert-stack logprob drift (the Backlog near-tie defect), so a flagship generation band must be recorded alongside — not folded into — the dense-family bands.
+  - Rejected: inheriting dense-family bands for routed families; treating GPU-prefill drift as separable from the cross-tool parity window this phase inherits.
+  - Contract: a per-fixture flagship generation band plus the DN-M7-1 cross-tool window recorded before any Flash-Next prefill default is set.
+
+#### Implementation Items
+
+- [_] On-device Flash-Next step — matmul + gather composed with SSM/QSA/hyper-connection attention and device KV/state residency (see DN-M73-1)
+  - Verify: `dotnet test --filter Category=Moe|Prefill -c Release` on CUDA — a flagship prefill generation lands within its recorded band vs the CPU-prefill reference; monitor shows a device-side step, PLE still host/disk-gathered. *(gated on DN-M7-1 + qwen4exp layout)*
+- [_] Flagship GPU-prefill payoff + parity bench — measure device-vs-CPU Flash-Next prefill and record the generation band alongside the cross-tool window (see DN-M73-2)
+  - Verify: committed `bench/reports/` flagship prefill tok/s and per-fixture band; a measured no-win records it rather than asserting fast MoE prefill. *(gate active)*
+
+#### Tests
+
+- [_] Automated Moe/Prefill: flagship GPU-prefill generations within their recorded band vs CPU-prefill reference, respecting the cross-tool window
+- [_] Manual Flash-Next Serve (gated): confirm from monitor/bench that a device-side step runs and prefill is measurably faster once DN-M7-1 numbers exist
+
+#### Open Items
+
+- [_] **DN-M7-1 reality-check gate** — flagship GPU-prefill kernels are unbuildable until the Flash-Next measurements (tok/s, bytes/token, expert gather) are recorded. Resolve before this phase builds.
+- [_] **MoE cross-tool parity window** — inherited from MVP7's Open Item / the Backlog near-tie defect: a per-fixture routed-family window must be settled by DN-M7-1 before flagship prefill can gate (see DN-M73-2).
+
 ### MVP8 [v0.8.0] - Tentative
 
 Residency spans RAM, VRAM, and disk.
@@ -1731,12 +1995,13 @@ Vision input on chat models.
 | idea | Early-exit argmax | skip vocab rows; ~5–8% on 248K-vocab LM head |
 | idea | Quant conversion tooling | only if the published-quant story breaks |
 | idea | Vulkan/Metal backends | deferred; LAIR commits to CPU + CUDA |
+| idea | Multi-GPU placement / >1 accelerator partitioning | the fleet carries a single CUDA device (`cuDeviceGet(..., 0)`); concurrent multi-model compute on one accelerator lands in MVP6.1, and partitioning across >1 GPU stays deferred until a target box actually has multiple GPUs to measure against |
 | idea | Multimodal image input | Strata has it; LAIR later |
 | idea | Embeddings model families | ModernBERT-class GGUF quants, pooling modes |
 | question | License | MIT / Apache 2.0 / private — dotLLM is GPLv3: study ideas, never copy code |
 | bug | 2DPC DIMM derate | production box derates 2400→2133 MT/s; more RAM ≠ speed |
 | bug | Monitor CLI on a torn event stream | killing the server while `lair monitor` is attached throws an unhandled `System.IO.IOException` in `MonitorCommand.RunAsync` (`src/Lair.Host/MonitorCommand.cs:54`) instead of ending cleanly — guard the reader and exit with a notice |
-| question | CUDA binding choice | resolved for planning: nvcc microkernels + cuBLASLt (DN-M4-1); revisit only if the toolchain open item forces a strategy change |
+| question | CUDA binding choice | as-built: embedded PTX microkernels only, no cuBLAS/cuBLASLt linked. MVP5.3 (DN-M5.3-2) keeps dense matmul hand-PTX under the managed-first posture; cuBLAS/cuBLASLt is reconsidered only if a measured bench shows hand kernels cannot close the gap and the owner accepts relaxing managed-first |
 | question | PLE index format | does the GGUF PLE tensor allow random row access, or is a repack sidecar index needed? (MVP7 open item) |
 | idea | Conversation cache policy | TTL/LRU eviction rules; optional encryption of disk snapshots; cache invalidation on model/config change |
 | idea | Client-keyed cache retention | tie prompt/conversation cache items to client identity — e.g. a sticky id issued in a response header — and use it for sliding retention (keep each client's most recent conversation cache item) instead of or alongside LRU; precondition: a reliable-enough client identification method (issued token header, optional API key/session, connection fingerprint); interacts with server-posture backlog |
@@ -1753,6 +2018,16 @@ Vision input on chat models.
 | idea | Server-side MCP injection | per-model, config-declared MCP servers whose tool definitions LAIR injects into chat requests regardless of client; injected tools execute server-side (contrast DN-M2-8: client-supplied tools stay client-side); enables cross-model composition — an LLM calling a diffusion model through its MCP endpoint, or the embeddings engine exposed as a vector/RAG MCP; interacts with tool-call API work and server posture |
 
 ## Decision Log
+
+- **2026-11-16 — MVP6 partitions GPU *capacity* only; concurrent multi-model device compute moves to a new refined MVP6.1, and multi-GPU placement is backlogged.** The `DeviceLedger` (DN-M6-2) accounts VRAM/DRAM/core claims first-come with tier spilldown, but on the single CUDA device today each model runs its own scheduler and kernels serialize through one primary context — so "serve multiple models concurrently" did not actually mean concurrent GPU throughput, and MVP6's flagship scenario (one GPU model + one CPU model) never tested two models on the device. MVP6.1 adds per-model CUDA streams on the shared primary context plus a cross-model co-scheduling seam and a fair-share bound (`compute_share`/per-segment caps), preserving no-preemption and solo-vs-overlapped determinism; it is refined because these are settleable architecture choices, gated only by a co-scheduling-payoff bench. Multi-GPU placement is recorded in Backlog, not a phase, because this fleet has exactly one 4090 and the plan defers unmeasurable features (the AVX-512/Zen precedent). Rejected: implying the memory ledger delivers concurrent GPU throughput; reopening refined MVP6 to own device-stream co-scheduling; planning multi-GPU partitioning with no second GPU to validate against. Number note: the 2026-11-03 "MVP6.1 [v0.6.1] = dense IQ3_XXS coverage" plan was superseded — that dense coverage shipped in MVP3.8 and never became a phase — so v0.6.1 is reused here for concurrent multi-model device compute.
+
+- **2026-11-16 — MVP7.1/7.2/7.3 give flagship MoE models the same GPU-compute feature set MVP5.* gives dense models, as refined-but-measurement-gated phases.** Mapping dense→MoE: MVP7.1 = CUDA quant GEMV coverage for gather/host-resident experts (mirror of 5.2), reusing MVP5.2 kernels + `Q8_K` seam rather than a new decode path; MVP7.2 = CUDA GEMM for non-expert matrices — projections/hyper-connections/indexer/shared FFN, experts staying gather-slabbed so union-set streaming survives (mirror of 5.3); MVP7.3 = on-device Flash-Next step composing matmul + linear/SSM/QSA attention + gather with device KV/state residency for fast MoE GPU prefill (mirror of 5.4). Two dense features need **no** new phase because they are format/seam-generic and already reused: CPU i-quant decode flows through gather via DN-M7-2, and quantized-KV serves full-attention layers via MVP5.1's `BlockPool` while SSM state is the existing recurrent-state work. PLE deliberately stays host/disk-gathered (a ~28 GB ngram table with no measured GPU-residency benefit). All three inherit DN-M7-1, the qwen4exp layout open item, and the host-resident viability decision — refined in design posture but **not build-ready until those measurements exist**, so their Open Items are hard gates. Rejected: new phases re-implementing gather/quant decode (duplicate parity surfaces); promising flagship GPU prefill independent of DN-M7-1; moving PLE onto the device; running experts as dense matmul (defeats residency).
+
+- **2026-11-16 — the GPU-compute story is split into MVP5.3 (CUDA dense matmul + toolchain) and MVP5.4 (deferred CUDA attention + device-resident KV), both before MVP6.** The owner wants fast GPU prefill by MVP6, but a single mega-phase carrying matmul + attention + KV-on-device + the cuBLAS-vs-PTX decision is unrefineable (too many coupled open questions) and would ship dense matmul with **no demonstrable prefill speedup**, because GEMM alone is not fast prefill — `softmax(QKᵀ)V`, RoPE, causal masking, and device-side KV read/write must also run on the device. So 5.3 owns only the blocked-matmul kernels (`SupportsGemm`/`GemmBatch`), the prefill kernel selection/capability gate, and the toolchain decision; 5.4 owns the GPU-attention path MVP4 explicitly deferred (2026-11-16) plus device-resident KV for the GPU step. Rejected: one MVP5.3 carrying all four concerns; leaving GPU prefill to land in/after MVP6; pulling MVP4's deferred attention kernels into a phase without recording the deferral move; scoping 5.3 as GEMM-only while pretending that is "GPU prefill."
+
+- **2026-11-16 — CUDA drops bit-identical parity for a per-format measured tolerance band, so the new GEMV kernels are written to be fast rather than last-bit-equal (DN-M5.2-1).** The existing "one device result matches one host scalar dot bit-for-bit" invariant forbids every technique that makes GPU GEMV win (`dp4a`, coalesced loads, `fma`, shared-memory activation staging, split-K/tree reduction), so the sub-4-bit i-quants — which most want dp4a — were the worst case under bit-identity. MVP5.2 validates CUDA against the CPU oracle (ik-pinned integer-dot for i-quants, scalar float for block quants) within a recorded band instead, precedented by the lossy-mode bands already in DN-M51-7/DN-M7-9. **CPU parity is untouched** — scalar==AVX2==VNNI stays bit-identical and no CPU band is widened; this adds a new CUDA-only band rather than stretching an existing one (the 2026-11-11 "never widen a band" posture holds). A bench gate records each format's band width and the measured GPU-vs-CPU delta before kernels start. Consequence named: CUDA-served and CPU-served output may diverge on near-tie tokens, guarded by a documented behavior note plus a Parity near-tie argmax fixture. Rejected: keeping bit-identity; dequant-to-FP32 for i-quants (6–9× drift, forfeits dp4a); a LAIR-authored CUDA-only oracle (consistently-wrong risk); widening a CPU band to absorb CUDA drift.
+
+- **2026-11-16 — new MVP5.2 brings the CUDA backend to CPU parity on GGUF quant-format coverage for weight GEMV.** The CUDA seam today carries `F32`/`F16`/`BF16`/`Q4_K`/`Q6_K` only, while the CPU backend also executes `Q8_0`, `Q5_0`, `Q5_K`, `Q2_K`, `Q3_K`, `Q2_0`, `IQ4_NL`, `IQ4_XS`, and the sub-4-bit i-quants `IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`, so a `cuda`/`hybrid` segment on a file in any of those formats raises `Unsupported` mid-decode. MVP5.2 adds the missing CUDA GEMV kernels, reuses MVP5's integer-dot + `Q8_K`-activation scheme for the i-quants, and adds a load-time capability gate so a route naming a format CUDA cannot execute refuses at load naming the format. Ordered after MVP5 and MVP5.1. Scope stays weight GEMV only — CUDA attention kernels remain deferred (2026-11-16 MVP4 posture). Rejected: silently falling back to CPU for a CUDA-named format; a dequant-to-FP32 dot for the i-quants (DN-M5-2); widening any parity band to absorb CUDA-vs-CPU drift.
 
 - **2026-11-16 — Greenfield config vocabulary is cleaned without compatibility aliases: `host:` replaces `tiers:`, `disk` replaces `nvme`, and placement defaults become `auto`.** `host:` is the right name for machine posture because it declares/auto-detects CPU cores, DRAM, disk path, and NUMA nodes; `disk` is the right tier name because the cold tier is disk-backed residency, not a promise about NVMe hardware. `auto` is the default placement value but resolves to today's CPU-only defaults on this build, while explicit `cuda` or `hybrid` remains fail-fast when the device is absent. Because MVP4 is already the active phase, this cleanup rides MVP4 as a housekeeping amendment rather than inserting a new MVP3.16 phase. Rejected: keeping `tiers:` or `nvme` as aliases; treating `auto` as a silent CPU fallback for an explicitly declared accelerator; adding a new completed-phase number after MVP4 is already in progress.
 
