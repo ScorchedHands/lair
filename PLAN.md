@@ -1357,7 +1357,8 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the host-
 - [✓] Host-resident compute spike — a CUDA segment computing over DRAM-resident weights on a model fully resident in RAM (see DN-M4-7, DN-M314-6)
   - Landed: mapped-host residency is proven through anonymous host-resident weight sources and a host-mapped CUDA posture that registers live host regions with the driver instead of copying tensors into persistent device memory. Synthetic F16 gates prove token identity across CPU-only baseline, hybrid CUDA-transformer/CPU-tail/head routes, and whole-model default-copy vs mapped-host modes; copy accounting proves zero persistent weight copies for mapped mode while mapping counters name every registered region. Explicit double-buffered PCIe overlap remains deferred by the current bench/toolchain window.
   - Verify gates: `dotnet test --filter "Category=Cuda" -c Release`; `dotnet test --filter "FullyQualifiedName~CudaFracSpikeTests|FullyQualifiedName~SplitRouteExecutionTests|FullyQualifiedName~ModelRouteTests|FullyQualifiedName~GpuLayersServeTests|FullyQualifiedName~GpuLayersConfigTests|FullyQualifiedName~GenerationServiceTests" -c Release`.
-- [_] CUDA GEMV quantized formats — packed GGUF weight matrices run through embedded PTX (see DN-M4-1)
+- [✓] CUDA GEMV quantized formats — packed GGUF weight matrices run through embedded PTX (see DN-M4-1)
+  - Landed: Q4_K dense and batched GEMV run as unrolled embedded PTX kernels against device or host-mapped weight bytes, with synthetic hand-built blocks proving exact/partial/group-tail/batch/mapped-host parity plus split-header scale/min codes; unsupported packed formats still refuse naming the CUDA backend. Release gates ran targeted Q4_K synthetic parity 12/12, `Category=Cuda` 27/27, and affected split/config/host filters 66/66.
   - Verify gates: `dotnet test --filter "Category=Cuda" -c Release` plus targeted synthetic Q4_K_M parity against scalar/CPU reference math, with unsupported packed formats still refusing naming this backend rather than running elsewhere.
 - [_] VRAM residency — models fitting 24 GB resident on device
   - Verify: a pinned local `models/Llama-3.2-1B-Instruct-Q4_K_M.gguf` run stays fully device-resident and token-identical against its CPU-resident baseline when the fixture is present; an over-budget load is refused with ledger breakdown naming model, resource, tier, and amounts.
@@ -1371,7 +1372,7 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the host-
 - [_] Automated Parity-Hybrid: token match across cpu / cuda / hybrid configurations
 - [_] Automated Budget: per-resource VRAM tier caps admitted or refused with a ledger breakdown naming model, resource, and tier. Verify: `dotnet test --filter Category=Config|Budget -c Release`
 - [✓] Automated Host-Resident Compute Identity: a CUDA segment over DRAM-resident weights decodes token-identical to the CPU-resident route with no persistent weight copy into VRAM. Verify gates landed through `Category=Cuda` and targeted host-resident-compute/split-route/config/host filters in Release; full PCIe throughput records remain deferred by the current bench/toolchain window.
-- [_] Automated Kernel: CUDA fused dequant GEMV vs scalar reference
+- [✓] Automated Kernel: CUDA fused dequant GEMV vs scalar reference — Release gates ran targeted Q4_K synthetic parity 12/12, `Category=Cuda` 27/27, and affected split/config/host filters 66/66.
 - [_] Manual Hybrid Serve: monitor shows GPU utilization and PCIe transfer counters during hybrid decode *(GPU tiles arrive with MVP3's UI; counters require the CUDA phase)*
 
 #### Open Items
