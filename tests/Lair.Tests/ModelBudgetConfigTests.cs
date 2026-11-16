@@ -32,7 +32,7 @@ public sealed class ModelBudgetConfigTests : IDisposable
                 path: '{TempModelFile()}'
                 budgets:
                   weights:
-                    order: [dram, nvme]
+                    order: [dram, disk]
                     caps:
                       dram_mb: 2048
                   kv:
@@ -51,9 +51,9 @@ public sealed class ModelBudgetConfigTests : IDisposable
         Assert.Equal(3, model.Budgets.Count);
 
         BudgetChain weights = ChainOf(model.Budgets, BudgetResource.Weights);
-        Assert.Equal([BudgetTier.Dram, BudgetTier.Nvme], weights.Order);
+        Assert.Equal([BudgetTier.Dram, BudgetTier.Disk], weights.Order);
         Assert.Equal(2048L, weights.Caps[BudgetTier.Dram]);
-        Assert.False(weights.Caps.ContainsKey(BudgetTier.Nvme)); // an uncapped position states no ceiling rather than some default one.
+        Assert.False(weights.Caps.ContainsKey(BudgetTier.Disk)); // an uncapped position states no ceiling rather than some default one.
 
         BudgetChain kv = ChainOf(model.Budgets, BudgetResource.Kv);
         Assert.Equal([BudgetTier.Dram], kv.Order);
@@ -186,7 +186,7 @@ public sealed class ModelBudgetConfigTests : IDisposable
 
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
         Assert.Contains("models[0].budgets.weights.caps.dram_blocks", error.Message);
-        Assert.Contains("'weights' ceilings are named 'dram_mb', 'vram_mb', 'nvme_mb'", error.Message);
+        Assert.Contains("'weights' ceilings are named 'dram_mb', 'vram_mb', 'disk_mb'", error.Message);
     }
 
     [Fact]
@@ -198,13 +198,31 @@ public sealed class ModelBudgetConfigTests : IDisposable
                 path: '{TempModelFile()}'
                 budgets:
                   kv:
-                    order: [disk]
+                    order: [ssd]
 
             """;
 
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
-        Assert.Contains("models[0].budgets.kv.order 'disk' is invalid for model 'qwen-test'", error.Message);
-        Assert.Contains("'dram', 'vram', 'nvme'", error.Message);
+        Assert.Contains("models[0].budgets.kv.order 'ssd' is invalid for model 'qwen-test'", error.Message);
+        Assert.Contains("'dram', 'vram', 'disk'", error.Message);
+    }
+
+    [Fact]
+    public void Load_OldTierNameInOrder_FailsNamingValueAndAcceptedTiers()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  kv:
+                    order: [dram, nvme]
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].budgets.kv.order 'nvme' is invalid for model 'qwen-test'", error.Message); // the retired spelling names no tier: it fails as a value, not as an alias.
+        Assert.Contains("'dram', 'vram', 'disk'", error.Message);
     }
 
     [Fact]
@@ -216,12 +234,12 @@ public sealed class ModelBudgetConfigTests : IDisposable
                 path: '{TempModelFile()}'
                 budgets:
                   weights:
-                    order: [nvme, dram]
+                    order: [disk, dram]
 
             """;
 
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
-        Assert.Contains("models[0].budgets.weights.order 'nvme', 'dram' is out of order for model 'qwen-test'", error.Message);
+        Assert.Contains("models[0].budgets.weights.order 'disk', 'dram' is out of order for model 'qwen-test'", error.Message);
     }
 
     [Fact]
@@ -326,16 +344,48 @@ public sealed class ModelBudgetConfigTests : IDisposable
                 path: '{TempModelFile()}'
                 budgets:
                   weights:
-                    order: [dram, nvme]
+                    order: [dram, disk]
                     caps:
                       dram_mb: 1024
-                      nvme_mb: 2048
+                      disk_mb: 2048
 
             """;
 
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
-        Assert.Contains("models[0].budgets.weights.caps.nvme_mb", error.Message);
-        Assert.Contains("no model-level ceiling describes that position", error.Message);
+        Assert.Contains("models[0].budgets.weights.caps.disk_mb", error.Message);
+        Assert.Contains("no model-level ceiling describes that position", error.Message); // the byte resource already sits whole on its origin store.
+    }
+
+    [Fact]
+    public void Load_OlderCapKeySpellings_FailNamingPathAndAcceptedCeilings()
+    {
+        ConfigException weights = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  weights:
+                    order: [dram, disk]
+                    caps:
+                      nvme_mb: 2048
+
+            """)));
+        Assert.Contains("models[0].budgets.weights.caps.nvme_mb", weights.Message); // the retired key spelling is not rewritten to the new one.
+        Assert.Contains("'weights' ceilings are named 'dram_mb', 'vram_mb', 'disk_mb'", weights.Message);
+
+        ConfigException kv = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  kv:
+                    order: [dram]
+                    caps:
+                      nvme_blocks: 256
+
+            """)));
+        Assert.Contains("models[0].budgets.kv.caps.nvme_blocks", kv.Message);
+        Assert.Contains("'kv' ceilings are named 'dram_blocks', 'vram_blocks', 'disk_blocks'", kv.Message);
     }
 
     [Fact]
@@ -357,6 +407,27 @@ public sealed class ModelBudgetConfigTests : IDisposable
 
         BudgetChain kv = ChainOf(model.Budgets!, BudgetResource.Kv);
         Assert.Equal([BudgetTier.Dram, BudgetTier.Vram], kv.Order);
+    }
+
+    [Fact]
+    public void Load_DiskKvChain_AcceptsStructurallyWhereNoWritingExistsYet()
+    {
+        // The write-side disk tier is chain vocabulary before anything can land there — the posture refusal belongs to resolution against opened pools, not to parsing a declaration.
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  kv:
+                    order: [dram, disk]
+
+            """;
+
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+        ModelConfig model = Assert.Single(config.Models);
+
+        BudgetChain kv = ChainOf(model.Budgets!, BudgetResource.Kv);
+        Assert.Equal([BudgetTier.Dram, BudgetTier.Disk], kv.Order);
     }
 
     private static BudgetChain ChainOf(IReadOnlyList<BudgetChain> chains, BudgetResource resource)

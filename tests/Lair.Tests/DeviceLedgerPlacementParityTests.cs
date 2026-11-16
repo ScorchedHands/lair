@@ -48,7 +48,7 @@ public sealed class DeviceLedgerPlacementParityTests : IDisposable
         IReadOnlyList<DeviceLedgerClaim> claims = ledger.Claims; // the placement this test is about: one tier held, its neighbour demoted to
         Assert.Equal(BudgetTier.Dram, claims[0].Tier);
         Assert.False(claims[0].Demoted);
-        Assert.Equal(BudgetTier.Nvme, claims[1].Tier);
+        Assert.Equal(BudgetTier.Disk, claims[1].Tier);
         Assert.True(claims[1].Demoted);
 
         const string prompt = "hello world"; // the same tokens through both placements, greedy so every run is comparable
@@ -83,7 +83,7 @@ public sealed class DeviceLedgerPlacementParityTests : IDisposable
                 Path = modelPath,
                 MaxContextTokens = 512,
                 KvBlocks = 8,
-                Budgets = [new BudgetChain { Resource = BudgetResource.Weights, Order = [BudgetTier.Dram, BudgetTier.Nvme], Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Dram] = 1024 } }],
+                Budgets = [new BudgetChain { Resource = BudgetResource.Weights, Order = [BudgetTier.Dram, BudgetTier.Disk], Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Dram] = 1024 } }],
             },
         ],
     };

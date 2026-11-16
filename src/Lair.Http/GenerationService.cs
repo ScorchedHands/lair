@@ -815,13 +815,13 @@ public sealed class GenerationService : IDisposable
 
     // The ledger an engine opens when it carries no shared accounting: every tier its pools back for every budgetable resource, each
     // stating the explicit unbounded capacity posture — a public total no configuration declared is never invented. Accelerator memory
-    // holding weight copies is the exception on host totals: opening that tier states the ceiling 'tiers.vram_mb' declares for it when
+    // holding weight copies is the exception on host totals: opening that tier states the ceiling 'host.vram_mb' declares for it when
     // the configuration names one, and keeps the unbounded posture where it does not, because nothing here consults a driver-detected
     // device total. An accelerator route this engine opened also carries its prompt windows' activation bytes across to the device per
     // sub-batch, so that tier gets an unbounded seam for prefill buffers too — what bounds a claim there is the model's own declared
     // ceiling at that chain position, never an invented host total. No seam opens at accelerator memory for any resource whose backing
     // this open did not establish: block pools live in system memory until a device-backed residency is opened beside them.
-    private static DeviceLedger OpenHostLedger(string modelName, TierCapacityConfig? tiers, CudaBackend? splitExecution, CudaBackend? kvStorageOwner, ILogger? logger)
+    private static DeviceLedger OpenHostLedger(string modelName, HostCapacityConfig? host, CudaBackend? splitExecution, CudaBackend? kvStorageOwner, ILogger? logger)
     {
         BudgetResource[] resources = [BudgetResource.Weights, BudgetResource.Kv, BudgetResource.PrefillBuffers];
         List<CapacitySeam> seams = [];
@@ -846,7 +846,7 @@ public sealed class GenerationService : IDisposable
         }
         if (splitExecution is not null && splitExecution.WeightTier == Lair.Contracts.WeightTier.Vram)
         {
-            long? declaredMb = tiers?.VramMb;
+            long? declaredMb = host?.VramMb;
             seams.Add(new CapacitySeam { Tier = BudgetTier.Vram, Resource = BudgetResource.Weights, Capacity = declaredMb });
 
             logger?.LogInformation(
@@ -862,7 +862,7 @@ public sealed class GenerationService : IDisposable
     // Declared capacity totals read against the posture this host reported. A disagreement is logged and accepted rather than refused: an
     // operator may state a number detection could not see, which is exactly what a per-node override exists for, while byte totals no node stated
     // read as incomparable rather than as a mismatch with what was declared. The posture itself is always reported so the comparison has a source.
-    private static void ReportDeclaredCapacity(string modelName, TierCapacityConfig? tiers, ComputeCapacityLedger compute, ILogger? logger)
+    private static void ReportDeclaredCapacity(string modelName, HostCapacityConfig? host, ComputeCapacityLedger compute, ILogger? logger)
     {
         HostTopology topology = compute.Topology;
 
@@ -873,27 +873,27 @@ public sealed class GenerationService : IDisposable
             topology.TotalLogicalProcessors,
             topology.ReportedMemoryMb is long reportedMb ? $" node_mb_total={reportedMb}" : " node_bytes=unreported");
 
-        if (tiers is null)
+        if (host is null)
         {
             return; // nothing declared: today's posture states no public totals and compares against none.
         }
 
-        DeclaredTotalsReport totals = compute.CheckDeclaredTotals(tiers.DramCores, tiers.DramMb);
+        DeclaredTotalsReport totals = compute.CheckDeclaredTotals(host.CpuCores, host.DramMb);
         if (totals.ReportsCoreMismatch || totals.ReportsByteMismatch)
         {
             logger?.LogWarning(
-                "tiers_capacity model='{Model}' {Detail} — accepted against reported topology",
+                "host_capacity model='{Model}' {Detail} — accepted against reported topology",
                 modelName,
                 totals.Describe());
         }
 
-        foreach (NodeCapacityOverride nodeOverride in tiers.Nodes)
+        foreach (NodeCapacityOverride nodeOverride in host.Nodes)
         {
             HostNodeCapacity? reported = topology.Nodes.FirstOrDefault(node => node.Index == nodeOverride.Index);
             if (reported is null)
             {
                 logger?.LogWarning(
-                    "tiers_capacity model='{Model}' declares node index {DeclaredIndex} this posture does not report ({Posture}) — accepted as an override of detection",
+                    "host_capacity model='{Model}' declares node index {DeclaredIndex} this posture does not report ({Posture}) — accepted as an override of detection",
                     modelName,
                     nodeOverride.Index,
                     topology.Describe());
@@ -903,7 +903,7 @@ public sealed class GenerationService : IDisposable
             if (nodeOverride.Cores is int declaredCores && declaredCores != reported.LogicalProcessors)
             {
                 logger?.LogWarning(
-                    "tiers_capacity model='{Model}' declares cores={DeclaredCores} for node index {NodeIndex} against reported {ReportedCores} — accepted as an override of detection",
+                    "host_capacity model='{Model}' declares cores={DeclaredCores} for node index {NodeIndex} against reported {ReportedCores} — accepted as an override of detection",
                     modelName,
                     declaredCores,
                     nodeOverride.Index,
@@ -914,7 +914,7 @@ public sealed class GenerationService : IDisposable
             if (nodeOverride.Mb is long declaredMb && reported.MemoryMb is long reportedNodeMb && declaredMb != reportedNodeMb)
             {
                 logger?.LogWarning(
-                    "tiers_capacity model='{Model}' declares megabytes={DeclaredMegabytes} for node index {NodeIndex} against reported {ReportedMegabytes} — accepted as an override of detection",
+                    "host_capacity model='{Model}' declares megabytes={DeclaredMegabytes} for node index {NodeIndex} against reported {ReportedMegabytes} — accepted as an override of detection",
                     modelName,
                     declaredMb,
                     nodeOverride.Index,
@@ -1108,7 +1108,7 @@ public sealed class GenerationService : IDisposable
         // OS reports them, byte totals reported where stated — and seats claims against that host total. Which node a share draws from belongs to placement, not accounting.
         compute ??= new ComputeCapacityLedger(HostTopologyProbe.Detect());
 
-        ReportDeclaredCapacity(modelConfig.Name, config.Tiers, compute, logger); // warn-and-accept: an operator's declared totals read against what this posture reported.
+        ReportDeclaredCapacity(modelConfig.Name, config.Host, compute, logger); // warn-and-accept: an operator's declared totals read against what this posture reported.
 
         int engineThreadsChoice = config.Engine.Threads == 0 ? CpuBackend.AutoWorkerCount : config.Engine.Threads;
         int requestedShare = modelConfig.Placement.ThreadQuota is { } declaredQuota
@@ -1331,7 +1331,7 @@ public sealed class GenerationService : IDisposable
         // explicit unbounded capacity posture — the answer a host gives when it backs a tier but states no public total.
         // Claims register in this open's order: weights once the tensor table is read, prefill from the activation
         // posture the engine families hold, a device-backed block range as its own standing claim before any pool opens, and the KV reservation as the pool opens.
-        ledger ??= OpenHostLedger(modelConfig.Name, config.Tiers, splitExecution, kvStorageOwner, logger);
+        ledger ??= OpenHostLedger(modelConfig.Name, config.Host, splitExecution, kvStorageOwner, logger);
 
         GgufFile? file = null;
         TransformerModel? model = null;

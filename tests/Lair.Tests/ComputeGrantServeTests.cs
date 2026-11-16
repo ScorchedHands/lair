@@ -121,7 +121,7 @@ public sealed class ComputeGrantServeTests : IDisposable
     }
 
     [Fact]
-    public void DeclaredTierTotals_AndNodeOverrides_LogWarnAndAcceptAgainstTheReportedPosture()
+    public void DeclaredHostTotals_AndNodeOverrides_LogWarnAndAcceptAgainstTheReportedPosture()
     {
         string path = SyntheticModel("grant-declared");
         ComputeCapacityLedger compute = new(SyntheticTwoNodePosture(processorsPerNode: 3, memoryMb: [4096, 8192])); // six processors / twelve GB reported.
@@ -129,13 +129,13 @@ public sealed class ComputeGrantServeTests : IDisposable
         CapturingLogger log = new();
         using GenerationService engine = OpenEngine(
             path, "grant-mismatch", threads: 1, logger: log, compute: compute,
-            tiers: new TierCapacityConfig { DramCores = 32, DramMb = 65536, Nodes = [new NodeCapacityOverride { Index = 9, Mb = 4096 }] });
+            host: new HostCapacityConfig { CpuCores = 32, DramMb = 65536, Nodes = [new NodeCapacityOverride { Index = 9, Mb = 4096 }] });
 
         IReadOnlyList<string> info = log.Messages(LogLevel.Information);
         Assert.Contains(info, line => line.StartsWith("compute_topology model='grant-mismatch' nodes=2 logical_processors=6 node_mb_total=12288", StringComparison.Ordinal)); // the posture is reported once per open against its source.
 
         IReadOnlyList<string> warnings = log.Messages(LogLevel.Warning);
-        Assert.Contains(warnings, line => line.Contains("declared cores 32 against reported 6") && line.Contains("accepted against reported topology"));
+        Assert.Contains(warnings, line => line.Contains("host_capacity") && line.Contains("declared cores 32 against reported 6") && line.Contains("accepted against reported topology"));
         Assert.Contains(warnings, line => line.Contains("declared megabytes 65536 against reported 12288"));
         Assert.Contains(warnings, line => line.Contains("node index 9 this posture does not report") && line.Contains("accepted as an override of detection"));
 
@@ -143,7 +143,7 @@ public sealed class ComputeGrantServeTests : IDisposable
     }
 
     [Fact]
-    public void DeclaredTierTotals_ThatMatchTheReportedPosture_LogNoCapacityWarning()
+    public void DeclaredHostTotals_ThatMatchTheReportedPosture_LogNoCapacityWarning()
     {
         string path = SyntheticModel("grant-matching");
         ComputeCapacityLedger compute = new(SyntheticTwoNodePosture(processorsPerNode: 3, memoryMb: [4096, 8192]));
@@ -151,9 +151,9 @@ public sealed class ComputeGrantServeTests : IDisposable
         CapturingLogger log = new();
         using GenerationService engine = OpenEngine(
             path, "grant-matching", threads: 1, logger: log, compute: compute,
-            tiers: new TierCapacityConfig { DramCores = 6, DramMb = 12288 });
+            host: new HostCapacityConfig { CpuCores = 6, DramMb = 12288 });
 
-        Assert.DoesNotContain(log.Messages(LogLevel.Warning), line => line.Contains("tiers_capacity")); // agreement needs no warning; the posture line still states its source.
+        Assert.DoesNotContain(log.Messages(LogLevel.Warning), line => line.Contains("host_capacity")); // agreement needs no warning; the posture line still states its source.
         Assert.Contains(log.Messages(LogLevel.Information), line => line.StartsWith("compute_topology model='grant-matching'", StringComparison.Ordinal));
 
         engine.Dispose();
@@ -220,18 +220,18 @@ public sealed class ComputeGrantServeTests : IDisposable
         int threads,
         CapturingLogger logger,
         ComputeCapacityLedger compute,
-        TierCapacityConfig? tiers = null)
+        HostCapacityConfig? host = null)
     {
-        GenerationService engine = GenerationService.Open(Config(modelPath, modelName, threads, tiers), logger, ledger: null, compute);
+        GenerationService engine = GenerationService.Open(Config(modelPath, modelName, threads, host), logger, ledger: null, compute);
         engine.AttachMetrics(NullLoggerFactory.Instance, TimeSpan.FromMilliseconds(50)); // the same facts path a serving host wires through its monitor build.
         return engine;
     }
 
-    private static LairConfig Config(string modelPath, string modelName, int threads, TierCapacityConfig? tiers = null) => new()
+    private static LairConfig Config(string modelPath, string modelName, int threads, HostCapacityConfig? host = null) => new()
     {
         Server = new ServerConfig(),
         Engine = new EngineConfig { Threads = threads },
-        Tiers = tiers,
+        Host = host,
         Models =
         [
             new ModelConfig

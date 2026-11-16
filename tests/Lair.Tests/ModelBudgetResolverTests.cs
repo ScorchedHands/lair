@@ -16,7 +16,7 @@ public sealed class ModelBudgetResolverTests
                 new BudgetChain
                 {
                     Resource = BudgetResource.Weights,
-                    Order = [BudgetTier.Dram, BudgetTier.Nvme],
+                    Order = [BudgetTier.Dram, BudgetTier.Disk],
                     Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Dram] = 2048 },
                 },
             ],
@@ -24,7 +24,7 @@ public sealed class ModelBudgetResolverTests
         });
 
         ResolvedBudgetChain weights = resolved.For(BudgetResource.Weights)!;
-        Assert.Equal([BudgetTier.Dram, BudgetTier.Nvme], weights.Tiers.Select(position => position.Tier));
+        Assert.Equal([BudgetTier.Dram, BudgetTier.Disk], weights.Tiers.Select(position => position.Tier));
 
         ResolvedBudgetTier resident = weights.FirstCopyHoldingTier()!;
         Assert.Equal(BudgetTier.Dram, resident.Tier);
@@ -32,7 +32,7 @@ public sealed class ModelBudgetResolverTests
         Assert.Equal(2048L, resident.Cap);
 
         // The file already holds the complete weight set on its origin store: that position needs no ceiling of ours and claims nothing.
-        ResolvedBudgetTier origin = weights.At(BudgetTier.Nvme)!;
+        ResolvedBudgetTier origin = weights.At(BudgetTier.Disk)!;
         Assert.True(origin.IsOriginStore);
         Assert.Null(origin.Cap);
     }
@@ -116,7 +116,7 @@ public sealed class ModelBudgetResolverTests
                 new BudgetChain
                 {
                     Resource = BudgetResource.PrefillBuffers,
-                    Order = [BudgetTier.Dram, BudgetTier.Nvme],
+                    Order = [BudgetTier.Dram, BudgetTier.Disk],
                     Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Dram] = 64 },
                 },
             ],
@@ -124,7 +124,7 @@ public sealed class ModelBudgetResolverTests
         }));
 
         Assert.Contains("budgets for resource 'prefill_buffers'", error.Message);
-        Assert.Contains("no opened pool backs working copies at tier 'nvme'", error.Message);
+        Assert.Contains("no opened pool backs working copies at tier 'disk'", error.Message); // resolution names the retired spelling's successor, not a silent drop.
         Assert.Contains("write-side bytes reach storage only where something writes them", error.Message);
     }
 
@@ -279,7 +279,7 @@ public sealed class ModelBudgetResolverTests
                 new BudgetChain
                 {
                     Resource = BudgetResource.Weights,
-                    Order = [BudgetTier.Dram, BudgetTier.Nvme],
+                    Order = [BudgetTier.Dram, BudgetTier.Disk],
                 },
             ]);
     }
@@ -289,8 +289,8 @@ public sealed class ModelBudgetResolverTests
     {
         ModelException error = Assert.Throws<ModelException>(() => ModelBudgets.ValidateDeclaredChains(
             "qwen-test",
-            [new BudgetChain { Resource = BudgetResource.Weights, Order = [BudgetTier.Nvme, BudgetTier.Dram] }]));
+            [new BudgetChain { Resource = BudgetResource.Weights, Order = [BudgetTier.Disk, BudgetTier.Dram] }]));
 
-        Assert.Contains("order ['nvme', 'dram'] is out of order", error.Message);
+        Assert.Contains("order ['disk', 'dram'] is out of order", error.Message); // the origin store may not sit before the working-copy tier it demotes through.
     }
 }

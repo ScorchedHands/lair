@@ -74,7 +74,7 @@ public enum BudgetTier
     Vram,
 
     /// <summary>Disk storage. A read-side resource's origin store; write-side bytes land there only where something writes them.</summary>
-    Nvme,
+    Disk,
 }
 
 /// <summary>The config key name of each budget tier, and the reverse read that decides which tiers are public vocabulary.</summary>
@@ -82,15 +82,15 @@ public static class BudgetTierNames
 {
     public const string Dram = "dram";
     public const string Vram = "vram";
-    public const string Nvme = "nvme";
+    public const string Disk = "disk";
 
     /// <summary>The tier names a chain may declare, in the priority order every legal chain follows.</summary>
-    public static IReadOnlyList<string> DeclaredNames { get; } = [Dram, Vram, Nvme];
+    public static IReadOnlyList<string> DeclaredNames { get; } = [Dram, Vram, Disk];
 
     public static string Of(BudgetTier tier) => tier switch
     {
         BudgetTier.Vram => Vram,
-        BudgetTier.Nvme => Nvme,
+        BudgetTier.Disk => Disk,
         _ => Dram,
     };
 
@@ -107,8 +107,8 @@ public static class BudgetTierNames
                 tier = BudgetTier.Vram;
                 return true;
 
-            case Nvme:
-                tier = BudgetTier.Nvme;
+            case Disk:
+                tier = BudgetTier.Disk;
                 return true;
 
             default:
@@ -288,7 +288,7 @@ public sealed record BudgetRequest
 
 /// <summary>
 /// Resolves declared budget chains into the value set a model's plan carries, and owns every rule that resolution enforces.
-/// A chain must name known tiers in priority order (<c>dram</c> ahead of <c>vram</c> ahead of <c>nvme</c>, any tier skippable)
+/// A chain must name known tiers in priority order (<c>dram</c> ahead of <c>vram</c> ahead of <c>disk</c>, any tier skippable)
 /// with no tier named twice; a ceiling binds only a tier its own chain names; and the read/write split decides which
 /// positions hold copies at all — a read-side resource's disk position is its origin store, legal only as the final position
 /// of its chain and never under a ceiling of ours because that storage already holds the complete set. Every other position
@@ -300,7 +300,7 @@ public sealed record BudgetRequest
 public static class ModelBudgets
 {
     /// <summary>The priority order every chain must follow, highest-priority residency first.</summary>
-    private static readonly BudgetTier[] PriorityOrder = [BudgetTier.Dram, BudgetTier.Vram, BudgetTier.Nvme];
+    private static readonly BudgetTier[] PriorityOrder = [BudgetTier.Dram, BudgetTier.Vram, BudgetTier.Disk];
 
     /// <summary>
     /// Resolves one model's declared chains against the pools its host opened. Each resource resolves independently: mixed
@@ -430,10 +430,10 @@ public static class ModelBudgets
 
             // A read-side origin store already holds this resource's complete set outside LAIR's working copies, so a ceiling
             // of ours there can only misrepresent it. Skipping that check here would let a config carry a number nothing could honor.
-            if (chain.Resource == BudgetResource.Weights && cap.Key == BudgetTier.Nvme)
+            if (chain.Resource == BudgetResource.Weights && cap.Key == BudgetTier.Disk)
             {
                 throw new ModelException(
-                    $"model '{model}', budgets for resource '{resource}': a ceiling at tier '{BudgetTierNames.Of(BudgetTier.Nvme)}' is not meaningful — " +
+                    $"model '{model}', budgets for resource '{resource}': a ceiling at tier '{BudgetTierNames.Of(BudgetTier.Disk)}' is not meaningful — " +
                     $"'{resource}' reads its complete set from that storage already, so it caps only the tiers holding working copies ({CapUnitName(chain.Resource)})");
             }
         }
@@ -441,11 +441,11 @@ public static class ModelBudgets
         // A read-side resource's disk position is where its complete set already lives: legal only as the last position of its own chain.
         for (int index = 0; index < chain.Order.Count - 1; index++)
         {
-            if (chain.Order[index] == BudgetTier.Nvme && IsReadSide(chain.Resource))
+            if (chain.Order[index] == BudgetTier.Disk && IsReadSide(chain.Resource))
             {
                 throw new ModelException(
                     $"model '{model}', budgets for resource '{resource}': order [{DescribeOrder(chain.Order)}] names its origin store before the tier it demotes to — " +
-                    $"'{BudgetTierNames.Of(BudgetTier.Nvme)}' must be this chain's last position");
+                    $"'{BudgetTierNames.Of(BudgetTier.Disk)}' must be this chain's last position");
             }
         }
     }
@@ -465,7 +465,7 @@ public static class ModelBudgets
             BudgetTier tier = chain.Order[index];
 
             // A read-side origin store holds the complete set outside LAIR's working copies: no ceiling of ours describes it and no claim needs it.
-            if (tier == BudgetTier.Nvme && IsReadSide(chain.Resource))
+            if (tier == BudgetTier.Disk && IsReadSide(chain.Resource))
             {
                 positions.Add(new ResolvedBudgetTier { Tier = tier, IsOriginStore = true });
                 continue;

@@ -231,7 +231,7 @@ public sealed class KvResidencyConfigTests : IDisposable
                 """)));
 
         Assert.Contains("models[0].budgets.kv.caps.vram_mb", error.Message);
-        Assert.Contains("'kv' ceilings are named 'dram_blocks', 'vram_blocks', 'nvme_blocks'", error.Message, StringComparison.Ordinal);
+        Assert.Contains("'kv' ceilings are named 'dram_blocks', 'vram_blocks', 'disk_blocks'", error.Message, StringComparison.Ordinal);
     }
 
     private static BudgetChain ChainOf(IReadOnlyList<BudgetChain> chains, BudgetResource resource)

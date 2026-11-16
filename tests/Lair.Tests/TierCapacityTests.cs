@@ -3,11 +3,12 @@ using Lair.Host.Config;
 namespace Lair.Tests;
 
 /// <summary>
-/// Declared host capacity and the core-set posture built on it: a top-level tiers block parses its flat resident totals, its
-/// presence-only disk path, and per-node overrides keyed by node position; malformed or non-positive values fail naming key and value
-/// (naming the index too for an override); unknown keys under any of those blocks are refused with the accepted vocabulary. Pinned core
-/// sets keep today's disjoint-partition refusal naming both models by default, and a model that opts into core overcommit relaxes that
-/// rule for its own claim only.
+/// Declared host capacity and the core-set posture built on it: a top-level host block parses its flat resident totals, its
+/// presence-only disk path, and per-node overrides keyed by node position under its numa nesting; malformed or non-positive values fail
+/// naming key and value (naming the index too for an override); unknown keys under any of those blocks are refused with the accepted
+/// vocabulary, and a block spelled in the old top-level name is refused as an unknown key. Pinned core sets keep today's
+/// disjoint-partition refusal naming both models by default, and a model that opts into core overcommit relaxes that rule for its own
+/// claim only.
 /// </summary>
 [Trait("Category", "Config")]
 public sealed class TierCapacityTests : IDisposable
@@ -32,45 +33,46 @@ public sealed class TierCapacityTests : IDisposable
     }
 
     [Fact]
-    public void Load_TiersBlock_ParsesResidentTotalsDiskPathAndNodeOverrides()
+    public void Load_HostBlock_ParsesResidentTotalsDiskPathAndNodeOverrides()
     {
         string yaml = $"""
             models:
               - name: qwen-test
                 path: '{TempModelFile()}'
-            tiers:
+            host:
               dram_mb: 65536
-              dram_cores: 32
-              nvme_path: models
-              nodes:
-                - index: 0
-                  mb: 32768
-                  cores: 16
-                - index: 1
-                  mb: 32768
+              cpu_cores: 32
+              disk_path: models
+              numa:
+                nodes:
+                  - index: 0
+                    mb: 32768
+                    cores: 16
+                  - index: 1
+                    mb: 32768
         """;
 
         LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
 
-        TierCapacityConfig tiers = config.Tiers!;
-        Assert.Equal(65536L, tiers.DramMb);
-        Assert.Null(tiers.VramMb); // absent accelerator posture stays undeclared, not zero
-        Assert.Equal(32, tiers.DramCores);
-        Assert.Equal("models", tiers.NvmePath);
+        HostCapacityConfig host = config.Host!;
+        Assert.Equal(65536L, host.DramMb);
+        Assert.Null(host.VramMb); // absent accelerator posture stays undeclared, not zero
+        Assert.Equal(32, host.CpuCores);
+        Assert.Equal("models", host.DiskPath);
 
-        Assert.Equal(2, tiers.Nodes.Count);
-        NodeCapacityOverride first = tiers.Nodes[0];
+        Assert.Equal(2, host.Nodes.Count);
+        NodeCapacityOverride first = host.Nodes[0];
         Assert.Equal(0, first.Index);
         Assert.Equal(32768L, first.Mb);
         Assert.Equal(16, first.Cores); // an override may state cores alone about a node
 
-        NodeCapacityOverride second = tiers.Nodes[1];
+        NodeCapacityOverride second = host.Nodes[1];
         Assert.Equal(1, second.Index);
         Assert.Null(second.Cores); // what an entry does not declare stays undeclared rather than zero
     }
 
     [Fact]
-    public void Load_AbsentTiersBlock_DeclaresNoPublicTotals()
+    public void Load_AbsentHostBlock_DeclaresNoPublicTotals()
     {
         LairConfig config = YamlConfigLoader.Load(WriteConfig($"""
             models:
@@ -78,25 +80,25 @@ public sealed class TierCapacityTests : IDisposable
                 path: '{TempModelFile()}'
             """));
 
-        Assert.Null(config.Tiers); // today's posture states no capacity, exactly as before this key existed.
+        Assert.Null(config.Host); // today's posture states no capacity, exactly as before this key existed.
     }
 
     [Fact]
-    public void Load_TiersBlock_ParsesAcceleratorTotal()
+    public void Load_HostBlock_ParsesAcceleratorTotal()
     {
         string yaml = $"""
             models:
               - name: qwen-test
                 path: '{TempModelFile()}'
-            tiers:
+            host:
               vram_mb: 24576
         """;
 
         LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
 
-        TierCapacityConfig tiers = config.Tiers!;
-        Assert.Null(tiers.DramMb);
-        Assert.Equal(24576L, tiers.VramMb);
+        HostCapacityConfig host = config.Host!;
+        Assert.Null(host.DramMb);
+        Assert.Equal(24576L, host.VramMb);
     }
 
     [Fact]
@@ -106,62 +108,171 @@ public sealed class TierCapacityTests : IDisposable
             models:
               - name: qwen-test
                 path: '{TempModelFile()}'
-            tiers:
+            host:
               vram_mb: 0
         """)));
 
-        Assert.Contains("tiers.vram_mb 0 is invalid", error.Message);
+        Assert.Contains("host.vram_mb 0 is invalid", error.Message);
     }
 
     [Fact]
-    public void Load_UnknownKeyUnderTiers_FailsNamingTheOffendingKey()
+    public void Load_UnknownKeyUnderHost_FailsNamingTheOffendingKey()
+    {
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            host:
+              ddr_mb: 1024
+        """)));
+
+        Assert.Contains("Unknown key 'ddr_mb' under 'host'", error.Message);
+        Assert.Contains("dram_mb, vram_mb, cpu_cores, disk_path, numa", error.Message);
+    }
+
+    [Fact]
+    public void Load_OldTopLevelBlockSpelling_FailsAsAnUnknownKeyNamingTheAcceptedVocabulary()
     {
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
             models:
               - name: qwen-test
                 path: '{TempModelFile()}'
             tiers:
-              ddr_mb: 1024
+              dram_cores: 8
         """)));
 
-        Assert.Contains("Unknown key 'ddr_mb' under 'tiers'", error.Message);
-        Assert.Contains("dram_mb, vram_mb, dram_cores, nvme_path, nodes", error.Message);
+        // The old spelling is refused outright, not aliased: the refusal names it and lists where capacity belongs now.
+        Assert.Contains("Unknown key 'tiers' under", error.Message);
+        Assert.Contains("server, engine, models, ui, host", error.Message);
     }
 
     [Fact]
-    public void Load_NonPositiveTierTotal_FailsNamingKeyAndValue()
+    public void Load_OldPostureKeySpellings_FailAsUnknownKeysUnderHost()
     {
         ConfigException cores = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
             models:
               - name: qwen-test
                 path: '{TempModelFile()}'
-            tiers:
-              dram_cores: 0
+            host:
+              dram_cores: 8
         """)));
-        Assert.Contains("tiers.dram_cores 0 is invalid", cores.Message);
+        Assert.Contains("Unknown key 'dram_cores' under 'host'", cores.Message);
 
         ConfigException bytes = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
             models:
               - name: qwen-test
                 path: '{TempModelFile()}'
-            tiers:
-              dram_mb: -5
+            host:
+              nvme_path: models
         """)));
-        Assert.Contains("tiers.dram_mb -5 is invalid", bytes.Message);
+        Assert.Contains("Unknown key 'nvme_path' under 'host'", bytes.Message);
+
+        ConfigException nodes = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            host:
+              dram_mb: 8192
+              nodes: []
+        """)));
+        Assert.Contains("Unknown key 'nodes' under 'host'", nodes.Message); // per-node overrides moved into the numa nesting; the flat spelling is not accepted.
     }
 
     [Fact]
-    public void Load_MalformedTierValue_FailsNamingTheKey()
+    public void Load_NonPositiveHostTotal_FailsNamingKeyAndValue()
+    {
+        ConfigException cores = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            host:
+              cpu_cores: 0
+        """)));
+        Assert.Contains("host.cpu_cores 0 is invalid", cores.Message);
+
+        ConfigException bytes = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            host:
+              dram_mb: -5
+        """)));
+        Assert.Contains("host.dram_mb -5 is invalid", bytes.Message);
+    }
+
+    [Fact]
+    public void Load_MalformedHostValue_FailsNamingTheKey()
     {
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
             models:
               - name: qwen-test
                 path: '{TempModelFile()}'
-            tiers:
+            host:
               dram_mb: lots-of-memory
         """)));
 
-        Assert.Contains("tiers.dram_mb must be an integer value.", error.Message);
+        Assert.Contains("host.dram_mb must be an integer value.", error.Message);
+    }
+
+    [Fact]
+    public void Load_MalformedDiskPath_FailsNamingTheKeyWithItsPresenceOnlyContract()
+    {
+        ConfigException blank = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            host:
+              disk_path: '   '
+        """)));
+
+        Assert.Contains("host.disk_path must name a non-empty path this host reads from", blank.Message);
+
+        ConfigException nested = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            host:
+              disk_path:
+                drive: D
+        """)));
+
+        Assert.Contains("host.disk_path must be a text value.", nested.Message); // presence and path only — no ceiling may ride the posture key.
+    }
+
+    [Fact]
+    public void Load_MalformedNumaNesting_FailsNamingTheNestAndItsAcceptedKeys()
+    {
+        ConfigException notMapping = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            host:
+              numa: 0
+        """)));
+
+        Assert.Contains("'host.numa' must be a mapping of key/value pairs.", notMapping.Message);
+
+        ConfigException unknownNestKey = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            host:
+              numa:
+                spread: local
+        """)));
+
+        Assert.Contains("Unknown key 'spread' under 'host.numa'", unknownNestKey.Message); // placement posture lives on the model entry, not in declared capacity.
+
+        ConfigException nodesNotList = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            host:
+              numa:
+                nodes: 0
+        """)));
+
+        Assert.Contains("'host.numa.nodes' must be a list of per-node overrides", nodesNotList.Message);
     }
 
     [Fact]
@@ -171,10 +282,11 @@ public sealed class TierCapacityTests : IDisposable
             models:
               - name: qwen-test
                 path: '{TempModelFile()}'
-            tiers:
-              nodes:
-                - index: 1
-                  mb: 0
+            host:
+              numa:
+                nodes:
+                  - index: 1
+                    mb: 0
         """)));
 
         Assert.Contains("mb 0 is invalid for node index 1", bytes.Message);
@@ -183,10 +295,11 @@ public sealed class TierCapacityTests : IDisposable
             models:
               - name: qwen-test
                 path: '{TempModelFile()}'
-            tiers:
-              nodes:
-                - index: 2
-                  cores: not-a-number
+            host:
+              numa:
+                nodes:
+                  - index: 2
+                    cores: not-a-number
         """)));
 
         Assert.Contains("cores must be an integer value.", cores.Message);
@@ -199,9 +312,10 @@ public sealed class TierCapacityTests : IDisposable
             models:
               - name: qwen-test
                 path: '{TempModelFile()}'
-            tiers:
-              nodes:
-                - mb: 4096
+            host:
+              numa:
+                nodes:
+                  - mb: 4096
         """)));
 
         Assert.Contains("Missing required key 'index' under", error.Message);
@@ -214,25 +328,47 @@ public sealed class TierCapacityTests : IDisposable
             models:
               - name: qwen-test
                 path: '{TempModelFile()}'
-            tiers:
-              nodes:
-                - index: 0
-                  cores: 8
-                - index: 0
-                  mb: 4096
+            host:
+              numa:
+                nodes:
+                  - index: 0
+                    cores: 8
+                  - index: 0
+                    mb: 4096
         """)));
 
         Assert.Contains("names node index 0 more than once", error.Message);
     }
 
     [Fact]
-    public void Load_EmptyTiersBlock_FailsAsADeclarationOfNothing()
+    public void Load_EmptyHostBlock_FailsAsADeclarationOfNothing()
     {
         // The braces spell an empty mapping, which needs a plain string here: an interpolated raw literal would read them as interpolation holes.
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(
-            "models:\n  - name: qwen-test\n    path: '" + TempModelFile() + "'\ntiers: {}")));
+            "models:\n  - name: qwen-test\n    path: '" + TempModelFile() + "'\nhost: {}")));
 
-        Assert.Contains("'tiers' declares nothing", error.Message);
+        Assert.Contains("'host' declares nothing", error.Message);
+    }
+
+    [Fact]
+    public void Load_HostBlockNamingOnlyAnEmptyNumaNesting_FailsAsADeclarationOfNothing()
+    {
+        // Same brace caution as above: the empty mapping needs a plain string, not an interpolated raw literal.
+        ConfigException emptyNest = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(
+            "models:\n  - name: qwen-test\n    path: '" + TempModelFile() + "'\nhost:\n  numa: {}")));
+
+        Assert.Contains("'host' declares nothing", emptyNest.Message); // an empty nesting states no override, so the block as a whole still says nothing.
+
+        ConfigException emptyList = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            host:
+              numa:
+                nodes: []
+        """)));
+
+        Assert.Contains("'host' declares nothing", emptyList.Message); // same answer for an explicitly empty override list.
     }
 
     [Fact]
@@ -310,7 +446,7 @@ public sealed class TierCapacityTests : IDisposable
 
     private string WriteConfig(string yaml)
     {
-        string path = Path.Combine(Path.GetTempPath(), $"lair-tiers-{Guid.NewGuid():N}.yaml");
+        string path = Path.Combine(Path.GetTempPath(), $"lair-host-{Guid.NewGuid():N}.yaml");
         File.WriteAllText(path, yaml);
         _tempPaths.Add(path);
         return path;

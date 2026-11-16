@@ -1,26 +1,28 @@
 # LAIR configuration example.
-# Copy to lair.yaml and adjust; `models` must list exactly one model and `path`
-# must point at a GGUF file that exists on disk.
+# Copy to lair.yaml and adjust; `models` must list exactly one model, and `path`
+# must point at a GGUF file that exists on disk unless a `source:` pin can fetch it.
 
 server:
   bind: 127.0.0.1
-  port: 8181
+  port: 8080          # monitor defaults to http://127.0.0.1:8080 when no -u is supplied
 
 engine:
-  threads: 0          # 0 = pick automatically: one worker per physical core (SMT siblings excluded)
-  block_size: 16      # fixed to 16
-  max_batch_tokens: 512  # largest prompt chunk prefilled in one scheduler step
-  # prefill_kernel: gemv   # optional; gemv | tiled | gemm — which attention/weight path the engine's prefill route selects. All three run today; gemm serves only a model whose dense weight formats it has kernels for (Q8_0, Q4_K, IQ4_XS), and a file with any other format is refused at model open naming that format rather than falling back.
+  threads: 0              # 0 = pick automatically: one worker per physical core (SMT siblings excluded)
+  block_size: 16          # fixed to 16
+  max_batch_tokens: 512   # largest prompt chunk prefilled in one scheduler step
+  # prefill_kernel: gemv  # optional; gemv | tiled | gemm — which attention/weight path the engine's prefill route selects. All three run today; gemm serves only a model whose dense weight formats it has kernels for (Q8_0, Q4_K, IQ4_XS), and a file with any other format is refused at model open naming that format rather than falling back.
   # prefill_step_budget_ms: 250  # optional; sizes prompt-window token counts from measured per-row cost, clamped by scheduler floor/ceiling and engine row caps.
 
-# tiers:
-#   dram_mb: 65536         # optional host DRAM byte total; reported warn-and-accept against OS topology when present
-#   dram_cores: 32         # optional host logical-processor total; compute grants are first-come against this posture
-#   # nvme_path: D:\       # optional presence-only NVMe tier marker
-#   # nodes:               # optional per-node overrides keyed by reported node index
-#   #   - index: 0
-#   #     dram_mb: 32768
-#   #     dram_cores: 16
+# host:                 # optional capacity posture; omit the whole block to declare no totals or node overrides.
+#   dram_mb: 65536      # optional system-memory total in megabytes; reported warn-and-accept against OS topology when present
+#   vram_mb: 8192       # optional accelerator ceiling declared by the operator, not read off a driver-detected budget
+#   cpu_cores: 32       # optional logical-processor total used for compute grants and placement reporting
+#   disk_path: D:\      # presence-only marker; host.disk_path names storage only and takes no byte ceiling here
+#   numa:               # optional per-node overrides keyed by reported node index
+#     nodes:
+#       - index: 0
+#         mb: 32768
+#         cores: 16
 
 models:
   - name: smollm-135m-instruct-q8_0
@@ -34,6 +36,16 @@ models:
     # max_reasoning_tokens: 256  # optional; tokens a reasoning region may spend before it is closed; requires the model's tokenizer to carry <think>/</think> as whole tokens
     # max_response_tokens: 1024  # optional; tokens of visible output the model may generate
     # max_concurrent_requests: 8 # optional; omitted is uncapped; admission rejections name the blocking KV/token/quota limit
+    # budgets:                   # optional per-resource ceilings; omit declares no chain (see docs/reference/CONFIG.md)
+    #   weights:                 # read-side material; disk is its origin store and takes no model-level ceiling there
+    #     order: [dram]          # highest-priority residency first; skip tiers this resource does not use
+    #     caps: { dram_mb: 4096 }
+    #   kv:                      # write-side state; ceilings count KV blocks, not bytes
+    #     order: [dram, vram]    # device-backed KV pools require finite declared ceilings when they are used
+    #     caps: { dram_blocks: 256 }
+    #   prefill_buffers:         # transient prompt-window working-set bytes
+    #     order: [vram]          # accelerator-tier claims need opened device-backed seams before model open can seat them
+    #     caps: { vram_mb: 128 }
     # source:                    # optional published-source pin; with source present, path may name a file that fetch-if-absent will create
     #   repo: QuantFactory/SmolLM-135M-Instruct-GGUF
     #   revision: main           # commit sha or branch; fetch resolves a branch once and records the resolved sha in manifest.json
@@ -43,12 +55,13 @@ models:
     #   #     sha256: 0000000000000000000000000000000000000000000000000000000000000000
     #   #     size: 144810912
     placement:
-      device: cpu
-      kv_residency: dram
-      prefill: cpu
+      device: auto       # omitted or auto resolves to CPU-only behavior in this build; an explicit accelerator posture is refused until a compute backend reports it
+      kv_residency: dram # optional; auto | dram | vram | split — resolved residency decides whether block pools need finite VRAM ceilings at model open
+      prefill: auto      # omitted or auto resolves to CPU-only behavior in this build; an explicit accelerator stage is refused until a compute backend reports it
+      # gpu_layers: 0    # optional; count of transformer layers execution opens on device 'cuda', counted from layer 0
       # prefill_lane: shared   # optional; shared | dedicated — dedicated sub-allocates a prefill worker share and activation buffers from this model's claim
-      core_set: "0-15"   # optional; omit to leave the model unpinned; pinned models may not share core ids unless this model opts into core_overcommit
-      thread_quota: 8    # optional; caps this model's workers at 8 regardless of engine threads
+      # core_set: "0-15"   # optional; omit to leave the model unpinned; pinned models may not share core ids unless this model opts into core_overcommit
+      # thread_quota: 8    # optional; caps this model's workers at 8 regardless of engine threads
       # core_overcommit: false # optional; restart-only; relaxes pinned core-set disjointness for this model only
       # numa_spread: auto      # optional; auto | local | interleave — auto chooses least-loaded node, local follows a pinned set, interleave spreads across reported nodes
 
@@ -58,9 +71,9 @@ models:
   #   max_context_tokens: 4096
   #   kv_blocks: 256
   #   placement:
-  #     device: cpu
+  #     device: auto       # omitted or auto resolves to CPU-only behavior in this build
   #     kv_residency: dram
-  #     prefill: cpu
+  #     prefill: auto      # omitted or auto resolves to CPU-only behavior in this build
   #     core_set: "0-15"   # optional; omit to leave the model unpinned; pinned models may not share core ids
   #     thread_quota: 8    # optional; caps this model's workers at 8 regardless of engine threads
 

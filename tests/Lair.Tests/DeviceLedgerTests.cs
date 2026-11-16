@@ -120,7 +120,7 @@ public sealed class DeviceLedgerTests
             Tiers =
             [
                 new ResolvedBudgetTier { Tier = BudgetTier.Dram, Cap = 1 },
-                new ResolvedBudgetTier { Tier = BudgetTier.Nvme, IsOriginStore = true }, // the file already holds the complete weight set there
+                new ResolvedBudgetTier { Tier = BudgetTier.Disk, IsOriginStore = true }, // the file already holds the complete weight set there
             ],
         };
 
@@ -130,12 +130,12 @@ public sealed class DeviceLedgerTests
         ClaimOutcome demoted = ledger.Ledger.RegisterClaim("model-b", chain, amount: 1);
 
         Assert.True(demoted.Seated); // landing on the origin store is a posture, not an eviction of 'model-a'
-        Assert.Equal(BudgetTier.Nvme, demoted.Claim!.Tier);
+        Assert.Equal(BudgetTier.Disk, demoted.Claim!.Tier);
         Assert.True(demoted.Claim.AtOriginStore);
         Assert.True(demoted.Claim.Demoted);
 
         Assert.Equal(1L, ledger.Ledger.Occupied(BudgetTier.Dram, BudgetResource.Weights)); // the first claim still holds its tier whole
-        Assert.Equal(0L, ledger.Ledger.Occupied(BudgetTier.Nvme, BudgetResource.Weights));  // an origin-store seating consumes no ledger capacity
+        Assert.Equal(0L, ledger.Ledger.Occupied(BudgetTier.Disk, BudgetResource.Weights));  // an origin-store seating consumes no ledger capacity
     }
 
     [Fact]
@@ -274,7 +274,7 @@ public sealed class DeviceLedgerTests
         Assert.Equal(5L, ledger.Ledger.Occupied(BudgetTier.Dram, BudgetResource.Kv));
         Assert.Equal(4L, ledger.Ledger.Occupied(BudgetTier.Vram, BudgetResource.Kv)); // what each position holds counts once, at the tier it stands at
 
-        Assert.False(ledger.Ledger.UpdateStandingClaimAmount("model-a", BudgetResource.Kv, newAmount: 9, atTier: BudgetTier.Nvme)); // a seat this model never took is not moved to some other one
+        Assert.False(ledger.Ledger.UpdateStandingClaimAmount("model-a", BudgetResource.Kv, newAmount: 9, atTier: BudgetTier.Disk)); // a seat this model never took is not moved to some other one
     }
 
     [Fact]

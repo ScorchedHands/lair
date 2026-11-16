@@ -16,15 +16,20 @@ For dense Llama-class models under a 4 GB working-set budget on CPU, `IQ4_XS` is
 ## Quick start
 
 ```powershell
-# 1. Copy the example config and point it at your model
+# 1. Build once; this produces src\Lair.Host\bin\Release\net10.0\lair.exe on Windows (or ./lair on Linux/macOS).
+dotnet build Lair.sln -c Release
+
+# 2. Copy the example config and point it at your model
 copy lair.example.yaml lair.yaml
 # edit lair.yaml: model path, name, context, kv_blocks, port
 
-# 2. Serve the OpenAI-compatible API (binds 127.0.0.1 by default)
-dotnet run --project src/Lair.Host -- serve -c lair.yaml
+$LAIR = ".\src\Lair.Host\bin\Release\net10.0\lair.exe"
 
-# 3. Or talk to the model directly in a terminal REPL
-dotnet run --project src/Lair.Host -- chat -c lair.yaml
+# 3. Serve the OpenAI-compatible API (binds 127.0.0.1 by default)
+& $LAIR serve -c lair.yaml
+
+# 4. Or talk to the model directly in a terminal REPL
+& $LAIR chat -c lair.yaml
 ```
 
 ## API
@@ -37,7 +42,7 @@ dotnet run --project src/Lair.Host -- chat -c lair.yaml
 | `GET /monitor/stream` | SSE stream of engine metrics snapshots and request lifecycle events (versioned schema) |
 | `GET /healthz` | liveness + model readiness |
 
-Any OpenAI SDK works by pointing `base_url` at `http://127.0.0.1:8080/v1`. Errors use the OpenAI error shape with codes `invalid_request`, `model_not_found`, `context_length_exceeded`, `engine_overloaded`, `internal`. Every response carries `x-lair-request-id`.
+Any OpenAI SDK works by pointing `base_url` at your configured API root, e.g. `http://127.0.0.1:8080/v1`. Errors use the OpenAI error shape with codes `invalid_request`, `model_not_found`, `context_length_exceeded`, `engine_overloaded`, `internal`. Every response carries `x-lair-request-id`.
 
 Requests run concurrently through shared batch steps; `503 engine_overloaded` surfaces only when engine capacity is exhausted. Chat requests that declare tools get exactly one tool surface, resolved when the model loads: a model whose chat template renders tools itself gets them through the template and its own call shape is read out of the decoded text, a toolless template gets LAIR's schema injection plus the fenced-JSON detector, and `tool_parser: auto | template | fenced | none` pins the choice (`force_fenced_tools: true` still forces the injected form). A model that emits reasoning markup (`<think>` … `</think>`) streams it into visible content by default; `reasoning: strip` withholds recognized regions from visible output while their boundaries stay recorded, and a flip applies to requests admitted after it. Recognized calls appear as `tool_calls` (execution is client-side), and `/v1/models` reports the resolved parser and reasoning policy.
 
@@ -49,13 +54,13 @@ Model token budgets bound a generation on both surfaces: `max_reasoning_tokens` 
 
 ## Monitor UI
 
-Point a browser at `http://127.0.0.1:8080/ui` while the server runs: a tabbed web UI with live engine stats — configured models (expandable for config and state), in-flight requests, per-request throughput sparklines, recent request log — plus a built-in chat client for exercising the model directly from the browser (streaming replies, mid-stream stop, tool-call display).
+Point a browser at your server's `/ui`, e.g. `http://127.0.0.1:8080/ui` when default settings are used: a tabbed web UI with live engine stats — configured models (expandable for config and state), in-flight requests, per-request throughput sparklines, recent request log — plus a built-in chat client for exercising the model directly from the browser (streaming replies, mid-stream stop, tool-call display).
 
 ## Monitor CLI
 
 ```powershell
-dotnet run --project src/Lair.Host -- monitor            # default http://127.0.0.1:8080
-dotnet run --project src/Lair.Host -- monitor -u http://127.0.0.1:8080 --interval 1000
+& $LAIR monitor            # defaults to http://127.0.0.1:8080; pass -u when your server uses another bind/port
+& $LAIR monitor -u http://127.0.0.1:8181 --interval 1000
 ```
 
 Live table per model: tok/s, step time, batch occupancy, cache-hit rate, KV utilization, active sequences.
@@ -77,17 +82,17 @@ models:
 `source:` pins a repo, a revision, and one or more GGUF files. A branch revision is resolved once at fetch and recorded as a commit sha in `models/manifest.json`; load verifies the manifest and fetches the pinned artifact only when it is absent. Hashes are computed by LAIR after download, and a `.part` file is never loadable.
 
 ```powershell
-dotnet run --project src/Lair.Host -- model fetch QuantFactory/SmolLM-135M-Instruct-GGUF -c lair.yaml
-dotnet run --project src/Lair.Host -- model check manual-fetch-smollm -c lair.yaml
-dotnet run --project src/Lair.Host -- model list -c lair.yaml
+& $LAIR model fetch QuantFactory/SmolLM-135M-Instruct-GGUF -c lair.yaml
+& $LAIR model check manual-fetch-smollm -c lair.yaml
+& $LAIR model list -c lair.yaml
 ```
 
 `model check` is report-only: it prints candidate deltas against the hub's current HEAD without downloading, repinning, or changing the load path. `/monitor/stream` carries the same candidate as optional `metrics_update_candidate` when a served model has a source pin and a candidate is found. Gated repos authenticate through `LAIR_HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN` fallback); the token is sent only to `huggingface.co` and is never written to logs, errors, or the manifest.
 
 ## Configuration
 
-One YAML file (`lair.example.yaml` shows every knob): server bind/port, engine `threads`, `max_batch_tokens`, optional `prefill_kernel`, optional `prefill_step_budget_ms`, block size, optional top-level `tiers:` capacity totals with per-node overrides, exactly one model with path, name, type, `max_context_tokens`, `kv_blocks`, optional `max_concurrent_requests`, optional `force_fenced_tools`, optional `tool_parser` and `reasoning`, optional token budgets (`max_reasoning_tokens`, `max_response_tokens`), optional `source:` model acquisition, optional placement policy (`prefill_lane`, `core_set`, `thread_quota`, `core_overcommit`, `numa_spread`), and the UI ring size `ui.recent_requests`.
+One YAML file (`lair.example.yaml` shows every knob): server bind/port, engine `threads`, `max_batch_tokens`, optional `prefill_kernel`, optional `prefill_step_budget_ms`, block size, optional top-level `host:` capacity posture (`dram_mb`, `vram_mb`, `cpu_cores`, presence-only `disk_path`, and per-node overrides under `numa.nodes`), exactly one model with path/name/type/context/KV budget, optional budgets chains for weights/KV/prefill buffers using tier caps like `<tier>_mb` or KV `<tier>_blocks`, optional token/tool/reasoning controls, optional `source:` acquisition, placement policy (`device: auto|cpu`, `kv_residency`, `prefill: auto|cpu`, `gpu_layers`, `prefill_lane`, core pinning/quota/overcommit, NUMA spread), and UI ring size. See [docs/reference/CONFIG.md](docs/reference/CONFIG.md) for the full current schema.
 
-A running server watches the config file and applies edits automatically: batch width, thread quota, KV budget, and the step-time prefill budget take effect live; context length, the token budgets, the prefill-kernel selection, and `numa_spread` apply to new requests (a kernel edit re-points the engine's prompt-window route from its next window); block size, model path, quant geometry, `prefill_lane`, and `core_overcommit` are refused with a message telling you to restart. Invalid edits are rejected without touching the running engine. Prompt windows resolve a measured default of 32 rows independently from `max_batch_tokens`; `prefill_kernel` selects `gemv`, `tiled`, or `gemm`, and `gemm` is accepted only when every dense weight matrix in the served file has a blocked matmul format (`Q8_0`, `Q4_K`, `IQ4_XS`) — otherwise model open refuses naming those formats. `prefill_step_budget_ms` sizes prompt-window token counts from measured per-row cost, `prefill_buffers` caps can narrow the effective prompt-window row width while reporting requested versus effective width, and `tiers:` plus per-model placement keys drive capacity, worker-grant, and placement reporting through the monitor stream.
+A running server watches the config file and applies edits automatically: batch width, thread quota, system-memory KV budget (`kv_blocks` or `budgets.kv.caps.dram_blocks`), step-time prefill budget, and UI ring size take effect live; context length, token budgets, tool/reasoning policy, kernel selection, NUMA spread, and `prefill_buffers` ceilings apply to new requests (a kernel edit re-points the engine's prompt-window route from its next window); server bind/port, model identity/path/source pins, host capacity totals/node overrides, weight caps, device-backed KV caps/residency modes, placement core sets/device/prefill/gpu layers/core overcommit, and budget chain orders are refused with a restart-only message. Invalid edits are rejected without touching the running engine. Prompt windows resolve a measured default of 32 rows independently from `max_batch_tokens`; `prefill_kernel` selects `gemv`, `tiled`, or `gemm`, and `gemm` is accepted only when every dense weight matrix in the served file has a blocked matmul format (`Q8_0`, `Q4_K`, `IQ4_XS`) — otherwise model open refuses naming those formats. `prefill_step_budget_ms` sizes prompt-window token counts from measured per-row cost, `prefill_buffers` caps can narrow the effective prompt-window row width while reporting requested versus effective width, and host posture plus placement/budget keys drive capacity, worker-grant, residency, prefill, and monitor reporting through the monitor stream. See [docs/reference/CONFIG.md](docs/reference/CONFIG.md) for hot-reload classes per key.
 
 At load the server prints what each model will actually run: the profile and tensor decisions, the `tool_parser` choice, the `reasoning` policy, the prefill kernel selection (`prefill_kernel model='…' kernel=gemv`), the marker ids a declared reasoning budget binds to (`reasoning_region model='…' open_token_id=151667 close_token_id=151668`), and the positional plan when the file declares rope scaling or a partial rotary slice (`rope_scaling model='…' variant=yarn multiplier=2 original_context_length=512 …`).
