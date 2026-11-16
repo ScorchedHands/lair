@@ -123,15 +123,16 @@ public sealed class CudaBackendParityTests : IDisposable
         using CudaBackend cuda = new();
 
         // Quantized weight formats reach this backend only to be refused naming it — never a silent CPU fallback.
-        byte[] packedQ4K = new byte[2 * 144]; // two rows of Q4_K packing for shape [2, 256]
+        TensorShape refusalShape = new([2, 256]);
+        byte[] packedQ5 = new byte[2 * (int)refusalShape.RowStrideBytes(QuantFormat.Q5_0)]; // two rows of Q5_0 packing for shape [2, 256]
 
         NotSupportedException gemvError = Assert.Throws<NotSupportedException>(
-            () => cuda.Gemv(new float[256], new WeightRef(packedQ4K, new TensorShape([2, 256]), QuantFormat.Q4_K), new float[2]));
+            () => cuda.Gemv(new float[256], new WeightRef(packedQ5, refusalShape, QuantFormat.Q5_0), new float[2]));
         Assert.Contains("CudaBackend ('cuda')", gemvError.Message);
-        Assert.Contains("Q4_K", gemvError.Message);
+        Assert.Contains("Q5_0", gemvError.Message);
 
         NotSupportedException gemmError = Assert.Throws<NotSupportedException>(
-            () => cuda.GemmBatch(new float[256], 1, new WeightRef(packedQ4K, new TensorShape([2, 256]), QuantFormat.Q4_K), new float[2]));
+            () => cuda.GemmBatch(new float[256], 1, new WeightRef(packedQ5, refusalShape, QuantFormat.Q5_0), new float[2]));
         Assert.Contains("CudaBackend ('cuda')", gemmError.Message);
         Assert.False(cuda.SupportsGemm(QuantFormat.F16)); // the blocked matmul has no CUDA path yet at all
 
