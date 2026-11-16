@@ -15,5 +15,5 @@ public sealed partial class CudaBackend
         ".address_size 64\n";
 
     private static readonly byte[] PtxBytes = Encoding.UTF8.GetBytes(
-        PtxHeader + "\n" + GemvF32Ptx + "\n" + GemvF16Ptx + "\n" + GemvBf16Ptx + "\n" + GemvQ4KPtx + "\0");
+        PtxHeader + "\n" + GemvF32Ptx + "\n" + GemvF16Ptx + "\n" + GemvBf16Ptx + "\n" + GemvQ4KPtx + "\n" + BuildGemvQ6KPtx() + "\0");
 }
