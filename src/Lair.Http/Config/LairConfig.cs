@@ -105,6 +105,22 @@ public sealed record EngineConfig
     /// open naming that file's own weight formats. A hot edit takes effect from the next prefill window boundary.
     /// </summary>
     public string PrefillKernel { get; init; } = "gemv";
+
+    /// <summary>The engine-wide CPU posture block: which integer-dot instruction set the sub-4-bit i-quant kernels run.</summary>
+    public EngineCpuConfig Cpu { get; init; } = new();
+}
+
+/// <summary>The keys one engine cpu block may declare.</summary>
+public sealed record EngineCpuConfig
+{
+    /// <summary>
+    /// Which integer-dot encoding the sub-4-bit i-quant kernels run: <c>auto</c> (default — the highest path this host's CPU
+    /// reports, AVX-VNNI over AVX2), <c>avx2</c>, or <c>avx-vnni</c>. The axis resolves once at engine open and every row,
+    /// batch vector, worker, and lane of the model runs that one encoding; forcing a path this CPU does not report fails the
+    /// load naming the missing feature instead of falling back. All three spellings are accepted by the schema — what a host
+    /// can run is decided when its backend opens.
+    /// </summary>
+    public string Isa { get; init; } = "auto";
 }
 
 /// <summary>One served model and how it is placed on the machine.</summary>

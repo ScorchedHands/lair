@@ -90,15 +90,17 @@ public sealed unsafe partial class CpuBackend
 
     // Row evaluator for the sub-4-bit formats: same shape as RowDot but over a quantized activation. A row is still a
     // pure function of its own packed bytes plus the shared activation blocks, so any row partition stays bit-identical.
-    private static float RowDotQ8K(byte* row, byte* qa, float* da, int cols, QuantFormat format, bool avx2)
+    // The dot path arrives already resolved from engine.cpu.isa and never changes mid-row: every format's vector kernels
+    // stage identically whatever encoding they run, which is what makes scalar, AVX2, and AVX-VNNI land on the same bits.
+    private static float RowDotQ8K(byte* row, byte* qa, float* da, int cols, QuantFormat format, IntegerDotPath dot)
     {
         return format switch
         {
-            QuantFormat.IQ2_XXS => avx2 ? RowDotIQ2XXSQ8Avx2(row, qa, da, cols) : RowDotIQ2XXSQ8Scalar(row, qa, da, cols),
-            QuantFormat.IQ2_XS => avx2 ? RowDotIQ2XSQ8Avx2(row, qa, da, cols) : RowDotIQ2XSQ8Scalar(row, qa, da, cols),
-            QuantFormat.IQ2_S => avx2 ? RowDotIQ2SQ8Avx2(row, qa, da, cols) : RowDotIQ2SQ8Scalar(row, qa, da, cols),
-            QuantFormat.IQ3_XXS => avx2 ? RowDotIQ3XQ8Avx2(row, qa, da, cols) : RowDotIQ3XQ8Scalar(row, qa, da, cols),
-            QuantFormat.IQ3_S => avx2 ? RowDotIQ3SQ8Avx2(row, qa, da, cols) : RowDotIQ3SQ8Scalar(row, qa, da, cols),
+            QuantFormat.IQ2_XXS => dot == IntegerDotPath.Scalar ? RowDotIQ2XXSQ8Scalar(row, qa, da, cols) : RowDotIQ2XXSQ8Vector(row, qa, da, cols, dot),
+            QuantFormat.IQ2_XS => dot == IntegerDotPath.Scalar ? RowDotIQ2XSQ8Scalar(row, qa, da, cols) : RowDotIQ2XSQ8Vector(row, qa, da, cols, dot),
+            QuantFormat.IQ2_S => dot == IntegerDotPath.Scalar ? RowDotIQ2SQ8Scalar(row, qa, da, cols) : RowDotIQ2SQ8Vector(row, qa, da, cols, dot),
+            QuantFormat.IQ3_XXS => dot == IntegerDotPath.Scalar ? RowDotIQ3XQ8Scalar(row, qa, da, cols) : RowDotIQ3XQ8Vector(row, qa, da, cols, dot),
+            QuantFormat.IQ3_S => dot == IntegerDotPath.Scalar ? RowDotIQ3SQ8Scalar(row, qa, da, cols) : RowDotIQ3SQ8Vector(row, qa, da, cols, dot),
             _ => throw new ArgumentOutOfRangeException(nameof(format), format, "Format does not dot against a Q8_K activation."),
         };
     }
@@ -107,14 +109,14 @@ public sealed unsafe partial class CpuBackend
     // like its single-vector GEMV - exact int32 sub-block totals under ls factors, then d * bsum per super-block in
     // block order, then the format's final factor once - so every batch output is bit-identical to a solo row. The
     // weight bytes are traversed once and each decoded sub-block feeds all vectors' integer dots.
-    private static void RowBatchDotQ8K(byte* rowBytes, byte* qa, float* da, int blocks, int count, int rows, QuantFormat format, bool avx2, float* outBase)
+    private static void RowBatchDotQ8K(byte* rowBytes, byte* qa, float* da, int blocks, int count, int rows, QuantFormat format, IntegerDotPath dot, float* outBase)
     {
-        if (!avx2)
+        if (dot == IntegerDotPath.Scalar)
         {
             for (int b = 0; b < count; b++)
             {
-                // Non-AVX2 fallback: the same scalar kernels a solo GEMV would run, one accumulator chain per vector.
-                outBase[(long)b * rows] = RowDotQ8K(rowBytes, qa + (long)b * blocks * QkK, da + (long)b * blocks, blocks * QkK, format, false);
+                // Scalar posture: the same reference kernels a solo GEMV would run, one accumulator chain per vector.
+                outBase[(long)b * rows] = RowDotQ8K(rowBytes, qa + (long)b * blocks * QkK, da + (long)b * blocks, blocks * QkK, format, IntegerDotPath.Scalar);
             }
 
             return;
@@ -123,19 +125,19 @@ public sealed unsafe partial class CpuBackend
         switch (format)
         {
             case QuantFormat.IQ2_XXS:
-                BatchIQ2XXQ8_Avx2(rowBytes, qa, da, blocks, count, rows, outBase);
+                BatchIQ2XXQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, dot);
                 break;
             case QuantFormat.IQ2_XS:
-                BatchIQ2XSQ8_Avx2(rowBytes, qa, da, blocks, count, rows, outBase);
+                BatchIQ2XSQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, dot);
                 break;
             case QuantFormat.IQ2_S:
-                BatchIQ2SQ8_Avx2(rowBytes, qa, da, blocks, count, rows, outBase);
+                BatchIQ2SQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, dot);
                 break;
             case QuantFormat.IQ3_XXS:
-                BatchIQ3XQ8_Avx2(rowBytes, qa, da, blocks, count, rows, outBase);
+                BatchIQ3XQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, dot);
                 break;
             default:
-                BatchIQ3SQ8_Avx2(rowBytes, qa, da, blocks, count, rows, outBase);
+                BatchIQ3SQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, dot);
                 break;
         }
     }
@@ -176,28 +178,18 @@ public sealed unsafe partial class CpuBackend
         hiSum = hi;
     }
 
-    // AVX2 form of the same sub-block dot: each group's sign byte is broadcast over its eight activation lanes with a
-    // lane mask, a byte-wise AND with the kmask table turns every set sign bit into a nonzero test lane, psubb negates
-    // exactly the tested lanes, and pmaddubsw then pmaddwd reproduce the reference's pair-then-quadruple integer grouping. Pair
-    // sums are bounded by 2 * 127 * 127 < 32767, so no pmaddubsw lane can saturate, and every lane accumulator and
-    // lane sum is an exact int32 - so the lane grouping here and the sequential order of SubBlockDotQ8KScalar are two
-    // paths over the same integer total.
+    // AVX2 form of the same sub-block dot: the shared sign fold below negates exactly the tested activation lanes, and
+    // pmaddubsw then pmaddwd reproduce the reference's pair-then-quadruple integer grouping. Pair sums are bounded by
+    // 2 * 127 * 127 < 32767, so no pmaddubsw lane can saturate, and every lane accumulator and lane sum is an exact int32
+    // - so the lane grouping here and the sequential order of SubBlockDotQ8KScalar are two paths over the same integer total.
     private static void SubBlockDotQ8KAvx2(byte* mag, uint signs, sbyte* act, out int loSum, out int hiSum)
     {
         Vector256<byte> magnitudes = Avx.LoadVector256(mag); // 32 unsigned magnitudes, all below 128
         Vector256<sbyte> activation = Avx.LoadVector256(act); // 32 Q8_K quants, all in [-127, 127]
 
-        // Each group's sign byte is broadcast over exactly its eight activation lanes with a lane mask, then AND-ed with
-        // the kmask bit table leaves a nonzero lane exactly where the sign is set, and the byte compare turns that into an
-        // all-ones mask over the lanes left positive. A packed dword cannot be spread with one shuffle or broadcast: those
-        // intrinsics are element-typed, so broadcasting the four sign bytes broadcasts only their first byte.
-        Vector256<byte> groupedSigns = GroupedSignBytes(signs);
-        Vector256<byte> positive = Avx2.CompareEqual(Avx2.And(groupedSigns, GetSignBitTable()), Vector256<byte>.Zero);
-        Vector256<byte> folded = Avx2.Or(
-            Avx2.And(activation.AsByte(), positive),
-            Avx2.AndNot(positive, Avx2.Subtract(Vector256<sbyte>.Zero, activation).AsByte()));
+        Vector256<sbyte> folded = FoldActivationSigns(signs, activation);
 
-        Vector256<short> pairs = Avx2.MultiplyAddAdjacent(magnitudes, folded.AsSByte()); // pmaddubsw: adjacent products summed in int16 lanes
+        Vector256<short> pairs = Avx2.MultiplyAddAdjacent(magnitudes, folded); // pmaddubsw: adjacent products summed in int16 lanes
         Vector128<short> ones = Vector128.Create((short)1);
 
         loSum = HSumInt32(Sse2.MultiplyAddAdjacent(pairs.GetLower(), ones)); // pmaddwd against ones: quadruple sums in int32 lanes
@@ -206,6 +198,55 @@ public sealed unsafe partial class CpuBackend
 
     // Integer lane reduction: every partial is an exact int32, so lane order is irrelevant and a plain fold is enough.
     private static int HSumInt32(Vector128<int> v) => v.GetElement(0) + v.GetElement(1) + v.GetElement(2) + v.GetElement(3);
+
+    // AVX-VNNI form of the same sub-block dot: the sign fold above is reused unchanged (the fold belongs to the activation,
+    // whatever dot consumes it), and vpdpbusd then widens each unsigned magnitude times signed quant straight into an int32
+    // lane that keeps accumulating its own group of four products. The AVX2 path stops one step earlier - pair sums held in
+    // int16 lanes before pmaddwd adds them - and those pair sums are bounded by 2 * 127 * 127 < 32767, so neither encoding
+    // saturates anywhere: each dword lane here holds exactly the same four exact products the AVX2 path groups, and a dword
+    // lane of the lower half covers elements 0..15 while one of the upper half covers 16..31. Same integer totals as
+    // SubBlockDotQ8KAvx2 and SubBlockDotQ8KScalar, so lo/hi carry identical values into the same float accumulation.
+    private static void SubBlockDotQ8KVnni(byte* mag, uint signs, sbyte* act, out int loSum, out int hiSum)
+    {
+        Vector256<byte> magnitudes = Avx.LoadVector256(mag); // 32 unsigned magnitudes, all below 128 (the vpdpbusd left operand is read unsigned)
+        Vector256<sbyte> activation = Avx.LoadVector256(act); // 32 Q8_K quants, all in [-127, 127]
+
+        Vector256<sbyte> folded = FoldActivationSigns(signs, activation);
+
+        Vector256<int> accumulators = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, magnitudes, folded); // vpdpbusd: unsigned x signed accumulated in int32 lanes
+
+        loSum = HSumInt32(accumulators.GetLower());
+        hiSum = HSumInt32(accumulators.GetUpper());
+    }
+
+    // The vector integer dot one sub-block runs: the encoding arrives already resolved at engine open and stays constant
+    // for the whole row, batch, and worker set, so a kernel never re-decides mid-forward. Both encodings fold signs onto
+    // the activation through one shared helper and return identical exact int32 half totals over the same 32 values.
+    private static void SubBlockDotQ8KVector(byte* mag, uint signs, sbyte* act, out int loSum, out int hiSum, IntegerDotPath dot)
+    {
+        if (dot == IntegerDotPath.Vnni)
+        {
+            SubBlockDotQ8KVnni(mag, signs, act, out loSum, out hiSum);
+            return;
+        }
+
+        SubBlockDotQ8KAvx2(mag, signs, act, out loSum, out hiSum);
+    }
+
+    // The sign fold both vector encodings consume: each group's sign byte is broadcast over exactly its eight activation
+    // lanes with a lane mask, AND-ed with the kmask bit table leaves a nonzero lane exactly where the sign is set, and the
+    // byte compare turns that into an all-ones mask over the lanes left positive. A packed dword cannot be spread with one
+    // shuffle or broadcast: those intrinsics are element-typed, so broadcasting the four sign bytes broadcasts only their
+    // first byte. Shared verbatim between the AVX2 and AVX-VNNI dots so the activation each one multiplies is identical.
+    private static Vector256<sbyte> FoldActivationSigns(uint signs, Vector256<sbyte> activation)
+    {
+        Vector256<byte> groupedSigns = GroupedSignBytes(signs);
+        Vector256<byte> positive = Avx2.CompareEqual(Avx2.And(groupedSigns, GetSignBitTable()), Vector256<byte>.Zero);
+
+        return Avx2.Or(
+            Avx2.And(activation.AsByte(), positive),
+            Avx2.AndNot(positive, Avx2.Subtract(Vector256<sbyte>.Zero, activation).AsByte())).AsSByte();
+    }
 
     // Broadcasts each packed sign byte over exactly the eight activation lanes of its own value group, so a sub-block's
     // four groups line up with the kmask bit table below. Four scalar broadcasts and lane masks beat any shuffle trick:

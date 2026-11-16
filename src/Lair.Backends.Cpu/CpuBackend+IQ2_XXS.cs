@@ -202,10 +202,11 @@ public sealed unsafe partial class CpuBackend
         return 0.125f * sumf;
     }
 
-    // AVX2: the same staged magnitudes and packed sign bytes feed SubBlockDotQ8KAvx2, whose pmaddubsw/pmaddwd lane
-    // totals are exactly the scalar loop's running total - only the float accumulation order matters there, and it is
-    // paths over the same integer total. The activation side needs no staging either: a sub-block of Q8_K quants is already contiguous bytes.
-    private static float RowDotIQ2XXSQ8Avx2(byte* row, byte* qa, float* da, int cols)
+    // Vector integer dot: the same staged magnitudes and packed sign bytes feed SubBlockDotQ8KVector, whose lane totals -
+    // pmaddubsw/pmaddwd under AVX2, vpdpbusd under AVX-VNNI - are exactly the scalar loop's running total. Only the float
+    // accumulation order matters there, and it is shared: two paths over the same integer total. The activation side needs
+    // no staging either: a sub-block of Q8_K quants is already contiguous bytes.
+    private static float RowDotIQ2XXSQ8Vector(byte* row, byte* qa, float* da, int cols, IntegerDotPath dot)
     {
         Span<byte> mag = stackalloc byte[32]; // magnitude bytes of the current 32-value sub-block
         int blocks = Q8KBlockCount(cols); // whole super-blocks: padding columns quantize to zero and contribute nothing
@@ -228,7 +229,7 @@ public sealed unsafe partial class CpuBackend
 
                 fixed (byte* pMag = mag)
                 {
-                    SubBlockDotQ8KAvx2(pMag, signs, (sbyte*)(qa + bi * QkK + ib * 32), out lo, out hi);
+                    SubBlockDotQ8KVector(pMag, signs, (sbyte*)(qa + bi * QkK + ib * 32), out lo, out hi, dot);
                 }
 
                 bsum += (lo + hi) * (2 * (int)(signAux >> 28) + 1);
@@ -296,9 +297,10 @@ public sealed unsafe partial class CpuBackend
     }
 
     // Batched IQ2_XXS row against Q8_K activations: each sub-block's magnitudes and sign bytes are staged once, then
-    // applied to every vector's activation quants in RowDotIQ2XXSQ8Avx2's integer and float order, so the packed weight
-    // bytes are streamed one time for the whole batch.
-    private static void BatchIQ2XXQ8_Avx2(byte* row, byte* qa, float* da, int blocks, int count, int rows, float* outBase)
+    // applied to every vector's activation quants in RowDotIQ2XXSQ8Vector's integer and float order, so the packed weight
+    // bytes are streamed one time for the whole batch. The dot encoding is this backend's resolved one, identical to what
+    // a solo GEMV of the same row runs.
+    private static void BatchIQ2XXQ8_Vector(byte* row, byte* qa, float* da, int blocks, int count, int rows, float* outBase, IntegerDotPath dot)
     {
         Span<byte> mag = stackalloc byte[32]; // magnitude bytes of the current 32-value sub-block
         Span<int> bsum = stackalloc int[MaxBatch]; // exact per-vector integer super-block totals
@@ -320,7 +322,7 @@ public sealed unsafe partial class CpuBackend
                 {
                     for (int b = 0; b < count; b++)
                     {
-                        SubBlockDotQ8KAvx2(pMag, signs, (sbyte*)(qa + (long)b * blocks * QkK + bi * QkK + ib * 32), out int lo, out int hi);
+                        SubBlockDotQ8KVector(pMag, signs, (sbyte*)(qa + (long)b * blocks * QkK + bi * QkK + ib * 32), out int lo, out int hi, dot);
                         bsum[b] += (lo + hi) * ls;
                     }
                 }
@@ -335,7 +337,7 @@ public sealed unsafe partial class CpuBackend
 
         for (int b = 0; b < count; b++)
         {
-            outBase[(long)b * rows] = 0.125f * sumf[b]; // the reference's single final factor, applied exactly as in RowDotIQ2XXSQ8Avx2
+            outBase[(long)b * rows] = 0.125f * sumf[b]; // the reference's single final factor, applied exactly as in RowDotIQ2XXSQ8Vector
         }
     }
 

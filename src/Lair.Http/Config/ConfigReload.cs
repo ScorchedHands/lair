@@ -123,6 +123,13 @@ public static class ConfigMutationTable
             changes.Add(new FieldChange("engine.prefill_kernel", oldEngine.PrefillKernel, newEngine.PrefillKernel, ConfigMutationClass.NewRequestsOnly));
         }
 
+        // The CPU ISA axis is a fact of an opened backend's kernels, not a knob any live path re-reads: the whole engine
+        // restarts to move it.
+        if (newEngine.Cpu.Isa != oldEngine.Cpu.Isa)
+        {
+            changes.Add(new FieldChange("engine.cpu.isa", oldEngine.Cpu.Isa, newEngine.Cpu.Isa, ConfigMutationClass.RestartOnly));
+        }
+
         ServerConfig oldServer = current.Server;
         ServerConfig newServer = candidate.Server;
         Add(changes, "server.bind", oldServer.Bind, newServer.Bind);
@@ -283,6 +290,7 @@ public static class ConfigMutationTable
         "engine.max_batch_tokens" => ConfigMutationClass.Live,
         "engine.prefill_step_budget_ms" => ConfigMutationClass.Live,
         "engine.prefill_kernel" => ConfigMutationClass.NewRequestsOnly,
+        "engine.cpu.isa" => ConfigMutationClass.RestartOnly, // resolved into the opened backend's kernels at load: only a restart re-resolves it
         "models[0].kv_blocks" => ConfigMutationClass.Live,
         "models[0].placement.thread_quota" => ConfigMutationClass.Live,
         "ui.recent_requests" => ConfigMutationClass.Live,
@@ -406,6 +414,7 @@ public static class ConfigMutationTable
         yield return ("engine.max_batch_tokens", ScalarText(engine, "max_batch_tokens"));
         yield return ("engine.prefill_step_budget_ms", ScalarText(engine, "prefill_step_budget_ms"));
         yield return ("engine.prefill_kernel", ScalarText(engine, "prefill_kernel"));
+        yield return ("engine.cpu.isa", ScalarText(Child(engine, "cpu"), "isa"));
 
         YamlDotNet.RepresentationModel.YamlMappingNode? model = FirstModel(root);
         yield return ("models[0].name", ScalarText(model, "name"));
@@ -473,6 +482,7 @@ public static class ConfigMutationTable
         "engine.max_batch_tokens" => Text(current.Engine.MaxBatchTokens),
         "engine.prefill_step_budget_ms" => TextOrNone(current.Engine.PrefillStepBudgetMs),
         "engine.prefill_kernel" => current.Engine.PrefillKernel,
+        "engine.cpu.isa" => current.Engine.Cpu.Isa,
         "models[0].name" => current.Models[0].Name,
         "models[0].path" => current.Models[0].Path,
         "models[0].type" => current.Models[0].Type,

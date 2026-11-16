@@ -1,4 +1,5 @@
 using System.Globalization;
+using Lair.Backends.Cpu;
 using Lair.Kv;
 using Lair.Models;
 using YamlDotNet.Core;
@@ -17,7 +18,8 @@ public static class YamlConfigLoader
 
     private static readonly string[] TopLevelKeys = ["server", "engine", "models", "ui", "host"];
     private static readonly string[] ServerKeys = ["bind", "port"];
-    private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel"];
+    private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel", "cpu"];
+    private static readonly string[] CpuKeys = ["isa"];
     private static readonly string[] UiKeys = ["recent_requests"];
     private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "budgets", "source"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit", "numa_spread", "gpu_layers"];
@@ -323,7 +325,33 @@ public static class YamlConfigLoader
                 $"engine.prefill_kernel '{prefillKernel}' is invalid for model '{models[0].Name}': 'prefill_kernel' accepts only '{PrefillKernelNames.GemV}', '{PrefillKernelNames.Tiled}', or '{PrefillKernelNames.Gemm}'.");
         }
 
-        return new EngineConfig { Threads = threads, BlockSize = blockSize, MaxBatchTokens = maxBatchTokens, PrefillStepBudgetMs = prefillStepBudgetMs, PrefillKernel = prefillKernel };
+        EngineCpuConfig cpu = ParseEngineCpu(keys, models[0].Name);
+
+        return new EngineConfig { Threads = threads, BlockSize = blockSize, MaxBatchTokens = maxBatchTokens, PrefillStepBudgetMs = prefillStepBudgetMs, PrefillKernel = prefillKernel, Cpu = cpu };
+    }
+
+    // CPU ISA selection: auto (default — the highest integer-dot path this host's CPU reports), avx2, or avx-vnni. All three
+    // spellings are accepted by the schema; whether a forced one can run is what the backend answers when the engine opens. An
+    // unrecognized value fails naming the served model and the key with the accepted set, exactly as the other choice keys do.
+    private static EngineCpuConfig ParseEngineCpu(Dictionary<string, YamlNode> engineKeys, string modelName)
+    {
+        const string where = "'engine.cpu'";
+        if (!engineKeys.TryGetValue("cpu", out YamlNode? node))
+        {
+            return new EngineCpuConfig();
+        }
+
+        Dictionary<string, YamlNode> keys = KeysOf(AsMapping(node, where), where);
+        RejectUnknownKeys(keys, where, CpuKeys);
+
+        string isa = TryText(keys, "isa", "engine.cpu.isa") ?? CpuIsaNames.Auto;
+        if (!CpuIsaNames.TryParse(isa, out _))
+        {
+            throw new ConfigException(
+                $"engine.cpu.isa '{isa}' is invalid for model '{modelName}': 'cpu.isa' accepts {CpuIsaNames.AcceptedVocabulary}.");
+        }
+
+        return new EngineCpuConfig { Isa = isa };
     }
 
     private static IReadOnlyList<ModelConfig> ParseModels(Dictionary<string, YamlNode> top)

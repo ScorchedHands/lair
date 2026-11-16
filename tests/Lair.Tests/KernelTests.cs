@@ -1191,6 +1191,137 @@ public class KernelTests
         }
     }
 
+    // The same bit-exactness the scalar/AVX2 pair carries, over the vpdpbusd integer dot engine.cpu.isa selects: each dword lane a
+    // vpdpbusd accumulates holds exactly the four products pmaddubsw and pmaddwd group in the AVX2 path, so all three encodings must
+    // land on identical bits for every Q8_K super-block. The resolved-path assertions prove which encoding actually ran instead of
+    // trusting a constructor argument to mean what it says.
+    [Theory]
+    [InlineData(QuantFormat.IQ2_XXS)]
+    [InlineData(QuantFormat.IQ2_XS)]
+    [InlineData(QuantFormat.IQ2_S)]
+    [InlineData(QuantFormat.IQ3_XXS)]
+    [InlineData(QuantFormat.IQ3_S)]
+    public void Gemv_Q8KFormats_ScalarAvx2AndVnni_AreBitIdentical(QuantFormat format)
+    {
+        if (!CpuIsaProbe.Detect().AvxVnniAvailable)
+        {
+            return; // the vpdpbusd gates run only where this host reports AVX-VNNI beside its vector baseline (xunit 2.9 has no dynamic Assert.Skip).
+        }
+
+        foreach ((int rows, int cols) in MatrixSizes)
+        {
+            (float[] x, byte[] weights) = CreateCase(rows, cols, format, seed: 31415);
+
+            using CpuBackend scalar = new(threads: 1, allowAvx2: false);
+            using CpuBackend avx2 = new(threads: 1, requestedIsa: CpuIsa.Avx2);
+            using CpuBackend vnni = new(threads: 1, requestedIsa: CpuIsa.AvxVnni);
+
+            Assert.Equal(IntegerDotPath.Scalar, scalar.ResolvedIntegerDotPath); // the no-vector posture runs reference dots whatever auto resolved to
+            Assert.Equal(IntegerDotPath.Avx2, avx2.ResolvedIntegerDotPath);
+            Assert.Equal(IntegerDotPath.Vnni, vnni.ResolvedIntegerDotPath);
+
+            float[] fromScalar = new float[rows];
+            float[] fromAvx2 = new float[rows];
+            float[] fromVnni = new float[rows];
+            WeightRef w = new(weights, MatrixShape(rows, cols), format);
+            scalar.Gemv(x, w, fromScalar);
+            avx2.Gemv(x, w, fromAvx2);
+            vnni.Gemv(x, w, fromVnni);
+
+            AssertExact(fromAvx2, fromScalar, $"{format} avx2 vs scalar GEMV at {rows}x{cols}");
+            AssertExact(fromVnni, fromScalar, $"{format} avx-vnni vs scalar GEMV at {rows}x{cols}");
+        }
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.IQ2_XXS)]
+    [InlineData(QuantFormat.IQ2_XS)]
+    [InlineData(QuantFormat.IQ2_S)]
+    [InlineData(QuantFormat.IQ3_XXS)]
+    [InlineData(QuantFormat.IQ3_S)]
+    public void GemvBatch_Q8KFormats_VnniMatchesAvx2SoloAndIntegerOracleExactly(QuantFormat format)
+    {
+        if (!CpuIsaProbe.Detect().AvxVnniAvailable)
+        {
+            return; // the vpdpbusd gates run only where this host reports AVX-VNNI beside its vector baseline (xunit 2.9 has no dynamic Assert.Skip).
+        }
+
+        foreach ((int rows, int cols) in MatrixSizes)
+        {
+            (_, byte[] weights) = CreateCase(rows, cols, format, seed: 2718);
+
+            foreach (int count in new[] { 1, 3, 8 })
+            {
+                float[] inputs = NextFloats(new Random(900 + count), count * cols);
+                WeightRef w = new(weights, MatrixShape(rows, cols), format);
+
+                using CpuBackend soloAvx2 = new(threads: 1, requestedIsa: CpuIsa.Avx2);
+                using CpuBackend batchVnni = new(threads: 1, requestedIsa: CpuIsa.AvxVnni);
+
+                Assert.Equal(IntegerDotPath.Vnni, batchVnni.ResolvedIntegerDotPath); // the batched kernel really ran vpdpbusd over its whole window
+
+                float[] fromSolo = new float[count * rows];
+                for (int b = 0; b < count; b++)
+                {
+                    soloAvx2.Gemv(inputs.AsSpan(b * cols, cols), w, fromSolo.AsSpan(b * rows, rows));
+                }
+
+                float[] batchOut = new float[count * rows];
+                batchVnni.GemvBatch(inputs, count, w, batchOut);
+                AssertExact(batchOut, fromSolo, $"{format} avx-vnni batch({count}) vs solo GEMV at {rows}x{cols}");
+
+                // The same numbers against the independent integer reference: each vector's own quantized activation.
+                for (int b = 0; b < count; b++)
+                {
+                    float[] slice = new float[cols];
+                    Array.Copy(inputs, (long)b * cols, slice, 0, cols);
+
+                    AssertExact(
+                        batchOut.AsSpan(b * rows, rows),
+                        OracleDotQ8K(slice, weights, rows, cols, format),
+                        $"{format} avx-vnni batch({count}) vector {b} vs integer oracle at {rows}x{cols}");
+                }
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.IQ2_XXS)]
+    [InlineData(QuantFormat.IQ2_XS)]
+    [InlineData(QuantFormat.IQ2_S)]
+    [InlineData(QuantFormat.IQ3_XXS)]
+    [InlineData(QuantFormat.IQ3_S)]
+    public void Gemv_Q8KFormats_Vnni_OneThreadAndFourThreads_AreBitIdentical(QuantFormat format)
+    {
+        if (!CpuIsaProbe.Detect().AvxVnniAvailable)
+        {
+            return; // the vpdpbusd gates run only where this host reports AVX-VNNI beside its vector baseline (xunit 2.9 has no dynamic Assert.Skip).
+        }
+
+        foreach ((int rows, int cols) in MatrixSizes)
+        {
+            (float[] x, byte[] weights) = CreateCase(rows, cols, format, seed: 4242);
+
+            using CpuBackend single = new(threads: 1, requestedIsa: CpuIsa.AvxVnni);
+            using CpuBackend parallel = new(threads: 4, requestedIsa: CpuIsa.AvxVnni);
+            using CpuBackend scalar = new(threads: 1, allowAvx2: false);
+
+            Assert.Equal(IntegerDotPath.Vnni, single.ResolvedIntegerDotPath); // a partition never re-decides the encoding mid-forward
+            Assert.Equal(IntegerDotPath.Vnni, parallel.ResolvedIntegerDotPath);
+
+            float[] oneThread = new float[rows];
+            float[] fourThreads = new float[rows];
+            float[] fromScalar = new float[rows];
+            WeightRef w = new(weights, MatrixShape(rows, cols), format);
+            single.Gemv(x, w, oneThread);
+            parallel.Gemv(x, w, fourThreads);
+            scalar.Gemv(x, w, fromScalar);
+
+            AssertExact(fourThreads, oneThread, $"{format} avx-vnni 4-thread vs 1-thread GEMV at {rows}x{cols}");
+            AssertExact(fourThreads, fromScalar, $"{format} avx-vnni 4-thread vs scalar GEMV at {rows}x{cols}");
+        }
+    }
+
     // Bit-exact comparison: int32 bit patterns, so signed zeros and NaN payloads count as differences too.
     private static void AssertExact(ReadOnlySpan<float> actual, ReadOnlySpan<float> expected, string context)
     {

@@ -191,11 +191,11 @@ public sealed unsafe partial class CpuBackend
         return sumf; // IQ3_S carries its scale in ls itself: the reference applies no final factor
     }
 
-    // AVX2: expand each 32-value sub-block into a stack staging buffer with the grid/sign lookups (a 512-entry
-    // grid of four-byte entries cannot be reached through a single pshufb, so staging replaces direct table
-    // lookup), then fuse the staged weights into the same eight-lane accumulator, chunk order, and lane reduction as
-    // RowDotIQ3XAvx2. Partial chunks fall to scalar accumulation.
-    private static float RowDotIQ3SQ8Avx2(byte* row, byte* qa, float* da, int cols)
+    // Vector integer dot: stage each 32-value sub-block's magnitudes and sign bytes exactly as the scalar loop stages them
+    // (a 512-entry grid of four-byte entries cannot be reached through a single pshufb, so staging replaces direct table
+    // lookup), then feed them to SubBlockDotQ8KVector - pmaddubsw/pmaddwd under AVX2, vpdpbusd under AVX-VNNI - whose lane
+    // totals are the same exact integer running total, in the same sub-block order and with the same float accumulation.
+    private static float RowDotIQ3SQ8Vector(byte* row, byte* qa, float* da, int cols, IntegerDotPath dot)
     {
         Span<byte> mag = stackalloc byte[32]; // magnitude bytes of the current 32-value sub-block
         int blocks = Q8KBlockCount(cols); // whole super-blocks: padding columns quantize to zero and contribute nothing
@@ -217,7 +217,7 @@ public sealed unsafe partial class CpuBackend
 
                 fixed (byte* pMag = mag)
                 {
-                    SubBlockDotQ8KAvx2(pMag, signs, (sbyte*)(qa + bi * QkK + ib * 32), out lo, out hi);
+                    SubBlockDotQ8KVector(pMag, signs, (sbyte*)(qa + bi * QkK + ib * 32), out lo, out hi, dot);
                 }
 
                 bsum += (lo + hi) * ls; // one ls covers the whole sub-block, as in the scalar path
@@ -287,9 +287,9 @@ public sealed unsafe partial class CpuBackend
         }
     }
 
-    // Batched IQ3_S row: one staged sub-block feeds all accumulator chains with the same fused (x * w) FMA shape as
-    // RowDotIQ3SAvx2, so the packed bytes are streamed once for the whole batch.
-    private static void BatchIQ3SQ8_Avx2(byte* row, byte* qa, float* da, int blocks, int count, int rows, float* outBase)
+    // Batched IQ3_S row: one staged sub-block feeds every vector's integer dot in RowDotIQ3SQ8Vector's integer and float
+    // order, so the packed bytes are streamed once for the whole batch. Each vector keeps its own exact int32 super-block total.
+    private static void BatchIQ3SQ8_Vector(byte* row, byte* qa, float* da, int blocks, int count, int rows, float* outBase, IntegerDotPath dot)
     {
         Span<byte> mag = stackalloc byte[32]; // magnitude bytes of the current 32-value sub-block
         Span<int> bsum = stackalloc int[MaxBatch]; // exact per-vector integer super-block totals
@@ -309,7 +309,7 @@ public sealed unsafe partial class CpuBackend
                     uint signs = StageIQ3SMagnitudes(block + 2 + 8 * ib, block[66 + ib], block + 74 + 4 * ib, mag); // decoded once per sub-block and reused across the batch
                     for (int b = 0; b < count; b++)
                     {
-                        SubBlockDotQ8KAvx2(pMag, signs, (sbyte*)(qa + (long)b * blocks * QkK + bi * QkK + ib * 32), out int lo, out int hi);
+                        SubBlockDotQ8KVector(pMag, signs, (sbyte*)(qa + (long)b * blocks * QkK + bi * QkK + ib * 32), out int lo, out int hi, dot);
                         bsum[b] += (lo + hi) * ls;
                     }
                 }
@@ -324,7 +324,7 @@ public sealed unsafe partial class CpuBackend
 
         for (int b = 0; b < count; b++)
         {
-            outBase[(long)b * rows] = sumf[b]; // IQ3_S applies no final factor, exactly as in RowDotIQ3SQ8Avx2
+            outBase[(long)b * rows] = sumf[b]; // IQ3_S applies no final factor, exactly as in RowDotIQ3SQ8Vector
         }
     }
 

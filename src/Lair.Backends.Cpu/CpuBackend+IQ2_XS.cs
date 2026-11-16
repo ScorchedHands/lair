@@ -323,10 +323,11 @@ public sealed unsafe partial class CpuBackend
 
     // AVX2: the same staged magnitudes and packed sign bytes feed SubBlockDotQ8KAvx2 (the grid stays looked up through
     // staging because a 512-entry table of eight-byte entries cannot be reached by one pshufb), together with the two
-    // sub-block scale nibbles. Its pmaddubsw/pmaddwd lane totals are exactly the scalar loop's running total, so only
-    // the float accumulation order matters there - and it is shared, step for step, with RowDotIQ2XSQ8Scalar. The Q8_K
-    // quants of a sub-block are already contiguous activation bytes, so nothing needs staging on that side either.
-    private static float RowDotIQ2XSQ8Avx2(byte* row, byte* qa, float* da, int cols)
+    // sub-block scale nibbles. SubBlockDotQ8KVector's lane totals - pmaddubsw/pmaddwd under AVX2, vpdpbusd under AVX-VNNI -
+    // are exactly the scalar loop's running total, so only the float accumulation order matters there - and it is shared,
+    // step for step, with RowDotIQ2XSQ8Scalar. The Q8_K quants of a sub-block are already contiguous activation bytes, so
+    // nothing needs staging on that side either.
+    private static float RowDotIQ2XSQ8Vector(byte* row, byte* qa, float* da, int cols, IntegerDotPath dot)
     {
         Span<byte> mag = stackalloc byte[32]; // magnitude bytes of the current 32-value sub-block
         int blocks = Q8KBlockCount(cols); // whole super-blocks: padding columns quantize to zero and contribute nothing
@@ -348,7 +349,7 @@ public sealed unsafe partial class CpuBackend
 
                 fixed (byte* pMag = mag)
                 {
-                    SubBlockDotQ8KAvx2(pMag, signs, (sbyte*)(qa + bi * QkK + ib * 32), out lo, out hi);
+                    SubBlockDotQ8KVector(pMag, signs, (sbyte*)(qa + bi * QkK + ib * 32), out lo, out hi, dot);
                 }
 
                 bsum += lo * (2 * (scaleByte & 0xF) + 1); // ls1 over groups 0..1 and ls2 over groups 2..3, as in the scalar path
@@ -420,9 +421,9 @@ public sealed unsafe partial class CpuBackend
     }
 
     // Batched IQ2_XS row against Q8_K activations: each sub-block's magnitudes and sign bytes are staged once, then
-    // applied to every vector's activation quants in RowDotIQ2XSQ8Avx2's integer and float order, so the packed weight
+    // applied to every vector's activation quants in RowDotIQ2XSQ8Vector's integer and float order, so the packed weight
     // bytes are streamed one time for the whole batch. Each vector keeps its own exact int32 super-block total.
-    private static void BatchIQ2XSQ8_Avx2(byte* row, byte* qa, float* da, int blocks, int count, int rows, float* outBase)
+    private static void BatchIQ2XSQ8_Vector(byte* row, byte* qa, float* da, int blocks, int count, int rows, float* outBase, IntegerDotPath dot)
     {
         Span<byte> mag = stackalloc byte[32]; // magnitude bytes of the current 32-value sub-block
         Span<int> bsum = stackalloc int[MaxBatch]; // exact per-vector integer super-block totals
@@ -444,7 +445,7 @@ public sealed unsafe partial class CpuBackend
                     uint signs = StageIQ2XSMagnitudes(block + 2 + 8 * ib, mag); // decoded once per sub-block and reused across the batch
                     for (int b = 0; b < count; b++)
                     {
-                        SubBlockDotQ8KAvx2(pMag, signs, (sbyte*)(qa + (long)b * blocks * QkK + bi * QkK + ib * 32), out int lo, out int hi);
+                        SubBlockDotQ8KVector(pMag, signs, (sbyte*)(qa + (long)b * blocks * QkK + bi * QkK + ib * 32), out int lo, out int hi, dot);
                         bsum[b] += lo * ls1;
                         bsum[b] += hi * ls2;
                     }
@@ -460,7 +461,7 @@ public sealed unsafe partial class CpuBackend
 
         for (int b = 0; b < count; b++)
         {
-            outBase[(long)b * rows] = 0.125f * sumf[b]; // the reference's single final factor, applied exactly as in RowDotIQ2XSQ8Avx2
+            outBase[(long)b * rows] = 0.125f * sumf[b]; // the reference's single final factor, applied exactly as in RowDotIQ2XSQ8Vector
         }
     }
 

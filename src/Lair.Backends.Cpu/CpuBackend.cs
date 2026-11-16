@@ -52,6 +52,8 @@ public sealed unsafe partial class CpuBackend : IBackend
     private readonly ulong? _coreMask;
     private bool _samplingRequested; // test-only instrumentation flag, read when the pool is created and pushed on enable
     private readonly bool _useAvx2;
+    private readonly CpuIsa _requestedIsa;
+    private readonly IntegerDotPath _integerDot; // resolved once at open: every i-quant dot this backend runs uses this encoding for its whole lifetime
     private WorkerPool? _pool;
 
     /// <summary>
@@ -72,8 +74,12 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// model's compute stays inside its configured processor set. Pinning is applied on Windows only: on other platforms it is a
     /// documented no-op that warns once at startup (Linux affinity via sched_setaffinity is later hardening). Core ids must lie
     /// within one 64-bit processor group ([0, 63]) because that is what an affinity mask can express.
+    /// <paramref name="requestedIsa"/> is the engine.cpu.isa axis: it resolves against this host's reported CPU features exactly
+    /// once here, and every i-quant integer dot this backend runs - solo GEMV, batched GEMV, threaded or not - uses that resolved
+    /// encoding for the backend's whole lifetime. A forced ISA this CPU does not report fails the open naming the missing feature;
+    /// <see cref="cpuFeatures"/> lets a caller state a posture other than what this process reports.
     /// </summary>
-    public CpuBackend(int threads = 0, IReadOnlySet<int>? coreSet = null, int? threadQuota = null, bool allowAvx2 = true)
+    public CpuBackend(int threads = 0, IReadOnlySet<int>? coreSet = null, int? threadQuota = null, bool allowAvx2 = true, CpuIsa requestedIsa = CpuIsa.Auto, CpuFeaturePosture? cpuFeatures = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(threads);
         if (threadQuota is < 1)
@@ -92,8 +98,39 @@ public sealed unsafe partial class CpuBackend : IBackend
             _coreMask = ThreadAffinity.BuildCoreMask(coreSet);
         }
 
-        _useAvx2 = allowAvx2 && Avx2.IsSupported && Fma.IsSupported && Ssse3.IsSupported;
+        // One capability posture for this whole open, read once: it gates both the vector baseline every kernel uses and the
+        // integer-dot encoding engine.cpu.isa resolves to. A forced selection this host cannot run fails here rather than at
+        // some later token, because nothing downstream can tell a substituted path from the one that was asked for.
+        CpuFeaturePosture features = cpuFeatures ?? CpuIsaProbe.Detect();
+
+        if (!CpuIsaProbe.TryResolve(requestedIsa, features, out IntegerDotPath resolvedDot, out string? missingFeature))
+        {
+            throw new CpuIsaUnavailableException(requestedIsa, missingFeature!);
+        }
+
+        _useAvx2 = allowAvx2 && features.Avx2Available; // the same AVX2 + FMA + SSSE3 gate this backend has always applied, now read from one posture
+
+        if (!allowAvx2)
+        {
+            if (requestedIsa != CpuIsa.Auto)
+            {
+                throw new ArgumentException(
+                    $"engine.cpu.isa '{CpuIsaNames.Of(requestedIsa)}' cannot be forced on a backend opened with its vector posture disabled: forcing an ISA asks for a vector integer dot this posture never runs.",
+                    nameof(allowAvx2));
+            }
+
+            resolvedDot = IntegerDotPath.Scalar; // the no-vector posture (the scalar-oracle test knob) keeps running reference dots whatever auto resolved to.
+        }
+
+        _requestedIsa = requestedIsa;
+        _integerDot = resolvedDot;
     }
+
+    /// <summary>The engine.cpu.isa selection this backend was opened with, exactly as declared.</summary>
+    internal CpuIsa RequestedCpuIsa => _requestedIsa;
+
+    /// <summary>The integer-dot encoding that selection resolved to at open - scalar reference, AVX2 pair sums, or AVX-VNNI vpdpbusd - fixed for this backend's whole lifetime.</summary>
+    internal IntegerDotPath ResolvedIntegerDotPath => _integerDot;
 
     public string DeviceId => "cpu";
 
@@ -253,14 +290,14 @@ public sealed unsafe partial class CpuBackend : IBackend
                 for (int row = 0; row < rows; row++)
                 {
                     pOut[row] = usesQ8K
-                        ? RowDotQ8K(pBytes + (long)row * stride, qa, da, cols, format, _useAvx2)
+                        ? RowDotQ8K(pBytes + (long)row * stride, qa, da, cols, format, _integerDot)
                         : RowDot(pBytes + (long)row * stride, pX, cols, format, _useAvx2);
                 }
             }
             else
             {
                 WorkerPool pool = GetOrCreatePool();
-                pool.Run((rows + RowBlock - 1) / RowBlock, new RowBlockJob(pBytes, pX, qa, da, usesQ8K ? 1 : 0, pOut, stride, rows, cols, format, _useAvx2));
+                pool.Run((rows + RowBlock - 1) / RowBlock, new RowBlockJob(pBytes, pX, qa, da, usesQ8K ? 1 : 0, pOut, stride, rows, cols, format, _useAvx2, _integerDot));
             }
         }
 
@@ -356,7 +393,7 @@ public sealed unsafe partial class CpuBackend : IBackend
                 {
                     if (usesQ8K)
                     {
-                        RowBatchDotQ8K(pBytes + (long)row * stride, qa, da, q8Blocks, count, rows, format, _useAvx2, pOut + row);
+                        RowBatchDotQ8K(pBytes + (long)row * stride, qa, da, q8Blocks, count, rows, format, _integerDot, pOut + row);
                     }
                     else
                     {
@@ -367,7 +404,7 @@ public sealed unsafe partial class CpuBackend : IBackend
             else
             {
                 WorkerPool pool = GetOrCreatePool();
-                pool.Run((rows + RowBlock - 1) / RowBlock, new BatchRowJob(pBytes, pIn, qa, da, usesQ8K ? 1 : 0, q8Blocks, pOut, stride, rows, cols, count, format, _useAvx2));
+                pool.Run((rows + RowBlock - 1) / RowBlock, new BatchRowJob(pBytes, pIn, qa, da, usesQ8K ? 1 : 0, q8Blocks, pOut, stride, rows, cols, count, format, _useAvx2, _integerDot));
             }
         }
 
@@ -1100,8 +1137,9 @@ public sealed unsafe partial class CpuBackend : IBackend
         private readonly int _cols;
         private readonly QuantFormat _format;
         private readonly bool _avx2;
+        private readonly IntegerDotPath _dot; // this backend's resolved i-quant encoding: identical for every block of the call, whatever partition claims them
 
-        public RowBlockJob(byte* bytes, float* x, byte* qa, float* da, int q8k, float* outPtr, int stride, int rows, int cols, QuantFormat format, bool avx2)
+        public RowBlockJob(byte* bytes, float* x, byte* qa, float* da, int q8k, float* outPtr, int stride, int rows, int cols, QuantFormat format, bool avx2, IntegerDotPath dot)
         {
             _bytes = bytes;
             _x = x;
@@ -1114,6 +1152,7 @@ public sealed unsafe partial class CpuBackend : IBackend
             _cols = cols;
             _format = format;
             _avx2 = avx2;
+            _dot = dot;
         }
 
         public void ProcessBlock(int block)
@@ -1124,7 +1163,7 @@ public sealed unsafe partial class CpuBackend : IBackend
             {
                 byte* rowBytes = _bytes + (long)row * _stride;
                 _out[row] = _q8k != 0
-                    ? RowDotQ8K(rowBytes, _qa, _da, _cols, _format, _avx2)
+                    ? RowDotQ8K(rowBytes, _qa, _da, _cols, _format, _dot)
                     : RowDot(rowBytes, _x, _cols, _format, _avx2);
             }
         }
@@ -1154,8 +1193,9 @@ public sealed unsafe partial class CpuBackend : IBackend
         private readonly int _count;
         private readonly QuantFormat _format;
         private readonly bool _avx2;
+        private readonly IntegerDotPath _dot; // this backend's resolved i-quant encoding: identical for every block and batch vector of the call
 
-        public BatchRowJob(byte* bytes, float* inputs, byte* qa, float* da, int q8k, int blocks, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2)
+        public BatchRowJob(byte* bytes, float* inputs, byte* qa, float* da, int q8k, int blocks, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2, IntegerDotPath dot)
         {
             _bytes = bytes;
             _inputs = inputs;
@@ -1170,6 +1210,7 @@ public sealed unsafe partial class CpuBackend : IBackend
             _count = count;
             _format = format;
             _avx2 = avx2;
+            _dot = dot;
         }
 
         public void ProcessBlock(int block)
@@ -1181,7 +1222,7 @@ public sealed unsafe partial class CpuBackend : IBackend
                 byte* rowBytes = _bytes + (long)row * _stride;
                 if (_q8k != 0)
                 {
-                    RowBatchDotQ8K(rowBytes, _qa, _da, _blocks, _count, _rows, _format, _avx2, _out + row);
+                    RowBatchDotQ8K(rowBytes, _qa, _da, _blocks, _count, _rows, _format, _dot, _out + row);
                 }
                 else
                 {
