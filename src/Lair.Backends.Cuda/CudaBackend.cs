@@ -13,8 +13,9 @@ namespace Lair.Backends.Cuda;
 /// answers with, so no weight tensor is ever copied into persistent device memory and the weights stay resident exactly
 /// where the weight source holds them. Formats with no kernel here refuse naming this backend rather than run through
 /// some other route; the blocked matmul has no CUDA path at all yet. Activation vectors and outputs cross the PCIe
-/// seam per call in either posture, so KV arenas and split-route staging stay host-resident aligned memory under this
-/// device id until accelerator residency lands elsewhere.
+/// seam per call in either posture, and a KV arena stays host-resident for attention reads in both: the device KV mirror
+/// seam opens a persistent device copy of a declared block range that dirty blocks cross on flush, which is residency
+/// accounting only — no device-side attention kernel stands behind a mirror, and opening one implies none.
 /// </summary>
 public sealed partial class CudaBackend : IBackend
 {
@@ -283,6 +284,7 @@ public sealed partial class CudaBackend : IBackend
             _disposed = true;
             SetCurrentContext();
 
+            ReleaseKvMirrors(); // mirrors flush and release their pins while this instance's context is still current
             FreeDeviceWeightAllocations();
             ReleaseHostMappedRegions();
         }

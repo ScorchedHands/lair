@@ -254,6 +254,30 @@ public sealed class DeviceLedgerTests
     }
 
     [Fact]
+    public void UpdateStandingClaimAmount_AtOneTier_LeavesTheSameModelsClaimAtAnotherTier_Untouched()
+    {
+        ResolvedBudgetChain hostReservation = new() { Resource = BudgetResource.Kv, Tiers = [new ResolvedBudgetTier { Tier = BudgetTier.Dram }] };
+        ResolvedBudgetChain deviceRange = new() { Resource = BudgetResource.Kv, Tiers = [new ResolvedBudgetTier { Tier = BudgetTier.Vram, Cap = 8 }] };
+
+        using TestLedger ledger = new(
+            Capacity(BudgetTier.Dram, BudgetResource.Kv, 16),
+            Capacity(BudgetTier.Vram, BudgetResource.Kv, 8));
+
+        Assert.True(ledger.Ledger.RegisterClaim("model-a", hostReservation, amount: 8).Seated);
+        Assert.True(ledger.Ledger.RegisterClaim("model-a", deviceRange, amount: 4).Seated); // one model's blocks can stand at two positions of their own chain at once
+
+        Assert.True(ledger.Ledger.UpdateStandingClaimAmount("model-a", BudgetResource.Kv, newAmount: 5, atTier: BudgetTier.Dram));
+
+        Assert.Equal(5L, Assert.Single(ledger.Ledger.ClaimsAt(BudgetTier.Dram, BudgetResource.Kv)).Amount); // the seat a live edit governs carries the new amount
+        Assert.Equal(4L, Assert.Single(ledger.Ledger.ClaimsAt(BudgetTier.Vram, BudgetResource.Kv)).Amount); // and the claim seated beside it keeps its own standing amount rather than being retargeted twice
+
+        Assert.Equal(5L, ledger.Ledger.Occupied(BudgetTier.Dram, BudgetResource.Kv));
+        Assert.Equal(4L, ledger.Ledger.Occupied(BudgetTier.Vram, BudgetResource.Kv)); // what each position holds counts once, at the tier it stands at
+
+        Assert.False(ledger.Ledger.UpdateStandingClaimAmount("model-a", BudgetResource.Kv, newAmount: 9, atTier: BudgetTier.Nvme)); // a seat this model never took is not moved to some other one
+    }
+
+    [Fact]
     public void ObserveAdmission_LandingRidesInsideEngineSeams_WithoutReDecidingItsOwnModelCeiling()
     {
         ResolvedBudgetChain chain = new() { Resource = BudgetResource.Kv, Tiers = [new ResolvedBudgetTier { Tier = BudgetTier.Dram, Cap = 4 }] };

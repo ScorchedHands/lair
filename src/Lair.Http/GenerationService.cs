@@ -38,6 +38,9 @@ public sealed class GenerationService : IDisposable
     // The accelerator compute backend a declared layer split opened beside this service's decode-side CPU backend: the execution backend resolved for the route segment that names device 'cuda'. It holds no worker pool and answers no scheduler or monitor fact — the decode-side CPU backend keeps every one of those. Null whenever no split was declared, which is every model served today.
     private readonly CudaBackend? _splitExecution;
 
+    // The accelerator backend this open owns solely as the storage owner for a device-backed KV pool's persistent block copies: opened when placement declares an accelerator-resident or divided reservation and no layer split opened one already. It runs no forward, holds no worker pool, and copies no weight tensor — its only seam is the mirror the pool opens through it, while this service's CPU backend keeps owning the arena every attention read addresses. Null for every host-only reservation.
+    private readonly CudaBackend? _kvMirrorExecution;
+
     private readonly TransformerModel _model;
     private readonly GgufTokenizer _tokenizer;
     private readonly MinjaChatTemplate? _chatTemplate;
@@ -106,6 +109,15 @@ public sealed class GenerationService : IDisposable
     /// <summary>The placement this engine's worker claim seated on, resolved when the engine opened — null until then. Internal diagnostics for hosts and tests.</summary>
     internal NumaPlacement? ResolvedPlacement => _placement;
 
+    // The KV block pool this engine serves from: its residency mode, device-backed range, and mirror counters are what a loaded model actually holds, read here so an observer never has to infer them from a declared placement value. Internal diagnostics for hosts and tests.
+    internal BlockPool ServedBlockPool => _pool;
+
+    // The scheduler advancing this engine's pipelines: its last composition report says which candidates merged on which segment and what kept any of them out, read here so an observer can tell where sequences actually stepped instead of inferring it from placement. Internal diagnostics for hosts and tests.
+    internal GenerationScheduler ServedScheduler => _scheduler;
+
+    // The tier the ledger seated this model's whole-reservation KV claim at — what a live soft-cap edit retargets there, leaving any device-backed range claimed beside it on its own standing seat. Null when the model declared no KV chain to register.
+    private BudgetTier? _reservationKvClaimTier;
+
     private bool _disposed;
 
     private GenerationService(
@@ -125,15 +137,17 @@ public sealed class GenerationService : IDisposable
         LairConfig config,
         CpuBackend? prefillsBackend = null,
         PrefillLaneLayout? prefillsLane = null,
-        CudaBackend? splitExecution = null)
+        CudaBackend? splitExecution = null,
+        CudaBackend? kvMirrorExecution = null)
     {
         _file = file;
         _backend = backend;
         _prefillsBackend = prefillsBackend;
         _prefillsLane = prefillsLane;
 
-        // The accelerator side a declared layer split opened arrives as a fact of this open, held for the engine's whole lifetime.
+        // The accelerator side a declared layer split opened arrives as a fact of this open, held for the engine's whole lifetime. So does an accelerator backend opened only to own a device-backed block pool's persistent copies.
         _splitExecution = splitExecution;
+        _kvMirrorExecution = kvMirrorExecution;
         _model = model;
         _tokenizer = tokenizer;
         _chatTemplate = chatTemplate;
@@ -221,7 +235,8 @@ public sealed class GenerationService : IDisposable
         config.Models[0].Placement.ThreadQuota,
         config.Models[0].Placement.Device,
         config.Models[0].Placement.Prefill,
-        config.Models[0].Placement.KvResidency,
+        // What the opened pool actually holds blocks at, not what placement declared: a posture-neutral declaration and an explicit host-resident one both report the residency this engine's pools run, and no snapshot can name a mode its pool does not hold.
+        BlockResidencyModeNames.Of(_pool.Residency),
         config.Engine.PrefillKernel,
         string.Join(", ", _model.MatmulWeightFormats),
         config.Models[0].MaxConcurrentRequests,
@@ -705,7 +720,7 @@ public sealed class GenerationService : IDisposable
     /// <summary>Records a live KV soft-cap application on the host ledger when this engine has a standing claim for that resource.</summary>
     private void RecordAppliedKvClaim(GenerationScheduler.KvBudgetApply budget)
     {
-        if (_ledger?.UpdateStandingClaimAmount(Model.Id, BudgetResource.Kv, budget.AppliedBlocks) == true)
+        if (_ledger?.UpdateStandingClaimAmount(Model.Id, BudgetResource.Kv, budget.AppliedBlocks, _reservationKvClaimTier) == true)
         {
             _logger?.LogInformation(
                 "ledger_claim_update model='{Model}' resource='kv' amount_blocks={AmountBlocks}",
@@ -797,7 +812,7 @@ public sealed class GenerationService : IDisposable
     // holding weight copies is the exception: opening that tier states the ceiling 'tiers.vram_mb' declares for it when the configuration
     // names one, and keeps the unbounded posture where it does not, because nothing here consults a driver-detected device total. No seam
     // opens at accelerator memory for any other resource: block pools and activation buffers live in system memory until something backs them elsewhere.
-    private static DeviceLedger OpenHostLedger(string modelName, TierCapacityConfig? tiers, CudaBackend? splitExecution, ILogger? logger)
+    private static DeviceLedger OpenHostLedger(string modelName, TierCapacityConfig? tiers, CudaBackend? splitExecution, CudaBackend? kvStorageOwner, ILogger? logger)
     {
         BudgetResource[] resources = [BudgetResource.Weights, BudgetResource.Kv, BudgetResource.PrefillBuffers];
         List<CapacitySeam> seams = [];
@@ -815,6 +830,11 @@ public sealed class GenerationService : IDisposable
             }
         }
 
+        if (kvStorageOwner is not null)
+        {
+            // A resolved device-backed residency opens an accelerator-tier seam for block pools specifically: what bounds those claims is each model's own declared finite KV ceiling at that position, because a public device total no configuration states is never invented into a block count — the byte size of one block belongs to a model, not to a host.
+            seams.Add(new CapacitySeam { Tier = BudgetTier.Vram, Resource = BudgetResource.Kv, Capacity = null });
+        }
         if (splitExecution is not null && splitExecution.WeightTier == Lair.Contracts.WeightTier.Vram)
         {
             long? declaredMb = tiers?.VramMb;
@@ -912,6 +932,25 @@ public sealed class GenerationService : IDisposable
         }
 
         return false;
+    }
+
+    // The finite ceiling this model's budgets declare for KV blocks held on a device: the block count declared at its chain's accelerator position, read straight from what was configured. A resolved device-backed residency is admitted only against one — no host total stands in for it, and nothing here guesses a bound a declaration never stated.
+    private static long? DeclaredDeviceKvCeiling(ModelConfig model)
+    {
+        if (model.Budgets is null)
+        {
+            return null;
+        }
+
+        foreach (BudgetChain chain in model.Budgets)
+        {
+            if (chain.Resource == BudgetResource.Kv && chain.Caps.TryGetValue(BudgetTier.Vram, out long ceiling))
+            {
+                return ceiling;
+            }
+        }
+
+        return null;
     }
 
     // Whether this configuration's KV chain names the system-memory tier at all: only such a chain has live working copies for a budgeted
@@ -1161,6 +1200,59 @@ public sealed class GenerationService : IDisposable
                 CudaBackend.DeviceIdValue);
         }
 
+        // KV residency is its own placement axis beside the layer split, resolved here onto the posture this build's pools can actually run: an absent or posture-neutral declaration lands on host-resident blocks exactly as every model served today does, and an accelerator-resident or divided one needs both a finite ceiling declared for those blocks and a backend that owns persistent device storage to keep them in. The ceiling is checked before any seam opens — a device-backed reservation with no finite ceiling refuses naming the model, its resource, the tier, and what it failed to declare rather than opening a pool bounded by nothing.
+        if (!BlockResidencyModeNames.TryResolvePlacementValue(modelConfig.Placement.KvResidency, out BlockResidencyMode kvResidency))
+        {
+            throw new ModelException(
+                $"model '{modelConfig.Name}' declares 'placement.kv_residency' '{modelConfig.Placement.KvResidency}': " +
+                $"'kv_residency' accepts {BlockResidencyModeNames.AcceptedVocabulary}.");
+        }
+
+        long? declaredKvDeviceCeiling = DeclaredDeviceKvCeiling(modelConfig);
+
+        if (kvResidency != BlockResidencyMode.Dram && declaredKvDeviceCeiling is null)
+        {
+            throw new ModelException(
+                $"model '{modelConfig.Name}' declares 'placement.kv_residency' '{BlockResidencyModeNames.Of(kvResidency)}': device-backed KV blocks are admitted only against a finite ceiling, and this model's budgets declare none for resource '{BudgetResourceNames.Kv}' at tier '{BudgetTierNames.Vram}'. " +
+                $"Declare 'models[].budgets.kv.caps.vram_blocks' with the block count this host may keep resident on the device — or resolve the residency to '{BlockResidencyModeNames.Dram}', which needs no ceiling because it opens no device pool.");
+        }
+
+        // The persistent range a resolved reservation declares for itself: an accelerator-resident one covers every id its pool can hand out, and a divided one defaults to half of them in allocation order. A declared finite ceiling narrows that default; nothing widens past the midpoint or past what the pool reserves. Whether what remains fits is decided against the ledger below, so an over-capacity load refuses with the same breakdown every other exhausted chain reports — before any device-resident byte exists.
+        int deviceBackedBlocks = kvResidency switch
+        {
+            BlockResidencyMode.Vram => modelConfig.KvBlocks,
+            BlockResidencyMode.Split => (int)Math.Min(Math.Max(1L, modelConfig.KvBlocks / 2), Math.Max(1L, declaredKvDeviceCeiling!.Value)),
+            _ => 0,
+        };
+
+        // A device-backed reservation needs a backend that owns persistent block copies. When the placement already opened an accelerator compute backend for a layer split, that instance owns them beside its own weight residency; when every forward stays on this service's CPU backend, this second seam exists only to hold those copies — it maps no weight tensor into device memory, runs no kernel, and answers no scheduler or monitor fact, while the CPU backend keeps owning the arena attention reads. No usable driver or device behind that seam fails the open naming what is missing rather than seating blocks somewhere the declaration never asked for.
+        CudaBackend? kvMirrorExecution = null;
+
+        if (deviceBackedBlocks > 0 && splitExecution is null)
+        {
+            try
+            {
+                kvMirrorExecution = new(CudaWeightResidency.HostMapped); // no weight copy ever reaches this instance: its only resident material is the block range a mirror declares.
+            }
+            catch (Exception ex) when (ex is CudaException or DllNotFoundException or EntryPointNotFoundException or TypeInitializationException)
+            {
+                throw new InvalidOperationException(
+                    $"model '{modelConfig.Name}' declares 'placement.kv_residency' '{BlockResidencyModeNames.Of(kvResidency)}': device-backed blocks keep their persistent copy in '{ModelRoute.CudaBackendSeam}', and this host opened no usable CUDA driver or device behind that seam — refusing rather than serving this model against host-resident pools.",
+                    ex);
+            }
+
+            logger?.LogInformation(
+                "kv_residency model='{Model}' residency={Residency} declared_ceiling_blocks={DeclaredCeilingBlocks} device_backed_blocks={DeviceBackedBlocks} device={Device}",
+                modelConfig.Name,
+                BlockResidencyModeNames.Of(kvResidency),
+                declaredKvDeviceCeiling!.Value,
+                deviceBackedBlocks,
+                CudaBackend.DeviceIdValue);
+        }
+
+        // Whichever accelerator backend this open owns becomes the storage owner of a device-backed pool's persistent copies: the layer split's compute backend when placement opened one, and otherwise the seam opened only to hold those blocks. Null whenever every block this engine hands out stays host-resident.
+        CudaBackend? kvStorageOwner = kvMirrorExecution ?? (deviceBackedBlocks > 0 ? splitExecution : null);
+
         // The model's placement resolves to its route value set here, against the compute backends this service opens for it:
         // consecutive stages naming 'cpu' collapse into one CPU segment carrying this model's thread cap and pinned core share,
         // a declared split lands its first span on device 'cuda' from layer 0 with every later layer — through the last one, where
@@ -1195,6 +1287,11 @@ public sealed class GenerationService : IDisposable
                 Stages = stages,
                 AvailableDevices = splitExecution is null ? [backend.DeviceId] : [backend.DeviceId, splitExecution.DeviceId],
                 DeviceWeightTiers = deviceWeightTiers,
+
+                // The KV axis rides the route exactly as resolution expects it: what placement declared became a mode above, and whether an opened backend can hold persistent block copies is this open's answer — never the compute segment's weight tier. A storage-only accelerator seam is deliberately absent from AvailableDevices because no stage runs on it; only where its blocks live follows it.
+                KvResidency = kvResidency,
+                DeviceBackedKvMirrorSupport = kvStorageOwner is not null,
+
                 ThreadQuota = modelConfig.Placement.ThreadQuota,
                 CoreSet = modelConfig.Placement.CoreSet,
             });
@@ -1203,32 +1300,36 @@ public sealed class GenerationService : IDisposable
             // opened host can actually carry, and a claim nothing backs fails now naming the model, the resource, the tier, and the missing
             // capability — before any weight view or reservation is spent on posture that cannot hold it. What every backend this build opens
             // holds working copies in is system memory; an accelerator backend opened with device-resident weight copies opens that tier for
-            // weight claims too, and disk-backed write-side pools remain vocabulary those chains may name but nothing here carries yet.
+            // weight claims too, a resolved device-backed KV residency opens the accelerator tier for block pools specifically while compute and attention stay host-side, and disk-backed write-side pools remain vocabulary those chains may name but nothing here carries yet.
             budgets = ModelBudgets.Resolve(new BudgetRequest
             {
                 ModelName = modelConfig.Name,
                 Declared = modelConfig.Budgets ?? [],
                 OpenedPoolTiers = OpenedPoolTiersFor(splitExecution),
+                OpenedKvPoolTiers = deviceBackedBlocks > 0 ? [BudgetTier.Vram] : [],
             });
         }
         catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
         {
             splitExecution?.Dispose(); // a route or budget this configuration cannot resolve must not leave an opened accelerator backend standing.
+            kvMirrorExecution?.Dispose(); // nor one opened only to hold device-backed blocks.
             throw;
         }
+
         // The ledger this engine's claims account against: a supplied one is a host's shared accounting across several
         // programmatically opened engines, so their claims register against one set of capacity seams in the order the
         // opens happen; an omitted one is this engine's own ledger over the tiers its pools back, each stating the
         // explicit unbounded capacity posture — the answer a host gives when it backs a tier but states no public total.
         // Claims register in this open's order: weights once the tensor table is read, prefill from the activation
-        // posture the engine families hold, and the KV reservation as the pool opens.
-        ledger ??= OpenHostLedger(modelConfig.Name, config.Tiers, splitExecution, logger);
+        // posture the engine families hold, a device-backed block range as its own standing claim before any pool opens, and the KV reservation as the pool opens.
+        ledger ??= OpenHostLedger(modelConfig.Name, config.Tiers, splitExecution, kvStorageOwner, logger);
 
         GgufFile? file = null;
         TransformerModel? model = null;
         BlockPool? pool = null;
         GenerationScheduler? scheduler = null;
         string? updateCandidate = null;
+        BudgetTier? reservationKvClaimTier = null; // where the ledger seated this engine's whole-reservation KV claim, so a live soft-cap edit retargets that seat and only that seat.
         try
         {
             // A model that declares a published source is verified against its pack manifest before any byte of the
@@ -1361,13 +1462,71 @@ public sealed class GenerationService : IDisposable
                     clampDetail);
             }
 
+            // A resolved device-backed range registers as a standing claim of its own before any block crosses to the device, walked against exactly the positions that can hold persistent copies. An exhausted chain refuses here — with the breakdown every other exhaustion reports, naming model, resource, tier, and what each consulted position holds against its ceiling — rather than opening a pool bounded by nothing or serving work its declared ceiling cannot bound.
+            if (deviceBackedBlocks > 0)
+            {
+                ResolvedBudgetChain? resolvedKvChain = budgets.For(BudgetResource.Kv);
+                List<ResolvedBudgetTier> devicePositions = [];
+
+                if (resolvedKvChain is not null)
+                {
+                    foreach (ResolvedBudgetTier position in resolvedKvChain.Tiers)
+                    {
+                        if (!position.IsOriginStore && position.Tier == BudgetTier.Vram)
+                        {
+                            devicePositions.Add(position);
+                        }
+                    }
+                }
+
+                if (devicePositions.Count == 0)
+                {
+                    throw new ModelException(
+                        $"model '{modelConfig.Name}' declares 'placement.kv_residency' '{BlockResidencyModeNames.Of(kvResidency)}': device-backed blocks seat against a copy-holding '{BudgetTierNames.Vram}' position of their '{BudgetResourceNames.Kv}' chain, and this model resolves none. " +
+                        $"Name '{BudgetTierNames.Vram}' in 'models[].budgets.kv.order' with a finite ceiling to bound {deviceBackedBlocks} blocks.");
+                }
+
+                ClaimOutcome deviceClaim = ledger.RegisterClaim(
+                    modelConfig.Name,
+                    new ResolvedBudgetChain { Resource = BudgetResource.Kv, Tiers = [.. devicePositions] },
+                    deviceBackedBlocks);
+
+                if (!deviceClaim.Seated)
+                {
+                    throw new BudgetExhaustedException(modelConfig.Name, BudgetResource.Kv, deviceClaim.ExhaustedAtTier!.Value, deviceClaim.Breakdown);
+                }
+
+                logger?.LogInformation(
+                    "ledger_claim model='{Model}' resource='kv' tier='{Tier}' amount_blocks={AmountBlocks} chain_position={ChainPosition} demoted={Demoted}",
+                    modelConfig.Name,
+                    BudgetTierNames.Of(deviceClaim.Claim!.Tier),
+                    deviceClaim.Claim.Amount,
+                    deviceClaim.Claim.ChainPosition,
+                    deviceClaim.Claim.Demoted);
+            }
+
+            // The pool opens with the residency this open resolved: its arena stays owned by this service's CPU backend — the allocation and free list every attention read addresses through — while only the declared leading block range carries a persistent copy in the accelerator backend this open owns. A host-only reservation passes no device-backed range and opens no mirror at all, exactly as it always has.
             pool = new BlockPool(
                 blockTokens,
                 model.Plan.LayerCount,
                 model.Plan.KvHeadCount,
                 model.Plan.HeadDim,
                 modelConfig.KvBlocks,
-                backend);
+                backend,
+                kvResidency,
+                deviceBackedBlocks,
+                mirrorOwner: (IBackend?)kvStorageOwner ?? backend);
+
+            if (deviceBackedBlocks > 0)
+            {
+                logger?.LogInformation(
+                    "kv_residency model='{Model}' residency={Residency} device_backed_blocks={DeviceBackedBlocks} persistent_device_bytes={PersistentDeviceBytes} bytes_per_block={BytesPerBlock}",
+                    modelConfig.Name,
+                    BlockResidencyModeNames.Of(pool.Residency),
+                    pool.DeviceBackedBlockCount,
+                    pool.DeviceMirrorBytes,
+                    pool.BytesPerBlock);
+            }
 
             // The KV claim observes the pool opening that already happened: the reservation the pool reserved at open,
             // stated in this resource's block unit, against the first copy-holding position the resolved KV chain names
@@ -1381,6 +1540,8 @@ public sealed class GenerationService : IDisposable
                 {
                     throw new BudgetExhaustedException(modelConfig.Name, BudgetResource.Kv, kvClaim.ExhaustedAtTier!.Value, kvClaim.Breakdown);
                 }
+
+                reservationKvClaimTier = kvClaim.Claim!.Tier; // the standing seat this engine's live block budget governs.
 
                 logger?.LogInformation(
                     "ledger_claim model='{Model}' resource='kv' tier='{Tier}' amount_blocks={AmountBlocks} chain_position={ChainPosition} demoted={Demoted}",
@@ -1511,9 +1672,10 @@ public sealed class GenerationService : IDisposable
                 model.Plan.SparseFfnStrategy is { } strategy ? SparseFfnStrategyNames.Of(strategy) : null,
                 modelConfig.MaxConcurrentRequests);
 
-            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, markerPair, markersProven ? string.Empty : markerRefusal, logger, pool, scheduler, info, config, prefillsBackend, prefillsLane, splitExecution);
+            GenerationService service = new(file, backend, model, tokenizer, chatTemplate, chatTemplateCapabilities, outputParser, markerPair, markersProven ? string.Empty : markerRefusal, logger, pool, scheduler, info, config, prefillsBackend, prefillsLane, splitExecution, kvMirrorExecution);
             service._cacheForMetrics = cache; // the metrics bus reports cached blocks from the same cache the scheduler uses
             service._ledger = ledger; // the claims this open registered ride the same ledger the scheduler reports admissions to
+            service._reservationKvClaimTier = reservationKvClaimTier; // a live block-budget edit retargets exactly the seat this claim took
             service._compute = compute; // the core accounting this model's grant seated against, shared with any engine opened beside it
             service._computeGrant = computeGrant; // requested against granted, reported on monitor facts beside the live worker count
             service._placement = placement; // the node this engine seated on, reported on monitor facts beside its grant
@@ -1533,6 +1695,7 @@ public sealed class GenerationService : IDisposable
             backend.Dispose();
             prefillsBackend?.Dispose();
             splitExecution?.Dispose(); // the accelerator side of a declared layer split belongs to this open exactly as the CPU backends do.
+            kvMirrorExecution?.Dispose(); // so does an accelerator backend opened only to hold device-backed blocks, whose pool never got built.
             throw;
         }
     }
@@ -1907,7 +2070,10 @@ public sealed class GenerationService : IDisposable
         _file.Dispose();
         _backend.Dispose();
         _prefillsBackend?.Dispose(); // the lane's pool workers belong to this service exactly as the decode side's do
-        _splitExecution?.Dispose();  // and so does the accelerator compute backend a declared layer split opened beside them
+
+        // Both accelerator backends this open owns go last: the pool that pinned a host arena flushed across its mirror while that arena was still alive, so what remains here is releasing device storage and context — for the layer split's compute backend, and for one opened only to hold device-backed blocks.
+        _splitExecution?.Dispose();
+        _kvMirrorExecution?.Dispose();
     }
 
     private IReadOnlyList<int> EncodeChat(GenerationRequest request, ToolPipeline tools, CancellationToken cancellationToken)

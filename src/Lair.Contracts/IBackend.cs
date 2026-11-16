@@ -23,6 +23,16 @@ public interface IBackend : IDisposable
     void FreeAligned(MemoryHandle handle);
 
     /// <summary>
+    /// Opens a persistent device-resident KV mirror over the caller's host arena for the device-backed block range the
+    /// request names. The host arena stays the copy attention reads; the mirror keeps a persistent device copy of exactly
+    /// that block range, with the host side pinned as the staging path dirty blocks cross on flush. A backend with no
+    /// device-resident KV storage refuses the request naming its device id, the requested tier, and the resource rather
+    /// than answering with a host-only stand-in.
+    /// </summary>
+    /// <exception cref="NotSupportedException">This backend holds no device-resident storage for the named resource at the requested tier.</exception>
+    IKvDeviceMirror OpenKvMirror(KvMirrorRequest request);
+
+    /// <summary>
     /// output[0..rows) = w.Bytes-as-matrix (rows x cols) times x. The weight matrix is the
     /// first rows columns of each row consumed as-is; x must be exactly cols long and output
     /// at least rows long. Results are deterministic regardless of internal parallelism.

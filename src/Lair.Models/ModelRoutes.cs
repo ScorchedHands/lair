@@ -1,6 +1,7 @@
 namespace Lair.Models;
 
 using Lair.Contracts;
+using Lair.Kv;
 
 /// <summary>One execution stage a model's placement declares: the part of the path it names (<c>"prefill"</c>,
 /// <c>"decode"</c>) and the compute device that part runs on. Stages reach a route in declaration order, and each may
@@ -27,8 +28,11 @@ public sealed record RouteRequest
     /// <summary>The weight tier each opened backend reports for the device id it answers. A device named in <see cref="AvailableDevices"/> with no entry here states no device-resident posture, so its segments read host-resident weights — the posture every backend without persistent device copies reports. This is where a resolved segment's weight tier comes from; the model's KV residency names no segment tier.</summary>
     public IReadOnlyDictionary<string, WeightTier> DeviceWeightTiers { get; init; } = new Dictionary<string, WeightTier>();
 
-    /// <summary>Residency placement declares for this model's KV, matched against every resolved segment: an accelerator residency with no accelerator-backed segment refuses naming the model and what is missing. DRAM is what every engine path holds today. This axis is independent of a segment's weight tier — a whole-model accelerator span over device-resident weights still steps sequences whose blocks live in system memory.</summary>
-    public WeightTier KvResidency { get; init; } = WeightTier.Dram;
+    /// <summary>How placement declares this model's KV block residency — <c>Dram</c>, <c>Vram</c>, or <c>Split</c> — landed on every resolved segment as the block residencies that segment can step over. An accelerator-resident declaration no opened pool can back refuses naming the model and what is missing. This axis is independent of a segment's weight tier: a whole-model accelerator span over device-resident weights still steps sequences whose blocks live wherever this residency says they do.</summary>
+    public BlockResidencyMode KvResidency { get; init; } = BlockResidencyMode.Dram;
+
+    /// <summary>True when the opened compute backends can hold a device-backed KV mirror — the seam a device-backed block pool opens its persistent device copy through. An accelerator-resident KV declaration with this false refuses naming that seam rather than falling back to host residency; a host-only residency never consults it.</summary>
+    public bool DeviceBackedKvMirrorSupport { get; init; }
 
     /// <summary>The model's hard cap on worker threads (1 or greater); null leaves each CPU segment at the engine's own thread choice.</summary>
     public int? ThreadQuota { get; init; }
@@ -72,9 +76,9 @@ public static class ModelRoutes
     /// states — the ordered execution stages with the device each declares, the model's thread cap and pinned core set,
     /// and the device ids the backends they opened report — and this owns how those become segments: collapse by consecutive
     /// stages agreeing on device, residency, and boundary position, engine ceilings as batch caps, CPU quota from placement
-    /// alone. An unresolvable declaration (no stage, an unnamed or repeated stage, a blank device, a cap outside the engine's
-    /// range, a residency its device cannot hold, a device no backend reports) throws naming the model and the segment
-    /// it belongs to.
+    /// alone, and the model's KV residency landed as the block residencies every resolved segment can step over. An
+    /// unresolvable declaration (no stage, an unnamed or repeated stage, a blank device, a cap outside the engine's range,
+    /// a KV residency no opened pool can back, a device no backend reports) throws naming the model and what it belongs to.
     /// </summary>
     public static ModelRoute Resolve(RouteRequest request)
     {
@@ -98,6 +102,12 @@ public static class ModelRoutes
 
         HashSet<string> seenStages = new(StringComparer.Ordinal);
         List<DeviceSegment> segments = [];
+
+        // The KV residency axis is one declaration for the whole model, so it resolves once here rather than per stage: which
+        // device a span runs on says nothing about where this model's blocks live, and an accelerator-resident declaration is
+        // answered by whether the caller opened the mirror seam those pools copy through — never by falling back to host
+        // residency that happens to run.
+        IReadOnlyList<WeightTier> blockResidencies = ResolveBlockResidencies(request);
 
         foreach (RouteStage stage in request.Stages)
         {
@@ -138,7 +148,7 @@ public static class ModelRoutes
             {
                 DeviceId = stage.DeviceId,
                 WeightTier = tier,
-                BlockResidencyTiers = [request.KvResidency],
+                BlockResidencyTiers = blockResidencies,
                 SplitPosition = stage.SplitPosition,
                 BatchCap = request.BatchCap ?? Engine.TransformerModel.MaxBatchSequences,
                 Quota = IsCpuDevice(stage.DeviceId)
@@ -155,21 +165,35 @@ public static class ModelRoutes
 
     // The tier a stage's weights land at: the weight tier the opened compute backend on that stage's device reports. A
     // device whose opened backend states no device-resident posture reads host-resident weights, which is what every
-    // backend without persistent device copies reports today. The model's KV residency is a separate axis: it decides
-    // which pools hold a sequence's blocks, never which tier a segment's weights sit at. An accelerator KV residency on
-    // a stage whose device reads blocks from host pools is what this refuses — the two axes cannot be satisfied there.
-    private static WeightTier TierForStage(RouteRequest request, RouteStage stage)
-    {
-        if (request.KvResidency == WeightTier.Vram && IsCpuDevice(stage.DeviceId))
-        {
-            throw new ModelException(
-                $"model '{request.ModelName}', stage '{stage.Name}': kv residency 'vram' cannot be held by a segment on '{ModelRoute.CpuDeviceId}' — " +
-                $"sequences whose KV blocks live in accelerator memory need a device-backed block pool, those pools run in " +
-                $"'{ModelRoute.CudaBackendSeam}' once one is opened for them, and only '{ModelRoute.CpuDeviceId}' is available to run this model");
-        }
+    // backend without persistent device copies reports today. The model's KV residency never enters here: it decides which
+    // pools hold a sequence's blocks and what those segments can step over, not which tier a span's weights sit at.
+    private static WeightTier TierForStage(RouteRequest request, RouteStage stage) =>
+        request.DeviceWeightTiers.TryGetValue(stage.DeviceId, out WeightTier tier) ? tier : WeightTier.Dram;
 
-        return request.DeviceWeightTiers.TryGetValue(stage.DeviceId, out WeightTier tier) ? tier : WeightTier.Dram;
-    }
+    // The block residencies the declared KV residency lands on: system memory alone for a host-only declaration, accelerator
+    // memory for an accelerator-resident one, and both tiers for a divided reservation — because a split pool holds some of its
+    // ids in each range, so a step over any segment of this model can address either. A declaration naming accelerator-backed
+    // blocks with no opened mirror seam refuses here naming the seam those pools run in, exactly as every other capability
+    // this build declares before it carries; nothing falls back to residency the caller did not ask for.
+    private static IReadOnlyList<WeightTier> ResolveBlockResidencies(RouteRequest request) => request.KvResidency switch
+    {
+        BlockResidencyMode.Dram => [WeightTier.Dram],
+
+        BlockResidencyMode.Vram or BlockResidencyMode.Split when !request.DeviceBackedKvMirrorSupport => throw new ModelException(
+            $"model '{request.ModelName}': kv residency '{BlockResidencyModeNames.Of(request.KvResidency)}' declares its KV blocks device-backed, and no opened backend can hold a " +
+            $"device-backed KV mirror for them — those pools keep their persistent device copy in '{ModelRoute.CudaBackendSeam}', which this open has none, so the residency is refused " +
+            $"rather than run against host-resident pools"),
+
+        BlockResidencyMode.Vram => [WeightTier.Vram],
+
+        // A divided reservation carries both residencies: its leading ids sit in a device-backed range and its tail stays host-only,
+        // so every segment of this route can step over either tier.
+        BlockResidencyMode.Split => [WeightTier.Dram, WeightTier.Vram],
+
+        _ => throw new ModelException(
+            $"model '{request.ModelName}': kv residency '{request.KvResidency}' is not a residency a placement declares " +
+            $"({string.Join(", ", BlockResidencyModeNames.DeclaredNames)})"),
+    };
 
     // Every rule one resolved segment must satisfy before it can carry work: its batch cap inside the ceiling the engine's
     // own step math honors, a quota whose numbers mean something for the device class they name, and a compute backend

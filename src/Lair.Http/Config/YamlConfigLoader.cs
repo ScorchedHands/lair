@@ -1,4 +1,5 @@
 using System.Globalization;
+using Lair.Kv;
 using Lair.Models;
 using YamlDotNet.Core;
 using YamlDotNet.RepresentationModel;
@@ -498,12 +499,16 @@ public static class YamlConfigLoader
                 $"An accelerator device becomes placeable when a compute backend reports it in '{ModelRoute.CudaBackendSeam}'.");
         }
 
-        string kvResidency = TryText(keys, "kv_residency", $"models[{index}].placement.kv_residency") ?? "dram";
-        if (kvResidency != "dram")
+        // KV residency is its own placement axis beside the device keys: an absent key keeps today's host-resident posture,
+        // and every declared mode is vocabulary this loader accepts without consulting what any opened backend can back —
+        // whether a device-backed block pool can be seated is what route resolution answers when the engine opens. A value
+        // outside the declared set fails naming the served model, the key, and the accepted set, exactly as the other
+        // choice keys here do.
+        string kvResidency = TryText(keys, "kv_residency", $"models[{index}].placement.kv_residency") ?? BlockResidencyModeNames.Dram;
+        if (!BlockResidencyModeNames.TryResolvePlacementValue(kvResidency, out _))
         {
             throw new ConfigException(
-                $"models[{index}].placement.kv_residency '{kvResidency}' is invalid: the only accepted value for 'kv_residency' is 'dram'. " +
-                $"An accelerator residency becomes placeable when a compute backend reports that device in '{ModelRoute.CudaBackendSeam}'.");
+                $"models[{index}].placement.kv_residency '{kvResidency}' is invalid for model '{modelName}': 'kv_residency' accepts {BlockResidencyModeNames.AcceptedVocabulary}.");
         }
 
         string prefill = TryText(keys, "prefill", $"models[{index}].placement.prefill") ?? "cpu";
@@ -919,7 +924,7 @@ public static class YamlConfigLoader
         return value;
     }
 
-    /// <summary>Parses one model entry's budgets block: every declared resource names its own ordered tier chain and the ceilings it declares along that chain, each refusal naming the qualified config path, the offending value, and the accepted vocabulary exactly as the other choice keys do. Chain shape — a known tier at each position, priority order, no repeats — is enforced here in config-path wording; ceiling ranges are checked against what each key sizes: a system-memory KV ceiling carries <c>kv_blocks</c>' floor of 8 because it reserves physical blocks exactly as the legacy key does, every other ceiling must be positive where it states one, and the read-side origin store takes no ceiling at all because that storage already holds the complete set. Nothing here consults capacity or opened pools — which claims a host can carry is resolution's answer when the engine opens.</summary>
+    /// <summary>Parses one model entry's budgets block: every declared resource names its own ordered tier chain and the ceilings it declares along that chain, each refusal naming the qualified config path, the offending value, and the accepted vocabulary exactly as the other choice keys do. Chain shape — a known tier at each position, priority order, no repeats — is enforced here in config-path wording; ceiling ranges are checked against what each key sizes: a system-memory KV ceiling carries <c>kv_blocks</c>' floor of 8 because it reserves physical blocks exactly as the legacy key does, every other ceiling must be positive where it states one (so an accelerator-tier KV ceiling is a finite block count, and stating none there declares no model-level bound rather than an unbounded reservation), and the read-side origin store takes no ceiling at all because that storage already holds the complete set. Nothing here consults capacity or opened pools — which claims a host can carry is resolution's answer when the engine opens.</summary>
     private static IReadOnlyList<BudgetChain>? ParseBudgets(Dictionary<string, YamlNode> modelKeys, int index, string modelName)
     {
         if (!modelKeys.TryGetValue("budgets", out YamlNode? node))
@@ -1013,7 +1018,9 @@ public static class YamlConfigLoader
                 if (!parsed)
                 {
                     throw new ConfigException(
-                        $"{capsWhere}.{capKey} '{text}' is invalid for model '{modelName}': a system-memory KV ceiling sizes the physical reservation and must be an integer no larger than {int.MaxValue}.");
+                        resource == BudgetResource.Kv && tier == BudgetTier.Dram
+                            ? $"{capsWhere}.{capKey} '{text}' is invalid for model '{modelName}': a system-memory KV ceiling sizes the physical reservation and must be an integer no larger than {int.MaxValue}."
+                            : $"{capsWhere}.{capKey} '{text}' is invalid for model '{modelName}': '{capKey}' must state an integer ceiling.");
                 }
 
                 ValidateCap(modelName, capsWhere, capKey, resource, tier, declared, order);

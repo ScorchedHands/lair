@@ -1,4 +1,5 @@
 using Lair.Contracts;
+using Lair.Kv;
 using Lair.Loader;
 using Lair.Models;
 using Lair.Models.Engine;
@@ -127,13 +128,15 @@ public sealed class StepCompositionArbiterTests : IDisposable
         Assert.Contains("holds its KV at tier 'Vram'", refusal.Reason, StringComparison.Ordinal);
         Assert.Contains("segment 0 ('cpu' at 'Dram') cannot address", refusal.Reason, StringComparison.Ordinal);
 
-        // The same rule read the other way: a segment resident on an accelerator steps candidates resident at that residency.
+        // The same rule read the other way: a segment resident on an accelerator steps candidates resident at that residency,
+        // which is a route resolution can only resolve once a device-backed KV mirror is opened for those blocks.
         ModelPlan acceleratorResident = ResolvePlanWith("arbiter-residency-accelerator", new RouteRequest
         {
             ModelName = "arbiter-residency-accelerator",
             Stages = [new(ModelRoutes.DecodeStage, AcceleratorDeviceId)],
             AvailableDevices = [ModelRoute.CpuDeviceId, AcceleratorDeviceId],
-            KvResidency = WeightTier.Vram,
+            KvResidency = BlockResidencyMode.Vram,
+            DeviceBackedKvMirrorSupport = true,
         });
 
         CompositionReport stepped = new StepCompositionArbiter().Compose(

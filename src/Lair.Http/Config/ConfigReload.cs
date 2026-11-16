@@ -295,6 +295,9 @@ public static class ConfigMutationTable
         "models[0].max_concurrent_requests" => ConfigMutationClass.NewRequestsOnly,
         "models[0].placement.numa_spread" => ConfigMutationClass.NewRequestsOnly,
         "models[0].placement.core_overcommit" => ConfigMutationClass.RestartOnly,
+        // The KV residency mode says how this model's block pools are seated across host and device storage. Reseating an
+        // opened pool's blocks is not something a live engine can do, so the mode is established when the engine opens.
+        "models[0].placement.kv_residency" => ConfigMutationClass.RestartOnly,
         "models[0].source" => ConfigMutationClass.RestartOnly, // loadability depends on the manifest and fetch behavior established at open.
         "tiers.dram_mb" or "tiers.vram_mb" or "tiers.dram_cores" or "tiers.nvme_path" or "tiers.nodes" => ConfigMutationClass.RestartOnly,
         _ => BudgetFieldClass(field) ?? ConfigMutationClass.RestartOnly,
@@ -344,10 +347,11 @@ public static class ConfigMutationTable
             tiers.Nodes.OrderBy(node => node.Index).Select(node => $"index={node.Index}:mb={(node.Mb is long mb ? mb.ToString(CultureInfo.InvariantCulture) : "unset")}:cores={(node.Cores is int cores ? cores.ToString(CultureInfo.InvariantCulture) : "unset")}"));
 
     // How one budget field classifies: a ceiling on the system-memory tier of the KV chain is the live soft cap 'kv_blocks' has always been;
-    // weight ceilings bind what every forward reads and retarget only by re-reading slabs from the model file, so they are restart-only; prefill
-    // buffer ceilings classify for later requests alone even where nothing clamps to them yet — a class is not an enforcement promise. A chain's
-    // order names structure that was resolved when the engine opened, and any budget-shaped key this table does not recognize stays restart-only
-    // rather than falling through unclassified.
+    // a ceiling at the accelerator tier of that chain bounds blocks a device-backed pool holds, and reseating those blocks is not live, so it
+    // carries the same posture the residency mode beside it does. Weight ceilings bind what every forward reads and retarget only by re-reading
+    // slabs from the model file, so they are restart-only; prefill buffer ceilings classify for later requests alone even where nothing clamps
+    // to them yet — a class is not an enforcement promise. A chain's order names structure that was resolved when the engine opened, and any
+    // budget-shaped key this table does not recognize stays restart-only rather than falling through unclassified.
     private static ConfigMutationClass? BudgetFieldClass(string field)
     {
         const string prefix = "models[0].budgets.";
@@ -376,6 +380,7 @@ public static class ConfigMutationTable
         return (resource, tier) switch
         {
             (BudgetResource.Kv, BudgetTier.Dram) => ConfigMutationClass.Live,
+            (BudgetResource.Kv, BudgetTier.Vram) => ConfigMutationClass.RestartOnly, // bounds blocks a device-backed pool holds: reseating them is not live.
             (BudgetResource.PrefillBuffers, _) => ConfigMutationClass.NewRequestsOnly,
             _ => ConfigMutationClass.RestartOnly,
         };

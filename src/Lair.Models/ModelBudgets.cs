@@ -279,6 +279,9 @@ public sealed record BudgetRequest
     /// <summary>The tiers opened pools can hold working copies at. A chain naming a tier outside this list resolves structurally and refuses here rather than dropping that position silently — the posture every unimplemented capability takes.</summary>
     public required IReadOnlyList<BudgetTier> OpenedPoolTiers { get; init; }
 
+    /// <summary>Tier positions an opened device-backed block pool backs for the KV resource specifically: accelerator memory holding persistent copies of declared blocks while compute and attention stay host-resident. A position named here counts toward KV working copies only — never weight slabs or activation buffers.</summary>
+    public IReadOnlyList<BudgetTier> OpenedKvPoolTiers { get; init; } = [];
+
     /// <summary>Whether opened state can write bytes out to disk storage for a write-side resource. False everywhere this build runs: nothing writes KV or activation material anywhere but system memory yet, so a chain asking for it reports what is missing.</summary>
     public bool DiskWriteSupport { get; init; }
 }
@@ -322,7 +325,7 @@ public static class ModelBudgets
         List<ResolvedBudgetChain> chains = [];
         foreach (BudgetChain chain in request.Declared)
         {
-            chains.Add(ResolveChain(model, chain, request.OpenedPoolTiers, request.DiskWriteSupport));
+            chains.Add(ResolveChain(model, chain, request.OpenedPoolTiers, request.OpenedKvPoolTiers, request.DiskWriteSupport));
         }
 
         return new ResolvedBudgetSet { Resources = [.. chains] };
@@ -448,9 +451,12 @@ public static class ModelBudgets
     }
 
     // The posture pass: every structural rule already holds, so each position either lands as the read-side origin store or needs an opened pool.
-    private static ResolvedBudgetChain ResolveChain(string model, BudgetChain chain, IReadOnlyList<BudgetTier> openedPools, bool diskWrites)
+    private static ResolvedBudgetChain ResolveChain(string model, BudgetChain chain, IReadOnlyList<BudgetTier> openedPools, IReadOnlyList<BudgetTier> openedKvPools, bool diskWrites)
     {
         string resource = DescribeResource(chain.Resource);
+
+        // Which positions an opened host backs is a per-resource answer: device-backed block pools back KV positions at the accelerator tier even while every weight slab and activation buffer this host opens lives in system memory.
+        IReadOnlyList<BudgetTier> openedForThisResource = chain.Resource == BudgetResource.Kv ? [.. openedPools, .. openedKvPools] : openedPools;
 
         List<ResolvedBudgetTier> positions = [];
 
@@ -468,7 +474,7 @@ public static class ModelBudgets
             // Every other position holds a working copy LAIR owns, so it needs an opened pool of that residency. A CPU-only host
             // has the system-memory tier open only: an accelerator-resident claim names what is missing rather than dropping the
             // position its chain declared, and disk-backed write-side bytes name the writing machinery this build does not carry.
-            if (!ContainsTier(openedPools, tier))
+            if (!ContainsTier(openedForThisResource, tier))
             {
                 throw new ModelException(
                     $"model '{model}', budgets for resource '{resource}': no opened pool backs working copies at tier '{BudgetTierNames.Of(tier)}' — " +

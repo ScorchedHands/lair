@@ -247,6 +247,8 @@ public sealed class CudaPrefillOffloadTests : IDisposable
 
         public void FreeAligned(MemoryHandle handle) => _inner.FreeAligned(handle);
 
+        public IKvDeviceMirror OpenKvMirror(KvMirrorRequest request) => _inner.OpenKvMirror(request);
+
         public void Gemv(ReadOnlySpan<float> x, WeightRef w, Span<float> output)
         {
             GemvCalls++;

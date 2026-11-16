@@ -488,6 +488,8 @@ public sealed class SplitRouteExecutionTests : IDisposable
             _inner.FreeAligned(handle);
         }
 
+        public IKvDeviceMirror OpenKvMirror(KvMirrorRequest request) => _inner.OpenKvMirror(request);
+
         public void Gemv(ReadOnlySpan<float> x, WeightRef w, Span<float> output) => _inner.Gemv(x, w, output);
 
         public void GemvBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs) => _inner.GemvBatch(inputs, count, w, outputs);

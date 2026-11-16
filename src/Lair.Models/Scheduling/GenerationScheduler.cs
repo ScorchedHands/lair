@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Threading.Channels;
+using Lair.Contracts;
 using Lair.Kv;
 using Lair.Models;
 using Lair.Models.Engine;
@@ -631,6 +632,9 @@ public sealed class GenerationScheduler : IDisposable
         // are the last pool changes visible to window accounting: one snapshot per boundary governs every composition stepped at it.
         int blocksLeft = Math.Max(Math.Min(_pool.FreeBlocks, _pool.AllocationCeiling - _pool.UsedBlocks), 0);
 
+        // Where one advancing pipeline's blocks actually live: the residency its own block table holds, read from the pool that handed those ids out. A host-only pool answers system memory for every sequence; a device-backed range answers accelerator memory for the ids inside it; and an unstarted sequence is about to take the first id, which sits in the device-backed range whenever a pool declares one. This is what composition consults rather than any declared label.
+        WeightTier KvTierFor(SequenceKv kv) => _pool.IsDeviceBacked(kv.Blocks.Count > 0 ? kv.Blocks[^1] : 0) ? WeightTier.Vram : WeightTier.Dram;
+
         _candidates.Clear();
         _candidatePipelines.Clear();
         _candidateIndex.Clear();
@@ -650,7 +654,7 @@ public sealed class GenerationScheduler : IDisposable
             }
 
             int index = _candidatePipelines.Count;
-            _candidates.Add(new StepCandidate { PipelineId = pipeline.Id, Plan = _model.Plan });
+            _candidates.Add(new StepCandidate { PipelineId = pipeline.Id, Plan = _model.Plan, KvResidency = KvTierFor(pipeline.Kv) });
             _candidatePipelines.Add(pipeline);
             _candidateIndex[pipeline.Id] = index;
         }
