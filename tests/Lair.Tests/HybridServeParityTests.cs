@@ -200,6 +200,123 @@ public sealed class HybridServeParityTests : IDisposable
         }
     }
 
+    [Fact]
+    public void HybridPrefillWorkingSetAgainstDeviceBackedBuffers_SeatsAtAcceleratorTier_AndDeclaredCeilingNarrowsWindowThere()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return; // the CUDA driver seam is exercised on Windows against nvcuda.dll.
+        }
+
+        long processFloor = ProcessBytes();
+
+        string path = SyntheticModel("hybrid-prefill-envelope", ResidencyShape); // the wider synthetic shape whose sub-batch rows a one-megabyte ceiling actually binds
+        int layerCount = LayerCount(path);
+
+        DeviceLedger ledger = new([new CapacitySeam { Tier = BudgetTier.Vram, Resource = BudgetResource.PrefillBuffers, Capacity = null }]);
+
+        try
+        {
+            using GenerationService hybrid = GenerationService.Open(
+                ConfigFor(path, "hybrid-prefill-vram", gpuLayers: layerCount) with
+                {
+                    Models =
+                    [
+                        new ModelConfig
+                        {
+                            Name = "hybrid-prefill-vram",
+                            Path = path,
+                            MaxContextTokens = 512,
+                            KvBlocks = 8,
+                            Placement = new PlacementConfig { GpuLayers = layerCount },
+                            Budgets = [new BudgetChain { Resource = BudgetResource.PrefillBuffers, Order = [BudgetTier.Vram], Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Vram] = 1 } }],
+                        },
+                    ],
+                },
+                NullLogger.Instance,
+                ledger);
+
+            Assert.Equal(2, hybrid.ResolvedRoute.Segments.Count); // prompt windows cross the opened accelerator span beside its host-side tail — this engine's activation posture is device-backed where it works
+
+            PrefillRowWidthClamp clamp = hybrid.ServedScheduler.ResolvedPrefillRowClamp!;
+            Assert.Equal(BudgetTier.Vram, clamp.Tier); // the declared ceiling at the accelerator position is what bound this window
+            Assert.True(clamp.AllowsPositiveWidth);
+            Assert.True(hybrid.ServedScheduler.EffectivePrefillRowWidth < clamp.RequestedRowWidth, $"effective width {hybrid.ServedScheduler.EffectivePrefillRowWidth} did not narrow requested {clamp.RequestedRowWidth} under the declared ceiling");
+
+            DeviceLedgerClaim claim = Assert.Single(ledger.ClaimsAt(BudgetTier.Vram, BudgetResource.PrefillBuffers));
+            Assert.Equal(BudgetTier.Vram, claim.Tier); // the narrowed working set seats where its chain says it lives, beside the route that carries it across
+            Assert.False(claim.Demoted);
+            Assert.InRange(claim.Amount, 1L, clamp.CapMegabytes);
+
+            long workingSet = ProcessBytes();
+            AssertWorkingSetWithinEnvelope(floor: processFloor, measured: workingSet);
+        }
+        catch (Exception ex) when (IsUnavailableCudaSeam(ex))
+        {
+            return; // no usable driver or device behind this host's accelerator seam: the device-backed buffer posture cannot be opened here.
+        }
+    }
+
+    [Fact]
+    public void HybridPrefillClaimAgainstHeldDeviceSeam_RefusesOpenNamingBuffersTierAndLedgerBreakdown()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return; // the CUDA driver seam is exercised on Windows against nvcuda.dll.
+        }
+
+        string path = SyntheticModel("hybrid-prefill-exhaust");
+        int layerCount = LayerCount(path);
+
+        BudgetChain buffersOnly = new() { Resource = BudgetResource.PrefillBuffers, Order = [BudgetTier.Vram] };
+        DeviceLedger ledger = new([new CapacitySeam { Tier = BudgetTier.Vram, Resource = BudgetResource.PrefillBuffers, Capacity = 1 }]);
+        ResolvedBudgetSet neighbourChain = ModelBudgets.Resolve(new BudgetRequest
+        {
+            ModelName = "hybrid-prefill-neighbour",
+            Declared = [buffersOnly],
+            OpenedPoolTiers = [BudgetTier.Dram, BudgetTier.Vram], // the posture an opened accelerator-backed route reports for this resource
+        });
+
+        Assert.True(ledger.RegisterClaim("hybrid-prefill-neighbour", neighbourChain.For(BudgetResource.PrefillBuffers)!, amount: 1).Seated);
+
+        try
+        {
+            GenerationService engine = GenerationService.Open(
+                ConfigFor(path, "hybrid-prefill-exhaust", gpuLayers: layerCount) with
+                {
+                    Models =
+                    [
+                        new ModelConfig
+                        {
+                            Name = "hybrid-prefill-exhaust",
+                            Path = path,
+                            MaxContextTokens = 512,
+                            KvBlocks = 8,
+                            Placement = new PlacementConfig { GpuLayers = layerCount },
+                            Budgets = [buffersOnly],
+                        },
+                    ],
+                },
+                NullLogger.Instance,
+                ledger);
+
+            Assert.Fail($"expected the held device seam to refuse '{engine.Model.Id}' before this model opened");
+        }
+        catch (BudgetExhaustedException error)
+        {
+            Assert.Equal("hybrid-prefill-exhaust", error.Model);
+            Assert.Equal(BudgetResource.PrefillBuffers, error.Resource);
+            Assert.Equal(BudgetTier.Vram, error.Tier); // the only position this chain seats at is held — no fallback residency absorbs it
+            Assert.Contains("'prefill_buffers'", error.Message);
+            Assert.Contains("tier 'vram'", error.Message);
+            Assert.Contains("'hybrid-prefill-neighbour' 1 megabytes", error.Breakdown);
+        }
+        catch (Exception ex) when (IsUnavailableCudaSeam(ex))
+        {
+            return; // no usable driver or device behind this host's accelerator seam: the held-seam posture cannot be opened here.
+        }
+    }
+
     private static bool IsUnavailableCudaSeam(Exception error) =>
         error is DllNotFoundException
             or EntryPointNotFoundException

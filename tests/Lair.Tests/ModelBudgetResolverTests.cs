@@ -129,6 +129,42 @@ public sealed class ModelBudgetResolverTests
     }
 
     [Fact]
+    public void Resolve_PrefillAcceleratorClaimWithoutDeviceBackedBuffers_ReportsTheMissingPoolPosture()
+    {
+        ModelException error = Assert.Throws<ModelException>(() => ModelBudgets.Resolve(new BudgetRequest
+        {
+            ModelName = "qwen-test",
+            Declared = [new BudgetChain { Resource = BudgetResource.PrefillBuffers, Order = [BudgetTier.Vram], Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Vram] = 64 } }],
+            OpenedPoolTiers = [BudgetTier.Dram],
+        }));
+
+        Assert.Contains("model 'qwen-test'", error.Message);
+        Assert.Contains("budgets for resource 'prefill_buffers'", error.Message);
+        Assert.Contains("no opened pool backs working copies at tier 'vram'", error.Message); // opening accelerator weight copies does not hand this resource a residency it never asked its host for
+        Assert.Contains($"device-backed pools for '{BudgetResourceNames.PrefillBuffers}'", error.Message);
+    }
+
+    [Fact]
+    public void Resolve_PrefillChainAtAcceleratorTier_LandsWithDeclaredCeilingWhenTheDeviceBackedRouteIsOpened()
+    {
+        ResolvedBudgetSet resolved = ModelBudgets.Resolve(new BudgetRequest
+        {
+            ModelName = "qwen-test",
+            Declared = [new BudgetChain { Resource = BudgetResource.PrefillBuffers, Order = [BudgetTier.Vram], Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Vram] = 64 } }],
+            OpenedPoolTiers = [BudgetTier.Dram, BudgetTier.Vram], // the posture an opened accelerator-backed prompt route reports: system memory plus device-resident working copies
+        });
+
+        ResolvedBudgetChain buffers = resolved.For(BudgetResource.PrefillBuffers)!;
+        ResolvedBudgetTier position = Assert.Single(buffers.Tiers);
+        Assert.Equal(BudgetTier.Vram, position.Tier);
+        Assert.False(position.IsOriginStore); // activation bytes are transient working-set material, never an origin-store set
+        Assert.Equal(64L, position.Cap);
+
+        ResolvedBudgetTier firstCopyHolding = buffers.FirstCopyHoldingTier()!;
+        Assert.Equal(BudgetTier.Vram, firstCopyHolding.Tier);
+    }
+
+    [Fact]
     public void Resolve_KvChainStaysSystemMemoryBackedOnThisHost()
     {
         ResolvedBudgetSet resolved = ModelBudgets.Resolve(new BudgetRequest

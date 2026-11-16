@@ -234,6 +234,48 @@ public sealed class KvResidencyServeTests : IDisposable
         }
     }
 
+    [Fact]
+    [Trait("Category", "Cuda")]
+    public void SystemMemoryWeightsBesideDeviceBackedBlocks_OpenAndSeatEveryClaimAtItsChainsTier()
+    {
+        string path = SyntheticModel("kv-residency-mixed");
+
+        CapturingLogger logger = new();
+
+        // The mixed shape this vocabulary already allows: weights resident where the file's copies are read, blocks admitted against their declared device ceiling — one model carrying both at once needs no key beyond today's placement axis and its budget chains.
+        try
+        {
+            using GenerationService engine = GenerationService.Open(
+                Config(
+                    path,
+                    "kv-mixed",
+                    kvBlocks: 8,
+                    placement: new PlacementConfig { KvResidency = "vram" },
+                    budgets:
+                    [
+                        new BudgetChain { Resource = BudgetResource.Weights, Order = [BudgetTier.Dram], Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Dram] = 1024 } },
+                        new BudgetChain { Resource = BudgetResource.Kv, Order = [BudgetTier.Dram, BudgetTier.Vram], Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Vram] = 8L } },
+                    ]),
+                logger);
+
+            IReadOnlyList<string> claims = logger.Messages(LogLevel.Information)
+                .Where(message => message.Contains("ledger_claim", StringComparison.Ordinal))
+                .ToList();
+
+            Assert.Contains(claims, message => message.Contains("resource='weights' tier='dram'", StringComparison.Ordinal)); // the weight claim seats at its chain's system-memory position beside an opened device-backed sibling
+            Assert.Contains(claims, message => message.Contains("resource='kv' tier='vram' amount_blocks=8", StringComparison.Ordinal)); // and this reservation's device-held copy carries its own standing seat against the declared ceiling
+
+            Assert.Equal(BlockResidencyMode.Vram, engine.ServedBlockPool.Residency);
+            Assert.Equal(8, engine.ServedBlockPool.DeviceBackedBlockCount); // both resources landed on the tiers their chains named — nothing half-opened
+        }
+        catch (InvalidOperationException ex) when (ex.Message.Contains(ModelRoute.CudaBackendSeam))
+        {
+            throw new InvalidOperationException(
+                "CUDA driver seam unavailable: a device-backed KV residency needs the backend that holds persistent block copies, and this host opened none.",
+                ex);
+        }
+    }
+
     // ---------------------------------------------------------------- helpers
 
     private static ModelConfig ConfigModel(string modelName, string modelPath, int kvBlocks, string residency) => new()

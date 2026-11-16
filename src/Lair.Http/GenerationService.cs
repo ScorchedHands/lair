@@ -815,9 +815,12 @@ public sealed class GenerationService : IDisposable
 
     // The ledger an engine opens when it carries no shared accounting: every tier its pools back for every budgetable resource, each
     // stating the explicit unbounded capacity posture — a public total no configuration declared is never invented. Accelerator memory
-    // holding weight copies is the exception: opening that tier states the ceiling 'tiers.vram_mb' declares for it when the configuration
-    // names one, and keeps the unbounded posture where it does not, because nothing here consults a driver-detected device total. No seam
-    // opens at accelerator memory for any other resource: block pools and activation buffers live in system memory until something backs them elsewhere.
+    // holding weight copies is the exception on host totals: opening that tier states the ceiling 'tiers.vram_mb' declares for it when
+    // the configuration names one, and keeps the unbounded posture where it does not, because nothing here consults a driver-detected
+    // device total. An accelerator route this engine opened also carries its prompt windows' activation bytes across to the device per
+    // sub-batch, so that tier gets an unbounded seam for prefill buffers too — what bounds a claim there is the model's own declared
+    // ceiling at that chain position, never an invented host total. No seam opens at accelerator memory for any resource whose backing
+    // this open did not establish: block pools live in system memory until a device-backed residency is opened beside them.
     private static DeviceLedger OpenHostLedger(string modelName, TierCapacityConfig? tiers, CudaBackend? splitExecution, CudaBackend? kvStorageOwner, ILogger? logger)
     {
         BudgetResource[] resources = [BudgetResource.Weights, BudgetResource.Kv, BudgetResource.PrefillBuffers];
@@ -827,7 +830,7 @@ public sealed class GenerationService : IDisposable
         {
             foreach (BudgetResource resource in resources)
             {
-                if (tier == BudgetTier.Vram && resource != BudgetResource.Weights)
+                if (tier == BudgetTier.Vram && resource is not (BudgetResource.Weights or BudgetResource.PrefillBuffers))
                 {
                     continue; // no device-backed pool for this resource is opened here, so nothing accounts against that position
                 }
