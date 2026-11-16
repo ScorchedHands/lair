@@ -1385,7 +1385,7 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the host-
 - [X] **CPU GEMV flake under MVP4 gates** — the Backlog defect row "Intermittent `AccessViolationException` in the AVX2 Q4_K GEMV worker under three resident engines" sits underneath every MVP4 gate that runs real models on the CPU side of a cross-device comparison; diagnose it before MVP4 build starts so a CPU-path crash is not misattributed to the CUDA backend.
   - Decision: moved into MVP4 as an implementation item rather than left open, because the diagnosis has code-visible evidence and gates but no unresolved design question.
 
-### MVP5 [v0.5.0] - Tentative
+### MVP5 [v0.5.0] - Refined
 
 Sub-4-bit i-quants decode at the Q4_K/IQ4_XS cost on AVX2, not the measured ≈6.5× baseline.
 
@@ -1406,32 +1406,42 @@ Sub-4-bit i-quants decode at the Q4_K/IQ4_XS cost on AVX2, not the measured ≈6
 - **DN-M5-4** — CPU-feature scope is a load-time ISA selection with an explicit config axis `engine.cpu.isa: auto | avx2 | avx-vnni`. `auto` picks the highest available of {AVX-VNNI, AVX2}; forcing one the host lacks fails the load naming the missing feature. Both integer-dot kernels ship from day 1 — VNNI via `vpdpwssd`/`vpdpbusd`, AVX2 via `maddubs`+`maddwd` — bit-identical, so they share one parity gate regardless of which is selected. AVX-512 and AMD/Zen-specific gather tuning stay deferred; no CPU on this fleet carries them.
   - Rationale: AVX-VNNI is present on the i9-13900K (Alder Lake onward), so it *is* measurable on the dev box even though the E5-2683 v4 production target lacks it — the earlier "no test hardware" deferral was over-broad, and only AVX-512 and Zen are genuinely unmeasurable here. Shipping VNNI beside AVX2 also proves the dispatch seam: a capability path with a single implementation is unvalidated, and two bit-identical implementations make the abstraction real from day 1. The override exists for measurement — forcing `avx2` on a VNNI-capable box lets both paths be benchmarked on one machine without switching hardware, and the forced selection lands in the config fingerprint so comparison runs diff cleanly (the separate-config-runs invariant).
   - Rejected: AVX2-only (leaves the measurable VNNI win untested); `auto`-only with no override (cannot compare the two ISA paths on a single box); silently falling back to an available path when a forced ISA is absent rather than failing the load; AVX-512 or Zen-4 kernels in this phase (no CPU to validate against); a per-token ISA switch (resolved once at engine open, consistent with DN-M1-3).
+- **DN-M5-5** — The parity oracle for the sub-4-bit i-quant rewrite is re-pinned to **ik_llama.cpp semantics**: the scalar Kernel oracle is derived from ik's `ggml_vec_dot_iq3_xxs_q8_K` / `ggml_vec_dot_iq2_xs_q8_K` integer-dot + `Q8_K`-activation math, and the engine Parity fixtures for these formats are regenerated against ik outputs. Tolerance-band *width* is unchanged; only the reference values move.
+  - Rationale: the integer-dot + quantized-activation path is deliberately the integer-dot lineage, so it will not match a stock-llama.cpp float path bit-for-bit; ik_llama.cpp is already LAIR's named CPU bench ceiling and its `hx[k]` two-chunks-per-64-block scale rule is exactly what DN-M5-2 encodes, so pinning to it is internally consistent.
+  - Rejected: stock-llama.cpp float-path fixtures (integer-dot ≠ float bit-for-bit; matching them would force widening a band, forbidden by the 2026-11-11 decision); a LAIR-authored-only oracle (guarantees scalar==SIMD==VNNI but risks being consistently wrong against every real engine); Strata semantics (chases a second engine's exact rounding).
+  - Contract: the scalar integer-dot reference is the Kernel ground truth (scalar==AVX2==VNNI); sub-4-bit i-quant Parity fixtures are regenerated from the ik reference at build with identical band widths.
+- **DN-M5-6** — Sign-plane folding and the VNNI dot stay managed, no native shim. The grid sign is applied to the *activation* as a per-element ±1 via `Avx2` blend/select on the activation's stored sign (never to the decoded weight magnitudes), and the VNNI dot uses the `AvxVnni`/`Avx512Vnni` intrinsics for `vpdpwssd`/`vpdpbusd`; the scalar reference oracle validates both paths bit-identically.
+  - Rationale: folding the sign onto the activation is what lets the weight decode yield unsigned magnitudes for a clean integer dot; a native shim would break the managed-first posture and the scalar==SIMD parity gate.
+  - Rejected: a native shim for the sign fold or VNNI (violates managed-first); applying the sign to decoded weights (the entire point of folding is to avoid that).
+  - Contract: `CpuBackend+IQ*` dot kernels stay managed; exact intrinsic names are confirmed at build against the scalar oracle, not a design unknown.
+- **DN-M5-7** — The resolved `(isa, gather-mode)` pair is a load-time value recorded in the config fingerprint and surfaced in the monitor model line, so `auto` and forced-ISA runs diff as separate config runs.
+  - Rationale: the whole point of the `engine.cpu.isa` override is benchmarking both paths on one box; an implicit selection can't be diffed against the metrics bus.
+  - Rejected: leaving the selection implicit (comparison runs become indistinguishable); per-token ISA reporting (log noise, no signal).
+  - Contract: a config-fingerprint field plus a monitor field carry the resolved ISA and gather encoding.
 
 #### Implementation Items
 
 - [_] Integer-dot GEMV for `IQ3_XXS`/`IQ3_S`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S` — decode-once/apply-per-token `maddubs`+`maddwd` against `Q8_K`, packed grids, sign folded onto the activation (see DN-M5-1)
-  - Verify: `dotnet test -c Release --filter Category=Kernel` — integer-dot oracle bit-identical to the re-pinned reference across representative super-blocks, batch equals solo, 1-thread equals 4-thread; `Category=Parity` bands unchanged on the pinned IQ fixtures.
+  - Verify: `dotnet test -c Release --filter Category=Kernel` — integer-dot output bit-identical to the ik-derived scalar oracle across representative super-blocks, batch equals solo, 1-thread equals 4-thread; `Category=Parity` bands unchanged in width against the ik-pinned IQ fixtures (see DN-M5-5).
 - [_] AVX-VNNI integer-dot variant + `engine.cpu.isa` selection — `vpdpwssd`/`vpdpbusd` kernels alongside the AVX2 path; `auto` picks the highest available from a capability probe (the same probe that resolves the DN-M5-3 gather-vs-scalar encoding), and an explicit `avx2` / `avx-vnni` forces that path or fails the load naming the missing feature when absent (see DN-M5-4)
   - Verify: `dotnet test -c Release --filter Category=Kernel|Config` — VNNI and AVX2 kernels are bit-identical to each other and to the re-pinned reference across representative super-blocks (batch==solo, 1T==4T); `auto` selects VNNI on the 13900K and AVX2 on the E5-2683 v4; forcing `avx-vnni` on a non-VNNI host fails the load naming the feature, while both forced paths pass the same gate.
 - [_] Activation-quant contract — quantize the activation to `Q8_K`/`Q8_0` once per forward, shared across the batch, with the two-chunks-per-block scale rule and `hx[k]` correction (see DN-M5-2)
   - Verify: a scalar FP-activation oracle now diverges from the quantized-activation reference by >1e-3 on IQ fixtures, proving the contract binds; Parity bands unchanged.
 - [_] Weight-row prefetch + gather-vs-scalar probe — stream rows ~2 KB ahead and pick grid encoding from a measured CPU-class value resolved at engine open (see DN-M5-3)
   - Verify: `bench/` `gemv-file` shows the prefetched path ≥ unprefetched on the pinned IQ fixtures; both encodings bit-identical.
+- [_] Selection reporting — record the resolved `(isa, gather-mode)` pair in the config fingerprint and surface it in the monitor model line so `auto` and forced-ISA runs diff (see DN-M5-7)
+  - Verify: a config-fingerprint diff between an `auto` run and a forced `avx2` run on the same box shows the ISA field changing, and the monitor model line reports the resolved ISA/gather encoding for each.
 - [_] Measured-cost re-pin — re-run `gemv-file` and live decode for every sub-4-bit i-quant against the Q4_K/IQ4_XS baseline and update `README.md`'s recommendation from measured speed (see DN-M5-1)
   - Verify: committed bench report; sub-4-bit i-quants land in the IQ4_XS band (≈1–2× baseline), not ≈6.5×; if they do not, the premise is falsified and recorded rather than asserted.
 
 #### Tests
 
-- [_] Automated Kernel: integer-dot GEMV bit-identity vs the re-pinned reference for every sub-4-bit i-quant (scalar-vs-AVX2-vs-AVX-VNNI, batch==solo, 1T==4T), plus a Config fact that `engine.cpu.isa` auto-picks the highest available path on each target and fails the load naming the feature when an absent ISA is forced
-- [_] Automated Parity: pinned IQ fixtures reproduce within the existing bands with a quantized activation — no band widened
+- [_] Automated Kernel: integer-dot GEMV bit-identity vs the ik-derived scalar oracle for every sub-4-bit i-quant (scalar-vs-AVX2-vs-AVX-VNNI, batch==solo, 1T==4T)
+- [_] Automated Config: `engine.cpu.isa` auto-picks the highest available path on each target, an explicit override forces its path, and forcing an absent ISA fails the load naming the feature; the resolved `(isa, gather-mode)` pair appears in the config fingerprint and the monitor model line
+- [_] Automated Parity: ik-pinned IQ fixtures reproduce within the existing band width with a quantized activation — no band widened
 - [_] Manual Quant Recommendation: read the re-measured bench and confirm the documented pick follows speed, not file size
 
-#### Open Items
-
-- [ ] **Parity oracle re-pin** — decide the exact integer-dot reference (ik_llama.cpp vs Strata semantics) that the Kernel fixtures pin to, so the rewrite matches a real engine rather than LAIR's own writer; no Parity band may be widened.
-- [ ] **.NET intrinsic mapping for the sign plane** — `Avx2.MultiplyAdd*` covers `vpmaddwd`; confirm how to fold the grid sign onto the activation without a native shim (shuffle vs xor) under the managed-first posture.
-
-### MVP5.1 [v0.5.1] - Tentative
+### MVP5.1 [v0.5.1] - Refined
 
 KV cache becomes a configurable per-side format pair (`fp32`, `fp16`, `int8`/k8v8, `k8v4`, `q4`) with copy-less storage and an in-kernel quantized-dot attention path, ordered after MVP5 because it reuses the same activation-quant machinery.
 
@@ -1440,7 +1450,7 @@ KV cache becomes a configurable per-side format pair (`fp32`, `fp16`, `int8`/k8v
 - **DN-M51-1** — The KV cache is a pair of per-side *formats*, not a pair of scales: `(KFormat, VFormat)`, each side drawn from `{fp32, fp16, q8_0 (int8), q4_0}`. The named combos are the public surface and MVP5.1's whole option set — `f32/f32` (the pinned default), `f16/f16`, `q8/q8` (= "int8" = k8v8), `k8v4` (q8 K / q4 V), `q4/q4`. Each quantized side owns its own per-block group scales; `fp32`/`fp16` carry no stored scale. This mirrors llama.cpp's separate `--cache-type-k` / `--cache-type-v`, which is why a single "quant" knob cannot express the asymmetric combos.
   - Rationale: K and V are used by different attention ops (K in the query·key dot, V in the weighted sum), so they quantize with different numerical impact; naming them independently lets `k8v4` exist without special-casing storage. The pair maps directly onto a two-type-parameter pool (`BlockPool<TK, TV>`).
   - Rejected: one global "kv.quant" scalar (can't express k8v4); treating all formats as "a value + a scale" (fp16 has no scale; group scales are private to the block-quant formats).
-- **DN-M51-2** *(tentative)* — Implementation mechanism is a hybrid, not generics-or-records. Cold path: a format *descriptor* (enum/record per combo) drives pool sizing, footprint metrics, config fingerprint, and backend kernel selection. Hot path: a generic static-abstract seam (`interface IKvFormat<TSelf>` with `static abstract` dot/accumulate members; `BlockPool<TK,TV>`, `LayerOps<TK,TV>`) where each format is a fixed-size **block struct** (payload + scale in one struct), so `Span<Q8Block>` stays contiguous and the zero-copy `.Slice` read survives at block granularity while the JIT specializes per combo with no runtime switch.
+- **DN-M51-2** — Implementation mechanism is a hybrid, not generics-or-records. Cold path: a format *descriptor* (enum/record per combo) drives pool sizing, footprint metrics, config fingerprint, and backend kernel selection. Hot path: a generic static-abstract seam (`interface IKvFormat<TSelf>` with `static abstract` dot/accumulate members; `BlockPool<TK,TV>`, `LayerOps<TK,TV>`) where each format is a fixed-size **block struct** (payload + scale in one struct), so `Span<Q8Block>` stays contiguous and the zero-copy `.Slice` read survives at block granularity while the JIT specializes per combo with no runtime switch.
   - Rationale: quantized blocks are composite (32 payload bytes + half-scale for q8_0; nibbles + scale for q4_0), so a scalar type argument cannot represent them — modeling the element as a fixed-size block struct is what keeps storage copy-less. Static-abstract members give per-format specialization without virtual dispatch, matching the load-time-resolved / no-per-token-dispatch posture (DN-M1-3).
   - Rejected: an `abstract record KvFormat` per combo *on the hot path* — reference-type allocation plus virtual dispatch is exactly the per-token tax the engine already forbids, and records can't hold `unsafe fixed` buffers; records are kept only for the cold descriptor. A single generic scalar element (loses the scale, breaks copy-less).
 - **DN-M51-3** — Backend posture: the engine, pool sizing, footprint accounting, and config are format-agnostic through the descriptor + type seam; each backend implements the seam in its own idiom — CPU as generic static-abstract SIMD, CUDA as one kernel per `(TK,TV)` combo selected once at pool open. No format branching in the engine's hot orchestration.
@@ -1451,30 +1461,37 @@ KV cache becomes a configurable per-side format pair (`fp32`, `fp16`, `int8`/k8v
   - Rejected: making a quantized mode the default; re-tolerating the dense-family bands to absorb quantized-KV drift.
 - **DN-M51-5** — MVP5.1 reuses MVP5's activation-quant machinery (quantized operand + group scale + per-layer correction) for the K-dot rather than building a parallel quantizer; MVP5.1 is ordered after MVP5 for that reason.
   - Rationale: the K·query dot against a quantized K is the same `maddubs`+`maddwd`-against-`Q8_K` pattern MVP5 establishes for weights; two quantizers would be two parity surfaces to maintain.
+- **DN-M51-6** — The mechanism decision is made: static-abstract generic hot path (`LayerOps<TK,TV>`) is the primary implementation, **gated by a de-risk spike** that can demote it to hand-specialized per-combo kernels. The spike measures a generic `LayerOps<TK,TV>` dot against today's hand-written `ReadOnlySpan<float>` attention path on the pinned fixtures; within-noise parity keeps the generic seam, a measurable tax adopts the fallback (cold descriptor + hand-specialized hot kernels). Both paths are decided now so the outcome is a recorded choice, not an open question.
+  - Rationale: static-abstract struct specialization is the right shape but JIT devirtualization is not guaranteed; committing to it *with a known demotion path* settles the design while letting measurement pick which one ships.
+  - Rejected: betting the whole phase on the generic seam with no fallback (a JIT tax would strand the phase); defaulting to hand-written kernels and abandoning the copy-less/least-duplication goal up front.
+  - Contract: a spike item runs before the storage/attention items; its measured delta selects primary vs fallback, recorded in the Decision Log.
+- **DN-M51-7** — Quantized-KV parity policy: `f32/f32` stays the bit-identical pinned default and the Kernel/Parity oracle. Each quantized mode is validated against **llama.cpp/ik_llama.cpp run with the same cache-type pair** (e.g. LAIR `q8/q8` vs llama `--cache-type-k q8_0 --cache-type-v q8_0`) within a per-mode measured band recorded in the parity report, cross-checked against the MoE cross-tool drift band. Bands are per-mode additions; the dense-family `f32` band is never widened.
+  - Rationale: "matches a real engine" is the same standard MVP5 adopted for weights — anchoring each KV mode to the ecosystem engine's matching cache-type is a stronger check than comparing to LAIR's own `f32` run, and it is what makes the comparison runs honest.
+  - Rejected: validating quantized modes only against LAIR's own `f32` output (self-consistent but not engine-anchored); folding quantized-KV drift into the dense-family band (forbidden widening).
+  - Contract: a parity fixture per named combo, generated against the matching llama/ik cache-type output, with its measured drift recorded as that mode's band.
 
 #### Implementation Items
 
-- [_] KV format descriptor + `models[].kv.quant.{k,v}` config axis (cold path) — enumerate the five named combos, resolve at model open, fold the pair into the config fingerprint, and drive `BlockPool` sizing/footprint from the descriptor (see DN-M51-1, DN-M51-2)
+- [_] Format-abstraction de-risk spike — measure a generic `LayerOps<TK,TV>` quantized-dot against the hand-written `ReadOnlySpan<float>` attention path on pinned fixtures; the delta selects the generic seam or the hand-specialized fallback (see DN-M51-6)
+  - Verify: `bench/` report of generic-vs-hand-written decode tok/s on a pinned fixture; within-noise keeps the generic seam, a measurable regression records the fallback switch in the Decision Log.
+- [_] q4-K viability spike — measure LAIR `q4/q4` KV against llama/ik `q4_0` cache-type on pinned fixtures and record the drift band; a band that clears keeps `q4/q4` in the named set, a band that fails drops it and records the decision (see DN-M51-7)
+  - Verify: `dotnet test --filter Category=Parity` — `q4/q4` logprob drift vs the llama/ik `q4_0` reference either lands inside the recorded per-mode band (keep) or exceeds it (drop `q4/q4`, record).
+- [_] KV format descriptor + `models[].kv.quant.{k,v}` config axis (cold path) — enumerate the named combos, resolve at model open, fold the pair into the config fingerprint, and drive `BlockPool` sizing/footprint from the descriptor (see DN-M51-1, DN-M51-2)
   - Verify: `dotnet test --filter Category=Config|Kv` — an unknown or asymmetric combo resolves or reports naming K/V format; footprint and `BytesPerBlock` reflect the declared formats; `f32/f32` is the default when unset.
 - [_] Generic block-struct storage — `BlockPool<TK,TV>` with q8_0/q4_0 as fixed-size payload+scale structs, preserving zero-copy block-granularity `.Slice` reads (see DN-M51-2)
   - Verify: `dotnet test --filter Category=Kv` — a quantized block round-trips bit-identically to its own writer (1T==4T, batch==solo), and copy-on-write copies the quantized block whole without re-quantizing.
-- [_] In-kernel quantized-dot attention (CPU) — `LayerOps<TK,TV>` over `IKvFormat<TSelf>` static-abstract dot/accumulate, reusing MVP5's activation-quant machinery for the K-dot (see DN-M51-2, DN-M51-5)
-  - Verify: `dotnet test --filter Category=Parity` — `f32/f32` reproduces the pinned reference bit-identically; each quantized mode lands within its documented tolerance against the dense-equivalent reference.
+- [_] In-kernel quantized-dot attention (CPU) — `LayerOps<TK,TV>` over `IKvFormat<TSelf>` static-abstract dot/accumulate, reusing MVP5's activation-quant machinery for the K-dot (see DN-M51-2, DN-M51-5, DN-M51-6)
+  - Verify: `dotnet test --filter Category=Parity` — `f32/f32` reproduces the pinned reference bit-identically; each quantized mode lands within its recorded band against the matching llama/ik cache-type output.
 - [_] CUDA per-combo KV attention kernel selected at pool open (see DN-M51-3)
-  - Verify: `dotnet test --filter Category=Parity` on CUDA — the selected kernel matches the CPU quantized-mode output within the same tolerance; no runtime format branching in the engine step loop.
+  - Verify: `dotnet test --filter Category=Parity` on CUDA — the selected kernel matches the CPU quantized-mode output within the same band; no runtime format branching in the engine step loop.
 
 #### Tests
 
-- [_] Automated Config/Kv: the five combos resolve, sizing/footprint follows the declared formats, and `f32/f32` is the default
+- [_] Automated Config/Kv: the named combos resolve, sizing/footprint follows the declared formats, and `f32/f32` is the default
 - [_] Automated Kv: quantized block round-trip bit-identity and CoW-without-requantize
-- [_] Automated Parity: `f32/f32` bit-identical to the pinned oracle; `fp16`/`q8`/`k8v4`/`q4` within their documented tolerance on the pinned fixtures (CPU and CUDA)
+- [_] Automated Parity: `f32/f32` bit-identical to the pinned oracle; each quantized mode within its recorded band against the matching llama/ik cache-type output (CPU and CUDA)
+- [_] Automated Spike: generic-vs-hand-written attention delta on a pinned fixture records primary vs fallback, and q4-K drift vs llama `q4_0` records keep/drop of `q4/q4`
 - [_] Manual Quant Recommendation: read the measured per-mode bench and confirm the documented KV default follows the parity/quality decision, not the smallest footprint
-
-#### Open Items
-
-- [ ] **Generics-vs-records mechanism decision** — confirm the static-abstract `IKvFormat<TSelf>` seam survives the .NET JIT without a hot-path tax on the pinned fixtures (measure a generic `LayerOps<TK,TV>` dot against today's hand-written `ReadOnlySpan<float>` path); if it taxes, fall back to a per-combo cold descriptor plus hand-specialized hot kernels. Resolve in `/plan-refine MVP5.1`.
-- [ ] **KV parity re-pin design** — define the per-mode lossy tolerance for `fp16`/`q8`/`q4` and how it coexists with the bit-identical `f32` oracle and the MoE cross-tool drift band, without widening any existing band. Resolve in `/plan-refine MVP5.1`.
-- [ ] **q4 viability** — whether q4 on K (not just V) clears its tolerance at all on the pinned fixtures; if it does not, drop `q4/q4` from the named set and record the decision rather than shipping a mode that fails parity.
 
 ### MVP6 [v0.6.0] - Refined
 
@@ -1678,6 +1695,10 @@ Vision input on chat models.
 | idea | `auto` device fallback | silent CPU fallback when a configured CUDA device is absent — deliberately not a default (DN-M4-3) |
 
 ## Decision Log
+
+- **2026-11-16 — MVP5.1 refined: the quantized-KV mechanism is committed as a static-abstract generic hot path with a measured demotion path, and quantized modes are validated against the matching llama/ik cache-type output (DN-M51-6, DN-M51-7).** The generics-vs-records question is settled as "generic `LayerOps<TK,TV>` primary, gated by a de-risk spike that can switch to hand-specialized per-combo kernels" rather than left open; each quantized KV mode (`fp16`/`q8`/`k8v4`/q4) gets a per-mode parity band measured against llama/ik run with the same cache-type pair, cross-checked against the MoE cross-tool band, with `f32/f32` staying bit-identical and no dense-family band widened. `q4/q4` stays in the named set only if a q4-K viability spike clears its band, else it is dropped and recorded. Rejected: betting the phase on the generic seam with no fallback; validating quantized modes only against LAIR's own `f32` output; folding quantized-KV drift into the dense-family band.
+
+- **2026-11-16 — MVP5 refined; the sub-4-bit i-quant parity oracle is re-pinned to ik_llama.cpp semantics (DN-M5-5).** The integer-dot + `Q8_K`-activation path is deliberately the integer-dot lineage, so it will not match a stock-llama.cpp float path bit-for-bit; the scalar Kernel oracle is derived from ik's `ggml_vec_dot_iq*_q8_K` and the engine Parity fixtures for these formats are regenerated against ik outputs with the tolerance-band *width* unchanged. Rejected: stock-llama.cpp float-path fixtures (would force widening a band, forbidden); a LAIR-authored-only oracle (risk being consistently wrong against real engines); Strata semantics (chases a second engine's rounding). Sign-plane folding and the VNNI dot stay managed with no native shim (DN-M5-6), and the resolved `(isa, gather-mode)` pair is recorded in the config fingerprint and monitor so forced-ISA benchmark runs diff (DN-M5-7).
 
 - **2026-11-16 — Strata's cache-conditioned routing is adopted as an opt-in toggle (`moe.resident_routing`), flipping the earlier "explicitly not a LAIR default" line.** It biases top-k expert *selection* toward experts already in the hot tier while keeping the router's mixing weights unbiased, shrinking the batch union active-expert set so fewer experts stream over PCIe or gather on CPU. Adopted as **resident-biased routing** (DN-M7-12), a gated follow-on to the hot tier (DN-M7-5) and deliberately non-default: a strong bias distorts selection when few experts are resident (≤12 GB, 4.5 vs 5.6 agent tasks passed). Because it changes output it is validated by a documented lossy tolerance plus per-model quality reporting against the dense-equivalent reference (the DN-M7-9 pattern), never the bit-identical Parity gate; the policy is residency-aware so it applies on both the CPU RAM hot tier and the CUDA VRAM hot tier, not CUDA-only.
 
