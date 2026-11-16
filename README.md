@@ -6,7 +6,13 @@ User documentation lives in [`docs/README.md`](docs/README.md) (feature and oper
 
 ## Requirements
 
-- .NET SDK 10.0.400+ (x64)
+- A `lair` executable. Build it from a checkout with the .NET 10 SDK (10.0.400+, x64):
+
+  ```powershell
+  dotnet publish src/Lair.Host -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o release
+  ```
+
+  `release\lair.exe` carries the .NET runtime and serves its Web UI from the `wwwroot` directory beside it. Building, testing, and running from a checkout is covered in [DEVELOP.md](DEVELOP.md).
 - A GGUF model file, e.g. from Hugging Face — see Quantization below for the supported tensor types and which one to pick
 
 ## Quantization
@@ -23,10 +29,10 @@ copy lair.example.yaml lair.yaml
 # edit lair.yaml: model path, name, context, kv_blocks, port
 
 # 2. Serve the OpenAI-compatible API (binds 127.0.0.1; the example config serves on port 8181)
-dotnet run --project src/Lair.Host -- serve -c lair.yaml
+lair serve -c lair.yaml
 
 # 3. Or talk to the model directly in a terminal REPL
-dotnet run --project src/Lair.Host -- chat -c lair.yaml
+lair chat -c lair.yaml
 ```
 
 The loader defaults are `server.bind: 127.0.0.1` and `server.port: 8080`, but `lair.example.yaml` ships with `port: 8181` — every URL below follows whatever `server.port` your config declares. `monitor` defaults to `http://127.0.0.1:8080`, so point it with `-u` when the server runs on a different port.
@@ -58,8 +64,8 @@ Point a browser at `http://127.0.0.1:8181/ui` (or your configured port; `/` redi
 ## Monitor CLI
 
 ```powershell
-dotnet run --project src/Lair.Host -- monitor --interval 0        # default http://127.0.0.1:8080, every snapshot
-dotnet run --project src/Lair.Host -- monitor -u http://127.0.0.1:8181 --interval 1000
+lair monitor --interval 0        # default http://127.0.0.1:8080, every snapshot
+lair monitor -u http://127.0.0.1:8181 --interval 1000
 ```
 
 `monitor` needs at least one option in this build — a bare `monitor` prints the usage block and exits 1. `-u` takes an absolute URL of the serving server; `--interval` is the minimum milliseconds between rendered rows (0 renders every snapshot; the server emits one every 2 seconds).
@@ -83,9 +89,9 @@ models:
 `source:` pins a repo, a revision, and one or more GGUF files. A branch revision is resolved once at fetch and recorded as a commit sha in `models/manifest.json`; load verifies the manifest and fetches the pinned artifact only when it is absent. Hashes are computed by LAIR after download, and a `.part` file is never loadable.
 
 ```powershell
-dotnet run --project src/Lair.Host -- model fetch QuantFactory/SmolLM-135M-Instruct-GGUF -c lair.yaml
-dotnet run --project src/Lair.Host -- model check manual-fetch-smollm -c lair.yaml
-dotnet run --project src/Lair.Host -- model list -c lair.yaml
+lair model fetch QuantFactory/SmolLM-135M-Instruct-GGUF -c lair.yaml
+lair model check manual-fetch-smollm -c lair.yaml
+lair model list -c lair.yaml
 ```
 
 `model check` is report-only: it prints candidate deltas against the hub's current HEAD without downloading, repinning, or changing the load path. `/monitor/stream` carries the same candidate as optional `metrics_update_candidate` when a served model has a source pin and a candidate is found. Gated repos authenticate through `LAIR_HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN` fallback); the token is sent only to `huggingface.co` and is never written to logs, errors, or the manifest.

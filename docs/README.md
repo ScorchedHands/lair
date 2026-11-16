@@ -6,30 +6,36 @@ This page is the base overview. The authoritative detail lives in [reference/CLI
 
 ## Requirements
 
-- **.NET 10 SDK** (every project targets `net10.0`), x64. CPU kernels use AVX2 when the CPU has it and fall back to scalar paths otherwise.
+- **A `lair` executable.** A release build produces a self-contained single-file executable that carries the .NET runtime, so running LAIR needs nothing else installed. Building it needs the **.NET 10 SDK** (every project targets `net10.0`), x64, plus Node 22 / npm 11 only when the Web UI is bundled (`-p:SkipWebUi=true` builds without it):
+
+  ```powershell
+  dotnet publish src/Lair.Host -c Release -r win-x64 --self-contained -p:PublishSingleFile=true -o release
+  ```
+
+  `release\lair.exe` ships with `wwwroot\` beside it — the Web UI bundle the host serves at `/ui`. A checkout can also be run without publishing (`dotnet build Lair.sln` then `src\Lair.Host\bin\Release\net10.0\lair.exe`). A prebuilt release artifact is not published yet: no publish profile or CI packaging step is committed.
 - **A GGUF model file** on disk, from the published quant ecosystem (for example a Hugging Face GGUF repo), or fetched by LAIR from a pinned `source:` declaration.
-- **Node 22 / npm 11** only for building the Web UI bundle: `dotnet build`/`dotnet run` bundles `src/Lair.Host/ClientApp` automatically. On a machine without Node, build with `-p:SkipWebUi=true` and the host serves no `/ui`.
+- CPU kernels use AVX2 when the CPU has it and fall back to scalar paths otherwise.
 
 ## Quick start
 
-From a checkout of this repository:
+From a directory holding the `lair` executable and a config file:
 
 ```powershell
-# 1. Copy the example config and point it at your model
+# 1. Copy the example config (it ships in the repository, not in a release directory) and point it at your model
 copy lair.example.yaml lair.yaml
 # edit lair.yaml: model name, path, max_context_tokens, kv_blocks, port
 
 # 2. Serve the OpenAI-compatible API
-dotnet run --project src/Lair.Host -- serve -c lair.yaml
+lair serve -c lair.yaml
 
 # 3. Or talk to the model directly in a terminal REPL
-dotnet run --project src/Lair.Host -- chat -c lair.yaml
+lair chat -c lair.yaml
 ```
 
 Port precision matters here. The config loader's defaults are `server.bind: 127.0.0.1` and `server.port: 8080`, but `lair.example.yaml` ships with `port: 8181` — so a copied example serves on `http://127.0.0.1:8181`, not `8080`. The `monitor` command defaults to `http://127.0.0.1:8080`, so point it explicitly when the server runs on the example's port:
 
 ```powershell
-dotnet run --project src/Lair.Host -- monitor -u http://127.0.0.1:8181 --interval 1000
+lair monitor -u http://127.0.0.1:8181 --interval 1000
 ```
 
 A bare `monitor` with no flags is a usage error in this build (it prints the usage block and exits `1`): pass `-u` or `--interval`. `serve` and `chat` require `-c <path>`; there is no default config path and no `--config` long form.
@@ -43,7 +49,7 @@ $body = '{"model":"smollm-135m-instruct-q8_0","messages":[{"role":"user","conten
 Invoke-RestMethod -Uri http://127.0.0.1:8181/v1/chat/completions -Method Post -ContentType application/json -Body $body
 ```
 
-`dotnet build Lair.sln` produces the same program as `lair.exe` under `src/Lair.Host/bin/<Configuration>/net10.0/`, so a built checkout can be driven directly (`.\src\Lair.Host\bin\Release\net10.0\lair.exe serve -c lair.yaml`). A self-contained single-file publish is not configured on this branch. Full command semantics, flags, output formats, and exit codes: [reference/CLI.md](reference/CLI.md).
+Config paths are read relative to the working directory you launch `lair` from, and `model fetch`/`check`/`list` without `-c` work on a `models` directory beside the executable — so a release keeps its model packs next to `lair.exe`. Full command semantics, flags, output formats, and exit codes: [reference/CLI.md](reference/CLI.md).
 
 ## What LAIR does not do
 
