@@ -8,6 +8,13 @@ public sealed partial class CudaBackend
     /// <summary>Weight tensors this instance has copied to device memory so far.</summary>
     public int DeviceWeightCopies => _deviceWeights.Count;
 
+    // The persistent residency accounting: every copy cached here is one allocation the instance holds for its whole lifetime and releases together at dispose. Each cache entry records the exact length its device buffer was allocated with, so the byte total reads off the same tracking that answers weight passes — no separate ledger to keep in step.
+    /// <summary>Persistent device weight allocations this instance currently holds open: every copy made so far, freed as a set at dispose.</summary>
+    public int PersistentDeviceWeightAllocations => _weightAllocations.Count;
+
+    /// <summary>The device bytes these persistent weight copies hold: the sum over every cached tensor at its allocated length. A host-mapped posture records no allocation in this tracking and reports zero — its weights never enter persistent device memory.</summary>
+    public long PersistentDeviceWeightBytes => _deviceWeights.Sum(entry => entry.Key.Length);
+
     // The copy residency: each (pointer, length) tensor is allocated once on the device and filled by one host-to-device
     // copy, cached for the instance's lifetime, and freed at dispose.
     private ulong EnsureDeviceWeights(nint hostPointer, nuint bytes)

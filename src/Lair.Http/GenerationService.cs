@@ -115,6 +115,12 @@ public sealed class GenerationService : IDisposable
     // The scheduler advancing this engine's pipelines: its last composition report says which candidates merged on which segment and what kept any of them out, read here so an observer can tell where sequences actually stepped instead of inferring it from placement. Internal diagnostics for hosts and tests.
     internal GenerationScheduler ServedScheduler => _scheduler;
 
+    // The persistent weight residency the split execution backend holds open for this model's accelerator span: the byte total across exactly the allocations its kernels read and dispose releases, so an observer sees what an opened whole-model hybrid posture actually keeps in device memory instead of inferring it from placement. Internal diagnostics for hosts and tests; null whenever no layer split was declared, and zero on a host-mapped posture whose weights never enter persistent device memory.
+    internal long? SplitExecutionPersistentDeviceWeightBytes => _splitExecution?.PersistentDeviceWeightBytes;
+
+    /// <summary>The allocation count behind that residency — one per weight tensor the copy posture has cached. Internal diagnostics for hosts and tests.</summary>
+    internal int? SplitExecutionPersistentDeviceWeightAllocations => _splitExecution?.PersistentDeviceWeightAllocations;
+
     // The tier the ledger seated this model's whole-reservation KV claim at — what a live soft-cap edit retargets there, leaving any device-backed range claimed beside it on its own standing seat. Null when the model declared no KV chain to register.
     private BudgetTier? _reservationKvClaimTier;
 
