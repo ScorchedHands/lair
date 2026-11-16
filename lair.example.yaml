@@ -14,14 +14,16 @@ engine:
   # prefill_kernel: gemv   # optional; gemv | tiled | gemm — which attention/weight path the engine's prefill route selects. All three run today; gemm serves only a model whose dense weight formats it has kernels for (Q8_0, Q4_K, IQ4_XS), and a file with any other format is refused at model open naming that format rather than falling back.
   # prefill_step_budget_ms: 250  # optional; sizes prompt-window token counts from measured per-row cost, clamped by scheduler floor/ceiling and engine row caps.
 
-# tiers:
+# host:
 #   dram_mb: 65536         # optional host DRAM byte total; reported warn-and-accept against OS topology when present
-#   dram_cores: 32         # optional host logical-processor total; compute grants are first-come against this posture
-#   # nvme_path: D:\       # optional presence-only NVMe tier marker
-#   # nodes:               # optional per-node overrides keyed by reported node index
-#   #   - index: 0
-#   #     mb: 32768        # per-node byte override (not dram_mb — that key belongs to tiers)
-#   #     cores: 16        # per-node logical-processor override
+#   vram_mb: 8192          # optional accelerator/VRAM byte posture; declared ceiling only, not driver-detected capacity
+#   cpu_cores: 32          # optional host logical-processor total; compute grants are first-come against this posture
+#   # disk_path: D:\       # optional presence-only disk marker; no byte ceiling belongs at that position
+#   numa:                  # optional per-node overrides keyed by reported node index
+#     nodes:
+#       - index: 0
+#         mb: 32768        # per-node byte override (not host.dram_mb — that key belongs to the flat host posture)
+#         cores: 16        # per-node logical-processor override
 
 models:
   - name: smollm-135m-instruct-q8_0
@@ -44,25 +46,27 @@ models:
     #   #     sha256: 0000000000000000000000000000000000000000000000000000000000000000
     #   #     size: 144810912
     placement:
-      device: cpu
+      device: auto
       kv_residency: dram
-      prefill: cpu
+      prefill: auto
       # prefill_lane: shared   # optional; shared | dedicated — dedicated sub-allocates a prefill worker share and activation buffers from this model's claim
       core_set: "0-15"   # optional; omit to leave the model unpinned; pinned models may not share core ids unless this model opts into core_overcommit
       thread_quota: 8    # optional; caps this model's workers at 8 regardless of engine threads
       # core_overcommit: false # optional; restart-only; relaxes pinned core-set disjointness for this model only
       # numa_spread: auto      # optional; auto | local | interleave — auto chooses least-loaded node, local follows a pinned set, interleave spreads across reported nodes
+      # gpu_layers: 0          # optional; non-zero opens the first N transformer layers on device 'cuda'; requires supported formats (F32, F16, BF16, Q4_K, Q6_K) and a usable CUDA driver/device
     # budgets:                 # optional per-resource tier ceilings; each resource gets its own ordered chain and its own caps
     #   weights:
-    #     order: [dram, nvme]  # nvme is terminal here and takes no ceiling — disk already holds the complete set
+    #     order: [dram, disk]  # disk is terminal here and takes no ceiling — it already holds the complete set
     #   kv:
-    #     order: [dram]
+    #     order: [dram]        # add vram only for device-backed KV residency with a finite ceiling; split divides block ids across tiers
     #     caps:
     #       dram_blocks: 256   # canonical spelling of kv_blocks; both may appear only when they state the same number
+    #       # vram_blocks: 128 # optional device-backed KV ceiling; required by placement.kv_residency: vram|split and restart-only once opened
     #   prefill_buffers:
     #     order: [dram]
     #     caps:
-    #       dram_mb: 512       # narrows the effective prompt-window row width when the engine opens
+    #       dram_mb: 512       # narrows the effective prompt-window row width when the engine opens; live ceiling edits classify for later requests but are refused because the opened clamp stays established.
 
   # - name: smollm-135m-instruct-q4_k_m   # commented because this build serves exactly one model
   #   path: models/smollm-135m-instruct-q4_k_m.gguf

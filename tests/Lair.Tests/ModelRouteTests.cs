@@ -1,6 +1,8 @@
 using Lair.Backends.Cpu;
+using Lair.Contracts;
 using Lair.Host.Config;
 using Lair.Http;
+using Lair.Kv;
 using Lair.Loader;
 using Lair.Models;
 using Lair.Models.Engine;
@@ -13,7 +15,9 @@ namespace Lair.Tests;
 /// pinned core share; split and hybrid shapes keep their segments in stage order and resolve as value sets without any
 /// accelerator present — an accelerator-backed segment carries a declared stream priority or SM share unchanged, refused only when out of
 /// range, with nothing enforced against a device ledger yet; every unresolvable declaration fails naming the model and the offending segment,
-/// including a segment whose device no opened backend reports — which is what an engine open refuses too, never falling back to CPU.
+/// including a segment whose device no opened backend reports — which is what an engine open refuses too, never falling back to CPU. KV
+/// residency is one model-wide declaration: a host-only residency needs nothing, a device-backed one needs the opened mirror seam those
+/// pools copy through, and a divided one lands both block residencies on every segment the route resolves.
 /// </summary>
 [Trait("Category", "Loader")]
 [Collection("model-loaded")] // shares one serialized lane with the other suites that open engines on this box
@@ -213,28 +217,146 @@ public sealed class ModelRouteTests : IDisposable
             ModelName = "route-accelerator-only",
             Stages = [new(ModelRoutes.DecodeStage, AcceleratorDeviceId)],
             AvailableDevices = ["cpu", AcceleratorDeviceId],
-            KvResidency = WeightTier.Vram,
+            DeviceWeightTiers = new Dictionary<string, WeightTier> { [AcceleratorDeviceId] = WeightTier.Vram },
+            KvResidency = BlockResidencyMode.Vram,
+            DeviceBackedKvMirrorSupport = true,
         });
 
         DeviceSegment segment = Assert.Single(route.Segments);
         Assert.Equal(AcceleratorDeviceId, segment.DeviceId);
-        Assert.Equal(WeightTier.Vram, segment.WeightTier);
+        Assert.Equal(WeightTier.Vram, segment.WeightTier); // the opened backend posture for this device's weights
+        Assert.Equal([WeightTier.Vram], segment.BlockResidencyTiers); // KV residency is a separate axis on that same segment
     }
 
     [Fact]
-    public void ModelRoutes_AcceleratorResidencyOnACpuStage_FailsNamingModelAndSegment()
+    [Trait("Category", "Kv")]
+    public void ModelRoutes_VramKvResidencyOnACpuStageWithoutADevicePool_FailsNamingModelAndMirrorSeam()
     {
         ModelException error = Assert.Throws<ModelException>(() => ModelRoutes.Resolve(new RouteRequest
         {
             ModelName = "route-vram-on-cpu",
             Stages = [new(ModelRoutes.DecodeStage, "cpu")],
             AvailableDevices = ["cpu"],
-            KvResidency = WeightTier.Vram,
+            KvResidency = BlockResidencyMode.Vram,
         }));
 
         Assert.Contains("model 'route-vram-on-cpu'", error.Message);
-        Assert.Contains("stage 'decode'", error.Message);
-        Assert.Contains("'vram' cannot be held by a segment on 'cpu'", error.Message);
+        Assert.Contains("kv residency 'vram'", error.Message, StringComparison.Ordinal);
+        Assert.Contains("no opened backend can hold a device-backed KV mirror", error.Message, StringComparison.Ordinal);
+        Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ModelRoutes_AcceleratorKvResidencyWithoutDeviceWeightPosture_KeepsSegmentWeightsHostResident()
+    {
+        ModelRoute route = ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "route-accelerator-kv-residency",
+            Stages = [new(ModelRoutes.DecodeStage, AcceleratorDeviceId)],
+            AvailableDevices = ["cpu", AcceleratorDeviceId],
+            KvResidency = BlockResidencyMode.Vram,
+            DeviceBackedKvMirrorSupport = true,
+        });
+
+        DeviceSegment segment = Assert.Single(route.Segments);
+        Assert.Equal(WeightTier.Dram, segment.WeightTier); // no opened backend posture says these weights live in device memory
+        Assert.Equal([WeightTier.Vram], segment.BlockResidencyTiers); // the KV axis still names where this model's blocks step
+    }
+
+    // ---------------------------------------------------------------- KV residency against the device-pool seam
+
+    [Fact]
+    [Trait("Category", "Kv")]
+    public void ModelRoutes_HostResidency_ResolvesWithoutConsultingTheMirrorSeam()
+    {
+        ModelRoute route = ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "route-host-residency",
+            Stages = [new(ModelRoutes.PrefillStage, "cpu"), new(ModelRoutes.DecodeStage, "cpu")],
+            AvailableDevices = ["cpu"],
+        });
+
+        DeviceSegment segment = Assert.Single(route.Segments);
+        Assert.Equal([WeightTier.Dram], segment.BlockResidencyTiers); // the residency every host-only pool holds blocks at needs no seam
+    }
+
+    [Fact]
+    [Trait("Category", "Kv")]
+    public void ModelRoutes_DeviceBackedResidencyOnCpuStages_ResolvesWhenTheMirrorSeamIsOpened()
+    {
+        // The seam decides a residency, not the device a stage runs on: host attention reads the pool's own arena while the
+        // opened mirror keeps the declared range's device copy current, so a CPU-only compute span can carry device-backed blocks.
+        ModelRoute route = ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "route-cpu-stages-device-backed-kv",
+            Stages = [new(ModelRoutes.PrefillStage, "cpu"), new(ModelRoutes.DecodeStage, "cpu")],
+            AvailableDevices = ["cpu", AcceleratorDeviceId],
+            KvResidency = BlockResidencyMode.Vram,
+            DeviceBackedKvMirrorSupport = true,
+        });
+
+        DeviceSegment segment = Assert.Single(route.Segments);
+        Assert.Equal("cpu", segment.DeviceId);
+        Assert.Equal(WeightTier.Dram, segment.WeightTier); // the compute span's weights stay host-resident
+        Assert.Equal([WeightTier.Vram], segment.BlockResidencyTiers); // its blocks are the device-backed ones
+    }
+
+    [Fact]
+    [Trait("Category", "Kv")]
+    public void ModelRoutes_SplitResidency_LandsBothBlockResidenciesOnEverySegment()
+    {
+        ModelRoute route = ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "route-split-residency",
+            Stages =
+            [
+                new(ModelRoutes.PrefillStage, "cpu"),
+                new("split_block", AcceleratorDeviceId),
+                new(ModelRoutes.DecodeStage, "cpu"),
+            ],
+            AvailableDevices = ["cpu", AcceleratorDeviceId],
+            KvResidency = BlockResidencyMode.Split,
+            DeviceBackedKvMirrorSupport = true,
+        });
+
+        Assert.Equal(3, route.Segments.Count);
+        foreach (DeviceSegment segment in route.Segments)
+        {
+            Assert.Equal([WeightTier.Dram, WeightTier.Vram], segment.BlockResidencyTiers);
+        }
+    }
+
+    [Fact]
+    [Trait("Category", "Kv")]
+    public void ModelRoutes_SplitResidencyWithoutADevicePool_FailsNamingModelAndMirrorSeam()
+    {
+        ModelException error = Assert.Throws<ModelException>(() => ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "route-split-without-pool",
+            Stages = [new(ModelRoutes.DecodeStage, "cpu")],
+            AvailableDevices = ["cpu"],
+            KvResidency = BlockResidencyMode.Split,
+        }));
+
+        Assert.Contains("model 'route-split-without-pool'", error.Message);
+        Assert.Contains("kv residency 'split'", error.Message, StringComparison.Ordinal);
+        Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    [Trait("Category", "Kv")]
+    public void ModelRoutes_UndeclaredResidencyValue_FailsNamingTheAcceptedResidencies()
+    {
+        ModelException error = Assert.Throws<ModelException>(() => ModelRoutes.Resolve(new RouteRequest
+        {
+            ModelName = "route-undefined-residency",
+            Stages = [new(ModelRoutes.DecodeStage, "cpu")],
+            AvailableDevices = ["cpu"],
+            KvResidency = (BlockResidencyMode)int.MaxValue,
+        }));
+
+        Assert.Contains("model 'route-undefined-residency'", error.Message);
+        Assert.Contains("not a residency a placement declares (dram, vram, split)", error.Message, StringComparison.Ordinal);
     }
 
     // ---------------------------------------------------------------- unresolvable declarations

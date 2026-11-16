@@ -6,7 +6,7 @@
 dotnet build Lair.sln
 ```
 
-Target framework: net10.0. Solution layout: `src/Lair.*` projects (Contracts, Loader, Backends.Cpu, Kv, Tokenizer, Templating.Minja, Sampling, Models, Http, Host), `tests/Lair.Tests`, `bench/Lair.Bench`. The continuous-batch scheduler lives in `src/Lair.Models/Scheduling/`; the metrics bus and monitor stream in `src/Lair.Http/Monitoring/`; the config watcher and change-application bus in `src/Lair.Host/ConfigWatcher.cs` + `src/Lair.Http/Config/ConfigReload.cs`. `src/Lair.Templating.Minja` is the managed minja-parity template engine (parser/evaluator/chat wrapper/limits) with no dependency on the HTTP, model, or tokenizer projects.
+Target framework: net10.0. Solution layout: `src/Lair.*` projects (Contracts, Loader, Backends.Cpu, Backends.Cuda, Kv, Tokenizer, Templating.Minja, Sampling, Models, Http, Host), `tests/Lair.Tests`, `bench/Lair.Bench`. The continuous-batch scheduler lives in `src/Lair.Models/Scheduling/`; the metrics bus and monitor stream in `src/Lair.Http/Monitoring/`; accelerator accounting for CUDA-backed serves lives in `src/Lair.Http/Monitoring/AcceleratorAccounting.cs` + `src/Lair.Backends.Cuda/CudaBackend+Accounting.cs`; the config watcher and change-application bus in `src/Lair.Host/ConfigWatcher.cs` + `src/Lair.Http/Config/ConfigReload.cs`. `src/Lair.Templating.Minja` is the managed minja-parity template engine (parser/evaluator/chat wrapper/limits) with no dependency on the HTTP, model, or tokenizer projects.
 
 ## Web UI build (`src/Lair.Host/ClientApp/`)
 
@@ -21,7 +21,7 @@ dotnet test Lair.sln --filter Category=Parity # golden parity vs pinned llama.cp
 dotnet test Lair.sln --filter Category=Kernel # kernel oracle comparisons
 ```
 
-Test categories: `Loader`, `Moe`, `Tokenizer`, `Template`, `TemplateDiagnostics`, `TemplateParity`, `Serve`, `MinjaSyntax`, `MinjaEval`, `MinjaStatements`, `MinjaFilters`, `MinjaChat`, `MinjaLimits`, `Kernel`, `Layers`, `Kv`, `Sampling`, `Api`, `Cli`, `Config`, `ToolCalls`, `Parity`, `Calib`, `Concurrency`, `Prefill`, `Cache`, `Cancel`, `HotReload`, `Metrics`, `Scheduling`, `Budget`, `Embeddings`, `Affinity`, `MonitorUi`, `WebUi`.
+Test categories: `Loader`, `Moe`, `Tokenizer`, `Template`, `TemplateDiagnostics`, `TemplateParity`, `Serve`, `MinjaSyntax`, `MinjaEval`, `MinjaStatements`, `MinjaFilters`, `MinjaChat`, `MinjaLimits`, `Kernel`, `Layers`, `Kv`, `Sampling`, `Api`, `Cli`, `Config`, `ToolCalls`, `Parity`, `Calib`, `Concurrency`, `Prefill`, `Cache`, `Cancel`, `HotReload`, `Metrics`, `Scheduling`, `Budget`, `Embeddings`, `Affinity`, `MonitorUi`, `WebUi`, `Cuda`, `MonitorCounters`, `Parity-Hybrid`.
 
 Model acquisition gates run through the hub transport seam with local or mocked stand-ins (`Category=Loader|Config|Api|Metrics|Cli`); no automated test requires live network.
 
@@ -139,4 +139,6 @@ dotnet run --project src/Lair.Host -- chat -c lair.yaml
 dotnet run --project src/Lair.Host -- monitor -u http://127.0.0.1:8181 --interval 1000   # live engine stats table from the serving server; monitor needs at least one option
 ```
 
-Editing `lair.yaml` while `serve` runs hot-reloads live knobs (batch width, thread quota, KV budget) and new-request-only knobs; restart-only fields are refused with a log line.
+For an optional hybrid CUDA proof, point a config at a model whose opened `placement.gpu_layers` span uses supported formats (`F32`, `F16`, `BF16`, `Q4_K`, or `Q6_K`) and run the same serve/monitor commands; nonzero GPU utilization, PCIe transfer bytes/copies, or persistent device VRAM appear as a tail on monitor rows.
+
+Editing `lair.yaml` while `serve` runs hot-reloads live knobs (batch width, thread quota, system-memory KV ceilings) and new-request-only knobs; host capacity totals/node overrides, device-backed KV caps/residency modes, placement posture including `gpu_layers`, weight caps, budget chain orders, block size, model identity, prefill lane/core-set changes are refused with a log line.

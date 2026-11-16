@@ -4,6 +4,20 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-16
+
+### Added
+
+- CUDA-backed hybrid execution through the Driver API and embedded PTX GEMV kernels for `F32`, `F16`, `BF16`, `Q4_K`, and `Q6_K` weight passes. `placement.gpu_layers: N` opens transformer layers 0..N-1 on device `cuda`; unsupported tensor formats or split spans without a usable CUDA/capacity seam are refused naming the backend and reason instead of falling back to CPU execution.
+- Host-mapped CUDA weight posture registers live host-owned tensors with the driver, so GPU compute can run over DRAM-resident weights without copying them into persistent device VRAM. Default copy-holding hybrid serves keep split-span weights resident within declared finite ceilings.
+- Device-backed KV block pools enforce their selected residency tiers against finite VRAM capacity claims and report exhausted tier admissions through the existing budget/admission surfaces rather than relying on driver-detected totals.
+- Hybrid monitor counters: `/monitor/stream` snapshots gained optional `metrics_gpu_utilization_percent`, `metrics_pcie_transfer_bytes_total`, `metrics_pcie_transfers_total`, and `metrics_persistent_vram_bytes`. Monitor CLI rows append a conditional accelerator tail, Web UI GPU/PCIe cards read the live facts, and CPU-only serves omit them instead of showing idle-hardware zeros.
+
+### Changed
+
+- Host capacity config now uses top-level `host:` with `dram_mb`, `vram_mb`, `cpu_cores`, presence-only `disk_path`, and NUMA node overrides; storage tier vocabulary is `disk` rather than the old `nvme` spelling, and neutral placement defaults accept/resolve `auto`.
+- Prefill budget accounting binds through opened accelerator routes when a hybrid prompt window crosses onto device memory.
+
 ## [0.3.15] - 2026-11-15
 
 ### Added

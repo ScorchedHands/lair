@@ -60,7 +60,7 @@ usage:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--version`, `-v` | — | Print `lair <version>` (for example `lair 0.3.15`) and exit `0`. Recognised only when it is the single argument. |
+| `--version`, `-v` | — | Print `lair <version>` (for example `lair 0.4.0`) and exit `0`. Recognised only when it is the single argument. |
 
 ### Exit codes
 
@@ -110,7 +110,7 @@ Conditional lines appear only when the model or config carries the matching fact
 | `rope_scaling model='…' variant=… multiplier=… original_context_length=…` | The GGUF declares rope scaling or a partial rotary slice. |
 | `sparse_ffn model='…' layout=… rank=… strategy=…` | The file declares routed experts. |
 | `ledger_claim model='…' resource='weights'\|'kv'\|'prefill_buffers' …` | The model entry declares `budgets:`. |
-| `tiers_capacity model='…' … accepted against reported topology` | Declared `tiers:` totals disagree with what the host reports; this is a warning, and startup continues. |
+| `host_capacity model='…' … accepted against reported topology` | Declared `host:` totals disagree with what the host reports; this is a warning, and startup continues. |
 | `kv_blocks model='…' value=… deprecated: …` | Both `kv_blocks` and `budgets.kv.caps.dram_blocks` state the same ceiling. |
 | `update_candidate model='…' check skipped: …` | A `source:` model's HEAD check could not run (offline, gated, transport failure). Serving continues. |
 
@@ -126,7 +126,7 @@ A model that declares `max_reasoning_tokens` on a vocabulary that cannot carry `
   ```
 
 - `GET /ui` serves the Web UI (a tabbed monitor plus a browser chat client). `GET /` redirects permanently to `/ui/`. The UI is only served when the host build bundled it; a build with `-p:SkipWebUi=true` serves no UI and `/ui` returns 404.
-- `GET /monitor/stream` is the SSE engine snapshot stream that `monitor` and the Web UI both consume.
+- `GET /monitor/stream` is the SSE engine snapshot stream that `monitor` and the Web UI both consume. CUDA-backed serves also publish GPU utilization, PCIe transfer totals, and persistent device VRAM bytes.
 
 ### Hot reload
 
@@ -206,6 +206,7 @@ Note: `monitor` requires at least one option in the current build — a bare `mo
 ```text
 model                 tok/s   step ms  seqs/step  cache hit    KV used/cap  active
 smollm-135m-instruct  11.62     86.0      1.00     42.9%       17/256       1
+smollm-135m-f16        9.80     94.0      1.00      0.0%       17/256       1  gpu 2.64%  pcie 1.5 MiB over 224 copies  persistent-vram 13.5 MiB
 ```
 
 | Column | Meaning |
@@ -216,8 +217,11 @@ smollm-135m-instruct  11.62     86.0      1.00     42.9%       17/256       1
 | `cache hit` | Share of admitted requests that reused cached prefix KV blocks. |
 | `KV used/cap` | KV blocks in use against the model's live cap. |
 | `active` | Sequences currently admitted. |
+| `gpu` | CUDA utilization percentage for the served model, printed when nonzero. |
+| `pcie` | PCIe transfer bytes and copy count for the served model, printed when nonzero. |
+| `persistent-vram` | Persistent device VRAM held by the served model, printed when nonzero. |
 
-Keep-alive frames and malformed snapshots are skipped rather than ending the table.
+Keep-alive frames and malformed snapshots are skipped rather than ending the table. The accelerator tail appears only for CUDA-backed serves with nonzero accelerator facts; CPU-only rows omit it.
 
 ### Ctrl+C and exit codes
 
@@ -368,7 +372,7 @@ These are **not available on this branch**. Each is listed with its status so a 
 | Packaged release artifacts: a committed publish profile, CI packaging, and a distributable archive | planned | The self-contained single-file `win-x64` publish documented under "Getting the executable" works today, but no publish profile or packaging step is committed in the repository, so a release has to be built locally. |
 | Native AOT packaging | planned | Backlog idea (startup cost reduction); nothing implemented. |
 | Multi-model serving, so `serve`/`chat`/`model` operate on more than one model | planned | This build serves exactly one model; `models:` must list exactly one entry, and `model check`/`list` iterate packs accordingly. |
-| Monitor rows for accelerator and tier counters (GPU utilisation, PCIe transfer bytes, per-tier occupancy) | planned | The snapshot vocabulary is being extended; the `monitor` table columns documented above are the shipped set. |
+| Whole-model CUDA monitor/tier counters beyond the shipped hybrid split | planned | GPU utilization, PCIe transfer bytes/copies, and persistent device VRAM are shipped for CUDA-backed serves; whole-model CUDA execution, broader tier occupancy, and CUDA kernels across all loader-accepted quant formats remain planned. |
 | `embed` model serving (`type: embed`) reachable from `serve` | planned | The config key is validated today but only `chat` is accepted. |
 
 Known open defect, not a feature: `monitor` on a torn event stream (server killed while attached) exits with an unhandled `IOException` instead of a clean notice.

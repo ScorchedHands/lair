@@ -52,7 +52,7 @@ public sealed class DeviceLedgerSharedHostTests : IDisposable
 
         Assert.Equal(BudgetTier.Dram, claims[0].Tier);   // the first engine keeps its working-copy tier whole
         Assert.False(claims[0].Demoted);
-        Assert.Equal(BudgetTier.Nvme, claims[1].Tier);   // the second lands on its chain's next position — the origin store it already reads from
+        Assert.Equal(BudgetTier.Disk, claims[1].Tier);   // the second lands on its chain's next position — the origin store it already reads from
         Assert.True(claims[1].Demoted);
 
         string[] claimLines = [.. logger.Messages(LogLevel.Information).Where(line => line.Contains("ledger_claim", StringComparison.Ordinal))];
@@ -61,7 +61,7 @@ public sealed class DeviceLedgerSharedHostTests : IDisposable
         Assert.Contains("tier='dram'", claimLines[0]);
         Assert.Contains("demoted=False", claimLines[0]);
         Assert.Contains("'ledger-b'", claimLines[1]);
-        Assert.Contains("tier='nvme'", claimLines[1]);
+        Assert.Contains("tier='disk'", claimLines[1]); // the demoted seat names its chain position in the accepted vocabulary.
         Assert.Contains("demoted=True", claimLines[1]);
 
         // A generation on the first engine runs normally after the second opened beside it: the demotion moved nothing.
@@ -188,7 +188,7 @@ public sealed class DeviceLedgerSharedHostTests : IDisposable
                 MaxContextTokens = 512,
                 KvBlocks = kvBlocks,
                 Budgets = weightsToOriginStore
-                    ? [new BudgetChain { Resource = BudgetResource.Weights, Order = [BudgetTier.Dram, BudgetTier.Nvme], Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Dram] = 1024 } }]
+                    ? [new BudgetChain { Resource = BudgetResource.Weights, Order = [BudgetTier.Dram, BudgetTier.Disk], Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Dram] = 1024 } }]
                     : [new BudgetChain { Resource = BudgetResource.Kv, Order = [BudgetTier.Dram], Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Dram] = kvBlocks } }],
             },
         ],

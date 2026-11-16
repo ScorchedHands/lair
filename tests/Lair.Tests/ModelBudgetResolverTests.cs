@@ -16,7 +16,7 @@ public sealed class ModelBudgetResolverTests
                 new BudgetChain
                 {
                     Resource = BudgetResource.Weights,
-                    Order = [BudgetTier.Dram, BudgetTier.Nvme],
+                    Order = [BudgetTier.Dram, BudgetTier.Disk],
                     Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Dram] = 2048 },
                 },
             ],
@@ -24,7 +24,7 @@ public sealed class ModelBudgetResolverTests
         });
 
         ResolvedBudgetChain weights = resolved.For(BudgetResource.Weights)!;
-        Assert.Equal([BudgetTier.Dram, BudgetTier.Nvme], weights.Tiers.Select(position => position.Tier));
+        Assert.Equal([BudgetTier.Dram, BudgetTier.Disk], weights.Tiers.Select(position => position.Tier));
 
         ResolvedBudgetTier resident = weights.FirstCopyHoldingTier()!;
         Assert.Equal(BudgetTier.Dram, resident.Tier);
@@ -32,7 +32,7 @@ public sealed class ModelBudgetResolverTests
         Assert.Equal(2048L, resident.Cap);
 
         // The file already holds the complete weight set on its origin store: that position needs no ceiling of ours and claims nothing.
-        ResolvedBudgetTier origin = weights.At(BudgetTier.Nvme)!;
+        ResolvedBudgetTier origin = weights.At(BudgetTier.Disk)!;
         Assert.True(origin.IsOriginStore);
         Assert.Null(origin.Cap);
     }
@@ -62,6 +62,50 @@ public sealed class ModelBudgetResolverTests
     }
 
     [Fact]
+    public void Resolve_WeightsAcceleratorClaimWithoutDeviceCopies_ReportsTheMissingWeightCopyPosture()
+    {
+        ModelException error = Assert.Throws<ModelException>(() => ModelBudgets.Resolve(new BudgetRequest
+        {
+            ModelName = "qwen-test",
+            Declared = [new BudgetChain { Resource = BudgetResource.Weights, Order = [BudgetTier.Vram] }],
+            OpenedPoolTiers = [BudgetTier.Dram],
+        }));
+
+        Assert.Contains("model 'qwen-test'", error.Message);
+        Assert.Contains("budgets for resource 'weights'", error.Message);
+        Assert.Contains("no opened pool backs working copies at tier 'vram'", error.Message);
+        Assert.Contains("device-resident weight copies", error.Message);
+    }
+
+    [Fact]
+    public void Resolve_WeightsChainAtAcceleratorTier_LandsWithDeclaredCeilingWhenDeviceCopiesAreOpened()
+    {
+        ResolvedBudgetSet resolved = ModelBudgets.Resolve(new BudgetRequest
+        {
+            ModelName = "qwen-test",
+            Declared =
+            [
+                new BudgetChain
+                {
+                    Resource = BudgetResource.Weights,
+                    Order = [BudgetTier.Vram],
+                    Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Vram] = 2048 },
+                },
+            ],
+            OpenedPoolTiers = [BudgetTier.Dram, BudgetTier.Vram],
+        });
+
+        ResolvedBudgetChain weights = resolved.For(BudgetResource.Weights)!;
+        ResolvedBudgetTier position = Assert.Single(weights.Tiers);
+        Assert.Equal(BudgetTier.Vram, position.Tier);
+        Assert.False(position.IsOriginStore);
+        Assert.Equal(2048L, position.Cap);
+
+        ResolvedBudgetTier firstCopyHolding = weights.FirstCopyHoldingTier()!;
+        Assert.Equal(BudgetTier.Vram, firstCopyHolding.Tier);
+    }
+
+    [Fact]
     public void Resolve_WriteSideDiskClaim_ReportsTheMissingWritingMachinery()
     {
         ModelException error = Assert.Throws<ModelException>(() => ModelBudgets.Resolve(new BudgetRequest
@@ -72,7 +116,7 @@ public sealed class ModelBudgetResolverTests
                 new BudgetChain
                 {
                     Resource = BudgetResource.PrefillBuffers,
-                    Order = [BudgetTier.Dram, BudgetTier.Nvme],
+                    Order = [BudgetTier.Dram, BudgetTier.Disk],
                     Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Dram] = 64 },
                 },
             ],
@@ -80,8 +124,44 @@ public sealed class ModelBudgetResolverTests
         }));
 
         Assert.Contains("budgets for resource 'prefill_buffers'", error.Message);
-        Assert.Contains("no opened pool backs working copies at tier 'nvme'", error.Message);
+        Assert.Contains("no opened pool backs working copies at tier 'disk'", error.Message); // resolution names the retired spelling's successor, not a silent drop.
         Assert.Contains("write-side bytes reach storage only where something writes them", error.Message);
+    }
+
+    [Fact]
+    public void Resolve_PrefillAcceleratorClaimWithoutDeviceBackedBuffers_ReportsTheMissingPoolPosture()
+    {
+        ModelException error = Assert.Throws<ModelException>(() => ModelBudgets.Resolve(new BudgetRequest
+        {
+            ModelName = "qwen-test",
+            Declared = [new BudgetChain { Resource = BudgetResource.PrefillBuffers, Order = [BudgetTier.Vram], Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Vram] = 64 } }],
+            OpenedPoolTiers = [BudgetTier.Dram],
+        }));
+
+        Assert.Contains("model 'qwen-test'", error.Message);
+        Assert.Contains("budgets for resource 'prefill_buffers'", error.Message);
+        Assert.Contains("no opened pool backs working copies at tier 'vram'", error.Message); // opening accelerator weight copies does not hand this resource a residency it never asked its host for
+        Assert.Contains($"device-backed pools for '{BudgetResourceNames.PrefillBuffers}'", error.Message);
+    }
+
+    [Fact]
+    public void Resolve_PrefillChainAtAcceleratorTier_LandsWithDeclaredCeilingWhenTheDeviceBackedRouteIsOpened()
+    {
+        ResolvedBudgetSet resolved = ModelBudgets.Resolve(new BudgetRequest
+        {
+            ModelName = "qwen-test",
+            Declared = [new BudgetChain { Resource = BudgetResource.PrefillBuffers, Order = [BudgetTier.Vram], Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Vram] = 64 } }],
+            OpenedPoolTiers = [BudgetTier.Dram, BudgetTier.Vram], // the posture an opened accelerator-backed prompt route reports: system memory plus device-resident working copies
+        });
+
+        ResolvedBudgetChain buffers = resolved.For(BudgetResource.PrefillBuffers)!;
+        ResolvedBudgetTier position = Assert.Single(buffers.Tiers);
+        Assert.Equal(BudgetTier.Vram, position.Tier);
+        Assert.False(position.IsOriginStore); // activation bytes are transient working-set material, never an origin-store set
+        Assert.Equal(64L, position.Cap);
+
+        ResolvedBudgetTier firstCopyHolding = buffers.FirstCopyHoldingTier()!;
+        Assert.Equal(BudgetTier.Vram, firstCopyHolding.Tier);
     }
 
     [Fact]
@@ -199,7 +279,7 @@ public sealed class ModelBudgetResolverTests
                 new BudgetChain
                 {
                     Resource = BudgetResource.Weights,
-                    Order = [BudgetTier.Dram, BudgetTier.Nvme],
+                    Order = [BudgetTier.Dram, BudgetTier.Disk],
                 },
             ]);
     }
@@ -209,8 +289,8 @@ public sealed class ModelBudgetResolverTests
     {
         ModelException error = Assert.Throws<ModelException>(() => ModelBudgets.ValidateDeclaredChains(
             "qwen-test",
-            [new BudgetChain { Resource = BudgetResource.Weights, Order = [BudgetTier.Nvme, BudgetTier.Dram] }]));
+            [new BudgetChain { Resource = BudgetResource.Weights, Order = [BudgetTier.Disk, BudgetTier.Dram] }]));
 
-        Assert.Contains("order ['nvme', 'dram'] is out of order", error.Message);
+        Assert.Contains("order ['disk', 'dram'] is out of order", error.Message); // the origin store may not sit before the working-copy tier it demotes through.
     }
 }

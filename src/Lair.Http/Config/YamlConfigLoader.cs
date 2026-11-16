@@ -1,4 +1,5 @@
 using System.Globalization;
+using Lair.Kv;
 using Lair.Models;
 using YamlDotNet.Core;
 using YamlDotNet.RepresentationModel;
@@ -14,12 +15,12 @@ public static class YamlConfigLoader
 {
     private const string TopLevel = "the top level";
 
-    private static readonly string[] TopLevelKeys = ["server", "engine", "models", "ui", "tiers"];
+    private static readonly string[] TopLevelKeys = ["server", "engine", "models", "ui", "host"];
     private static readonly string[] ServerKeys = ["bind", "port"];
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel"];
     private static readonly string[] UiKeys = ["recent_requests"];
     private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "budgets", "source"];
-    private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit", "numa_spread"];
+    private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit", "numa_spread", "gpu_layers"];
 
     /// <summary>The keys one model entry's source block may declare, beside exactly one of the two file spellings.</summary>
     private static readonly string[] SourceKeys = ["repo", "revision", "file", "files"];
@@ -27,8 +28,11 @@ public static class YamlConfigLoader
     /// <summary>The keys one source file mapping may declare beside the path it names.</summary>
     private static readonly string[] SourceFileKeys = ["path", "sha256", "size"];
 
-    /// <summary>The resident capacity keys a top-level tiers block may declare, in the order a refusal reports them.</summary>
-    private static readonly IReadOnlyList<string> TierKeys = ["dram_mb", "dram_cores", "nvme_path", "nodes"];
+    /// <summary>The resident capacity keys a top-level host block may declare, in the order a refusal reports them.</summary>
+    private static readonly IReadOnlyList<string> HostPostureKeys = ["dram_mb", "vram_mb", "cpu_cores", "disk_path", "numa"];
+
+    /// <summary>The keys one posture's numa nesting may declare.</summary>
+    private static readonly IReadOnlyList<string> NumaNestKeys = ["nodes"];
 
     /// <summary>The keys one per-node override entry may declare beside the node position it names.</summary>
     private static readonly IReadOnlyList<string> NodeOverrideKeys = ["index", "mb", "cores"];
@@ -59,7 +63,7 @@ public static class YamlConfigLoader
             Engine = ParseEngine(top, models),
             Models = models,
             Ui = ParseUi(top),
-            Tiers = ParseTiers(top),
+            Host = ParseHost(top),
         };
     }
 
@@ -137,64 +141,82 @@ public static class YamlConfigLoader
     }
 
     /// <summary>
-    /// Parses the top-level tiers block: flat resident capacity keys for system memory, a disk path declared as presence and path only,
-    /// and an optional list of per-node overrides keyed by node position. Shape is validated here — every known key that expects a number
-    /// must state one, positive where it states anything, and a refusal names the qualified key with the offending value (naming the node
-    /// index too for a per-node override). Whether declared totals agree with what a host reports is answered when an engine opens,
-    /// warn-and-accept: this loader never consults topology. A disk byte ceiling is not accepted here because that position already holds
-    /// the complete set; accelerator ceilings are not this block's vocabulary at all.
+    /// Parses the top-level host block: flat resident capacity keys for system and accelerator memory, a disk path declared as presence
+    /// and path only, and an optional numa nesting carrying per-node overrides keyed by node position. Shape is validated here — every
+    /// known key that expects a number must state one, positive where it states anything, and a refusal names the qualified key with the
+    /// offending value (naming the node index too for a per-node override). Whether a declared system-memory total agrees with what a host
+    /// reports is answered when an engine opens, warn-and-accept: this loader never consults topology, and an accelerator total is declared
+    /// posture alone because no driver-detected budget is consulted. A disk byte ceiling is not accepted here because that position already
+    /// holds the complete set.
     /// </summary>
-    private static TierCapacityConfig? ParseTiers(Dictionary<string, YamlNode> top)
+    private static HostCapacityConfig? ParseHost(Dictionary<string, YamlNode> top)
     {
-        if (!top.TryGetValue("tiers", out YamlNode? node))
+        if (!top.TryGetValue("host", out YamlNode? node))
         {
-            return null; // no tiers block declares nothing: today's posture states no public totals.
+            return null; // no host block declares nothing: today's posture states no public totals.
         }
 
-        const string where = "'tiers'";
+        const string where = "'host'";
         Dictionary<string, YamlNode> keys = KeysOf(AsMapping(node, where), where);
-        RejectUnknownKeys(keys, where, TierKeys);
+        RejectUnknownKeys(keys, where, HostPostureKeys);
 
-        long? dramMb = TryLong(keys, "dram_mb", "tiers.dram_mb");
+        long? dramMb = TryLong(keys, "dram_mb", "host.dram_mb");
         if (dramMb is < 1)
         {
-            throw new ConfigException($"tiers.dram_mb {dramMb} is invalid: 'dram_mb' must be 1 or greater — omit the key to declare no byte total.");
+            throw new ConfigException($"host.dram_mb {dramMb} is invalid: 'dram_mb' must be 1 or greater — omit the key to declare no byte total.");
         }
 
-        int? dramCores = TryInteger(keys, "dram_cores", "tiers.dram_cores");
-        if (dramCores is < 1)
+        // An accelerator total is the ceiling a device-resident weight claim seats against, stated by the operator rather than read
+        // off any device: what a host backs without stating a size keeps the posture that states no public total.
+        long? vramMb = TryLong(keys, "vram_mb", "host.vram_mb");
+        if (vramMb is < 1)
         {
-            throw new ConfigException($"tiers.dram_cores {dramCores} is invalid: 'dram_cores' must be 1 or greater — omit the key to declare no core total.");
+            throw new ConfigException($"host.vram_mb {vramMb} is invalid: 'vram_mb' must be 1 or greater — omit the key to declare no byte total.");
+        }
+
+        int? cpuCores = TryInteger(keys, "cpu_cores", "host.cpu_cores");
+        if (cpuCores is < 1)
+        {
+            throw new ConfigException($"host.cpu_cores {cpuCores} is invalid: 'cpu_cores' must be 1 or greater — omit the key to declare no core total.");
         }
 
         // A disk path declares only that this host reads from one. No ceiling belongs at that position, so nothing here reads a number beside it.
-        string? nvmePath = TryText(keys, "nvme_path", "tiers.nvme_path");
-        if (nvmePath is not null && string.IsNullOrWhiteSpace(nvmePath))
+        string? diskPath = TryText(keys, "disk_path", "host.disk_path");
+        if (diskPath is not null && string.IsNullOrWhiteSpace(diskPath))
         {
-            throw new ConfigException("tiers.nvme_path must name a non-empty path this host reads from — omit the key to say nothing about disk storage.");
+            throw new ConfigException("host.disk_path must name a non-empty path this host reads from — omit the key to say nothing about disk storage.");
         }
 
-        IReadOnlyList<NodeCapacityOverride> nodes = ParseNodeOverrides(keys);
+        IReadOnlyList<NodeCapacityOverride> nodes = ParseNumaOverrides(keys);
 
-        if (dramMb is null && dramCores is null && nvmePath is null && nodes.Count == 0)
+        if (dramMb is null && vramMb is null && cpuCores is null && diskPath is null && nodes.Count == 0)
         {
             throw new ConfigException(
-                $"{where} declares nothing: a tiers block states at least one of {Vocabulary(TierKeys)} — omit 'tiers' entirely to declare no capacity.");
+                $"{where} declares nothing: a host block states at least one of {Vocabulary(HostPostureKeys)} — omit 'host' entirely to declare no capacity.");
         }
 
-        return new TierCapacityConfig { DramMb = dramMb, DramCores = dramCores, NvmePath = nvmePath, Nodes = nodes };
+        return new HostCapacityConfig { DramMb = dramMb, VramMb = vramMb, CpuCores = cpuCores, DiskPath = diskPath, Nodes = nodes };
     }
 
-    // Per-node overrides: each entry names the node position it disagrees with and states its own bytes and/or cores. A malformed value
+    // Per-node overrides sit in the host block's own numa nesting: each entry names the node position it disagrees with and states its own bytes and/or cores. A malformed value
     // fails naming key, value, and the index that entry names; a duplicate or out-of-range index cannot name one node position at all.
-    private static IReadOnlyList<NodeCapacityOverride> ParseNodeOverrides(Dictionary<string, YamlNode> tierKeys)
+    private static IReadOnlyList<NodeCapacityOverride> ParseNumaOverrides(Dictionary<string, YamlNode> hostKeys)
     {
-        if (!tierKeys.TryGetValue("nodes", out YamlNode? node))
+        if (!hostKeys.TryGetValue("numa", out YamlNode? numa))
         {
-            return [];
+            return []; // no nesting: the posture states nothing about individual nodes.
         }
 
-        const string where = "'tiers.nodes'";
+        const string nestWhere = "'host.numa'";
+        Dictionary<string, YamlNode> nestKeys = KeysOf(AsMapping(numa, nestWhere), nestWhere);
+        RejectUnknownKeys(nestKeys, nestWhere, NumaNestKeys);
+
+        if (!nestKeys.TryGetValue("nodes", out YamlNode? node))
+        {
+            return []; // a nesting that names no list declares no per-node override.
+        }
+
+        const string where = "'host.numa.nodes'";
         if (node.NodeType != YamlNodeType.Sequence)
         {
             throw new ConfigException($"{where} must be a list of per-node overrides, each naming an index and stating 'mb' and/or 'cores'.");
@@ -481,27 +503,31 @@ public static class YamlConfigLoader
         Dictionary<string, YamlNode> keys = KeysOf(AsMapping(node, where), where);
         RejectUnknownKeys(keys, where, PlacementKeys);
 
-        string device = TryText(keys, "device", $"models[{index}].placement.device") ?? "cpu";
-        if (device != "cpu")
+        string device = TryText(keys, "device", $"models[{index}].placement.device") ?? "auto";
+        if (device is not ("auto" or "cpu"))
         {
             throw new ConfigException(
-                $"models[{index}].placement.device '{device}' is invalid: the only accepted value for 'device' is 'cpu'. " +
+                $"models[{index}].placement.device '{device}' is invalid: 'device' accepts only 'auto' or 'cpu'. " +
                 $"An accelerator device becomes placeable when a compute backend reports it in '{ModelRoute.CudaBackendSeam}'.");
         }
 
-        string kvResidency = TryText(keys, "kv_residency", $"models[{index}].placement.kv_residency") ?? "dram";
-        if (kvResidency != "dram")
+        // KV residency is its own placement axis beside the device keys: an absent key keeps today's host-resident posture,
+        // and every declared mode is vocabulary this loader accepts without consulting what any opened backend can back —
+        // whether a device-backed block pool can be seated is what route resolution answers when the engine opens. A value
+        // outside the declared set fails naming the served model, the key, and the accepted set, exactly as the other
+        // choice keys here do.
+        string kvResidency = TryText(keys, "kv_residency", $"models[{index}].placement.kv_residency") ?? BlockResidencyModeNames.Dram;
+        if (!BlockResidencyModeNames.TryResolvePlacementValue(kvResidency, out _))
         {
             throw new ConfigException(
-                $"models[{index}].placement.kv_residency '{kvResidency}' is invalid: the only accepted value for 'kv_residency' is 'dram'. " +
-                $"An accelerator residency becomes placeable when a compute backend reports that device in '{ModelRoute.CudaBackendSeam}'.");
+                $"models[{index}].placement.kv_residency '{kvResidency}' is invalid for model '{modelName}': 'kv_residency' accepts {BlockResidencyModeNames.AcceptedVocabulary}.");
         }
 
-        string prefill = TryText(keys, "prefill", $"models[{index}].placement.prefill") ?? "cpu";
-        if (prefill != "cpu")
+        string prefill = TryText(keys, "prefill", $"models[{index}].placement.prefill") ?? "auto";
+        if (prefill is not ("auto" or "cpu"))
         {
             throw new ConfigException(
-                $"models[{index}].placement.prefill '{prefill}' is invalid: the only accepted value for 'prefill' is 'cpu'. " +
+                $"models[{index}].placement.prefill '{prefill}' is invalid: 'prefill' accepts only 'auto' or 'cpu'. " +
                 $"An accelerator prefill stage becomes placeable when a compute backend reports that device in '{ModelRoute.CudaBackendSeam}'.");
         }
 
@@ -542,16 +568,29 @@ public static class YamlConfigLoader
                 $"models[{index}].placement.numa_spread '{numaSpread}' is invalid for model '{modelName}': 'numa_spread' accepts {NumaSpreadNames.AcceptedVocabulary}.");
         }
 
+        // Layer split: absent means today's CPU-only posture, and a present value names how many transformer layers execution
+        // opens on device 'cuda', counted from layer 0. A negative count says nothing about where a split lands, so it fails
+        // naming the model, key, and value like every other out-of-range integer here; what the split actually opens is decided
+        // when the engine opens — including refusing an open that names more layers than this file carries.
+        int gpuLayers = TryInteger(keys, "gpu_layers", $"models[{index}].placement.gpu_layers") ?? 0;
+        if (gpuLayers < 0)
+        {
+            throw new ConfigException(
+                $"models[{index}].placement.gpu_layers {gpuLayers} is invalid for model '{modelName}': 'gpu_layers' must be a non-negative integer — " +
+                "the count of this model's transformer layers execution opens on device 'cuda', counted from layer 0.");
+        }
+
         return new PlacementConfig
         {
-            Device = device,
+            Device = device is "auto" ? "cpu" : device,
             KvResidency = kvResidency,
-            Prefill = prefill,
+            Prefill = prefill is "auto" ? "cpu" : prefill,
             CoreSet = coreSet,
             ThreadQuota = threadQuota,
             PrefillLane = prefillLane,
             CoreOvercommit = coreOvercommit,
             NumaSpread = numaSpread,
+            GpuLayers = gpuLayers,
         };
     }
 
@@ -862,7 +901,7 @@ public static class YamlConfigLoader
         return value;
     }
 
-    // The same read as TryInteger for the byte totals a tiers block declares: capacity ceilings count in whole megabytes and can name a
+    // The same read as TryInteger for the byte totals a host posture declares: capacity ceilings count in whole megabytes and can name a
     // number larger than an int carries, so these keys parse wide while still refusing anything that is not an integer.
     private static long? TryLong(Dictionary<string, YamlNode> keys, string key, string qualifiedKey)
     {
@@ -897,7 +936,7 @@ public static class YamlConfigLoader
         return value;
     }
 
-    /// <summary>Parses one model entry's budgets block: every declared resource names its own ordered tier chain and the ceilings it declares along that chain, each refusal naming the qualified config path, the offending value, and the accepted vocabulary exactly as the other choice keys do. Chain shape — a known tier at each position, priority order, no repeats — is enforced here in config-path wording; ceiling ranges are checked against what each key sizes: a system-memory KV ceiling carries <c>kv_blocks</c>' floor of 8 because it reserves physical blocks exactly as the legacy key does, every other ceiling must be positive where it states one, and the read-side origin store takes no ceiling at all because that storage already holds the complete set. Nothing here consults capacity or opened pools — which claims a host can carry is resolution's answer when the engine opens.</summary>
+    /// <summary>Parses one model entry's budgets block: every declared resource names its own ordered tier chain and the ceilings it declares along that chain, each refusal naming the qualified config path, the offending value, and the accepted vocabulary exactly as the other choice keys do. Chain shape — a known tier at each position, priority order, no repeats — is enforced here in config-path wording; ceiling ranges are checked against what each key sizes: a system-memory KV ceiling carries <c>kv_blocks</c>' floor of 8 because it reserves physical blocks exactly as the legacy key does, every other ceiling must be positive where it states one (so an accelerator-tier KV ceiling is a finite block count, and stating none there declares no model-level bound rather than an unbounded reservation), and the read-side origin store takes no ceiling at all because that storage already holds the complete set. Nothing here consults capacity or opened pools — which claims a host can carry is resolution's answer when the engine opens.</summary>
     private static IReadOnlyList<BudgetChain>? ParseBudgets(Dictionary<string, YamlNode> modelKeys, int index, string modelName)
     {
         if (!modelKeys.TryGetValue("budgets", out YamlNode? node))
@@ -991,7 +1030,9 @@ public static class YamlConfigLoader
                 if (!parsed)
                 {
                     throw new ConfigException(
-                        $"{capsWhere}.{capKey} '{text}' is invalid for model '{modelName}': a system-memory KV ceiling sizes the physical reservation and must be an integer no larger than {int.MaxValue}.");
+                        resource == BudgetResource.Kv && tier == BudgetTier.Dram
+                            ? $"{capsWhere}.{capKey} '{text}' is invalid for model '{modelName}': a system-memory KV ceiling sizes the physical reservation and must be an integer no larger than {int.MaxValue}."
+                            : $"{capsWhere}.{capKey} '{text}' is invalid for model '{modelName}': '{capKey}' must state an integer ceiling.");
                 }
 
                 ValidateCap(modelName, capsWhere, capKey, resource, tier, declared, order);
@@ -1040,7 +1081,7 @@ public static class YamlConfigLoader
                 $"{capsWhere}.{capKey} is invalid for model '{modelName}': a ceiling binds only tiers its own 'order' names — declare '{BudgetTierNames.Of(tier)}' there to cap it.");
         }
 
-        if (resource == BudgetResource.Weights && tier == BudgetTier.Nvme)
+        if (resource == BudgetResource.Weights && tier == BudgetTier.Disk)
         {
             throw new ConfigException(
                 $"{capsWhere}.{capKey} is invalid for model '{modelName}': weights read their complete set from disk storage already, so no model-level ceiling describes that position.");

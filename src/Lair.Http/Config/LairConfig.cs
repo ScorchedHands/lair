@@ -17,29 +17,33 @@ public sealed record LairConfig
     public UiConfig Ui { get; init; } = new();
 
     /// <summary>
-    /// The resident capacity an operator declares for this host — byte and core totals per tier, with optional per-node overrides — or
-    /// null when the configuration says nothing about any of it. These are declared values exactly as the loader parsed them: what a host
-    /// actually carries is what its reported topology states, and a declaration that disagrees with it is accepted with a warning rather
-    /// than rejected. Internal today: compute accounting reads these totals against the reported posture when an engine opens.
+    /// The resident capacity an operator declares for this host — system-memory and accelerator byte totals, logical processors, a disk
+    /// posture, with optional per-node overrides — or null when the configuration says nothing about any of it. These are declared values
+    /// exactly as the loader parsed them: what a host actually carries is what its reported topology states, and a declaration that
+    /// disagrees with it is accepted with a warning rather than rejected. Internal today: compute accounting reads these totals against
+    /// the reported posture when an engine opens.
     /// </summary>
-    internal TierCapacityConfig? Tiers { get; init; }
+    internal HostCapacityConfig? Host { get; init; }
 }
 
 /// <summary>
-/// Declared resident capacity for one host's tiers, in flat keys: system-memory bytes and logical processors, the disk path a read-side
-/// tier reads from, and optional per-node overrides keyed by node position. Every value is declared posture — an absent key declares no
-/// total rather than zero, and a per-node override states only what its entry names.
+/// Declared resident capacity for one host, in flat keys: system-memory bytes and logical processors, a disk path declared as presence
+/// only, and optional per-node overrides keyed by node position. Every value is declared posture — an absent key declares no total rather
+/// than zero, and a per-node override states only what its entry names.
 /// </summary>
-public sealed record TierCapacityConfig
+public sealed record HostCapacityConfig
 {
     /// <summary>Megabytes the operator declares at system memory; null (absent) declares no byte total.</summary>
     public long? DramMb { get; init; }
 
-    /// <summary>Logical processors the operator declares at system memory — the unit a core set or thread quota counts in; null (absent) declares no core total.</summary>
-    public int? DramCores { get; init; }
+    /// <summary>Megabytes the operator declares at accelerator memory — the ceiling a device-resident weight claim seats against when a compute backend opened with device-resident weight copies backs that residency. No driver-detected total is consulted: an absent key states no public total, which is the posture a host gives when it backs a residency without naming its size.</summary>
+    public long? VramMb { get; init; }
+
+    /// <summary>The logical processors this host carries — the unit a core set or thread quota counts in; null (absent) declares no core total.</summary>
+    public int? CpuCores { get; init; }
 
     /// <summary>The disk path this host reads from, declared as presence and path only. No byte ceiling belongs to that position: the model file already is the complete set.</summary>
-    public string? NvmePath { get; init; }
+    public string? DiskPath { get; init; }
 
     /// <summary>Per-node overrides keyed by node position, each stating its own bytes and/or cores. An override never replaces the reported posture — it disagrees with it.</summary>
     public IReadOnlyList<NodeCapacityOverride> Nodes { get; init; } = [];
@@ -250,4 +254,12 @@ public sealed record PlacementConfig
     /// preference for later placement decisions without re-binding an opened worker pool.
     /// </summary>
     public string NumaSpread { get; init; } = "auto";
+
+    /// <summary>
+    /// How many of this model's transformer layers execution opens on device <c>cuda</c>, counted from layer 0, with every later
+    /// layer and the output head staying on CPU. Zero (absent) keeps today's posture: every layer runs on this service's own CPU
+    /// backend and no accelerator seam is opened at all. A present value must be 0 or greater; a split opens its CUDA compute backend
+    /// when the engine opens, so changing it — like any key that decides which backends and route segments exist — is a restart-only edit.
+    /// </summary>
+    public int GpuLayers { get; init; }
 }

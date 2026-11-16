@@ -350,6 +350,58 @@ public sealed class PrefillBufferClampTests : IDisposable
         Assert.Contains("activation_bytes=", claimLine); // lane/working bytes reported beside the row widths the claim covers
     }
 
+    [Fact]
+    public void RegisterClaim_PrefillChainHeldAtItsSystemPosition_DemotesToTheDevicePositionAndSeatsThere()
+    {
+        DeviceLedger ledger = new(
+        [
+            new CapacitySeam { Tier = BudgetTier.Dram, Resource = BudgetResource.PrefillBuffers, Capacity = null },
+            new CapacitySeam { Tier = BudgetTier.Vram, Resource = BudgetResource.PrefillBuffers, Capacity = 2 },
+        ]);
+
+        ResolvedBudgetSet budgets = Resolve(
+        [
+            new BudgetChain
+            {
+                Resource = BudgetResource.PrefillBuffers,
+                Order = [BudgetTier.Dram, BudgetTier.Vram],
+                Caps = new Dictionary<BudgetTier, long> { [BudgetTier.Dram] = 1 }, // the model's own system-memory ceiling is below this claim; its device position states no ceiling of its own
+            },
+        ],
+        openedPoolTiers: [BudgetTier.Dram, BudgetTier.Vram]);
+
+        ClaimOutcome outcome = ledger.RegisterClaim("clamp-device-demote", budgets.For(BudgetResource.PrefillBuffers)!, amount: 2);
+
+        Assert.True(outcome.Seated);
+        DeviceLedgerClaim claim = outcome.Claim!;
+        Assert.Equal(BudgetTier.Vram, claim.Tier); // the chain's own demotion landed where its declaration still allows the bytes
+        Assert.True(claim.Demoted);
+        Assert.Equal(1, claim.ChainPosition);
+
+        ClaimChainStep systemPosition = outcome.ChainWalk[0];
+        Assert.Equal("declared ceiling below demand", systemPosition.Outcome); // passed by under this model's own ceiling — nothing half-seated and nothing displaced
+    }
+
+    [Fact]
+    public void RegisterClaim_PrefillDevicePositionHeldByEarlierClaims_RefusesNamingModelResourceTierAndBreakdown()
+    {
+        DeviceLedger ledger = new([new CapacitySeam { Tier = BudgetTier.Vram, Resource = BudgetResource.PrefillBuffers, Capacity = 1 }]);
+
+        ResolvedBudgetSet neighbourChain = Resolve(
+            [new BudgetChain { Resource = BudgetResource.PrefillBuffers, Order = [BudgetTier.Vram] }],
+            openedPoolTiers: [BudgetTier.Dram, BudgetTier.Vram]); // the posture an accelerator-backed prompt route reports for this resource
+
+        Assert.True(ledger.RegisterClaim("clamp-device-neighbour", neighbourChain.For(BudgetResource.PrefillBuffers)!, amount: 1).Seated);
+
+        ClaimOutcome refused = ledger.RegisterClaim("clamp-device-refused", neighbourChain.For(BudgetResource.PrefillBuffers)!, amount: 2);
+
+        Assert.False(refused.Seated);
+        Assert.Equal(BudgetTier.Vram, refused.ExhaustedAtTier); // the only position this chain seats at is held by an earlier claim — no fallback residency exists to absorb it
+        Assert.Contains("model 'clamp-device-refused'", refused.Breakdown);
+        Assert.Contains("'prefill_buffers'", refused.Breakdown);
+        Assert.Contains("'vram' holds 1 of 1 megabytes ('clamp-device-neighbour' 1 megabytes)", refused.Breakdown);
+    }
+
     // ---------------------------------------------------------------- harnesses and helpers
 
     private static ResolvedBudgetSet Resolve(IReadOnlyList<BudgetChain> declared, IReadOnlyList<BudgetTier>? openedPoolTiers = null) =>

@@ -212,35 +212,50 @@ public sealed class ConfigTests : IDisposable
     }
 
     [Fact]
-    public void Load_PlacementDeviceMustBeCpu_Fails()
+    public void Load_PlacementDeviceAuto_ResolvesHostCompute()
+    {
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(PlacementYaml("device: auto")));
+
+        Assert.Equal("cpu", config.Models[0].Placement.Device); // the posture-neutral declaration resolves once at load onto this build's opened compute backend.
+    }
+
+    [Fact]
+    public void Load_PlacementDeviceAccelerator_FailsNamingAcceptedVocabularyAndSeam()
     {
         ConfigException error = Assert.Throws<ConfigException>(
             () => YamlConfigLoader.Load(WriteConfig(PlacementYaml("device: cuda"))));
 
         Assert.Contains("placement.device 'cuda'", error.Message);
-        Assert.Contains("only accepted value for 'device' is 'cpu'", error.Message);
+        Assert.Contains("'device' accepts only 'auto' or 'cpu'", error.Message, StringComparison.Ordinal);
         Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Load_PlacementKvResidencyMustBeDram_Fails()
+    public void Load_PlacementKvResidencyOutsideTheDeclaredSet_FailsNamingModelKeyAndAcceptedSet()
     {
         ConfigException error = Assert.Throws<ConfigException>(
-            () => YamlConfigLoader.Load(WriteConfig(PlacementYaml("kv_residency: vram"))));
+            () => YamlConfigLoader.Load(WriteConfig(PlacementYaml("kv_residency: gpu"))));
 
-        Assert.Contains("placement.kv_residency 'vram'", error.Message);
-        Assert.Contains("only accepted value for 'kv_residency' is 'dram'", error.Message);
-        Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
+        Assert.Contains("models[0].placement.kv_residency 'gpu' is invalid for model 'qwen-test'", error.Message);
+        Assert.Contains("'kv_residency' accepts only 'auto', 'dram', 'vram', 'split'", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Load_PlacementPrefillMustBeCpu_Fails()
+    public void Load_PlacementPrefillAuto_ResolvesHostCompute()
+    {
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(PlacementYaml("prefill: auto")));
+
+        Assert.Equal("cpu", config.Models[0].Placement.Prefill); // the posture-neutral declaration resolves once at load onto this build's opened prefill backend.
+    }
+
+    [Fact]
+    public void Load_PlacementPrefillAccelerator_FailsNamingAcceptedVocabularyAndSeam()
     {
         ConfigException error = Assert.Throws<ConfigException>(
             () => YamlConfigLoader.Load(WriteConfig(PlacementYaml("prefill: gpu"))));
 
         Assert.Contains("placement.prefill 'gpu'", error.Message);
-        Assert.Contains("only accepted value for 'prefill' is 'cpu'", error.Message);
+        Assert.Contains("'prefill' accepts only 'auto' or 'cpu'", error.Message, StringComparison.Ordinal);
         Assert.Contains(ModelRoute.CudaBackendSeam, error.Message, StringComparison.Ordinal);
     }
 

@@ -1,5 +1,7 @@
 namespace Lair.Models;
 
+using Lair.Contracts;
+
 /// <summary>
 /// The resolved execution path of one model: an ordered set of device segments, each naming the compute device it
 /// runs on, where its weights are held while it computes, the batch cap a step may advance on it, and the quota a
@@ -30,7 +32,8 @@ public sealed record ModelRoute
     /// the model, so consecutive stages landing on one device at one residency collapse into the single span they always did.
     /// A declared boundary is the index of the layer its span starts at — zero or greater — and two spans naming distinct
     /// boundaries stay separate positions of the ordered path even when their device and residency agree. Assembly-internal:
-    /// no placement key declares a boundary today, so every model served resolves this position alone.
+    /// a host's placement resolves a split onto these positions through <see cref="RouteStage"/>; every posture without one
+    /// carries this position alone.
     /// </summary>
     internal const int WholeModelSplitPosition = -1;
 
@@ -59,15 +62,19 @@ public sealed record ModelRoute
 /// split when a route names more than it: the identity says which compute backend runs this part, the tier says where
 /// its weights are resident while it does, the boundary position says where its range of layers begins, the batch cap
 /// is how many sequences one step may advance on it at once, and the quota is what that step holds against it for as
-/// long as it runs.
+/// long as it runs. A segment's weight tier and the block residencies it can step over are separate answers: where a
+/// span's weights live says nothing about where its sequences' KV blocks live.
 /// </summary>
 public sealed record DeviceSegment
 {
     /// <summary>The compute device this segment runs on: a backend-reported id (<see cref="ModelRoute.CpuDeviceId"/>, or an accelerator id once one exists), not a placement label.</summary>
     public required string DeviceId { get; init; }
 
-    /// <summary>Where this segment's weights are held while it computes. DRAM-resident is the only residency any engine reads today.</summary>
+    /// <summary>Where this segment's weights are held while it computes: the tier the compute backend resolved for this position reports, not a residency any placement key carries for the model's KV.</summary>
     public WeightTier WeightTier { get; init; } = WeightTier.Dram;
+
+    /// <summary>The block residencies a merged step over this segment may hold its sequences' KV at, landed from the model's declared KV residency: system memory for a host-only reservation, accelerator memory for a device-backed one, and both tiers where a divided reservation splits its ids between them. A candidate whose blocks name any other residency steps on its own rather than merging here — and this stays a separate answer from <see cref="WeightTier"/>, because weights and blocks are placed independently.</summary>
+    public IReadOnlyList<WeightTier> BlockResidencyTiers { get; init; } = [WeightTier.Dram];
 
     /// <summary>The boundary of the ordered path this span starts at: the index of the first layer it runs, or <see cref="ModelRoute.WholeModelSplitPosition"/> when nothing splits the model. Two spans that agree on device and residency stay separate positions because they name distinct boundaries — which is what keeps an ordered pair of same-device spans addressable as two ranges of layers instead of collapsing into one.</summary>
     internal int SplitPosition { get; init; } = ModelRoute.WholeModelSplitPosition;
@@ -80,16 +87,6 @@ public sealed record DeviceSegment
 
     /// <summary>The identity an error message names this segment by: its position in the route and the device it runs on.</summary>
     public string Describe(int index) => $"segment {index} ('{DeviceId}' at '{WeightTier}')";
-}
-
-/// <summary>Where a resource is resident while compute reads it. DRAM is what every engine path holds today; an accelerator tier stays vocabulary until the device exists to back it.</summary>
-public enum WeightTier
-{
-    /// <summary>Resident in system memory: where weights, KV blocks, and activation buffers live for every model served today.</summary>
-    Dram,
-
-    /// <summary>Resident on an accelerator's own memory. Named by the vocabulary only until a backend reports such a device; a segment at this tier refuses before any engine allocates against it.</summary>
-    Vram,
 }
 
 /// <summary>

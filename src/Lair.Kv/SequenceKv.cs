@@ -236,8 +236,10 @@ public sealed class SequenceKv : IDisposable
             CopyOnWrite(blockIndex); // a genuine mid-block rewrite: the shared copy becomes private before any byte lands in it
         }
 
-        Span<float> slot = _pool.SlotSpan(_blocks[blockIndex], layer, isV, logicalPos % _pool.BlockTokens);
+        int physicalBlockId = _blocks[blockIndex];
+        Span<float> slot = _pool.SlotSpan(physicalBlockId, layer, isV, logicalPos % _pool.BlockTokens);
         values.CopyTo(slot);
+        _pool.MarkWritten(physicalBlockId); // a device-backed block's host bytes just changed: its next crossing must carry them
     }
 
     // Addresses one slot inside a selection the sequence itself produced: the coverage check is what makes a windowed

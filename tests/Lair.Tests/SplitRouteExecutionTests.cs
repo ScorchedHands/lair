@@ -474,6 +474,8 @@ public sealed class SplitRouteExecutionTests : IDisposable
 
         public string DeviceId => _inner.DeviceId;
 
+        public Lair.Contracts.WeightTier WeightTier => _inner.WeightTier;
+
         public MemoryHandle AllocateAligned(long bytes, int alignment)
         {
             AllocateCalls++;
@@ -485,6 +487,8 @@ public sealed class SplitRouteExecutionTests : IDisposable
             FreeCalls++;
             _inner.FreeAligned(handle);
         }
+
+        public IKvDeviceMirror OpenKvMirror(KvMirrorRequest request) => _inner.OpenKvMirror(request);
 
         public void Gemv(ReadOnlySpan<float> x, WeightRef w, Span<float> output) => _inner.Gemv(x, w, output);
 

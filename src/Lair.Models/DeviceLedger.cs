@@ -444,7 +444,18 @@ public sealed class DeviceLedger
     /// earlier or later seating moves, displaces anything, or re-runs first-come selection. Returns false when the model
     /// has no seated working-copy claim for that resource.
     /// </summary>
-    public bool UpdateStandingClaimAmount(string model, BudgetResource resource, long newAmount)
+    public bool UpdateStandingClaimAmount(string model, BudgetResource resource, long newAmount) =>
+        UpdateStandingClaimAmount(model, resource, newAmount, atTier: null);
+
+    /// <summary>
+    /// Updates the amount of one model's latest seated working-copy claim for a resource, recording that its own live
+    /// engine seam retargeted what that standing seat covers. When a tier is named, only that model's claims holding
+    /// working copies at that tier are candidates: an engine that seats part of one resource across tiers updates the
+    /// seat its live cap governs and leaves every other seat whole. The claim stays at its tier and registration order:
+    /// no earlier or later seating moves, displaces anything, or re-runs first-come selection. Returns false when the
+    /// model has no seated working-copy claim matching what was named.
+    /// </summary>
+    public bool UpdateStandingClaimAmount(string model, BudgetResource resource, long newAmount, BudgetTier? atTier)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(model);
         ArgumentOutOfRangeException.ThrowIfNegative(newAmount);
@@ -455,7 +466,8 @@ public sealed class DeviceLedger
             for (int candidate = 0; candidate < _claims.Count; candidate++)
             {
                 DeviceLedgerClaim claim = _claims[candidate];
-                if (claim.Model == model && claim.Resource == resource && !claim.AtOriginStore)
+                if (claim.Model == model && claim.Resource == resource && !claim.AtOriginStore
+                    && (atTier is null || claim.Tier == atTier))
                 {
                     index = candidate;
                 }

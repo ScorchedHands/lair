@@ -97,6 +97,9 @@ public sealed unsafe partial class CpuBackend : IBackend
 
     public string DeviceId => "cpu";
 
+    /// <summary>Every kernel here reads weight bytes from host memory the weight source owns: the system-memory tier.</summary>
+    public WeightTier WeightTier => Lair.Contracts.WeightTier.Dram;
+
     /// <summary>Worker count this backend actually runs threaded GEMV with (dispatcher plus pool workers), after quota and auto-sizing.</summary>
     public int EffectiveWorkerCount => _effectiveThreads;
 
@@ -165,6 +168,16 @@ public sealed unsafe partial class CpuBackend : IBackend
     {
         NativeMemory.AlignedFree(handle.Pointer);
     }
+
+    /// <summary>
+    /// Refused: every block this backend hands out lives in host memory, so there is no device-resident storage a KV
+    /// mirror could copy into. The refusal names this backend, the tier the request declared, and the resource it asked
+    /// to back, rather than answering with a host-only stand-in that would report device residency it cannot hold.
+    /// </summary>
+    public IKvDeviceMirror OpenKvMirror(KvMirrorRequest request) => throw new NotSupportedException(
+        $"CpuBackend ('{DeviceId}') holds no device-resident storage for '{request.ResourceName}' at tier " +
+        $"{request.Tier}: every block this backend hands out stays in host memory, so a device-backed KV mirror is " +
+        "refused naming this backend rather than answered with a host-only stand-in.");
 
     public void Gemv(ReadOnlySpan<float> x, WeightRef w, Span<float> output)
     {

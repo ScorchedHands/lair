@@ -208,6 +208,9 @@ public static class ConfigMutationTable
         // established them — nothing here re-binds an opened worker pool or its weight pages.
         Add(changes, "models[0].placement.numa_spread", oldPlacement.NumaSpread, newPlacement.NumaSpread);
 
+        // The layer split decides which compute backends and route segments an open builds, so it belongs to the opened engine exactly like the device keys beside it: reported through the table's default restart-only class rather than falling through unclassified.
+        Add(changes, "models[0].placement.gpu_layers", Text(oldPlacement.GpuLayers), Text(newPlacement.GpuLayers));
+
         // Core-set overcommit changes what a running engine's workers contend for, so it is established when the engine opens: refused live,
         // exactly like the pinned set it relaxes. Declared capacity totals bind accounting at open for the same reason.
         if (newPlacement.CoreOvercommit != oldPlacement.CoreOvercommit)
@@ -215,7 +218,7 @@ public static class ConfigMutationTable
             changes.Add(new FieldChange("models[0].placement.core_overcommit", Text(oldPlacement.CoreOvercommit), Text(newPlacement.CoreOvercommit), ConfigMutationClass.RestartOnly));
         }
 
-        AddTierChanges(changes, current.Tiers, candidate.Tiers);
+        AddHostCapacityChanges(changes, current.Host, candidate.Host);
 
         if (candidate.Ui.RecentRequests != current.Ui.RecentRequests)
         {
@@ -292,25 +295,29 @@ public static class ConfigMutationTable
         "models[0].max_concurrent_requests" => ConfigMutationClass.NewRequestsOnly,
         "models[0].placement.numa_spread" => ConfigMutationClass.NewRequestsOnly,
         "models[0].placement.core_overcommit" => ConfigMutationClass.RestartOnly,
+        // The KV residency mode says how this model's block pools are seated across host and device storage. Reseating an
+        // opened pool's blocks is not something a live engine can do, so the mode is established when the engine opens.
+        "models[0].placement.kv_residency" => ConfigMutationClass.RestartOnly,
         "models[0].source" => ConfigMutationClass.RestartOnly, // loadability depends on the manifest and fetch behavior established at open.
-        "tiers.dram_mb" or "tiers.dram_cores" or "tiers.nvme_path" or "tiers.nodes" => ConfigMutationClass.RestartOnly,
+        "host.dram_mb" or "host.vram_mb" or "host.cpu_cores" or "host.disk_path" or "host.numa.nodes" => ConfigMutationClass.RestartOnly,
         _ => BudgetFieldClass(field) ?? ConfigMutationClass.RestartOnly,
     };
 
     // Every declared-capacity difference between two configurations, reported key by key so each carries its own restart-only class and a
     // refused edit cannot hide another. Per-node overrides are a structural list with no single canonical scalar to compare against raw
     // text — exactly like 'placement.core_set' and budget chain orders — so they report through one field carrying the whole declared posture.
-    private static void AddTierChanges(List<FieldChange> changes, TierCapacityConfig? currentTiers, TierCapacityConfig? candidateTiers)
+    private static void AddHostCapacityChanges(List<FieldChange> changes, HostCapacityConfig? currentHost, HostCapacityConfig? candidateHost)
     {
-        Add(changes, "tiers.dram_mb", NumberOrNone(currentTiers?.DramMb), NumberOrNone(candidateTiers?.DramMb));
-        Add(changes, "tiers.dram_cores", NumberOrNone(currentTiers?.DramCores), NumberOrNone(candidateTiers?.DramCores));
-        Add(changes, "tiers.nvme_path", currentTiers?.NvmePath ?? "(unset)", candidateTiers?.NvmePath ?? "(unset)");
+        Add(changes, "host.dram_mb", NumberOrNone(currentHost?.DramMb), NumberOrNone(candidateHost?.DramMb));
+        Add(changes, "host.vram_mb", NumberOrNone(currentHost?.VramMb), NumberOrNone(candidateHost?.VramMb));
+        Add(changes, "host.cpu_cores", NumberOrNone(currentHost?.CpuCores), NumberOrNone(candidateHost?.CpuCores));
+        Add(changes, "host.disk_path", currentHost?.DiskPath ?? "(unset)", candidateHost?.DiskPath ?? "(unset)");
 
-        string currentNodeOverrides = CanonicalNodeOverrides(currentTiers);
-        string candidateNodeOverrides = CanonicalNodeOverrides(candidateTiers);
+        string currentNodeOverrides = CanonicalNodeOverrides(currentHost);
+        string candidateNodeOverrides = CanonicalNodeOverrides(candidateHost);
         if (currentNodeOverrides != candidateNodeOverrides)
         {
-            changes.Add(new FieldChange("tiers.nodes", currentNodeOverrides, candidateNodeOverrides, ConfigMutationClass.RestartOnly));
+            changes.Add(new FieldChange("host.numa.nodes", currentNodeOverrides, candidateNodeOverrides, ConfigMutationClass.RestartOnly));
         }
     }
 
@@ -333,17 +340,18 @@ public static class ConfigMutationTable
     }
 
     // The declared per-node overrides in one canonical text so two postures compare like-for-like: each entry keyed by the node position it names.
-    private static string CanonicalNodeOverrides(TierCapacityConfig? tiers) => tiers?.Nodes is not { Count: > 0 }
+    private static string CanonicalNodeOverrides(HostCapacityConfig? host) => host?.Nodes is not { Count: > 0 }
         ? "(none)"
         : string.Join(
             ";",
-            tiers.Nodes.OrderBy(node => node.Index).Select(node => $"index={node.Index}:mb={(node.Mb is long mb ? mb.ToString(CultureInfo.InvariantCulture) : "unset")}:cores={(node.Cores is int cores ? cores.ToString(CultureInfo.InvariantCulture) : "unset")}"));
+            host.Nodes.OrderBy(node => node.Index).Select(node => $"index={node.Index}:mb={(node.Mb is long mb ? mb.ToString(CultureInfo.InvariantCulture) : "unset")}:cores={(node.Cores is int cores ? cores.ToString(CultureInfo.InvariantCulture) : "unset")}"));
 
     // How one budget field classifies: a ceiling on the system-memory tier of the KV chain is the live soft cap 'kv_blocks' has always been;
-    // weight ceilings bind what every forward reads and retarget only by re-reading slabs from the model file, so they are restart-only; prefill
-    // buffer ceilings classify for later requests alone even where nothing clamps to them yet — a class is not an enforcement promise. A chain's
-    // order names structure that was resolved when the engine opened, and any budget-shaped key this table does not recognize stays restart-only
-    // rather than falling through unclassified.
+    // a ceiling at the accelerator tier of that chain bounds blocks a device-backed pool holds, and reseating those blocks is not live, so it
+    // carries the same posture the residency mode beside it does. Weight ceilings bind what every forward reads and retarget only by re-reading
+    // slabs from the model file, so they are restart-only; prefill buffer ceilings classify for later requests alone even where nothing clamps
+    // to them yet — a class is not an enforcement promise. A chain's order names structure that was resolved when the engine opened, and any
+    // budget-shaped key this table does not recognize stays restart-only rather than falling through unclassified.
     private static ConfigMutationClass? BudgetFieldClass(string field)
     {
         const string prefix = "models[0].budgets.";
@@ -372,6 +380,7 @@ public static class ConfigMutationTable
         return (resource, tier) switch
         {
             (BudgetResource.Kv, BudgetTier.Dram) => ConfigMutationClass.Live,
+            (BudgetResource.Kv, BudgetTier.Vram) => ConfigMutationClass.RestartOnly, // bounds blocks a device-backed pool holds: reseating them is not live.
             (BudgetResource.PrefillBuffers, _) => ConfigMutationClass.NewRequestsOnly,
             _ => ConfigMutationClass.RestartOnly,
         };
@@ -419,15 +428,19 @@ public static class ConfigMutationTable
         yield return ("models[0].placement.prefill_lane", ScalarText(placement, "prefill_lane"));
         yield return ("models[0].placement.numa_spread", ScalarText(placement, "numa_spread"));
 
+        // The layer split is a plain scalar beside the other placement postures: its raw text carries into best-effort classification of a candidate that failed validation.
+        yield return ("models[0].placement.gpu_layers", ScalarText(placement, "gpu_layers"));
+
         // Core-set overcommit is a plain scalar beside the pinned set it relaxes. Declared capacity totals are plain scalars too; per-node
         // override lists skip here exactly as 'placement.core_set' and budget chain orders do — a structural list has no single canonical text,
         // and a semantic override change on a file that does validate surfaces through the full Diff instead.
         yield return ("models[0].placement.core_overcommit", ScalarText(placement, "core_overcommit"));
 
-        YamlDotNet.RepresentationModel.YamlMappingNode? tiers = Child(root, "tiers");
-        yield return ("tiers.dram_mb", ScalarText(tiers, "dram_mb"));
-        yield return ("tiers.dram_cores", ScalarText(tiers, "dram_cores"));
-        yield return ("tiers.nvme_path", ScalarText(tiers, "nvme_path"));
+        YamlDotNet.RepresentationModel.YamlMappingNode? host = Child(root, "host");
+        yield return ("host.dram_mb", ScalarText(host, "dram_mb"));
+        yield return ("host.vram_mb", ScalarText(host, "vram_mb"));
+        yield return ("host.cpu_cores", ScalarText(host, "cpu_cores"));
+        yield return ("host.disk_path", ScalarText(host, "disk_path"));
 
         // Budget chain order lists are skipped here exactly as 'placement.core_set' is: a structural list has no single canonical text to compare against, and a semantic chain change on a file that does validate surfaces through the full Diff instead. Each ceiling is a plain scalar carrying its own qualified key below. The source block is skipped for the same reason — a structural pin with no single canonical scalar — and a semantic source edit on a file that does validate surfaces through the full Diff as one restart-only field.
         YamlDotNet.RepresentationModel.YamlMappingNode? budgets = Child(model, "budgets");
@@ -477,10 +490,12 @@ public static class ConfigMutationTable
         "models[0].placement.thread_quota" => TextOrNone(current.Models[0].Placement.ThreadQuota),
         "models[0].placement.prefill_lane" => current.Models[0].Placement.PrefillLane,
         "models[0].placement.numa_spread" => current.Models[0].Placement.NumaSpread,
+        "models[0].placement.gpu_layers" => Text(current.Models[0].Placement.GpuLayers),
         "models[0].placement.core_overcommit" => Text(current.Models[0].Placement.CoreOvercommit),
-        "tiers.dram_mb" => NumberOrNone(current.Tiers?.DramMb),
-        "tiers.dram_cores" => NumberOrNone(current.Tiers?.DramCores),
-        "tiers.nvme_path" => current.Tiers?.NvmePath ?? "(unset)",
+        "host.dram_mb" => NumberOrNone(current.Host?.DramMb),
+        "host.vram_mb" => NumberOrNone(current.Host?.VramMb),
+        "host.cpu_cores" => NumberOrNone(current.Host?.CpuCores),
+        "host.disk_path" => current.Host?.DiskPath ?? "(unset)",
         "ui.recent_requests" => Text(current.Ui.RecentRequests),
         _ => BudgetCurrentText(current, field) ?? string.Empty, // a budget ceiling the running engine holds in its declared chains reads back in the same text form RawScalars produces.
     };

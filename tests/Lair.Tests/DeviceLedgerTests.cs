@@ -83,6 +83,24 @@ public sealed class DeviceLedgerTests
     }
 
     [Fact]
+    public void RegisterClaim_FiniteAcceleratorWeightSeam_ExhaustsAgainstDeclaredCapacity_NamingModelResourceTierAndAmounts()
+    {
+        ResolvedBudgetChain chain = WeightsChain([BudgetTier.Vram]);
+        using TestLedger ledger = new(Capacity(BudgetTier.Vram, BudgetResource.Weights, 4));
+
+        Assert.True(ledger.Ledger.RegisterClaim("model-a", chain, amount: 3).Seated);
+
+        ClaimOutcome exhausted = ledger.Ledger.RegisterClaim("model-b", chain, amount: 2);
+        Assert.False(exhausted.Seated);
+        Assert.Equal(BudgetTier.Vram, exhausted.ExhaustedAtTier);
+
+        Assert.Contains("model 'model-b'", exhausted.Breakdown);
+        Assert.Contains("'weights'", exhausted.Breakdown);
+        Assert.Contains("'vram' holds 3 of 4 megabytes", exhausted.Breakdown);
+        Assert.Contains("'model-a' 3 megabytes", exhausted.Breakdown);
+    }
+
+    [Fact]
     public void RegisterClaim_ChainWithNoOpenedSeam_ReportsWhatThisHostDoesNotOpen()
     {
         using TestLedger ledger = new(); // a ledger with no capacity seams at all: nothing is guessed into existence
@@ -102,7 +120,7 @@ public sealed class DeviceLedgerTests
             Tiers =
             [
                 new ResolvedBudgetTier { Tier = BudgetTier.Dram, Cap = 1 },
-                new ResolvedBudgetTier { Tier = BudgetTier.Nvme, IsOriginStore = true }, // the file already holds the complete weight set there
+                new ResolvedBudgetTier { Tier = BudgetTier.Disk, IsOriginStore = true }, // the file already holds the complete weight set there
             ],
         };
 
@@ -112,12 +130,12 @@ public sealed class DeviceLedgerTests
         ClaimOutcome demoted = ledger.Ledger.RegisterClaim("model-b", chain, amount: 1);
 
         Assert.True(demoted.Seated); // landing on the origin store is a posture, not an eviction of 'model-a'
-        Assert.Equal(BudgetTier.Nvme, demoted.Claim!.Tier);
+        Assert.Equal(BudgetTier.Disk, demoted.Claim!.Tier);
         Assert.True(demoted.Claim.AtOriginStore);
         Assert.True(demoted.Claim.Demoted);
 
         Assert.Equal(1L, ledger.Ledger.Occupied(BudgetTier.Dram, BudgetResource.Weights)); // the first claim still holds its tier whole
-        Assert.Equal(0L, ledger.Ledger.Occupied(BudgetTier.Nvme, BudgetResource.Weights));  // an origin-store seating consumes no ledger capacity
+        Assert.Equal(0L, ledger.Ledger.Occupied(BudgetTier.Disk, BudgetResource.Weights));  // an origin-store seating consumes no ledger capacity
     }
 
     [Fact]
@@ -233,6 +251,30 @@ public sealed class DeviceLedgerTests
         Assert.Equal(BudgetTier.Dram, claim.Tier);
         Assert.Equal(4L, claim.Amount);
         Assert.Equal(4L, ledger.Ledger.Occupied(BudgetTier.Dram, BudgetResource.Kv));
+    }
+
+    [Fact]
+    public void UpdateStandingClaimAmount_AtOneTier_LeavesTheSameModelsClaimAtAnotherTier_Untouched()
+    {
+        ResolvedBudgetChain hostReservation = new() { Resource = BudgetResource.Kv, Tiers = [new ResolvedBudgetTier { Tier = BudgetTier.Dram }] };
+        ResolvedBudgetChain deviceRange = new() { Resource = BudgetResource.Kv, Tiers = [new ResolvedBudgetTier { Tier = BudgetTier.Vram, Cap = 8 }] };
+
+        using TestLedger ledger = new(
+            Capacity(BudgetTier.Dram, BudgetResource.Kv, 16),
+            Capacity(BudgetTier.Vram, BudgetResource.Kv, 8));
+
+        Assert.True(ledger.Ledger.RegisterClaim("model-a", hostReservation, amount: 8).Seated);
+        Assert.True(ledger.Ledger.RegisterClaim("model-a", deviceRange, amount: 4).Seated); // one model's blocks can stand at two positions of their own chain at once
+
+        Assert.True(ledger.Ledger.UpdateStandingClaimAmount("model-a", BudgetResource.Kv, newAmount: 5, atTier: BudgetTier.Dram));
+
+        Assert.Equal(5L, Assert.Single(ledger.Ledger.ClaimsAt(BudgetTier.Dram, BudgetResource.Kv)).Amount); // the seat a live edit governs carries the new amount
+        Assert.Equal(4L, Assert.Single(ledger.Ledger.ClaimsAt(BudgetTier.Vram, BudgetResource.Kv)).Amount); // and the claim seated beside it keeps its own standing amount rather than being retargeted twice
+
+        Assert.Equal(5L, ledger.Ledger.Occupied(BudgetTier.Dram, BudgetResource.Kv));
+        Assert.Equal(4L, ledger.Ledger.Occupied(BudgetTier.Vram, BudgetResource.Kv)); // what each position holds counts once, at the tier it stands at
+
+        Assert.False(ledger.Ledger.UpdateStandingClaimAmount("model-a", BudgetResource.Kv, newAmount: 9, atTier: BudgetTier.Disk)); // a seat this model never took is not moved to some other one
     }
 
     [Fact]

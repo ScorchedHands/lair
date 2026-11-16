@@ -54,6 +54,11 @@ interface WireSnapshot {
   metrics_decode_device?: string | null;
   metrics_prefill_device?: string | null;
   metrics_kv_residency?: string | null;
+  // additive accelerator facts (null on a serve holding no CUDA backend open)
+  metrics_gpu_utilization_percent?: number | null;
+  metrics_pcie_transfer_bytes_total?: number | null;
+  metrics_pcie_transfers_total?: number | null;
+  metrics_persistent_vram_bytes?: number | null;
 }
 
 interface WireRequest {
@@ -150,6 +155,8 @@ export interface MonitorView {
   meta: string;
   kpis: Record<string, KpiView>;
   processRam: KpiView | null;
+  gpuUtil: KpiView | null;
+  pcieTransfer: KpiView | null;
   models: ModelRowView[];
   inFlight: InFlightRowView[];
   recent: RecentRowView[];
@@ -177,6 +184,17 @@ function fmtDuration(ms: number): string {
 export function percentOf(part: number, whole: number): string {
   if (whole <= 0) return DASH;
   return `${Math.round((part / whole) * 100)}%`;
+}
+
+// Byte totals as the engine reported them: device residency and runtime transfer volume read in the unit their own
+// magnitude deserves, so a tiny synthetic gate's few kilobytes never render as "0.0 MiB".
+export function fmtBytes(bytes: number): string {
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const kib = bytes / 1024;
+  if (kib < 1024) return `${kib.toFixed(1)} KiB`;
+  const mib = kib / 1024;
+  if (mib < 1024) return `${mib.toFixed(1)} MiB`;
+  return `${(mib / 1024).toFixed(2)} GiB`;
 }
 
 // Sparkline points from the tok/s sample series: each interval between consecutive samples becomes one segment
@@ -295,6 +313,31 @@ class MonitorStore {
       processRam = { value: `${fmt1(workingSetMb / 1024)} GB`, sub: "engine working set" };
     }
 
+    // Accelerator cards appear only from snapshots that carry the facts a CUDA backend publishes. A CPU-only serve leaves
+    // them null — the card keeps its placeholder reading instead of showing zeros for hardware no engine holds open.
+    let gpuUtil: KpiView | null = null;
+    let pcieTransfer: KpiView | null = null;
+
+    const windowedBusy = snapshots
+      .map((s) => s.metrics_gpu_utilization_percent)
+      .filter((value): value is number => value !== null && value !== undefined);
+    if (windowedBusy.length > 0) {
+      // One device's busy share as the busiest engine measured it: windowed rates are per-engine, and a shared device reads
+      // at least as busy as whichever engine reported itself.
+      gpuUtil = { value: `${Math.max(...windowedBusy).toFixed(1)}%`, sub: "kernel busy on device" };
+    }
+
+    const acceleratorSnapshots = snapshots.filter((s) => s.metrics_pcie_transfer_bytes_total != null || s.metrics_persistent_vram_bytes != null);
+    if (acceleratorSnapshots.length > 0) {
+      const transferBytes = acceleratorSnapshots.reduce((sum, s) => sum + (s.metrics_pcie_transfer_bytes_total ?? 0), 0);
+      const transferCalls = acceleratorSnapshots.reduce((sum, s) => sum + (s.metrics_pcie_transfers_total ?? 0), 0);
+      const persistentVramBytes = acceleratorSnapshots.reduce((sum, s) => sum + (s.metrics_persistent_vram_bytes ?? 0), 0);
+      pcieTransfer = {
+        value: fmtBytes(transferBytes),
+        sub: `${transferCalls} runtime copies · ${fmtBytes(persistentVramBytes)} resident`,
+      };
+    }
+
     const modelIds = new Set<string>([...this.snapshots.keys(), ...this.identities.keys()]);
     const models: ModelRowView[] = [...modelIds].sort().map((id) => buildModelRow(id, latestByModel.get(id), this.identities.get(id)));
 
@@ -306,7 +349,7 @@ class MonitorStore {
 
     const meta = `${window.location.origin} · up ${fmtDuration(nowMs - mountedAtMs)}`;
 
-    return { connection: this.connection, meta, kpis, processRam, models, inFlight, recent };
+    return { connection: this.connection, meta, kpis, processRam, gpuUtil, pcieTransfer, models, inFlight, recent };
   }
 
   private invalidate(): void {
@@ -454,6 +497,32 @@ function buildModelRow(id: string, snapshot: WireSnapshot | undefined, identity:
     modelRam = `${workingSetGb} GB working set · ${kvGb} KV reserved`;
   }
 
+  // Device weight residency comes straight from the opened backend's own accounting; a serve holding no CUDA backend
+  // keeps the column reserved-marked rather than claiming an empty device.
+  const persistentVramBytes = snapshot?.metrics_persistent_vram_bytes ?? null;
+  const vram = persistentVramBytes != null ? `${fmtBytes(persistentVramBytes)} resident` : "reserved —";
+
+  const detail: DetailField[] = [
+    { label: "context / block size", value: `${contextTokens} / ${blockTokens}` },
+    { label: "kv_blocks budget", value: budget },
+    { label: "core set / quota", value: `${coreSet} / ${quota}` },
+    { label: "prefill · decode · kv residency", value: `${prefillDevice} · ${decodeDevice} · ${residency}` },
+    { label: "cache blocks (DRAM)", value: cacheBlocks },
+    { label: "finish tallies", value: tallies },
+    { label: "experts hot / cold", value: "n/a — dense model (MoE phase adds tier counts)" },
+    { label: "model RAM", value: modelRam },
+  ];
+
+  const transferBytes = snapshot?.metrics_pcie_transfer_bytes_total ?? null;
+  if (transferBytes != null) {
+    const utilization = snapshot?.metrics_gpu_utilization_percent;
+    const transfers = snapshot?.metrics_pcie_transfers_total ?? 0;
+    detail.push({
+      label: "kernel busy · runtime xfer",
+      value: `${utilization == null ? DASH : `${utilization.toFixed(1)}%`} · ${fmtBytes(transferBytes)} over ${transfers} copies`,
+    });
+  }
+
   return {
     id,
     name,
@@ -466,18 +535,9 @@ function buildModelRow(id: string, snapshot: WireSnapshot | undefined, identity:
     kvText,
     cacheHit,
     workers,
-    vram: "reserved —", // no GPU surface yet; the mockup's VRAM column stays reserved-marked
+    vram,
     expandedByDefault: !embed,
-    detail: [
-      { label: "context / block size", value: `${contextTokens} / ${blockTokens}` },
-      { label: "kv_blocks budget", value: budget },
-      { label: "core set / quota", value: `${coreSet} / ${quota}` },
-      { label: "prefill · decode · kv residency", value: `${prefillDevice} · ${decodeDevice} · ${residency}` },
-      { label: "cache blocks (DRAM)", value: cacheBlocks },
-      { label: "finish tallies", value: tallies },
-      { label: "experts hot / cold", value: "n/a — dense model (MoE phase adds tier counts)" },
-      { label: "model RAM", value: modelRam },
-    ],
+    detail,
   };
 }
 

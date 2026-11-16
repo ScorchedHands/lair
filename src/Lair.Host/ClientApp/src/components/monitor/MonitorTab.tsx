@@ -22,8 +22,16 @@ export function MonitorTab({ hidden }: { hidden: boolean }) {
       <RecentTable rows={view.recent} />
 
       <div className="grid">
-        <KpiCard card={placeholderCards[0]!} placeholder />
-        <KpiCard card={placeholderCards[1]!} placeholder />
+        {view.gpuUtil ? (
+          <KpiCard card={{ ...placeholderCards[0]!, value: view.gpuUtil.value, sub: view.gpuUtil.sub }} />
+        ) : (
+          <KpiCard card={placeholderCards[0]!} placeholder />
+        )}
+        {view.pcieTransfer ? (
+          <KpiCard card={{ ...placeholderCards[1]!, value: view.pcieTransfer.value, sub: view.pcieTransfer.sub }} />
+        ) : (
+          <KpiCard card={placeholderCards[1]!} placeholder />
+        )}
         {view.processRam ? (
           <KpiCard card={{ ...placeholderCards[2]!, value: view.processRam.value, sub: view.processRam.sub }} />
         ) : (

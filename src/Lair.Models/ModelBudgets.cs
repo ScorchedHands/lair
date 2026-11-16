@@ -74,7 +74,7 @@ public enum BudgetTier
     Vram,
 
     /// <summary>Disk storage. A read-side resource's origin store; write-side bytes land there only where something writes them.</summary>
-    Nvme,
+    Disk,
 }
 
 /// <summary>The config key name of each budget tier, and the reverse read that decides which tiers are public vocabulary.</summary>
@@ -82,15 +82,15 @@ public static class BudgetTierNames
 {
     public const string Dram = "dram";
     public const string Vram = "vram";
-    public const string Nvme = "nvme";
+    public const string Disk = "disk";
 
     /// <summary>The tier names a chain may declare, in the priority order every legal chain follows.</summary>
-    public static IReadOnlyList<string> DeclaredNames { get; } = [Dram, Vram, Nvme];
+    public static IReadOnlyList<string> DeclaredNames { get; } = [Dram, Vram, Disk];
 
     public static string Of(BudgetTier tier) => tier switch
     {
         BudgetTier.Vram => Vram,
-        BudgetTier.Nvme => Nvme,
+        BudgetTier.Disk => Disk,
         _ => Dram,
     };
 
@@ -107,8 +107,8 @@ public static class BudgetTierNames
                 tier = BudgetTier.Vram;
                 return true;
 
-            case Nvme:
-                tier = BudgetTier.Nvme;
+            case Disk:
+                tier = BudgetTier.Disk;
                 return true;
 
             default:
@@ -279,13 +279,16 @@ public sealed record BudgetRequest
     /// <summary>The tiers opened pools can hold working copies at. A chain naming a tier outside this list resolves structurally and refuses here rather than dropping that position silently — the posture every unimplemented capability takes.</summary>
     public required IReadOnlyList<BudgetTier> OpenedPoolTiers { get; init; }
 
+    /// <summary>Tier positions an opened device-backed block pool backs for the KV resource specifically: accelerator memory holding persistent copies of declared blocks while compute and attention stay host-resident. A position named here counts toward KV working copies only — never weight slabs or activation buffers.</summary>
+    public IReadOnlyList<BudgetTier> OpenedKvPoolTiers { get; init; } = [];
+
     /// <summary>Whether opened state can write bytes out to disk storage for a write-side resource. False everywhere this build runs: nothing writes KV or activation material anywhere but system memory yet, so a chain asking for it reports what is missing.</summary>
     public bool DiskWriteSupport { get; init; }
 }
 
 /// <summary>
 /// Resolves declared budget chains into the value set a model's plan carries, and owns every rule that resolution enforces.
-/// A chain must name known tiers in priority order (<c>dram</c> ahead of <c>vram</c> ahead of <c>nvme</c>, any tier skippable)
+/// A chain must name known tiers in priority order (<c>dram</c> ahead of <c>vram</c> ahead of <c>disk</c>, any tier skippable)
 /// with no tier named twice; a ceiling binds only a tier its own chain names; and the read/write split decides which
 /// positions hold copies at all — a read-side resource's disk position is its origin store, legal only as the final position
 /// of its chain and never under a ceiling of ours because that storage already holds the complete set. Every other position
@@ -297,7 +300,7 @@ public sealed record BudgetRequest
 public static class ModelBudgets
 {
     /// <summary>The priority order every chain must follow, highest-priority residency first.</summary>
-    private static readonly BudgetTier[] PriorityOrder = [BudgetTier.Dram, BudgetTier.Vram, BudgetTier.Nvme];
+    private static readonly BudgetTier[] PriorityOrder = [BudgetTier.Dram, BudgetTier.Vram, BudgetTier.Disk];
 
     /// <summary>
     /// Resolves one model's declared chains against the pools its host opened. Each resource resolves independently: mixed
@@ -322,7 +325,7 @@ public static class ModelBudgets
         List<ResolvedBudgetChain> chains = [];
         foreach (BudgetChain chain in request.Declared)
         {
-            chains.Add(ResolveChain(model, chain, request.OpenedPoolTiers, request.DiskWriteSupport));
+            chains.Add(ResolveChain(model, chain, request.OpenedPoolTiers, request.OpenedKvPoolTiers, request.DiskWriteSupport));
         }
 
         return new ResolvedBudgetSet { Resources = [.. chains] };
@@ -427,10 +430,10 @@ public static class ModelBudgets
 
             // A read-side origin store already holds this resource's complete set outside LAIR's working copies, so a ceiling
             // of ours there can only misrepresent it. Skipping that check here would let a config carry a number nothing could honor.
-            if (chain.Resource == BudgetResource.Weights && cap.Key == BudgetTier.Nvme)
+            if (chain.Resource == BudgetResource.Weights && cap.Key == BudgetTier.Disk)
             {
                 throw new ModelException(
-                    $"model '{model}', budgets for resource '{resource}': a ceiling at tier '{BudgetTierNames.Of(BudgetTier.Nvme)}' is not meaningful — " +
+                    $"model '{model}', budgets for resource '{resource}': a ceiling at tier '{BudgetTierNames.Of(BudgetTier.Disk)}' is not meaningful — " +
                     $"'{resource}' reads its complete set from that storage already, so it caps only the tiers holding working copies ({CapUnitName(chain.Resource)})");
             }
         }
@@ -438,19 +441,22 @@ public static class ModelBudgets
         // A read-side resource's disk position is where its complete set already lives: legal only as the last position of its own chain.
         for (int index = 0; index < chain.Order.Count - 1; index++)
         {
-            if (chain.Order[index] == BudgetTier.Nvme && IsReadSide(chain.Resource))
+            if (chain.Order[index] == BudgetTier.Disk && IsReadSide(chain.Resource))
             {
                 throw new ModelException(
                     $"model '{model}', budgets for resource '{resource}': order [{DescribeOrder(chain.Order)}] names its origin store before the tier it demotes to — " +
-                    $"'{BudgetTierNames.Of(BudgetTier.Nvme)}' must be this chain's last position");
+                    $"'{BudgetTierNames.Of(BudgetTier.Disk)}' must be this chain's last position");
             }
         }
     }
 
     // The posture pass: every structural rule already holds, so each position either lands as the read-side origin store or needs an opened pool.
-    private static ResolvedBudgetChain ResolveChain(string model, BudgetChain chain, IReadOnlyList<BudgetTier> openedPools, bool diskWrites)
+    private static ResolvedBudgetChain ResolveChain(string model, BudgetChain chain, IReadOnlyList<BudgetTier> openedPools, IReadOnlyList<BudgetTier> openedKvPools, bool diskWrites)
     {
         string resource = DescribeResource(chain.Resource);
+
+        // Which positions an opened host backs is a per-resource answer: device-backed block pools back KV positions at the accelerator tier even while every weight slab and activation buffer this host opens lives in system memory.
+        IReadOnlyList<BudgetTier> openedForThisResource = chain.Resource == BudgetResource.Kv ? [.. openedPools, .. openedKvPools] : openedPools;
 
         List<ResolvedBudgetTier> positions = [];
 
@@ -459,7 +465,7 @@ public static class ModelBudgets
             BudgetTier tier = chain.Order[index];
 
             // A read-side origin store holds the complete set outside LAIR's working copies: no ceiling of ours describes it and no claim needs it.
-            if (tier == BudgetTier.Nvme && IsReadSide(chain.Resource))
+            if (tier == BudgetTier.Disk && IsReadSide(chain.Resource))
             {
                 positions.Add(new ResolvedBudgetTier { Tier = tier, IsOriginStore = true });
                 continue;
@@ -468,7 +474,7 @@ public static class ModelBudgets
             // Every other position holds a working copy LAIR owns, so it needs an opened pool of that residency. A CPU-only host
             // has the system-memory tier open only: an accelerator-resident claim names what is missing rather than dropping the
             // position its chain declared, and disk-backed write-side bytes name the writing machinery this build does not carry.
-            if (!ContainsTier(openedPools, tier))
+            if (!ContainsTier(openedForThisResource, tier))
             {
                 throw new ModelException(
                     $"model '{model}', budgets for resource '{resource}': no opened pool backs working copies at tier '{BudgetTierNames.Of(tier)}' — " +
@@ -486,13 +492,18 @@ public static class ModelBudgets
         return new ResolvedBudgetChain { Resource = chain.Resource, Tiers = [.. positions] };
     }
 
-    // What a claim against an unopened residency is missing: the accelerator seam for a compute-backed tier (the same seam route
-    // resolution names), and, for write-side bytes at the disk tier, whether this host writes them out at all — declared vocabulary
-    // in every case, never a silent drop.
+    // What a claim against an unopened residency is missing: for the accelerator tier, whether the resource needs a compute backend opened
+    // with device-resident weight copies or a device-backed pool that residency does not hold yet (the same seam route resolution names), and
+    // for write-side bytes at the disk tier, whether this host writes them out at all — declared vocabulary in every case, never a silent drop.
     private static string DescribeMissingCapability(string resource, BudgetTier tier, bool diskWrites) => tier switch
     {
+        BudgetTier.Vram when resource == BudgetResourceNames.Weights =>
+            $"'{resource}' resident in accelerator memory needs a compute backend opened with device-resident weight copies in " +
+            $"'{ModelRoute.CudaBackendSeam}', which this open has none",
+
         BudgetTier.Vram =>
-            $"accelerator-resident working copies run in '{ModelRoute.CudaBackendSeam}', which this build does not carry",
+            $"'{resource}' has no device-backed pool opened for it — accelerator memory holds weight copies today, and device-backed pools " +
+            $"for '{resource}' run in '{ModelRoute.CudaBackendSeam}' once they are opened",
 
         _ when !diskWrites =>
             $"'{resource}' has no disk-backed pool opened for it — write-side bytes reach storage only where something writes them, " +

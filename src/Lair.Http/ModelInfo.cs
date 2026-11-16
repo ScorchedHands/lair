@@ -1,3 +1,4 @@
+using Lair.Contracts;
 using Lair.Models;
 
 namespace Lair.Http;

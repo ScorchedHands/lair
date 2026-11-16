@@ -9,12 +9,12 @@ using Microsoft.Extensions.Hosting;
 namespace Lair.Tests;
 
 /// <summary>
-/// Wire-side budget attribution on the pinned Qwen3 fixture: a reasoning-capped exchange reports the reasoning ceiling, a
-/// response-capped exchange reports the response ceiling, and both keep the ordinary <c>finish_reason: length</c> vocabulary.
-/// The class skips cleanly when the pinned model file is absent.
-/// </summary>
+    /// Wire-side budget attribution on the pinned Qwen3 fixture: a reasoning-capped exchange reports the reasoning ceiling, a
+    /// response-capped exchange reports the response ceiling, and both keep the ordinary <c>finish_reason: length</c> vocabulary.
+    /// The class skips cleanly when the pinned model file is absent, and its live-server bursts run in the serialized API lane so unrelated suites cannot starve this measurement under shared-host load.
+    /// </summary>
 [Trait("Category", "Api")]
-[Collection("model-loaded")]
+[Collection("lair-api-serialized")]
 public sealed class TokenBudgetAttributionApiTests
 {
     private const string ModelRelativePath = "models/Qwen3-0.6B-Q8_0.gguf";
