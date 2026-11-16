@@ -134,9 +134,9 @@ IQ4_XS wins: fastest decode (≈12% over the Q4_K_M baseline) on a smaller file.
 ```powershell
 copy lair.example.yaml lair.yaml   # point at a real model
 dotnet run --project src/Lair.Host -- serve -c lair.yaml
-curl http://127.0.0.1:8080/healthz
+curl.exe http://127.0.0.1:8181/healthz   # the example config sets server.port: 8181
 dotnet run --project src/Lair.Host -- chat -c lair.yaml
-dotnet run --project src/Lair.Host -- monitor   # live engine stats table from the serving server
+dotnet run --project src/Lair.Host -- monitor -u http://127.0.0.1:8181 --interval 1000   # live engine stats table from the serving server; monitor needs at least one option
 ```
 
 Editing `lair.yaml` while `serve` runs hot-reloads live knobs (batch width, thread quota, KV budget) and new-request-only knobs; restart-only fields are refused with a log line.

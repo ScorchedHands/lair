@@ -1,6 +1,7 @@
 # LAIR configuration example.
-# Copy to lair.yaml and adjust; `models` must list exactly one model and `path`
-# must point at a GGUF file that exists on disk.
+# Copy to lair.yaml and adjust; `models` must list exactly one model, and `path`
+# must name a GGUF file that exists on disk — unless the entry declares `source:`,
+# which lets load fetch the pinned artifact when that file is absent.
 
 server:
   bind: 127.0.0.1
@@ -19,8 +20,8 @@ engine:
 #   # nvme_path: D:\       # optional presence-only NVMe tier marker
 #   # nodes:               # optional per-node overrides keyed by reported node index
 #   #   - index: 0
-#   #     dram_mb: 32768
-#   #     dram_cores: 16
+#   #     mb: 32768        # per-node byte override (not dram_mb — that key belongs to tiers)
+#   #     cores: 16        # per-node logical-processor override
 
 models:
   - name: smollm-135m-instruct-q8_0
@@ -51,9 +52,20 @@ models:
       thread_quota: 8    # optional; caps this model's workers at 8 regardless of engine threads
       # core_overcommit: false # optional; restart-only; relaxes pinned core-set disjointness for this model only
       # numa_spread: auto      # optional; auto | local | interleave — auto chooses least-loaded node, local follows a pinned set, interleave spreads across reported nodes
+    # budgets:                 # optional per-resource tier ceilings; each resource gets its own ordered chain and its own caps
+    #   weights:
+    #     order: [dram, nvme]  # nvme is terminal here and takes no ceiling — disk already holds the complete set
+    #   kv:
+    #     order: [dram]
+    #     caps:
+    #       dram_blocks: 256   # canonical spelling of kv_blocks; both may appear only when they state the same number
+    #   prefill_buffers:
+    #     order: [dram]
+    #     caps:
+    #       dram_mb: 512       # narrows the effective prompt-window row width when the engine opens
 
-  # - name: smollm-135m-instruct-q4_k_m
-  #   path: models/smollm-135m-instruct-q4_k_m.gguf   # requires Q4_K_M family support — v0.3.1
+  # - name: smollm-135m-instruct-q4_k_m   # commented because this build serves exactly one model
+  #   path: models/smollm-135m-instruct-q4_k_m.gguf
   #   type: chat
   #   max_context_tokens: 4096
   #   kv_blocks: 256
