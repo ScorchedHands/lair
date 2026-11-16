@@ -304,13 +304,19 @@ public sealed class PrefillStepBudgetSelectionTests : IDisposable
         // only part of that long prompt — the shorts advance while its chunked prefill is still running.
         List<long> partialPrefillTokensA = [];
         List<long> partialPrefillTokensB = [];
+        System.Threading.ManualResetEventSlim allAdmitted = new(false);
+
         PipelineHandle firstShort = harness.Scheduler.Submit(
-            Request(shortA, 6, _ => { partialPrefillTokensA.Add(harness.Scheduler.Stats.PrefillTokensForwarded); Thread.Sleep(20); }),
+            Request(shortA, 6, _ => { if (!allAdmitted.Wait(System.TimeSpan.FromSeconds(10))) throw new System.TimeoutException("prefill concurrency gate did not admit three pipelines"); partialPrefillTokensA.Add(harness.Scheduler.Stats.PrefillTokensForwarded); Thread.Sleep(20); }),
             CancellationToken.None);
+
         PipelineHandle secondShort = harness.Scheduler.Submit(
-            Request(shortB, 6, _ => { partialPrefillTokensB.Add(harness.Scheduler.Stats.PrefillTokensForwarded); Thread.Sleep(20); }),
+            Request(shortB, 6, _ => { if (!allAdmitted.Wait(System.TimeSpan.FromSeconds(10))) throw new System.TimeoutException("prefill concurrency gate did not admit three pipelines"); partialPrefillTokensB.Add(harness.Scheduler.Stats.PrefillTokensForwarded); Thread.Sleep(20); }),
             CancellationToken.None);
+
         PipelineHandle longPrefill = harness.Scheduler.Submit(Request(longPrompt, 8), CancellationToken.None);
+
+        allAdmitted.Set();
 
         SequenceOutcome[] outcomes = await Task.WhenAll(firstShort.Completion, secondShort.Completion, longPrefill.Completion);
 
