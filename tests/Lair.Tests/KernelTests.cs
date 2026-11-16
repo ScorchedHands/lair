@@ -42,8 +42,15 @@ public class KernelTests
             float[] output = new float[rows];
             backend.Gemv(x, new WeightRef(weights, MatrixShape(rows, cols), format), output);
 
-            (double[] expected, double[] magnitudes) = OracleDot(x, weights, rows, cols, format);
-            AssertClose(output, expected, magnitudes, relativeTolerance: 1e-4, $"scalar {format} GEMV at {rows}x{cols}");
+            if (UsesQ8KActivation(format))
+            {
+                AssertExact(output, OracleDotQ8K(x, weights, rows, cols, format), $"scalar {format} GEMV at {rows}x{cols}");
+            }
+            else
+            {
+                (double[] expected, double[] magnitudes) = OracleDot(x, weights, rows, cols, format);
+                AssertClose(output, expected, magnitudes, relativeTolerance: 1e-4, $"scalar {format} GEMV at {rows}x{cols}");
+            }
         }
     }
 
@@ -79,6 +86,13 @@ public class KernelTests
             WeightRef w = new(weights, MatrixShape(rows, cols), format);
             scalar.Gemv(x, w, expected);
             avx2.Gemv(x, w, actual);
+
+            if (UsesQ8KActivation(format))
+            {
+                // Both paths sum the same exact integer totals, so their float accumulation must land on identical bits.
+                AssertExact(actual, expected, $"AVX2 vs scalar {format} GEMV at {rows}x{cols}");
+                continue;
+            }
 
             // Bound the difference by eps-like accumulation scale: dot-product reassociation noise grows with sum|x*w|,
             // not with a near-zero output value. The oracle magnitudes provide that scale without sharing kernel code.
@@ -159,8 +173,15 @@ public class KernelTests
             float[] output = new float[rows];
             backend.Gemv(x, new WeightRef(weights, MatrixShape(rows, cols), format), output);
 
-            (double[] expected, double[] magnitudes) = OracleDot(x, weights, rows, cols, format);
-            AssertClose(output, expected, magnitudes, relativeTolerance: 1e-4, $"AVX2 {format} GEMV at {rows}x{cols}");
+            if (UsesQ8KActivation(format))
+            {
+                AssertExact(output, OracleDotQ8K(x, weights, rows, cols, format), $"AVX2 {format} GEMV at {rows}x{cols}");
+            }
+            else
+            {
+                (double[] expected, double[] magnitudes) = OracleDot(x, weights, rows, cols, format);
+                AssertClose(output, expected, magnitudes, relativeTolerance: 1e-4, $"AVX2 {format} GEMV at {rows}x{cols}");
+            }
         }
     }
 
@@ -345,9 +366,6 @@ public class KernelTests
                 float[] gemvOut = new float[rows];
                 avx2.Gemv(x, w, gemvOut);
 
-                (double[] oracle, double[] magnitudes) = OracleDot(x, weights, rows, cols, format);
-                AssertClose(gemvOut, oracle, magnitudes, relativeTolerance: 1e-4, $"packed vs {format} GEMV at {rows}x{cols}");
-
                 float[] row0 = new float[cols];
                 avx2.DequantRow(w, 0, row0);
                 double manualDot = 0;
@@ -356,7 +374,30 @@ public class KernelTests
                     manualDot += (double)x[i] * row0[i];
                 }
 
-                Assert.True(Math.Abs(gemvOut[0] - manualDot) <= 1e-4 * Math.Max(1e-6, magnitudes[0]), $"{format}: Gemv(row0) vs dequant-row dot mismatch");
+                if (UsesQ8KActivation(format))
+                {
+                    // The packed GEMV dots against a Q8_K quantization of the activation here, so both this cross-check and
+                    // the dequant-row dot must be compared against that same integer reference rather than an FP product.
+                    AssertExact(gemvOut, OracleDotQ8K(x, weights, rows, cols, format), $"packed vs {format} GEMV at {rows}x{cols}");
+
+                    (byte[] qaRow, float[] daRow) = QuantizeActivationQ8K(x, cols);
+                    double quantizedDequantDot = 0;
+                    for (int i = 0; i < cols; i++)
+                    {
+                        quantizedDequantDot += row0[i] * (sbyte)qaRow[i] * daRow[i / 256];
+                    }
+
+                    Assert.True(
+                        Math.Abs(gemvOut[0] - quantizedDequantDot) <= 1e-4 * Math.Max(1e-6, Math.Abs(quantizedDequantDot)),
+                        $"{format}: Gemv(row0) vs dequant-row dot mismatch");
+                }
+                else
+                {
+                    (double[] oracle, double[] magnitudes) = OracleDot(x, weights, rows, cols, format);
+                    AssertClose(gemvOut, oracle, magnitudes, relativeTolerance: 1e-4, $"packed vs {format} GEMV at {rows}x{cols}");
+
+                    Assert.True(Math.Abs(gemvOut[0] - manualDot) <= 1e-4 * Math.Max(1e-6, magnitudes[0]), $"{format}: Gemv(row0) vs dequant-row dot mismatch");
+                }
             }
         }
     }
@@ -988,9 +1029,20 @@ public class KernelTests
             scalar.Gemv(x, w, actualScalar);
             avx2.Gemv(x, w, actualAvx2);
 
-            (double[] expected, double[] magnitudes) = OracleDot(x, weights, rows, cols, format);
-            AssertClose(actualScalar, expected, magnitudes, relativeTolerance: 1e-4, $"scalar {format} partial final block at {rows}x{cols}");
-            AssertClose(actualAvx2, expected, magnitudes, relativeTolerance: 1e-4, $"avx2 {format} partial final block at {rows}x{cols}");
+            if (UsesQ8KActivation(format))
+            {
+                // The padded tail columns quantize to zero quants under the real block scale, so whole sub-blocks are
+                // consumed and both paths must still land on the integer oracle bit-for-bit.
+                float[] expectedExact = OracleDotQ8K(x, weights, rows, cols, format);
+                AssertExact(actualScalar, expectedExact, $"scalar {format} partial final block at {rows}x{cols}");
+                AssertExact(actualAvx2, expectedExact, $"avx2 {format} partial final block at {rows}x{cols}");
+            }
+            else
+            {
+                (double[] expected, double[] magnitudes) = OracleDot(x, weights, rows, cols, format);
+                AssertClose(actualScalar, expected, magnitudes, relativeTolerance: 1e-4, $"scalar {format} partial final block at {rows}x{cols}");
+                AssertClose(actualAvx2, expected, magnitudes, relativeTolerance: 1e-4, $"avx2 {format} partial final block at {rows}x{cols}");
+            }
 
             // The dequant expansion of the same padded row must agree bit-for-bit across paths.
             float[] rowScalar = new float[cols];
@@ -1039,6 +1091,119 @@ public class KernelTests
         byte[] tooShort = new byte[packed.Length - 1];
         Assert.Throws<ArgumentException>(
             () => backend.DequantRow(new WeightRef(tooShort, shape, format), 0, new float[70]));
+    }
+
+    // Exact gates for the integer-dot path: scalar and AVX2 kernels must land on identical bits, batched GEMV must
+    // reproduce solo GEMV bit-for-bit over the same quantized activation, one-thread and four-thread runs must agree, and
+    // every result has to equal an independently written reference over Q8_K quants. No tolerance participates here.
+    [Theory]
+    [InlineData(QuantFormat.IQ2_XXS)]
+    [InlineData(QuantFormat.IQ2_XS)]
+    [InlineData(QuantFormat.IQ2_S)]
+    [InlineData(QuantFormat.IQ3_XXS)]
+    [InlineData(QuantFormat.IQ3_S)]
+    public void Gemv_Q8KFormats_ScalarAndAvx2_AreBitIdentical(QuantFormat format)
+    {
+        foreach ((int rows, int cols) in MatrixSizes)
+        {
+            (float[] x, byte[] weights) = CreateCase(rows, cols, format, seed: 31415);
+
+            using CpuBackend scalar = new(threads: 1, allowAvx2: false);
+            using CpuBackend avx2 = new(threads: 1, allowAvx2: true);
+
+            float[] fromScalar = new float[rows];
+            float[] fromAvx2 = new float[rows];
+            WeightRef w = new(weights, MatrixShape(rows, cols), format);
+            scalar.Gemv(x, w, fromScalar);
+            avx2.Gemv(x, w, fromAvx2);
+
+            AssertExact(fromAvx2, fromScalar, $"{format} avx2 vs scalar GEMV at {rows}x{cols}");
+        }
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.IQ2_XXS)]
+    [InlineData(QuantFormat.IQ2_XS)]
+    [InlineData(QuantFormat.IQ2_S)]
+    [InlineData(QuantFormat.IQ3_XXS)]
+    [InlineData(QuantFormat.IQ3_S)]
+    public void GemvBatch_Q8KFormats_MatchSoloGemvAndIntegerOracleExactly(QuantFormat format)
+    {
+        foreach ((int rows, int cols) in MatrixSizes)
+        {
+            (_, byte[] weights) = CreateCase(rows, cols, format, seed: 2718);
+
+            foreach (int count in new[] { 1, 3, 8 })
+            {
+                float[] inputs = NextFloats(new Random(900 + count), count * cols);
+                WeightRef w = new(weights, MatrixShape(rows, cols), format);
+
+                using CpuBackend soloAvx2 = new(threads: 1, allowAvx2: true);
+                using CpuBackend batch = new(threads: 1, allowAvx2: true);
+
+                float[] fromSolo = new float[count * rows];
+                for (int b = 0; b < count; b++)
+                {
+                    soloAvx2.Gemv(inputs.AsSpan(b * cols, cols), w, fromSolo.AsSpan(b * rows, rows));
+                }
+
+                float[] batchOut = new float[count * rows];
+                batch.GemvBatch(inputs, count, w, batchOut);
+                AssertExact(batchOut, fromSolo, $"{format} batch({count}) vs solo GEMV at {rows}x{cols}");
+
+                // The same numbers against the independent integer reference: each vector's own quantized activation.
+                for (int b = 0; b < count; b++)
+                {
+                    float[] slice = new float[cols];
+                    Array.Copy(inputs, (long)b * cols, slice, 0, cols);
+
+                    AssertExact(
+                        batchOut.AsSpan(b * rows, rows),
+                        OracleDotQ8K(slice, weights, rows, cols, format),
+                        $"{format} batch({count}) vector {b} vs integer oracle at {rows}x{cols}");
+                }
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.IQ2_XXS)]
+    [InlineData(QuantFormat.IQ2_XS)]
+    [InlineData(QuantFormat.IQ2_S)]
+    [InlineData(QuantFormat.IQ3_XXS)]
+    [InlineData(QuantFormat.IQ3_S)]
+    public void Gemv_Q8KFormats_OneThreadAndFourThreads_AreBitIdentical(QuantFormat format)
+    {
+        foreach ((int rows, int cols) in MatrixSizes)
+        {
+            (float[] x, byte[] weights) = CreateCase(rows, cols, format, seed: 4242);
+
+            using CpuBackend single = new(threads: 1);
+            using CpuBackend parallel = new(threads: 4);
+
+            float[] oneThread = new float[rows];
+            float[] fourThreads = new float[rows];
+            WeightRef w = new(weights, MatrixShape(rows, cols), format);
+            single.Gemv(x, w, oneThread);
+            parallel.Gemv(x, w, fourThreads);
+
+            AssertExact(fourThreads, oneThread, $"{format} 4-thread vs 1-thread GEMV at {rows}x{cols}");
+        }
+    }
+
+    // Bit-exact comparison: int32 bit patterns, so signed zeros and NaN payloads count as differences too.
+    private static void AssertExact(ReadOnlySpan<float> actual, ReadOnlySpan<float> expected, string context)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+
+        for (int i = 0; i < actual.Length; i++)
+        {
+            int actualBits = BitConverter.SingleToInt32Bits(actual[i]);
+            int expectedBits = BitConverter.SingleToInt32Bits(expected[i]);
+            Assert.True(
+                actualBits == expectedBits,
+                $"{context}: output[{i}] diverges ({actual[i]:G9} / 0x{actualBits:X8} vs {expected[i]:G9} / 0x{expectedBits:X8})");
+        }
     }
 
     private static TensorShape MatrixShape(int rows, int cols) => new([rows, cols]);
@@ -3224,6 +3389,250 @@ public class KernelTests
         }
 
         return (expected, magnitudes);
+    }
+
+    // The five sub-4-bit i-quants dot against a Q8_K quantization of the activation, so their expected values come from
+    // an integer oracle rather than from a float dequant-and-dot of the same weights.
+    private static bool UsesQ8KActivation(QuantFormat format) =>
+        format is QuantFormat.IQ2_XXS or QuantFormat.IQ2_XS or QuantFormat.IQ2_S or QuantFormat.IQ3_XXS or QuantFormat.IQ3_S;
+
+    // Test-side Q8_K quantization of the activation, mirroring the published block_q8_K semantics: the signed value
+    // carrying the largest magnitude picks the scale, iscale = -127/max negates it so every stored quant lands in
+    // [-127, 127], nearest_int rounds to nearest with ties to even, an all-zero super-block gets a zero scale, and
+    // columns past cols store zero quants under the real block scale. One copy serves every row of one GEMV call.
+    private static (byte[] Quants, float[] Scales) QuantizeActivationQ8K(float[] x, int cols)
+    {
+        int blocks = (cols + 255) / 256;
+        byte[] quants = new byte[blocks * 256];
+        float[] scales = new float[blocks];
+
+        for (int i = 0; i < blocks; i++)
+        {
+            int start = i * 256;
+            int limit = Math.Min(256, cols - start); // never negative: blocks covers exactly the real columns' super-blocks.
+
+            float amax = 0f;
+            float max = 0f;
+            for (int j = 0; j < limit; j++)
+            {
+                float v = x[start + j];
+                if (Math.Abs(v) > amax)
+                {
+                    amax = Math.Abs(v);
+                    max = v; // the published scan keeps the first strict improvement, sign included.
+                }
+            }
+
+            if (amax == 0f)
+            {
+                continue; // scale zero and quants zero: this super-block contributes nothing to any dot.
+            }
+
+            float iscale = -127f / max;
+            for (int j = 0; j < limit; j++)
+            {
+                int v = Math.Min(127, (int)Math.Round(iscale * x[start + j], MidpointRounding.ToEven)); // nearest_int then clamped high
+                quants[start + j] = (byte)(sbyte)v;
+            }
+
+            scales[i] = 1f / iscale;
+        }
+
+        return (quants, scales);
+    }
+
+    private static ushort HalfAt(byte[] weights, int offset) => (ushort)(weights[offset] | (weights[offset + 1] << 8));
+
+    private static uint ReadU32(byte[] weights, int offset) =>
+        (uint)(weights[offset] | (weights[offset + 1] << 8) | (weights[offset + 2] << 16) | (weights[offset + 3] << 24));
+
+    // One integer product of the dot: an unsigned grid magnitude times a sign-folded activation quant. The quants are
+    // stored as raw bytes holding two's-complement values, so they must land on sbyte before any arithmetic - folding the
+    // sign onto them is what the reference does, and it keeps every partial inside int32 exactly.
+    private static int ProductQ8K(int magnitude, byte[] quants, int column, int signs, int bit) =>
+        magnitude * ((signs & (1 << bit)) != 0 ? -(sbyte)quants[column] : (sbyte)quants[column]);
+
+    // Independent integer-dot oracle for the five sub-4-bit formats, written from the published reference shape: grid
+    // magnitudes stay unsigned, each group's sign row folds onto the activation quant, every sub-block total is an exact
+    // int32 under its ls scale factor (one ls per IQ3 super-block pair member and per IQ3_XXS/IQ2_XXS sub-block; two nibble
+    // scales split the IQ2_XS/IQ2_S sub-block in half), one float add per super-block combines d * bsum in block order,
+    // and the format's final factor (0.125f for the IQ2 family, 0.25f for IQ3_XXS, none for IQ3_S) lands once at the end.
+    // Everything before that float step is exact integer arithmetic, which is why both kernel paths and this oracle have
+    // to agree bit-for-bit regardless of how each one groups lanes or sums partials.
+    private static float[] OracleDotQ8K(float[] x, byte[] weights, int rows, int cols, QuantFormat format)
+    {
+        (byte[] qa, float[] da) = QuantizeActivationQ8K(x, cols); // one shared quantization per GEMV call, like the engine's scratch buffer
+        int blocks = (cols + 255) / 256;
+        int blockBytes = format switch
+        {
+            QuantFormat.IQ2_XXS => 66,
+            QuantFormat.IQ2_XS => 74,
+            QuantFormat.IQ2_S => 82,
+            QuantFormat.IQ3_XXS => 98,
+            _ => 110, // IQ3_S
+        };
+
+        float finalFactor = format switch
+        {
+            QuantFormat.IQ3_XXS => 0.25f,
+            QuantFormat.IQ3_S => 1f, // IQ3_S carries its scale in ls itself: the reference applies no final factor
+            _ => 0.125f, // the IQ2 family scales once at the end of the row
+        };
+
+        float[] output = new float[rows];
+
+        for (int row = 0; row < rows; row++)
+        {
+            int rowBase = row * blocks * blockBytes; // rows are stored whole super-block by whole super-block, so the stride is blocks-wide
+            float sumf = 0f;
+
+            for (int b = 0; b < blocks; b++)
+            {
+                int blk = rowBase + b * blockBytes;
+                float d = (float)BitConverter.Int16BitsToHalf((short)HalfAt(weights, blk)) * da[b]; // weight half first, then the activation block scale
+                int bsum = 0;
+
+                for (int ib = 0; ib < 8; ib++)
+                {
+                    int subBase = b * 256 + ib * 32;
+
+                    switch (format)
+                    {
+                        case QuantFormat.IQ2_XXS:
+                        {
+                            uint gridAux = ReadU32(weights, blk + 2 + 8 * ib); // four grid indices of the sub-block's groups
+                            uint signAux = ReadU32(weights, blk + 6 + 8 * ib); // four seven-bit sign codes plus the scale code at bits 28..31
+
+                            int sumi = 0;
+                            for (int l = 0; l < 4; l++)
+                            {
+                                ulong entry = Iq2XXSGridU64[(int)((gridAux >> (8 * l)) & 0xFF)]; // one entry covers a whole eight-value group
+                                int signs = KSignsIQ2Xs[(signAux >> (7 * l)) & 127];
+
+                                for (int j = 0; j < 8; j++)
+                                {
+                                    sumi += ProductQ8K((int)((entry >> (8 * j)) & 0xFF), qa, subBase + l * 8 + j, signs, j);
+                                }
+                            }
+
+                            bsum += sumi * (2 * (int)(signAux >> 28) + 1); // ls = 2*code + 1
+                            break;
+                        }
+
+                        case QuantFormat.IQ2_XS:
+                        {
+                            byte scaleByte = weights[blk + 66 + ib]; // low nibble scales groups 0..1, high nibble groups 2..3
+
+                            int lo = 0;
+                            int hi = 0;
+                            for (int l = 0; l < 4; l++)
+                            {
+                                int word = weights[blk + 2 + 8 * ib + 2 * l] | (weights[blk + 3 + 8 * ib + 2 * l] << 8); // nine-bit index and seven-bit sign code in one word
+                                ulong entry = Iq2XSGridU64[word & 511];
+                                int signs = KSignsIQ2Xs[word >> 9];
+
+                                for (int j = 0; j < 8; j++)
+                                {
+                                    if (l < 2)
+                                    {
+                                        lo += ProductQ8K((int)((entry >> (8 * j)) & 0xFF), qa, subBase + l * 8 + j, signs, j);
+                                    }
+                                    else
+                                    {
+                                        hi += ProductQ8K((int)((entry >> (8 * j)) & 0xFF), qa, subBase + l * 8 + j, signs, j);
+                                    }
+                                }
+                            }
+
+                            bsum += lo * (2 * (scaleByte & 0xF) + 1); // the reference splits sumi at the halfway point of the sub-block
+                            bsum += hi * (2 * (scaleByte >> 4) + 1);
+                            break;
+                        }
+
+                        case QuantFormat.IQ2_S:
+                        {
+                            byte scaleByte = weights[blk + 74 + ib]; // low nibble scales groups 0..1, high nibble groups 2..3
+                            int qh = weights[blk + 66 + ib]; // the two ninth index bits of each group
+
+                            int lo = 0;
+                            int hi = 0;
+                            for (int l = 0; l < 4; l++)
+                            {
+                                int gi = weights[blk + 2 + 4 * ib + l] | (((qh >> (2 * l)) & 1) << 8) | (((qh >> (2 * l + 1)) & 1) << 9); // nine-bit grid index
+                                ulong entry = Iq2SGridU64[gi];
+
+                                for (int j = 0; j < 8; j++)
+                                {
+                                    int product = ProductQ8K((int)((entry >> (8 * j)) & 0xFF), qa, subBase + l * 8 + j, weights[blk + 34 + 4 * ib + l], j); // raw sign byte from the sign plane at qs + QK_K/8
+                                    if (l < 2)
+                                    {
+                                        lo += product;
+                                    }
+                                    else
+                                    {
+                                        hi += product;
+                                    }
+                                }
+                            }
+
+                            bsum += (1 + 2 * (scaleByte & 0xF)) * lo; // ls1*sumi1 + ls2*sumi2, as the reference pairs them
+                            bsum += (1 + 2 * (scaleByte >> 4)) * hi;
+                            break;
+                        }
+
+                        case QuantFormat.IQ3_XXS:
+                        {
+                            uint aux = ReadU32(weights, blk + 66 + 4 * ib); // four seven-bit sign codes plus the scale code at bits 28..31
+
+                            int sumi = 0;
+                            for (int l = 0; l < 4; l++)
+                            {
+                                uint entryA = Iq3XXSGridU32[weights[blk + 2 + 8 * ib + 2 * l]]; // low four values of the group
+                                uint entryB = Iq3XXSGridU32[weights[blk + 2 + 8 * ib + 2 * l + 1]]; // high four values
+                                int signs = KSignsIQ2Xs[(aux >> (7 * l)) & 127];
+
+                                for (int j = 0; j < 4; j++)
+                                {
+                                    sumi += ProductQ8K((int)((entryA >> (8 * j)) & 0xFF), qa, subBase + l * 8 + j, signs, j);
+                                    sumi += ProductQ8K((int)((entryB >> (8 * j)) & 0xFF), qa, subBase + l * 8 + 4 + j, signs, 4 + j);
+                                }
+                            }
+
+                            bsum += sumi * (2 * (int)(aux >> 28) + 1); // ls = 2*code + 1 covers the whole sub-block
+                            break;
+                        }
+
+                        default: // IQ3_S
+                        {
+                            int ls = 1 + 2 * ((weights[blk + 106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xF); // the scale code half of byte ib/2, as ls = 2*code + 1
+                            int qh = weights[blk + 66 + ib]; // bit 2l completes group l's low index and bit 2l+1 its high index
+
+                            int sumi = 0;
+                            for (int l = 0; l < 4; l++)
+                            {
+                                uint entryA = Iq3SGridU32[weights[blk + 2 + 8 * ib + 2 * l] | (((qh >> (2 * l)) & 1) << 8)];
+                                uint entryB = Iq3SGridU32[weights[blk + 2 + 8 * ib + 2 * l + 1] | (((qh >> (2 * l + 1)) & 1) << 8)];
+
+                                for (int j = 0; j < 4; j++)
+                                {
+                                    sumi += ProductQ8K((int)((entryA >> (8 * j)) & 0xFF), qa, subBase + l * 8 + j, weights[blk + 74 + 4 * ib + l], j); // raw sign byte per group
+                                    sumi += ProductQ8K((int)((entryB >> (8 * j)) & 0xFF), qa, subBase + l * 8 + 4 + j, weights[blk + 74 + 4 * ib + l], 4 + j);
+                                }
+                            }
+
+                            bsum += sumi * ls; // no final factor for IQ3_S: the scale lives in ls
+                            break;
+                        }
+                    }
+                }
+
+                sumf += d * bsum; // one float add per super-block, in block order, exactly as the reference dots do it
+            }
+
+            output[row] = finalFactor * sumf;
+        }
+
+        return output;
     }
 
     private static void AssertClose(ReadOnlySpan<float> actual, ReadOnlySpan<double> expected, ReadOnlySpan<double> scale, double relativeTolerance, string context)

@@ -1444,7 +1444,7 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the host-
 - [X] **CPU GEMV flake under MVP4 gates** — the Backlog defect row "Intermittent `AccessViolationException` in the AVX2 Q4_K GEMV worker under three resident engines" sits underneath every MVP4 gate that runs real models on the CPU side of a cross-device comparison; diagnose it before MVP4 build starts so a CPU-path crash is not misattributed to the CUDA backend.
   - Decision: moved into MVP4 as an implementation item rather than left open, because the diagnosis has code-visible evidence and gates but no unresolved design question.
 
-### MVP5 [v0.5.0] - Refined
+### MVP5 [v0.5.0] - In Progress
 
 Sub-4-bit i-quants decode at the Q4_K/IQ4_XS cost on AVX2, not the measured ≈6.5× baseline.
 
@@ -1480,7 +1480,7 @@ Sub-4-bit i-quants decode at the Q4_K/IQ4_XS cost on AVX2, not the measured ≈6
 
 #### Implementation Items
 
-- [_] Integer-dot GEMV for `IQ3_XXS`/`IQ3_S`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S` — decode-once/apply-per-token `maddubs`+`maddwd` against `Q8_K`, packed grids, sign folded onto the activation (see DN-M5-1)
+- [✓] Integer-dot GEMV for `IQ3_XXS`/`IQ3_S`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S` — decode-once/apply-per-token `maddubs`+`maddwd` against `Q8_K`, packed grids, sign folded onto the activation (see DN-M5-1)
   - Verify: `dotnet test -c Release --filter Category=Kernel` — integer-dot output bit-identical to the ik-derived scalar oracle across representative super-blocks, batch equals solo, 1-thread equals 4-thread; `Category=Parity` bands unchanged in width against the ik-pinned IQ fixtures (see DN-M5-5).
 - [_] AVX-VNNI integer-dot variant + `engine.cpu.isa` selection — `vpdpwssd`/`vpdpbusd` kernels alongside the AVX2 path; `auto` picks the highest available from a capability probe (the same probe that resolves the DN-M5-3 gather-vs-scalar encoding), and an explicit `avx2` / `avx-vnni` forces that path or fails the load naming the missing feature when absent (see DN-M5-4)
   - Verify: `dotnet test -c Release --filter Category=Kernel|Config` — VNNI and AVX2 kernels are bit-identical to each other and to the re-pinned reference across representative super-blocks (batch==solo, 1T==4T); `auto` selects VNNI on the 13900K and AVX2 on the E5-2683 v4; forcing `avx-vnni` on a non-VNNI host fails the load naming the feature, while both forced paths pass the same gate.
