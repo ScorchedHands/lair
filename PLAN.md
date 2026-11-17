@@ -1487,7 +1487,7 @@ Sub-4-bit i-quants decode at the Q4_K/IQ4_XS cost on AVX2, not the measured ≈6
   - Verify: `dotnet test -c Release --filter Category=Kernel` — integer-dot output bit-identical to the ik-derived scalar oracle across representative super-blocks, batch equals solo, 1-thread equals 4-thread; `Category=Parity` bands unchanged in width against the ik-pinned IQ fixtures (see DN-M5-5).
 - [✓] AVX-VNNI integer-dot variant + `engine.cpu.isa` selection — `vpdpwssd`/`vpdpbusd` kernels alongside the AVX2 path; `auto` picks the highest available from a capability probe (the same probe that resolves the DN-M5-3 gather-vs-scalar encoding), and an explicit `avx2` / `avx-vnni` forces that path or fails the load naming the missing feature when absent (see DN-M5-4)
   - Verify: `dotnet test -c Release --filter Category=Kernel|Config` — VNNI and AVX2 kernels are bit-identical to each other and to the re-pinned reference across representative super-blocks (batch==solo, 1T==4T); `auto` selects VNNI on the 13900K and AVX2 on the E5-2683 v4; forcing `avx-vnni` on a non-VNNI host fails the load naming the feature, while both forced paths pass the same gate.
-- [→] Activation-quant contract — quantize the activation to `Q8_K`/`Q8_0` once per forward, shared across the batch, with the Q8_K super-block scale rule and sub-block weight scales (see DN-M5-2)
+- [✓] Activation-quant contract — quantize the activation to `Q8_K`/`Q8_0` once per forward, shared across the batch, with the Q8_K super-block scale rule and sub-block weight scales (see DN-M5-2)
   - Verify: a scalar FP-activation oracle now diverges from the quantized-activation reference by >1e-3 on IQ fixtures, proving the contract binds; Parity gate passes with regenerated calibrated logprob entries against the committed b12032 reference at unchanged band widths.
 - [_] Weight-row prefetch + gather-vs-scalar probe — stream rows ~2 KB ahead and pick grid encoding from a measured CPU-class value resolved at engine open (see DN-M5-3)
   - Verify: `bench/` `gemv-file` shows the prefetched path ≥ unprefetched on the pinned IQ fixtures; both encodings bit-identical.
@@ -1498,9 +1498,9 @@ Sub-4-bit i-quants decode at the Q4_K/IQ4_XS cost on AVX2, not the measured ≈6
 
 #### Tests
 
-- [_] Automated Kernel: integer-dot GEMV bit-identity vs the ik-derived scalar oracle for every sub-4-bit i-quant (scalar-vs-AVX2-vs-AVX-VNNI, batch==solo, 1T==4T)
+- [✓] Automated Kernel: integer-dot GEMV bit-identity vs the ik-derived scalar oracle for every sub-4-bit i-quant (scalar-vs-AVX2-vs-AVX-VNNI, batch==solo, 1T==4T)
 - [_] Automated Config: `engine.cpu.isa` auto-picks the highest available path on each target, an explicit override forces its path, and forcing an absent ISA fails the load naming the feature; the resolved `(isa, gather-mode)` pair appears in the config fingerprint and the monitor model line
-- [_] Automated Parity: sub4-bit integer-dot fixtures retain b12032 top-logprob references, regenerate LAIR calibration entries from current output, and pass unchanged reproduction/cross-tool bands with drift recorded — no band widened
+- [✓] Automated Parity: sub4-bit integer-dot fixtures retain b12032 top-logprob references, regenerate LAIR calibration entries from current output, and pass unchanged reproduction/cross-tool bands with drift recorded — no band widened
 - [_] Manual Quant Recommendation: read the re-measured bench and confirm the documented pick follows speed, not file size
 
 #### Open Items

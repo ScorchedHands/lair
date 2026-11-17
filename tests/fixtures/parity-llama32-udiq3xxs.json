@@ -8,7 +8,7 @@
     "temperature": 0.0,
     "context": 1024
   },
-  "generated_utc": "2026-11-11T01:16:45Z",
+  "generated_utc": "2026-11-17T00:22:12Z",
   "prompts": [
     {
       "prompt": "The capital of France is",
@@ -19,31 +19,31 @@
           "id": 12366,
           "token": " Paris",
           "logprob": -0.6055503487586975,
-          "lair_logprob": -0.6712
+          "lair_logprob": -0.6599
         },
         {
           "id": 264,
           "token": " a",
           "logprob": -2.6054129600524902,
-          "lair_logprob": -2.4308
+          "lair_logprob": -2.4711
         },
         {
           "id": 279,
           "token": " the",
           "logprob": -3.784018039703369,
-          "lair_logprob": -3.5862
+          "lair_logprob": -3.5329
         },
         {
           "id": 1148,
           "token": " what",
           "logprob": -3.912532329559326,
-          "lair_logprob": -3.9271
+          "lair_logprob": -3.8309
         },
         {
           "id": 539,
           "token": " not",
           "logprob": -4.0521979331970215,
-          "lair_logprob": -3.8953
+          "lair_logprob": -3.9265
         }
       ]
     },
@@ -56,31 +56,31 @@
           "id": 11,
           "token": ",",
           "logprob": -0.14400885999202728,
-          "lair_logprob": -0.1431
+          "lair_logprob": -0.1503
         },
         {
           "id": 304,
           "token": " in",
           "logprob": -2.236768960952759,
-          "lair_logprob": -2.2167
+          "lair_logprob": -2.1776
         },
         {
           "id": 1070,
           "token": " there",
           "logprob": -4.650913715362549,
-          "lair_logprob": -4.7337
+          "lair_logprob": -4.4798
         },
         {
           "id": 1131,
           "token": "...",
           "logprob": -5.206884384155273,
-          "lair_logprob": -5.2487
+          "lair_logprob": -5.3441
         },
         {
           "id": 320,
           "token": " (",
           "logprob": -5.913462162017822,
-          "lair_logprob": -5.9516
+          "lair_logprob": -6.0135
         }
       ]
     },
@@ -93,31 +93,31 @@
           "id": 262,
           "token": "   ",
           "logprob": -0.010016911663115025,
-          "lair_logprob": -0.0102
+          "lair_logprob": -0.0097
         },
         {
           "id": 220,
           "token": " ",
           "logprob": -5.118432521820068,
-          "lair_logprob": -5.231
+          "lair_logprob": -5.2991
         },
         {
           "id": 1084,
           "token": "    \n",
           "logprob": -6.233693599700928,
-          "lair_logprob": -6.0242
+          "lair_logprob": -6.0681
         },
         {
           "id": 3270,
           "token": " \"\"\"\n",
           "logprob": -7.480556011199951,
-          "lair_logprob": -7.3688
+          "lair_logprob": -7.3174
         },
         {
           "id": 720,
           "token": " \n",
           "logprob": -8.166458129882812,
-          "lair_logprob": -8.0474
+          "lair_logprob": -8.0489
         }
       ]
     },
@@ -130,31 +130,31 @@
           "id": 44,
           "token": "M",
           "logprob": -0.48087507486343384,
-          "lair_logprob": -0.693
+          "lair_logprob": -0.6753
         },
         {
           "id": 791,
           "token": "The",
           "logprob": -1.3457984924316406,
-          "lair_logprob": -1.0845
+          "lair_logprob": -1.0855
         },
         {
           "id": 53,
           "token": "V",
           "logprob": -3.6602821350097656,
-          "lair_logprob": -3.1828
+          "lair_logprob": -3.2291
         },
         {
           "id": 62066,
           "token": "NASA",
           "logprob": -4.183681488037109,
-          "lair_logprob": -3.7547
+          "lair_logprob": -3.7290
         },
         {
           "id": 2170,
           "token": "As",
           "logprob": -4.959434509277344,
-          "lair_logprob": -4.9871
+          "lair_logprob": -4.9523
         }
       ]
     }

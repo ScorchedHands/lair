@@ -1322,6 +1322,65 @@ public class KernelTests
         }
     }
 
+    // The activation-contract half of the integer-dot gate: production quantizes each activation once per Gemv/GemvBatch call and shares that one Q8_K copy across every row, so an FP-activation oracle over the very same stored weights must land visibly away from the kernels' totals while the backend stays bit-exact against the published reference. The exactness assertion pins which side of the pair production is on; the divergence bound proves the separation is real quantization error and not accumulation noise - a float dot, or an added bias/bsum correction folded into these formats, would move both numbers together and break one gate loudly instead of hiding inside a tolerance band.
+    [Theory]
+    [InlineData(QuantFormat.IQ2_XXS)]
+    [InlineData(QuantFormat.IQ2_XS)]
+    [InlineData(QuantFormat.IQ2_S)]
+    [InlineData(QuantFormat.IQ3_XXS)]
+    [InlineData(QuantFormat.IQ3_S)]
+    public void Gemv_Q8KFormats_FpActivationOracle_DivergesFromQuantizedActivationContract(QuantFormat format)
+    {
+        foreach ((int rows, int cols) in MatrixSizes)
+        {
+            (float[] uniform, byte[] weights) = CreateCase(rows, cols, format, seed: 9021);
+
+            // A sign-preserving fourth power of the same deterministic draws: like real activations, most channels sit far below
+            // the block maximum that fixes each Q8_K scale, so every small channel pays a visible share of its own magnitude to
+            // rounding while the wide-range outliers stay exact. Uniform [-1, 1] inputs land at ~4e-3 here; this fixture lands at
+            // 5.2e-3 - 8.3e-3 across all fifteen cases, so the gate below clears by a factor of five or more on every size.
+            float[] x = new float[cols];
+            for (int i = 0; i < cols; i++)
+            {
+                double magnitude = Math.Abs(uniform[i]);
+                x[i] = (float)Math.Sign(uniform[i]) * (float)(magnitude * magnitude * magnitude * magnitude);
+            }
+
+            using CpuBackend scalar = new(threads: 1, allowAvx2: false);
+            WeightRef w = new(weights, MatrixShape(rows, cols), format);
+
+            float[] output = new float[rows];
+            scalar.Gemv(x, w, output);
+
+            // The production contract first: bit-exact against the independent integer Q8_K reference.
+            AssertExact(output, OracleDotQ8K(x, weights, rows, cols, format), $"scalar {format} GEMV at {rows}x{cols}");
+
+            // Then the FP-activation oracle in double precision over DequantRow's expansion of every stored row against these same unquantized activations: identical weight values to what the kernels dot, so its distance from each kernel total is activation quantization error and nothing else. Accumulation reordering alone could never move a float-dot result by this much against an exact reference.
+            double divergence = 0;
+            double expectedMagnitude = 0;
+            float[] row = new float[cols];
+
+            for (int r = 0; r < rows; r++)
+            {
+                scalar.DequantRow(w, r, row);
+
+                double fpDot = 0;
+                for (int i = 0; i < cols; i++)
+                {
+                    fpDot += (double)row[i] * x[i];
+                }
+
+                divergence += Math.Abs(output[r] - fpDot);
+                expectedMagnitude += Math.Abs(fpDot);
+            }
+
+            double ratio = divergence / expectedMagnitude;
+            Assert.True(
+                ratio > 1e-3,
+                $"{format} at {rows}x{cols}: the FP-activation oracle diverges from the quantized-activation contract by only {ratio:E4}, which is accumulation noise rather than activation quantization");
+        }
+    }
+
     // Bit-exact comparison: int32 bit patterns, so signed zeros and NaN payloads count as differences too.
     private static void AssertExact(ReadOnlySpan<float> actual, ReadOnlySpan<float> expected, string context)
     {
