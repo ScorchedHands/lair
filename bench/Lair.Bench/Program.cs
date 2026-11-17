@@ -2,6 +2,7 @@
 using System.Globalization;
 using System.Runtime.Intrinsics.X86;
 using Lair.Backends.Cpu;
+using Lair.Bench;
 using Lair.Contracts;
 using Lair.Kv;
 using Lair.Loader;
@@ -11,7 +12,7 @@ using Lair.Tokenizer;
 
 if (args.Length == 0)
 {
-    Console.WriteLine("usage: Lair.Bench <gemv|gguf-dump|gemv-file|prefill-profile|help>");
+    Console.WriteLine("usage: Lair.Bench <gemv|gguf-dump|gemv-file|prefill-profile|kv-spike|kv-micro|help>");
     return 1;
 }
 
@@ -21,12 +22,14 @@ return args[0] switch
     "gguf-dump" => DumpGguf(args.Length > 1 ? args[1] : @"models\SmolLM-135M-Instruct-F16.gguf"),
     "gemv-file" => BenchFileGemv(args),
     "prefill-profile" => BenchPrefillProfile(args),
+    "kv-spike" => KvFormatSpike.RunDecode(args),
+    "kv-micro" => KvFormatSpike.RunMicro(args),
     _ => Usage(),
 };
 
 static int Usage()
 {
-    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M] [--grid scalar|gather|compare] [--prefetch on|off|compare], or prefill-profile <gguf path> [--threads N] [--lengths L1,L2,...] [--widths W1,W2,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--out <path>]");
+    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M] [--grid scalar|gather|compare] [--prefetch on|off|compare], prefill-profile <gguf path> [--threads N] [--lengths L1,L2,...] [--widths W1,W2,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--out <path>], kv-spike [model.gguf] [--modes baseline,f32block,q8k] [--threads N] [--context C] [--decode D] [--windows N], or kv-micro [model.gguf] [--modes baseline,f32block,q8k] [--threads N] [--context P]");
     return 1;
 }
 

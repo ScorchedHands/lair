@@ -303,6 +303,12 @@ public sealed class TransformerModel : IDisposable
     /// <summary>Total mutable activation bytes one prompt-window sub-batch row carries on this engine's prompt route — what a declared prefill-buffer ceiling measures rows against.</summary>
     public long PrefillRowActivationBytes => _prefillRowActivationBytes;
 
+    // A measurement-only attention route for candidate KV-format kernels: null on every host path, so an untouched
+    // engine forwards exactly the hand-written FP32 causal kernel it always has. Only bench and test opens install a
+    // route through EnableKvFormatSpike below, and the resolved check at each single-token attention call is the only
+    // thing the default posture pays for its existence.
+    private KvAttentionSpikeRoute? _kvAttentionSpike;
+
     /// <summary>
     /// Re-points the engine's prefill path selection. The new value is read fresh at the next prefill window
     /// boundary, so sequences already mid-window finish that window on the route they started with — the same
@@ -319,6 +325,25 @@ public sealed class TransformerModel : IDisposable
 
         _prefillKernel = kernel;
     }
+
+    /// <summary>
+    /// The attention route a candidate KV-format kernel runs on this engine's single-token decode step, taking the same
+    /// operands the pinned FP32 causal kernel is called with. Assembly-internal: no host configuration path can install one.
+    /// </summary>
+    internal delegate void KvAttentionSpikeRoute(
+        ReadOnlySpan<float> qHeads, int headCount, int kvHeadCount, int headDim, SequenceKv kv, int layer, int position,
+        float attnScale, float softcap, int window, Span<float> outConcat);
+
+    /// <summary>
+    /// Routes this engine's single-token decode attention through a candidate kernel for measurement. Bench and test opens
+    /// only: the hand-written FP32 causal kernel stays in force whenever no route is installed, prompt windows keep running
+    /// their resolved prefill kernel whatever this sets, and every other forward step is untouched.
+    /// </summary>
+    internal void EnableKvFormatSpike(KvAttentionSpikeRoute route) =>
+        _kvAttentionSpike = route ?? throw new ArgumentNullException(nameof(route));
+
+    /// <summary>The candidate attention route installed on this engine, or null while it runs the pinned FP32 kernel.</summary>
+    internal KvAttentionSpikeRoute? ResolvedKvFormatSpike => _kvAttentionSpike;
 
     /// <summary>The quant formats this engine's dense weight matrices carry, deduplicated in role order: the formats a blocked matmul needs kernels for before the dense-matrix selection can run this file.</summary>
     public IReadOnlyList<QuantFormat> MatmulWeightFormats => _matmulFormats;
@@ -2374,7 +2399,15 @@ public sealed class TransformerModel : IDisposable
                 kv.WriteK(position, l, _k);
                 kv.WriteV(position, l, _v);
 
-                LayerOps.CausalAttention(engine, _q, Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, position, attnScale, Plan.AttentionSoftcap, layerWindow, _attnOut);
+                if (_kvAttentionSpike is { } spikeRoute)
+                {
+                    // Measurement-only candidate route (EnableKvFormatSpike): the pinned FP32 kernel below runs whenever no route is installed.
+                    spikeRoute(_q, Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, position, attnScale, Plan.AttentionSoftcap, layerWindow, _attnOut);
+                }
+                else
+                {
+                    LayerOps.CausalAttention(engine, _q, Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, position, attnScale, Plan.AttentionSoftcap, layerWindow, _attnOut);
+                }
 
                 // Output projection (+bias) into scratch; the residual added before the FFN norm is the pre-attention
                 // stream value (ffn_inp = attn_out + inpSA), matching the reference graph. cur held that stream through
