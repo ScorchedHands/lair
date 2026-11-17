@@ -203,7 +203,17 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_pcie_transfers_total")] long? PcieTransfersTotal = null,
 
     /// <summary>Device bytes the opened default-copy postures hold open for resident weights right now — host-mapped weight residency and transient activation buffers stay outside this reading, which drops as an instance releases its allocations; null on a serve holding no accelerator backend.</summary>
-    [property: JsonPropertyName("metrics_persistent_vram_bytes")] long? PersistentVramBytes = null)
+    [property: JsonPropertyName("metrics_persistent_vram_bytes")] long? PersistentVramBytes = null,
+
+    // Additive CPU-selection facts (earlier shapes untouched): both read from what the opened CPU backend resolved at open —
+    // the integer-dot encoding its ISA axis landed on and the grid staging that feeds it. A serve always holds a CPU backend,
+    // so these fill once the owning service attaches model facts; an unattached bus still carries them as nothing.
+
+    /// <summary>The integer-dot encoding the opened CPU backend runs (<c>scalar</c>, <c>avx2</c>, <c>vnni</c>) — resolved at open, not a configuration echo; null until CPU selection facts attach.</summary>
+    [property: JsonPropertyName("metrics_cpu_isa")] string? CpuIsa = null,
+
+    /// <summary>The grid staging that encoding feeds the sub-4-bit i-quant dots (<c>scalar</c>, <c>gather</c>); null until CPU selection facts attach.</summary>
+    [property: JsonPropertyName("metrics_cpu_gather")] string? CpuGather = null)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

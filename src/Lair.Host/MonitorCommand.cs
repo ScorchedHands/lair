@@ -6,7 +6,8 @@ namespace Lair.Host;
 /// Live engine monitor: follows the server's <c>/monitor/stream</c> SSE snapshots and re-renders one compact table
 /// per snapshot — model, decode tok/s, average step time, batch occupancy, prefix-cache hit share, KV block usage,
 /// working set, CPU share, active sequences — with an accelerator tail (kernel busy share, runtime PCIe transfer tallies,
-/// persistent device weight residency) on rows only where the served engine reports those facts. A CPU-only serve renders
+/// persistent device weight residency) on rows only where the served engine reports those facts, and a CPU selection tail
+/// (the integer-dot encoding and grid staging the opened backend resolved) beside it. A CPU-only serve renders
 /// its columns as they always have and shows nothing about a device it does not hold open. Ctrl+C (or any cancellation)
 /// exits cleanly with 0; a server that cannot be reached produces exactly one actionable error line and a non-zero exit.
 /// </summary>
@@ -117,6 +118,11 @@ public static class MonitorCommand
                 ? null
                 : new AcceleratorRow(gpuUtilization, transferBytes ?? 0L, transferCalls ?? 0L, persistentVramBytes ?? 0L);
 
+            // CPU selection facts ride the same snapshot additively: absent or null reads as nothing, so a row never shows an
+            // encoding its engine did not resolve.
+            string? cpuIsa = ReadOptionalString(root, "metrics_cpu_isa");
+            string? cpuGather = ReadOptionalString(root, "metrics_cpu_gather");
+
             return new MetricsRow(
                 model.GetString() ?? string.Empty,
                 ReadDouble(root, "metrics_tok_s"),
@@ -127,7 +133,9 @@ public static class MonitorCommand
                 ReadInt(root, "metrics_kv_used_blocks"),
                 ReadInt(root, "metrics_kv_capacity_blocks"),
                 ReadInt(root, "metrics_active_sequences"),
-                accelerator);
+                accelerator,
+                cpuIsa,
+                cpuGather);
         }
         catch (System.Text.Json.JsonException)
         {
@@ -146,6 +154,11 @@ public static class MonitorCommand
             line += $"   gpu {utilization}%  pcie {Megabytes(accelerator.PcieTransferBytesTotal)} over {accelerator.PcieTransfersTotal} copies  persistent-vram {Megabytes(accelerator.PersistentVramBytes)}";
         }
 
+        if (row.CpuIsa is not null || row.CpuGather is not null)
+        {
+            line += $"   cpu{(row.CpuIsa is string isa ? $" isa={isa}" : string.Empty)}{(row.CpuGather is string gather ? $" gather={gather}" : string.Empty)}";
+        }
+
         return line;
     }
 
@@ -161,13 +174,17 @@ public static class MonitorCommand
     private static long? ReadOptionalLong(System.Text.Json.JsonElement root, string name) =>
         root.TryGetProperty(name, out System.Text.Json.JsonElement value) && value.ValueKind == System.Text.Json.JsonValueKind.Number && value.TryGetInt64(out long parsed) ? parsed : null;
 
+    // A text additive field: absent or null reads as nothing, so a row never states an encoding its engine did not resolve.
+    private static string? ReadOptionalString(System.Text.Json.JsonElement root, string name) =>
+        root.TryGetProperty(name, out System.Text.Json.JsonElement value) && value.ValueKind == System.Text.Json.JsonValueKind.String ? value.GetString() : null;
+
     private static long ReadLong(System.Text.Json.JsonElement root, string name) =>
         root.TryGetProperty(name, out System.Text.Json.JsonElement value) && value.TryGetInt64(out long parsed) ? parsed : 0L;
 
     private static int ReadInt(System.Text.Json.JsonElement root, string name) =>
         root.TryGetProperty(name, out System.Text.Json.JsonElement value) && value.TryGetInt32(out int parsed) ? parsed : 0;
 
-    /// <summary>The table fields lifted from one snapshot. Accelerator facts ride along only when the served engine reports them, so a CPU-only row renders its columns unchanged.</summary>
+    /// <summary>The table fields lifted from one snapshot. Accelerator facts ride along only when the served engine reports them, so a CPU-only row renders its columns unchanged; the resolved CPU selection pair rides the same way from the engine's own opened backend.</summary>
     internal sealed record MetricsRow(
         string Model,
         double TokensPerSec,
@@ -178,7 +195,9 @@ public static class MonitorCommand
         int KvUsedBlocks,
         int KvCapacityBlocks,
         int ActiveSequences,
-        AcceleratorRow? Accelerator = null);
+        AcceleratorRow? Accelerator = null,
+        string? CpuIsa = null,
+        string? CpuGather = null);
 
     /// <summary>Engine-side accelerator facts one snapshot carries: windowed kernel busy share beside the runtime copy tallies and the persistent device weight residency currently held. A utilization reading no snapshot filled stays null rather than claiming an idle device.</summary>
     internal sealed record AcceleratorRow(

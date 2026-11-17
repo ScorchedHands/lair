@@ -282,7 +282,10 @@ public sealed class GenerationService : IDisposable
         PlacementSpreadRequested: _placement is null ? null : NumaSpreadNames.Of(_placement.Requested),
         PlacementNodeAllocations: _computeGrant is { NodeAllocations.Count: > 0 } seatedGrant ? seatedGrant.NodeAllocationText() : null,
         PlacementAdvisory: _placement?.Advisory,
-        UpdateCandidate: _updateCandidate);
+        UpdateCandidate: _updateCandidate,
+        // The CPU integer-dot posture this engine's opened backend runs, read from the fact open resolved — not re-derived here.
+        CpuIsa: _backend.ResolvedSelection.ResolvedIsa,
+        CpuGather: _backend.ResolvedSelection.GatherMode);
 
     // Sums what each compute backend this open owns answers about its own device work: cumulative kernel busy time and
     // runtime copy tallies since that instance opened, plus the weight residency it holds in persistent device memory now.
@@ -1117,9 +1120,9 @@ public sealed class GenerationService : IDisposable
     /// back with each stating the explicit unbounded capacity posture. <paramref name="compute"/> is host-scoped core accounting shared the same
     /// way: an injected one carries both what the host reported about nodes and every share seated ahead of this model, so a later claim is
     /// clamped to what its predecessors left instead of being refused or preempting them; a null one opens fresh accounting over this process's
-    /// reported topology. No host configuration path reaches either seam — they are programmatic seams.
+    /// reported topology. No host configuration path reaches either seam — they are programmatic seams. <paramref name="cpuFeatures"/> is a third programmatic CPU-posture seam: production opens leave it null and detect the process posture, while tests may state one explicitly so an unavailable forced ISA can be proven to refuse before any backend exists.
     /// </summary>
-    public static GenerationService Open(LairConfig config, ILogger? logger, DeviceLedger? ledger, ComputeCapacityLedger? compute, IModelHubTransport? transport = null)
+    public static GenerationService Open(LairConfig config, ILogger? logger, DeviceLedger? ledger, ComputeCapacityLedger? compute, IModelHubTransport? transport = null, CpuFeaturePosture? cpuFeatures = null)
     {
         ArgumentNullException.ThrowIfNull(config);
         if (config.Models.Count == 0)
@@ -1214,17 +1217,36 @@ public sealed class GenerationService : IDisposable
         // nodes, nothing is masked and the posture bounds participation by worker count alone, as it always did.
         IReadOnlySet<int> backendCoreSet = EffectiveBackendCoreSet(compute.Topology, placement, modelConfig.Placement.CoreSet);
 
+        // The CPU integer-dot ISA axis resolves exactly once for this open, before any backend exists: every kernel path this
+        // model runs — decode side, a dedicated prefill lane's side, threaded or not — uses one encoding for the engine's whole
+        // lifetime. A forced selection this host cannot run refuses here naming the model, the key as declared, and what the CPU
+        // does not report; nothing answers it with some other path that happens to be available.
+        if (!CpuIsaNames.TryParse(config.Engine.Cpu.Isa, out CpuIsa requestedIsa))
+        {
+            throw new ModelException(
+                $"model '{modelConfig.Name}' declares 'engine.cpu.isa' '{config.Engine.Cpu.Isa}': 'cpu.isa' accepts {CpuIsaNames.AcceptedVocabulary}.");
+        }
+
+        CpuFeaturePosture resolvedFeatures = cpuFeatures ?? CpuIsaProbe.Detect();
+
+        if (!CpuIsaProbe.TryResolve(requestedIsa, resolvedFeatures, out _, out string? missingFeature))
+        {
+            throw new ModelException(
+                $"model '{modelConfig.Name}' declares 'engine.cpu.isa' '{config.Engine.Cpu.Isa}': this host's CPU does not report " +
+                $"{missingFeature}, and a forced ISA is never answered with some other integer-dot path that happens to be available — declare '{CpuIsaNames.Auto}' to select the highest path this host runs, or run on hardware reporting {missingFeature}.");
+        }
+
         if (modelConfig.Placement.PrefillLane == PlacementPrefillLaneValues.Dedicated)
         {
             // A dedicated posture sub-allocates both lane sides from this model's granted share, so a clamped claim narrows the split instead of letting one side reach past what the host seated for it. A node-derived core set splits inside the chosen node: each lane claims its side of that node's reported ids.
             prefillsLane = ModelPrefillLanes.ResolveDedicated(modelConfig.Name, engineThreadsChoice, grantedQuota, backendCoreSet);
 
-            backend = new(engineThreadsChoice, new HashSet<int>(prefillsLane.DecodeCoreIds), prefillsLane.DecodeShareThreads);
-            prefillsBackend = new(prefillsLane.PrefillShareThreads, new HashSet<int>(prefillsLane.PrefillCoreIds));
+            backend = new(engineThreadsChoice, new HashSet<int>(prefillsLane.DecodeCoreIds), prefillsLane.DecodeShareThreads, requestedIsa: requestedIsa, cpuFeatures: resolvedFeatures);
+            prefillsBackend = new(prefillsLane.PrefillShareThreads, new HashSet<int>(prefillsLane.PrefillCoreIds), requestedIsa: requestedIsa, cpuFeatures: resolvedFeatures);
         }
         else
         {
-            backend = new(config.Engine.Threads, backendCoreSet, grantedQuota);
+            backend = new(config.Engine.Threads, backendCoreSet, grantedQuota, requestedIsa: requestedIsa, cpuFeatures: resolvedFeatures);
         }
 
         // The placement's layer split opens the accelerator compute backend beside this service's decode-side CPU backend — and only when a model declares one: an absent or zero key never touches the CUDA seam at all. A declared split with no usable driver or device behind it fails here naming the model, the key as declared, and where accelerator-backed segments run; nothing falls back to some other posture that happens to work.
@@ -1688,6 +1710,18 @@ public sealed class GenerationService : IDisposable
                     reasoningRegion.OpenTokenId,
                     reasoningRegion.CloseTokenId);
             }
+
+            // The integer-dot posture the opened backends actually run is announced in the same style: it states the encoding
+            // the ISA axis resolved to against this host's posture and the grid staging that encoding feeds, so an auto run
+            // and a forced-ISA run of one model diff on those two fields. A dedicated lane resolves both sides against the
+            // same axis and posture, so one line states the pair every side runs.
+            CpuSelectionReport selection = backend.ResolvedSelection;
+
+            logger?.LogInformation(
+                "cpu_selection model='{Model}' isa={Isa} gather={Gather}",
+                modelConfig.Name,
+                selection.ResolvedIsa,
+                selection.GatherMode);
 
             // The prefill route the forward engine resolved to is announced in the same style: it reports what this
             // engine actually runs, and a selection with no kernel never reaches here because opening refused it.

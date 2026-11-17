@@ -47,6 +47,8 @@ Engine-wide knobs shared by the served model.
 | `engine.prefill_step_budget_ms` | integer ≥ 1, optional | omitted | A wall-clock budget each prefill step aims at. Omitted means chunk width comes from `max_batch_tokens` alone. Present lets the scheduler size each future chunk from measured step cost toward this budget, still capped by `max_batch_tokens` and never below one token. |
 | `engine.prefill_kernel` | `gemv` \| `tiled` \| `gemm` | `gemv` | Which attention/weight path the prefill route selects. `gemv` is the batched row window, `tiled` adds row-tiled causal attention, `gemm` traverses dense weights by blocked matmul. |
 
+| `engine.cpu.isa` | `auto` \| `avx2` \| `avx-vnni` | `auto` | CPU integer-dot ISA selection resolved at model open. `auto` picks the highest path reported by the host; an explicit forced value resolves to that path or refuses naming the missing feature. |
+
 `prefill_kernel` accepts all three values at load, but a selection this engine cannot run for the served file is refused **at model open**, naming that file's own weight formats. Today the blocked-matmul path exists only for `Q8_0`, `Q4_K`, and `IQ4_XS`: a file with any other dense format is refused rather than falling back.
 
 Chunk width and row width are separate numbers: `max_batch_tokens` bounds how many prompt tokens a step forwards, while the engine's prompt windows run in sub-batches of a resolved **row** count (measured default 32, engine ceiling 64) that no configuration key sets on this build. A declared `prefill_buffers` cap can narrow that effective row width; see budgets below.
@@ -238,6 +240,8 @@ Taken from the change-application table, not from prose. Anything not listed as 
 | `models[].placement.thread_quota` | live | Effective worker count changes from the next kernel call; lowered workers idle. With a dedicated prefill lane open it maps onto the decode side only and is refused when the new quota cannot cover both lanes. |
 | `ui.recent_requests` | live | Ring capacity changes immediately; entries beyond the new cap are dropped oldest-first. |
 | `engine.prefill_kernel` | new-requests | Re-points the prompt-window route from its next window boundary; a selection the served file's formats cannot run is refused naming them. |
+
+| `engine.cpu.isa` | restart-only | Resolved when the CPU backend opens and compiled into its integer-dot dispatch. |
 | `models[].max_context_tokens` | new-requests | Admission validates against the new window; in-flight sequences are unaffected. |
 | `models[].force_fenced_tools` | new-requests | Later chat requests re-resolve their tool surface; in-flight sequences keep their resolved limits. |
 | `models[].tool_parser` | new-requests | Later chat requests resolve to the new parser. |

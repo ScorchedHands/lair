@@ -52,6 +52,8 @@ public sealed unsafe partial class CpuBackend : IBackend
     private readonly ulong? _coreMask;
     private bool _samplingRequested; // test-only instrumentation flag, read when the pool is created and pushed on enable
     private readonly bool _useAvx2;
+    private readonly CpuIsa _requestedIsa;
+    private readonly IntegerDotPath _integerDot; // resolved once at open: every i-quant dot this backend runs uses this encoding for its whole lifetime
     private WorkerPool? _pool;
 
     /// <summary>
@@ -72,8 +74,29 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// model's compute stays inside its configured processor set. Pinning is applied on Windows only: on other platforms it is a
     /// documented no-op that warns once at startup (Linux affinity via sched_setaffinity is later hardening). Core ids must lie
     /// within one 64-bit processor group ([0, 63]) because that is what an affinity mask can express.
+    /// <paramref name="requestedIsa"/> is the engine.cpu.isa axis: it resolves against this host's reported CPU features exactly
+    /// once here, and every i-quant integer dot this backend runs - solo GEMV, batched GEMV, threaded or not - uses that resolved
+    /// encoding for the backend's whole lifetime. A forced ISA this CPU does not report fails the open naming the missing feature;
+    /// <see cref="cpuFeatures"/> lets a caller state a posture other than what this process reports.
     /// </summary>
-    public CpuBackend(int threads = 0, IReadOnlySet<int>? coreSet = null, int? threadQuota = null, bool allowAvx2 = true)
+    public CpuBackend(int threads = 0, IReadOnlySet<int>? coreSet = null, int? threadQuota = null, bool allowAvx2 = true, CpuIsa requestedIsa = CpuIsa.Auto, CpuFeaturePosture? cpuFeatures = null)
+        : this(threads, coreSet, threadQuota, allowAvx2, requestedIsa, cpuFeatures, forcedGrid: null, forcePrefetchWeights: null)
+    {
+    }
+
+    // The full open seam every sub-4-bit axis flows through. Host config never reaches the last two parameters: a stated grid
+    // encoding or prefetch posture arrives only from internal seams (test and bench opens), while an auto open resolves both
+    // itself - the grid encoding from one process-wide sub-4-bit GEMV benchmark, cached for later auto opens. A forced gather on a
+    // posture that cannot run gathers fails exactly like a forced ISA does, naming what is missing instead of substituting.
+    internal CpuBackend(
+        int threads,
+        IReadOnlySet<int>? coreSet,
+        int? threadQuota,
+        bool allowAvx2,
+        CpuIsa requestedIsa,
+        CpuFeaturePosture? cpuFeatures,
+        GridLoadEncoding? forcedGrid,
+        bool? forcePrefetchWeights)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(threads);
         if (threadQuota is < 1)
@@ -92,8 +115,67 @@ public sealed unsafe partial class CpuBackend : IBackend
             _coreMask = ThreadAffinity.BuildCoreMask(coreSet);
         }
 
-        _useAvx2 = allowAvx2 && Avx2.IsSupported && Fma.IsSupported && Ssse3.IsSupported;
+        // One capability posture for this whole open, read once: it gates both the vector baseline every kernel uses and the
+        // integer-dot encoding engine.cpu.isa resolves to. A forced selection this host cannot run fails here rather than at
+        // some later token, because nothing downstream can tell a substituted path from the one that was asked for.
+        CpuFeaturePosture features = cpuFeatures ?? CpuIsaProbe.Detect();
+
+        if (!CpuIsaProbe.TryResolve(requestedIsa, features, out IntegerDotPath resolvedDot, out string? missingFeature))
+        {
+            throw new CpuIsaUnavailableException(requestedIsa, missingFeature!);
+        }
+
+        _useAvx2 = allowAvx2 && features.Avx2Available; // the same AVX2 + FMA + SSSE3 gate this backend has always applied, now read from one posture
+
+        if (!allowAvx2)
+        {
+            if (requestedIsa != CpuIsa.Auto)
+            {
+                throw new ArgumentException(
+                    $"engine.cpu.isa '{CpuIsaNames.Of(requestedIsa)}' cannot be forced on a backend opened with its vector posture disabled: forcing an ISA asks for a vector integer dot this posture never runs.",
+                    nameof(allowAvx2));
+            }
+
+            resolvedDot = IntegerDotPath.Scalar; // the no-vector posture (the scalar-oracle test knob) keeps running reference dots whatever auto resolved to.
+        }
+
+        _requestedIsa = requestedIsa;
+        _integerDot = resolvedDot;
+
+        // The sub-4-bit staging axis resolves alongside the dot encoding and stays fixed for this backend's whole lifetime, so a
+        // grid variant is never swapped mid-row. Gather needs the same vector posture every vector kernel runs: forcing it on an
+        // AVX2-less posture fails the open naming what is missing rather than quietly running something else. Prefetch hints are
+        // pure - outputs never depend on them - so they default to running whenever the vector Q8_K kernels do and can be forced
+        // either way through internal seams for measurement.
+        bool vectorPosture = allowAvx2 && features.Avx2Available;
+
+        if (forcedGrid is GridLoadEncoding.Gather && !vectorPosture)
+        {
+            throw new ArgumentException(
+                "The gather grid encoding cannot be forced on a backend opened without its vector posture: gathers are issued by the same AVX2 gate every vector kernel runs under.",
+                nameof(allowAvx2));
+        }
+
+        _grid = forcedGrid ?? (vectorPosture ? ResolveAutoGrid(features) : GridLoadEncoding.Scalar);
+        _prefetchWeights = forcePrefetchWeights ?? vectorPosture;
     }
+
+    /// <summary>The engine.cpu.isa selection this backend was opened with, exactly as declared.</summary>
+    internal CpuIsa RequestedCpuIsa => _requestedIsa;
+
+    /// <summary>The integer-dot encoding that selection resolved to at open - scalar reference, AVX2 pair sums, or AVX-VNNI vpdpbusd - fixed for this backend's whole lifetime.</summary>
+    internal IntegerDotPath ResolvedIntegerDotPath => _integerDot;
+
+    /// <summary>
+    /// This opened backend's resolved CPU selection in host reporting shape: the ISA axis as declared (<c>auto</c>, <c>avx2</c>,
+    /// <c>avx-vnni</c>), the integer-dot encoding it resolved to against this posture (<c>scalar</c>, <c>avx2</c>, <c>vnni</c>), and
+    /// the grid staging that encoding feeds its i-quant dots (<c>scalar</c>, <c>gather</c>). Reporting only — every value is a fact
+    /// already resolved once at open, nothing here is a knob, and an auto-resolved pair never claims a mode this backend does not run.
+    /// </summary>
+    public CpuSelectionReport ResolvedSelection => new(
+        CpuIsaNames.Of(_requestedIsa),
+        ResolvedIntegerDotNames.Of(_integerDot),
+        GridLoadEncodingNames.Of(_grid));
 
     public string DeviceId => "cpu";
 
@@ -218,12 +300,36 @@ public sealed unsafe partial class CpuBackend : IBackend
         int stride = (int)strideBytes;
         QuantFormat format = w.Format;
 
+        // The sub-4-bit i-quants dot against a Q8_K quantization of the activation instead of its FP values: one shared
+        // quantized copy per call, so every row and every worker sees identical operands. ArrayPool rentals are pinned
+        // for the duration of the call and returned after WorkerPool.Run has finished with them.
+        bool usesQ8K = UsesQ8KActivation(format);
+        int q8Blocks = Q8KBlockCount(cols);
+        byte[]? qaRent = null;
+        float[]? daRent = null;
+        if (usesQ8K)
+        {
+            qaRent = ArrayPool<byte>.Shared.Rent(q8Blocks * QkK);
+            daRent = ArrayPool<float>.Shared.Rent(q8Blocks);
+        }
+
         // The threaded job carries raw pointers and ints only: fixed locals, spans, and ref structs such as
         // WeightRef cannot be captured by delegates. Pinned spans are stable for the duration of the call.
         fixed (byte* pBytes = w.Bytes)
         fixed (float* pX = x)
         fixed (float* pOut = output)
+        fixed (byte* qa = qaRent)
+        fixed (float* da = daRent)
         {
+            if (usesQ8K)
+            {
+                QuantizeActivationToQ8K(pX, cols, qa, da);
+            }
+
+            // One resolved sub-4-bit posture for the whole call: dot encoding, grid staging, and prefetch hints identical across
+            // every row, worker, and batch vector, whatever partition claims them.
+            Q8KKernelOptions opts = new(_integerDot, _grid, _prefetchWeights);
+
             // Participation is sampled per call so a quota applied on another thread takes effect from this kernel on.
             int workers = _effectiveThreads;
             bool parallel = workers > 1 && rows >= ParallelRowThreshold;
@@ -232,14 +338,31 @@ public sealed unsafe partial class CpuBackend : IBackend
             {
                 for (int row = 0; row < rows; row++)
                 {
-                    pOut[row] = RowDot(pBytes + (long)row * stride, pX, cols, format, _useAvx2);
+                    if (usesQ8K)
+                    {
+                        PrefetchRowWindow(pBytes, stride, rows, row, opts.Prefetch); // pure hint over this call's own row region: future rows streamed ahead.
+                    }
+
+                    pOut[row] = usesQ8K
+                        ? RowDotQ8K(pBytes + (long)row * stride, qa, da, cols, format, opts)
+                        : RowDot(pBytes + (long)row * stride, pX, cols, format, _useAvx2);
                 }
-
-                return;
             }
+            else
+            {
+                WorkerPool pool = GetOrCreatePool();
+                pool.Run((rows + RowBlock - 1) / RowBlock, new RowBlockJob(pBytes, pX, qa, da, usesQ8K ? 1 : 0, pOut, stride, rows, cols, format, _useAvx2, opts));
+            }
+        }
 
-            WorkerPool pool = GetOrCreatePool();
-            pool.Run((rows + RowBlock - 1) / RowBlock, new RowBlockJob(pBytes, pX, pOut, stride, rows, cols, format, _useAvx2));
+        if (qaRent is not null)
+        {
+            ArrayPool<byte>.Shared.Return(qaRent);
+        }
+
+        if (daRent is not null)
+        {
+            ArrayPool<float>.Shared.Return(daRent);
         }
     }
 
@@ -289,13 +412,33 @@ public sealed unsafe partial class CpuBackend : IBackend
         int stride = (int)strideBytes;
         QuantFormat format = w.Format;
 
+        // Same shared quantized activation as Gemv: one Q8_K region per batch vector, built once for the whole call.
+        bool usesQ8K = UsesQ8KActivation(format);
+        int q8Blocks = Q8KBlockCount(cols);
+        byte[]? qaRent = null;
+        float[]? daRent = null;
+        if (usesQ8K)
+        {
+            qaRent = ArrayPool<byte>.Shared.Rent(count * q8Blocks * QkK);
+            daRent = ArrayPool<float>.Shared.Rent(count * q8Blocks);
+        }
+
         // Same raw-pointer job contract as Gemv: pinned spans stay stable for the duration of the call and every
         // claimed block finishes before WorkerPool.Run returns. Rows are independent, so row partitioning stays
         // bit-identical; each batch vector is computed by its own accumulator chain exactly like a single GEMV.
         fixed (byte* pBytes = w.Bytes)
         fixed (float* pIn = inputs)
         fixed (float* pOut = outputs)
+        fixed (byte* qa = qaRent)
+        fixed (float* da = daRent)
         {
+            if (usesQ8K)
+            {
+                QuantizeActivationsToQ8K(pIn, count, cols, qa, da);
+            }
+
+            Q8KKernelOptions opts = new(_integerDot, _grid, _prefetchWeights); // same resolved posture for every row and batch vector of the call
+
             // Participation is sampled per call so a quota applied on another thread takes effect from this kernel on.
             int workers = _effectiveThreads;
             bool parallel = workers > 1 && rows >= ParallelRowThreshold;
@@ -304,14 +447,33 @@ public sealed unsafe partial class CpuBackend : IBackend
             {
                 for (int row = 0; row < rows; row++)
                 {
-                    RowBatchDot(pBytes + (long)row * stride, pIn, count, rows, cols, format, _useAvx2, pOut + row);
+                    if (usesQ8K)
+                    {
+                        PrefetchRowWindow(pBytes, stride, rows, row, opts.Prefetch); // pure hint over this call's own row region: future rows streamed ahead.
+
+                        RowBatchDotQ8K(pBytes + (long)row * stride, qa, da, q8Blocks, count, rows, format, opts, pOut + row);
+                    }
+                    else
+                    {
+                        RowBatchDot(pBytes + (long)row * stride, pIn, count, rows, cols, format, _useAvx2, pOut + row);
+                    }
                 }
-
-                return;
             }
+            else
+            {
+                WorkerPool pool = GetOrCreatePool();
+                pool.Run((rows + RowBlock - 1) / RowBlock, new BatchRowJob(pBytes, pIn, qa, da, usesQ8K ? 1 : 0, q8Blocks, pOut, stride, rows, cols, count, format, _useAvx2, opts));
+            }
+        }
 
-            WorkerPool pool = GetOrCreatePool();
-            pool.Run((rows + RowBlock - 1) / RowBlock, new BatchRowJob(pBytes, pIn, pOut, stride, rows, cols, count, format, _useAvx2));
+        if (qaRent is not null)
+        {
+            ArrayPool<byte>.Shared.Return(qaRent);
+        }
+
+        if (daRent is not null)
+        {
+            ArrayPool<float>.Shared.Return(daRent);
         }
     }
 
@@ -1005,11 +1167,8 @@ public sealed unsafe partial class CpuBackend : IBackend
             QuantFormat.Q6_K => avx2 ? RowDotQ6KAvx2(row, x, cols) : RowDotQ6KScalar(row, x, cols),
             QuantFormat.Q2_K => avx2 ? RowDotQ2KAvx2(row, x, cols) : RowDotQ2KScalar(row, x, cols),
             QuantFormat.Q3_K => avx2 ? RowDotQ3KAvx2(row, x, cols) : RowDotQ3KScalar(row, x, cols),
-            QuantFormat.IQ2_XXS => avx2 ? RowDotIQ2XXSAvx2(row, x, cols) : RowDotIQ2XXSScalar(row, x, cols),
-            QuantFormat.IQ2_XS => avx2 ? RowDotIQ2XSAvx2(row, x, cols) : RowDotIQ2XSScalar(row, x, cols),
-            QuantFormat.IQ2_S => avx2 ? RowDotIQ2SAvx2(row, x, cols) : RowDotIQ2SScalar(row, x, cols),
-            QuantFormat.IQ3_XXS => avx2 ? RowDotIQ3XAvx2(row, x, cols) : RowDotIQ3XScalar(row, x, cols),
-            QuantFormat.IQ3_S => avx2 ? RowDotIQ3SAvx2(row, x, cols) : RowDotIQ3SScalar(row, x, cols),
+            // The five sub-4-bit i-quants are absent here on purpose: Gemv routes them to RowDotQ8K against a Q8_K
+            // quantization of the activation, and reaching this evaluator with one of those formats is a wiring bug.
             QuantFormat.IQ4_NL => avx2 ? RowDotIQ4NAvx2(row, x, cols) : RowDotIQ4NScalar(row, x, cols),
             QuantFormat.IQ4_XS => avx2 ? RowDotIQ4XAvx2(row, x, cols) : RowDotIQ4XScalar(row, x, cols),
             QuantFormat.Q2_0 => avx2 ? RowDotQ20Avx2(row, x, cols) : RowDotQ20Scalar(row, x, cols),
@@ -1027,23 +1186,31 @@ public sealed unsafe partial class CpuBackend : IBackend
     {
         private readonly byte* _bytes;
         private readonly float* _x;
+        private readonly byte* _qa;
+        private readonly float* _da;
+        private readonly int _q8k; // 1 when this format dots against the shared Q8_K activation instead of _x
         private readonly float* _out;
         private readonly int _stride;
         private readonly int _rows;
         private readonly int _cols;
         private readonly QuantFormat _format;
         private readonly bool _avx2;
+        private readonly Q8KKernelOptions _opts; // this backend's resolved sub-4-bit posture: identical for every block of the call, whatever partition claims them
 
-        public RowBlockJob(byte* bytes, float* x, float* outPtr, int stride, int rows, int cols, QuantFormat format, bool avx2)
+        public RowBlockJob(byte* bytes, float* x, byte* qa, float* da, int q8k, float* outPtr, int stride, int rows, int cols, QuantFormat format, bool avx2, Q8KKernelOptions opts)
         {
             _bytes = bytes;
             _x = x;
+            _qa = qa;
+            _da = da;
+            _q8k = q8k;
             _out = outPtr;
             _stride = stride;
             _rows = rows;
             _cols = cols;
             _format = format;
             _avx2 = avx2;
+                        _opts = opts;
         }
 
         public void ProcessBlock(int block)
@@ -1052,7 +1219,17 @@ public sealed unsafe partial class CpuBackend : IBackend
             int lastRow = Math.Min(firstRow + RowBlock, _rows);
             for (int row = firstRow; row < lastRow; row++)
             {
-                _out[row] = RowDot(_bytes + (long)row * _stride, _x, _cols, _format, _avx2);
+                byte* rowBytes = _bytes + (long)row * _stride;
+                if (_q8k != 0)
+                {
+                    PrefetchRowWindow(_bytes, _stride, _rows, row, _opts.Prefetch); // pure hint over this call's own row region: future rows streamed ahead.
+
+                    _out[row] = RowDotQ8K(rowBytes, _qa, _da, _cols, _format, _opts);
+                }
+                else
+                {
+                    _out[row] = RowDot(rowBytes, _x, _cols, _format, _avx2);
+                }
             }
         }
     }
@@ -1070,6 +1247,10 @@ public sealed unsafe partial class CpuBackend : IBackend
     {
         private readonly byte* _bytes;
         private readonly float* _inputs;
+        private readonly byte* _qa;
+        private readonly float* _da;
+        private readonly int _q8k; // 1 when this format dots against the shared Q8_K activations instead of _inputs
+        private readonly int _blocks; // Q8_K super-blocks per batch vector
         private readonly float* _out;
         private readonly int _stride;
         private readonly int _rows;
@@ -1077,11 +1258,16 @@ public sealed unsafe partial class CpuBackend : IBackend
         private readonly int _count;
         private readonly QuantFormat _format;
         private readonly bool _avx2;
+        private readonly Q8KKernelOptions _opts; // this backend's resolved sub-4-bit posture: identical for every block and batch vector of the call
 
-        public BatchRowJob(byte* bytes, float* inputs, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2)
+        public BatchRowJob(byte* bytes, float* inputs, byte* qa, float* da, int q8k, int blocks, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2, Q8KKernelOptions opts)
         {
             _bytes = bytes;
             _inputs = inputs;
+            _qa = qa;
+            _da = da;
+            _q8k = q8k;
+            _blocks = blocks;
             _out = outPtr;
             _stride = stride;
             _rows = rows;
@@ -1089,6 +1275,7 @@ public sealed unsafe partial class CpuBackend : IBackend
             _count = count;
             _format = format;
             _avx2 = avx2;
+                        _opts = opts;
         }
 
         public void ProcessBlock(int block)
@@ -1097,7 +1284,17 @@ public sealed unsafe partial class CpuBackend : IBackend
             int lastRow = Math.Min(firstRow + RowBlock, _rows);
             for (int row = firstRow; row < lastRow; row++)
             {
-                RowBatchDot(_bytes + (long)row * _stride, _inputs, _count, _rows, _cols, _format, _avx2, _out + row);
+                byte* rowBytes = _bytes + (long)row * _stride;
+                if (_q8k != 0)
+                {
+                    PrefetchRowWindow(_bytes, _stride, _rows, row, _opts.Prefetch); // pure hint over this call's own row region: future rows streamed ahead.
+
+                    RowBatchDotQ8K(rowBytes, _qa, _da, _blocks, _count, _rows, _format, _opts, _out + row);
+                }
+                else
+                {
+                    RowBatchDot(rowBytes, _inputs, _count, _rows, _cols, _format, _avx2, _out + row);
+                }
             }
         }
     }
@@ -1239,76 +1436,8 @@ public sealed unsafe partial class CpuBackend : IBackend
                 }
 
                 break;
-            case QuantFormat.IQ2_XXS:
-                if (avx2)
-                {
-                    BatchIQ2XX_Avx2(rowBytes, inputs, count, rows, cols, outBase);
-                }
-                else
-                {
-                    for (int b = 0; b < count; b++)
-                    {
-                        outBase[b * rows] = RowDotIQ2XXSScalar(rowBytes, inputs + (long)b * cols, cols);
-                    }
-                }
-
-                break;
-            case QuantFormat.IQ2_XS:
-                if (avx2)
-                {
-                    BatchIQ2X_Avx2(rowBytes, inputs, count, rows, cols, outBase);
-                }
-                else
-                {
-                    for (int b = 0; b < count; b++)
-                    {
-                        outBase[b * rows] = RowDotIQ2XSScalar(rowBytes, inputs + (long)b * cols, cols);
-                    }
-                }
-
-                break;
-            case QuantFormat.IQ2_S:
-                if (avx2)
-                {
-                    BatchIQ2S_Avx2(rowBytes, inputs, count, rows, cols, outBase);
-                }
-                else
-                {
-                    for (int b = 0; b < count; b++)
-                    {
-                        outBase[b * rows] = RowDotIQ2SScalar(rowBytes, inputs + (long)b * cols, cols);
-                    }
-                }
-
-                break;
-            case QuantFormat.IQ3_XXS:
-                if (avx2)
-                {
-                    BatchIQ3X_Avx2(rowBytes, inputs, count, rows, cols, outBase);
-                }
-                else
-                {
-                    for (int b = 0; b < count; b++)
-                    {
-                        outBase[b * rows] = RowDotIQ3XScalar(rowBytes, inputs + (long)b * cols, cols);
-                    }
-                }
-
-                break;
-            case QuantFormat.IQ3_S:
-                if (avx2)
-                {
-                    BatchIQ3S_Avx2(rowBytes, inputs, count, rows, cols, outBase);
-                }
-                else
-                {
-                    for (int b = 0; b < count; b++)
-                    {
-                        outBase[b * rows] = RowDotIQ3SScalar(rowBytes, inputs + (long)b * cols, cols);
-                    }
-                }
-
-                break;
+            // The five sub-4-bit i-quants are absent here on purpose: GemvBatch routes them to RowBatchDotQ8K against
+            // per-vector Q8_K activations, and reaching this evaluator with one of those formats is a wiring bug.
             case QuantFormat.IQ4_NL:
                 if (avx2)
                 {

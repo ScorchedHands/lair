@@ -26,7 +26,7 @@ return args[0] switch
 
 static int Usage()
 {
-    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M], or prefill-profile <gguf path> [--threads N] [--lengths L1,L2,...] [--widths W1,W2,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--out <path>]");
+    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M] [--grid scalar|gather|compare] [--prefetch on|off|compare], or prefill-profile <gguf path> [--threads N] [--lengths L1,L2,...] [--widths W1,W2,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--out <path>]");
     return 1;
 }
 
@@ -166,7 +166,7 @@ static int BenchFileGemv(string[] args)
 {
     if (args.Length < 2)
     {
-        Console.WriteLine("usage: gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M]");
+        Console.WriteLine("usage: gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M] [--grid scalar|gather|compare] [--prefetch on|off|compare]");
         return 1;
     }
 
@@ -177,6 +177,10 @@ static int BenchFileGemv(string[] args)
     // tensor in each format group inflated ~2-4x at low reps and settled by 150).
     int reps = 150;
     int maxRows = 1024;
+    GridLoadEncoding? grid = null;      // sub-4-bit grid-load encoding forcing seam: absent keeps the backend's auto resolution.
+    bool? prefetch = null;              // weight prefetch-hint seam: absent lets each posture default its own behavior.
+    bool compareGrid = false;           // when set, one run measures both sub-4-bit grid encodings against identical file bytes instead of only forcing one encoding.
+    bool comparePrefetch = false;       // when set, one run measures the prefetched and unprefetched Q8_K row loops against identical file bytes at the same resolved grid encoding.
     for (int i = 2; i < args.Length; i += 2)
     {
         if (i + 1 >= args.Length)
@@ -196,6 +200,46 @@ static int BenchFileGemv(string[] args)
             case "--max-rows":
                 maxRows = ParseOption(args[i + 1], maxRows);
                 break;
+            case "--grid":
+                if (string.Equals(args[i + 1], "scalar", StringComparison.OrdinalIgnoreCase))
+                {
+                    grid = GridLoadEncoding.Scalar;
+                }
+                else if (string.Equals(args[i + 1], "gather", StringComparison.OrdinalIgnoreCase))
+                {
+                    grid = GridLoadEncoding.Gather;
+                }
+                else if (string.Equals(args[i + 1], "compare", StringComparison.OrdinalIgnoreCase))
+                {
+                    compareGrid = true;
+                }
+                else
+                {
+                    Console.WriteLine("gemv-file: --grid must be scalar, gather, or compare");
+                    return 1;
+                }
+
+                break;
+            case "--prefetch":
+                if (args[i + 1] == "on")
+                {
+                    prefetch = true;
+                }
+                else if (args[i + 1] == "off")
+                {
+                    prefetch = false;
+                }
+                else if (args[i + 1] == "compare")
+                {
+                    comparePrefetch = true;
+                }
+                else
+                {
+                    Console.WriteLine("gemv-file: --prefetch must be on, off, or compare");
+                    return 1;
+                }
+
+                break;
             default:
                 Console.WriteLine($"gemv-file: unknown option '{args[i]}'");
                 return 1;
@@ -206,6 +250,18 @@ static int BenchFileGemv(string[] args)
     {
         Console.WriteLine("gemv-file: --threads must be at least 1");
         return 1;
+    }
+
+    if ((grid == GridLoadEncoding.Gather || compareGrid) && !Avx2.IsSupported)
+    {
+        // The backend would refuse a forced gather the same way it refuses a forced ISA, but reporting it before opening any file keeps the bench usage message-shaped.
+        Console.WriteLine("gemv-file: --gather needs an AVX2 host; this process reports none");
+        return 1;
+    }
+
+    if (compareGrid || comparePrefetch)
+    {
+        return BenchSub4BitComparison(args[1], quota, reps, maxRows, grid, prefetch, compareGrid, comparePrefetch);
     }
 
     const int BatchProbe = 16;      // CpuBackend's batch cap, so the probe measures the engine's widest batched shape
@@ -247,10 +303,15 @@ static int BenchFileGemv(string[] args)
     }
 
     using GgufMmapWeightSource source = new(gguf);
-    using CpuBackend singleThreaded = new(threads: 1, allowAvx2: true);
-    using CpuBackend quotaBackend = new(threadQuota: quota, allowAvx2: true); // engine posture: auto thread choice capped by the model quota
+
+    // With no forcing these are exactly the engine postures as before; with --grid/--prefetch they open through the internal seam so one run can compare encodings on identical data.
+    using CpuBackend singleThreaded = grid is null && prefetch is null ? new(threads: 1, allowAvx2: true) : new(threads: 1, coreSet: null, threadQuota: null, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: null, forcedGrid: grid, forcePrefetchWeights: prefetch);
+    using CpuBackend quotaBackend = grid is null && prefetch is null ? new(threadQuota: quota, allowAvx2: true) : new(threads: 0, coreSet: null, threadQuota: quota, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: null, forcedGrid: grid, forcePrefetchWeights: prefetch); // engine posture: auto thread choice capped by the model quota
 
     Console.WriteLine($"  backend workers: gemv1T={singleThreaded.EffectiveWorkerCount} quotaRun={quotaBackend.EffectiveWorkerCount}");
+    Console.WriteLine(
+        $"  sub4bit axis: forcedGrid={(grid is null ? "auto" : grid.Value.ToString().ToLowerInvariant())} forcedPrefetch={(prefetch is null ? "auto" : prefetch.Value ? "on" : "off")} " +
+        $"resolvedGrid={singleThreaded.ResolvedGridEncoding.ToString().ToLowerInvariant()} prefetchHints={(singleThreaded.PrefetchWeightsEnabled ? "on" : "off")}");
 
     Random activations = new(20261110);
     foreach (QuantFormat format in views.Select(v => v.Tensor.Format).Distinct().OrderBy(f => f.ToString(), StringComparer.Ordinal))
@@ -474,6 +535,308 @@ static float[] NextActivations(Random rng, int cols)
 
 static bool IsAttentionOrMlp(string name) =>
     name.Contains(".attn_", StringComparison.Ordinal) || name.Contains(".ffn_", StringComparison.Ordinal);
+
+static bool IsSub4BitQuant(QuantFormat format) =>
+    format is QuantFormat.IQ2_XXS or QuantFormat.IQ2_XS or QuantFormat.IQ2_S or QuantFormat.IQ3_XXS or QuantFormat.IQ3_S;
+
+static List<RowView> BuildRowViews(GgufFile gguf)
+{
+    List<RowView> views = [];
+    foreach (LogicalTensor tensor in gguf.Tensors.Tensors)
+    {
+        int[] dims = tensor.Shape.Dims;
+        if (dims.Length < 2 || dims[^1] <= 0)
+        {
+            continue; // one-dimensional tensors (norms, biases) are not GEMV operands
+        }
+
+        int cols = dims[^1];
+        long stride = tensor.Shape.RowStrideBytes(tensor.Format);
+        if (stride <= 0 || stride > int.MaxValue)
+        {
+            continue;
+        }
+
+        // A GGUF payload is one packed row after another over its innermost dimension, so a rank-3 slab reads as rows x cols too.
+        long flatRows = tensor.Shape.ElementCount / cols;
+        if (flatRows * stride != tensor.SizeBytes)
+        {
+            continue; // not a plain row stream for this format: skip rather than guess at its packing
+        }
+
+        views.Add(new RowView(tensor, cols, flatRows, dims.Length > 2));
+    }
+
+    return views;
+}
+
+static (List<RowView>, string) SelectTensorsForFormat(List<RowView> pool, int hidden)
+{
+    if (pool.Count == 0)
+    {
+        return ([], "no tensors of this format in the file");
+    }
+
+    // Prefer attention/MLP tensors whose contraction width is the model's embedding length: those are the rows decode streams.
+    List<RowView> selected;
+    string geometryNote;
+    List<RowView> attnMlpHidden = [.. pool
+        .Where(v => v.Cols == hidden && IsAttentionOrMlp(v.Tensor.Name))
+        .OrderBy(v => v.Tensor.Name, StringComparer.Ordinal)
+        .Take(4)];
+    if (attnMlpHidden.Count > 0)
+    {
+        selected = attnMlpHidden;
+        geometryNote = "attention/MLP rows at embedding width";
+    }
+    else
+    {
+        List<RowView> hiddenWidthAny = [.. pool
+            .Where(v => v.Cols == hidden)
+            .OrderBy(v => v.Tensor.Name, StringComparer.Ordinal)
+            .Take(4)];
+        if (hiddenWidthAny.Count > 0)
+        {
+            selected = hiddenWidthAny;
+            geometryNote = "embedding/LM-head rows at embedding width (no attention/MLP tensor of this format carries it)";
+        }
+        else
+        {
+            selected = [.. pool.OrderByDescending(v => v.Tensor.SizeBytes).ThenBy(v => v.Tensor.Name, StringComparer.Ordinal).Take(4)];
+            geometryNote = $"rows of contraction width {selected[0].Cols} (no tensor of this format carries the embedding width)";
+        }
+    }
+
+    return (selected, geometryNote);
+}
+
+static int BenchSub4BitComparison(string path, int quota, int reps, int maxRows, GridLoadEncoding? explicitGrid, bool? explicitPrefetch, bool compareGrid, bool comparePrefetch)
+{
+    using GgufFile gguf = GgufFile.Open(path);
+    string arch = gguf.Metadata.GetString("general.architecture", "general");
+    int hidden = gguf.Metadata.GetInt($"{arch}.embedding_length", 0);
+
+    Console.WriteLine($"sub4bit-compare file={gguf.Path} version={gguf.Version} alignment={gguf.Alignment} tensors={gguf.Tensors.Tensors.Count} size={gguf.FileSize}");
+    Console.WriteLine(
+        $"  arch={arch} embedding_length={hidden} avx2={Avx2.IsSupported} physicalCores={CpuBackend.DetectedPhysicalCoreCount} " +
+        $"logicalProcessors={Environment.ProcessorCount} quotaThreads={quota} reps={reps} maxRowsPerTensor={maxRows}");
+
+    List<RowView> views = BuildRowViews(gguf);
+    if (!views.Any(v => IsSub4BitQuant(v.Tensor.Format)))
+    {
+        Console.WriteLine("  no sub-4-bit i-quant tensors to compare in this file");
+        return 1;
+    }
+
+    using GgufMmapWeightSource source = new(gguf);
+    CpuFeaturePosture features = CpuIsaProbe.Detect();
+    GridLoadEncoding resolvedGrid = CpuBackend.ResolveAutoGrid(features);
+
+    if (compareGrid)
+    {
+        // Encoding comparisons keep hints off unless the caller states otherwise, so scalar/gather cost is isolated from row-hint overhead.
+        bool prefForEncodings = explicitPrefetch ?? false;
+        using CpuBackend scalarBackend = new(threads: 0, coreSet: null, threadQuota: quota, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: features, forcedGrid: GridLoadEncoding.Scalar, forcePrefetchWeights: prefForEncodings);
+        using CpuBackend gatherBackend = new(threads: 0, coreSet: null, threadQuota: quota, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: features, forcedGrid: GridLoadEncoding.Gather, forcePrefetchWeights: prefForEncodings);
+        RunSub4BitComparisonFormats(views, hidden, source, "grid", ["scalar", "gather"], [scalarBackend, gatherBackend], reps, maxRows);
+    }
+
+    if (comparePrefetch)
+    {
+        GridLoadEncoding gridForPrefetch = explicitGrid ?? resolvedGrid;
+        using CpuBackend offBackend = new(threads: 0, coreSet: null, threadQuota: quota, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: features, forcedGrid: gridForPrefetch, forcePrefetchWeights: false);
+        using CpuBackend onBackend = new(threads: 0, coreSet: null, threadQuota: quota, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: features, forcedGrid: gridForPrefetch, forcePrefetchWeights: true);
+        RunSub4BitComparisonFormats(views, hidden, source, "prefetch", ["off", "on"], [offBackend, onBackend], reps, maxRows);
+    }
+
+    return 0;
+}
+
+static void RunSub4BitComparisonFormats(List<RowView> allViews, int hidden, GgufMmapWeightSource source, string axis, List<string> labels, CpuBackend[] backends, int reps, int maxRows)
+{
+    Console.WriteLine(
+        $"  comparison={axis} resolvedGrids={(string.Join(",", backends.Select(b => b.ResolvedGridEncoding.ToString().ToLowerInvariant())))} " +
+        $"prefetchHints={(string.Join(",", backends.Select(b => b.PrefetchWeightsEnabled ? "on" : "off")))} workers={backends[0].EffectiveWorkerCount}");
+
+    double[] allSeconds = new double[backends.Length];
+    long allRows = 0;
+    double allBytes = 0;
+    bool allExact = true;
+
+    foreach (QuantFormat format in allViews.Where(v => IsSub4BitQuant(v.Tensor.Format)).Select(v => v.Tensor.Format).Distinct().OrderBy(f => f.ToString(), StringComparer.Ordinal))
+    {
+        List<RowView> pool = [.. allViews.Where(v => v.Tensor.Format == format)];
+        (List<RowView> selected, string geometryNote) = SelectTensorsForFormat(pool, hidden);
+        if (selected.Count == 0)
+        {
+            continue;
+        }
+
+        long rowsTotal = 0;
+        double bytesTotal = 0;
+        bool exactAll = true;
+        double[] seconds = new double[backends.Length];
+
+        Console.WriteLine($"FORMAT {format} ({geometryNote}) comparison={axis} tensors={selected.Count}");
+        foreach (RowView view in selected)
+        {
+            LogicalTensor tensor = view.Tensor;
+            long stride = tensor.Shape.RowStrideBytes(format);
+            int rows = (int)Math.Min(view.Rows, maxRows);
+            if (rows <= 0 || view.Cols <= 0)
+            {
+                continue;
+            }
+
+            ReadOnlySpan<byte> full = source.Resolve(tensor);
+            ReadOnlySpan<byte> bytes = full.Slice(0, checked((int)(rows * stride)));
+            TensorShape shape = new([rows, view.Cols]);
+            WeightRef w = new(bytes, shape, format);
+
+            Random activations = new(unchecked(20261117 ^ view.Cols));
+            float[] x = NextActivations(activations, view.Cols);
+
+            (double[] firstSeconds, double[] bestSeconds, bool exactTensor) = TimeInterleavedGemv(backends, w, x, rows, reps);
+            if (!exactTensor)
+            {
+                Console.WriteLine($"  {axis} mismatch tensor={tensor.Name} rows={rows} cols={view.Cols}");
+                exactAll = false;
+            }
+
+            for (int i = 0; i < backends.Length; i++)
+            {
+                seconds[i] += bestSeconds[i];
+            }
+
+            Console.WriteLine(
+                $"  tensor {tensor.Name} dims=[{string.Join(",", tensor.Shape.Dims)}]" +
+                (view.Flattened ? " viewed as flat rows" : string.Empty) +
+                $" measuredRows={rows} cols={view.Cols} strideBytes={stride} bpw={(stride * 8.0 / view.Cols):F2}" +
+                $" exact={(exactTensor ? "yes" : "no")}");
+            Console.WriteLine($"    {axis} warm {FormatComparisonTimes(labels, bestSeconds, rows, "ns/GEMV")}");
+            Console.WriteLine($"    {axis} cold {FormatComparisonTimes(labels, firstSeconds, rows, "firstPass ns/GEMV")}");
+
+            rowsTotal += rows;
+            bytesTotal += (double)rows * stride;
+        }
+
+        if (rowsTotal == 0)
+        {
+            continue;
+        }
+
+        double[] summarySeconds = new double[backends.Length];
+        for (int i = 0; i < backends.Length; i++)
+        {
+            summarySeconds[i] = seconds[i] / rowsTotal * 1e9;
+        }
+
+        Console.WriteLine($"SUMMARY {format,-8} comparison={axis} exact={(exactAll ? "yes" : "no")} bytes={bytesTotal:F0}");
+        Console.WriteLine($"    warm ns/GEMV {(string.Join(" ", Enumerable.Range(0, labels.Count).Select(i => $"{labels[i]}={summarySeconds[i]:F1}")))}");
+
+        for (int i = 0; i < backends.Length; i++)
+        {
+            allSeconds[i] += seconds[i];
+        }
+
+        allRows += rowsTotal;
+        allBytes += bytesTotal;
+        allExact &= exactAll;
+
+        if (backends.Length == 2)
+        {
+            double speedup = seconds[0] > 0 ? ((seconds[0] - seconds[1]) / seconds[0]) * 100.0 : 0;
+            Console.WriteLine($"    {labels[1]} vs {labels[0]} warm delta%={speedup:F3} (positive means {labels[1]} is faster)");
+        }
+    }
+
+    if (allRows > 0)
+    {
+        double[] allSummarySeconds = new double[backends.Length];
+        for (int i = 0; i < backends.Length; i++)
+        {
+            allSummarySeconds[i] = allSeconds[i] / allRows * 1e9;
+        }
+
+        Console.WriteLine($"SUMMARY SUB4BIT comparison={axis} exact={(allExact ? "yes" : "no")} rows={allRows} bytes={allBytes:F0}");
+        Console.WriteLine($"    warm ns/GEMV {(string.Join(" ", Enumerable.Range(0, labels.Count).Select(i => $"{labels[i]}={allSummarySeconds[i]:F1}")))}");
+
+        if (backends.Length == 2)
+        {
+            double speedup = allSeconds[0] > 0 ? ((allSeconds[0] - allSeconds[1]) / allSeconds[0]) * 100.0 : 0;
+            Console.WriteLine($"    {labels[1]} vs {labels[0]} warm delta%={speedup:F3} (positive means {labels[1]} is faster)");
+        }
+    }
+
+}
+
+static (double[], double[], bool) TimeInterleavedGemv(CpuBackend[] backends, WeightRef w, ReadOnlySpan<float> x, int rows, int reps)
+{
+    float[][] outputs = new float[backends.Length][];
+    for (int i = 0; i < backends.Length; i++)
+    {
+        outputs[i] = new float[rows];
+    }
+
+    double[] firstSeconds = new double[backends.Length];
+    double[] bestSeconds = new double[backends.Length];
+
+    for (int i = 0; i < backends.Length; i++)
+    {
+        Stopwatch sw = Stopwatch.StartNew();
+        backends[i].Gemv(x, w, outputs[i]);
+        sw.Stop();
+        firstSeconds[i] = sw.Elapsed.TotalSeconds;
+        bestSeconds[i] = firstSeconds[i];
+    }
+
+    for (int rep = 0; rep < reps; rep++)
+    {
+        for (int i = 0; i < backends.Length; i++)
+        {
+            Stopwatch sw = Stopwatch.StartNew();
+            backends[i].Gemv(x, w, outputs[i]);
+            sw.Stop();
+
+            if (sw.Elapsed.TotalSeconds < bestSeconds[i])
+            {
+                bestSeconds[i] = sw.Elapsed.TotalSeconds;
+            }
+        }
+    }
+
+    bool exact = true;
+    for (int i = 1; i < backends.Length && exact; i++)
+    {
+        if (!ExactFloatArrays(outputs[0], outputs[i]))
+        {
+            exact = false;
+        }
+    }
+
+    return (firstSeconds, bestSeconds, exact);
+}
+
+static bool ExactFloatArrays(float[] left, float[] right)
+{
+    if (left.Length != right.Length)
+    {
+        return false;
+    }
+
+    for (int i = 0; i < left.Length; i++)
+    {
+        if (BitConverter.SingleToInt32Bits(left[i]) != BitConverter.SingleToInt32Bits(right[i]))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static string FormatComparisonTimes(List<string> labels, double[] seconds, int rows, string unit) =>
+    string.Join(" ", Enumerable.Range(0, labels.Count).Select(i => $"{labels[i]}={seconds[i] * 1e9 / Math.Max(1, rows):F2} {unit}"));
 
 // Prefill cost profile: forward prompt windows of the requested lengths through the engine's batched-prefill path
 // (and optionally through the single-token forward, the route prefill took before row batching) over a fresh KV per

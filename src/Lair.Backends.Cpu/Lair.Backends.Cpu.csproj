@@ -6,6 +6,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Lair.Tests" />
+    <InternalsVisibleTo Include="Lair.Bench" /> <!-- bench forces grid/prefetch encodings through the internal seams for evidence comparisons. -->
   </ItemGroup>
 
   <PropertyGroup>

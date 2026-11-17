@@ -14,7 +14,7 @@ This page is the base overview. The authoritative detail lives in [reference/CLI
 
   `release\lair.exe` ships with `wwwroot\` beside it — the Web UI bundle the host serves at `/ui`. A checkout can also be run without publishing (`dotnet build Lair.sln` then `src\Lair.Host\bin\Release\net10.0\lair.exe`). A prebuilt release artifact is not published yet: no publish profile or CI packaging step is committed.
 - **A GGUF model file** on disk, from the published quant ecosystem (for example a Hugging Face GGUF repo), or fetched by LAIR from a pinned `source:` declaration.
-- CPU kernels use AVX2 when the CPU has it and fall back to scalar paths otherwise.
+- CPU integer-dot kernels select `AVX-VNNI` or `AVX2` through engine-open ISA dispatch, falling back to scalar paths only when neither vector path is available.
 - Optional hybrid CUDA execution needs a CUDA-capable NVIDIA driver/runtime and a model whose opened `placement.gpu_layers` span uses the currently covered CUDA kernel formats (`F32`, `F16`, `BF16`, `Q4_K`, `Q6_K`).
 
 ## Quick start
@@ -70,7 +70,7 @@ Config paths are read relative to the working directory you launch `lair` from, 
 | `/v1/chat/completions` | POST | JSON or SSE (`"stream": true`); `tools`/`tool_choice`, `logprobs`/`top_logprobs`, `presence_penalty`/`frequency_penalty`, `logit_bias`, `seed`, `stop`, `temperature`/`top_p`/`top_k`, `max_tokens` (default 128), `max_reasoning_tokens`/`max_response_tokens` |
 | `/v1/completions` | POST | Legacy text completions, JSON or SSE, same sampling fields |
 | `/v1/models` | GET | Advertises `context_length`, the byte-dominant `quant`, `architecture`, model `type`, the resolved `tool_parser` and `reasoning` policy, sparse-FFN strategy, the concurrency-cap posture, and the resolved route segments |
-| `/monitor/stream` | GET | SSE engine snapshots (every 2 s) plus request lifecycle events; consumed by `monitor` and the Web UI; CUDA-backed serves also publish GPU-busy, PCIe transfer totals, and persistent device VRAM bytes |
+| `/monitor/stream` | GET | SSE engine snapshots (every 2 s) plus request lifecycle events; consumed by `monitor` and the Web UI; integer-dot CPU serves report resolved `metrics_cpu_isa` and `metrics_cpu_gather`; CUDA-backed serves also publish GPU-busy, PCIe transfer totals, and persistent device VRAM bytes |
 | `/healthz` | GET | `{"status":"ok","model_ready":true}` readiness probe |
 | `/ui` | GET | Web UI (tabbed monitor + browser chat client); `GET /` redirects permanently to `/ui/` |
 
@@ -126,7 +126,7 @@ Architecture profiles resolved at load: `llama`, `qwen2`, `qwen3`, `gemma2`, `ge
 
 Tensor types the loader accepts and the CPU engine decodes today: `F32`, `F16`, `BF16`, `Q8_0`, `Q4_K`, `Q5_0`, `Q5_K`, `Q6_K`, `Q3_K`, `Q2_K`, `IQ4_NL`, `IQ4_XS`, `IQ3_S`, `IQ3_XXS`, `IQ2_S`, `IQ2_XS`, `IQ2_XXS`, `Q2_0`. (`IQ1_*`, `TQ*`, `MXFP4`/`NVFP4`, and FP8 containers are not accepted.) Mixed-tier files resolve per tensor, so a file like a `UD-IQ3_XXS` quant loads through the same registry. The blocked-matmul prefill kernel exists only for `Q8_0`, `Q4_K`, and `IQ4_XS`: a `gemm` selection over any other dense format refuses at model open. CUDA hybrid execution covers `F32`, `F16`, `BF16`, `Q4_K`, and `Q6_K` tensors in the opened `placement.gpu_layers` span; an opened span with an unsupported CUDA format refuses rather than falling back to CPU execution.
 
-Measured on this runtime (context 4096, `thread_quota: 8`): `IQ4_XS` decoded 11.6 tok/s against 10.3–10.4 for `Q4_K_M` while being smaller (743 MB against 808 MB), so `IQ4_XS` is the throughput pick under a 4 GB working-set budget. Sub-4-bit i-quants cost roughly 6.5× the `Q4_K` GEMV cost per element (≈1.07–1.09 ns/element against ≈0.163–0.171) and a mixed-tier `IQ3_XXS` file decoded 3.9 tok/s — about 2.6× slower than `Q4_K_M`: they buy bytes you then pay for in tokens. Quality is a separate question from these numbers: the repo's parity fixtures pin `smollm` models only, and a 2-bit-class file has been measured serving coherent-but-wrong arithmetic on a 1B model, so sub-3-bit files are load/parity fixtures here, not serving recommendations.
+Measured on this runtime (context 4096, `thread_quota: 8`): `IQ4_XS` remains the throughput pick — monitor-windowed decode peaks at ≈16.5 tok/s against ≈12.4 for `Q4_K_M`, with peak working sets of ≈1344 MB and ≈1431 MB respectively, so it is faster while staying under a 4 GB ceiling. Sub-4-bit GEMV costs are no longer the old ≈6.5× penalty: settled samples put them at roughly 0.25–0.39 ns/element against `Q4_K`'s ≈0.164 (about 1.5–2.3×, with `IQ3_XXS` modestly above the intended 2× band), and a mixed-tier `UD-IQ3_XXS` file now peaks around 13 tok/s rather than ≈3.9 — still slower than either dense baseline here because live throughput is fixture-level output behavior, not a per-format kernel measurement. The runs record their actual auto-resolved grid mode; this build has no public encoding override. Quality remains separate: parity fixtures pin `smollm` models only, and a 2-bit-class file has been measured serving coherent-but-wrong arithmetic on a 1B model, so sub-3-bit files are load/parity fixtures here, not serving recommendations.
 
 ### Placement and capacity vocabulary
 
@@ -139,7 +139,6 @@ None of the following works in this build. Status labels describe project direct
 | Area | Status | What an operator would get |
 |---|---|---|
 | Whole-model CUDA execution and full CUDA quant coverage | **in progress** | `device: cuda`/`hybrid`, whole-model CUDA execution, CUDA kernels across all loader-accepted quant formats, and GPU compute paths beyond the current `gpu_layers` hybrid split — hybrid layer-split execution through `gpu_layers` is available today for `F32`, `F16`, `BF16`, `Q4_K`, and `Q6_K` |
-| ISA dispatch and i-quant kernel rewrite | planned | Sub-4-bit i-quants decoding at `Q4_K`/`IQ4_XS` cost instead of the measured ≈6.5× penalty, with ISA-level dispatch selection |
 | Quantized KV format pair | planned | Configurable KV storage formats (`fp32`/`fp16`/`int8`/`k8v4`/`q4`) with in-kernel quantized-dot attention — a larger effective context from the same RAM |
 | Embeddings endpoint and multi-model serving (`type: embed`) | planned | `/v1/embeddings` for encoder-only models, and several models resident in one process, each with its own placement policy |
 | Sparse-MoE residency management, PLE, MTP drafting | planned | Router-driven expert gather with hot/cold tiers, pageable n-gram tables with their own budgets, speculative drafting with accept-rate reporting. Dense-resident MoE serves today; gather, tiered expert residency, PLE, and drafting do not |

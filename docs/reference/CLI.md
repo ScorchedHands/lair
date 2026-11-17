@@ -126,7 +126,7 @@ A model that declares `max_reasoning_tokens` on a vocabulary that cannot carry `
   ```
 
 - `GET /ui` serves the Web UI (a tabbed monitor plus a browser chat client). `GET /` redirects permanently to `/ui/`. The UI is only served when the host build bundled it; a build with `-p:SkipWebUi=true` serves no UI and `/ui` returns 404.
-- `GET /monitor/stream` is the SSE engine snapshot stream that `monitor` and the Web UI both consume. CUDA-backed serves also publish GPU utilization, PCIe transfer totals, and persistent device VRAM bytes.
+- `GET /monitor/stream` is the SSE engine snapshot stream that `monitor` and the Web UI both consume. Integer-dot CPU snapshots report resolved `metrics_cpu_isa` and `metrics_cpu_gather`; CUDA-backed serves also publish GPU utilization, PCIe transfer totals, and persistent device VRAM bytes.
 
 ### Hot reload
 
@@ -220,8 +220,10 @@ smollm-135m-f16        9.80     94.0      1.00      0.0%       17/256       1  g
 | `gpu` | CUDA utilization percentage for the served model, printed when nonzero. |
 | `pcie` | PCIe transfer bytes and copy count for the served model, printed when nonzero. |
 | `persistent-vram` | Persistent device VRAM held by the served model, printed when nonzero. |
+| `cpu isa` | Resolved integer-dot ISA (`scalar`, `avx2`, or `vnni`) for the served model. |
+| `gather` | Grid staging encoding paired with the resolved ISA (`scalar` or `gather`). |
 
-Keep-alive frames and malformed snapshots are skipped rather than ending the table. The accelerator tail appears only for CUDA-backed serves with nonzero accelerator facts; CPU-only rows omit it.
+Keep-alive frames and malformed snapshots are skipped rather than ending the table. Integer-dot CPU rows carry `cpu isa=<scalar|avx2|vnni> gather=<scalar|gather>`; the accelerator tail appears only for CUDA-backed serves with nonzero accelerator facts, and CPU-only serves omit it.
 
 ### Ctrl+C and exit codes
 
