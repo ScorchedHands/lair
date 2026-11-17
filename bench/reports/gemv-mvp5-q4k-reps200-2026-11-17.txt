@@ -1,0 +1,76 @@
+gemv-file file=C:\source\gitlab.scorchedhands.com\personal\LAIR\models\Llama-3.2-1B-Instruct-Q4_K_M.gguf version=3 alignment=32 tensors=147 size=807694368
+  arch=llama embedding_length=2048 avx2=True physicalCores=24 logicalProcessors=32 quotaThreads=8 reps=200 maxRowsPerTensor=256
+  backend workers: gemv1T=1 quotaRun=8
+  sub4bit axis: forcedGrid=auto forcedPrefetch=auto resolvedGrid=gather prefetchHints=on
+FORMAT Q4_K (attention/MLP rows at embedding width) tensors=4
+  tensor blk.0.attn_k.weight dims=[512,2048] measuredRows=256 cols=2048 strideBytes=1152 bpw=4.50
+    mmap-direct gemv1T warm ns/GEMV=331.2 GB/s=3.48 firstPass ns/GEMV=33184.8
+    mmap-direct gemv8T warm ns/GEMV=159.4 GB/s=7.23 firstPass ns/GEMV=1385.9 (threading engaged)
+    mmap-direct batch16 warm ns/dot=66.87 GB/s=1.08 firstPass ns/dot=922.83
+    resident    gemv1T ns/GEMV=332.8 GB/s=3.46 firstPass ns/GEMV=335.9
+    resident    gemv8T ns/GEMV=132.0 GB/s=8.73 firstPass ns/GEMV=222.7
+    resident    batch16 ns/dot=65.14 GB/s=1.11 firstPass ns/dot=87.43
+  tensor blk.0.attn_output.weight dims=[2048,2048] measuredRows=256 cols=2048 strideBytes=1152 bpw=4.50
+    mmap-direct gemv1T warm ns/GEMV=346.1 GB/s=3.33 firstPass ns/GEMV=625.4
+    mmap-direct gemv8T warm ns/GEMV=147.3 GB/s=7.82 firstPass ns/GEMV=224.6 (threading engaged)
+    mmap-direct batch16 warm ns/dot=66.46 GB/s=1.08 firstPass ns/dot=88.75
+    resident    gemv1T ns/GEMV=346.1 GB/s=3.33 firstPass ns/GEMV=348.4
+    resident    gemv8T ns/GEMV=131.2 GB/s=8.78 firstPass ns/GEMV=176.6
+    resident    batch16 ns/dot=64.06 GB/s=1.12 firstPass ns/dot=101.32
+  tensor blk.0.attn_q.weight dims=[2048,2048] measuredRows=256 cols=2048 strideBytes=1152 bpw=4.50
+    mmap-direct gemv1T warm ns/GEMV=331.6 GB/s=3.47 firstPass ns/GEMV=632.4
+    mmap-direct gemv8T warm ns/GEMV=120.7 GB/s=9.54 firstPass ns/GEMV=177.3 (threading engaged)
+    mmap-direct batch16 warm ns/dot=63.60 GB/s=1.13 firstPass ns/dot=304.81
+    resident    gemv1T ns/GEMV=331.6 GB/s=3.47 firstPass ns/GEMV=334.4
+    resident    gemv8T ns/GEMV=125.0 GB/s=9.22 firstPass ns/GEMV=244.5
+    resident    batch16 ns/dot=64.40 GB/s=1.12 firstPass ns/dot=78.15
+  tensor blk.0.ffn_gate.weight dims=[8192,2048] measuredRows=256 cols=2048 strideBytes=1152 bpw=4.50
+    mmap-direct gemv1T warm ns/GEMV=331.2 GB/s=3.48 firstPass ns/GEMV=660.9
+    mmap-direct gemv8T warm ns/GEMV=132.0 GB/s=8.73 firstPass ns/GEMV=197.7 (threading engaged)
+    mmap-direct batch16 warm ns/dot=63.04 GB/s=1.14 firstPass ns/dot=81.62
+    resident    gemv1T ns/GEMV=332.8 GB/s=3.46 firstPass ns/GEMV=335.9
+    resident    gemv8T ns/GEMV=122.3 GB/s=9.42 firstPass ns/GEMV=396.1
+    resident    batch16 ns/dot=63.09 GB/s=1.14 firstPass ns/dot=72.71
+SUMMARY Q4_K     rows=1024 colsAvg=2048 bpw=4.50 bytes=1179648
+  mmap-direct gemv   threads=1     warm ns/GEMV=335.1  ns/elt=0.164  GB/s=3.44  firstPass GB/s=0.13
+  mmap-direct gemv   threads=8     warm ns/GEMV=139.8  GB/s=8.24
+  mmap-direct batch16 threads=8     warm ns/dot=64.990  GB/s=1.11
+  resident    gemv   threads=1     ns/GEMV=335.8  ns/elt=0.164  GB/s=3.43
+  resident    gemv   threads=8     ns/GEMV=127.6  GB/s=9.03
+  resident    batch16 threads=8     ns/dot=64.172  GB/s=1.12
+FORMAT Q6_K (attention/MLP rows at embedding width) tensors=4
+  tensor blk.0.attn_v.weight dims=[512,2048] measuredRows=256 cols=2048 strideBytes=1680 bpw=6.56
+    mmap-direct gemv1T warm ns/GEMV=2736.3 GB/s=0.61 firstPass ns/GEMV=5706.6
+    mmap-direct gemv8T warm ns/GEMV=234.4 GB/s=7.17 firstPass ns/GEMV=885.5 (threading engaged)
+    mmap-direct batch16 warm ns/dot=82.81 GB/s=1.27 firstPass ns/dot=340.70
+    resident    gemv1T ns/GEMV=739.8 GB/s=2.27 firstPass ns/GEMV=890.6
+    resident    gemv8T ns/GEMV=219.1 GB/s=7.67 firstPass ns/GEMV=296.9
+    resident    batch16 ns/dot=55.49 GB/s=1.89 firstPass ns/dot=70.68
+  tensor blk.1.attn_v.weight dims=[512,2048] measuredRows=256 cols=2048 strideBytes=1680 bpw=6.56
+    mmap-direct gemv1T warm ns/GEMV=739.5 GB/s=2.27 firstPass ns/GEMV=1171.5
+    mmap-direct gemv8T warm ns/GEMV=230.9 GB/s=7.28 firstPass ns/GEMV=295.7 (threading engaged)
+    mmap-direct batch16 warm ns/dot=76.68 GB/s=1.37 firstPass ns/dot=143.48
+    resident    gemv1T ns/GEMV=739.8 GB/s=2.27 firstPass ns/GEMV=744.1
+    resident    gemv8T ns/GEMV=228.5 GB/s=7.35 firstPass ns/GEMV=258.2
+    resident    batch16 ns/dot=76.68 GB/s=1.37 firstPass ns/dot=92.85
+  tensor blk.10.attn_v.weight dims=[512,2048] measuredRows=256 cols=2048 strideBytes=1680 bpw=6.56
+    mmap-direct gemv1T warm ns/GEMV=739.5 GB/s=2.27 firstPass ns/GEMV=1192.2
+    mmap-direct gemv8T warm ns/GEMV=229.7 GB/s=7.31 firstPass ns/GEMV=270.3 (threading engaged)
+    mmap-direct batch16 warm ns/dot=71.07 GB/s=1.48 firstPass ns/dot=80.27
+    resident    gemv1T ns/GEMV=741.8 GB/s=2.26 firstPass ns/GEMV=748.4
+    resident    gemv8T ns/GEMV=233.6 GB/s=7.19 firstPass ns/GEMV=360.5
+    resident    batch16 ns/dot=71.88 GB/s=1.46 firstPass ns/dot=173.41
+  tensor blk.13.attn_v.weight dims=[512,2048] measuredRows=256 cols=2048 strideBytes=1680 bpw=6.56
+    mmap-direct gemv1T warm ns/GEMV=741.0 GB/s=2.27 firstPass ns/GEMV=1204.7
+    mmap-direct gemv8T warm ns/GEMV=237.1 GB/s=7.09 firstPass ns/GEMV=367.2 (threading engaged)
+    mmap-direct batch16 warm ns/dot=76.83 GB/s=1.37 firstPass ns/dot=95.46
+    resident    gemv1T ns/GEMV=739.8 GB/s=2.27 firstPass ns/GEMV=744.1
+    resident    gemv8T ns/GEMV=244.5 GB/s=6.87 firstPass ns/GEMV=304.3
+    resident    batch16 ns/dot=76.64 GB/s=1.37 firstPass ns/dot=112.60
+SUMMARY Q6_K     rows=1024 colsAvg=2048 bpw=6.56 bytes=1720320
+  mmap-direct gemv   threads=1     warm ns/GEMV=1239.1  ns/elt=0.605  GB/s=1.36  firstPass GB/s=0.72
+  mmap-direct gemv   threads=8     warm ns/GEMV=233.0  GB/s=7.21
+  mmap-direct batch16 threads=8     warm ns/dot=76.849  GB/s=1.37
+  resident    gemv   threads=1     ns/GEMV=740.3  ns/elt=0.361  GB/s=2.27
+  resident    gemv   threads=8     ns/GEMV=231.4  GB/s=7.26
+  resident    batch16 threads=8     ns/dot=70.172  GB/s=1.50
