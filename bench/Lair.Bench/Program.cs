@@ -12,7 +12,7 @@ using Lair.Tokenizer;
 
 if (args.Length == 0)
 {
-    Console.WriteLine("usage: Lair.Bench <gemv|gguf-dump|gemv-file|prefill-profile|kv-spike|kv-micro|help>");
+    Console.WriteLine("usage: Lair.Bench <gemv|gguf-dump|gemv-file|prefill-profile|kv-spike|kv-micro|q4-parity|help>");
     return 1;
 }
 
@@ -24,12 +24,13 @@ return args[0] switch
     "prefill-profile" => BenchPrefillProfile(args),
     "kv-spike" => KvFormatSpike.RunDecode(args),
     "kv-micro" => KvFormatSpike.RunMicro(args),
+    "q4-parity" => KvFormatSpike.RunParity(args), // q4-K viability measurement: bench-only, no production route or config posture changes
     _ => Usage(),
 };
 
 static int Usage()
 {
-    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M] [--grid scalar|gather|compare] [--prefetch on|off|compare], prefill-profile <gguf path> [--threads N] [--lengths L1,L2,...] [--widths W1,W2,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--out <path>], kv-spike [model.gguf] [--modes baseline,f32block,q8k] [--threads N] [--context C] [--decode D] [--windows N], or kv-micro [model.gguf] [--modes baseline,f32block,q8k] [--threads N] [--context P]");
+    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M] [--grid scalar|gather|compare] [--prefetch on|off|compare], prefill-profile <gguf path> [--threads N] [--lengths L1,L2,...] [--widths W1,W2,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--out <path>], kv-spike [model.gguf] [--modes baseline,f32block,q8k,q4] [--threads N] [--context C] [--decode D] [--windows N], q4-parity <gguf path> [--ref llama-ref.json] [--out measurement.txt] [--prompts p1,p2,p3,p4] [--threads N] [--context C], or kv-micro [model.gguf] [--modes baseline,f32block,q8k,q4] [--threads N] [--context P]");
     return 1;
 }
 

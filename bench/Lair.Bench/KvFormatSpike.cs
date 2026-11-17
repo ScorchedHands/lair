@@ -4,6 +4,8 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Lair.Backends.Cpu;
 using Lair.Kv;
 using Lair.Loader;
@@ -67,9 +69,9 @@ internal static class KvFormatSpike
 
         foreach (string mode in modes)
         {
-            if (mode is not ("baseline" or "f32block" or "q8k"))
+            if (mode is not ("baseline" or "f32block" or "q8k" or "q4"))
             {
-                Console.WriteLine($"kv-spike: unknown mode '{mode}' - expected baseline, f32block, q8k");
+                Console.WriteLine($"kv-spike: unknown mode '{mode}' - expected baseline, f32block, q8k, q4");
                 return 1;
             }
 
@@ -382,10 +384,14 @@ internal static class KvFormatSpike
     // instantiated once as a closed generic over (TK,TV), so no format branch exists inside the position loop it runs; every
     // decoded token's K/V enters that storage in the same step that attends them, which is what quantized append costs.
     private static TransformerModel.KvAttentionSpikeRoute RouteFor(
-        string mode, ModelPlan geometry, KvKernelOptions options, SpikeMirror mirror) =>
-        mode == "f32block"
-            ? RouteGeneric<F32Block, F32Block>(mirror, options, geometry)
-            : RouteGeneric<Q8DotBlock, Q8ValueBlock>(mirror, options, geometry);
+        string mode, ModelPlan geometry, KvKernelOptions options, SpikeMirror mirror) => mode switch
+    {
+        "f32block" => RouteGeneric<F32Block, F32Block>(mirror, options, geometry),
+        // The candidate q4/q4 combo: both sides stored in ggml's Q4_0 block shape, K dotted through this backend's shipped
+        // Q8_K integer-dot machinery against a quantized activation and V accumulated from dequantized nibbles.
+        "q4" => RouteGeneric<Q4DotBlock, Q4ValueBlock>(mirror, options, geometry),
+        _ => RouteGeneric<Q8DotBlock, Q8ValueBlock>(mirror, options, geometry),
+    };
 
     private static TransformerModel.KvAttentionSpikeRoute RouteGeneric<TK, TV>(
         SpikeMirror mirror, KvKernelOptions options, ModelPlan geometry)
@@ -807,7 +813,7 @@ internal static class KvFormatSpike
 
         public int CapacityPositions { get; }
 
-        private readonly bool _f32Storage;
+        private readonly string _mode; // which candidate block shape this mirror holds: f32block, q8k, or the ggml-geometry q4 pair
         private readonly int _regionBlocks;
         private readonly int _kBlockBytes;
         private readonly int _vBlockBytes;
@@ -822,15 +828,33 @@ internal static class KvFormatSpike
                 throw new ArgumentException($"a spike KV region must cover whole 32-value groups, got {kvDimValues} values.", nameof(kvDimValues));
             }
 
-            _f32Storage = mode == "f32block";
+            _mode = mode;
             CapacityPositions = capacityPositions;
             _regionBlocks = kvDimValues / 32; // whole groups per token region, whatever block size each side uses
-            _kBlockBytes = _f32Storage ? Unsafe.SizeOf<F32Block>() : Unsafe.SizeOf<Q8DotBlock>();
-            _vBlockBytes = _f32Storage ? Unsafe.SizeOf<F32Block>() : Unsafe.SizeOf<Q8ValueBlock>();
+            (_kBlockBytes, _vBlockBytes) = _mode switch
+            {
+                "f32block" => (Unsafe.SizeOf<F32Block>(), Unsafe.SizeOf<F32Block>()),
+                "q4" => CheckedQ4SideBytes(), // the q4 pair is guarded against ggml's 18-byte Q4_0 block before any arena is sized
+                _ => (Unsafe.SizeOf<Q8DotBlock>(), Unsafe.SizeOf<Q8ValueBlock>()),
+            };
 
             int blocksPerSide = layerCount * capacityPositions * _regionBlocks; // one region per (layer, position) the sequence can address
             KStorage = new byte[checked(blocksPerSide * _kBlockBytes)];
             VStorage = new byte[checked(blocksPerSide * _vBlockBytes)];
+        }
+
+        private static (int K, int V) CheckedQ4SideBytes()
+        {
+            int kBytes = Unsafe.SizeOf<Q4DotBlock>();
+            int vBytes = Unsafe.SizeOf<Q4ValueBlock>();
+
+            if (kBytes != 18 || vBytes != 18)
+            {
+                throw new InvalidOperationException(
+                    $"the q4 pair must hold ggml's Q4_0 block geometry exactly: expected 18 bytes per side, got K={kBytes} V={vBytes}.");
+            }
+
+            return (kBytes, vBytes);
         }
 
         public Span<byte> KRegion(int layer, int position) => Region(KStorage, _kBlockBytes, layer, position);
@@ -840,16 +864,26 @@ internal static class KvFormatSpike
         /// <summary>Quantizes or copies one token's K and V regions into this mirror - the storage write every append pays.</summary>
         public void QuantizeOne(SequenceKv kv, int layer, int position)
         {
-            if (_f32Storage)
+            switch (_mode)
             {
-                F32Block.WriteRegion(kv.ReadK(position, layer), MemoryMarshal.Cast<byte, F32Block>(KRegion(layer, position)));
-                F32Block.WriteRegion(kv.ReadV(position, layer), MemoryMarshal.Cast<byte, F32Block>(VRegion(layer, position)));
+                case "f32block":
+                    F32Block.WriteRegion(kv.ReadK(position, layer), MemoryMarshal.Cast<byte, F32Block>(KRegion(layer, position)));
+                    F32Block.WriteRegion(kv.ReadV(position, layer), MemoryMarshal.Cast<byte, F32Block>(VRegion(layer, position)));
 
-                return;
+                    return;
+
+                case "q4":
+                    Q4DotBlock.WriteRegion(kv.ReadK(position, layer), MemoryMarshal.Cast<byte, Q4DotBlock>(KRegion(layer, position)));
+                    Q4ValueBlock.WriteRegion(kv.ReadV(position, layer), MemoryMarshal.Cast<byte, Q4ValueBlock>(VRegion(layer, position)));
+
+                    return;
+
+                default:
+                    Q8DotBlock.WriteRegion(kv.ReadK(position, layer), MemoryMarshal.Cast<byte, Q8DotBlock>(KRegion(layer, position)));
+                    Q8ValueBlock.WriteRegion(kv.ReadV(position, layer), MemoryMarshal.Cast<byte, Q8ValueBlock>(VRegion(layer, position)));
+
+                    return;
             }
-
-            Q8DotBlock.WriteRegion(kv.ReadK(position, layer), MemoryMarshal.Cast<byte, Q8DotBlock>(KRegion(layer, position)));
-            Q8ValueBlock.WriteRegion(kv.ReadV(position, layer), MemoryMarshal.Cast<byte, Q8ValueBlock>(VRegion(layer, position)));
         }
 
         private Span<byte> Region(byte[] storage, int blockBytes, int layer, int position)
@@ -864,6 +898,589 @@ internal static class KvFormatSpike
             // The arenas are managed arrays: releasing this mirror drops its references and the collector takes both sides.
         }
     }
+
+    // q4-K viability measurement over the standard parity prompt set p1..p4 (the same prompts scripts/generate-parity.ps1 and the
+    // CalibrationProbe record against pinned llama.cpp). Three next-token distributions come from this engine per prompt: production
+    // batched prefill on pinned FP32 attention, a token-by-token replay of the same tokens on that same kernel, and the candidate q4/q4
+    // combo reached through EnableKvFormatSpike over its block-struct mirror. The sequential replay is what this measurement must use:
+    // the spike seam covers single-token forwards only (prompt windows keep their own route whatever a route install sets), so batched
+    // prefill cannot write quantized KV here without the storage work later MVP5.1 items own. Measuring FP32 both batched and sequential
+    // first prices that approximation separately instead of hiding it inside the candidate's drift, which is why all three distributions
+    // are reported rather than only q4-vs-reference. Nothing about production posture changes: no route exists unless this bench opens one.
+    internal static int RunParity(string[] args)
+    {
+        List<string> rest = [.. args[1..]];
+
+        if (rest.Count == 0 || !File.Exists(rest[0]))
+        {
+            Console.WriteLine("q4-parity: expected a model path first");
+            return 1;
+        }
+
+        string modelPath = rest[0];
+        int threads = ParseInt(rest, "--threads", 8);
+        int context = ParseInt(rest, "--context", 1024);
+        List<string> promptKeys = [.. ParseList(rest, "--prompts", ["p1", "p2", "p3", "p4"])];
+
+        using GgufFile gguf = GgufFile.Open(modelPath);
+        ModelPlan geometry = ModelPlans.Resolve(gguf); // the plan an engine open resolves: only region widths are read before opening
+
+        int kvDim = geometry.KvHeadCount * geometry.HeadDim;
+        if (kvDim % 32 != 0 || geometry.HeadDim % 32 != 0)
+        {
+            Console.WriteLine($"q4-parity: this seam needs whole q4_0 groups per head region, got kvDim={kvDim} headDim={geometry.HeadDim}");
+            return 1;
+        }
+
+        GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
+
+        List<(string Key, int[] Ids)> cases = [];
+        foreach (string key in promptKeys)
+        {
+            if (!ParityPrompts.TryGetValue(key, out string? prompt))
+            {
+                Console.WriteLine($"q4-parity: unknown prompt '{key}' - expected p1..p4");
+                return 1;
+            }
+
+            IReadOnlyList<int> ids = tokenizer.AddBosToken ? tokenizer.EncodeWithBos(prompt) : tokenizer.Encode(prompt); // the BOS posture every parity fixture records
+            cases.Add((key, [.. ids]));
+        }
+
+        int longest = 0;
+        foreach ((_, int[] ids) in cases)
+        {
+            longest = Math.Max(longest, ids.Length);
+        }
+
+        using CpuBackend backend = new(threads: threads, allowAvx2: true);
+        KvKernelOptions options = new(backend.ResolvedIntegerDotPath, backend.KvSpikeUsesAvx2FloatKernels);
+
+        Console.WriteLine($"q4-parity file={gguf.Path} bytes={gguf.FileSize} threads={backend.EffectiveWorkerCount} isaResolved={ResolvedIntegerDotNames.Of(backend.ResolvedIntegerDotPath)} avx2Float={options.Avx2}");
+        Console.WriteLine($"  arch={geometry.Architecture} layers={geometry.LayerCount} heads={geometry.HeadCount} kvHeads={geometry.KvHeadCount} headDim={geometry.HeadDim} vocab={geometry.VocabSize} context={context} prompts=[{string.Join(",", promptKeys)}] longestPromptTokens={longest}");
+
+        List<string> report = [];
+        Dictionary<string, List<TopEntry>> batched = [];
+        Dictionary<string, List<TopEntry>> sequential = [];
+        Dictionary<string, List<TopEntry>> candidateQ4 = [];
+
+        int poolBlocks = longest / 16 + 5; // prompt positions only: this probe samples the next-token distribution and decodes nothing after it
+
+        using (TransformerModel pinned = TransformerModel.Open(gguf, backend, maxContextTokens: Math.Max(context, longest + 8), logLine: null))
+        {
+            foreach ((string key, int[] ids) in cases)
+            {
+                using BlockPool pool = new(16, geometry.LayerCount, geometry.KvHeadCount, geometry.HeadDim, poolBlocks, backend);
+                using SequenceKv kv = new(pool);
+
+                pinned.Prefill(ids, kv); // the production prompt route: batched rows over pinned FP32 attention and f32/f32 storage
+                batched[key] = TopWithLogprobs(pinned.LastLogits());
+
+                using BlockPool seqPool = new(16, geometry.LayerCount, geometry.KvHeadCount, geometry.HeadDim, poolBlocks, backend);
+                using SequenceKv seqKv = new(seqPool);
+
+                foreach (int id in ids)
+                {
+                    pinned.DecodeNext(id, seqKv); // the same tokens stepped one at a time on the same kernel: prices the replay itself
+                }
+
+                sequential[key] = TopWithLogprobs(pinned.LastLogits());
+            }
+        }
+
+        using SpikeMirror mirror = new("q4", geometry.LayerCount, longest + 2, kvDim); // every position the replay addresses lives in candidate storage
+
+        using TransformerModel quantized = TransformerModel.Open(gguf, backend, maxContextTokens: Math.Max(context, longest + 8), logLine: null);
+        quantized.EnableKvFormatSpike(RouteFor("q4", geometry, options, mirror)); // assembly-internal seam: only a bench open installs a route
+
+        foreach ((string key, int[] ids) in cases)
+        {
+            using BlockPool pool = new(16, geometry.LayerCount, geometry.KvHeadCount, geometry.HeadDim, poolBlocks, backend);
+            using SequenceKv kv = new(pool);
+
+            foreach (int id in ids)
+            {
+                quantized.DecodeNext(id, kv); // each step's own K/V enter q4_0 storage before the attention that reads them: append semantics at token granularity
+            }
+
+            candidateQ4[key] = TopWithLogprobs(quantized.LastLogits());
+        }
+
+        foreach ((string key, int[] ids) in cases)
+        {
+            Console.WriteLine($"q4-parity prompt={key} tokens={ids.Length}");
+
+            foreach ((string mode, List<TopEntry> top) in new (string, List<TopEntry>)[] { ("batched", batched[key]), ("seqbaseline", sequential[key]), ("q4", candidateQ4[key]) })
+            {
+                string line = $"TOP prompt={key} mode={mode} argmaxId={top[0].Id} top16=" + string.Join("|", top.Select(e => $"{e.Id}={F(e.Logprob)}"));
+
+                report.Add(line);
+                Console.WriteLine(line);
+            }
+        }
+
+        string? refPath = ParseValue(rest, "--ref");
+        if (refPath is not null)
+        {
+            RefFixture reference = JsonSerializer.Deserialize<RefFixture>(File.ReadAllText(refPath), JsonWeb)
+                ?? throw new InvalidOperationException($"reference file '{refPath}' deserialized to null");
+
+            List<string> membership = [];
+            double worstQ4VsReference = 0d;
+            double worstQ4VsBaseline = 0d;
+            double worstSeqVsBatched = 0d;
+
+            foreach ((string key, int[] _) in cases)
+            {
+                RefPrompt? promptRef = reference.Prompts.FirstOrDefault(p => p.Key == key);
+                if (promptRef is null)
+                {
+                    report.Add($"DRIFT prompt={key} status=no-reference-entry");
+                    Console.WriteLine(report[^1]);
+
+                    continue;
+                }
+
+                IReadOnlyList<RefToken> referenceTokens = promptRef.TopLogprobs;
+
+                DriftStats q4AgainstReference = ReportDrift(candidateQ4[key], referenceTokens, report, key, "q4");
+                _ = ReportDrift(batched[key], referenceTokens, report, key, "batched"); // the production distribution's own cross-tool drift: what any candidate mode has to beat on this fixture
+                _ = ReportDrift(sequential[key], referenceTokens, report, key, "seqbaseline");
+
+                DeltaStats q4VsBatched = ReportMechanism(batched[key], candidateQ4[key], referenceTokens, key, report, "q4_vs_batched"); // quantization plus integer-dot error inside one engine
+                DeltaStats seqVsBatched = ReportMechanism(batched[key], sequential[key], referenceTokens, key, report, "seqbaseline_vs_batched"); // the replay approximation's own cost at FP32
+
+                membership.Add($"{key}={(q4AgainstReference.ArgmaxInReferenceTop5 ? "in" : "out")}");
+                worstQ4VsReference = Math.Max(worstQ4VsReference, q4AgainstReference.MaxRelevantDelta);
+                worstQ4VsBaseline = Math.Max(worstQ4VsBaseline, q4VsBatched.MaxDelta);
+                worstSeqVsBatched = Math.Max(worstSeqVsBatched, seqVsBatched.MaxDelta);
+
+                Console.WriteLine(
+                    $"q4-parity prompt={key} argmaxInReferenceTop5={q4AgainstReference.ArgmaxInReferenceTop5} " +
+                    $"q4VsReferenceMaxRelevant={(q4AgainstReference.Found == 0 ? "NA" : F(q4AgainstReference.MaxRelevantDelta))} " +
+                    $"q4VsBatchedMaxRelevant={(q4VsBatched.Found == 0 ? "NA" : F(q4VsBatched.MaxDelta))} missingInQ4Window={q4VsBatched.Missing} " +
+                    $"seqVsBatchedMaxRelevant={(seqVsBatched.Found == 0 ? "NA" : F(seqVsBatched.MaxDelta))}");
+            }
+
+            Console.WriteLine(
+                $"q4-parity summary file={gguf.Path} argmaxMembership=[{string.Join(",", membership)}] " +
+                $"worstQ4VsReferenceMaxRelevant={F(worstQ4VsReference)} worstQ4VsBatchedMaxRelevant={F(worstQ4VsBaseline)} worstSeqVsBatchedMaxRelevant={F(worstSeqVsBatched)}");
+        }
+
+        string? outPath = ParseValue(rest, "--out");
+        if (outPath is not null)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outPath)) ?? throw new InvalidOperationException($"'{outPath}' has no directory"));
+            File.WriteAllText(outPath, string.Join(Environment.NewLine, report) + Environment.NewLine);
+            Console.WriteLine($"q4-parity wrote {report.Count} measurement lines to {outPath}");
+        }
+
+        return 0;
+    }
+
+    // The standard parity prompt set exactly as scripts/generate-parity.ps1 and CalibrationProbeTests define it.
+    private static readonly Dictionary<string, string> ParityPrompts = new()
+    {
+        ["p1"] = "The capital of France is",
+        ["p2"] = "Once upon a time",
+        ["p3"] = "def fibonacci(n):\n",
+        ["p4"] = "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
+    };
+
+    // ParityTests' relevance window: a candidate deeper than this below the reference's own top-1 carries too little sampling weight for its
+    // absolute logprob to be decision-relevant, so it is excluded from drift maxima exactly as the parity gate excludes it.
+    private const double CrossToolWindowNats = 6.0;
+
+    // ggml's Q4_0 storage element: 18 bytes for a 32-value group, half-float signed scale (d = max / -8) followed by sixteen
+    // nibble windows that pair across the block halves: byte j holds low nibble for element start+j and high nibble for element
+    // start+16+j. The dequantized value of element e is (code - 8) * d with code in [0, 15], exactly as the reference unpacks it;
+    // this side stages those signed magnitudes and signs for the shipped Q8_K integer dot instead of accumulating floats.
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    internal unsafe struct Q4DotBlock : IKvFormat<Q4DotBlock>
+    {
+        public const int Values = 32;
+
+        private const int NibbleBytes = Values / 2; // one byte per pair: low nibble for element j, high nibble for element 16 + j - the reference pairing, not adjacent elements
+
+        public ushort ScaleBits; // raw IEEE-754 binary16 bits for this group's scale d
+        public fixed byte Nibbles[NibbleBytes];
+
+        public static int ValuesPerBlock => Values;
+
+        public static int BlockBytes => Unsafe.SizeOf<Q4DotBlock>(); // the footprint axis a pool would size blocks from
+
+        public static int QueryScratchBytesPerHead => CpuBackend.KvSpikeQ8KActivationBytes(512); // whole Q8_K super-blocks covering one head vector for this seam's current fixture widths
+
+        public static void WriteRegion(ReadOnlySpan<float> values, Span<Q4DotBlock> blocks)
+        {
+            fixed (byte* pBlocks = MemoryMarshal.Cast<Q4DotBlock, byte>(blocks))
+            {
+                Q4Writer.Write(values, (Q4RawBlock*)pBlocks); // K and V share one writer so both sides carry the same block geometry this spike measures
+            }
+        }
+
+        public static void PrepareQuery(ReadOnlySpan<float> qHeads, int headCount, int headDim, Span<byte> scratch, Span<float> scales, in KvKernelOptions options)
+        {
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(headDim, QkSuper); // one activation scale slot per query head: the same ceiling as the shipped Q8_K GEMV seam
+
+            fixed (float* pQ = qHeads)
+            fixed (byte* pScratch = scratch)
+            fixed (float* pScales = scales)
+            {
+                for (int h = 0; h < headCount; h++)
+                {
+                    CpuBackend.KvSpikeQuantizeActivationToQ8K(pQ + (long)h * headDim, headDim, pScratch + (long)h * QueryScratchBytesPerHead, pScales + h); // the shipped activation quantizer again: no parallel K-dot machinery
+                }
+            }
+
+            _ = options; // the dot encoding this side runs arrives with each call's resolved options
+        }
+
+        public static float DotHead(ReadOnlySpan<Q4DotBlock> tokenRegion, int headBlockOffset, ReadOnlySpan<float> qh, Span<byte> scratch, Span<float> scales, int headSlot, in KvKernelOptions options)
+        {
+            fixed (byte* pScratch = scratch)
+            {
+                sbyte* pAct = (sbyte*)pScratch + (long)headSlot * QueryScratchBytesPerHead; // this call's quantized query head
+
+                Q4RawBlock* blocks = (Q4RawBlock*)Unsafe.AsPointer(ref Unsafe.AsRef(in MemoryMarshal.GetReference(tokenRegion))) + headBlockOffset;
+
+                byte* pMag = stackalloc byte[Values]; // staged magnitudes reused per block: every iteration writes all Values bytes before the dot reads them
+                float acc = 0f;
+                int headBlocks = qh.Length / Values;
+
+                for (int blockIndex = 0; blockIndex < headBlocks; blockIndex++)
+                {
+                    Q4RawBlock* block = blocks + blockIndex;
+                    float d = (float)BitConverter.UInt16BitsToHalf(block->ScaleBits); // the stored half scale, read back exactly as it was written
+
+                    uint signs = 0u;
+                    for (int j = 0; j < NibbleBytes; j++)
+                    {
+                        byte window = block->Nibbles[j]; // reference unpack: low nibble is element start+j, high nibble is element start+16+j - the same pairing dequantize_row_q4_0 applies
+
+                        int low = (window & 0xF) - 8;
+                        int high = ((window >> 4) & 0xF) - 8;
+
+                        pMag[j] = (byte)Math.Abs(low); // magnitudes stay unsigned for the Q8_K dot and never exceed 8 here: code 0 on a signed-max block is magnitude 8
+                        if (low < 0)
+                        {
+                            signs |= 1u << j; // this value's sign folds onto the activation quant, as every shipped integer dot expects
+                        }
+
+                        pMag[Values / 2 + j] = (byte)Math.Abs(high);
+                        if (high < 0)
+                        {
+                            signs |= 1u << (Values / 2 + j); // element order for magnitudes and sign bits stays the head vector's own: only storage pairing differs from adjacency
+                        }
+                    }
+
+                    CpuBackend.KvSpikeSubBlockDotQ8K(
+                        pMag, signs, pAct + blockIndex * Values, out int loSum, out int hiSum, options.Dot); // magnitudes times sign-folded Q8_K quants: same exact integer dot every sub-4-bit GEMV uses
+
+                    acc += (float)(loSum + hiSum) * d; // this group's stored scale after the signed magnitude sum
+                }
+
+                return acc * scales[headSlot]; // then the activation super-block scale, once per head region as every Q8_K kernel applies it
+            }
+        }
+
+        public static void AccumulateHead(Span<float> outHead, ReadOnlySpan<Q4DotBlock> tokenRegion, int headBlockOffset, float weight, in KvKernelOptions options) =>
+            throw new NotSupportedException("The integer-dot side stages magnitudes and signs for the K-dot; a value side accumulates dequantized nibbles.");
+
+        private const int QkSuper = 256; // one activation scale slot per query head, matching the shipped Q8_K seam's current width ceiling
+    }
+
+    // V-side twin of the same q4_0 block shape: identical storage and writer (signed half scale, cross-half nibble pairing), but its dot is an FMA accumulation over dequantized nibbles. This keeps both sides at 18 bytes while measuring what a value side costs when it reads quantized blocks directly.
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    internal unsafe struct Q4ValueBlock : IKvFormat<Q4ValueBlock>
+    {
+        public const int Values = 32;
+
+        private const int NibbleBytes = Values / 2; // one byte per pair: low nibble for element j, high nibble for element 16 + j - the reference pairing, not adjacent elements
+
+        public ushort ScaleBits; // raw IEEE-754 binary16 bits for this group's scale d
+        public fixed byte Nibbles[NibbleBytes];
+
+        public static int ValuesPerBlock => Values;
+
+        public static int BlockBytes => Unsafe.SizeOf<Q4ValueBlock>();
+
+        public static int QueryScratchBytesPerHead => 0; // the value side never touches the prepared query scratch
+
+        public static void WriteRegion(ReadOnlySpan<float> values, Span<Q4ValueBlock> blocks)
+        {
+            fixed (byte* pBlocks = MemoryMarshal.Cast<Q4ValueBlock, byte>(blocks))
+            {
+                Q4Writer.Write(values, (Q4RawBlock*)pBlocks); // the same writer as K: identical geometry on both sides of q4/q4
+            }
+        }
+
+        public static void PrepareQuery(ReadOnlySpan<float> qHeads, int headCount, int headDim, Span<byte> scratch, Span<float> scales, in KvKernelOptions options)
+        {
+            _ = qHeads;
+            _ = headCount;
+            _ = headDim;
+            _ = scratch;
+            _ = scales;
+            _ = options; // the value side has no query preparation: it only accumulates weighted values
+        }
+
+        public static float DotHead(ReadOnlySpan<Q4ValueBlock> tokenRegion, int headBlockOffset, ReadOnlySpan<float> qh, Span<byte> scratch, Span<float> scales, int headSlot, in KvKernelOptions options) =>
+            throw new NotSupportedException("The value side is not a K-dot format; the combo pairs it with the integer-dot side.");
+
+        public static void AccumulateHead(Span<float> outHead, ReadOnlySpan<Q4ValueBlock> tokenRegion, int headBlockOffset, float weight, in KvKernelOptions options)
+        {
+            _ = options; // scalar dequantize-then-FMA accumulation: measuring drift over q4_0 storage without inventing a new value-side SIMD unpacker
+
+            Q4RawBlock* stored = (Q4RawBlock*)Unsafe.AsPointer(ref Unsafe.AsRef(in MemoryMarshal.GetReference(tokenRegion))) + headBlockOffset;
+            int blocks = outHead.Length / Values;
+
+            fixed (float* pOut = outHead)
+            {
+                for (int blockIndex = 0; blockIndex < blocks; blockIndex++)
+                {
+                    Q4RawBlock* block = stored + blockIndex;
+                    float d = (float)BitConverter.UInt16BitsToHalf(block->ScaleBits); // the stored signed half scale, read back exactly as it was written for this value-side block: dequant is code * d with no sign flip of its own
+
+                    for (int j = 0; j < NibbleBytes; j++)
+                    {
+                        byte window = block->Nibbles[j]; // reference unpack in element order: low nibble is element start+j, high nibble is element start+16+j
+
+                        int codeLow = (window & 0xF) - 8;
+                        int codeHigh = ((window >> 4) & 0xF) - 8;
+
+                        pOut[blockIndex * Values + j] += weight * (codeLow * d); // dequantized value times the attention weight: same arithmetic as a scalar kernel, no widening required for this spike
+                        pOut[blockIndex * Values + Values / 2 + j] += weight * (codeHigh * d);
+                    }
+                }
+            }
+        }
+
+        private const int QkSuper = 256; // present only to keep the q4 pair's scale ceiling beside its K-side twin
+    }
+
+    /// <summary>Shared byte view over both fixed-size q4_0 block structs so one writer can fill either side without boxing or a common base type.</summary>
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private unsafe struct Q4RawBlock
+    {
+        public ushort ScaleBits; // raw IEEE-754 binary16 bits for this group's scale d
+        public fixed byte Nibbles[Q4Writer.NibbleBytes];
+    }
+
+    /// <summary>The q4_0 block writer faithful to pinned llama.cpp b12032 quantize_row_q4_0_ref: signed-max half scale (d = max / -8), FP32 reciprocal id for quantization, C truncation-after-offset code rounding with a top clamp at 15, and per-byte packing of element start + j in the low nibble beside element start + 16 + j in the high nibble.</summary>
+    private static class Q4Writer
+    {
+        public const int Values = 32;
+
+        public const int NibbleBytes = Values / 2; // one byte per pair: low nibble holds element start+j, high nibble holds element start+16+j - the reference layout, not adjacent elements
+
+        public unsafe static void Write(ReadOnlySpan<float> values, Q4RawBlock* blocks)
+        {
+            if (values.Length % Values != 0)
+            {
+                throw new ArgumentException($"q4_0 blocks cover whole {Values}-value groups only, got {values.Length} values.", nameof(values));
+            }
+
+            int blockCount = values.Length / Values;
+
+            for (int blockIndex = 0; blockIndex < blockCount; blockIndex++)
+            {
+                Q4RawBlock* block = blocks + blockIndex;
+                int start = blockIndex * Values;
+
+                float amax = 0f; // magnitude seen so far...
+                float max = 0f; // ...and the signed value that produced it: strict '<' keeps the first element on ties, exactly as quantize_row_q4_0_ref does
+                for (int i = 0; i < Values; i++)
+                {
+                    float v = values[start + i];
+                    if (amax < Math.Abs(v))
+                    {
+                        amax = Math.Abs(v);
+                        max = v;
+                    }
+                }
+
+                // The reference scale is signed: d = max / -8, so the block side that carries the magnitude keeps full range. A group of exact zeros lands on d = -0 (half 0x8000) and id = 0 under the same formula; no special case needed there because every value * 0 + 8.5 truncates to code 8, which dequantizes back through the zero scale exactly as the reference does
+                float d = max / -8f;
+                block->ScaleBits = BitConverter.HalfToUInt16Bits((Half)d);
+
+                float id = d != 0f ? 1f / d : 0f; // reciprocal of the FP32 scale, not of the stored half: the reference quantizes against unrounded d and only then rounds d into storage
+
+                for (int j = 0; j < NibbleBytes; j++)
+                {
+                    int low = QuantizeCode(values[start + j], id); // element start+j lives in this byte's low nibble...
+                    int high = QuantizeCode(values[start + Values / 2 + j], id); // ...element start+16+j in its high nibble
+
+                    block->Nibbles[j] = (byte)(low | (high << 4)); // reference packing: half-region pairing, not adjacent pairs
+                }
+            }
+        }
+
+        private static int QuantizeCode(float value, float reciprocalScale)
+        {
+            // z + 8.5f in FP32 first, then truncation toward zero - the C posture of MIN(15, (int8_t)(x0 + 8.5f)), not a round-to-even helper: for finite block values |z| <= 8 so the offset lands in [0.5, 16.5] and only the top clamp is reachable
+            float z = value * reciprocalScale + 8.5f;
+
+            if (!float.IsFinite(z))
+            {
+                return z > 0f ? 15 : 0; // guard for pathological non-finite inputs only: normal K/V regions never take this branch, and the C cast would be undefined there anyway
+            }
+
+            int truncated = (int)z; // C-equivalent truncation toward zero for finite in-range values
+
+            if (truncated > 15)
+            {
+                return 15; // reference top clamp: MIN(15, ...) after the cast
+            }
+
+            return truncated < 0 ? 0 : truncated; // unreachable for |z| <= 8 blocks; kept so a code never leaves [0, 15] on hostile input
+        }
+    }
+
+    /// <summary>Whether this distribution's argmax is one of the recorded reference leaders (the honest cross-tool gate ParityTests uses), after reporting each relevant candidate's absolute delta.</summary>
+    private static DriftStats ReportDrift(List<TopEntry> measured, IReadOnlyList<RefToken> referenceTokens, List<string> report, string promptKey, string mode)
+    {
+        double refTop = referenceTokens[0].Logprob;
+
+        int found = 0;
+        int missing = 0;
+        double maxDelta = 0d;
+
+        foreach (RefToken token in referenceTokens)
+        {
+            if (refTop - token.Logprob > CrossToolWindowNats)
+            {
+                continue; // tail shape only: sub-nat logit differences reorder this part of the distribution wholesale
+            }
+
+            int slot = measured.FindIndex(e => e.Id == token.Id);
+            if (slot < 0)
+            {
+                missing++;
+                report.Add($"DELTA prompt={promptKey} mode={mode} id={token.Id} ref={F(token.Logprob)} lair=MISSING delta=NA");
+
+                continue;
+            }
+
+            double delta = Math.Abs(measured[slot].Logprob - token.Logprob);
+            found++;
+            maxDelta = Math.Max(maxDelta, delta);
+
+            report.Add($"DELTA prompt={promptKey} mode={mode} id={token.Id} ref={F(token.Logprob)} lair={F(measured[slot].Logprob)} delta={F(delta)}");
+        }
+
+        bool inReferenceTop5 = referenceTokens.Any(t => t.Id == measured[0].Id);
+
+        report.Add(
+            $"DRIFT prompt={promptKey} mode={mode} argmaxId={measured[0].Id} argmaxLogprob={F(measured[0].Logprob)} " +
+            $"argmaxInReferenceTop5={inReferenceTop5} relevantFound={found} relevantMissing={missing} " +
+            $"maxRelevantDelta={(found == 0 ? "NA" : F(maxDelta))}");
+
+        return new DriftStats(inReferenceTop5, found, missing, maxDelta);
+    }
+
+    // LAIR-to-LAIR drift over the same relevance set: what one mode costs against another through this engine, which separates quantization
+    // and integer-dot error from cross-tool posture. The reference's own token set defines relevance so every comparison prices the same ids.
+    private static DeltaStats ReportMechanism(List<TopEntry> baseline, List<TopEntry> measured, IReadOnlyList<RefToken> referenceTokens, string promptKey, List<string> report, string pair)
+    {
+        double refTop = referenceTokens[0].Logprob;
+
+        int found = 0;
+        int missing = 0;
+        double maxDelta = 0d;
+
+        foreach (RefToken token in referenceTokens)
+        {
+            if (refTop - token.Logprob > CrossToolWindowNats)
+            {
+                continue;
+            }
+
+            int baseSlot = baseline.FindIndex(e => e.Id == token.Id);
+            int slot = measured.FindIndex(e => e.Id == token.Id);
+
+            if (baseSlot < 0 || slot < 0)
+            {
+                missing++; // a candidate sitting inside one window and outside the other is itself evidence: ranking moved, not just values
+
+                continue;
+            }
+
+            double delta = Math.Abs(measured[slot].Logprob - baseline[baseSlot].Logprob);
+            found++;
+            maxDelta = Math.Max(maxDelta, delta);
+
+            report.Add($"MECH prompt={promptKey} pair={pair} id={token.Id} baseline={F(baseline[baseSlot].Logprob)} measured={F(measured[slot].Logprob)} delta={F(delta)}");
+        }
+
+        return new DeltaStats(found, missing, maxDelta);
+    }
+
+    // The CalibrationProbe/ParityTests ranking window: softmax logprobs over the full vocabulary, kept as the sixteen strongest entries in the
+    // same order those gates read them.
+    private static List<TopEntry> TopWithLogprobs(ReadOnlySpan<float> logits)
+    {
+        double max = double.NegativeInfinity;
+        for (int i = 0; i < logits.Length; i++)
+        {
+            if (logits[i] > max)
+            {
+                max = logits[i];
+            }
+        }
+
+        double sumExp = 0.0;
+        for (int i = 0; i < logits.Length; i++)
+        {
+            sumExp += Math.Exp(logits[i] - max);
+        }
+
+        double logSumExp = max + Math.Log(sumExp);
+
+        List<TopEntry> top = [];
+        for (int id = 0; id < logits.Length; id++)
+        {
+            double logprob = logits[id] - logSumExp;
+            if (top.Count < 16 || logprob > top[^1].Logprob)
+            {
+                int at = top.BinarySearch(new TopEntry(id, logprob), Comparer<TopEntry>.Create(
+                    (a, b) => a.Logprob != b.Logprob ? b.Logprob.CompareTo(a.Logprob) : a.Id.CompareTo(b.Id)));
+
+                if (at < 0)
+                {
+                    at = ~at;
+                }
+
+                top.Insert(at, new TopEntry(id, logprob));
+                if (top.Count > 16)
+                {
+                    top.RemoveAt(16);
+                }
+            }
+        }
+
+        return top;
+    }
+
+    private static string F(double value) => value.ToString("F4", CultureInfo.InvariantCulture);
+
+    private sealed record TopEntry(int Id, double Logprob);
+
+    internal readonly record struct DriftStats(bool ArgmaxInReferenceTop5, int Found, int Missing, double MaxRelevantDelta);
+
+    internal readonly record struct DeltaStats(int Found, int Missing, double MaxDelta);
+
+    internal sealed record RefFixture([property: JsonPropertyName("prompts")] RefPrompt[] Prompts);
+
+    internal sealed record RefPrompt(
+        [property: JsonPropertyName("key")] string Key,
+        [property: JsonPropertyName("top_logprobs")] IReadOnlyList<RefToken> TopLogprobs);
+
+    internal sealed record RefToken(
+        [property: JsonPropertyName("id")] int Id,
+        [property: JsonPropertyName("logprob")] double Logprob);
+
+    private static readonly JsonSerializerOptions JsonWeb = new(JsonSerializerDefaults.Web);
 
     private static string FormatStats(string mode, List<double> values)
     {
@@ -930,5 +1547,16 @@ internal static class KvFormatSpike
         }
 
         return [.. args[index + 1].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)];
+    }
+
+    private static string? ParseValue(List<string> args, string key)
+    {
+        int index = args.IndexOf(key);
+        if (index < 0 || index + 1 >= args.Count)
+        {
+            return null; // absence is not an error here: --ref and --out are optional measurement inputs on this bench path only
+        }
+
+        return args[index + 1];
     }
 }
