@@ -282,7 +282,10 @@ public sealed class GenerationService : IDisposable
         PlacementSpreadRequested: _placement is null ? null : NumaSpreadNames.Of(_placement.Requested),
         PlacementNodeAllocations: _computeGrant is { NodeAllocations.Count: > 0 } seatedGrant ? seatedGrant.NodeAllocationText() : null,
         PlacementAdvisory: _placement?.Advisory,
-        UpdateCandidate: _updateCandidate);
+        UpdateCandidate: _updateCandidate,
+        // The CPU integer-dot posture this engine's opened backend runs, read from the fact open resolved — not re-derived here.
+        CpuIsa: _backend.ResolvedSelection.ResolvedIsa,
+        CpuGather: _backend.ResolvedSelection.GatherMode);
 
     // Sums what each compute backend this open owns answers about its own device work: cumulative kernel busy time and
     // runtime copy tallies since that instance opened, plus the weight residency it holds in persistent device memory now.
@@ -1707,6 +1710,18 @@ public sealed class GenerationService : IDisposable
                     reasoningRegion.OpenTokenId,
                     reasoningRegion.CloseTokenId);
             }
+
+            // The integer-dot posture the opened backends actually run is announced in the same style: it states the encoding
+            // the ISA axis resolved to against this host's posture and the grid staging that encoding feeds, so an auto run
+            // and a forced-ISA run of one model diff on those two fields. A dedicated lane resolves both sides against the
+            // same axis and posture, so one line states the pair every side runs.
+            CpuSelectionReport selection = backend.ResolvedSelection;
+
+            logger?.LogInformation(
+                "cpu_selection model='{Model}' isa={Isa} gather={Gather}",
+                modelConfig.Name,
+                selection.ResolvedIsa,
+                selection.GatherMode);
 
             // The prefill route the forward engine resolved to is announced in the same style: it reports what this
             // engine actually runs, and a selection with no kernel never reaches here because opening refused it.

@@ -582,6 +582,11 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 PrefillKernel: facts?.PrefillKernel,
                 MatmulWeightFormats: facts?.MatmulWeightFormats,
 
+                // Additive CPU-selection facts read from what the opened backend resolved at open (earlier shapes untouched):
+                // an auto run and a forced-ISA run of the same model diff on these two fields alone.
+                CpuIsa: facts?.CpuIsa,
+                CpuGather: facts?.CpuGather,
+
                 WindowedLayers: _pool.DeclaredWindowedLayerCount,
                 KvReadFootprintBlocks: _pool.KvReadFootprintBlocksAtBudget,
                 SkippedKvReadBlocks: _pool.SkippedKvReadFootprintBlocksAtBudget,

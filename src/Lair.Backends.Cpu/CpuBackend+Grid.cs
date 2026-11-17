@@ -14,6 +14,15 @@ internal enum GridLoadEncoding
     Gather,
 }
 
+/// <summary>The reporting names of an opened backend's resolved grid encoding: which staging shape its i-quant dots actually run. Internal because only a backend resolves one; the host reads it through <see cref="CpuBackend.ResolvedSelection"/>.</summary>
+internal static class GridLoadEncodingNames
+{
+    public const string Scalar = "scalar";
+    public const string Gather = "gather";
+
+    public static string Of(GridLoadEncoding grid) => grid == GridLoadEncoding.Gather ? Gather : Scalar;
+}
+
 public sealed unsafe partial class CpuBackend
 {
     // Roughly two cache lines of weight bytes streamed ahead by the Q8_K row kernels' prefetch hints. Prefetch is a pure hint:

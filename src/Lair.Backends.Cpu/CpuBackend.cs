@@ -166,6 +166,17 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// <summary>The integer-dot encoding that selection resolved to at open - scalar reference, AVX2 pair sums, or AVX-VNNI vpdpbusd - fixed for this backend's whole lifetime.</summary>
     internal IntegerDotPath ResolvedIntegerDotPath => _integerDot;
 
+    /// <summary>
+    /// This opened backend's resolved CPU selection in host reporting shape: the ISA axis as declared (<c>auto</c>, <c>avx2</c>,
+    /// <c>avx-vnni</c>), the integer-dot encoding it resolved to against this posture (<c>scalar</c>, <c>avx2</c>, <c>vnni</c>), and
+    /// the grid staging that encoding feeds its i-quant dots (<c>scalar</c>, <c>gather</c>). Reporting only — every value is a fact
+    /// already resolved once at open, nothing here is a knob, and an auto-resolved pair never claims a mode this backend does not run.
+    /// </summary>
+    public CpuSelectionReport ResolvedSelection => new(
+        CpuIsaNames.Of(_requestedIsa),
+        ResolvedIntegerDotNames.Of(_integerDot),
+        GridLoadEncodingNames.Of(_grid));
+
     public string DeviceId => "cpu";
 
     /// <summary>Every kernel here reads weight bytes from host memory the weight source owns: the system-memory tier.</summary>

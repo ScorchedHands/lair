@@ -95,4 +95,10 @@ public sealed record ModelFacts(
     string? PlacementAdvisory = null,
 
     /// <summary>The report-only update candidate this model's pinned pack has against the hub's current HEAD — the candidate revision and its delta summary — or null when the model declares no published source, when a check found no candidate, or when a check could not be consulted. Additive: a snapshot of a model with no candidate reads exactly as it did before this fact existed.</summary>
-    string? UpdateCandidate = null);
+    string? UpdateCandidate = null,
+
+    /// <summary>The integer-dot encoding the opened CPU backend resolved its ISA axis to (<c>scalar</c>, <c>avx2</c>, <c>vnni</c>) — what its kernels actually run, not what configuration declared. Additive: null until the owning service attaches CPU selection facts.</summary>
+    string? CpuIsa = null,
+
+    /// <summary>The grid staging that resolved encoding feeds this backend's sub-4-bit dots (<c>scalar</c>, <c>gather</c>) — never a mode the opened posture cannot run. Additive: null until CPU selection facts attach.</summary>
+    string? CpuGather = null);

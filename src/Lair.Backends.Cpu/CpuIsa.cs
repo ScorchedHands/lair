@@ -32,6 +32,31 @@ public enum IntegerDotPath
     Vnni,
 }
 
+/// <summary>The reporting names of an integer-dot encoding already resolved at open: which dot path one opened backend actually runs. Distinct from <see cref="CpuIsaNames"/>, which is the vocabulary a host may declare.</summary>
+public static class ResolvedIntegerDotNames
+{
+    public const string Scalar = "scalar";
+    public const string Avx2 = "avx2";
+    public const string Vnni = "vnni";
+
+    /// <summary>The accepted set as the text a report names its values by.</summary>
+    public static IReadOnlyList<string> ReportedNames { get; } = [Scalar, Avx2, Vnni];
+
+    public static string Of(IntegerDotPath path) => path switch
+    {
+        IntegerDotPath.Avx2 => Avx2,
+        IntegerDotPath.Vnni => Vnni,
+        _ => Scalar,
+    };
+}
+
+/// <summary>
+/// The CPU selection one opened backend reports to its host: the ISA axis exactly as declared, the integer-dot encoding that
+/// declaration resolved to against this posture, and the grid staging that encoding feeds. Reporting shape only — every value is
+/// a stable lowercase string from an already-resolved fact, nothing here can be set, and no field changes after the backend opens.
+/// </summary>
+public readonly record struct CpuSelectionReport(string RequestedIsa, string ResolvedIsa, string GatherMode);
+
 /// <summary>The vocabulary one engine.cpu.isa key accepts and the names a resolved selection reports, each in the order a refusal reports it.</summary>
 public static class CpuIsaNames
 {
