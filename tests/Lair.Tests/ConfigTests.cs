@@ -192,7 +192,7 @@ public sealed class ConfigTests : IDisposable
 
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
         Assert.Contains("Missing required key 'path'", error.Message);
-        Assert.Contains("name, path, type, max_context_tokens, kv_blocks, placement", error.Message);
+        Assert.Contains("name, path, type, max_context_tokens, kv_blocks, kv, placement", error.Message);
     }
 
     [Fact]
@@ -439,7 +439,7 @@ public sealed class ConfigTests : IDisposable
                 "models:\n  - name: qwen-test\n    path: '" + modelPath + "'\n    context: 4096\n",
                 "context",
                 "models[0]",
-                "name, path, type, max_context_tokens, kv_blocks, placement"
+                "name, path, type, max_context_tokens, kv_blocks, kv, placement"
             ),
             (
                 "models:\n  - name: qwen-test\n    path: '" + modelPath + "'\n    placement:\n      device_id: 0\n",

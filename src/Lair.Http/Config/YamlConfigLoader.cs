@@ -21,8 +21,14 @@ public static class YamlConfigLoader
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel", "cpu"];
     private static readonly string[] CpuKeys = ["isa"];
     private static readonly string[] UiKeys = ["recent_requests"];
-    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "budgets", "source"];
+    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "kv", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "budgets", "source"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit", "numa_spread", "gpu_layers"];
+
+    /// <summary>The keys one model entry's KV block may declare.</summary>
+    private static readonly string[] KvKeys = ["quant"];
+
+    /// <summary>The per-side keys one KV quant nesting may declare.</summary>
+    private static readonly string[] KvQuantKeys = ["k", "v"];
 
     /// <summary>The keys one model entry's source block may declare, beside exactly one of the two file spellings.</summary>
     private static readonly string[] SourceKeys = ["repo", "revision", "file", "files"];
@@ -500,6 +506,8 @@ public static class YamlConfigLoader
                 $"models[{index}].max_concurrent_requests {maxConcurrentRequests} is invalid: 'max_concurrent_requests' must be 1 or greater.");
         }
 
+        KvFormatPair kvQuant = ParseKvQuant(keys, index);
+
         return new ModelConfig
         {
             Name = name,
@@ -507,6 +515,7 @@ public static class YamlConfigLoader
             Type = type,
             MaxContextTokens = maxContextTokens,
             KvBlocks = kvBlocks,
+            KvQuant = kvQuant,
             ForceFencedTools = forceFencedTools,
             ToolParser = toolParser,
             Reasoning = reasoning,
@@ -518,6 +527,55 @@ public static class YamlConfigLoader
             Source = ParseSource(keys, index, name),
             Placement = ParsePlacement(keys, index, name),
         };
+    }
+
+    /// <summary>Parses one model entry's KV format axis: absent means today's FP32/FP32 pair, each declared side resolves to a canonical lowercase name, and the dropped q4_0/q4_0 combo refuses by naming both qualified paths rather than falling back.</summary>
+    private static KvFormatPair ParseKvQuant(Dictionary<string, YamlNode> modelKeys, int index)
+    {
+        string where = $"models[{index}].kv";
+        if (!modelKeys.TryGetValue("kv", out YamlNode? node))
+        {
+            return KvFormatPair.Default;
+        }
+
+        Dictionary<string, YamlNode> kvKeys = KeysOf(AsMapping(node, where), where);
+        RejectUnknownKeys(kvKeys, where, KvKeys);
+
+        if (!kvKeys.TryGetValue("quant", out YamlNode? quantNode))
+        {
+            return KvFormatPair.Default;
+        }
+
+        string quantWhere = $"{where}.quant";
+        Dictionary<string, YamlNode> quantKeys = KeysOf(AsMapping(quantNode, quantWhere), quantWhere);
+        RejectUnknownKeys(quantKeys, quantWhere, KvQuantKeys);
+
+        string? declaredK = TryText(quantKeys, "k", $"{quantWhere}.k");
+        string? declaredV = TryText(quantKeys, "v", $"{quantWhere}.v");
+
+        KvSideFormat k = KvSideFormat.F32;
+        KvSideFormat v = KvSideFormat.F32;
+
+        if (declaredK is not null && !KvSideFormatNames.TryResolve(declaredK, out k))
+        {
+            throw new ConfigException(
+                $"{quantWhere}.k '{declaredK}' is invalid: 'k' accepts {KvSideFormatNames.AcceptedVocabulary}.");
+        }
+
+        if (declaredV is not null && !KvSideFormatNames.TryResolve(declaredV, out v))
+        {
+            throw new ConfigException(
+                $"{quantWhere}.v '{declaredV}' is invalid: 'v' accepts {KvSideFormatNames.AcceptedVocabulary}.");
+        }
+
+        KvFormatPair pair = new(k, v);
+        if (pair.IsDroppedQ4Pair)
+        {
+            throw new ConfigException(
+                $"{quantWhere}.k declares '{KvSideFormatNames.Q4_0}' and {quantWhere}.v declares '{KvSideFormatNames.Q4_0}': q4_0/q4_0 is the dropped KV pair, and LAIR has no quantized KV storage or attention execution path for it.");
+        }
+
+        return pair;
     }
 
     private static PlacementConfig ParsePlacement(Dictionary<string, YamlNode> modelKeys, int index, string modelName)

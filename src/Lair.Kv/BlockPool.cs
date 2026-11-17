@@ -31,6 +31,14 @@ namespace Lair.Kv;
 /// Bytes per block = layerCount * 2 * blockTokens * kvHeads * headDim * sizeof(float).
 /// The arena is zero-initialized at construction, so slots that were never written read back as 0.
 /// </remarks>
+/// <remarks>
+/// A pool opens for a resolved KV format pair, and that pair — not a float assumption — is what sizes the arena. The default pair is
+/// FP32/FP32, whose layout is the one above byte-for-byte. A quantized pair instead stores each side's region as whole GGML groups of
+/// 32 values plus one half-precision scale, so bytes per block becomes <c>layerCount * (kRegionBytes + vRegionBytes)</c> with each side
+/// rounded up to whole groups on its own. Only FP32/FP32 is readable through this pool's float views today: on any other pair the arena,
+/// free list, refcounts, and residency accounting all work, while <see cref="SlotSpan"/>, <see cref="BlockView"/>, and the writable
+/// block spans refuse naming the formats whose storage and attention paths have not landed.
+/// </remarks>
 public sealed class BlockPool : IDisposable
 {
     private const int ArenaAlignment = 64;
@@ -38,6 +46,11 @@ public sealed class BlockPool : IDisposable
     private readonly IBackend _backend;
     private readonly MemoryHandle _arena;
     private readonly unsafe float* _base;
+    private readonly long _totalBytes;
+
+    // The resolved KV format pair this pool was sized for. Cold only: it decides the arena's byte layout at construction and is
+    // read by footprint accounting and refusals, never on an attention path — no hot path branches on it.
+    private readonly KvFormatPair _formats;
     private readonly int[] _refCounts;
     private readonly int[] _freeStack;
     private readonly int _totalFloats;
@@ -101,6 +114,30 @@ public sealed class BlockPool : IDisposable
     /// of it, and an accelerator-resident one covers all of it.
     /// </summary>
     public unsafe BlockPool(int blockTokens, int layerCount, int kvHeads, int headDim, int capacityBlocks, IBackend backend, BlockResidencyMode residency, int deviceBackedBlocks, IBackend? mirrorOwner)
+        : this(blockTokens, layerCount, kvHeads, headDim, capacityBlocks, backend, residency, deviceBackedBlocks, mirrorOwner, KvFormatPair.Default)
+    {
+    }
+
+    /// <summary>
+    /// Opens a host-resident pool sized for an explicit KV format pair — the cold-path sizing seam that proves a declared pair's footprint
+    /// against <see cref="BytesPerBlock"/> without opening a model. The arena is the pair's raw zeroed bytes, allocated and freed exactly as
+    /// an FP32 pool's is, and blocks are handed out by the same free list. Nothing serves from it unless the pair is FP32/FP32: on any other
+    /// pair the float views that attention and copy-on-write use refuse, naming the formats this pool cannot read yet.
+    /// </summary>
+    public unsafe BlockPool(int blockTokens, int layerCount, int kvHeads, int headDim, int capacityBlocks, IBackend backend, KvFormatPair formats)
+        : this(blockTokens, layerCount, kvHeads, headDim, capacityBlocks, backend, BlockResidencyMode.Dram, DeclaredDeviceRange(BlockResidencyMode.Dram, capacityBlocks), mirrorOwner: null, formats)
+    {
+    }
+
+    /// <summary>
+    /// Opens a pool whose block layout was resolved to an explicit KV format pair rather than assumed to be FP32. The pair drives the
+    /// arena's byte sizing — and therefore <see cref="BytesPerBlock"/> and every footprint reading beside it — for both sides at once, so a
+    /// quantized reservation sizes exactly what its group geometry stores instead of what floats would. Only an FP32/FP32 pair is servable:
+    /// the float views, attention kernels, and copy-on-write helpers address FP32 storage, so on any other pair this pool exists to prove a
+    /// footprint and every one of those seams refuses naming the formats it cannot read yet. Residency, refcounting, allocation order, and the
+    /// device mirror's byte arithmetic are identical whatever the pair says.
+    /// </summary>
+    public unsafe BlockPool(int blockTokens, int layerCount, int kvHeads, int headDim, int capacityBlocks, IBackend backend, BlockResidencyMode residency, int deviceBackedBlocks, IBackend? mirrorOwner, KvFormatPair formats)
     {
         ValidateDeclaredDeviceRange(residency, capacityBlocks, deviceBackedBlocks);
 
@@ -116,29 +153,52 @@ public sealed class BlockPool : IDisposable
         KvHeads = kvHeads;
         HeadDim = headDim;
         KvDim = checked(kvHeads * headDim);
-        LayerRegion = checked(2L * blockTokens * KvDim);
-        FloatsPerBlock = checked((int)(LayerCount * LayerRegion));
-        BytesPerBlock = checked(FloatsPerBlock * sizeof(float));
         CapacityBlocks = capacityBlocks;
         _budgetBlocks = capacityBlocks; // no cap until one is set: a fresh pool budgets its whole reservation
         _layerWindowTokens = new int[layerCount];
         _windowedLayerCount = 0;
         _backend = backend;
 
-        long totalBytes = checked((long)capacityBlocks * BytesPerBlock);
-        if ((long)capacityBlocks * FloatsPerBlock > int.MaxValue)
+        long totalBytes;
+
+        if (formats.IsFloatStorage)
         {
-            throw new ArgumentOutOfRangeException(nameof(capacityBlocks), $"A pool of {capacityBlocks} blocks exceeds the addressable span size.");
+            LayerRegion = checked(2L * blockTokens * KvDim);
+            FloatsPerBlock = checked((int)(LayerCount * LayerRegion));
+            BytesPerBlock = checked(FloatsPerBlock * sizeof(float));
+
+            totalBytes = checked((long)capacityBlocks * BytesPerBlock);
+            if ((long)capacityBlocks * FloatsPerBlock > int.MaxValue)
+            {
+                throw new ArgumentOutOfRangeException(nameof(capacityBlocks), $"A pool of {capacityBlocks} blocks exceeds the addressable span size.");
+            }
+
+            _totalFloats = capacityBlocks * FloatsPerBlock;
+        }
+        else
+        {
+            // A quantized pair stores group payload+scale bytes per side region, so no float addressing exists for it: the block's byte
+            // count comes straight from the descriptor and stays what a device mirror copies.
+            BytesPerBlock = checked(formats.BytesPerBlock(LayerCount, blockTokens, KvDim));
+
+            totalBytes = checked((long)capacityBlocks * BytesPerBlock);
+            if (totalBytes > int.MaxValue)
+            {
+                throw new ArgumentOutOfRangeException(nameof(capacityBlocks), $"A pool of {capacityBlocks} blocks exceeds the addressable arena size.");
+            }
         }
 
-        _totalFloats = capacityBlocks * FloatsPerBlock;
+        _formats = formats;
+        _totalBytes = totalBytes;
         _arena = backend.AllocateAligned(totalBytes, ArenaAlignment);
         if (_arena.Pointer is null)
         {
             throw new OutOfMemoryException($"Failed to allocate {totalBytes} bytes for the KV block arena.");
         }
 
-        _base = (float*)_arena.Pointer;
+        // Only an FP32 pair gets a float base pointer over the arena: quantized storage has no floats to address, so nothing here can
+        // produce one even by accident.
+        _base = formats.IsFloatStorage ? (float*)_arena.Pointer : null;
         ClearArena();
 
         // Free list as a stack of ids: pop on Allocate, push on Release. Blocks are pushed in
@@ -199,8 +259,11 @@ public sealed class BlockPool : IDisposable
 
     internal int FloatsPerBlock { get; }
 
-    /// <summary>Total bytes stored in one physical block across all layers and both K/V halves.</summary>
+    /// <summary>Total bytes stored in one physical block across all layers and both K/V halves, for whichever KV format pair this pool opened with.</summary>
     public long BytesPerBlock { get; }
+
+    /// <summary>The resolved KV format pair this pool's block layout was sized for. Cold-path posture only: it says how the arena's bytes are laid out, and nothing on an attention path reads it.</summary>
+    public KvFormatPair Formats => _formats;
 
     public int CapacityBlocks { get; }
 
@@ -409,6 +472,7 @@ public sealed class BlockPool : IDisposable
     internal unsafe Span<float> MutableBlockSpan(int physicalBlockId)
     {
         ThrowIfDisposed();
+        ThrowIfFloatStorageAddressable("MutableBlockSpan");
         ValidateBlockId(physicalBlockId);
         MarkDeviceDirty(physicalBlockId);
         return new Span<float>(_base + (long)physicalBlockId * FloatsPerBlock, FloatsPerBlock);
@@ -417,6 +481,7 @@ public sealed class BlockPool : IDisposable
     private unsafe Span<float> ReadBlockSpan(int physicalBlockId)
     {
         ThrowIfDisposed();
+        ThrowIfFloatStorageAddressable("BlockView");
         ValidateBlockId(physicalBlockId);
         return new Span<float>(_base + (long)physicalBlockId * FloatsPerBlock, FloatsPerBlock);
     }
@@ -425,6 +490,7 @@ public sealed class BlockPool : IDisposable
     internal unsafe Span<float> SlotSpan(int blockId, int layer, bool isV, int offsetWithinBlock)
     {
         ThrowIfDisposed();
+        ThrowIfFloatStorageAddressable("SlotSpan");
         ValidateBlockId(blockId);
         if ((uint)layer >= (uint)LayerCount)
         {
@@ -527,7 +593,33 @@ public sealed class BlockPool : IDisposable
         _ => deviceBackedBlocks,
     };
 
-    private unsafe void ClearArena() => new Span<float>(_base, _totalFloats).Clear();
+    private unsafe void ClearArena()
+    {
+        if (_formats.IsFloatStorage)
+        {
+            new Span<float>(_base, _totalFloats).Clear();
+            return;
+        }
+
+        // A quantized pair's arena is raw group bytes: cleared as bytes, because there is no float layout to clear it as.
+        new Span<byte>((byte*)_arena.Pointer, (int)_totalBytes).Clear();
+    }
+
+    // The float views are this pool's FP32 storage seam: attention, SequenceKv's reads and writes, and copy-on-write all address floats
+    // through them. A pool opened for any other KV format pair holds that pair's group payload and scale bytes with no float addressing,
+    // so every one of those seams refuses here naming the formats it cannot read yet, instead of handing back a span that would read
+    // quantized bytes as floats.
+    private void ThrowIfFloatStorageAddressable(string seam)
+    {
+        if (_formats.IsFloatStorage)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"{seam} addresses FP32 KV storage, but this pool's blocks store k='{KvSideFormatNames.Of(_formats.K)}' v='{KvSideFormatNames.Of(_formats.V)}': " +
+            "no quantized-KV storage or attention execution path has landed for that pair, so nothing may read or write these blocks as floats.");
+    }
 
     private void ValidateBlockId(int physicalBlockId)
     {

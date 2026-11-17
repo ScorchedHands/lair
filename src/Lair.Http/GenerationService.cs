@@ -1411,6 +1411,18 @@ public sealed class GenerationService : IDisposable
         BudgetTier? reservationKvClaimTier = null; // where the ledger seated this engine's whole-reservation KV claim, so a live soft-cap edit retargets that seat and only that seat.
         try
         {
+            logger?.LogInformation(
+                "kv_quant model='{Model}' k={K} v={V}",
+                modelConfig.Name,
+                Lair.Kv.KvSideFormatNames.Of(modelConfig.KvQuant.K),
+                Lair.Kv.KvSideFormatNames.Of(modelConfig.KvQuant.V));
+
+            if (!modelConfig.KvQuant.IsFloatStorage)
+            {
+                throw new ModelException(
+                    $"model '{modelConfig.Name}' declares kv.quant k='{Lair.Kv.KvSideFormatNames.Of(modelConfig.KvQuant.K)}' v='{Lair.Kv.KvSideFormatNames.Of(modelConfig.KvQuant.V)}': LAIR has no quantized KV storage or attention execution support for this pair — refusing before the KV pool is constructed rather than silently serving it as k='f32' v='f32'.");
+            }
+
             // A model that declares a published source is verified against its pack manifest before any byte of the
             // GGUF is opened: a present artifact verifies with no transport call, an absent pinned file fetches exactly
             // the pinned revision, and a disagreement or a failed fetch refuses the open here — before a model starts

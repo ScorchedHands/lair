@@ -451,6 +451,8 @@ public sealed class AdmissionDiagnosticsTests : IDisposable
             using CancellationTokenSource holdLive = new();
             TaskCompletionSource<bool> firstToken = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+            bool parkFirstTokenOnce = false;
+
             GenerationRequest live = new()
             {
                 Model = server.ModelName,
@@ -459,7 +461,18 @@ public sealed class AdmissionDiagnosticsTests : IDisposable
                 MaxTokens = 24,
                 Temperature = 0f,
                 Stream = true,
-                OnToken = _ => firstToken.TrySetResult(true),
+                OnToken = _ =>
+                {
+                    firstToken.TrySetResult(true);
+
+                    if (!parkFirstTokenOnce)
+                    {
+                        parkFirstTokenOnce = true;
+
+                        // Hold the admitted sequence briefly after its first streamed token so the probe lands while that sequence still owns its KV block.
+                        Thread.Sleep(250);
+                    }
+                },
             };
 
             Task<GenerationResult> liveTask = server.Engine.GenerateAsync(live, holdLive.Token);
