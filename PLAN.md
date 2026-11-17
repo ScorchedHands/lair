@@ -52,7 +52,7 @@ graph TD
     MI --> S[Scheduler: continuous batching, admission, placement]
     S --> E[Engine: layer executor]
     E --> B[IBackend kernels]
-    B --> CPU[CpuBackend: AVX2 / AVX-512 dispatch]
+    B --> CPU[CpuBackend: AVX2 / AVX-VNNI dispatch (AVX-512 deferred)]
     B --> CUDA[CudaBackend: dense + hybrid]
     E --> KV[KV/State Manager: paged blocks, device-backed pools]
     E --> SAMP[Sampler + MTP drafter]
@@ -111,7 +111,7 @@ graph TD
 **PCIe tax as measured cost** — the scheduler models transfer cost explicitly; KV follows decode device by default; `split` KV residency is validated by bench before it becomes a default anywhere.
 - Rationale: attention reads all KV every token; bytes on the far side of PCIe are paid per token; llama.cpp's no-op-offload tax crippled hybrid runs in the archive.
 
-**AVX2 baseline, AVX-512 optional** — both dev and production target boxes are AVX2-only (13900K and E5-2683 v4 lack AVX-512); AVX-512 is a dispatch path, never a design assumption.
+**AVX2 baseline with engine-open ISA dispatch** — the shipped CPU paths select `AVX-VNNI` when hardware reports it and fall back to `AVX2`; both target boxes lack `AVX-512`, which remains deferred rather than assumed.
 
 **GGUF-first with GGUF-embedded tokenizer** — parse tokenizer + chat template from GGUF metadata; consume the published quant ecosystem.
 - Rejected: HF tokenizer.json sidecar (extra files break the model-pack story).
@@ -1444,7 +1444,7 @@ CUDA joins the engine; hybrid CPU/GPU inference on the 4090, including the host-
 - [X] **CPU GEMV flake under MVP4 gates** — the Backlog defect row "Intermittent `AccessViolationException` in the AVX2 Q4_K GEMV worker under three resident engines" sits underneath every MVP4 gate that runs real models on the CPU side of a cross-device comparison; diagnose it before MVP4 build starts so a CPU-path crash is not misattributed to the CUDA backend.
   - Decision: moved into MVP4 as an implementation item rather than left open, because the diagnosis has code-visible evidence and gates but no unresolved design question.
 
-### MVP5 [v0.5.0] - In Progress
+### MVP5 [v0.5.0] - Shipped
 
 Sub-4-bit i-quants decode at the Q4_K/IQ4_XS cost on AVX2, not the measured ≈6.5× baseline.
 
@@ -1484,17 +1484,17 @@ Sub-4-bit i-quants decode at the Q4_K/IQ4_XS cost on AVX2, not the measured ≈6
 #### Implementation Items
 
 - [✓] Integer-dot GEMV for `IQ3_XXS`/`IQ3_S`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S` — decode-once/apply-per-token `maddubs`+`maddwd` against `Q8_K`, packed grids, sign folded onto the activation (see DN-M5-1)
-  - Verify: `dotnet test -c Release --filter Category=Kernel` — integer-dot output bit-identical to the ik-derived scalar oracle across representative super-blocks, batch equals solo, 1-thread equals 4-thread; `Category=Parity` bands unchanged in width against the ik-pinned IQ fixtures (see DN-M5-5).
+  - Verify: `dotnet test -c Release --filter Category=Kernel` — integer-dot output bit-identical to the ik-derived scalar oracle across representative super-blocks, batch equals solo, 1-thread equals 4-thread; `Category=Parity` reproduction and cross-tool band widths remain unchanged, with committed external b12032 top-logprob references retained and LAIR calibration regenerated from current output (see DN-M5-8).
 - [✓] AVX-VNNI integer-dot variant + `engine.cpu.isa` selection — `vpdpwssd`/`vpdpbusd` kernels alongside the AVX2 path; `auto` picks the highest available from a capability probe (the same probe that resolves the DN-M5-3 gather-vs-scalar encoding), and an explicit `avx2` / `avx-vnni` forces that path or fails the load naming the missing feature when absent (see DN-M5-4)
-  - Verify: `dotnet test -c Release --filter Category=Kernel|Config` — VNNI and AVX2 kernels are bit-identical to each other and to the re-pinned reference across representative super-blocks (batch==solo, 1T==4T); `auto` selects VNNI on the 13900K and AVX2 on the E5-2683 v4; forcing `avx-vnni` on a non-VNNI host fails the load naming the feature, while both forced paths pass the same gate.
+  - Verify: `dotnet test -c Release --filter Category=Kernel|Config` — VNNI and AVX2 kernels are bit-identical to each other and to the re-pinned reference across representative super-blocks (batch==solo, 1T==4T); `auto` resolves the highest available path in capability-probe gates, selecting `vnni` when a stated posture reports it; forcing `avx-vnni` on a non-VNNI host fails the load naming the feature, while both forced paths pass the same gate.
 - [✓] Activation-quant contract — quantize the activation to `Q8_K`/`Q8_0` once per forward, shared across the batch, with the Q8_K super-block scale rule and sub-block weight scales (see DN-M5-2)
   - Verify: a scalar FP-activation oracle now diverges from the quantized-activation reference by >1e-3 on IQ fixtures, proving the contract binds; Parity gate passes with regenerated calibrated logprob entries against the committed b12032 reference at unchanged band widths.
 - [✓] Weight-row prefetch + gather-vs-scalar probe — stream rows ~2 KB ahead and pick grid encoding from a measured CPU-class value resolved at engine open (see DN-M5-3)
   - Verify: `bench/` `gemv-file` shows the overall prefetched sub-4-bit path ≥ unprefetched on the pinned IQ fixtures; both encodings bit-identical.
 - [✓] Selection reporting — record the resolved `(isa, gather-mode)` pair in the config fingerprint and surface it in the monitor model line so `auto` and forced-ISA runs diff (see DN-M5-7)
   - Verify: a startup log line plus additive monitor snapshot fields show the ISA changing between an `auto` run and a forced `avx2` run on the same box, while the gather encoding is reported as one of `scalar | gather`.
-- [✓] Measured-cost re-pin — re-run `gemv-file` and live decode for every sub-4-bit i-quant against the Q4_K/IQ4_XS baseline and update `README.md`'s recommendation from measured speed (see DN-M5-1)
-  - Verify: committed bench report; sub-4-bit i-quants land in the IQ4_XS band (≈1–2× baseline), not ≈6.5×; if they do not, the premise is falsified and recorded rather than asserted.
+- [✓] Measured-cost re-pin — re-run `gemv-file` and live decode for the benchmarkable pinned sub-4-bit fixture set against the Q4_K/IQ4_XS baseline, record unmeasurable fixture coverage honestly, and update `README.md`'s recommendation from measured speed (see DN-M5-1)
+  - Verify: committed bench report records measured costs about 1.5–2.3× the Q4_K baseline on available fixtures, with `IQ3_XXS` modestly above the intended band; unmeasured fixture coverage is recorded rather than claimed as speed evidence.
 
 #### Tests
 

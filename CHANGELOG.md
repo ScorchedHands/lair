@@ -4,6 +4,22 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-17
+
+### Added
+
+- CPU integer-dot ISA selection through `engine.cpu.isa` (`auto | avx2 | avx-vnni`). The resolved `(isa, gather-mode)` pair is reported in the startup log, `/monitor/stream`, and Monitor CLI rows; forcing an unavailable ISA refuses model load naming the missing feature.
+- Bench sub4-bit comparison axes: `gemv-file --grid scalar|gather|compare` and `--prefetch on|off|compare` let one run compare grid staging or prefetch hints against identical file bytes, while each normal run reports its resolved backend posture.
+
+### Changed
+
+- Sub-4-bit i-quants (`IQ2_*`, `IQ3_XXS`, `IQ3_S`) decode through the Q8_K integer-dot path with a quantized activation and weight-row prefetch/grid probing rather than MVP3.8's staging/FMA path. Measured costs land around 1.5–2.3× the Q4_K baseline on available pinned fixtures (with `IQ3_XXS` modestly above the intended band), instead of ≈6.5×; live decode recommendation remains speed-based (`IQ4_XS`).
+- Monitor snapshots and CLI rows now carry CPU integer-dot selection facts for served models, making forced ISA comparison runs diffable without a public grid knob.
+
+### Fixed
+
+- Sub-4-bit i-quant dots run against `Q8_K`/`Q8_0` activation data rather than FP activations, preventing the measured 6–9× oracle drift that an FP activation path introduced against these quantized weights.
+
 ## [0.4.0] - 2026-11-16
 
 ### Added
