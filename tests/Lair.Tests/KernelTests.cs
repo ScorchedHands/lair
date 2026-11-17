@@ -1322,6 +1322,189 @@ public class KernelTests
         }
     }
 
+    // Grid-load encoding axis gates: forcing either sub-4-bit grid encoding must reproduce the integer oracle's exact bits, batched and threaded gather runs must match their scalar-forced twins bit-for-bit, prefetch hints are pure behavior that never moves a result, a forced gather against a posture without AVX2 fails like any unsupported posture does, and an auto open resolves one cached process-wide encoding instead of re-probing per backend.
+    [Theory]
+    [InlineData(QuantFormat.IQ2_XXS)]
+    [InlineData(QuantFormat.IQ2_XS)]
+    [InlineData(QuantFormat.IQ2_S)]
+    [InlineData(QuantFormat.IQ3_XXS)]
+    [InlineData(QuantFormat.IQ3_S)]
+    public void Gemv_Q8KFormats_GridEncodings_AreBitIdenticalAcrossForcings(QuantFormat format)
+    {
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            return; // gather staging is an AVX2 encoding, so the forced-pair gates run only where this host can execute it.
+        }
+
+        foreach ((int rows, int cols) in MatrixSizes)
+        {
+            (float[] x, byte[] weights) = CreateCase(rows, cols, format, seed: 31415);
+
+            using CpuBackend scalarGrid = new(threads: 1, coreSet: null, threadQuota: null, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: null, forcedGrid: GridLoadEncoding.Scalar, forcePrefetchWeights: false);
+            using CpuBackend gatherGrid = new(threads: 1, coreSet: null, threadQuota: null, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: null, forcedGrid: GridLoadEncoding.Gather, forcePrefetchWeights: false);
+
+            // The resolved properties prove the seam actually bound this backend's kernels instead of a constructor argument meaning what it says.
+            Assert.Equal(GridLoadEncoding.Scalar, scalarGrid.ResolvedGridEncoding);
+            Assert.Equal(GridLoadEncoding.Gather, gatherGrid.ResolvedGridEncoding);
+
+            WeightRef w = new(weights, MatrixShape(rows, cols), format);
+            float[] fromScalar = new float[rows];
+            float[] fromGather = new float[rows];
+            scalarGrid.Gemv(x, w, fromScalar);
+            gatherGrid.Gemv(x, w, fromGather);
+
+            AssertExact(fromGather, fromScalar, $"{format} gather-grid vs scalar-grid GEMV at {rows}x{cols}");
+        }
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.IQ2_XXS)]
+    [InlineData(QuantFormat.IQ2_XS)]
+    [InlineData(QuantFormat.IQ2_S)]
+    [InlineData(QuantFormat.IQ3_XXS)]
+    [InlineData(QuantFormat.IQ3_S)]
+    public void GemvBatch_Q8KFormats_GatherMatchesSoloAndIntegerOracleExactly(QuantFormat format)
+    {
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            return; // same posture gate as the forced-encoding pair above.
+        }
+
+        foreach ((int rows, int cols) in MatrixSizes)
+        {
+            (_, byte[] weights) = CreateCase(rows, cols, format, seed: 2718);
+
+            foreach (int count in new[] { 1, 3, 8 })
+            {
+                float[] inputs = NextFloats(new Random(900 + count), count * cols);
+                WeightRef w = new(weights, MatrixShape(rows, cols), format);
+
+                using CpuBackend soloScalarGrid = new(threads: 1, coreSet: null, threadQuota: null, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: null, forcedGrid: GridLoadEncoding.Scalar, forcePrefetchWeights: false);
+                using CpuBackend batchGather = new(threads: 1, coreSet: null, threadQuota: null, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: null, forcedGrid: GridLoadEncoding.Gather, forcePrefetchWeights: false);
+
+                // Each vector's solo run gets its own output array so every row lands on its own exact totals.
+                float[] soloExact = new float[count * rows];
+                for (int b = 0; b < count; b++)
+                {
+                    float[] slice = new float[cols];
+                    Array.Copy(inputs, (long)b * cols, slice, 0, cols);
+
+                    float[] oneRowOut = new float[rows];
+                    soloScalarGrid.Gemv(slice, w, oneRowOut);
+                    Array.Copy(oneRowOut, 0, soloExact, b * rows, rows);
+                }
+
+                float[] batchOut = new float[count * rows];
+                batchGather.GemvBatch(inputs, count, w, batchOut);
+                AssertExact(batchOut, soloExact, $"{format} gather-batch({count}) vs scalar-grid solo GEMV at {rows}x{cols}");
+
+                for (int b = 0; b < count; b++)
+                {
+                    float[] slice = new float[cols];
+                    Array.Copy(inputs, (long)b * cols, slice, 0, cols);
+
+                    AssertExact(
+                        batchOut.AsSpan(b * rows, rows),
+                        OracleDotQ8K(slice, weights, rows, cols, format),
+                        $"{format} gather-batch({count}) vector {b} vs integer oracle at {rows}x{cols}");
+                }
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.IQ2_XXS)]
+    [InlineData(QuantFormat.IQ2_XS)]
+    [InlineData(QuantFormat.IQ2_S)]
+    [InlineData(QuantFormat.IQ3_XXS)]
+    [InlineData(QuantFormat.IQ3_S)]
+    public void Gemv_Q8KFormats_Gather_OneThreadAndFourThreads_AreBitIdentical(QuantFormat format)
+    {
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+        {
+            return; // same posture gate as the forced-encoding pair above.
+        }
+
+        foreach ((int rows, int cols) in MatrixSizes)
+        {
+            (float[] x, byte[] weights) = CreateCase(rows, cols, format, seed: 4242);
+
+            using CpuBackend single = new(threads: 1, coreSet: null, threadQuota: null, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: null, forcedGrid: GridLoadEncoding.Gather, forcePrefetchWeights: false);
+            using CpuBackend parallel = new(threads: 4, coreSet: null, threadQuota: null, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: null, forcedGrid: GridLoadEncoding.Gather, forcePrefetchWeights: false);
+
+            float[] oneThread = new float[rows];
+            float[] fourThreads = new float[rows];
+            WeightRef w = new(weights, MatrixShape(rows, cols), format);
+            single.Gemv(x, w, oneThread);
+            parallel.Gemv(x, w, fourThreads);
+
+            AssertExact(fourThreads, oneThread, $"{format} gather-grid 4-thread vs 1-thread GEMV at {rows}x{cols}");
+        }
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.IQ2_XXS)]
+    [InlineData(QuantFormat.IQ2_XS)]
+    [InlineData(QuantFormat.IQ2_S)]
+    [InlineData(QuantFormat.IQ3_XXS)]
+    [InlineData(QuantFormat.IQ3_S)]
+    public void Gemv_Q8KFormats_PrefetchHints_ArePureAcrossForcings(QuantFormat format)
+    {
+        foreach ((int rows, int cols) in MatrixSizes)
+        {
+            (float[] x, byte[] weights) = CreateCase(rows, cols, format, seed: 31415);
+
+            using CpuBackend prefetchOff = new(threads: 1, coreSet: null, threadQuota: null, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: null, forcedGrid: GridLoadEncoding.Scalar, forcePrefetchWeights: false);
+            using CpuBackend prefetchOn = new(threads: 1, coreSet: null, threadQuota: null, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: null, forcedGrid: GridLoadEncoding.Scalar, forcePrefetchWeights: true);
+
+            Assert.False(prefetchOff.PrefetchWeightsEnabled);
+            Assert.True(prefetchOn.PrefetchWeightsEnabled);
+
+            WeightRef w = new(weights, MatrixShape(rows, cols), format);
+            float[] fromOff = new float[rows];
+            float[] fromOn = new float[rows];
+            prefetchOff.Gemv(x, w, fromOff);
+            prefetchOn.Gemv(x, w, fromOn);
+
+            AssertExact(fromOn, fromOff, $"{format} prefetch-on vs prefetch-off GEMV at {rows}x{cols}");
+
+            if (System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+            {
+                using CpuBackend gatherPrefetchOff = new(threads: 1, coreSet: null, threadQuota: null, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: null, forcedGrid: GridLoadEncoding.Gather, forcePrefetchWeights: false);
+                using CpuBackend gatherPrefetchOn = new(threads: 1, coreSet: null, threadQuota: null, allowAvx2: true, requestedIsa: CpuIsa.Auto, cpuFeatures: null, forcedGrid: GridLoadEncoding.Gather, forcePrefetchWeights: true);
+
+                float[] fromGatherOff = new float[rows];
+                float[] fromGatherOn = new float[rows];
+                gatherPrefetchOff.Gemv(x, w, fromGatherOff);
+                gatherPrefetchOn.Gemv(x, w, fromGatherOn);
+
+                AssertExact(fromGatherOn, fromGatherOff, $"{format} gather-grid prefetch-on vs prefetch-off GEMV at {rows}x{cols}");
+            }
+        }
+    }
+
+    [Fact]
+    public void Constructor_ForceGatherWithoutVectorPosture_FailsLikeAnyUnsupportedPosture()
+    {
+        // The grid axis refuses a gather on a scalar posture exactly the way engine.cpu.isa refuses an absent ISA: it names what is missing instead of substituting another encoding.
+        Assert.Throws<ArgumentException>(
+            () => new CpuBackend(threads: 1, coreSet: null, threadQuota: null, allowAvx2: false, requestedIsa: CpuIsa.Auto, cpuFeatures: null, forcedGrid: GridLoadEncoding.Gather, forcePrefetchWeights: null));
+    }
+
+    [Fact]
+    public void AutoOpen_ResolvesSub4BitGridOncePerProcessAndStaysStable()
+    {
+        using CpuBackend first = new(threads: 1, allowAvx2: true);
+        using CpuBackend second = new(threads: 1, allowAvx2: true);
+
+        // Two independent auto opens must land on the same cached process-wide encoding; a scalar posture never probes and always resolves to the baseline.
+        Assert.Equal(first.ResolvedGridEncoding, second.ResolvedGridEncoding);
+        Assert.True(first.ResolvedGridEncoding is GridLoadEncoding.Scalar or GridLoadEncoding.Gather);
+
+        using CpuBackend scalarPosture = new(threads: 1, allowAvx2: false);
+        Assert.Equal(GridLoadEncoding.Scalar, scalarPosture.ResolvedGridEncoding);
+    }
+
     // The activation-contract half of the integer-dot gate: production quantizes each activation once per Gemv/GemvBatch call and shares that one Q8_K copy across every row, so an FP-activation oracle over the very same stored weights must land visibly away from the kernels' totals while the backend stays bit-exact against the published reference. The exactness assertion pins which side of the pair production is on; the divergence bound proves the separation is real quantization error and not accumulation noise - a float dot, or an added bias/bsum correction folded into these formats, would move both numbers together and break one gate loudly instead of hiding inside a tolerance band.
     [Theory]
     [InlineData(QuantFormat.IQ2_XXS)]

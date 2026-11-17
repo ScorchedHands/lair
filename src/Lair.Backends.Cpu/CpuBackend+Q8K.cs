@@ -92,15 +92,15 @@ public sealed unsafe partial class CpuBackend
     // pure function of its own packed bytes plus the shared activation blocks, so any row partition stays bit-identical.
     // The dot path arrives already resolved from engine.cpu.isa and never changes mid-row: every format's vector kernels
     // stage identically whatever encoding they run, which is what makes scalar, AVX2, and AVX-VNNI land on the same bits.
-    private static float RowDotQ8K(byte* row, byte* qa, float* da, int cols, QuantFormat format, IntegerDotPath dot)
+    private static float RowDotQ8K(byte* row, byte* qa, float* da, int cols, QuantFormat format, Q8KKernelOptions opts)
     {
         return format switch
         {
-            QuantFormat.IQ2_XXS => dot == IntegerDotPath.Scalar ? RowDotIQ2XXSQ8Scalar(row, qa, da, cols) : RowDotIQ2XXSQ8Vector(row, qa, da, cols, dot),
-            QuantFormat.IQ2_XS => dot == IntegerDotPath.Scalar ? RowDotIQ2XSQ8Scalar(row, qa, da, cols) : RowDotIQ2XSQ8Vector(row, qa, da, cols, dot),
-            QuantFormat.IQ2_S => dot == IntegerDotPath.Scalar ? RowDotIQ2SQ8Scalar(row, qa, da, cols) : RowDotIQ2SQ8Vector(row, qa, da, cols, dot),
-            QuantFormat.IQ3_XXS => dot == IntegerDotPath.Scalar ? RowDotIQ3XQ8Scalar(row, qa, da, cols) : RowDotIQ3XQ8Vector(row, qa, da, cols, dot),
-            QuantFormat.IQ3_S => dot == IntegerDotPath.Scalar ? RowDotIQ3SQ8Scalar(row, qa, da, cols) : RowDotIQ3SQ8Vector(row, qa, da, cols, dot),
+            QuantFormat.IQ2_XXS => opts.Dot == IntegerDotPath.Scalar ? RowDotIQ2XXSQ8Scalar(row, qa, da, cols, opts) : RowDotIQ2XXSQ8Vector(row, qa, da, cols, opts),
+            QuantFormat.IQ2_XS => opts.Dot == IntegerDotPath.Scalar ? RowDotIQ2XSQ8Scalar(row, qa, da, cols, opts) : RowDotIQ2XSQ8Vector(row, qa, da, cols, opts),
+            QuantFormat.IQ2_S => opts.Dot == IntegerDotPath.Scalar ? RowDotIQ2SQ8Scalar(row, qa, da, cols, opts) : RowDotIQ2SQ8Vector(row, qa, da, cols, opts),
+            QuantFormat.IQ3_XXS => opts.Dot == IntegerDotPath.Scalar ? RowDotIQ3XQ8Scalar(row, qa, da, cols, opts) : RowDotIQ3XQ8Vector(row, qa, da, cols, opts),
+            QuantFormat.IQ3_S => opts.Dot == IntegerDotPath.Scalar ? RowDotIQ3SQ8Scalar(row, qa, da, cols, opts) : RowDotIQ3SQ8Vector(row, qa, da, cols, opts),
             _ => throw new ArgumentOutOfRangeException(nameof(format), format, "Format does not dot against a Q8_K activation."),
         };
     }
@@ -109,14 +109,14 @@ public sealed unsafe partial class CpuBackend
     // like its single-vector GEMV - exact int32 sub-block totals under ls factors, then d * bsum per super-block in
     // block order, then the format's final factor once - so every batch output is bit-identical to a solo row. The
     // weight bytes are traversed once and each decoded sub-block feeds all vectors' integer dots.
-    private static void RowBatchDotQ8K(byte* rowBytes, byte* qa, float* da, int blocks, int count, int rows, QuantFormat format, IntegerDotPath dot, float* outBase)
+    private static void RowBatchDotQ8K(byte* rowBytes, byte* qa, float* da, int blocks, int count, int rows, QuantFormat format, Q8KKernelOptions opts, float* outBase)
     {
-        if (dot == IntegerDotPath.Scalar)
+        if (opts.Dot == IntegerDotPath.Scalar)
         {
             for (int b = 0; b < count; b++)
             {
                 // Scalar posture: the same reference kernels a solo GEMV would run, one accumulator chain per vector.
-                outBase[(long)b * rows] = RowDotQ8K(rowBytes, qa + (long)b * blocks * QkK, da + (long)b * blocks, blocks * QkK, format, IntegerDotPath.Scalar);
+                outBase[(long)b * rows] = RowDotQ8K(rowBytes, qa + (long)b * blocks * QkK, da + (long)b * blocks, blocks * QkK, format, opts);
             }
 
             return;
@@ -125,19 +125,19 @@ public sealed unsafe partial class CpuBackend
         switch (format)
         {
             case QuantFormat.IQ2_XXS:
-                BatchIQ2XXQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, dot);
+                BatchIQ2XXQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, opts);
                 break;
             case QuantFormat.IQ2_XS:
-                BatchIQ2XSQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, dot);
+                BatchIQ2XSQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, opts);
                 break;
             case QuantFormat.IQ2_S:
-                BatchIQ2SQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, dot);
+                BatchIQ2SQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, opts);
                 break;
             case QuantFormat.IQ3_XXS:
-                BatchIQ3XQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, dot);
+                BatchIQ3XQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, opts);
                 break;
             default:
-                BatchIQ3SQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, dot);
+                BatchIQ3SQ8_Vector(rowBytes, qa, da, blocks, count, rows, outBase, opts);
                 break;
         }
     }

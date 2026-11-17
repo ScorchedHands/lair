@@ -157,7 +157,7 @@ public sealed unsafe partial class CpuBackend
     // 106 + (ib >> 1) keeps even sub-blocks in its low nibble and odd sub-blocks in its high nibble, read back as
     // db = d * (1 + 2 * code). w = db * grid byte, sign-applied per value through the sign bytes. This is the
     // literal scalar port of the reference dequant formula.
-    private static float RowDotIQ3SQ8Scalar(byte* row, byte* qa, float* da, int cols)
+    private static float RowDotIQ3SQ8Scalar(byte* row, byte* qa, float* da, int cols, Q8KKernelOptions opts)
     {
         Span<byte> mag = stackalloc byte[32]; // magnitude bytes of the current 32-value sub-block
         int blocks = Q8KBlockCount(cols); // whole super-blocks: padding columns quantize to zero and contribute nothing
@@ -172,7 +172,7 @@ public sealed unsafe partial class CpuBackend
             for (int ib = 0; ib < 8; ib++)
             {
                 int ls = 1 + 2 * ((block[106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xF); // the sub-block's scale code half
-                uint signs = StageIQ3SMagnitudes(block + 2 + 8 * ib, block[66 + ib], block + 74 + 4 * ib, mag);
+                uint signs = StageIQ3SMagnitudes(block + 2 + 8 * ib, block[66 + ib], block + 74 + 4 * ib, mag, opts.Grid);
 
                 int lo;
                 int hi;
@@ -195,7 +195,7 @@ public sealed unsafe partial class CpuBackend
     // (a 512-entry grid of four-byte entries cannot be reached through a single pshufb, so staging replaces direct table
     // lookup), then feed them to SubBlockDotQ8KVector - pmaddubsw/pmaddwd under AVX2, vpdpbusd under AVX-VNNI - whose lane
     // totals are the same exact integer running total, in the same sub-block order and with the same float accumulation.
-    private static float RowDotIQ3SQ8Vector(byte* row, byte* qa, float* da, int cols, IntegerDotPath dot)
+    private static float RowDotIQ3SQ8Vector(byte* row, byte* qa, float* da, int cols, Q8KKernelOptions opts)
     {
         Span<byte> mag = stackalloc byte[32]; // magnitude bytes of the current 32-value sub-block
         int blocks = Q8KBlockCount(cols); // whole super-blocks: padding columns quantize to zero and contribute nothing
@@ -210,14 +210,14 @@ public sealed unsafe partial class CpuBackend
             for (int ib = 0; ib < 8; ib++)
             {
                 int ls = 1 + 2 * ((block[106 + (ib >> 1)] >> (4 * (ib & 1))) & 0xF); // the sub-block's scale code half
-                uint signs = StageIQ3SMagnitudes(block + 2 + 8 * ib, block[66 + ib], block + 74 + 4 * ib, mag);
+                uint signs = StageIQ3SMagnitudes(block + 2 + 8 * ib, block[66 + ib], block + 74 + 4 * ib, mag, opts.Grid);
 
                 int lo;
                 int hi;
 
                 fixed (byte* pMag = mag)
                 {
-                    SubBlockDotQ8KVector(pMag, signs, (sbyte*)(qa + bi * QkK + ib * 32), out lo, out hi, dot);
+                    SubBlockDotQ8KVector(pMag, signs, (sbyte*)(qa + bi * QkK + ib * 32), out lo, out hi, opts.Dot);
                 }
 
                 bsum += (lo + hi) * ls; // one ls covers the whole sub-block, as in the scalar path
@@ -233,12 +233,35 @@ public sealed unsafe partial class CpuBackend
     // group's low four values from bit 2l of the qh byte and the high four from bit 2l+1; each entry is read as one
     // unaligned uint so the eight magnitude bytes land in element order exactly as the reference pairs grid1/grid2, and
     // the group's raw sign byte packs back at l. Identical staging for both dot paths and every vector of a batch.
-    private static uint StageIQ3SMagnitudes(byte* qs, byte qh, byte* signs, Span<byte> mag)
+    private static uint StageIQ3SMagnitudes(byte* qs, byte qh, byte* signs, Span<byte> mag, GridLoadEncoding grid)
     {
         fixed (byte* pGrid = GetIq3SGrid())
         fixed (byte* pMag = mag)
         {
             uint packed = 0;
+
+            if (grid == GridLoadEncoding.Gather && Avx2.IsSupported)
+            {
+                // Hardware gather over whole entries: each lane's byte offset selects one four-byte entry, so the sub-block's eight nine-bit indices stage their magnitude bytes in element order from a single dword gather instead of eight dependent indexed loads. The gathered dwords land exactly where scalar staging writes its A/B pairs; signs still pack raw per group.
+                int g0 = (qs[0] | (((qh >> 0) & 1) << 8)) * 4;
+                int g1 = (qs[1] | (((qh >> 1) & 1) << 8)) * 4;
+                int g2 = (qs[2] | (((qh >> 2) & 1) << 8)) * 4;
+                int g3 = (qs[3] | (((qh >> 3) & 1) << 8)) * 4;
+                int g4 = (qs[4] | (((qh >> 4) & 1) << 8)) * 4;
+                int g5 = (qs[5] | (((qh >> 5) & 1) << 8)) * 4;
+                int g6 = (qs[6] | (((qh >> 6) & 1) << 8)) * 4;
+                int g7 = (qs[7] | (((qh >> 7) & 1) << 8)) * 4;
+
+                Vector256<uint> gathered = Avx2.GatherVector256((uint*)pGrid, Vector256.Create(g0, g1, g2, g3, g4, g5, g6, g7), 1); // each lane gathers one entry raw: bits copied unchanged.
+                Unsafe.WriteUnaligned(pMag, gathered);
+
+                for (int l = 0; l < 4; l++)
+                {
+                    packed |= (uint)signs[l] << (8 * l);
+                }
+
+                return packed;
+            }
 
             for (int l = 0; l < 4; l++)
             {
@@ -289,7 +312,7 @@ public sealed unsafe partial class CpuBackend
 
     // Batched IQ3_S row: one staged sub-block feeds every vector's integer dot in RowDotIQ3SQ8Vector's integer and float
     // order, so the packed bytes are streamed once for the whole batch. Each vector keeps its own exact int32 super-block total.
-    private static void BatchIQ3SQ8_Vector(byte* row, byte* qa, float* da, int blocks, int count, int rows, float* outBase, IntegerDotPath dot)
+    private static void BatchIQ3SQ8_Vector(byte* row, byte* qa, float* da, int blocks, int count, int rows, float* outBase, Q8KKernelOptions opts)
     {
         Span<byte> mag = stackalloc byte[32]; // magnitude bytes of the current 32-value sub-block
         Span<int> bsum = stackalloc int[MaxBatch]; // exact per-vector integer super-block totals
@@ -306,10 +329,10 @@ public sealed unsafe partial class CpuBackend
 
                 fixed (byte* pMag = mag)
                 {
-                    uint signs = StageIQ3SMagnitudes(block + 2 + 8 * ib, block[66 + ib], block + 74 + 4 * ib, mag); // decoded once per sub-block and reused across the batch
+                    uint signs = StageIQ3SMagnitudes(block + 2 + 8 * ib, block[66 + ib], block + 74 + 4 * ib, mag, opts.Grid); // decoded once per sub-block and reused across the batch
                     for (int b = 0; b < count; b++)
                     {
-                        SubBlockDotQ8KVector(pMag, signs, (sbyte*)(qa + (long)b * blocks * QkK + bi * QkK + ib * 32), out int lo, out int hi, dot);
+                        SubBlockDotQ8KVector(pMag, signs, (sbyte*)(qa + (long)b * blocks * QkK + bi * QkK + ib * 32), out int lo, out int hi, opts.Dot);
                         bsum[b] += (lo + hi) * ls;
                     }
                 }
