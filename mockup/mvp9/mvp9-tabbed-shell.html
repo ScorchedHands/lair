@@ -1,0 +1,378 @@
+<!--
+  phase: MVP9
+  component: tabbed-shell (Monitor + Chat tabs)
+  derives-from: mvp3-tabbed-shell.html rev B (mockup/mvp3/) — tokens, dark theme, chat tab, read-only contract carried
+
+  carried-locked from MVP3 (owner 2026-11-02), unchanged here:
+  - tabbed shell, Monitor | Chat, one shared stylesheet
+  - dark developer-tool theme
+  - monitor shows ALL models; no header model selector
+  - model rows expandable for config + state (now: each model is a full panel)
+  - request rows carry tok/s + inline sparkline (event schema already carries per-request tok/s series)
+  - chat tab owns the model selector, filtered to LLM (chat-type) models only
+  - live transport: SSE reusing /monitor/stream + Last-Event-ID replay from the snapshot ring
+  - monitor is read-only — presentation only, no mutation authority
+
+  MVP9 new decisions (proposed — confirm in /plan-refine MVP9):
+  - RESTRUCTURE: each configured model is its own panel — model metrics on the top half,
+      a single combined in-flight + recent requests table on the bottom half.
+      This replaces MVP3's one configured-models table + two separate request tables; the data and
+      read-only contract are unchanged, only the presentation.
+  - engine-level rollup stays a slim KPI strip + a Host posture panel (host facts are not per-model)
+  - GPU / PCIe tiles are REAL for a CUDA serve (MVP4 accelerator accounting), no longer placeholders
+  - power / temperature: GPU via NVML (reliable); CPU power/temp honest "not exposed on Windows";
+      RAM temp "n/a — consumer board" — matches the read-only-monitor contract note, never fabricated
+  - per-model tier occupancy across dram / vram / disk (ledger occupancy); disk column present but deferred (MVP8)
+  - per-model detail: resolved route segments, prefill-lane posture, windowed-KV footprint, weight formats
+  - per-model admission posture (admitted / queued / cap) + recent refusals naming the limit kind
+  - per-model acquisition: pinned manifest + report-only update candidate + last check — no fetch action on the UI
+  - this mockup is static with a fake live ticker; production subscribes to the same live stats stream (schema v1)
+-->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>lair — mockup: tabbed shell (MVP9)</title>
+  <link rel="stylesheet" href="mvp9-shared.css">
+</head>
+<body>
+  <header class="app">
+    <span class="brand">LAIR</span>
+    <span class="badge">serving</span>
+    <span style="margin-left:auto" class="meta">http://127.0.0.1:8080 · up 04:12 · schema v1</span>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" aria-selected="true" data-tab="monitor">Monitor</button>
+    <button role="tab" aria-selected="false" data-tab="chat">Chat</button>
+  </nav>
+
+  <main>
+    <!-- ================= MONITOR TAB ================= -->
+    <section id="tab-monitor">
+      <div class="grid">
+        <div class="card"><div class="label">decode tok/s</div><div class="value" id="toks">41.8</div><div class="sub">cpu + cuda in use</div></div>
+        <div class="card"><div class="label">step time</div><div class="value" id="stepms">28 ms</div><div class="sub">avg over 2.0s window</div></div>
+        <div class="card"><div class="label">cache hit</div><div class="value" id="hit">62%</div><div class="sub">engine-wide prefix reuse</div></div>
+        <div class="card"><div class="label">active reqs</div><div class="value" id="active">3</div><div class="sub">queued <span id="queued">1</span> · refusals <span id="refusals">2</span></div></div>
+      </div>
+
+      <!-- ============ ENGINE: HOST POSTURE + TELEMETRY ============ -->
+      <section class="block">
+        <h2>Host posture</h2>
+        <div class="host-grid">
+          <div class="col">
+            <h3>Detected</h3>
+            <dl>
+              <dt>cpu</dt><dd>i9-13900K · 24 cores / 32 logical · AVX2 + AVX-VNNI</dd>
+              <dt>dram</dt><dd>64 GB · 1 NUMA node</dd>
+              <dt>disk</dt><dd>./disk (cold tier)</dd>
+              <dt>accelerator</dt><dd>RTX 4090 · 24 GB · CUDA</dd>
+            </dl>
+          </div>
+          <div class="col">
+            <h3>Declared override</h3>
+            <dl>
+              <dt>host:</dt><dd class="override">none — fully auto-detected</dd>
+              <dt>numa_spread</dt><dd>auto → local (single node)</dd>
+              <dt>worker grants</dt><dd>requested 40 · granted 40 · no overcommit</dd>
+              <dt>resolved auto placement</dt><dd>decode cpu · prefill cpu · kv dram</dd>
+            </dl>
+          </div>
+        </div>
+        <div class="model-subsection">
+          <div class="h">Engine telemetry</div>
+          <div class="model-device">
+            <div class="stat"><div class="label">GPU util</div><div class="val" id="gpu">34% · NVML</div></div>
+            <div class="stat"><div class="label">PCIe transfer</div><div class="val">612 MiB · 1,204 copies</div></div>
+            <div class="stat"><div class="label">GPU power</div><div class="val">188 W · NVML</div></div>
+            <div class="stat"><div class="label">GPU temp</div><div class="val">61 °C · NVML</div></div>
+            <div class="stat"><div class="label">CPU power</div><div class="val">— not exposed (Win)</div></div>
+            <div class="stat"><div class="label">CPU temp</div><div class="val">— not exposed (Win)</div></div>
+            <div class="stat"><div class="label">RAM temp</div><div class="val">n/a — consumer board</div></div>
+            <div class="stat"><div class="label">process RAM</div><div class="val">3.1 GB working set</div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ MODEL PANEL: smollm-135m (cpu) ============ -->
+      <section class="block model-panel">
+        <div class="model-panel-head">
+          <div class="model-id"><strong>smollm-135m-instruct</strong><span class="meta">chat · q8_0 · cpu</span></div>
+          <div class="model-kpis">
+            <span class="mkpi"><b>27.4</b> decode tok/s</span>
+            <span class="mkpi"><b>2.00</b> seqs/step</span>
+            <span class="mkpi"><div class="bar kv"><span style="width:56%"></span></div><b>54/96</b> KV</span>
+            <span class="mkpi"><b>62%</b> cache hit</span>
+            <span class="mkpi"><b>24</b> workers</span>
+            <span class="mkpi">reserved —</span>
+          </div>
+        </div>
+        <div class="model-body">
+          <div class="detail-grid">
+            <div><div class="label">context / block size</div><div class="val">1024 / 16</div></div>
+            <div><div class="label">kv_blocks budget</div><div class="val">96 (soft cap)</div></div>
+            <div><div class="label">core set / quota</div><div class="val">0-23 / —</div></div>
+            <div><div class="label">resolved prefill · decode · kv</div><div class="val">cpu · cpu · dram</div></div>
+            <div><div class="label">weight formats</div><div class="val">Q8_0 · F16</div></div>
+            <div><div class="label">prefill kernel · row width</div><div class="val">gemv · 32</div></div>
+            <div><div class="label">cache blocks (DRAM)</div><div class="val">prefix 18 · active 36 · free 42</div></div>
+            <div><div class="label">finish tallies</div><div class="val">stop 12 · eos 9 · length 5 · abort 1 · failed 0</div></div>
+            <div><div class="label">windowed KV footprint</div><div class="val">n/a — dense, no declared window</div></div>
+            <div><div class="label">experts hot / cold</div><div class="val">n/a — dense model (MoE phase adds tier counts)</div></div>
+            <div><div class="label">model RAM</div><div class="val">1.9 GB weights · 0.5 GB KV</div></div>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Resolved route</div>
+            <div class="route">
+              <span class="seg"><span class="dev">cpu</span> <span class="sep">·</span> weights <span class="tier">dram</span> <span class="sep">·</span> batch cap 8 <span class="sep">·</span> quota 24 <span class="sep">·</span> cores 0-23</span>
+            </div>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Tier occupancy (per resource)</div>
+            <table class="tier-table">
+              <tr><td>weights/layers</td><td><span class="tier-bar dram"><span style="width:100%"></span></span>dram 1.9 GB</td><td class="tier-deferred">vram — · disk — (MVP8)</td></tr>
+              <tr><td>KV</td><td><span class="tier-bar dram"><span style="width:56%"></span></span>dram 54/96 blk</td><td class="tier-deferred">vram — · disk — (MVP8)</td></tr>
+              <tr><td>prefill working set</td><td><span class="tier-bar dram"><span style="width:22%"></span></span>dram 148 MB</td><td class="tier-deferred">vram — · disk — (MVP8)</td></tr>
+            </table>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Prefill lane</div>
+            <div class="lane-grid">
+              <div><div class="label">posture</div><div class="val">shared</div></div>
+              <div><div class="label">effective row width</div><div class="val">32</div></div>
+              <div><div class="label">working set</div><div class="val">148 MB</div></div>
+            </div>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Device &amp; residency</div>
+            <div class="model-device">
+              <div class="stat"><div class="label">GPU util</div><div class="val">n/a — cpu model</div></div>
+              <div class="stat"><div class="label">PCIe transfer</div><div class="val">n/a</div></div>
+              <div class="stat"><div class="label">persistent VRAM</div><div class="val">reserved —</div></div>
+            </div>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Admission posture</div>
+            <div class="model-admission">
+              <span class="stat">admitted <b>2</b> / cap <b>8</b></span>
+              <span class="stat">queued <b>0</b></span>
+              <span class="stat">refusals <b>1</b></span>
+              <ul class="refusal-list">
+                <li><span class="kind">concurrency_quota</span> · all 8 admission slots held · queue_timeout 30000 ms</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Model acquisition</div>
+            <table class="acq-table">
+              <tr><td class="acq-manifest">SmolLM/…-Q8_0 · rev 4f1c… · sha 9a2b…</td><td class="acq-none">up to date</td><td>last check 2026-11-16 15:02</td></tr>
+            </table>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Requests — in-flight + recent</div>
+            <table class="req-table">
+              <thead><tr><th>id</th><th>state</th><th>endpoint</th><th>prompt tok</th><th>gen tok</th><th>cached</th><th>tok/s</th><th></th><th>time</th><th>finish</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>9f2c…a1</td><td><span class="tag stream">streaming</span></td><td>chat/completions</td><td>127</td><td id="gen1">18</td><td>112</td><td id="tps1">28.1</td>
+                  <td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,14 10,10 20,11 30,8 40,9 50,7 60,8 70,6 80,7 90,5"/></svg></td>
+                  <td id="el1">1.2 s</td><td><span class="meta">—</span></td>
+                </tr>
+                <tr><td>77aa…31</td><td><span class="tag done">200</span></td><td>chat/completions</td><td>31</td><td>24</td><td>18</td><td>22.7</td><td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,12 15,9 30,10 45,8 60,9 75,7 90,8"/></svg></td><td>1.1 s</td><td>stop</td></tr>
+                <tr><td>1b8d…55</td><td><span class="tag err">499</span></td><td>chat/completions</td><td>18</td><td>7</td><td>0</td><td>7.8</td><td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,10 20,8 40,9 60,7 80,8"/></svg></td><td>0.9 s</td><td>client abort</td></tr>
+                <tr><td>c3f1…72</td><td><span class="tag done">200</span></td><td>chat/completions</td><td>96</td><td>21</td><td>64</td><td>15.0</td><td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,13 15,10 30,11 45,9 60,10 75,8 90,9"/></svg></td><td>1.4 s</td><td>tool calls</td></tr>
+                <tr><td>aa02…18</td><td><span class="tag done">200</span></td><td>completions</td><td>127</td><td>19</td><td>112</td><td>23.8</td><td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,11 15,9 30,9 45,8 60,8 75,7 90,7"/></svg></td><td>0.8 s</td><td>stop</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ MODEL PANEL: llama-3.2-1b (hybrid) ============ -->
+      <section class="block model-panel">
+        <div class="model-panel-head">
+          <div class="model-id"><strong>llama-3.2-1b-instruct</strong><span class="meta">chat · q4_k_m · hybrid</span></div>
+          <div class="model-kpis">
+            <span class="mkpi"><b>14.4</b> decode tok/s</span>
+            <span class="mkpi"><b>1.00</b> seqs/step</span>
+            <span class="mkpi"><div class="bar kv"><span style="width:22%"></span></div><b>21/96</b> KV</span>
+            <span class="mkpi"><b>48%</b> cache hit</span>
+            <span class="mkpi"><b>16</b> workers</span>
+            <span class="mkpi"><b>1.1 GiB</b> VRAM</span>
+          </div>
+        </div>
+        <div class="model-body">
+          <div class="detail-grid">
+            <div><div class="label">context / block size</div><div class="val">2048 / 16</div></div>
+            <div><div class="label">kv_blocks budget</div><div class="val">96 (soft cap)</div></div>
+            <div><div class="label">core set / quota</div><div class="val">0-15 / 16</div></div>
+            <div><div class="label">resolved prefill · decode · kv</div><div class="val">cuda · hybrid · vram</div></div>
+            <div><div class="label">weight formats</div><div class="val">Q4_K · Q5_0 · Q6_K · Q8_0</div></div>
+            <div><div class="label">prefill kernel · row width</div><div class="val">gemm · 32</div></div>
+            <div><div class="label">cache blocks (VRAM)</div><div class="val">prefix 9 · active 21 · free 75</div></div>
+            <div><div class="label">finish tallies</div><div class="val">stop 3 · eos 4 · length 6 · abort 0 · failed 0</div></div>
+            <div><div class="label">windowed KV footprint</div><div class="val">n/a — dense, no declared window</div></div>
+            <div><div class="label">experts hot / cold</div><div class="val">n/a — dense model (MoE phase adds tier counts)</div></div>
+            <div><div class="label">model RAM</div><div class="val">1.2 GB weights · 0.4 GB KV</div></div>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Resolved route</div>
+            <div class="route">
+              <span class="seg"><span class="dev">cuda</span> <span class="sep">·</span> weights <span class="tier">vram</span> <span class="sep">·</span> batch cap 4 <span class="sep">·</span> quota 16 <span class="sep">·</span> cores 0-15</span>
+              <span class="seg"><span class="sep">→</span> <span class="dev">cpu</span> <span class="sep">·</span> weights <span class="tier">dram</span> <span class="sep">·</span> batch cap 4 <span class="sep">·</span> quota 8 <span class="sep">·</span> cores 16-23</span>
+            </div>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Tier occupancy (per resource)</div>
+            <table class="tier-table">
+              <tr><td>weights/layers</td><td><span class="tier-bar dram"><span style="width:40%"></span></span>dram 0.6 GB</td><td><span class="tier-bar vram"><span style="width:70%"></span></span>vram 1.1 GiB</td><td class="tier-deferred">disk — (MVP8)</td></tr>
+              <tr><td>KV</td><td class="tier-deferred">dram —</td><td><span class="tier-bar vram"><span style="width:22%"></span></span>vram 21/96 blk</td><td class="tier-deferred">disk — (MVP8)</td></tr>
+              <tr><td>prefill working set</td><td class="tier-deferred">dram —</td><td><span class="tier-bar vram"><span style="width:34%"></span></span>vram 286 MB</td><td class="tier-deferred">disk — (MVP8)</td></tr>
+            </table>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Prefill lane</div>
+            <div class="lane-grid">
+              <div><div class="label">posture</div><div class="val">dedicated</div></div>
+              <div><div class="label">effective row width</div><div class="val">32</div></div>
+              <div><div class="label">working set</div><div class="val">286 MB</div></div>
+            </div>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Device &amp; residency</div>
+            <div class="model-device">
+              <div class="stat"><div class="label">GPU util</div><div class="val">34% · kernel busy</div></div>
+              <div class="stat"><div class="label">PCIe transfer</div><div class="val">612 MiB · 1,204 copies</div></div>
+              <div class="stat"><div class="label">persistent VRAM</div><div class="val">1.1 GiB resident</div></div>
+            </div>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Admission posture</div>
+            <div class="model-admission">
+              <span class="stat">admitted <b>1</b> / cap <b>4</b></span>
+              <span class="stat">queued <b>1</b></span>
+              <span class="stat">refusals <b>1</b></span>
+              <ul class="refusal-list">
+                <li><span class="kind">budget_exhaustion</span> · vram weight cap full — no tier in chain could seat the claim</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Model acquisition</div>
+            <table class="acq-table">
+              <tr><td class="acq-manifest">bartowski/…-Q4_K_M · rev 7d3e… · sha c0ff…</td><td class="acq-cand">newer revision · +2 quant files</td><td>last check 2026-11-16 15:02</td></tr>
+            </table>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Requests — in-flight + recent</div>
+            <table class="req-table">
+              <thead><tr><th>id</th><th>state</th><th>endpoint</th><th>prompt tok</th><th>gen tok</th><th>cached</th><th>tok/s</th><th></th><th>time</th><th>finish</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>4b70…0d</td><td><span class="tag stream">prefill chunk 24/51</span></td><td>chat/completions</td><td>407</td><td id="gen2">3</td><td>0</td><td id="tps2">—</td>
+                  <td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,16 15,16 30,16 45,16 60,12 75,8 90,6"/></svg></td>
+                  <td id="el2">2.8 s</td><td><span class="meta">—</span></td>
+                </tr>
+                <tr><td>e0c4…9f</td><td><span class="tag done">200</span></td><td>chat/completions</td><td>407</td><td>32</td><td>0</td><td>7.0</td><td><svg class="spark" width="90" height="18" viewBox="0 0 90 18"><polyline points="0,16 20,16 40,16 55,10 70,7 90,6"/></svg></td><td>4.6 s</td><td>length</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ MODEL PANEL: modernbert-embed (cpu, embed) ============ -->
+      <section class="block model-panel">
+        <div class="model-panel-head">
+          <div class="model-id"><strong>modernbert-embed</strong><span class="meta">embed · f16 · cpu</span></div>
+          <div class="model-kpis">
+            <span class="mkpi">decode tok/s <b>—</b></span>
+            <span class="mkpi">seqs/step <b>—</b></span>
+            <span class="mkpi">KV <b>n/a</b></span>
+            <span class="mkpi"><b>4</b> workers</span>
+            <span class="mkpi">reserved —</span>
+          </div>
+        </div>
+        <div class="model-body">
+          <div class="detail-grid">
+            <div><div class="label">context / block size</div><div class="val">512 / 16</div></div>
+            <div><div class="label">core set / quota</div><div class="val">0-3 / 4</div></div>
+            <div><div class="label">resolved prefill · decode</div><div class="val">cpu · cpu</div></div>
+            <div><div class="label">weight formats</div><div class="val">F16</div></div>
+            <div><div class="label">model RAM</div><div class="val">0.6 GB weights</div></div>
+          </div>
+
+          <div class="model-subsection">
+            <div class="h">Requests — in-flight + recent</div>
+            <div class="req-empty">no requests — encoder-only model served through /v1/embeddings</div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <!-- ================= CHAT TAB ================= -->
+    <section id="tab-chat" hidden>
+      <div class="chat">
+        <div class="meta">
+          model:
+          <select id="chat-model" style="background:var(--panel-2);color:var(--text);border:1px solid var(--border);border-radius:var(--radius);padding:2px 6px">
+            <option>smollm-135m-instruct (chat)</option>
+            <option>llama-3.2-1b-instruct (chat)</option>
+          </select>
+          · temp 0.7 · max tokens 256 · SSE streaming · selector lists LLM models only
+        </div>
+        <div class="messages">
+          <div class="msg user">Explain what a KV cache is in one short paragraph.</div>
+          <div class="msg assistant">A KV cache stores the key and value vectors computed for earlier tokens so the model does not recompute them when generating each new token. It grows with the sequence and is the main memory cost of inference.</div>
+          <div class="msg user">Now use the calculator tool for 12*12.</div>
+          <div class="msg assistant">
+            Computing that for you.
+            <div class="tool">tool call → calculator { "expression": "12*12" } · result 144</div>
+          </div>
+          <div class="msg user">Write a haiku about paged memory.</div>
+          <div class="msg assistant streaming">Blocks of sixteen tokens, mapped like pages of a book —</div>
+        </div>
+        <div class="composer">
+          <input type="text" placeholder="Send a message…" value="">
+          <button class="btn stop">Stop</button>
+          <button class="btn">Send</button>
+        </div>
+        <div class="meta">abort mid-stream keeps the engine healthy · tool calls rendered from the fenced-JSON detector</div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const tabs = document.querySelectorAll('nav.tabs button');
+    tabs.forEach(t => t.addEventListener('click', () => {
+      tabs.forEach(x => x.setAttribute('aria-selected', x === t));
+      document.getElementById('tab-monitor').hidden = t.dataset.tab !== 'monitor';
+      document.getElementById('tab-chat').hidden = t.dataset.tab !== 'chat';
+    }));
+    // fake live ticker so the mockup shows what the live stream will drive
+    setInterval(() => {
+      const j = (v, jit) => (v + (Math.random() - 0.5) * jit).toFixed(1);
+      document.getElementById('toks').textContent = j(41.8, 4);
+      document.getElementById('stepms').textContent = Math.round(j(28, 6)) + ' ms';
+      document.getElementById('gen1').textContent = (+document.getElementById('gen1').textContent + 1);
+      document.getElementById('tps1').textContent = j(28, 4);
+      document.getElementById('el1').textContent = (+document.getElementById('el1').textContent.replace(' s','') + 0.7).toFixed(1) + ' s';
+      document.getElementById('gpu').textContent = Math.round(j(34, 8)) + '% · NVML';
+    }, 900);
+  </script>
+</body>
+</html>
