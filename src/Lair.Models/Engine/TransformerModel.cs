@@ -83,6 +83,9 @@ public sealed class TransformerModel : IDisposable
     // to have one before that selection can run this file, and they are the names an unsupported file reports back.
     private readonly IReadOnlyList<QuantFormat> _matmulFormats;
 
+    // The name every load-time and re-point capability refusal this engine raises calls this model by — general.name when the file declares it, its path otherwise. Held so a hot re-point refused over resolved execution spans names the same identity an open refusal did.
+    private readonly string _modelDisplay;
+
     // Only a source this instance created is its own to release: a caller-supplied source stays under the caller's
     // lifetime rules and must outlive the model.
     private readonly bool _ownsWeights;
@@ -386,7 +389,8 @@ public sealed class TransformerModel : IDisposable
     /// boundary, so sequences already mid-window finish that window on the route they started with — the same
     /// boundary discipline a chunk-width edit keeps. A selection this build has no kernel for is refused naming it
     /// and what is missing; nothing falls back to the route that works. The dense-matrix selection is also refused
-    /// when one of this engine's own weight formats has no blocked matmul, naming that format.
+    /// when any resolved prompt-window range carries a weight format its own execution backend has no blocked matmul
+    /// for, naming that format beside the segment and backend it was resolved onto — the same gate model open runs.
     /// </summary>
     public void ApplyPrefillKernel(PrefillKernel kernel)
     {
@@ -402,6 +406,8 @@ public sealed class TransformerModel : IDisposable
         {
             throw QuantizedPrefillRefusal(kernel);
         }
+
+        ValidateSpanMatmulCapability(kernel, _modelDisplay, Plan.Route, _fileTensors, _prefillSpans); // the re-point answers to the same per-span capability gate model open does; a refused selection leaves the running route untouched.
 
         _prefillKernel = kernel;
     }
@@ -429,23 +435,30 @@ public sealed class TransformerModel : IDisposable
     public IReadOnlyList<QuantFormat> MatmulWeightFormats => _matmulFormats;
 
     // Whether a selection has kernels for this engine's own weights. The batched-row window and its row-tiled variant
-    // always do; the dense-matrix window does only when every dense weight matrix it multiplies activation rows
-    // against is a format the backend's blocked matmul executes. Decided from the same list an unsupported file names.
+    // always do; the dense-matrix window needs this file to carry dense weight matrices at all, and every compute backend
+    // that will multiply activation rows against them must report a blocked matmul for their formats — which is decided
+    // per resolved execution span by ValidateSpanMatmulCapability, from the backend each prompt-window range actually runs on.
     private bool KernelExecutes(PrefillKernel kernel) => kernel switch
     {
         PrefillKernel.GemV or PrefillKernel.Tiled => true,
-        PrefillKernel.Gemm => FormatsWithoutKernels().Count is 0 && _matmulFormats.Count > 0,
+        PrefillKernel.Gemm => _matmulFormats.Count > 0,
         _ => false,
     };
 
-    // The dense weight formats this engine carries that its backend has no blocked matmul for. Empty when every one of
-    // them runs through the dense-matrix window; otherwise exactly the names a refusal reports.
-    private List<QuantFormat> FormatsWithoutKernels()
+    // The dense weight formats this engine carries that one compute backend has no blocked matmul for. Empty when every
+    // one of them runs through the dense-matrix window on that backend; otherwise exactly the names a refusal reports.
+    private List<QuantFormat> FormatsWithoutKernels(IBackend engine) => MatmulFormatsWithoutKernels(_matmulFormats, engine);
+
+    // The formats one resolved prompt-window range carries through the dense-matrix window that its own resolved backend has no blocked matmul for: ResolveMatmulFormats' role list read over just this span's layers. Sparse FFN roles are excluded because expert matrices stay on batched row passes whatever selection is resolved — exactly as every forward of this engine runs them today.
+    private static List<QuantFormat> SpanMatmulGaps(ModelPlan plan, LogicalTensorTable tensors, ExecutionSpan prefill) =>
+        MatmulFormatsWithoutKernels(CollectWeightFormats(plan, tensors, prefill.LayerStart, prefill.LayerEnd, includeSparse: false), prefill.Backend);
+
+    private static List<QuantFormat> MatmulFormatsWithoutKernels(IReadOnlyList<QuantFormat> formats, IBackend engine)
     {
         List<QuantFormat> missing = [];
-        foreach (QuantFormat format in _matmulFormats)
+        foreach (QuantFormat format in formats)
         {
-            if (!_backend.SupportsGemm(format))
+            if (!engine.SupportsGemm(format))
             {
                 missing.Add(format);
             }
@@ -454,20 +467,53 @@ public sealed class TransformerModel : IDisposable
         return missing;
     }
 
+    // The capability gate the dense-matrix selection answers to: when that selection is resolved, every prompt-window span's own layer range must be formats its own resolved backend multiplies through a blocked matmul. A gap refuses at load — before any window dispatches, and with no fall back to another kernel or device — naming the model, the segment and the backend resolved for it, the offending format(s), and that this build carries no dense-matrix path there. The batched-row windows answer empty whatever a file carries, so every other posture is untouched by this gate.
+    private void ValidateSpanMatmulCapability(PrefillKernel kernel, string model, ModelRoute route, LogicalTensorTable tensors, ExecutionSpan[] prefill)
+    {
+        if (kernel != PrefillKernel.Gemm)
+        {
+            return;
+        }
+
+        for (int index = 0; index < prefill.Length && index < route.Segments.Count; index++)
+        {
+            List<QuantFormat> missing = SpanMatmulGaps(Plan, tensors, prefill[index]);
+
+            if (missing.Count > 0)
+            {
+                throw MatmulGapRefusal(model, route.Segments[index], index, prefill[index].Backend, missing);
+            }
+        }
+    }
+
+    // Which wording a dense-matrix gap gets: when the backend answering it is this engine's own opened compute backend on its own device, the shape an unrunnable selection has always carried — the value beside this file's own formats and that backend; when a route resolved some other execution backend for that position, the segment and its backend are named instead.
+    private ModelException MatmulGapRefusal(string model, DeviceSegment segment, int index, IBackend engine, List<QuantFormat> missing) =>
+        ReferenceEquals(engine, _backend) && string.Equals(segment.DeviceId, _backend.DeviceId, StringComparison.Ordinal)
+            ? KernelRefusal(PrefillKernel.Gemm)
+            : MatmulSpanRefusal(model, segment, index, engine, missing);
+
+    // The refusal wording a prompt-window span naming a format its own resolved compute backend cannot multiply in bulk answers: the model, the segment and the device resolved for it, the offending dense weight format(s), and that this build carries no blocked matmul there — beside the two windows that always run. It extends the load-time GEMV capability refusal shape to the window shape a split route or an offloaded prompt side selects, replacing any per-layer throw the same format would have raised after work dispatched.
+    private static ModelException MatmulSpanRefusal(string model, DeviceSegment segment, int index, IBackend engine, List<QuantFormat> missing) => new(
+        $"model '{model}', {segment.Describe(index)}: prefill kernel '{PrefillKernelNames.Gemm}' needs blocked matmul kernels for weight format(s) {string.Join(", ", missing)}, and the compute backend " +
+        $"'{engine.DeviceId}' resolved for this segment reports none — no dense-matrix path exists in this build for them on that device, so this model is refused at load naming the selection, the format, " +
+        $"and its backend rather than raised when a prompt window dispatches — resolve placement onto a segment whose backend multiplies these formats in bulk, re-quantize this file to one '{engine.DeviceId}' " +
+        $"does, or run it through '{PrefillKernelNames.GemV}' / '{PrefillKernelNames.Tiled}', which forward every format through batched row passes");
+
     // The one refusal wording an unrunnable prefill selection gets, at open and on apply alike: it names the value, what
     // the forward engine lacks for it, and the selections that execute today. For the dense-matrix selection it also
-    // names this file's own weight formats when they are the reason the selection cannot run.
+    // names this file's own weight formats when they are the reason the selection cannot run, beside the compute backend
+    // that reports no blocked matmul for them — which is why a route spanning two devices refuses per segment instead.
     private ModelException KernelRefusal(PrefillKernel kernel)
     {
         string name = PrefillKernelNames.Of(kernel);
-        List<QuantFormat> missing = kernel == PrefillKernel.Gemm ? FormatsWithoutKernels() : [];
+        List<QuantFormat> missing = kernel == PrefillKernel.Gemm ? FormatsWithoutKernels(_backend) : [];
 
         if (missing.Count > 0)
         {
             return new ModelException(
                 $"prefill kernel '{name}' is not implemented by the forward engine: architecture '{Plan.Architecture}' " +
-                $"carries dense weight matrices of format(s) {string.Join(", ", missing)} and no {name} attention/weight path exists in this build for them — " +
-                $"the window shape that multiplies a whole sub-batch against one matrix runs only where every dense weight matrix is {QuantFormat.Q8_0}, {QuantFormat.Q4_K}, or {QuantFormat.IQ4_XS} today, " +
+                $"carries dense weight matrices of format(s) {string.Join(", ", missing)} and no {name} attention/weight path exists in this build for them on the compute backend " +
+                $"'{_backend.DeviceId}' — the window shape that multiplies a whole sub-batch against one matrix runs only where every dense weight matrix has a blocked matmul kernel there, " +
                 $"while every other family forwards its prompt windows through batched row passes — set engine.prefill_kernel to '{PrefillKernelNames.GemV}' or " +
                 $"'{PrefillKernelNames.Tiled}' (or omit it) to run this file");
         }
@@ -855,6 +901,9 @@ public sealed class TransformerModel : IDisposable
         // device-named segment, and the check reads the tensor table alone: an unsupported route never spends a weight view.
         ValidateSpanWeightCapability(ModelDisplayName(file), file.Tensors, route, decodeSide, prefillSide);
 
+        // The dense-matrix selection answers to the same per-span gate: a prompt-window range naming a weight format its own resolved backend has no blocked matmul for refuses here at load — before any window dispatches and with no fall back to another kernel or device — rather than raising one weight pass late.
+        ValidateSpanMatmulCapability(_prefillKernel, ModelDisplayName(file), route, file.Tensors, prefillSide);
+
         return (decodeSide, prefillSide);
     }
 
@@ -940,6 +989,7 @@ public sealed class TransformerModel : IDisposable
         Plan = profileOverride is null ? ModelPlans.Resolve(file, logLine) : ModelPlans.Resolve(file, profileOverride, logLine);
         Desc = Plan.ToDesc();
         MaxContextTokens = maxContextTokens;
+        _modelDisplay = ModelDisplayName(file); // every capability refusal this engine raises — at open and on a re-point alike — calls this model by the same name the structured load lines report.
 
         // The formats this file's dense weight matrices carry, read from the plan's tensor map before any payload is
         // touched: it decides whether a selection that multiplies a whole sub-batch against one matrix can run here at
@@ -949,9 +999,10 @@ public sealed class TransformerModel : IDisposable
         // A prefill kernel selection this engine has no kernel for is refused at open, the posture every other
         // unimplemented capability takes: the selection stays visible in the resolved value's vocabulary, the
         // refusal names it and what is missing, and nothing falls back to the route that happens to work. The batched-
-        // row window and its row-tiled variant run for every family; the dense-matrix shape runs only where this file's
-        // own weight formats all have a blocked matmul. The check lands before any tensor maps are built, so an
-        // unrunnable selection never spends a weight view on it.
+        // row window and its row-tiled variant run for every family; the dense-matrix shape needs this file to carry
+        // dense weight matrices at all, and which compute backend must report a blocked matmul for each of their
+        // formats is decided per resolved execution span below. Both checks land before any tensor maps or weight views
+        // are built, so an unrunnable selection never spends either on it.
         if (!KernelExecutes(prefillKernel))
         {
             throw KernelRefusal(prefillKernel);

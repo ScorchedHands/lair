@@ -335,6 +335,49 @@ public sealed class CudaIQuantGemvTests
     [Theory]
     [InlineData(QuantFormat.IQ4_NL)]
     [InlineData(QuantFormat.IQ4_XS)]
+    public void CudaIQuantGemm_WindowLanesAnswerEachVectorExactlyAsItsOwnLaunchDoes(QuantFormat format)
+    {
+        foreach (int count in new[] { 5, 7, 8, 9 }) // a partially filled window, an exact window, and a batch that spans more than one window
+        {
+            AssertGemmWindowMatchesSoloLaunch(format, 2, ExactColumns(format), count);
+        }
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
+    public void CudaIQuantGemm_MatchesCpuOracleWithinBand_AndPartialTailStopsAtRealColumns(QuantFormat format)
+    {
+        AssertGemmMatchesOracle(format, 2, ExactColumns(format), count: 3); // a partial activation-row window against an exact block multiple.
+        AssertGemmMatchesOracle(format, 2, TailColumns(format), count: 1); // one vector through a row whose last quant block is partial.
+    }
+
+    // The Q8_K i-quant family carries its GEMV kernel today but no windowed blocked matmul yet: the capability gate and the launch both refuse it naming this backend.
+    [Theory]
+    [InlineData(QuantFormat.IQ2_XXS)]
+    [InlineData(QuantFormat.IQ2_XS)]
+    [InlineData(QuantFormat.IQ2_S)]
+    [InlineData(QuantFormat.IQ3_XXS)]
+    [InlineData(QuantFormat.IQ3_S)]
+    public void CudaIQuantGemm_Q8KFamilyRefusesNamingThisBackend(QuantFormat format)
+    {
+        Assert.True(CudaBackend.HasGemvKernel(format), $"the CUDA seam stopped reporting its {format} GEMV kernel");
+
+        int cols = ExactColumns(format);
+        byte[] bytes = BuildFixture(format, 1, cols);
+        TensorShape shape = new([1, cols]);
+
+        using CudaBackend cuda = OpenCuda();
+        Assert.False(cuda.SupportsGemm(format), $"the CUDA seam claimed a {format} blocked matmul its kernel does not exist for");
+
+        NotSupportedException error = Assert.Throws<NotSupportedException>(
+            () => cuda.GemmBatch(Activations(cols), 1, new WeightRef(bytes, shape, format), new float[1]));
+        Assert.Contains($"no blocked matmul kernel for format {format}", error.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.IQ4_NL)]
+    [InlineData(QuantFormat.IQ4_XS)]
     [InlineData(QuantFormat.IQ2_XXS)]
     [InlineData(QuantFormat.IQ2_XS)]
     [InlineData(QuantFormat.IQ2_S)]
@@ -430,6 +473,83 @@ public sealed class CudaIQuantGemvTests
             for (int r = 0; r < rows; r++)
             {
                 Assert.Equal(batched[bIdx * rows + r], solo[r]); // bit-for-bit: identical launch shape on both sides of the batch loop.
+            }
+        }
+    }
+    private static void AssertGemmMatchesOracle(QuantFormat format, int rows, int cols, int count)
+    {
+        byte[] bytes = BuildFixture(format, rows, cols);
+        TensorShape shape = new([rows, cols]);
+        float band = BandFor(format);
+
+        float[] inputs = new float[count * cols];
+        for (int bIdx = 0; bIdx < count; bIdx++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                inputs[bIdx * cols + c] = Activation(c + bIdx * 7); // distinct activation vectors per batch slot.
+            }
+        }
+
+        using CpuBackend cpu = OpenCpuOracle();
+        float[] expected = new float[count * rows];
+        for (int bIdx = 0; bIdx < count; bIdx++)
+        {
+            float[] one = CpuGemv(cpu, bytes, shape, format, inputs.AsSpan(bIdx * cols, cols));
+            for (int r = 0; r < rows; r++)
+            {
+                expected[bIdx * rows + r] = one[r];
+            }
+        }
+
+        using CudaBackend cuda = OpenCuda();
+        Assert.True(cuda.SupportsGemm(format), $"the CUDA seam stopped claiming its {format} blocked matmul");
+
+        float[] gemm = new float[count * rows];
+        cuda.GemmBatch(inputs, count, new WeightRef(bytes, shape, format), gemm);
+        AssertWithinBand(expected, gemm, band, $"cuda {format} blocked matmul ({count} vectors)");
+
+        // Same case device to device: every window lane answers bit-for-bit what that vector's own solo launch answers.
+        float[] solo = new float[rows];
+        for (int bIdx = 0; bIdx < count; bIdx++)
+        {
+            cuda.Gemv(inputs.AsSpan(bIdx * cols, cols), new WeightRef(bytes, shape, format), solo);
+
+            for (int r = 0; r < rows; r++)
+            {
+                Assert.Equal(solo[r], gemm[bIdx * rows + r]); // bit-for-bit: the windowed dot and the solo dot are the same chain.
+            }
+        }
+    }
+
+    private static void AssertGemmWindowMatchesSoloLaunch(QuantFormat format, int rows, int cols, int count)
+    {
+        byte[] bytes = BuildFixture(format, rows, cols);
+        TensorShape shape = new([rows, cols]);
+
+        float[] inputs = new float[count * cols];
+        for (int bIdx = 0; bIdx < count; bIdx++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                inputs[bIdx * cols + c] = Activation(c + bIdx * 7); // distinct activation vectors per batch slot.
+            }
+        }
+
+        using CudaBackend cuda = OpenCuda();
+        Assert.True(cuda.SupportsGemm(format), $"the CUDA seam stopped claiming its {format} blocked matmul");
+
+        float[] gemm = new float[count * rows];
+        cuda.GemmBatch(inputs, count, new WeightRef(bytes, shape, format), gemm);
+
+        float[] solo = new float[rows];
+        for (int bIdx = 0; bIdx < count; bIdx++)
+        {
+            cuda.Gemv(inputs.AsSpan(bIdx * cols, cols), new WeightRef(bytes, shape, format), solo);
+
+            for (int r = 0; r < rows; r++)
+            {
+                Assert.Equal(solo[r], gemm[bIdx * rows + r]); // bit-for-bit: the windowed dot and the solo dot are the same chain.
             }
         }
     }

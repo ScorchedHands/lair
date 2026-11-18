@@ -4,6 +4,18 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] - 2026-11-18
+
+### Added
+
+- CUDA blocked-matmul (`GemmBatch`) kernels for measured dense and quantized formats, including `F32`, `F16`, `BF16` plus `Q8_0`, `Q5_0`, `Q2_0`, every K-quant, `IQ4_NL`, and `IQ4_XS`. Sub-4-bit i-quant GEMM remains refused.
+- A repeatable `cuda-gemm` bench subcommand with committed device/host parity report for the CUDA blocked-matmul gate.
+
+### Changed
+
+- Prefill `gemm` selection is now capability-checked per resolved prompt-window backend/span, refusing at model open when a selected dense format has no supported GEMM kernel rather than falling back.
+- Hybrid CUDA spans can run measured blocked-matmul prefill for the formats above; attention and device-resident KV remain CPU host-side.
+
 ## [0.5.2] - 2026-11-18
 
 ### Added
