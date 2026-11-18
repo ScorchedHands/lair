@@ -16,7 +16,9 @@ namespace Lair.Tests;
 /// output must land inside that format's recorded band (measured on this box, asserted per element), batched launches must match
 /// both the CPU oracle and the same kernel run solo for every activation vector in the batch, host-mapped weight postures must
 /// answer from registered host bytes, and row dequantization — host-side scalar math with no accumulation chain — must agree bit
-/// for bit with CpuBackend's expansion. Formats without a kernel here keep refusing rather than running through another device.
+/// for bit with CpuBackend's expansion. Formats without a kernel here keep refusing rather than running through another device; the blocked-matmul
+/// family now runs on this seam too — each packed quant format walks its own GEMV unpacking once per activation-row window instead of once per vector,
+/// inside that format's recorded band — while F32, F16, and BF16 still refuse a dense matrix naming this backend.
 /// </summary>
 [Trait("Category", "Kernel")]
 [Trait("Category", "Cuda")]
@@ -819,7 +821,150 @@ public sealed class CudaBlockQuantGemvTests
         AssertWithinBand(expected, actual, band, $"cuda {format} host-mapped posture");
     }
 
-    // ---------------------------------------------------------------- every accepted format now carries a GEMV kernel, and blocked matmul still refuses.
+    // ---------------------------------------------------------------- the blocked-matmul family: same packed bytes, one unpack per activation-row window.
+
+    private static float BandFor(QuantFormat format) => format switch
+    {
+        QuantFormat.Q8_0 => BandQ8_0,
+        QuantFormat.Q5_0 => BandQ5_0,
+        QuantFormat.Q2_0 => BandQ2_0,
+        QuantFormat.Q5_K => BandQ5K,
+        QuantFormat.Q2_K => BandQ2K,
+        QuantFormat.Q3_K => BandQ3K,
+        _ => throw new ArgumentException($"this file carries no fixture band for {format}", nameof(format)),
+    };
+
+    // The exact postures each format's recorded band was measured against in the GEMV tests above — that format's batched
+    // launch over an exact block multiple (run here one vector at a time and as a three-vector partial window) plus its
+    // single-vector partial-tail row — so a blocked matmul is compared with the CPU oracle on cases those bands already cover.
+    private static readonly (QuantFormat Format, int Rows, int Cols, int Count)[] BandPostures =
+    [
+        (QuantFormat.Q8_0, 2, 96, 1), (QuantFormat.Q8_0, 2, 96, 3), (QuantFormat.Q8_0, 2, 36, 1),
+        (QuantFormat.Q5_0, 2, 64, 1), (QuantFormat.Q5_0, 2, 64, 3), (QuantFormat.Q5_0, 2, 40, 1),
+        (QuantFormat.Q2_0, 2, 128, 1), (QuantFormat.Q2_0, 2, 128, 3), (QuantFormat.Q2_0, 2, 84, 1),
+        (QuantFormat.Q5_K, 2, 512, 1), (QuantFormat.Q5_K, 2, 512, 3), (QuantFormat.Q5_K, 2, 300, 1),
+        (QuantFormat.Q2_K, 2, 512, 1), (QuantFormat.Q2_K, 2, 512, 3), (QuantFormat.Q2_K, 2, 300, 1),
+        (QuantFormat.Q3_K, 2, 512, 1), (QuantFormat.Q3_K, 2, 512, 3), (QuantFormat.Q3_K, 2, 300, 1),
+    ];
+
+    private static byte[] FixtureFor(QuantFormat format, int rows, int cols) => format switch
+    {
+        QuantFormat.Q8_0 => BuildQ8_0Fixture(rows, cols),
+        QuantFormat.Q5_0 => BuildQ5_0Fixture(rows, cols),
+        QuantFormat.Q2_0 => BuildQ2_0Fixture(rows, cols),
+        QuantFormat.Q5_K => BuildQ5KFixture(rows, cols),
+        QuantFormat.Q2_K => BuildQ2KFixture(rows, cols),
+        _ => BuildQ3KFixture(rows, cols),
+    };
+
+    private static float[] GemmInputs(int count, int cols)
+    {
+        float[] inputs = new float[count * cols];
+        for (int bIdx = 0; bIdx < count; bIdx++)
+        {
+            for (int c = 0; c < cols; c++)
+            {
+                inputs[bIdx * cols + c] = Activation(c + bIdx * 7); // distinct activation vectors per batch slot.
+            }
+        }
+
+        return inputs;
+    }
+
+    private static void AssertGemmWindowMatchesSoloLaunch(byte[] bytes, TensorShape shape, QuantFormat format, int count)
+    {
+        float[] inputs = GemmInputs(count, shape.Dims[^1]);
+
+        int rows = shape.Dims[0];
+        int cols = shape.Dims[^1];
+
+        using CudaBackend cuda = OpenCuda();
+        Assert.True(cuda.SupportsGemm(format), $"the CUDA seam stopped claiming its {format} blocked matmul");
+
+        float[] gemm = new float[count * rows];
+        cuda.GemmBatch(inputs, count, new WeightRef(bytes, shape, format), gemm);
+
+        // Every window lane answers bit-for-bit what that vector's own solo launch answers: the unpack runs once per window and each lane's chain advances over the same columns in the same order as its solo walk.
+        float[] solo = new float[rows];
+        for (int bIdx = 0; bIdx < count; bIdx++)
+        {
+            cuda.Gemv(inputs.AsSpan(bIdx * cols, cols), new WeightRef(bytes, shape, format), solo);
+
+            for (int r = 0; r < rows; r++)
+            {
+                Assert.Equal(solo[r], gemm[bIdx * rows + r]); // bit-for-bit: the windowed dot and the solo dot are the same chain.
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.Q8_0)]
+    [InlineData(QuantFormat.Q5_0)]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.Q5_K)]
+    [InlineData(QuantFormat.Q2_K)]
+    [InlineData(QuantFormat.Q3_K)]
+    public void CudaBlockQuantGemm_WindowLanesAnswerEachVectorExactlyAsItsOwnLaunchDoes(QuantFormat format)
+    {
+        foreach ((_, int rows, int cols, _) in BandPostures.Where(p => p.Format == format).DistinctBy(p => (p.Rows, p.Cols)))
+        {
+            byte[] bytes = FixtureFor(format, rows, cols);
+            TensorShape shape = new([rows, cols]);
+
+            foreach (int count in new[] { 5, 7, 8, 9 }) // a partially filled window, an exact window, and a batch that spans more than one window
+            {
+                AssertGemmWindowMatchesSoloLaunch(bytes, shape, format, count);
+            }
+        }
+    }
+
+    [Theory]
+    [InlineData(QuantFormat.Q8_0)]
+    [InlineData(QuantFormat.Q5_0)]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.Q5_K)]
+    [InlineData(QuantFormat.Q2_K)]
+    [InlineData(QuantFormat.Q3_K)]
+    public void CudaBlockQuantGemm_MatchesCpuOracleWithinBand(QuantFormat format)
+    {
+        float band = BandFor(format);
+
+        foreach ((_, int rows, int cols, int count) in BandPostures.Where(p => p.Format == format)) // the posture this format's band was measured on: a partial activation-row window over an exact block multiple, and its single-vector partial-tail row.
+        {
+            byte[] bytes = FixtureFor(format, rows, cols);
+            TensorShape shape = new([rows, cols]);
+
+            float[] inputs = GemmInputs(count, cols);
+
+            using CpuBackend cpu = OpenCpuOracle();
+            float[] expected = new float[count * rows];
+            for (int bIdx = 0; bIdx < count; bIdx++)
+            {
+                float[] one = CpuGemv(cpu, bytes, shape, format, inputs.AsSpan(bIdx * cols, cols));
+                for (int r = 0; r < rows; r++)
+                {
+                    expected[bIdx * rows + r] = one[r];
+                }
+            }
+
+            using CudaBackend cuda = OpenCuda();
+            float[] gemm = new float[count * rows];
+            cuda.GemmBatch(inputs, count, new WeightRef(bytes, shape, format), gemm);
+            AssertWithinBand(expected, gemm, band, $"cuda {format} blocked matmul at {rows}x{cols} ({count} vectors)");
+
+            // Same case, device to device: the windowed chain is bit-identical with each vector's own solo launch.
+            float[] solo = new float[rows];
+            for (int bIdx = 0; bIdx < count; bIdx++)
+            {
+                cuda.Gemv(inputs.AsSpan(bIdx * cols, cols), new WeightRef(bytes, shape, format), solo);
+
+                for (int r = 0; r < rows; r++)
+                {
+                    Assert.Equal(solo[r], gemm[bIdx * rows + r]);
+                }
+            }
+        }
+    }
 
     [Theory]
     [InlineData(QuantFormat.F32)]
@@ -840,7 +985,7 @@ public sealed class CudaBlockQuantGemvTests
     [InlineData(QuantFormat.IQ2_S)]
     [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
-    public void CudaGemv_ClaimsEveryFormatTheSeamCarries_AndStillRefusesBlockedMatmul(QuantFormat format)
+    public void CudaCapability_ClaimsEveryGEMV_AndClaimsOrRefusesBlockedMatmulWithItsKernelTable(QuantFormat format)
     {
         Assert.True(CudaBackend.HasGemvKernel(format), $"the CUDA seam stopped reporting its {format} GEMV kernel");
 
@@ -850,11 +995,20 @@ public sealed class CudaBlockQuantGemvTests
         float[] output = new float[1];
 
         using CudaBackend cuda = OpenCuda();
-        Assert.True(cuda.SupportsGemv(format), $"the backend stopped claiming the {format} GEMV its kernel exists for"); // weight GEMV only.
-        NotSupportedException gemmError = Assert.Throws<NotSupportedException>(
-            () => cuda.GemmBatch(x, 1, new WeightRef(bytes, shape, format), output));
-        Assert.Contains($"no blocked matmul kernel for format {format}", gemmError.Message, StringComparison.Ordinal);
+        Assert.True(cuda.SupportsGemv(format), $"the backend stopped claiming the {format} GEMV its kernel exists for"); // weight GEMV runs on the device for every format this seam accepts.
 
-        Assert.False(cuda.SupportsGemm(format)); // the capability gate agrees with the throw: no CUDA route claims a GEMM today.
+        bool carriesGemm = CudaBackend.HasGemmKernel(format);
+        Assert.Equal(carriesGemm, cuda.SupportsGemm(format)); // the capability gate answers from the same table the function handles resolve from.
+
+        if (carriesGemm)
+        {
+            cuda.GemmBatch(x, 1, new WeightRef(bytes, shape, format), output); // its own windowed kernel runs: no throw and no CPU fallback behind it.
+        }
+        else
+        {
+            NotSupportedException gemmError = Assert.Throws<NotSupportedException>(
+                () => cuda.GemmBatch(x, 1, new WeightRef(bytes, shape, format), output));
+            Assert.Contains($"no blocked matmul kernel for format {format}", gemmError.Message, StringComparison.Ordinal);
+        }
     }
 }

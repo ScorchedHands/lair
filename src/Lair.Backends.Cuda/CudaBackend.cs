@@ -16,7 +16,11 @@ namespace Lair.Backends.Cuda;
 /// tensor's live host region with the driver and launches the same kernels against the device pointer the registration
 /// answers with, so no weight tensor is ever copied into persistent device memory and the weights stay resident exactly
 /// where the weight source holds them. Formats with no kernel here refuse naming this backend rather than run through
-/// some other route; the blocked matmul has no CUDA path at all yet. Activation vectors and outputs cross the PCIe
+/// some other route; blocked matmul runs on the device for each format whose windowed kernel stands today — Q8_0/Q5_0/
+/// Q2_0, every K-quant, and the IQ4 pair, each one its own GEMV kernel's unpacking walked once per activation-row window
+/// instead of once per vector, in a `GemmBatch` entry point beside the GEMV — while F32/F16/BF16 (no WMMA dense matmul has
+/// landed yet) and the Q8_K i-quants carry none, so their dense-matrix selection is refused naming this backend.
+/// Activation vectors and outputs cross the PCIe
 /// seam per call in either posture, and a KV arena stays host-resident for attention reads in both: the device KV mirror
 /// seam opens a persistent device copy of a declared block range that dirty blocks cross on flush, which is residency
 /// accounting only — no device-side attention kernel stands behind a mirror, and opening one implies none.
@@ -51,6 +55,16 @@ public sealed partial class CudaBackend : IBackend
     private readonly IntPtr _gemvIQ2S;
     private readonly IntPtr _gemvIQ3X;
     private readonly IntPtr _gemvIQ3S;
+    private readonly IntPtr _gemmQ8_0;
+    private readonly IntPtr _gemmQ5_0;
+    private readonly IntPtr _gemmQ2_0;
+    private readonly IntPtr _gemmQ4K;
+    private readonly IntPtr _gemmQ6K;
+    private readonly IntPtr _gemmQ5K;
+    private readonly IntPtr _gemmQ2K;
+    private readonly IntPtr _gemmQ3K;
+    private readonly IntPtr _gemmIQ4Nl;
+    private readonly IntPtr _gemmIQ4Xs;
 
     private bool _disposed;
 
@@ -123,6 +137,16 @@ public sealed partial class CudaBackend : IBackend
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvIQ2S, _module, "gemv_iq2s"));
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvIQ3X, _module, "gemv_iq3xxs"));
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvIQ3S, _module, "gemv_iq3s"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemmQ8_0, _module, "gemm_q8_0"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemmQ5_0, _module, "gemm_q5_0"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemmQ2_0, _module, "gemm_q2_0"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemmQ4K, _module, "gemm_q4k"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemmQ6K, _module, "gemm_q6k"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemmQ5K, _module, "gemm_q5k"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemmQ2K, _module, "gemm_q2k"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemmQ3K, _module, "gemm_q3k"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemmIQ4Nl, _module, "gemm_iq4nl"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemmIQ4Xs, _module, "gemm_iq4xs"));
             }
             catch
             {
@@ -198,13 +222,6 @@ public sealed partial class CudaBackend : IBackend
 
         RunGemv(w, inputs, count, outputs);
     }
-
-    public void GemmBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs) =>
-        throw new NotSupportedException(
-            $"CudaBackend ('{DeviceIdValue}') has no blocked matmul kernel for format {w.Format}: the CUDA seam carries " +
-            "GEMV kernels only, so a dense-matrix prefill selection is refused rather than run through some other route.");
-
-    public bool SupportsGemm(QuantFormat format) => false;
 
     /// <summary>
     /// Whether this backend's GEMV kernels execute for weights in <paramref name="format"/>: the CUDA seam carries GEMV
@@ -523,8 +540,8 @@ public sealed partial class CudaBackend : IBackend
     private static NotSupportedException Unsupported(QuantFormat format, string kernel) => new(
         $"CudaBackend ('{DeviceIdValue}') has no {kernel} kernel for format {format}: the CUDA seam carries GEMV kernels " +
         "for every QuantFormat it accepts today (F32, F16, BF16, Q8_0, Q5_0, Q2_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ4_NL, " +
-        "IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, and IQ3_S) and blocked-matmul kernels none of them, " +
-        "so this weight pass is refused naming that backend rather than run through a CPU fallback.");
+        "IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, and IQ3_S) and windowed blocked matmul for Q8_0/Q5_0/Q2_0, every K-quant, " +
+        "and the IQ4 pair (F32/F16/BF16 and the Q8_K i-quants carry none), so this weight pass is refused naming that backend rather than run through a CPU fallback.");
 
     private static (int Rows, int Cols) ValidateShape(WeightRef w)
     {

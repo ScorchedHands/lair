@@ -248,6 +248,54 @@ public sealed class CudaQuantizedGemvTests
     }
 
     [Fact]
+    public void CudaQ4KGemm_MatchesHostScalarReference_AndWindowedLaunchAnswersEachVector()
+    {
+        const int rows = 2;
+        const int cols = 256;
+        (byte[] bytes, float[] weights) = BuildQ4KFixture(rows, cols);
+        TensorShape shape = new([rows, cols]);
+
+        foreach (int count in new[] { 1, 8, 9 }) // one vector, an exact activation-row window, and a window whose tail lanes clamp
+        {
+            float[] inputs = new float[count * cols];
+            for (int bIdx = 0; bIdx < count; bIdx++)
+            {
+                for (int c = 0; c < cols; c++)
+                {
+                    inputs[bIdx * cols + c] = Activation(c + bIdx * 7);
+                }
+            }
+
+            float[] expected = new float[count * rows];
+            for (int bIdx = 0; bIdx < count; bIdx++)
+            {
+                float[] one = ExpectedOutput(rows, cols, weights, inputs.AsSpan(bIdx * cols, cols));
+                for (int r = 0; r < rows; r++)
+                {
+                    expected[bIdx * rows + r] = one[r];
+                }
+            }
+
+            using CudaBackend cuda = OpenCuda();
+            Assert.True(cuda.SupportsGemm(QuantFormat.Q4_K), "the CUDA seam stopped claiming its Q4_K blocked matmul");
+
+            float[] gemm = new float[count * rows];
+            cuda.GemmBatch(inputs, count, new WeightRef(bytes, shape, QuantFormat.Q4_K), gemm);
+            AssertClose(expected, gemm); // the windowed chain lands on the host scalar reference inside this format's tolerance
+
+            float[] solo = new float[rows];
+            for (int bIdx = 0; bIdx < count; bIdx++)
+            {
+                cuda.Gemv(inputs.AsSpan(bIdx * cols, cols), new WeightRef(bytes, shape, QuantFormat.Q4_K), solo);
+                for (int r = 0; r < rows; r++)
+                {
+                    AssertClose(solo[r], gemm[bIdx * rows + r]); // a windowed dot answers the same value that vector's own GEMV does
+                }
+            }
+        }
+    }
+
+    [Fact]
     public void CudaQ4K_DequantRow_MatchesCpuBackendScalarExpansion()
     {
         const int rows = 2;
@@ -638,6 +686,54 @@ public sealed class CudaQuantizedGemvTests
         float[] actual = new float[count * rows];
         cuda.GemvBatch(inputs, count, new WeightRef(bytes, shape, QuantFormat.Q6_K), actual);
         AssertCloseBand(expected, actual, "cuda Q6_K batched launch");
+    }
+
+    [Fact]
+    public void CudaQ6KGemm_MatchesHostScalarReference_AndWindowedLaunchAnswersEachVector()
+    {
+        const int rows = 2;
+        const int cols = 512; // a multi-block row: the window loop must re-walk every block for each activation-row window
+        (byte[] bytes, float[] weights) = BuildQ6KFixture(rows, cols, (Half)(-0.25f));
+        TensorShape shape = new([rows, cols]);
+
+        foreach (int count in new[] { 1, 8, 9 }) // one vector, an exact activation-row window, and a window whose tail lanes clamp
+        {
+            float[] inputs = new float[count * cols];
+            for (int bIdx = 0; bIdx < count; bIdx++)
+            {
+                for (int c = 0; c < cols; c++)
+                {
+                    inputs[bIdx * cols + c] = Activation(c + bIdx * 7);
+                }
+            }
+
+            float[] expected = new float[count * rows];
+            for (int bIdx = 0; bIdx < count; bIdx++)
+            {
+                float[] one = ExpectedOutput(rows, cols, weights, inputs.AsSpan(bIdx * cols, cols));
+                for (int r = 0; r < rows; r++)
+                {
+                    expected[bIdx * rows + r] = one[r];
+                }
+            }
+
+            using CudaBackend cuda = OpenCuda();
+            Assert.True(cuda.SupportsGemm(QuantFormat.Q6_K), "the CUDA seam stopped claiming its Q6_K blocked matmul");
+
+            float[] gemm = new float[count * rows];
+            cuda.GemmBatch(inputs, count, new WeightRef(bytes, shape, QuantFormat.Q6_K), gemm);
+            AssertCloseBand(expected, gemm, $"cuda Q6_K blocked matmul ({count} vectors)");
+
+            float[] solo = new float[rows];
+            for (int bIdx = 0; bIdx < count; bIdx++)
+            {
+                cuda.Gemv(inputs.AsSpan(bIdx * cols, cols), new WeightRef(bytes, shape, QuantFormat.Q6_K), solo);
+                for (int r = 0; r < rows; r++)
+                {
+                    AssertCloseBand([solo[r]], [gemm[bIdx * rows + r]], $"cuda Q6_K windowed lane at vector {bIdx} row {r}");
+                }
+            }
+        }
     }
 
     [Fact]

@@ -213,5 +213,5 @@ public sealed partial class CudaBackend
         "\n" + BuildGemvQ5KPtx() + "\n" + BuildGemvQ2KPtx() + "\n" + BuildGemvQ3KPtx() +
         "\n" + BuildGemvIQ4NPtx() + "\n" + BuildGemvIQ4XPtx() + "\n" + BuildGemvIQ2XXSPtx() +
         "\n" + BuildGemvIQ2XSPtx() + "\n" + BuildGemvIQ2SPtx() + "\n" + BuildGemvIQ3XPtx() +
-        "\n" + BuildGemvIQ3SPtx() + "\0");
+        "\n" + BuildGemvIQ3SPtx() + BuildGemmFamilyPtx() + "\0");
 }
