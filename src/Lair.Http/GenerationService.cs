@@ -56,7 +56,7 @@ public sealed class GenerationService : IDisposable
     private readonly string _markerRefusalDetail;
 
     private readonly ILogger? _logger;
-    private readonly BlockPool _pool;
+    private readonly IKvPool _pool;
     private readonly GenerationScheduler _scheduler;
     private EngineMetricsBus? _metrics;
 
@@ -110,7 +110,9 @@ public sealed class GenerationService : IDisposable
     internal NumaPlacement? ResolvedPlacement => _placement;
 
     // The KV block pool this engine serves from: its residency mode, device-backed range, and mirror counters are what a loaded model actually holds, read here so an observer never has to infer them from a declared placement value. Internal diagnostics for hosts and tests.
-    internal BlockPool ServedBlockPool => _pool;
+    internal IKvPool ServedBlockPool => _pool;
+
+    internal TransformerModel ServedModel => _model;
 
     // The scheduler advancing this engine's pipelines: its last composition report says which candidates merged on which segment and what kept any of them out, read here so an observer can tell where sequences actually stepped instead of inferring it from placement. Internal diagnostics for hosts and tests.
     internal GenerationScheduler ServedScheduler => _scheduler;
@@ -143,7 +145,7 @@ public sealed class GenerationService : IDisposable
         ReasoningRegionMarkers? reasoningMarkers,
         string markerRefusalDetail,
         ILogger? logger,
-        BlockPool pool,
+        IKvPool pool,
         GenerationScheduler scheduler,
         ModelInfo info,
         LairConfig config,
@@ -1405,7 +1407,7 @@ public sealed class GenerationService : IDisposable
 
         GgufFile? file = null;
         TransformerModel? model = null;
-        BlockPool? pool = null;
+        IKvPool? pool = null;
         GenerationScheduler? scheduler = null;
         string? updateCandidate = null;
         BudgetTier? reservationKvClaimTier = null; // where the ledger seated this engine's whole-reservation KV claim, so a live soft-cap edit retargets that seat and only that seat.
@@ -1417,10 +1419,46 @@ public sealed class GenerationService : IDisposable
                 Lair.Kv.KvSideFormatNames.Of(modelConfig.KvQuant.K),
                 Lair.Kv.KvSideFormatNames.Of(modelConfig.KvQuant.V));
 
-            if (!modelConfig.KvQuant.IsFloatStorage)
+            // A declared quantized pair lands its serving posture here, before any weight view or pool is spent: the pair
+            // decides which attention route the forward engine closes at open, and this service opens it only over the
+            // posture that route serves — CPU kernels over host-resident blocks, prompt windows through the batched-row
+            // (gemv) window. Each refusal names the key that declared the posture and what to change; a pair with no
+            // attention route names the pair itself, refusing before the KV pool is constructed rather than silently
+            // serving it as k='f32' v='f32'.
+            bool quantizedKv = !modelConfig.KvQuant.IsFloatStorage;
+
+            if (quantizedKv)
             {
-                throw new ModelException(
-                    $"model '{modelConfig.Name}' declares kv.quant k='{Lair.Kv.KvSideFormatNames.Of(modelConfig.KvQuant.K)}' v='{Lair.Kv.KvSideFormatNames.Of(modelConfig.KvQuant.V)}': LAIR has no quantized KV storage or attention execution support for this pair — refusing before the KV pool is constructed rather than silently serving it as k='f32' v='f32'.");
+                if (modelConfig.KvQuant.K != KvSideFormat.Q8_0
+                    || (modelConfig.KvQuant.V != KvSideFormat.Q8_0 && modelConfig.KvQuant.V != KvSideFormat.Q4_0))
+                {
+                    throw new ModelException(
+                        $"model '{modelConfig.Name}' declares kv.quant k='{Lair.Kv.KvSideFormatNames.Of(modelConfig.KvQuant.K)}' v='{Lair.Kv.KvSideFormatNames.Of(modelConfig.KvQuant.V)}': LAIR's quantized attention route instantiates over 'q8_0' on the k side and 'q8_0' or 'q4_0' on the v side, and this pair has no storage/attention execution support — refusing before the KV pool is constructed rather than silently serving it as k='f32' v='f32'.");
+                }
+
+                if (splitExecution is not null)
+                {
+                    throw new ModelException(
+                        $"model '{modelConfig.Name}' declares kv.quant beside 'placement.gpu_layers' {modelConfig.Placement.GpuLayers}: quantized attention runs CPU kernels only, so a quantized pair refuses a split route — drop 'placement.gpu_layers' or omit 'kv.quant' to serve this model in the FP32 posture.");
+                }
+
+                if (prefillsLane is not null || prefillsBackend is not null)
+                {
+                    throw new ModelException(
+                        $"model '{modelConfig.Name}' declares kv.quant beside 'placement.prefill_lane' '{PlacementPrefillLaneValues.Dedicated}': the quantized attention route carries no dedicated-lane or offload posture — resolve placement onto the shared posture or omit 'kv.quant' to serve this model in the FP32 posture.");
+                }
+
+                if (kvResidency != BlockResidencyMode.Dram || deviceBackedBlocks > 0)
+                {
+                    throw new ModelException(
+                        $"model '{modelConfig.Name}' declares kv.quant beside 'placement.kv_residency' '{BlockResidencyModeNames.Of(kvResidency)}': quantized blocks are host-resident in this build — resolve the residency to '{BlockResidencyModeNames.Dram}' or omit 'kv.quant' to serve this model in the FP32 posture.");
+                }
+
+                if (ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel) != PrefillKernel.GemV)
+                {
+                    throw new ModelException(
+                        $"model '{modelConfig.Name}' declares kv.quant beside 'engine.prefill_kernel' '{config.Engine.PrefillKernel}': the quantized attention route runs prompt windows through the batched-row window only — set engine.prefill_kernel to '{PrefillKernelNames.GemV}' or omit 'kv.quant' to serve this model in the FP32 posture.");
+                }
             }
 
             // A model that declares a published source is verified against its pack manifest before any byte of the
@@ -1465,7 +1503,7 @@ public sealed class GenerationService : IDisposable
             // unimplemented capability takes — and nothing lands on a route that was not selected.
             try
             {
-                model = splitExecution is null
+                model = quantizedKv
                     ? TransformerModel.Open(
                         file,
                         backend,
@@ -1473,23 +1511,37 @@ public sealed class GenerationService : IDisposable
                         line => logger?.LogInformation("{ProfileLog}", line),
                         ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel),
                         route,
-                        prefillsBackend,
-                        prefillsLane,
+                        modelConfig.KvQuant,
+                        backend.ResolvedIntegerDotPath, // the integer-dot encoding this opened backend resolved: the quantized attention kernel runs it per scored position and never re-resolves it.
                         budgets)
-                    : TransformerModel.Open(
-                        file,
-                        backend,
-                        reservedSlots,
-                        line => logger?.LogInformation("{ProfileLog}", line),
-                        ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel),
-                        route,
-                        [splitExecution, backend], // the resolved execution set answers every segment position in order: 'cuda' first, this service's decode-side CPU backend after it.
-                        budgets);
+                    : splitExecution is null
+                        ? TransformerModel.Open(
+                            file,
+                            backend,
+                            reservedSlots,
+                            line => logger?.LogInformation("{ProfileLog}", line),
+                            ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel),
+                            route,
+                            prefillsBackend,
+                            prefillsLane,
+                            budgets)
+                        : TransformerModel.Open(
+                            file,
+                            backend,
+                            reservedSlots,
+                            line => logger?.LogInformation("{ProfileLog}", line),
+                            ResolvePrefillKernel(modelConfig.Name, config.Engine.PrefillKernel),
+                            route,
+                            [splitExecution, backend], // the resolved execution set answers every segment position in order: 'cuda' first, this service's decode-side CPU backend after it.
+                            budgets);
             }
-            catch (ModelException ex) when (ex.Message.StartsWith("prefill kernel '", StringComparison.Ordinal))
+            catch (ModelException ex) when (
+                ex.Message.StartsWith("prefill kernel '", StringComparison.Ordinal)
+                || ex.Message.StartsWith("this model opens quantized KV storage", StringComparison.Ordinal))
             {
-                // The engine names the selection and the weight formats it has no dense-matrix path for; this service
-                // adds which served model the refusal is about, so a load failure says what to change in the config.
+                // The engine names the selection and the weight formats it has no dense-matrix path for, or the quantized
+                // pair and the geometry its closed attention route cannot address; this service adds which served model
+                // the refusal is about, so a load failure says what to change in the config.
                 throw new ModelException($"model '{modelConfig.Name}': {ex.Message}");
             }
 
@@ -1596,26 +1648,32 @@ public sealed class GenerationService : IDisposable
                     deviceClaim.Claim.Demoted);
             }
 
-            // The pool opens with the residency this open resolved: its arena stays owned by this service's CPU backend — the allocation and free list every attention read addresses through — while only the declared leading block range carries a persistent copy in the accelerator backend this open owns. A host-only reservation passes no device-backed range and opens no mirror at all, exactly as it always has.
-            pool = new BlockPool(
-                blockTokens,
-                model.Plan.LayerCount,
-                model.Plan.KvHeadCount,
-                model.Plan.HeadDim,
-                modelConfig.KvBlocks,
-                backend,
-                kvResidency,
-                deviceBackedBlocks,
-                mirrorOwner: (IBackend?)kvStorageOwner ?? backend);
+            // The pool opens with the residency this open resolved: its arena stays owned by this service's CPU backend — the allocation and free list every attention read addresses through — while only the declared leading block range carries a persistent copy in the accelerator backend this open owns. A host-only reservation passes no device-backed range and opens no mirror at all, exactly as it always has. A quantized pair opens the typed pool its pair's group layout needs — the same free list, refcounts, budget, and window accounting the float pool runs, over that pair's bytes — and the posture checks above already refused anything but host residency for it.
+            pool = quantizedKv
+                ? modelConfig.KvQuant.V == KvSideFormat.Q8_0
+                    ? new BlockPool<Q8Block, Q8Block>(blockTokens, model.Plan.LayerCount, model.Plan.KvHeadCount, model.Plan.HeadDim, modelConfig.KvBlocks, backend, modelConfig.KvQuant)
+                    : new BlockPool<Q8Block, Q4Block>(blockTokens, model.Plan.LayerCount, model.Plan.KvHeadCount, model.Plan.HeadDim, modelConfig.KvBlocks, backend, modelConfig.KvQuant)
+                : new BlockPool(
+                    blockTokens,
+                    model.Plan.LayerCount,
+                    model.Plan.KvHeadCount,
+                    model.Plan.HeadDim,
+                    modelConfig.KvBlocks,
+                    backend,
+                    kvResidency,
+                    deviceBackedBlocks,
+                    mirrorOwner: (IBackend?)kvStorageOwner ?? backend);
 
             if (deviceBackedBlocks > 0)
             {
+                // A device-backed range only ever lands on the float pool: the posture checks above refused a quantized
+                // pair beside any non-host residency, so this mirror reporting addresses that pool directly.
                 logger?.LogInformation(
                     "kv_residency model='{Model}' residency={Residency} device_backed_blocks={DeviceBackedBlocks} persistent_device_bytes={PersistentDeviceBytes} bytes_per_block={BytesPerBlock}",
                     modelConfig.Name,
                     BlockResidencyModeNames.Of(pool.Residency),
                     pool.DeviceBackedBlockCount,
-                    pool.DeviceMirrorBytes,
+                    ((BlockPool)pool).DeviceMirrorBytes,
                     pool.BytesPerBlock);
             }
 
@@ -1741,6 +1799,16 @@ public sealed class GenerationService : IDisposable
                 "prefill_kernel model='{Model}' kernel={Kernel}",
                 modelConfig.Name,
                 PrefillKernelNames.Of(model.ResolvedPrefillKernel));
+
+            // The attention route a quantized pair closed at is announced in the same style: which quantized kernel
+            // instantiation every forward of this engine runs. A float posture logs nothing here.
+            if (quantizedKv)
+            {
+                logger?.LogInformation(
+                    "kv_attention model='{Model}' route={Route}",
+                    modelConfig.Name,
+                    model.ResolvedKvAttentionRoute);
+            }
 
             // Both spellings of this model's system-memory KV ceiling arrived and agreed — the loader refuses any other combination — so startup sizing is unchanged and one line says which spelling carries it forward. A legacy key alone or budgets alone log nothing here, exactly as they behaved before.
             if (modelConfig.LegacyKvBlocksDeclared && DeclaresSystemMemoryKvCeiling(modelConfig))

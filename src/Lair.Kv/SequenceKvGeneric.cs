@@ -10,7 +10,7 @@ namespace Lair.Kv;
 /// <see cref="SelectCausalRead"/> or <see cref="SelectRangeRead"/> first and reads only positions inside that selection,
 /// exactly the boundedness contract the non-generic sequence runs. Disposing the sequence releases every reference it holds.
 /// </summary>
-public sealed class SequenceKv<TK, TV> : IDisposable
+public sealed class SequenceKv<TK, TV> : IKvSequence
     where TK : struct, IKvFormat<TK>
     where TV : struct, IKvFormat<TV>
 {

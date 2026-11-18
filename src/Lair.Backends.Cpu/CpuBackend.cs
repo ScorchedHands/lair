@@ -164,7 +164,8 @@ public sealed unsafe partial class CpuBackend : IBackend
     internal CpuIsa RequestedCpuIsa => _requestedIsa;
 
     /// <summary>The integer-dot encoding that selection resolved to at open - scalar reference, AVX2 pair sums, or AVX-VNNI vpdpbusd - fixed for this backend's whole lifetime.</summary>
-    internal IntegerDotPath ResolvedIntegerDotPath => _integerDot;
+    /// <summary>The integer-dot encoding that selection resolved to at open - scalar reference, AVX2 pair sums, or AVX-VNNI vpdpbusd - fixed for this backend's whole lifetime. A host opening quantized KV attention passes this resolved fact to the model open: the quantized kernel runs it per scored position and never re-resolves it.</summary>
+    public IntegerDotPath ResolvedIntegerDotPath => _integerDot;
 
     /// <summary>
     /// This opened backend's resolved CPU selection in host reporting shape: the ISA axis as declared (<c>auto</c>, <c>avx2</c>,

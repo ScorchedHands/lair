@@ -11,8 +11,10 @@ namespace Lair.Kv;
 /// payload+scale block struct instead of floats. The arena is one aligned allocation owned by the backend; block, side, and
 /// token views are spans over that arena valid for the pool's lifetime, so a block-granularity read is copy-less. Blocks are
 /// handed out from a free-list stack in O(1) and carry a reference count for copy-on-write sharing, with the same
-/// free-list/refcount semantics the non-generic pool runs. This is a storage-only pool: it proves a quantized pair's
-/// footprint and its block addressing, and carries no residency/window/soft-cap machinery and no attention path.
+/// free-list/refcount semantics the non-generic pool runs. The scheduler-facing bookkeeping the non-generic pool carries —
+/// soft budget, admission windows, and windowed-read footprint accounting — runs here too, so a quantized pair admits and
+/// reports through the same pool surface a float model schedules against. Quantized blocks are host-only in this build: no
+/// device mirror opens for them, and the residency members report that posture.
 /// </summary>
 /// <remarks>
 /// Block layout (bytes inside one block), with <c>groupsPerTokenK = kvDim / TK.ValuesPerBlock</c> and the V side analogous:
@@ -33,7 +35,7 @@ namespace Lair.Kv;
     /// without a copy. The arena is zero-initialized at construction, so slots never written are raw zero bytes; quantized reads
     /// expect the writer to have filled every group they cover.
 /// </remarks>
-public sealed unsafe class BlockPool<TK, TV> : IDisposable
+public sealed unsafe class BlockPool<TK, TV> : IKvPool, IDisposable
     where TK : struct, IKvFormat<TK>
     where TV : struct, IKvFormat<TV>
 {
@@ -51,6 +53,16 @@ public sealed unsafe class BlockPool<TK, TV> : IDisposable
     private readonly int[] _refCounts;
     private readonly int[] _freeStack;
     private int _freeTop;
+
+    // Soft cap on usage within the fixed physical arena, the admission-window ceiling, and the windowed-read accounting —
+    // the same scheduler-facing bookkeeping the non-generic pool runs, and resolved off the attention hot path exactly as
+    // there. Volatile so observer threads (admission checks) see a hot budget edit immediately.
+    private int _budgetBlocks;
+    private readonly int[] _layerWindowTokens;
+    private int _windowedLayerCount;
+    private readonly object _windowGate = new();
+    private int _openWindows;
+    private int _windowCeiling = -1;
 
     // Per-side group geometry resolved once from the format structs and validated against the pair descriptor. Cold only.
     private readonly int _kGroupsPerToken;
@@ -151,6 +163,10 @@ public sealed unsafe class BlockPool<TK, TV> : IDisposable
         }
 
         _freeTop = capacityBlocks;
+
+        _budgetBlocks = capacityBlocks; // no cap until one is set: a fresh pool budgets its whole reservation
+        _layerWindowTokens = new int[layerCount];
+        _windowedLayerCount = 0;
     }
 
     public int BlockTokens { get; }
@@ -183,8 +199,124 @@ public sealed unsafe class BlockPool<TK, TV> : IDisposable
     /// <summary>Token slots still available in free blocks.</summary>
     public long FreeSlots => (long)FreeBlocks * BlockTokens;
 
+    /// <summary>Soft usage cap within the physical reservation: allocations stop once this many blocks are handed out. Equal to <see cref="CapacityBlocks"/> until a budget is set.</summary>
+    public int EffectiveBudgetBlocks => Volatile.Read(ref _budgetBlocks);
+
+    /// <summary>Free blocks still reachable under the soft cap — what admission and step accounting actually spend from.</summary>
+    public int EffectiveFreeBlocks => Math.Max(Math.Min(FreeBlocks, EffectiveBudgetBlocks - UsedBlocks), 0);
+
+    /// <summary>The ceiling allocations currently reach: the soft cap, or an open admission window's wider reservation while admitted sequences still run under it.</summary>
+    public int AllocationCeiling => Math.Max(EffectiveBudgetBlocks, Volatile.Read(ref _windowCeiling));
+
+    /// <summary>Declares the per-layer attention windows this pool accounts for. The values are read-side accounting only: storage and allocation remain whole-KV.</summary>
+    public void DeclareAttentionWindows(ReadOnlySpan<int> layerWindows)
+    {
+        ThrowIfDisposed();
+
+        if (layerWindows.Length != LayerCount)
+        {
+            throw new ArgumentException($"attention-window table must cover {LayerCount} layers, got {layerWindows.Length}.", nameof(layerWindows));
+        }
+
+        int windowed = 0;
+        for (int layer = 0; layer < layerWindows.Length; layer++)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(layerWindows[layer]);
+            _layerWindowTokens[layer] = layerWindows[layer];
+            if (layerWindows[layer] > 0)
+            {
+                windowed++;
+            }
+        }
+
+        Volatile.Write(ref _windowedLayerCount, windowed);
+    }
+
+    /// <summary>The number of layers declared with a finite attention window.</summary>
+    public int DeclaredWindowedLayerCount => Volatile.Read(ref _windowedLayerCount);
+
+    /// <summary>Logical KV blocks the model's attention would select across all layers at the current soft budget.</summary>
+    public long KvReadFootprintBlocksAtBudget
+    {
+        get
+        {
+            ThrowIfDisposed();
+            ComputeKvReadFootprints(Volatile.Read(ref _budgetBlocks), out long read, out _);
+            return read;
+        }
+    }
+
+    /// <summary>Whole logical blocks excluded by declared windows at the current soft budget.</summary>
+    public long SkippedKvReadFootprintBlocksAtBudget
+    {
+        get
+        {
+            ThrowIfDisposed();
+            ComputeKvReadFootprints(Volatile.Read(ref _budgetBlocks), out _, out long skipped);
+            return skipped;
+        }
+    }
+
+    /// <summary>
+    /// Sets the soft usage cap to <paramref name="blocks"/> blocks, clamped into [1, <see cref="CapacityBlocks"/>], and returns the value applied.
+    /// The physical arena is never touched: raising the cap makes already-free blocks allocatable again immediately; lowering it withholds new
+    /// allocations while in-use count exceeds the cap (already-allocated blocks are never revoked).
+    /// </summary>
+    public int SetEffectiveBudget(int blocks)
+    {
+        ThrowIfDisposed();
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blocks);
+
+        int applied = Math.Min(blocks, CapacityBlocks);
+        Volatile.Write(ref _budgetBlocks, applied);
+        return applied;
+    }
+
+    /// <summary>
+    /// Opens one admission window for a sequence whose whole-lifetime block need was checked against the effective budget by the
+    /// admitting scheduler. Inside an open window, allocations may rise above the soft cap up to physical capacity — that headroom is
+    /// exactly what pre-admission accounting reserved and eviction could not reclaim. Call <see cref="EndAdmissionWindow"/> when the
+    /// sequence finishes so later admissions respect the current cap again.
+    /// </summary>
+    public void BeginAdmissionWindow(int neededBlocks)
+    {
+        ThrowIfDisposed();
+
+        lock (_windowGate)
+        {
+            int ceiling = Math.Max(UsedBlocks + Math.Max(neededBlocks, 0), Volatile.Read(ref _windowCeiling));
+            Volatile.Write(ref _windowCeiling, Math.Min(Math.Max(ceiling, 1), CapacityBlocks));
+            _openWindows++;
+        }
+    }
+
+    /// <summary>Closes one admission window; the shared ceiling resets once every open window has closed.</summary>
+    public void EndAdmissionWindow()
+    {
+        lock (_windowGate)
+        {
+            if (--_openWindows <= 0)
+            {
+                _openWindows = 0;
+                Volatile.Write(ref _windowCeiling, -1);
+            }
+        }
+    }
+
+    /// <summary>This pool's residency posture: quantized blocks are host-only in this build, so every quantized pool reports <see cref="BlockResidencyMode.Dram"/>.</summary>
+    public BlockResidencyMode Residency => BlockResidencyMode.Dram;
+
+    /// <summary>How many leading block ids are declared device-backed — always zero here: a quantized pool opens no device mirror.</summary>
+    public int DeviceBackedBlockCount => 0;
+
+    /// <summary>True when this physical id carries a persistent device copy — always false here.</summary>
+    public bool IsDeviceBacked(int physicalBlockId) => false;
+
+    /// <summary>Opens the sequence type this pool's storage is addressed by: the typed sequence whose reads and writes address this pool's groups.</summary>
+    public IKvSequence NewSequence() => new SequenceKv<TK, TV>(this);
+
     /// <summary>Takes the next free block and returns its physical id with refcount 1.</summary>
-    /// <exception cref="KvFullException">The pool has no physically free blocks left.</exception>
+    /// <exception cref="KvFullException">The pool has no reachable blocks left — physically empty, or usage already at whichever ceiling governs: a shrunk soft cap, or an admission window opened by the admitting scheduler (see <see cref="BeginAdmissionWindow"/>).</exception>
     public int Allocate()
     {
         ThrowIfDisposed();
@@ -195,6 +327,14 @@ public sealed unsafe class BlockPool<TK, TV> : IDisposable
             throw new KvFullException(
                 $"KV block pool is full: all {CapacityBlocks} blocks of {BytesPerBlock} bytes " +
                 $"({totalBytes / (1024 * 1024)} MiB total) are in use. Release unused sequences or raise kv_blocks.");
+        }
+
+        int ceiling = Math.Max(EffectiveBudgetBlocks, Volatile.Read(ref _windowCeiling));
+        if (UsedBlocks >= ceiling)
+        {
+            throw new KvFullException(
+                $"KV block pool is at its soft cap: the budget allows {ceiling} of {CapacityBlocks} reserved blocks " +
+                $"to be in use and they are. Release unused sequences or raise kv_blocks.");
         }
 
         int id = _freeStack[--_freeTop];
@@ -394,6 +534,33 @@ public sealed unsafe class BlockPool<TK, TV> : IDisposable
             $"a quantized KV pool accepts only the quantized sides 'q8_0' and 'q4_0'; '{name}' declares " +
             $"'{KvSideFormatNames.Of(side)}', whose float storage the non-generic BlockPool addresses instead.",
             paramName);
+    }
+
+    private void ComputeKvReadFootprints(int budgetBlocks, out long readBlocks, out long skippedBlocks)
+    {
+        readBlocks = 0;
+        skippedBlocks = 0;
+
+        if (budgetBlocks <= 0)
+        {
+            return;
+        }
+
+        long budgetSlots = (long)budgetBlocks * BlockTokens;
+
+        for (int layer = 0; layer < LayerCount; layer++)
+        {
+            int window = _layerWindowTokens[layer];
+            long visiblePositions = window > 0 ? Math.Min(window, budgetSlots) : budgetSlots;
+            long selectedBlocks = (visiblePositions + BlockTokens - 1) / BlockTokens;
+
+            readBlocks += selectedBlocks;
+
+            if (window > 0)
+            {
+                skippedBlocks += budgetBlocks - selectedBlocks;
+            }
+        }
     }
 
     private void ValidateBlockId(int physicalBlockId)

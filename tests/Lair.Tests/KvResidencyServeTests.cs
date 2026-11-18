@@ -46,7 +46,7 @@ public sealed class KvResidencyServeTests : IDisposable
 
         Assert.Equal(BlockResidencyMode.Dram, absent.ServedBlockPool.Residency);
         Assert.Equal(0, absent.ServedBlockPool.DeviceBackedBlockCount);
-        Assert.Equal(0L, absent.ServedBlockPool.DeviceMirrorBytes); // a host-only reservation opens no mirror at all
+        Assert.Equal(0L, ((BlockPool)absent.ServedBlockPool).DeviceMirrorBytes); // a host-only reservation opens no mirror at all
 
         Assert.Equal(BlockResidencyMode.Dram, auto.ServedBlockPool.Residency);
         Assert.Equal(0, auto.ServedBlockPool.DeviceBackedBlockCount);
@@ -134,7 +134,7 @@ public sealed class KvResidencyServeTests : IDisposable
                     }]),
                 logger);
 
-            BlockPool pool = deviceBacked.ServedBlockPool;
+            BlockPool pool = (BlockPool)deviceBacked.ServedBlockPool;
 
             Assert.Equal(BlockResidencyMode.Vram, pool.Residency); // what the opened pool holds is what this engine reports
             Assert.Equal(pool.CapacityBlocks, pool.DeviceBackedBlockCount); // an accelerator-resident reservation covers every id it hands out

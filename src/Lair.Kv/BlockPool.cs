@@ -39,7 +39,7 @@ namespace Lair.Kv;
 /// free list, refcounts, and residency accounting all work, while <see cref="SlotSpan"/>, <see cref="BlockView"/>, and the writable
 /// block spans refuse naming the formats whose storage and attention paths have not landed.
 /// </remarks>
-public sealed class BlockPool : IDisposable
+public sealed class BlockPool : IKvPool, IDisposable
 {
     private const int ArenaAlignment = 64;
 
@@ -508,6 +508,9 @@ public sealed class BlockPool : IDisposable
                        + (long)offsetWithinBlock * KvDim;
         return new Span<float>(_base + baseFloat, KvDim);
     }
+
+    /// <summary>Opens the sequence type this pool's storage is addressed by: the float sequence whose reads and writes address this pool's slots.</summary>
+    public IKvSequence NewSequence() => new SequenceKv(this);
 
     /// <summary>The residency mode this pool opened with: which block ids carry a device-resident copy alongside their host bytes.</summary>
     public BlockResidencyMode Residency => _residency;

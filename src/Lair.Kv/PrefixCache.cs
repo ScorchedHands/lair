@@ -9,14 +9,17 @@ namespace Lair.Kv;
 /// first whenever the pool needs room for new allocations; blocks still shared by active sequences are never
 /// evicted out from under them. The cache is keyed at the pool's block granularity and lives exactly as long as
 /// the pool: a new pool starts with an empty cache, so any model, quantization, or block-size change invalidates
-/// every cached prefix automatically.
+/// every cached prefix automatically. The cache never reads KV bytes — it keys on token ids and shares whole physical
+/// blocks through the pool's refcounts — so it shares an FP32 pool's blocks and a quantized pool's groups through the
+/// same <see cref="IKvPool"/> / <see cref="IKvSequence"/> surface: an adopted block carries whatever its owning pool's
+/// storage wrote into it.
 /// </summary>
 public sealed class PrefixCache
 {
     /// <summary>Seed of the key chain; a fixed odd constant so token streams combine into a non-trivial first key.</summary>
     private const ulong ChainSeed = 0x9E37_79B9_7F4A_7C15UL;
 
-    private readonly BlockPool _pool;
+    private readonly IKvPool _pool;
 
     // Key → entry. One entry per distinct prefix chain; equal keys with different token content cannot coexist,
     // so a colliding publish replaces the stale entry and hands its block back to normal refcount bookkeeping.
@@ -26,7 +29,7 @@ public sealed class PrefixCache
     // entry has exactly one node here; a touch moves its node to the tail.
     private readonly LinkedList<PrefixEntry> _lru = new();
 
-    public PrefixCache(BlockPool pool)
+    public PrefixCache(IKvPool pool)
     {
         ArgumentNullException.ThrowIfNull(pool);
         _pool = pool;
@@ -76,7 +79,7 @@ public sealed class PrefixCache
     /// leaves the sequence exactly as if no cache existed. A partial tail prompt token block is never adopted:
     /// its positions must be forwarded fresh to produce that request's own logits path.
     /// </summary>
-    public int TryAdopt(ReadOnlySpan<int> promptTokens, SequenceKv kv)
+    public int TryAdopt(ReadOnlySpan<int> promptTokens, IKvSequence kv)
     {
         ArgumentNullException.ThrowIfNull(kv);
 
@@ -122,7 +125,7 @@ public sealed class PrefixCache
     /// out of the cache because their KV is not fully written at publish time. Returns how many blocks this call
     /// newly registered (renewals excluded).
     /// </summary>
-    public int Publish(ReadOnlySpan<int> promptTokens, SequenceKv kv)
+    public int Publish(ReadOnlySpan<int> promptTokens, IKvSequence kv)
     {
         ArgumentNullException.ThrowIfNull(kv);
 

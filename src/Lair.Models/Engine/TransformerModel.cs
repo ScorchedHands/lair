@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Globalization;
 
 using Lair.Contracts;
+using Lair.Backends.Cpu;
 using Lair.Kv;
 using Lair.Loader;
 
@@ -309,6 +310,77 @@ public sealed class TransformerModel : IDisposable
     // thing the default posture pays for its existence.
     private KvAttentionSpikeRoute? _kvAttentionSpike;
 
+    // The resolved KV format pair this engine's forwards serve, and the attention route closed for it: one fixed
+    // instantiation chosen at open — the pinned FP32 causal kernel (and the measurement spike on the single-token path
+    // when one is installed) for an FP32 pair, or one closed generic quantized kernel for a quantized pair. No forward
+    // branches on a format per token: the pair is decided once here and every forward body runs the route its type names.
+    private readonly KvFormatPair _kvFormats;
+    private readonly FloatAttentionRoute? _floatAttention;
+    private readonly QuantizedAttentionRoute<Q8Block, Q8Block>? _q8q8Attention;
+    private readonly QuantizedAttentionRoute<Q8Block, Q4Block>? _q8q4Attention;
+
+    /// <summary>The attention route a forward body runs at each attention call, closed over the sequence type its model opened with.</summary>
+    private interface IKvAttentionRoute<TSeq> where TSeq : class
+    {
+        void Apply(IBackend engine, ReadOnlySpan<float> qHeads, int headCount, int kvHeadCount, int headDim, TSeq kv, int layer,
+            int position, float attnScale, float softcap, int window, Span<float> outConcat);
+
+        void ApplySingleToken(IBackend engine, ReadOnlySpan<float> qHeads, int headCount, int kvHeadCount, int headDim, TSeq kv, int layer,
+            int position, float attnScale, float softcap, int window, Span<float> outConcat);
+    }
+
+    private sealed class FloatAttentionRoute(TransformerModel model) : IKvAttentionRoute<SequenceKv>
+    {
+        public void Apply(IBackend engine, ReadOnlySpan<float> qHeads, int headCount, int kvHeadCount, int headDim, SequenceKv kv, int layer,
+            int position, float attnScale, float softcap, int window, Span<float> outConcat) =>
+            LayerOps.CausalAttention(engine, qHeads, headCount, kvHeadCount, headDim, kv, layer, position, attnScale, softcap, window, outConcat);
+
+        public void ApplySingleToken(IBackend engine, ReadOnlySpan<float> qHeads, int headCount, int kvHeadCount, int headDim, SequenceKv kv, int layer,
+            int position, float attnScale, float softcap, int window, Span<float> outConcat)
+        {
+            if (model._kvAttentionSpike is { } spikeRoute)
+            {
+                // Measurement-only candidate route (EnableKvFormatSpike): the pinned FP32 kernel below runs whenever no route is installed.
+                spikeRoute(qHeads, headCount, kvHeadCount, headDim, kv, layer, position, attnScale, softcap, window, outConcat);
+                return;
+            }
+
+            Apply(engine, qHeads, headCount, kvHeadCount, headDim, kv, layer, position, attnScale, softcap, window, outConcat);
+        }
+    }
+
+    private sealed class QuantizedAttentionRoute<TK, TV> : IKvAttentionRoute<SequenceKv<TK, TV>>
+        where TK : struct, IKvFormat<TK>, IKvDotSide<TK>
+        where TV : struct, IKvFormat<TV>, IKvValueSide<TV>
+    {
+        private readonly IntegerDotPath _dot;
+        private readonly byte[] _queryScratch;
+        private readonly float[] _queryScales;
+
+        public QuantizedAttentionRoute(IntegerDotPath dot, int headCount, int headDim)
+        {
+            _dot = dot;
+            _queryScratch = new byte[TK.DotScratchBytesPerHead(headDim) * headCount];
+            _queryScales = new float[TK.DotScaleCount(headDim) * headCount];
+        }
+
+        public void Apply(IBackend engine, ReadOnlySpan<float> qHeads, int headCount, int kvHeadCount, int headDim, SequenceKv<TK, TV> kv, int layer,
+            int position, float attnScale, float softcap, int window, Span<float> outConcat) =>
+            LayerOps.CausalAttention(qHeads, headCount, kvHeadCount, headDim, kv, layer, position, attnScale, softcap, window, _dot, _queryScratch, _queryScales, outConcat);
+
+        // The measurement spike is a float-kernel candidate route: a quantized engine has no spike posture, so its single-token
+        // attention is exactly its closed quantized kernel.
+        public void ApplySingleToken(IBackend engine, ReadOnlySpan<float> qHeads, int headCount, int kvHeadCount, int headDim, SequenceKv<TK, TV> kv, int layer,
+            int position, float attnScale, float softcap, int window, Span<float> outConcat) =>
+            Apply(engine, qHeads, headCount, kvHeadCount, headDim, kv, layer, position, attnScale, softcap, window, outConcat);
+    }
+
+    /// <summary>The resolved KV format pair this engine's forwards serve: <see cref="KvFormatPair.Default"/> for every float-posture model.</summary>
+    public KvFormatPair ResolvedKvFormats => _kvFormats;
+
+    /// <summary>The attention route this engine's forwards run, as the closed route type its pair resolved to.</summary>
+    internal string ResolvedKvAttentionRoute => _q8q8Attention is not null ? "q8_0/q8_0" : _q8q4Attention is not null ? "q8_0/q4_0" : "f32/f32";
+
     /// <summary>
     /// Re-points the engine's prefill path selection. The new value is read fresh at the next prefill window
     /// boundary, so sequences already mid-window finish that window on the route they started with — the same
@@ -321,6 +393,14 @@ public sealed class TransformerModel : IDisposable
         if (!KernelExecutes(kernel))
         {
             throw KernelRefusal(kernel);
+        }
+
+        // A quantized engine forwards prompt windows through the batched-row window only: its attention route is the closed
+        // quantized kernel, and the row-tiled and dense-matrix windows carry the FP32 attention kernels. The selection is
+        // refused naming the pair, exactly as at open — nothing falls back to the route that works.
+        if (!_kvFormats.IsFloatStorage && kernel != PrefillKernel.GemV)
+        {
+            throw QuantizedPrefillRefusal(kernel);
         }
 
         _prefillKernel = kernel;
@@ -398,6 +478,29 @@ public sealed class TransformerModel : IDisposable
             $"{PrefillKernelNames.GemV} and {PrefillKernelNames.Tiled} execute today — set engine.prefill_kernel to '{PrefillKernelNames.GemV}' or " +
             $"'{PrefillKernelNames.Tiled}' (or omit it) to run this file");
     }
+
+    // The refusal wording a quantized-KV engine gets for a prefill selection its closed attention route cannot serve: the
+    // row-tiled and dense-matrix windows carry the FP32 attention kernels, so a quantized pair names its own pair and the
+    // selection that runs the quantized kernel.
+    private ModelException QuantizedPrefillRefusal(PrefillKernel kernel) => new(
+        $"prefill kernel '{PrefillKernelNames.Of(kernel)}' cannot run this model's quantized KV pair k='" +
+        $"{KvSideFormatNames.Of(_kvFormats.K)}' v='{KvSideFormatNames.Of(_kvFormats.V)}': its attention route is the closed quantized kernel, " +
+        $"which the batched-row window forwards — set engine.prefill_kernel to '{PrefillKernelNames.GemV}' (or omit it) to run this pair");
+
+    // The quantized-KV posture refusals one open shares: which posture the pair arrived beside, and what a quantized pair's
+    // CPU-kernel-only, host-resident, batched-row route does not carry.
+    private ModelException QuantizedPostureRefusal(string posture) => new(
+        $"this model opens quantized KV storage k='{KvSideFormatNames.Of(_kvFormats.K)}' v='{KvSideFormatNames.Of(_kvFormats.V)}' " +
+        $"beside {posture}: quantized attention runs CPU kernels over host-resident KV through the batched-row window only — " +
+        "resolve placement onto a CPU-only, host-resident posture with 'gemv' prefill to run this pair");
+
+    // The quantized attention kernel dots whole 32-value groups per head region: a head dimension that is not a whole number
+    // of groups has no block-aligned head slice to dot, so the pair refuses at open naming the geometry rather than failing
+    // mid-forward.
+    private ModelException QuantizedHeadDimRefusal() => new(
+        $"this model opens quantized KV storage k='{KvSideFormatNames.Of(_kvFormats.K)}' v='{KvSideFormatNames.Of(_kvFormats.V)}' " +
+        $"over a head dimension of {Plan.HeadDim}: the quantized attention kernel dots whole {KvFormatPair.GroupValues}-value groups per head region, " +
+        $"and {Plan.HeadDim} is not a whole number of them.");
 
     // The quant format of every dense weight matrix a prompt window multiplies activation rows against: the attention
     // trio — or one fused qkv buffer, whichever layout the plan resolves — the attention output, and the feed-forward
@@ -496,6 +599,20 @@ public sealed class TransformerModel : IDisposable
         GgufFile file, IBackend backend, int maxContextTokens, Action<string>? logLine, PrefillKernel prefillKernel, ModelRoute route,
         IBackend? prefillsBackend = null, PrefillLaneLayout? prefillsLane = null, ResolvedBudgetSet? budgets = null) =>
         new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel, prefillRowWidth: 0, route, prefillsBackend, prefillsLane, crossingBackends: null, budgets);
+
+    /// <summary>
+    /// Opens the engine serving an explicit quantized KV format pair: every forward of this engine — single-token, batched
+    /// decode, and prompt windows — runs the one attention instantiation closed for that pair, chosen once here and never
+    /// re-resolved per token. The posture a quantized route carries is CPU-only, host-resident KV over the batched-row
+    /// window: a split route, a dedicated lane or offload posture, a non-<c>gemv</c> prefill selection, or a head dimension
+    /// that is not a whole number of quant groups refuses at open naming what the opened posture declares and what the
+    /// quantized route lacks — never a silent fall back to the FP32 posture. <paramref name="quantizedDot"/> carries the
+    /// integer-dot encoding the opened CPU backend resolved, which the quantized kernel runs per scored position.
+    /// </summary>
+    public static TransformerModel Open(
+        GgufFile file, IBackend backend, int maxContextTokens, Action<string>? logLine, PrefillKernel prefillKernel, ModelRoute route,
+        KvFormatPair kvFormats, IntegerDotPath quantizedDot, ResolvedBudgetSet? budgets = null) =>
+        new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel, prefillRowWidth: 0, route, prefillsBackend: null, prefillsLane: null, crossingBackends: null, budgets, kvFormats, quantizedDot);
 
     /// <summary>
     /// Opens the engine with weight payloads supplied by an alternate <see cref="IWeightSource"/>: every tensor read
@@ -703,7 +820,7 @@ public sealed class TransformerModel : IDisposable
         return (decodeSide, prefillSide);
     }
 
-    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV, int prefillRowWidth = 0, ModelRoute? route = null, IBackend? prefillsBackend = null, PrefillLaneLayout? prefillsLane = null, IReadOnlyList<IBackend>? crossingBackends = null, ResolvedBudgetSet? budgets = null)
+    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV, int prefillRowWidth = 0, ModelRoute? route = null, IBackend? prefillsBackend = null, PrefillLaneLayout? prefillsLane = null, IReadOnlyList<IBackend>? crossingBackends = null, ResolvedBudgetSet? budgets = null, KvFormatPair? kvFormats = null, IntegerDotPath? quantizedDot = null)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(backend);
@@ -758,6 +875,67 @@ public sealed class TransformerModel : IDisposable
 
         // Budgets land on the plan exactly as the route did above: what a host resolved against its opened pools arrives unchanged here.
         Plan = budgets is null ? Plan : Plan with { Budgets = budgets };
+
+        // The KV format pair this engine's forwards serve lands here, once, before any allocation: a quantized pair closes
+        // one fixed attention instantiation for every forward of this engine, and a posture that instantiation cannot serve
+        // refuses at open naming what the opened posture declares and what the quantized route lacks — never a silent fall
+        // back to the FP32 posture. Quantized attention runs CPU kernels over host-resident KV through the batched-row
+        // window, dotting whole group-aligned head regions.
+        _kvFormats = kvFormats ?? KvFormatPair.Default;
+
+        if (_kvFormats.IsFloatStorage)
+        {
+            _floatAttention = new FloatAttentionRoute(this);
+        }
+        else
+        {
+            if (quantizedDot is null)
+            {
+                throw new ModelException(
+                    $"opening quantized KV storage k='{KvSideFormatNames.Of(_kvFormats.K)}' v='{KvSideFormatNames.Of(_kvFormats.V)}' needs the integer-dot encoding the opened backend resolved: " +
+                    "pass the opened CPU backend's resolved dot path beside the pair — the quantized attention kernel runs it per scored position and never re-resolves it.");
+            }
+
+            if (Plan.Route.Segments.Count > 1 || crossingBackends is not null)
+            {
+                throw QuantizedPostureRefusal($"a route of {Plan.Route.Segments.Count} segments");
+            }
+
+            if (prefillsLane is not null || prefillsBackend is not null)
+            {
+                throw QuantizedPostureRefusal(prefillsLane is not null ? "a dedicated prefill lane" : "an offloaded prefill backend");
+            }
+
+            if (!string.Equals(backend.DeviceId, ModelRoute.CpuDeviceId, StringComparison.Ordinal))
+            {
+                throw QuantizedPostureRefusal($"device '{backend.DeviceId}'");
+            }
+
+            if (prefillKernel != PrefillKernel.GemV)
+            {
+                throw QuantizedPrefillRefusal(prefillKernel);
+            }
+
+            if (Plan.HeadDim % KvFormatPair.GroupValues != 0)
+            {
+                throw QuantizedHeadDimRefusal();
+            }
+
+            if (_kvFormats.K == KvSideFormat.Q8_0 && _kvFormats.V == KvSideFormat.Q8_0)
+            {
+                _q8q8Attention = new QuantizedAttentionRoute<Q8Block, Q8Block>(quantizedDot.Value, Plan.HeadCount, Plan.HeadDim);
+            }
+            else if (_kvFormats.K == KvSideFormat.Q8_0 && _kvFormats.V == KvSideFormat.Q4_0)
+            {
+                _q8q4Attention = new QuantizedAttentionRoute<Q8Block, Q4Block>(quantizedDot.Value, Plan.HeadCount, Plan.HeadDim);
+            }
+            else
+            {
+                throw new ModelException(
+                    $"quantized KV pair k='{KvSideFormatNames.Of(_kvFormats.K)}' v='{KvSideFormatNames.Of(_kvFormats.V)}' has no attention route in this build: " +
+                    "the quantized kernel instantiates over 'q8_0' on the dot side and 'q8_0' or 'q4_0' on the value side — declare 'q8_0'/'q8_0' or 'q8_0'/'q4_0', or omit kv.quant for the FP32 posture");
+            }
+        }
 
 
         // A dedicated lane posture arrives as a pair — the second execution backend prompt windows run on, plus the resolved split it was capped from.
@@ -1324,7 +1502,7 @@ public sealed class TransformerModel : IDisposable
     /// <exception cref="InvalidOperationException">
     /// Appending the window would pass this model's max context, checked before any slot is reserved.
     /// </exception>
-    public Span<float> Prefill(IReadOnlyList<int> tokens, SequenceKv kv)
+    public Span<float> Prefill(IReadOnlyList<int> tokens, IKvSequence kv)
     {
         ArgumentNullException.ThrowIfNull(tokens);
         ArgumentNullException.ThrowIfNull(kv);
@@ -1342,40 +1520,79 @@ public sealed class TransformerModel : IDisposable
                 $"{n} prefill tokens starting at position {basePosition} exceed this model's max context of {MaxContextTokens} tokens.");
         }
 
-        // The row window this engine runs splits at: the plan's resolved count when no declared prefill-buffer ceiling binds, or the widest
-        // sub-batch those ceilings allow otherwise. Every width carries the same positions, KV bytes, and logits — a clamp narrows batched weight
-        // traversals and nothing else. Read fresh per call like every other forward-shape value.
-        int prefillRows = _effectivePrefillRowWidth;
-
-        for (int offset = 0; offset < n; offset += prefillRows)
+        if (_q8q8Attention is { } q8q8)
         {
-            // Prompt windows advance through the resolved execution spans in order: their first span runs on this engine's own backend (the dedicated lane's capped second backend when placement declares one), writing through that route's activation family either way.
-            RunPrefillWindow(tokens, offset, Math.Min(prefillRows, n - offset), basePosition, kv, emitLogits: offset + prefillRows >= n, _laneAct);
+            PrefillBody(tokens, ServeSequence<SequenceKv<Q8Block, Q8Block>>(kv), q8q8);
+        }
+        else if (_q8q4Attention is { } q8q4)
+        {
+            PrefillBody(tokens, ServeSequence<SequenceKv<Q8Block, Q4Block>>(kv), q8q4);
+        }
+        else
+        {
+            PrefillBody(tokens, ServeSequence<SequenceKv>(kv), _floatAttention!);
         }
 
         // The logits left by the window's final row live in this route's family — an alias of the model-owned buffer for a shared posture, lane-owned storage when dedicated. Valid on whichever thread ran the forward until its next forward overwrites it.
         return _laneAct.FinalLogits.AsSpan();
     }
 
+    // The window loop over one closed (sequence, attention-route) pair: the row window this engine runs splits at the plan's
+    // resolved count when no declared prefill-buffer ceiling binds, or the widest sub-batch those ceilings allow otherwise.
+    // Every width carries the same positions, KV bytes, and logits — a clamp narrows batched weight traversals and nothing
+    // else. Read fresh per call like every other forward-shape value.
+    private void PrefillBody<TSeq, TR>(IReadOnlyList<int> tokens, TSeq kv, TR attention)
+        where TSeq : class, IKvSequence
+        where TR : IKvAttentionRoute<TSeq>
+    {
+        int n = tokens.Count;
+        int basePosition = kv.Length;
+        int prefillRows = _effectivePrefillRowWidth;
+
+        for (int offset = 0; offset < n; offset += prefillRows)
+        {
+            // Prompt windows advance through the resolved execution spans in order: their first span runs on this engine's own backend (the dedicated lane's capped second backend when placement declares one), writing through that route's activation family either way.
+            RunPrefillWindow(tokens, offset, Math.Min(prefillRows, n - offset), basePosition, kv, emitLogits: offset + prefillRows >= n, _laneAct, attention);
+        }
+    }
+
+    // The sequence a forward may run on this engine: the concrete type its opened pair hands out. A host that passes some
+    // other storage's sequence is refused naming the pair rather than forwarding against bytes this engine never wrote.
+    private TSeq ServeSequence<TSeq>(IKvSequence kv) where TSeq : class =>
+        kv as TSeq ?? throw new InvalidOperationException(
+            $"this model opened kv k='{KvSideFormatNames.Of(_kvFormats.K)}' v='{KvSideFormatNames.Of(_kvFormats.V)}': its forwards run over the sequence type that pool hands out — open the sequence from the opened pool.");
+
     // The resolved kernel selection decides which window route runs, re-read at every sub-batch so a hot edit lands
     // from the next boundary: the batched row window, its row-tiled attention variant, and the dense-matrix weight
     // traversal all have kernels today, and a selection this build has no kernel for fails naming it rather than
     // running some other route behind it. The dense-matrix traversal is the row window with its weight passes handed
-    // to the blocked matmul; attention stays on the same per-row causal kernel either way.
-    private void RunPrefillWindow(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits, ActivationFamily act)
+    // to the blocked matmul; attention stays on the same per-row causal kernel either way. The row-tiled variant
+    // carries the FP32 attention kernels, so a quantized pair — whose selection is pinned to gemv at open — never
+    // reaches that arm.
+    private void RunPrefillWindow<TSeq, TR>(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, TSeq kv, bool emitLogits, ActivationFamily act, TR attention)
+        where TSeq : class, IKvSequence
+        where TR : IKvAttentionRoute<TSeq>
     {
         switch (_prefillKernel)
         {
             case PrefillKernel.GemV:
-                PrefillWindow(tokens, offset, rows, basePosition, kv, emitLogits, denseMatmul: false, act);
+                PrefillWindow(tokens, offset, rows, basePosition, kv, emitLogits, denseMatmul: false, act, attention);
                 break;
 
             case PrefillKernel.Tiled:
-                PrefillWindowTiled(tokens, offset, rows, basePosition, kv, emitLogits, act);
+                if (kv is SequenceKv tiledKv)
+                {
+                    PrefillWindowTiled(tokens, offset, rows, basePosition, tiledKv, emitLogits, act);
+                }
+                else
+                {
+                    throw QuantizedPrefillRefusal(_prefillKernel);
+                }
+
                 break;
 
             case PrefillKernel.Gemm:
-                PrefillWindow(tokens, offset, rows, basePosition, kv, emitLogits, denseMatmul: true, act);
+                PrefillWindow(tokens, offset, rows, basePosition, kv, emitLogits, denseMatmul: true, act, attention);
                 break;
 
             default:
@@ -1409,7 +1626,9 @@ public sealed class TransformerModel : IDisposable
     // through the blocked matmul when <paramref name="denseMatmul"/> selects it. The two routes differ only in how a
     // weight tile reaches the arithmetic, so each output element lands byte-identical to the other and to the
     // single-vector reference.
-    private void PrefillWindow(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, SequenceKv kv, bool emitLogits, bool denseMatmul, ActivationFamily act)
+    private void PrefillWindow<TSeq, TR>(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, TSeq kv, bool emitLogits, bool denseMatmul, ActivationFamily act, TR attention)
+        where TSeq : class, IKvSequence
+        where TR : IKvAttentionRoute<TSeq>
     {
         int hidden = Plan.HiddenSize;
         int qkvRegion = Plan.HeadCount * Plan.HeadDim;
@@ -1507,7 +1726,7 @@ public sealed class TransformerModel : IDisposable
 
                 for (int r = 0; r < rows; r++)
                 {
-                    LayerOps.CausalAttention(engine, batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, basePosition + offset + r, attnScale, Plan.AttentionSoftcap, layerWindow, batchAttnOut.AsSpan(r * qkvRegion, qkvRegion));
+                    attention.Apply(engine, batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, basePosition + offset + r, attnScale, Plan.AttentionSoftcap, layerWindow, batchAttnOut.AsSpan(r * qkvRegion, qkvRegion));
                 }
 
                 ReadOnlySpan<byte> bytes = _weights.Resolve(_wo[l]);
@@ -1789,11 +2008,23 @@ public sealed class TransformerModel : IDisposable
     }
 
     /// <summary>Forwards one token at the next free position and returns its vocab-sized logits.</summary>
-    public Span<float> DecodeNext(int tokenId, SequenceKv kv)
+    public Span<float> DecodeNext(int tokenId, IKvSequence kv)
     {
         ArgumentNullException.ThrowIfNull(kv);
 
-        ForwardToken(tokenId, kv.Length, kv);
+        if (_q8q8Attention is { } q8q8)
+        {
+            ForwardToken(tokenId, kv.Length, ServeSequence<SequenceKv<Q8Block, Q8Block>>(kv), q8q8);
+        }
+        else if (_q8q4Attention is { } q8q4)
+        {
+            ForwardToken(tokenId, kv.Length, ServeSequence<SequenceKv<Q8Block, Q4Block>>(kv), q8q4);
+        }
+        else
+        {
+            ForwardToken(tokenId, kv.Length, ServeSequence<SequenceKv>(kv), _floatAttention!);
+        }
+
         return _logits.AsSpan();
     }
 
@@ -1867,7 +2098,7 @@ public sealed class TransformerModel : IDisposable
     /// The two lists differ in length, fewer than one or more than <see cref="MaxBatchSequences"/> sequences were
     /// given, or a list entry is null.
     /// </exception>
-    public Span<float> DecodeBatch(IReadOnlyList<int> tokenIds, IReadOnlyList<SequenceKv> kvs)
+    public Span<float> DecodeBatch(IReadOnlyList<int> tokenIds, IReadOnlyList<IKvSequence> kvs)
     {
         ArgumentNullException.ThrowIfNull(tokenIds);
         ArgumentNullException.ThrowIfNull(kvs);
@@ -1891,7 +2122,7 @@ public sealed class TransformerModel : IDisposable
                 throw new ArgumentException($"token id {tokenIds[s]} at sequence {s} is outside the vocabulary of {Plan.VocabSize}.", nameof(tokenIds));
             }
 
-            SequenceKv kv = kvs[s] ?? throw new ArgumentException($"kvs entry {s} is null.", nameof(kvs));
+            IKvSequence kv = kvs[s] ?? throw new ArgumentException($"kvs entry {s} is null.", nameof(kvs));
             if (kv.Length >= MaxContextTokens)
             {
                 throw new InvalidOperationException(
@@ -1899,6 +2130,34 @@ public sealed class TransformerModel : IDisposable
             }
 
             positions[s] = kv.Length;
+        }
+
+        if (_q8q8Attention is { } q8q8)
+        {
+            return DecodeBatchBody<SequenceKv<Q8Block, Q8Block>, QuantizedAttentionRoute<Q8Block, Q8Block>>(tokenIds, kvs, positions, q8q8);
+        }
+
+        if (_q8q4Attention is { } q8q4)
+        {
+            return DecodeBatchBody<SequenceKv<Q8Block, Q4Block>, QuantizedAttentionRoute<Q8Block, Q4Block>>(tokenIds, kvs, positions, q8q4);
+        }
+
+        return DecodeBatchBody<SequenceKv, FloatAttentionRoute>(tokenIds, kvs, positions, _floatAttention!);
+    }
+
+    // The batched step over one closed (sequence, attention-route) pair: each table is cast to the pair's concrete
+    // sequence once here — the same once-per-forward addressing the pair's route is closed at — and every per-sequence
+    // op below addresses it directly, with no format branch anywhere in the loop.
+    private Span<float> DecodeBatchBody<TSeq, TR>(IReadOnlyList<int> tokenIds, IReadOnlyList<IKvSequence> kvs, int[] positions, TR attention)
+        where TSeq : class, IKvSequence
+        where TR : IKvAttentionRoute<TSeq>
+    {
+        int n = tokenIds.Count;
+
+        TSeq[] sequences = new TSeq[n];
+        for (int s = 0; s < n; s++)
+        {
+            sequences[s] = ServeSequence<TSeq>(kvs[s]);
         }
 
         // Embedding lookup: each token's dequantized token_embd row seeds its sequence's input stream.
@@ -1914,7 +2173,7 @@ public sealed class TransformerModel : IDisposable
         // Reserve this step's slot in every sequence before any layer writes, mirroring ForwardToken's append.
         for (int s = 0; s < n; s++)
         {
-            kvs[s].Append();
+            sequences[s].Append();
         }
 
         int hidden = Plan.HiddenSize;
@@ -1969,10 +2228,10 @@ public sealed class TransformerModel : IDisposable
                     ApplyRopeHeads(_batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, positions[s], windowedLayer: layerWindow > 0);
                     ApplyRopeHeads(_batchK.AsSpan(s * kvRegion, kvRegion), Plan.KvHeadCount, positions[s], windowedLayer: layerWindow > 0);
 
-                    kvs[s].WriteK(positions[s], l, _batchK.AsSpan(s * kvRegion, kvRegion));
-                    kvs[s].WriteV(positions[s], l, _batchV.AsSpan(s * kvRegion, kvRegion));
+                    sequences[s].WriteK(positions[s], l, _batchK.AsSpan(s * kvRegion, kvRegion));
+                    sequences[s].WriteV(positions[s], l, _batchV.AsSpan(s * kvRegion, kvRegion));
 
-                    LayerOps.CausalAttention(engine, _batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kvs[s], l, positions[s], attnScale, Plan.AttentionSoftcap, layerWindow, _batchAttnOut.AsSpan(s * qkvRegion, qkvRegion));
+                    attention.Apply(engine, _batchQ.AsSpan(s * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, sequences[s], l, positions[s], attnScale, Plan.AttentionSoftcap, layerWindow, _batchAttnOut.AsSpan(s * qkvRegion, qkvRegion));
                 }
 
                 ReadOnlySpan<byte> bytes = _weights.Resolve(_wo[l]);
@@ -2096,6 +2355,16 @@ public sealed class TransformerModel : IDisposable
         {
             throw new ModelException(
                 $"architecture '{Plan.Architecture}' resolves a route this engine crosses between backends, and its encoder forward rents streams past the row capacity those crossings stage through — open this model as one span to encode it");
+        }
+
+        // The encoder pass runs the FP32 bidirectional attention kernels over float KV reads: a quantized engine's closed
+        // route carries the causal quantized kernels only, so encoding a quantized model refuses naming the pair rather
+        // than reading quantized groups as floats.
+        if (!_kvFormats.IsFloatStorage)
+        {
+            throw new ModelException(
+                $"this model opened kv k='{KvSideFormatNames.Of(_kvFormats.K)}' v='{KvSideFormatNames.Of(_kvFormats.V)}': the encoder pass runs the FP32 bidirectional attention kernels over float KV reads, " +
+                "and no quantized encoder route exists in this build — omit kv.quant to encode this model in the FP32 posture");
         }
 
         int n = tokens.Count;
@@ -2331,7 +2600,9 @@ public sealed class TransformerModel : IDisposable
         _weights.Dispose();
     }
 
-    private void ForwardToken(int tokenId, int position, SequenceKv kv)
+    private void ForwardToken<TSeq, TR>(int tokenId, int position, TSeq kv, TR attention)
+        where TSeq : class, IKvSequence
+        where TR : IKvAttentionRoute<TSeq>
     {
         if ((uint)tokenId >= (uint)Plan.VocabSize)
         {
@@ -2399,15 +2670,10 @@ public sealed class TransformerModel : IDisposable
                 kv.WriteK(position, l, _k);
                 kv.WriteV(position, l, _v);
 
-                if (_kvAttentionSpike is { } spikeRoute)
-                {
-                    // Measurement-only candidate route (EnableKvFormatSpike): the pinned FP32 kernel below runs whenever no route is installed.
-                    spikeRoute(_q, Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, position, attnScale, Plan.AttentionSoftcap, layerWindow, _attnOut);
-                }
-                else
-                {
-                    LayerOps.CausalAttention(engine, _q, Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, position, attnScale, Plan.AttentionSoftcap, layerWindow, _attnOut);
-                }
+                // Single-token attention runs the opened pair's route: the pinned FP32 kernel — or the measurement spike
+                // route when one is installed on a float engine (EnableKvFormatSpike) — for an FP32 pair, and the closed
+                // quantized kernel for a quantized pair, which carries no spike posture.
+                attention.ApplySingleToken(engine, _q, Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, position, attnScale, Plan.AttentionSoftcap, layerWindow, _attnOut);
 
                 // Output projection (+bias) into scratch; the residual added before the FFN norm is the pre-attention
                 // stream value (ffn_inp = attn_out + inpSA), matching the reference graph. cur held that stream through

@@ -9,7 +9,8 @@ namespace Lair.Tests;
 
 /// <summary>
 /// The cold-path KV format axis: config resolves the pair, reload classifies each side as restart-only, direct pool
-/// sizing proves the footprint formulas, and model open refuses every non-FP32 pair before the pool is constructed.
+/// sizing proves the footprint formulas, and model open refuses a quantized pair its closed attention route cannot
+/// address — an unsupported pair or a head geometry the quant kernels cannot slice — before the pool is constructed.
 /// </summary>
 [Trait("Category", "Config")]
 [Trait("Category", "Kv")]
@@ -314,17 +315,20 @@ public sealed class KvFormatDescriptorTests : IDisposable
     }
 
     [Fact]
-    public void EngineOpen_NonDefaultKvQuant_RefusesBeforePoolConstruction()
+    public void EngineOpen_QuantizedPairOverUnaddressableGeometry_RefusesNamingModelPairAndHeadDimensionBeforePoolConstruction()
     {
         CapturingLogger logger = new();
 
+        // The synthetic fixture's head dimension is not a whole number of quant groups, so the closed quantized route
+        // cannot address its head regions: the refusal names the served model, the pair, and the geometry it cannot
+        // carry — before any pool is constructed, and never as a silent fall back to the FP32 posture.
         ModelException error = Assert.Throws<ModelException>(
             () => GenerationService.Open(ConfigWith("kv-format-k8v4", new KvFormatPair(KvSideFormat.Q8_0, KvSideFormat.Q4_0)), logger));
 
         Assert.Contains("model 'kv-format-k8v4'", error.Message);
         Assert.Contains("k='q8_0' v='q4_0'", error.Message);
-        Assert.Contains("no quantized KV storage or attention execution support", error.Message, StringComparison.Ordinal);
-        Assert.Contains("before the KV pool is constructed", error.Message, StringComparison.Ordinal);
+        Assert.Contains("head dimension", error.Message);
+        Assert.Contains("whole 32-value groups per head region", error.Message);
 
         Assert.Contains(
             logger.Messages(LogLevel.Information),

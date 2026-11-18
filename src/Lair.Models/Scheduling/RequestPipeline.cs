@@ -41,13 +41,13 @@ internal sealed class RequestPipeline
 {
     private int _cancelRequested;
 
-    public RequestPipeline(ScheduledRequest request, CancellationToken ct, BlockPool pool, long id)
+    public RequestPipeline(ScheduledRequest request, CancellationToken ct, IKvPool pool, long id)
     {
         Request = request;
         Cancellation = ct;
         Id = id;
         Sampler = new Sampler(request.Sampling);
-        Kv = new SequenceKv(pool);
+        Kv = pool.NewSequence(); // the sequence type this pool's storage is addressed by — float slots or a quantized pair's groups
         Outcome = new TaskCompletionSource<SequenceOutcome>(TaskCreationOptions.RunContinuationsAsynchronously);
         Handle = new PipelineHandle(this);
     }
@@ -62,7 +62,7 @@ internal sealed class RequestPipeline
     /// <summary>This pipeline's own sampler, built once from its sampling params; no other pipeline shares it.</summary>
     public Sampler Sampler { get; }
 
-    public SequenceKv Kv { get; }
+    public IKvSequence Kv { get; }
 
     public TaskCompletionSource<SequenceOutcome> Outcome { get; }
 
