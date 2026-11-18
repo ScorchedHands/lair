@@ -151,6 +151,24 @@ public static class ConfigMutationTable
             changes.Add(new FieldChange("models[0].kv_blocks", Text(oldModel.KvBlocks), Text(newModel.KvBlocks), ConfigMutationClass.Live));
         }
 
+        if (newModel.KvQuant.K != oldModel.KvQuant.K)
+        {
+            changes.Add(new FieldChange(
+                "models[0].kv.quant.k",
+                Lair.Kv.KvSideFormatNames.Of(oldModel.KvQuant.K),
+                Lair.Kv.KvSideFormatNames.Of(newModel.KvQuant.K),
+                ConfigMutationClass.RestartOnly)); // physical KV layout/attention execution is resolved at model open.
+        }
+
+        if (newModel.KvQuant.V != oldModel.KvQuant.V)
+        {
+            changes.Add(new FieldChange(
+                "models[0].kv.quant.v",
+                Lair.Kv.KvSideFormatNames.Of(oldModel.KvQuant.V),
+                Lair.Kv.KvSideFormatNames.Of(newModel.KvQuant.V),
+                ConfigMutationClass.RestartOnly)); // physical KV layout/attention execution is resolved at model open.
+        }
+
         if (newModel.ForceFencedTools != oldModel.ForceFencedTools)
         {
             changes.Add(new FieldChange("models[0].force_fenced_tools", Text(oldModel.ForceFencedTools), Text(newModel.ForceFencedTools), ConfigMutationClass.NewRequestsOnly));
@@ -292,6 +310,8 @@ public static class ConfigMutationTable
         "engine.prefill_kernel" => ConfigMutationClass.NewRequestsOnly,
         "engine.cpu.isa" => ConfigMutationClass.RestartOnly, // resolved into the opened backend's kernels at load: only a restart re-resolves it
         "models[0].kv_blocks" => ConfigMutationClass.Live,
+        // KV format pair physical layout and attention execution are resolved when the model opens.
+        "models[0].kv.quant.k" or "models[0].kv.quant.v" => ConfigMutationClass.RestartOnly,
         "models[0].placement.thread_quota" => ConfigMutationClass.Live,
         "ui.recent_requests" => ConfigMutationClass.Live,
         "models[0].max_context_tokens" => ConfigMutationClass.NewRequestsOnly,
@@ -422,6 +442,12 @@ public static class ConfigMutationTable
         yield return ("models[0].type", ScalarText(model, "type"));
         yield return ("models[0].max_context_tokens", ScalarText(model, "max_context_tokens"));
         yield return ("models[0].kv_blocks", ScalarText(model, "kv_blocks"));
+
+        YamlDotNet.RepresentationModel.YamlMappingNode? kvBlock = Child(model, "kv");
+        YamlDotNet.RepresentationModel.YamlMappingNode? kvQuant = Child(kvBlock, "quant");
+        yield return ("models[0].kv.quant.k", ScalarText(kvQuant, "k"));
+        yield return ("models[0].kv.quant.v", ScalarText(kvQuant, "v"));
+
         yield return ("models[0].force_fenced_tools", ScalarText(model, "force_fenced_tools"));
         yield return ("models[0].tool_parser", ScalarText(model, "tool_parser"));
         yield return ("models[0].reasoning", ScalarText(model, "reasoning"));
@@ -488,6 +514,8 @@ public static class ConfigMutationTable
         "models[0].type" => current.Models[0].Type,
         "models[0].max_context_tokens" => Text(current.Models[0].MaxContextTokens),
         "models[0].kv_blocks" => Text(current.Models[0].KvBlocks),
+        "models[0].kv.quant.k" => Lair.Kv.KvSideFormatNames.Of(current.Models[0].KvQuant.K),
+        "models[0].kv.quant.v" => Lair.Kv.KvSideFormatNames.Of(current.Models[0].KvQuant.V),
         "models[0].force_fenced_tools" => Text(current.Models[0].ForceFencedTools),
         "models[0].tool_parser" => current.Models[0].ToolParser,
         "models[0].reasoning" => current.Models[0].Reasoning,

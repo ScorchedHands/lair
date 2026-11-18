@@ -38,7 +38,7 @@ public sealed class GenerationScheduler : IDisposable
     internal const int InitialPrefillProbeTokens = 8;
 
     private readonly TransformerModel _model;
-    private readonly BlockPool _pool;
+    private readonly IKvPool _pool;
     private readonly PrefixCache? _cache;
 
     // The model this scheduler serves, named in every admission refusal so each one says which limit kind blocked it and for
@@ -105,7 +105,7 @@ public sealed class GenerationScheduler : IDisposable
     // Scratch lists for the current decode window, cleared (never reallocated) per window.
     private readonly List<RequestPipeline> _window = [];
     private readonly List<int> _windowTokens = [];
-    private readonly List<SequenceKv> _windowKvs = [];
+    private readonly List<IKvSequence> _windowKvs = [];
 
     // Route-aware step composition over this model's admitted pipelines: which candidates share one logical forward pass at a
     // boundary, decided on shared plan-and-route identity plus KV residency against the segment being stepped, that segment's batch
@@ -155,7 +155,7 @@ public sealed class GenerationScheduler : IDisposable
     /// <param name="modelName">The served model's id, named in every admission refusal so each one says which limit kind blocked it. Null keeps the generic wording.</param>
     /// <param name="prefillStepBudgetMs">Wall-clock budget, in milliseconds (1 or greater), that future prefill steps aim at; null forwards chunks at <paramref name="maxBatchTokens"/> exactly as before this knob existed. A present value sizes each chunk from measured step cost instead — see <see cref="ApplyPrefillStepBudget"/>.</param>
     /// <param name="ledger">The host device ledger this scheduler reports its landed KV reservations to, when its caller keeps host-scoped accounting. Supplying one observes chain decisions after the existing admission seams decide — a landed sequence rides inside what its model already seats, so no step is bounded and nothing admitted is disturbed; only a chain every position of which other models hold refuses that submission with <see cref="BudgetExhaustedException"/>. Null — what every scheduler built without host accounting uses — behaves exactly as before the ledger seam existed.</param>
-    public GenerationScheduler(TransformerModel model, BlockPool pool, int maxBatchTokens, PrefixCache? cache = null, int maxConcurrentRequests = UncappedConcurrencyCap, string? modelName = null, int? prefillStepBudgetMs = null, DeviceLedger? ledger = null)
+    public GenerationScheduler(TransformerModel model, IKvPool pool, int maxBatchTokens, PrefixCache? cache = null, int maxConcurrentRequests = UncappedConcurrencyCap, string? modelName = null, int? prefillStepBudgetMs = null, DeviceLedger? ledger = null)
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentNullException.ThrowIfNull(pool);
@@ -633,7 +633,7 @@ public sealed class GenerationScheduler : IDisposable
         int blocksLeft = Math.Max(Math.Min(_pool.FreeBlocks, _pool.AllocationCeiling - _pool.UsedBlocks), 0);
 
         // Where one advancing pipeline's blocks actually live: the residency its own block table holds, read from the pool that handed those ids out. A host-only pool answers system memory for every sequence; a device-backed range answers accelerator memory for the ids inside it; and an unstarted sequence is about to take the first id, which sits in the device-backed range whenever a pool declares one. This is what composition consults rather than any declared label.
-        WeightTier KvTierFor(SequenceKv kv) => _pool.IsDeviceBacked(kv.Blocks.Count > 0 ? kv.Blocks[^1] : 0) ? WeightTier.Vram : WeightTier.Dram;
+        WeightTier KvTierFor(IKvSequence kv) => _pool.IsDeviceBacked(kv.Blocks.Count > 0 ? kv.Blocks[^1] : 0) ? WeightTier.Vram : WeightTier.Dram;
 
         _candidates.Clear();
         _candidatePipelines.Clear();
@@ -920,7 +920,8 @@ public sealed class GenerationScheduler : IDisposable
 
         try
         {
-            pipeline.Kv.ReserveAppends(chunk);
+            // A dedicated lane is a float-posture shape — a quantized pair refuses one at model open — so this sequence is always the pool's float table here.
+            ((SequenceKv)pipeline.Kv).ReserveAppends(chunk);
         }
         catch (Exception ex) when (ex is KvFullException || ex is InvalidOperationException)
         {
@@ -929,7 +930,7 @@ public sealed class GenerationScheduler : IDisposable
         }
 
         int offset = pipeline.PromptOffset;
-        SequenceKv kv = pipeline.Kv;
+        IKvSequence kv = pipeline.Kv;
         System.Threading.Tasks.Task<long> forward = System.Threading.Tasks.Task.Run(() =>
         {
             Stopwatch clock = Stopwatch.StartNew();

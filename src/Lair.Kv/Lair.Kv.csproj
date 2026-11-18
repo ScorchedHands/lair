@@ -2,6 +2,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Lair.Contracts\Lair.Contracts.csproj" />
+    <!-- The quantized attention seam dots through this backend's shipped Q8_K activation machinery via its internal seams, so no parallel quantizer exists here. -->
+    <ProjectReference Include="..\Lair.Backends.Cpu\Lair.Backends.Cpu.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,3 +1,4 @@
+using Lair.Kv;
 using Lair.Models;
 
 namespace Lair.Host.Config;
@@ -147,6 +148,14 @@ public sealed record ModelConfig
 
     /// <summary>True when this entry wrote <c>kv_blocks</c> explicitly — presence is what separates a spelled-out number from today's default where the legacy ceiling and budgets' system-memory ceiling must state the same thing.</summary>
     internal bool LegacyKvBlocksDeclared { get; init; }
+
+    /// <summary>
+    /// The KV cache format pair this model entry declares, resolved to canonical per-side formats exactly as the loader parsed them: an absent
+    /// <c>kv</c> block, an absent <c>kv.quant</c> nesting, or an absent side all resolve to <c>f32</c>, which is today's storage. Whether a
+    /// resolved pair can actually be served is what model open answers against the pool and attention paths it has landed — this value states
+    /// posture only. Internal: no monitor or API surface reports it yet, while reload classification routes each side by its own mutation class.
+    /// </summary>
+    internal KvFormatPair KvQuant { get; init; } = KvFormatPair.Default;
 
     /// <summary>
     /// Tool-precedence override. When true, chat requests with declared tools always receive LAIR's fenced tool

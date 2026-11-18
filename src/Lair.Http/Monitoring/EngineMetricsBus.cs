@@ -45,7 +45,7 @@ public sealed class EngineMetricsBus : IAsyncDisposable
 
     private readonly string _modelId;
     private readonly SchedulerStats _stats;
-    private readonly BlockPool _pool;
+    private readonly IKvPool _pool;
     private readonly PrefixCache? _cache;
     private readonly ILogger<EngineMetricsBus> _logger;
     private readonly TimeSpan _interval;
@@ -109,7 +109,7 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     public EngineMetricsBus(
         string modelId,
         GenerationScheduler scheduler,
-        BlockPool pool,
+        IKvPool pool,
         PrefixCache? cache,
         ILoggerFactory loggerFactory,
         TimeSpan interval,

@@ -4,6 +4,8 @@
     <ProjectReference Include="..\Lair.Contracts\Lair.Contracts.csproj" />
     <ProjectReference Include="..\Lair.Loader\Lair.Loader.csproj" />
     <ProjectReference Include="..\Lair.Kv\Lair.Kv.csproj" />
+    <!-- The quantized attention kernel carries the CPU backend's resolved integer-dot encoding as a cold parameter; this reference names that vocabulary only, never any backend instance. -->
+    <ProjectReference Include="..\Lair.Backends.Cpu\Lair.Backends.Cpu.csproj" />
     <ProjectReference Include="..\Lair.Sampling\Lair.Sampling.csproj" />
   </ItemGroup>
 

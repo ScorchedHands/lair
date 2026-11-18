@@ -11,7 +11,7 @@ namespace Lair.Kv;
 /// windowed read overloads refuse any position outside it, and every earlier block stays allocated for the layers that still attend
 /// unbounded. Disposing the sequence releases every reference it holds back to the pool.
 /// </summary>
-public sealed class SequenceKv : IDisposable
+public sealed class SequenceKv : IKvSequence
 {
     private readonly BlockPool _pool;
     private readonly List<int> _blocks = [];
