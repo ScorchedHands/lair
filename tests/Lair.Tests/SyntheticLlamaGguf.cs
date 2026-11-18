@@ -268,9 +268,15 @@ internal static class SyntheticLlamaGguf
         {
             QuantFormat.F32 => 0u,
             QuantFormat.F16 => 1u,
+            QuantFormat.Q5_0 => 6u,
+            QuantFormat.Q8_0 => 8u,
+            QuantFormat.Q2_K => 10u,
+            QuantFormat.Q3_K => 11u,
             QuantFormat.Q4_K => 12u,
+            QuantFormat.Q5_K => 13u,
             QuantFormat.Q6_K => 14u,
             QuantFormat.IQ3_S => 21u,
+            QuantFormat.Q2_0 => 42u, // the project's own type id for its Q2_0 block layout
             _ => 30u, // BF16
         };
 
@@ -279,16 +285,24 @@ internal static class SyntheticLlamaGguf
             QuantFormat.F32 => 4,
             QuantFormat.F16 => 2,
             QuantFormat.BF16 => 2,
+            QuantFormat.Q5_0 => 22,
+            QuantFormat.Q8_0 => 34,
+            QuantFormat.Q2_K => 84,
+            QuantFormat.Q3_K => 110,
             QuantFormat.Q4_K => 144,
+            QuantFormat.Q5_K => 176,
             QuantFormat.Q6_K => 210,
             QuantFormat.IQ3_S => 110,
+            QuantFormat.Q2_0 => 18,
             _ => throw new ArgumentException($"no block geometry for {format}", nameof(format)),
         };
 
         public static int BlockSize(QuantFormat format) => format switch
         {
             QuantFormat.F32 or QuantFormat.F16 or QuantFormat.BF16 => 1,
-            QuantFormat.Q4_K or QuantFormat.Q6_K or QuantFormat.IQ3_S => 256,
+            QuantFormat.Q5_0 or QuantFormat.Q8_0 => 32,
+            QuantFormat.Q2_0 => 64,
+            QuantFormat.Q4_K or QuantFormat.Q5_K or QuantFormat.Q6_K or QuantFormat.Q2_K or QuantFormat.Q3_K or QuantFormat.IQ3_S => 256,
             _ => throw new ArgumentException($"no block geometry for {format}", nameof(format)),
         };
     }

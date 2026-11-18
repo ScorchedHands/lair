@@ -15,10 +15,11 @@ namespace Lair.Tests;
 /// the weight formats that segment runs refuses at model open, naming the model, the offending format, the segment, and
 /// that backend — the posture every other unimplemented capability takes, and the replacement for the mid-decode
 /// <c>Unsupported</c> throw that used to surface the same fact after work had dispatched. The gate consults the backend's
-/// own capability answer, so the CUDA formats the seam executes today (<c>F32</c>, <c>F16</c>, <c>BF16</c>, <c>Q4_K</c>,
-/// <c>Q6_K</c>) still resolve and open unchanged, a CPU-only route is untouched, and nothing falls back to CPU for a
-/// device-named segment. The CUDA capability facts are read through the backend's static kernel coverage, so no test here
-/// opens a device: the refusal is a load-time decision over the tensor table.
+    /// own capability answer, so the CUDA formats the seam executes today (<c>F32</c>, <c>F16</c>, <c>BF16</c>, <c>Q8_0</c>,
+/// <c>Q5_0</c>, <c>Q2_0</c>, <c>Q4_K</c>, <c>Q5_K</c>, <c>Q6_K</c>, <c>Q2_K</c>, and <c>Q3_K</c>) still resolve and open
+/// unchanged, a CPU-only route is untouched, and nothing falls back to CPU for a device-named segment. The CUDA capability
+/// facts are read through the backend's static kernel coverage, so no test here opens a device: the refusal is a load-time
+/// decision over the tensor table.
 /// </summary>
 [Trait("Category", "Loader")]
 [Trait("Category", "Config")]
@@ -178,6 +179,12 @@ public sealed class CudaWeightCapabilityGateTests : IDisposable
     [InlineData(QuantFormat.BF16)]
     [InlineData(QuantFormat.Q4_K)]
     [InlineData(QuantFormat.Q6_K)]
+    [InlineData(QuantFormat.Q8_0)]
+    [InlineData(QuantFormat.Q5_0)]
+    [InlineData(QuantFormat.Q2_0)]
+    [InlineData(QuantFormat.Q5_K)]
+    [InlineData(QuantFormat.Q2_K)]
+    [InlineData(QuantFormat.Q3_K)]
     public void CudaRoute_NamingFormatTheSeamExecutes_ResolvesAndOpensUnchanged(QuantFormat format)
     {
         Assert.True(CudaBackend.HasGemvKernel(format), $"the CUDA seam stopped reporting its {format} GEMV kernel");
@@ -238,11 +245,12 @@ public sealed class CudaWeightCapabilityGateTests : IDisposable
     [InlineData(QuantFormat.BF16, true)]
     [InlineData(QuantFormat.Q4_K, true)]
     [InlineData(QuantFormat.Q6_K, true)]
-    [InlineData(QuantFormat.Q8_0, false)]
-    [InlineData(QuantFormat.Q5_0, false)]
-    [InlineData(QuantFormat.Q5_K, false)]
-    [InlineData(QuantFormat.Q2_K, false)]
-    [InlineData(QuantFormat.Q3_K, false)]
+    [InlineData(QuantFormat.Q8_0, true)]
+    [InlineData(QuantFormat.Q5_0, true)]
+    [InlineData(QuantFormat.Q5_K, true)]
+    [InlineData(QuantFormat.Q2_K, true)]
+    [InlineData(QuantFormat.Q3_K, true)]
+    [InlineData(QuantFormat.Q2_0, true)]
     [InlineData(QuantFormat.IQ2_XXS, false)]
     [InlineData(QuantFormat.IQ2_XS, false)]
     [InlineData(QuantFormat.IQ2_S, false)]
@@ -250,7 +258,6 @@ public sealed class CudaWeightCapabilityGateTests : IDisposable
     [InlineData(QuantFormat.IQ3_S, false)]
     [InlineData(QuantFormat.IQ4_NL, false)]
     [InlineData(QuantFormat.IQ4_XS, false)]
-    [InlineData(QuantFormat.Q2_0, false)]
     public void CudaGemvCapability_CoversExactlyTheFormatsTheSeamCarries(QuantFormat format, bool supported) =>
         Assert.Equal(supported, CudaBackend.HasGemvKernel(format));
 

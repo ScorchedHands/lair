@@ -8,7 +8,7 @@ namespace Lair.Backends.Cuda;
 /// <summary>
 /// CUDA compute backend: packed weight tensors reach device memory one of two ways per instance. The default posture
 /// copies each tensor to device memory once per instance and every dense GEMV, single or batched, runs as an embedded
-    /// PTX kernel against those copies for F32, F16, BF16, Q4_K, and Q6_K weights. The host-mapped posture instead registers each
+    /// PTX kernel against those copies for F32, F16, BF16, Q8_0, Q5_0, Q2_0, Q4_K, Q5_K, Q6_K, Q2_K, and Q3_K weights. The host-mapped posture instead registers each
 /// tensor's live host region with the driver and launches the same kernels against the device pointer the registration
 /// answers with, so no weight tensor is ever copied into persistent device memory and the weights stay resident exactly
 /// where the weight source holds them. Formats with no kernel here refuse naming this backend rather than run through
@@ -34,6 +34,12 @@ public sealed partial class CudaBackend : IBackend
     private readonly IntPtr _gemvBf16;
     private readonly IntPtr _gemvQ4K;
     private readonly IntPtr _gemvQ6K;
+    private readonly IntPtr _gemvQ8_0;
+    private readonly IntPtr _gemvQ5_0;
+    private readonly IntPtr _gemvQ2_0;
+    private readonly IntPtr _gemvQ5K;
+    private readonly IntPtr _gemvQ2K;
+    private readonly IntPtr _gemvQ3K;
 
     private bool _disposed;
 
@@ -93,6 +99,12 @@ public sealed partial class CudaBackend : IBackend
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvBf16, _module, "gemv_bf16"));
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ4K, _module, "gemv_q4k"));
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ6K, _module, "gemv_q6k"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ8_0, _module, "gemv_q8_0"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ5_0, _module, "gemv_q5_0"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ2_0, _module, "gemv_q2_0"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ5K, _module, "gemv_q5k"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ2K, _module, "gemv_q2k"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ3K, _module, "gemv_q3k"));
             }
             catch
             {
@@ -179,7 +191,9 @@ public sealed partial class CudaBackend : IBackend
     /// <summary>
     /// Whether this backend's GEMV kernels execute for weights in <paramref name="format"/>: the CUDA seam carries GEMV
     /// kernels for <see cref="QuantFormat.F32"/>, <see cref="QuantFormat.F16"/>, <see cref="QuantFormat.BF16"/>,
-    /// <see cref="QuantFormat.Q4_K"/>, and <see cref="QuantFormat.Q6_K"/> only, so a route naming any other format is
+    /// <see cref="QuantFormat.Q8_0"/>, <see cref="QuantFormat.Q5_0"/>, <see cref="QuantFormat.Q2_0"/>,
+    /// <see cref="QuantFormat.Q4_K"/>, <see cref="QuantFormat.Q5_K"/>, <see cref="QuantFormat.Q6_K"/>,
+    /// <see cref="QuantFormat.Q2_K"/>, and <see cref="QuantFormat.Q3_K"/> only, so a route naming any other format is
     /// refused at load naming this backend rather than raised mid-decode by <see cref="SelectGemv"/> or run through some
     /// other device's kernels.
     /// </summary>
@@ -187,11 +201,15 @@ public sealed partial class CudaBackend : IBackend
 
     /// <summary>
     /// The capability fact every CUDA GEMV posture answers from: the formats the embedded PTX GEMV kernels this backend
-    /// resolves function handles for. A load-time capability gate consults it through <see cref="SupportsGemv"/>; it stays
-    /// static so the posture is inspectable without opening a device.
+    /// resolves function handles for — the dense pair plus every block-quant layout the seam now carries. A load-time
+    /// capability gate consults it through <see cref="SupportsGemv"/>; it stays static so the posture is inspectable without
+    /// opening a device. The sub-4-bit i-quant family answers false here because its integer-dot kernels are not built yet,
+    /// and reporting one true would claim a kernel that does not exist.
     /// </summary>
     public static bool HasGemvKernel(QuantFormat format) =>
-        format is QuantFormat.F32 or QuantFormat.F16 or QuantFormat.BF16 or QuantFormat.Q4_K or QuantFormat.Q6_K;
+        format is QuantFormat.F32 or QuantFormat.F16 or QuantFormat.BF16
+            or QuantFormat.Q8_0 or QuantFormat.Q5_0 or QuantFormat.Q4_K or QuantFormat.Q5_K or QuantFormat.Q6_K
+            or QuantFormat.Q2_K or QuantFormat.Q3_K or QuantFormat.Q2_0;
 
     // Row dequantization stays host-side: it expands one row for embedding lookups and norm vectors, not a matrix
     // traversal, with the same scalar math every backend already agrees on. Formats without an expansion here refuse
@@ -232,6 +250,24 @@ public sealed partial class CudaBackend : IBackend
                     break;
                 case QuantFormat.Q6_K:
                     DequantQ6KRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.Q8_0:
+                    DequantQ8_0Row(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.Q5_0:
+                    DequantQ5_0Row(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.Q2_0:
+                    DequantQ2_0Row(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.Q5_K:
+                    DequantQ5KRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.Q2_K:
+                    DequantQ2KRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.Q3_K:
+                    DequantQ3KRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
                     break;
                 default:
                     throw Unsupported(w.Format, "row dequantization");
@@ -413,11 +449,18 @@ public sealed partial class CudaBackend : IBackend
         QuantFormat.BF16 => _gemvBf16,
         QuantFormat.Q4_K => _gemvQ4K,
         QuantFormat.Q6_K => _gemvQ6K,
+        QuantFormat.Q8_0 => _gemvQ8_0,
+        QuantFormat.Q5_0 => _gemvQ5_0,
+        QuantFormat.Q2_0 => _gemvQ2_0,
+        QuantFormat.Q5_K => _gemvQ5K,
+        QuantFormat.Q2_K => _gemvQ2K,
+        QuantFormat.Q3_K => _gemvQ3K,
         _ => throw Unsupported(format, "GEMV"),
     };
 
     private static NotSupportedException Unsupported(QuantFormat format, string kernel) => new(
-        $"CudaBackend ('{DeviceIdValue}') has no {kernel} kernel for format {format}: the CUDA seam carries F32, F16, BF16, Q4_K, and Q6_K kernels only, " +
+        $"CudaBackend ('{DeviceIdValue}') has no {kernel} kernel for format {format}: the CUDA seam carries F32, F16, BF16, " +
+        "Q8_0, Q5_0, Q2_0, Q4_K, Q5_K, Q6_K, Q2_K, and Q3_K kernels only, " +
         "so this weight pass is refused naming that backend rather than run through a CPU fallback.");
 
     private static (int Rows, int Cols) ValidateShape(WeightRef w)
