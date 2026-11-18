@@ -389,7 +389,7 @@ internal static class CudaGemvBench
         return n % 2 == 1 ? sorted[n / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
     }
 
-    private static float Activation(int c) => (float)Math.Sin(0.11 * c + 1.7) * 1.3f; // the parity fixtures' deterministic activation family
+    internal static float Activation(int c) => (float)Math.Sin(0.11 * c + 1.7) * 1.3f; // the parity fixtures' deterministic activation family, shared with cuda-gemm's sweep so both benches feed identical vectors
 
     private static void WriteHeaderLE(Span<byte> dst, int offset, Half value)
     {
@@ -406,7 +406,8 @@ internal static class CudaGemvBench
     // choices, and code progressions), so these bytes are already known to decode identically on both backends. Values
     // stay bounded by construction: half-float headers cycle through one normal, one negative subnormal, and one upper-range magnitude.
 
-    private static byte[] BuildFixture(QuantFormat format, int rows, int cols) => format switch
+    // internal because the cuda-gemm sweep builds its fixtures through this same builder: identical pinned weight bytes per format across both benches is what makes their numbers comparable on one box.
+    internal static byte[] BuildFixture(QuantFormat format, int rows, int cols) => format switch
     {
         QuantFormat.F32 or QuantFormat.F16 or QuantFormat.BF16 => BuildDenseFixture(format, rows, cols),
         QuantFormat.Q8_0 => BuildQ8_0Fixture(rows, cols),
