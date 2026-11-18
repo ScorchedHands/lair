@@ -496,6 +496,8 @@ public sealed class SplitRouteExecutionTests : IDisposable
 
         public void GemmBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs) => _inner.GemmBatch(inputs, count, w, outputs);
 
+        public bool SupportsGemv(QuantFormat format) => _inner.SupportsGemv(format);
+
         public bool SupportsGemm(QuantFormat format) => _inner.SupportsGemm(format);
 
         public void DequantRow(WeightRef w, int row, Span<float> output) => _inner.DequantRow(w, row, output);

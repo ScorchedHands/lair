@@ -262,6 +262,14 @@ public sealed unsafe partial class CpuBackend : IBackend
         $"{request.Tier}: every block this backend hands out stays in host memory, so a device-backed KV mirror is " +
         "refused naming this backend rather than answered with a host-only stand-in.");
 
+    /// <summary>
+    /// The CPU backend carries a GEMV kernel for every stored format this build loads, so it answers yes for each one and
+    /// no route naming a CPU segment is ever refused on capability grounds. Formats with no blocked matmul stay reported by
+    /// <see cref="SupportsGemm"/> instead.
+    /// </summary>
+    /// <inheritdoc/>
+    public bool SupportsGemv(QuantFormat format) => true;
+
     public void Gemv(ReadOnlySpan<float> x, WeightRef w, Span<float> output)
     {
         int[] dims = w.Shape.Dims;

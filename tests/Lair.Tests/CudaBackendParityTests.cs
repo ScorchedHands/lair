@@ -16,7 +16,8 @@ namespace Lair.Tests;
 /// while its receiving span takes every later layer plus the output head onto CUDA. Greedy token streams must agree
 /// across all three — argmax agreement is what a device crossing guarantees, not raw logit bytes between devices — and
 /// each weight tensor reaches device memory exactly once per backend instance. Formats with no CUDA kernel refuse naming
-/// that backend instead of running some other route's math.
+/// that backend instead of running some other route's math, and a cuda-named route naming such a format refuses at model
+/// open — the load-time capability gate — rather than after a weight pass has dispatched.
 /// </summary>
 [Trait("Category", "Parity")]
 [Trait("Category", "Cuda")]
@@ -139,6 +140,21 @@ public sealed class CudaBackendParityTests : IDisposable
         ModelException kernelRefusal = Assert.Throws<ModelException>(
             () => TransformerModel.Open(gguf, cuda, maxContextTokens: 32, logLine: null, PrefillKernel.Gemm, CudaWholeModelRoute("parity-cuda-gemm")));
         Assert.Contains("gemm", kernelRefusal.Message);
+
+        // The same capability fact against a quantized file: a cuda-named route naming a format the seam has no GEMV
+        // kernel for is refused at model open — naming the model, the format, and this backend — before any weight pass
+        // dispatches, so the mid-decode refusal above is what a route can no longer reach.
+        string quantizedPath = SyntheticLlamaGguf.WriteQuantizedMatrices(
+            "parity-cuda-iq3s", QuantFormat.IQ3_S, new SyntheticLlamaGguf.Geometry(Layers: 2, HiddenSize: 256, HeadCount: 2, KvHeadCount: 2, FeedForwardLength: 512));
+        _tempFiles.Add(quantizedPath);
+
+        using GgufFile quantizedGguf = GgufFile.Open(quantizedPath);
+
+        ModelException loadRefusal = Assert.Throws<ModelException>(
+            () => TransformerModel.Open(quantizedGguf, cuda, maxContextTokens: 32, logLine: null, PrefillKernel.GemV, CudaWholeModelRoute("parity-cuda-iq3s")));
+        Assert.Contains("model 'parity-cuda-iq3s'", loadRefusal.Message);
+        Assert.Contains("IQ3_S", loadRefusal.Message);
+        Assert.Contains("no GEMV kernel", loadRefusal.Message);
     }
 
     // ---------------------------------------------------------------- helpers

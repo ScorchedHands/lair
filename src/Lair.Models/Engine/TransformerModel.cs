@@ -507,7 +507,15 @@ public sealed class TransformerModel : IDisposable
     // block's gate/up/down as its layout names them. Deduplicated in role order because a family that keeps one format
     // across every layer should report it once. A sparse-FFN block contributes nothing here: its expert matrices stay on
     // batched row passes whatever selection is resolved, so they do not constrain which window shape can run.
-    private static IReadOnlyList<QuantFormat> ResolveMatmulFormats(ModelPlan plan, LogicalTensorTable tensors)
+    private static IReadOnlyList<QuantFormat> ResolveMatmulFormats(ModelPlan plan, LogicalTensorTable tensors) =>
+        CollectWeightFormats(plan, tensors, 0, plan.LayerCount, includeSparse: false);
+
+    // The weight formats one range of this file's layers carries through a GEMV weight pass: the dense families
+    // ResolveMatmulFormats names, read over just that range, plus — when asked for them and the block declares a sparse
+    // FFN — the router, the stacked expert matrices, and the shared triplet, because those reach GEMV through whatever
+    // span runs the layer whatever prefill selection is resolved. Everything comes from the plan's tensor map and the
+    // file's own table, so the names a refusal reports are exactly the names the file carries.
+    private static List<QuantFormat> CollectWeightFormats(ModelPlan plan, LogicalTensorTable tensors, int layerStart, int layerEnd, bool includeSparse)
     {
         List<QuantFormat> formats = [];
 
@@ -518,7 +526,7 @@ public sealed class TransformerModel : IDisposable
                 return;
             }
 
-            for (int l = 0; l < plan.LayerCount; l++)
+            for (int l = layerStart; l < layerEnd; l++)
             {
                 if (descriptor.Resolve(tensors, l) is LogicalTensor tensor && !formats.Contains(tensor.Format))
                 {
@@ -553,6 +561,28 @@ public sealed class TransformerModel : IDisposable
             }
 
             AddRole(TensorRole.FeedForwardDown);
+        }
+        else if (includeSparse)
+        {
+            AddRole(plan.SparseFfn.RouterRole);
+            AddRole(plan.SparseFfn.ExpertGateRole);
+            AddRole(plan.SparseFfn.ExpertUpRole);
+            AddRole(plan.SparseFfn.ExpertDownRole);
+
+            if (plan.SparseFfn.SharedGateRole is { } sharedGate)
+            {
+                AddRole(sharedGate);
+            }
+
+            if (plan.SparseFfn.SharedUpRole is { } sharedUp)
+            {
+                AddRole(sharedUp);
+            }
+
+            if (plan.SparseFfn.SharedDownRole is { } sharedDown)
+            {
+                AddRole(sharedDown);
+            }
         }
 
         return formats;
@@ -589,7 +619,7 @@ public sealed class TransformerModel : IDisposable
     /// and the activation buffers sized from it land at open; every decode-side forward stays on <paramref name="backend"/>. The two
     /// must arrive together and report the same device this engine runs on: a half-declared lane posture is refused naming what is missing.
     /// A backend arriving alone with no layout opens an offload posture instead — prompt windows run on it while decode stays on
-    /// <paramref name="backend"/>, allowed only over the single DRAM-resident span every unsplit route resolves to, since that shape reads host-resident weight bytes across whatever device it reports; a split route refuses naming what lands short, and formats that backend has no kernel for are refused by it at forward time rather than run on some other device.
+    /// <paramref name="backend"/>, allowed only over the single DRAM-resident span every unsplit route resolves to, since that shape reads host-resident weight bytes across whatever device it reports; a split route refuses naming what lands short, and a weight format that backend reports no GEMV kernel for refuses at open naming the model, the format, and that backend rather than run on some other device.
     /// A host that resolved per-resource budgets against its own opened pools supplies them through <paramref name="budgets"/>, and they land
     /// on the plan unchanged beside the route — a declared prefill-buffer ceiling narrows this engine's row window to what it allows (requested
     /// width stays stated on the plan, effective width reported apart), while no capacity claim or relocation runs here. Omitting it keeps the
@@ -703,7 +733,7 @@ public sealed class TransformerModel : IDisposable
     // happens to work, exactly as it always did — where no crossing was supplied for a position, this engine's own opened backend is what answers
     // for it. A split route then needs boundaries that ascend from layer 0 and cover every layer exactly once; anything missing or out of order
     // refuses naming what lands short. The check lands before any weight view is spent on a shape that cannot run, exactly as an unrunnable kernel selection does.
-    private (ExecutionSpan[] DecodeSide, ExecutionSpan[] PrefillSide) ResolveExecutionSpans(IReadOnlyList<IBackend>? crossingBackends, IBackend? stageSidePrefills)
+    private (ExecutionSpan[] DecodeSide, ExecutionSpan[] PrefillSide) ResolveExecutionSpans(GgufFile file, IReadOnlyList<IBackend>? crossingBackends, IBackend? stageSidePrefills)
     {
         ModelRoute route = Plan.Route;
 
@@ -817,7 +847,87 @@ public sealed class TransformerModel : IDisposable
             prefillSide[index] = new ExecutionSpan { Backend = index == 0 ? stageSidePrefills ?? engine : engine, LayerStart = start, LayerEnd = end };
         }
 
+        // The load-time capability gate every resolved span passes before this engine opens: each span's own range of
+        // weight formats must be formats the compute backend resolved for that position executes through GEMV. A span
+        // naming a format its backend reports it has no GEMV kernel for refuses at open naming the model, the format, the
+        // segment, and that backend — the posture every other unimplemented capability takes, and the same fact the
+        // backend's own mid-forward refusal used to raise one weight pass late. Nothing falls back to CPU for a
+        // device-named segment, and the check reads the tensor table alone: an unsupported route never spends a weight view.
+        ValidateSpanWeightCapability(ModelDisplayName(file), file.Tensors, route, decodeSide, prefillSide);
+
         return (decodeSide, prefillSide);
+    }
+
+    // The capability gate itself: the formats one span's layer range carries through GEMV, plus the output head the tail
+    // span's own backend dots, each checked against the backend that span runs on for the decode side and the stage side
+    // alike — the two differ only where a dedicated lane or an offloaded prompt backend answers the first position, and a
+    // format either one would have to dot names the refusal.
+    private void ValidateSpanWeightCapability(string model, LogicalTensorTable tensors, ModelRoute route, ExecutionSpan[] decodeSide, ExecutionSpan[] prefillSide)
+    {
+        for (int index = 0; index < route.Segments.Count; index++)
+        {
+            DeviceSegment segment = route.Segments[index];
+            ExecutionSpan decode = decodeSide[index];
+            ExecutionSpan prefill = prefillSide[index];
+
+            List<QuantFormat> formats = CollectWeightFormats(Plan, tensors, decode.LayerStart, decode.LayerEnd, includeSparse: true);
+
+            if (index == route.Segments.Count - 1)
+            {
+                // The output head is no layer: its GEMV runs on the backend that finished the last span of each side, and a
+                // file tying its logits to the token embedding dots those rows there instead.
+                LogicalTensor? lmHead = Plan.Tensors[TensorRole.OutputHead].Resolve(tensors)
+                    ?? Plan.Tensors[TensorRole.TokenEmbedding].Resolve(tensors);
+
+                if (lmHead is not null && !formats.Contains(lmHead.Format))
+                {
+                    formats.Add(lmHead.Format);
+                }
+            }
+
+            ValidateSpanCapability(model, segment, index, decode.Backend, formats);
+
+            if (!ReferenceEquals(prefill.Backend, decode.Backend))
+            {
+                ValidateSpanCapability(model, segment, index, prefill.Backend, formats);
+            }
+        }
+    }
+
+    private void ValidateSpanCapability(string model, DeviceSegment segment, int index, IBackend engine, List<QuantFormat> formats)
+    {
+        List<QuantFormat> missing = [];
+        foreach (QuantFormat format in formats)
+        {
+            if (!engine.SupportsGemv(format))
+            {
+                missing.Add(format);
+            }
+        }
+
+        if (missing.Count > 0)
+        {
+            throw WeightCapabilityRefusal(model, segment, index, engine, missing);
+        }
+    }
+
+    // The refusal wording a span naming a format its own compute backend cannot dot gets: the model, the offending
+    // format(s), the segment and the backend answering it, and the reason — that backend reports no GEMV kernel for them —
+    // beside the two ways to run the file instead. It extends the FormatsWithoutKernels refusal shape for the route's
+    // other side, and replaces the mid-decode Unsupported throw the same format used to raise after work had dispatched.
+    private static ModelException WeightCapabilityRefusal(string model, DeviceSegment segment, int index, IBackend engine, List<QuantFormat> missing) => new(
+        $"model '{model}', {segment.Describe(index)}: weight format(s) {string.Join(", ", missing)} have no GEMV kernel in the compute backend " +
+        $"'{engine.DeviceId}' resolved for this segment: that backend reports it executes GEMV for other formats only, so this model is refused at load " +
+        $"naming the format and the backend rather than raised mid-decode — resolve placement onto '{ModelRoute.CpuDeviceId}' or re-quantize this file " +
+        $"to a format '{engine.DeviceId}' executes");
+
+    // The name every load-time refusal this engine raises calls the model by: general.name when the file declares it, and
+    // the file path when it does not, the same identity the structured load lines report.
+    private static string ModelDisplayName(GgufFile file)
+    {
+        GgufMetadata metadata = file.Metadata;
+        string name = metadata.Has("general.name") ? metadata.Get("general.name").AsString() : "";
+        return name.Length > 0 ? name : file.Path;
     }
 
     private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV, int prefillRowWidth = 0, ModelRoute? route = null, IBackend? prefillsBackend = null, PrefillLaneLayout? prefillsLane = null, IReadOnlyList<IBackend>? crossingBackends = null, ResolvedBudgetSet? budgets = null, KvFormatPair? kvFormats = null, IntegerDotPath? quantizedDot = null)
@@ -969,7 +1079,7 @@ public sealed class TransformerModel : IDisposable
         }
         else if (prefillsBackend is not null)
         {
-            // A prefill offload posture arrives as a backend alone: prompt windows run on it while every decode-side forward stays on this engine's own. It caps no worker share, so it carries no layout — and this build runs that shape only over the single DRAM-resident span every unsplit route resolves to, which is where reading host-resident weight bytes from another device holds. A split route refuses naming what lands short rather than staging an unsized lane through crossings; a residency other than DRAM was already refused against each segment's own backend below, and formats this backend has no kernel for are refused by it at forward time, never run on some other device behind the selection that happens to work.
+            // A prefill offload posture arrives as a backend alone: prompt windows run on it while every decode-side forward stays on this engine's own. It caps no worker share, so it carries no layout — and this build runs that shape only over the single DRAM-resident span every unsplit route resolves to, which is where reading host-resident weight bytes from another device holds. A split route refuses naming what lands short rather than staging an unsized lane through crossings; a residency other than DRAM was already refused against each segment's own backend below, and a weight format this backend reports no GEMV kernel for refused at open naming the model, the format, and this backend, never run on some other device behind the selection that happens to work.
             ModelRoute offloadRoute = Plan.Route;
 
             if (offloadRoute.Segments.Count > 1)
@@ -983,7 +1093,7 @@ public sealed class TransformerModel : IDisposable
         _prefillsBackend = prefillsBackend ?? backend;
 
         // The resolved segments become the execution spans every forward walks: one range holding this model's whole layer count on this engine's own device is what every route served today resolves to, and a supplied crossing backend takes each position it covers. Each segment lands against its own backend here — before any weight view or activation storage exists behind it.
-        (_mainSpans, _prefillSpans) = ResolveExecutionSpans(crossingBackends, prefillsBackend);
+        (_mainSpans, _prefillSpans) = ResolveExecutionSpans(file, crossingBackends, prefillsBackend);
 
         // Row capacity of every batched stream: whichever forward family needs the wider sub-batch — never below what a
         // decode batch may advance, and above that only when the plan resolves wider prompt windows. Allocation is the

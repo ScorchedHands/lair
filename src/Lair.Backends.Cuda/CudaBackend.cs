@@ -176,6 +176,23 @@ public sealed partial class CudaBackend : IBackend
 
     public bool SupportsGemm(QuantFormat format) => false;
 
+    /// <summary>
+    /// Whether this backend's GEMV kernels execute for weights in <paramref name="format"/>: the CUDA seam carries GEMV
+    /// kernels for <see cref="QuantFormat.F32"/>, <see cref="QuantFormat.F16"/>, <see cref="QuantFormat.BF16"/>,
+    /// <see cref="QuantFormat.Q4_K"/>, and <see cref="QuantFormat.Q6_K"/> only, so a route naming any other format is
+    /// refused at load naming this backend rather than raised mid-decode by <see cref="SelectGemv"/> or run through some
+    /// other device's kernels.
+    /// </summary>
+    public bool SupportsGemv(QuantFormat format) => HasGemvKernel(format);
+
+    /// <summary>
+    /// The capability fact every CUDA GEMV posture answers from: the formats the embedded PTX GEMV kernels this backend
+    /// resolves function handles for. A load-time capability gate consults it through <see cref="SupportsGemv"/>; it stays
+    /// static so the posture is inspectable without opening a device.
+    /// </summary>
+    public static bool HasGemvKernel(QuantFormat format) =>
+        format is QuantFormat.F32 or QuantFormat.F16 or QuantFormat.BF16 or QuantFormat.Q4_K or QuantFormat.Q6_K;
+
     // Row dequantization stays host-side: it expands one row for embedding lookups and norm vectors, not a matrix
     // traversal, with the same scalar math every backend already agrees on. Formats without an expansion here refuse
     // naming this backend instead of borrowing another device's kernel.

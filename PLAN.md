@@ -1564,7 +1564,7 @@ KV cache becomes a configurable named format pair (`f32/f32`, `f16/f16`, `q8/q8`
 - [✓] Automated Spike: generic-vs-hand-written attention delta on a pinned fixture records primary vs fallback, and q4-K drift vs llama `q4_0` records keep/drop of `q4/q4`
 - [✓] Manual Quant Recommendation: read the measured per-mode bench and confirm the documented KV default follows the parity/quality decision, not the smallest footprint
 
-### MVP5.2 [v0.5.2] - Refined
+### MVP5.2 [v0.5.2] - In Progress
 
 CUDA reaches CPU parity on GGUF quant-format coverage for weight GEMV: the 13 formats CUDA lacks (`Q8_0`, `Q5_0`, `Q5_K`, `Q2_K`, `Q3_K`, `Q2_0`, `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`/`IQ2_XS`/`IQ2_S`, `IQ3_XXS`/`IQ3_S`) get CUDA GEMV kernels validated against the CPU oracle **within a per-format measured band, not bit-for-bit**, so the new kernels are written to be fast rather than last-bit-equal. Ordered after MVP5 and MVP5.1 because it reuses their activation-quant machinery; scope is weight GEMV only — dense matmul/prefill land in MVP5.3/MVP5.4.
 
@@ -1589,8 +1589,8 @@ CUDA reaches CPU parity on GGUF quant-format coverage for weight GEMV: the 13 fo
 
 #### Implementation Items
 
-- [_] Load-time capability gate — refuse a `cuda`/`hybrid` segment naming an unsupported format at load, naming model/format/backend (see DN-M5.2-3)
-  - Verify: `dotnet test --filter Category=Config|Loader -c Release` — a route naming e.g. `IQ3_S` on CUDA refuses at load with the offending named; supported formats resolve unchanged.
+- [✓] Load-time capability gate — refuse a `cuda`/`hybrid` segment naming an unsupported format at load, naming model/format/backend (see DN-M5.2-3)
+  - Verify: `dotnet test --filter Category=Config|Loader -c Release` — a route naming e.g. `IQ3_S` on CUDA refuses at load with the offending named; supported formats resolve unchanged. Verified: new capability gate checks each resolved span's weight formats plus output head against `IBackend.SupportsGemv`, and targeted Config/Loader passed 389 tests including whole-model, hybrid split, tail-span, offloaded-prefill, CPU-unchanged, and CUDA-capability cases.
 - [_] Block-quant CUDA GEMV (`Q8_0`, `Q5_0`, `Q5_K`, `Q2_K`, `Q3_K`, `Q2_0`) — dequant+dot kernels mirroring the scalar reference math within band (see DN-M5.2-1)
   - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — output lands inside each format's recorded band vs the CPU oracle; batch==solo, no mid-decode `Unsupported`.
 - [_] i-quant CUDA GEMV (`IQ4_NL`, `IQ4_XS`, `IQ2_XXS/XS/S`, `IQ3_XXS/S`) — `dp4a` against a `Q8_K` activation crossed over PCIe (see DN-M5.2-1, DN-M5.2-2)
@@ -1601,7 +1601,7 @@ CUDA reaches CPU parity on GGUF quant-format coverage for weight GEMV: the 13 fo
 #### Tests
 
 - [_] Automated Kernel/Parity: CUDA GEMV for every newly covered format lands within its recorded per-format band vs the CPU oracle (batch==solo), with the near-tie argmax fixture
-- [_] Automated Config/Loader: an unsupported `cuda`-named format refuses at load naming model/format/backend
+- [✓] Automated Config/Loader: an unsupported `cuda`-named format refuses at load naming model/format/backend
 - [_] Manual Quant Recommendation: read the bench report and confirm each CUDA default follows measured speed, not assertion
 
 ### MVP5.3 [v0.5.3] - Refined
