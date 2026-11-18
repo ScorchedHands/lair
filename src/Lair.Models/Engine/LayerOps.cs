@@ -1,4 +1,5 @@
 using Lair.Contracts;
+using Lair.Backends.Cpu;
 using Lair.Kv;
 
 namespace Lair.Models.Engine;
@@ -511,6 +512,130 @@ internal static class LayerOps
                     {
                         outHead[j] += weight * vt[j];
                     }
+                }
+            }
+
+            float invSum = 1f / sumExp; // >= 1 because the max term contributes exp(0)
+            for (int j = 0; j < headDim; j++)
+            {
+                outHead[j] *= invSum;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Causal attention for one layer at the current position over quantized KV block storage: the generic twin of
+    /// <see cref="CausalAttention"/> over a <see cref="SequenceKv{TK, TV}"/>, instantiated once per resolved (K,V) format
+    /// pair so the hot body JIT-specializes on the concrete block structs and the loop carries no runtime format switch and
+    /// no per-token virtual dispatch. The numeric path mirrors the float kernel exactly: head h reads kv-head
+    /// (h * kvHeadCount / headCount); each score is the quantized dot result multiplied by attnScale — then capped by
+    /// <see cref="Softcap"/> when softcap is positive — over the same causal range, and the online softmax keeps the same
+    /// running max/sum update order, rescale-on-new-max rule, and final 1f / sumExp normalization. A positive window
+    /// narrows the range exactly as the float pass does, resolved once into a <see cref="BlockSelection"/> by
+    /// <see cref="SequenceKv{TK, TV}.SelectCausalRead"/>, and every K/V read addresses a position inside that selection —
+    /// an out-of-window physical block is never addressed. The K side scores through the dot side's seam: the query heads
+    /// are prepared once per call (one Q8_K-quantized activation per head, reused across calls through the caller-owned
+    /// scratch and scale spans) and each scored position's kv-head region is dotted as exact integer sub-block totals under
+    /// the resolved <paramref name="dot"/> encoding, scaled by the stored group scales and the activation super-block scales.
+    /// The V side decodes each stored group under its own scale and accumulates <c>weight * value</c> in element order, the
+    /// same order the float kernel's <c>outHead[j] += weight * vt[j]</c> uses. A non-positive softcap disables the cap: the
+    /// score path is then exactly the uncapped one.
+    /// </summary>
+    internal static void CausalAttention<TK, TV>(
+        ReadOnlySpan<float> qHeads, // headCount * headDim
+        int headCount,
+        int kvHeadCount,
+        int headDim,
+        SequenceKv<TK, TV> kv,
+        int layer,
+        int position,
+        float attnScale,
+        float softcap, // positive enables the score softcap; non-positive disables it
+        int window, // positive narrows the causal range to the window; non-positive leaves it unbounded
+        IntegerDotPath dot, // the integer-dot encoding resolved at backend open: this call carries it, it never re-resolves it
+        Span<byte> queryScratch, // caller-owned prepared-query scratch, reused across calls: one contiguous run per head as the dot side lays it out
+        Span<float> queryScales, // caller-owned activation scales, reused across calls, in the dot side's per-head order
+        Span<float> outConcat) // headCount * headDim
+        where TK : struct, IKvFormat<TK>, IKvDotSide<TK>
+        where TV : struct, IKvFormat<TV>, IKvValueSide<TV>
+    {
+        ArgumentNullException.ThrowIfNull(kv);
+
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(headCount);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(kvHeadCount);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(headDim);
+
+        int region = headCount * headDim;
+        if (qHeads.Length < region || outConcat.Length < region)
+        {
+            throw new ArgumentException("Attention operands must cover every head's full region.", nameof(qHeads));
+        }
+
+        if (headDim % TK.ValuesPerBlock != 0 || headDim % TV.ValuesPerBlock != 0)
+        {
+            throw new ArgumentException(
+                $"quantized attention needs whole groups per head region: headDim={headDim} is not a whole number of {TK.ValuesPerBlock}- and {TV.ValuesPerBlock}-value groups.",
+                nameof(headDim));
+        }
+
+        BlockSelection read = kv.SelectCausalRead(position, window); // the in-window positions and exactly which blocks they live in
+        int blockTokens = kv.BlockTokens;
+
+        int kBlocksPerHead = headDim / TK.ValuesPerBlock; // each kv-head's groups sit contiguously inside the token region
+        int vBlocksPerHead = headDim / TV.ValuesPerBlock;
+
+        TK.PrepareQuery(qHeads, headCount, headDim, queryScratch, queryScales); // once per attention call: the quantized-activation step this pair stages
+
+        for (int h = 0; h < headCount; h++)
+        {
+            ReadOnlySpan<float> qh = qHeads.Slice(h * headDim, headDim);
+            int kvHead = h * kvHeadCount / headCount; // grouped-query mapping: consecutive heads share a kv-head
+            int kBlockOffset = kvHead * kBlocksPerHead;
+            int vBlockOffset = kvHead * vBlocksPerHead;
+            Span<float> outHead = outConcat.Slice(h * headDim, headDim);
+
+            float runningMax = float.NegativeInfinity;
+            float sumExp = 0f;
+            outHead.Clear();
+
+            for (int blockIndex = read.FirstBlockIndex; blockIndex <= read.LastBlockIndex; blockIndex++)
+            {
+                // Only the selected block's slots inside the windowed range: a partial first or last block contributes its
+                // in-range positions, and no position outside the selection is ever addressed.
+                int slotFirst = Math.Max(read.FirstPosition, blockIndex * blockTokens);
+                int slotLast = Math.Min(read.LastPosition, (blockIndex + 1) * blockTokens - 1);
+
+                for (int t = slotFirst; t <= slotLast; t++)
+                {
+                    ReadOnlySpan<TK> kRegion = kv.ReadK(read, t, layer);
+                    float score = TK.DotHead(kRegion, kBlockOffset, qh, queryScratch, queryScales, h, dot) * attnScale;
+                    if (softcap > 0f)
+                    {
+                        score = Softcap(score, softcap); // after scaling, before the online softmax sees it
+                    }
+
+                    if (score > runningMax)
+                    {
+                        // Rescale everything accumulated under the old max so all weights share the new exponent base.
+                        if (!float.IsNegativeInfinity(runningMax))
+                        {
+                            float rescale = MathF.Exp(runningMax - score);
+                            sumExp *= rescale;
+
+                            for (int j = 0; j < headDim; j++)
+                            {
+                                outHead[j] *= rescale;
+                            }
+                        }
+
+                        runningMax = score;
+                    }
+
+                    float weight = MathF.Exp(score - runningMax); // the current max term contributes exactly 1
+                    sumExp += weight;
+
+                    ReadOnlySpan<TV> vRegion = kv.ReadV(read, t, layer);
+                    TV.AccumulateHead(outHead, vRegion, vBlockOffset, weight); // weighted values in element order, the same order the float kernel accumulates in
                 }
             }
 

@@ -7,6 +7,7 @@
   <ItemGroup>
     <InternalsVisibleTo Include="Lair.Tests" />
     <InternalsVisibleTo Include="Lair.Bench" /> <!-- bench forces grid/prefetch encodings through the internal seams for evidence comparisons. -->
+    <InternalsVisibleTo Include="Lair.Kv" /> <!-- quantized KV attention dots against this assembly's Q8_K machinery through its production visibility seams, with no copy of any kernel here. -->
   </ItemGroup>
 
   <PropertyGroup>

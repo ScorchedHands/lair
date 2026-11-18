@@ -7,10 +7,12 @@ namespace Lair.Kv;
 /// GGML q4_0 storage element: exactly 18 bytes — one half-precision signed group scale followed by 16 nibble bytes that
 /// cover 32 values. Byte j holds element start + j in its low nibble and element start + 16 + j in its high nibble, the
 /// reference cross-half pairing rather than adjacent pairs. Scale and payload share one fixed-size struct so a token region
-/// stays contiguous at block granularity and a block read is a copy-less typed span.
+/// stays contiguous at block granularity and a block read is a copy-less typed span. As an attention side this format is a
+/// value side only: it carries weighted accumulation against its stored nibbles decoded under the signed group scale, not a
+/// dot operand shape — so a quantized attention pair naming it on both sides cannot instantiate at all.
 /// </summary>
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
-public unsafe struct Q4Block : IKvFormat<Q4Block>
+public unsafe struct Q4Block : IKvFormat<Q4Block>, IKvValueSide<Q4Block>
 {
     /// <summary>Values one q4_0 group covers.</summary>
     public const int Values = 32;
@@ -96,5 +98,39 @@ public unsafe struct Q4Block : IKvFormat<Q4Block>
         }
 
         return truncated < 0 ? 0 : truncated; // kept so a code never leaves [0, 15] on hostile input
+    }
+
+    /// <summary>
+    /// Adds <c>weight * (code - 8) * d</c> for every stored value of one scored position's kv-head region: each nibble byte
+    /// unpacks with exactly the committed writer's pairing — low nibble to element start + j, high nibble to element
+    /// start + 16 + j — under that group's signed half scale. An all-zero block (code 8 through a zero scale) contributes
+    /// zero to every accumulator lane it covers.
+    /// </summary>
+    public static void AccumulateHead(Span<float> outHead, ReadOnlySpan<Q4Block> tokenRegion, int headBlockOffset, float weight)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(headBlockOffset);
+
+        int blocks = outHead.Length / Values;
+        if (outHead.Length % Values != 0 || tokenRegion.Length < headBlockOffset + blocks)
+        {
+            throw new ArgumentException(
+                $"the kv-head region needs whole {Values}-value groups from block {headBlockOffset} for a {outHead.Length}-value head, " +
+                $"got a region of {tokenRegion.Length} blocks.",
+                nameof(tokenRegion));
+        }
+
+        for (int blockIndex = 0; blockIndex < blocks; blockIndex++)
+        {
+            ref readonly Q4Block block = ref Unsafe.Add(ref MemoryMarshal.GetReference(tokenRegion), headBlockOffset + blockIndex);
+            float d = (float)BitConverter.UInt16BitsToHalf(block.ScaleBits); // the stored signed scale, read back exactly as the writer left it
+
+            for (int j = 0; j < NibbleBytes; j++)
+            {
+                byte packed = block.Nibbles[j];
+
+                outHead[blockIndex * Values + j] += weight * ((float)((packed & 0x0F) - 8) * d); // low nibble: element start + j, the writer's pairing
+                outHead[blockIndex * Values + NibbleBytes + j] += weight * ((float)((int)(packed >> 4) - 8) * d); // high nibble: element start + 16 + j in its own lane
+            }
+        }
     }
 }

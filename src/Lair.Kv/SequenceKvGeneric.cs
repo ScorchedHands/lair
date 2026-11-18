@@ -6,7 +6,9 @@ namespace Lair.Kv;
 /// adopt/copy-on-write semantics the float sequence runs: adopted blocks are read-only, and a write into one copies the whole
 /// block — raw bytes, no re-quantization — into fresh private storage first, so sharing never lets one sequence disturb
 /// another's stored groups. A K/V write quantizes the token's values into that token's typed block span through the format's
-/// own writer; a read hands back the typed block span with no copy. Disposing the sequence releases every reference it holds.
+/// own writer; a read hands back the typed block span with no copy. A windowed read resolves its block range through
+/// <see cref="SelectCausalRead"/> or <see cref="SelectRangeRead"/> first and reads only positions inside that selection,
+/// exactly the boundedness contract the non-generic sequence runs. Disposing the sequence releases every reference it holds.
 /// </summary>
 public sealed class SequenceKv<TK, TV> : IDisposable
     where TK : struct, IKvFormat<TK>
@@ -123,8 +125,85 @@ public sealed class SequenceKv<TK, TV> : IDisposable
     /// <summary>Reads back the V side for one token position and layer as its typed block span.</summary>
     public ReadOnlySpan<TV> ReadV(int logicalPos, int layer) => _pool.VTokenView(Resolve(logicalPos), layer, logicalPos % _pool.BlockTokens);
 
+    /// <summary>
+    /// Reads one position's K side inside an existing block selection. A position the selection does not cover is a failure
+    /// rather than a silent read — exactly the boundedness contract the non-generic sequence enforces: once a layer has resolved
+    /// its window into a selection, that layer's reads cannot reach past the window by accident.
+    /// </summary>
+    public ReadOnlySpan<TK> ReadK(BlockSelection selection, int logicalPos, int layer)
+    {
+        ThrowIfSelectionCovers(selection, logicalPos);
+        return _pool.KTokenView(Resolve(logicalPos), layer, logicalPos % _pool.BlockTokens);
+    }
+
+    /// <summary>V twin of <see cref="ReadK(BlockSelection, int, int)"/>.</summary>
+    public ReadOnlySpan<TV> ReadV(BlockSelection selection, int logicalPos, int layer)
+    {
+        ThrowIfSelectionCovers(selection, logicalPos);
+        return _pool.VTokenView(Resolve(logicalPos), layer, logicalPos % _pool.BlockTokens);
+    }
+
     /// <summary>The physical block backing a logical position. Valid for positions below <see cref="Length"/>.</summary>
     public int BlockFor(int logicalPos) => Resolve(logicalPos);
+
+    /// <summary>
+    /// Selects what one causal attention read at <paramref name="queryPosition"/> covers under that layer's resolved window: the
+    /// positions <c>[max(0, queryPosition - layerWindow + 1), queryPosition]</c> for a positive window and the whole prefix
+    /// <c>[0..queryPosition]</c> when the window is non-positive (unbounded), narrowed to exactly the logical blocks those
+    /// positions live in — identical resolution to the non-generic sequence's, so an out-of-window block stays readable only for
+    /// layers whose own selection covers it.
+    /// </summary>
+    public BlockSelection SelectCausalRead(int queryPosition, int layerWindow)
+    {
+        ThrowIfDisposed();
+
+        if (queryPosition < 0 || queryPosition >= _length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(queryPosition), $"Position {queryPosition} is outside the sequence of length {_length}.");
+        }
+
+        int firstVisible = layerWindow > 0 ? Math.Max(0, queryPosition - layerWindow + 1) : 0;
+        return SelectRangeRead(firstVisible, queryPosition);
+    }
+
+    /// <summary>
+    /// Selects what a read over an explicit position range covers — the variant every windowed or ranged attention pass resolves
+    /// for its own positions. Both edges must lie inside the positions this sequence holds; partial blocks at either edge select
+    /// because their in-range slots are what such a read addresses, and no block outside the run does.
+    /// </summary>
+    public BlockSelection SelectRangeRead(int fromPosition, int toPosition)
+    {
+        ThrowIfDisposed();
+
+        ArgumentOutOfRangeException.ThrowIfNegative(fromPosition);
+        if (toPosition >= _length)
+        {
+            throw new ArgumentOutOfRangeException(nameof(toPosition), $"Position {toPosition} is outside the sequence of length {_length}.");
+        }
+
+        int firstBlock = fromPosition / _pool.BlockTokens;
+        int lastBlock = toPosition / _pool.BlockTokens;
+        if (lastBlock >= _blocks.Count)
+        {
+            throw new InvalidOperationException($"Internal table gap: position {toPosition} has no physical block.");
+        }
+
+        return new BlockSelection(fromPosition, toPosition, firstBlock, lastBlock - firstBlock + 1, _blocks.Count);
+    }
+
+    // Coverage check for a selection the sequence itself produced: what makes a windowed read bounded instead of merely
+    // narrow, mirroring the non-generic sequence's SelectedSlot posture. The read then addresses the position through the
+    // same zero-copy token views every other read here uses.
+    private void ThrowIfSelectionCovers(BlockSelection selection, int logicalPos)
+    {
+        if (logicalPos < selection.FirstPosition || logicalPos > selection.LastPosition)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(logicalPos),
+                $"position {logicalPos} lies outside the selected read [{selection.FirstPosition}..{selection.LastPosition}] " +
+                $"covering {selection.SelectedBlocks} of {selection.TotalBlocks} blocks.");
+        }
+    }
 
     private void WriteSlot(int logicalPos, int layer, bool isV, ReadOnlySpan<float> values)
     {
