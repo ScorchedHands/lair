@@ -1595,7 +1595,7 @@ CUDA reaches CPU parity on GGUF quant-format coverage for weight GEMV: the 13 fo
   - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — output lands inside each format's recorded band vs the CPU oracle; batch==solo, no mid-decode `Unsupported`. Verified with PTX GEMV kernels and direct CUDA/CPU parity tests. Measured relative bands: Q8_0/Q5_0/Q2_0/Q2_K at 1e-6 (measured maxima 7.96e-7, 8.16e-7, 7.41e-7, 4.22e-7), Q5_K at 4e-6 (measured max 2.72e-6), and Q3_K at 2e-5 (batched measured max 1.01e-5).
 - [✓] i-quant CUDA GEMV (`IQ4_NL`, `IQ4_XS`, `IQ2_XXS/XS/S`, `IQ3_XXS/S`) — integer-dot against a host-side `Q8_K` activation crossed over PCIe (see DN-M5.2-1, DN-M5.2-2)
   - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — integer-dot output within band vs the ik-pinned reference; near-tie argmax fixture holds or is recorded as a documented divergence (see DN-M5.2-1). Verified with direct CPU-oracle parity, batch==solo, host-mapped posture, dequant/table equality, and near-tie argmax fixtures across all newly covered formats. Measured bands: IQ4_NL/IQ4_XS `2e-6` (worst ~1.03e-6 / 1.07e-6); IQ2_XXS/IQ2_XS/IQ3_XXS `5e-7` with measured bit-exact zero; IQ2_S `5e-7` worst ~8.27e-8 partial tail; IQ3_S `5e-7` worst ~1.47e-7 partial tail.
-- [_] Bench gate report — per-format CUDA-vs-CPU GEMV measured on pinned fixtures before defaults flip (see DN-M5.2-4)
+- [→] Bench gate report — per-format CUDA-vs-CPU GEMV measured on pinned fixtures before defaults flip (see DN-M5.2-4)
   - Verify: committed `bench/reports/cuda-gemv-parity-<date>.md` recording each format's band width and GPU/CPU delta; a measured loss keeps that format non-default rather than asserting a win.
 
 #### Tests
