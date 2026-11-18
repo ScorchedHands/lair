@@ -1614,9 +1614,9 @@ CUDA dense matmul (`GemmBatch`) plus the toolchain decision — flips `SupportsG
   - Rationale: re-dequantizing weights per token forfeits the matmul win; tiling is where a dense step beats repeated single-token dots.
   - Rejected: naive device-side N×GEMV loop (re-dequantizes every token); a new quant scheme for GEMM (breaks format coverage/parity with MVP5.2).
   - Contract: `GemmBatch`/`PrefillKernel.Gemm` kernel family over the same `IWeightSource` descriptors; `SupportsGemm` flips true per supported-format set.
-- **DN-M5.3-2** — Toolchain posture stays managed-first hand-written PTX, including WMMA inside the embedded-PTX seam for unquantized `f32`/`f16` dense matmul; cuBLAS/cuBLASLt is not linked and is reconsidered only if a measured bench shows our kernels cannot close the gap **and** the owner accepts relaxing managed-first.
+- **DN-M5.3-2** — Toolchain posture stays managed-first hand-written PTX, using tensor-core tiles inside the embedded-PTX seam where a native dense tile is available (`F16`) and hand-tiled FP32/BF16 matmul in embedded PTX rather than forcing precision-lossy conversions; cuBLAS/cuBLASLt is not linked and is reconsidered only if a measured bench shows our kernels cannot close the gap **and** the owner accepts relaxing managed-first.
   - Rationale: as-built CUDA links no native library today (embedded PTX only) and the plan repeatedly rejects native shims; dense unquantized matmul is where cuBLAS would win, so it is a measured escalation, not an assumption in either direction.
-  - Rejected: linking cuBLAS/cuBLASLt now (native dependency + packaging against the managed-first posture); betting on hand-written WMMA with no bench fallback (may underperform).
+  - Rejected: linking cuBLAS/cuBLASLt now (native dependency + packaging against the managed-first posture); betting on hand-written WMMA with no bench fallback (may underperform); forcing FP32/BF16 dense matmul through precision-lossy conversions just to call tensor cores.
   - Contract: dense matmul stays in the `CudaBackend+Ptx` seam; any toolchain change is recorded only against measured evidence.
 - **DN-M5.3-3** — The load-time capability gate extends to `PrefillKernel.Gemm`, reusing TransformerModel's existing `FormatsWithoutKernels`/`SupportsGemm` refusal so a CUDA segment naming GEMM on an unsupported format refuses at load rather than throwing per layer.
   - Rationale: prefill already selects GemV/Tiled/Gemm; the gate must decide before dispatch, not after work starts.
@@ -1633,8 +1633,8 @@ CUDA dense matmul (`GemmBatch`) plus the toolchain decision — flips `SupportsG
   - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — `GemmBatch` output lands within the inherited band vs the CPU reference, batch==solo. Verified with windowed PTX kernels for `Q8_0`, `Q5_0`, `Q2_0`, `Q4_K`, `Q6_K`, `Q5_K`, `Q2_K`, `Q3_K`, `IQ4_NL`, and `IQ4_XS`; targeted `Category=Cuda` passed 147/147 and `Category=Kernel|Parity` passed 520/520.
 - [✓] Prefill GEMM capability gate + selection — `PrefillKernel.Gemm` dispatches only when every resolved prompt-window backend has blocked matmul kernels for that window's dense formats; unsupported refuses at load naming the segment/backend/format (see DN-M5.3-3)
   - Verify: `dotnet test --filter Category=Config|Loader -c Release` — a CUDA route selecting `Gemm` on an unsupported format refuses at load; supported routes select it without per-layer throws. Verified with whole-model, hybrid/offloaded-prefill span gates and hot re-point refusal tests; targeted `Category=Config|Loader` passed 441/441, `Category=Cuda` passed 182/182, and `Category=Prefill|Parity` passed 175/175.
-- [_] Hand-written WMMA dense matmul for unquantized f32/f16 in the PTX seam (see DN-M5.3-2)
-  - Verify: `dotnet test --filter Category=Kernel -c Release` on CUDA — WMMA path within band vs scalar reference; no native library linked (`CudaBackend+Ptx` only).
+- [_] Hand-written unquantized dense matmul in embedded PTX — tensor-core tiles for `F16`, hand-tiled FP32/BF16 paths, no native library linked (see DN-M5.3-2)
+  - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — unquantized dense matmul paths land within the inherited band vs scalar references; no native library linked (`CudaBackend+Ptx` only).
 
 #### Tests
 
@@ -1644,7 +1644,7 @@ CUDA dense matmul (`GemmBatch`) plus the toolchain decision — flips `SupportsG
 
 #### Open Items
 
-- [_] **Toolchain escalation** — whether hand-written WMMA closes the dense-matmul gap is settled by the DN-M5.3-4 bench before any cuBLAS/cuBLASLt reconsideration; a measured shortfall records the escalation trigger rather than adopting a library on assumption (see DN-M5.3-2). Resolve during MVP5.3 build.
+- [_] **Toolchain escalation** — whether hand-written tensor-core/tiled PTX dense matmul closes the unquantized dense-matmul gap is settled by the DN-M5.3-4 bench before any cuBLAS/cuBLASLt reconsideration; a measured shortfall records the escalation trigger rather than adopting a library on assumption (see DN-M5.3-2). Resolve during MVP5.3 build.
 
 ### MVP5.4 [v0.5.4] - Refined
 
@@ -2063,6 +2063,8 @@ Vision input on chat models.
 - **2026-11-18 — MVP5.2 sub-4-bit CUDA GEMV lands as host-Q8_K crossing plus PTX integer-dot chains, not literal `dp4a` instruction use.** The implementation preserves the intended DN-M5.2-2 posture: five sub-4-bit formats consume a host-side Q8_K quantization of each activation crossed to device and dot against format-specific integer unpacking/scaling logic rather than an FP-activation or dequant-to-f32 primary path; measured parity is bit-exact for `IQ2_XXS`, `IQ2_XS`, `IQ3_XXS`, with low representable-rounding residuals for `IQ2_S` and `IQ3_S`. Rejected: claiming the literal PTX instruction name as a hard requirement when the integer-dot/Q8_K posture is what protects numerics, or widening existing CPU/dense-family bands to absorb percent-level kernel bugs.
 
 - **2026-11-18 — MVP5.2 CUDA GEMV defaults remain measured and explicit; no automatic format default flips from a microbench.** The committed `cuda-gemv` bench shows sub-4-bit i-quants as total-pass wins against auto-threaded CPU on the pinned synthetic shape (`IQ3_S`, `IQ3_XXS`, `IQ2_*`) while dense formats such as F32/F16/BF16/Q8_0/Q4_K remain losses once runtime transfer/launch/sync overhead is included. Rejected: promoting a CUDA GEMV format to default from compute-only kernel speed or GPU presence alone; claiming fast prefill before MVP5.4 composes device-side attention and device-resident KV. Evidence is recorded in `bench/reports/cuda-gemv-parity-2026-11-18.md`.
+
+- **2026-11-18 — MVP5.3 unquantized dense matmul stays embedded-PTX, with tensor-core tiles only where precision is native.** The plan wording "WMMA for f32/f16" cannot honestly mean forcing FP32/BF16 weights and activations through FP16 tensor cores just to call WMMA; that would create a precision cliff on unquantized dense paths. MVP5.3 therefore targets hand-written embedded PTX: `mma.sync`-style tiles for F16 where safe, hand-tiled FP32/BF16 matmul otherwise, and no cuBLAS/cuBLASLt linkage unless DN-M5.3-4 measurement plus owner acceptance justifies escalation.
 
 - **2026-11-17 — MVP5.1's KV config axis is a cold-path capability gate, not an early serving promise.** `models[].kv.quant.{k,v}` may parse and resolve named per-side combos (`f32/f32`, `f16/f16`, `q8/q8`/int8/k8v8, and `k8v4`) into footprint/config facts before block-struct storage and quantized attention land. The default `f32/f32` path serves unchanged; non-default named combos that have not yet landed their execution path are refused at model open naming the K/V formats and missing KV storage/attention support, rather than half-serving through today's FP32 pool or deferring the public axis until all later items finish. Rejected: accepting a quantized combo as servable while `BlockPool`/attention still only address FP32 floats; silently falling back to `f32/f32`; widening existing parity bands to make unimplemented modes appear supported.
 
