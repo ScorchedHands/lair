@@ -1564,7 +1564,7 @@ KV cache becomes a configurable named format pair (`f32/f32`, `f16/f16`, `q8/q8`
 - [✓] Automated Spike: generic-vs-hand-written attention delta on a pinned fixture records primary vs fallback, and q4-K drift vs llama `q4_0` records keep/drop of `q4/q4`
 - [✓] Manual Quant Recommendation: read the measured per-mode bench and confirm the documented KV default follows the parity/quality decision, not the smallest footprint
 
-### MVP5.2 [v0.5.2] - In Progress
+### MVP5.2 [v0.5.2] - Shipped
 
 CUDA reaches CPU parity on GGUF quant-format coverage for weight GEMV: the 13 formats CUDA lacks (`Q8_0`, `Q5_0`, `Q5_K`, `Q2_K`, `Q3_K`, `Q2_0`, `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`/`IQ2_XS`/`IQ2_S`, `IQ3_XXS`/`IQ3_S`) get CUDA GEMV kernels validated against the CPU oracle **within a per-format measured band, not bit-for-bit**, so the new kernels are written to be fast rather than last-bit-equal. Ordered after MVP5 and MVP5.1 because it reuses their activation-quant machinery; scope is weight GEMV only — dense matmul/prefill land in MVP5.3/MVP5.4.
 

@@ -4,6 +4,22 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-11-18
+
+### Added
+
+- CUDA weight-GEMV kernels for the remaining loader-accepted GGUF formats (`Q8_0`, `Q5_0`, `Q5_K`, `Q2_K`, `Q3_K`, `Q2_0`, `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, and `IQ3_S`) in hybrid `placement.gpu_layers` layer spans, with direct CPU-oracle parity bands for each format.
+- `Lair.Bench cuda-gemv [options]`: sweeps deterministic pinned synthetic GEMV fixtures across CUDA-supported formats, reporting CPU wall arms, CUDA launch wall, device kernel-busy microseconds, speed ratios, and equivalence sanity without writing files.
+
+### Changed
+
+- Hybrid CUDA execution now covers every loader-accepted GGUF tensor type for weight-GEMV passes; blocked matmul remains refused on CUDA until a dense-matmul backend ships.
+- Sub-4-bit i-quant CUDA GEMV kernels cross activations through host `Q8_K` blocks and PTX integer-dot chains, preserving CPU bit-identical decode posture while adding measured per-format quality bands.
+
+### Fixed
+
+- Unsupported hybrid CUDA weight formats are refused at model open with the offending tensor format named instead of failing later inside a decode dispatch.
+
 ## [0.5.1] - 2026-11-18
 
 ### Added
