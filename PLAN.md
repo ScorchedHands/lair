@@ -1604,7 +1604,7 @@ CUDA reaches CPU parity on GGUF quant-format coverage for weight GEMV: the 13 fo
 - [✓] Automated Config/Loader: an unsupported `cuda`-named format refuses at load naming model/format/backend
 - [✓] Manual Quant Recommendation: read the bench report and confirm each CUDA default follows measured speed, not assertion
 
-### MVP5.3 [v0.5.3] - Refined
+### MVP5.3 [v0.5.3] - Shipped
 
 CUDA dense matmul (`GemmBatch`) plus the toolchain decision — flips `SupportsGemm` true per supported format so `PrefillKernel.Gemm` can run on a CUDA segment. Self-contained and verifiable as GEMM parity, but **not yet fast prefill** (attention + device KV land in MVP5.4). Ordered after MVP5.2 because it reuses its dequant+dot primitives; before MVP5.4/MVP6.
 
