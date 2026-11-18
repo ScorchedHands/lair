@@ -819,35 +819,42 @@ public sealed class CudaBlockQuantGemvTests
         AssertWithinBand(expected, actual, band, $"cuda {format} host-mapped posture");
     }
 
-    // ---------------------------------------------------------------- formats without kernels keep refusing.
+    // ---------------------------------------------------------------- every accepted format now carries a GEMV kernel, and blocked matmul still refuses.
 
     [Theory]
+    [InlineData(QuantFormat.F32)]
+    [InlineData(QuantFormat.F16)]
+    [InlineData(QuantFormat.BF16)]
+    [InlineData(QuantFormat.Q8_0)]
+    [InlineData(QuantFormat.Q5_0)]
+    [InlineData(QuantFormat.Q4_K)]
+    [InlineData(QuantFormat.Q5_K)]
+    [InlineData(QuantFormat.Q6_K)]
+    [InlineData(QuantFormat.Q2_K)]
+    [InlineData(QuantFormat.Q3_K)]
+    [InlineData(QuantFormat.Q2_0)]
     [InlineData(QuantFormat.IQ4_NL)]
     [InlineData(QuantFormat.IQ4_XS)]
     [InlineData(QuantFormat.IQ2_XXS)]
+    [InlineData(QuantFormat.IQ2_XS)]
+    [InlineData(QuantFormat.IQ2_S)]
+    [InlineData(QuantFormat.IQ3_XXS)]
     [InlineData(QuantFormat.IQ3_S)]
-    public void CudaGemv_KeepsRefusingFormatsWithoutKernels_AndClaimsEveryBlockQuantItCarries(QuantFormat missing)
+    public void CudaGemv_ClaimsEveryFormatTheSeamCarries_AndStillRefusesBlockedMatmul(QuantFormat format)
     {
-        Assert.False(CudaBackend.HasGemvKernel(missing), $"the CUDA seam started claiming a kernel for {missing}");
-
-        foreach (QuantFormat carried in new[]
-        {
-            QuantFormat.F32, QuantFormat.F16, QuantFormat.BF16,
-            QuantFormat.Q8_0, QuantFormat.Q5_0, QuantFormat.Q4_K, QuantFormat.Q5_K, QuantFormat.Q6_K,
-            QuantFormat.Q2_K, QuantFormat.Q3_K, QuantFormat.Q2_0,
-        })
-        {
-            Assert.True(CudaBackend.HasGemvKernel(carried), $"the CUDA seam stopped reporting its {carried} GEMV kernel");
-        }
+        Assert.True(CudaBackend.HasGemvKernel(format), $"the CUDA seam stopped reporting its {format} GEMV kernel");
 
         TensorShape shape = new([1, 32]);
-        byte[] bytes = new byte[shape.RowStrideBytes(missing)]; // a correctly sized packed row for the refused format: the refusal is about the missing kernel, not the layout
+        byte[] bytes = new byte[shape.RowStrideBytes(format)]; // a correctly sized packed row for every format the seam now executes.
         float[] x = Activations(32);
         float[] output = new float[1];
 
         using CudaBackend cuda = OpenCuda();
-        NotSupportedException error = Assert.Throws<NotSupportedException>(
-            () => cuda.Gemv(x, new WeightRef(bytes, shape, missing), output));
-        Assert.Contains($"no GEMV kernel for format {missing}", error.Message, StringComparison.Ordinal);
+        Assert.True(cuda.SupportsGemv(format), $"the backend stopped claiming the {format} GEMV its kernel exists for"); // weight GEMV only.
+        NotSupportedException gemmError = Assert.Throws<NotSupportedException>(
+            () => cuda.GemmBatch(x, 1, new WeightRef(bytes, shape, format), output));
+        Assert.Contains($"no blocked matmul kernel for format {format}", gemmError.Message, StringComparison.Ordinal);
+
+        Assert.False(cuda.SupportsGemm(format)); // the capability gate agrees with the throw: no CUDA route claims a GEMM today.
     }
 }

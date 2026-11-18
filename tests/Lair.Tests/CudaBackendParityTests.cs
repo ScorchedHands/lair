@@ -1,3 +1,5 @@
+using System.Buffers;
+
 using System.Runtime.InteropServices;
 
 using Lair.Backends.Cpu;
@@ -15,9 +17,9 @@ namespace Lair.Tests;
 /// over CudaBackend as a single 'cuda' segment at DRAM residency, and a split route whose first span runs layer 0 on CPU
 /// while its receiving span takes every later layer plus the output head onto CUDA. Greedy token streams must agree
 /// across all three — argmax agreement is what a device crossing guarantees, not raw logit bytes between devices — and
-/// each weight tensor reaches device memory exactly once per backend instance. Formats with no CUDA kernel refuse naming
-/// that backend instead of running some other route's math, and a cuda-named route naming such a format refuses at model
-/// open — the load-time capability gate — rather than after a weight pass has dispatched.
+/// each weight tensor reaches device memory exactly once per backend instance. Weight GEMV runs on the device for every format this seam
+/// accepts today, blocked matmul refuses naming that backend for all of them, and a cuda-named route whose compute backend reports a weight
+/// format with no GEMV kernel refuses at model open — the load-time capability gate — rather than after a weight pass has dispatched.
 /// </summary>
 [Trait("Category", "Parity")]
 [Trait("Category", "Cuda")]
@@ -104,8 +106,12 @@ public sealed class CudaBackendParityTests : IDisposable
         Assert.Equal(expectedDeviceWeights, deviceWeightCopies); // weights crossed to device once per tensor for the whole run, never per GEMV call
     }
 
+    // The capability facts this file pins today: every format CudaBackend accepts resolves a GEMV function handle, so weight GEMV runs on the
+    // device for all of them and blocked matmul refuses naming this backend for every one. The load-time refusal lane therefore runs against a
+    // test-local stand-in that answers 'cuda' while reporting one chosen format as missing — what stays pinned is the gate's decision, wording,
+    // and no-CPU-fallback posture, not a coverage gap this seam no longer has.
     [Fact]
-    public void CudaParity_SplitRouteRefusesCrossingWithoutItsBackend_AndQuantizedFormatsRefuseNamingCuda()
+    public void CudaParity_SplitRouteRefusesCrossingWithoutItsBackend_AndFormatsAStandInCudaLacksRefuseNamingIt()
     {
         string path = SyntheticLlamaGguf.Write("parity-cuda-refusal", withReasoningMarkers: true, QuantFormat.F16);
         _tempFiles.Add(path);
@@ -123,35 +129,35 @@ public sealed class CudaBackendParityTests : IDisposable
 
         using CudaBackend cuda = new();
 
-        // Formats the CUDA seam carries no kernel for reach this backend only to be refused naming it — never a silent CPU fallback.
+        // Formats the seam executes reach this backend and run there; what it never carries is a blocked matmul, refused naming model-format-backend.
         TensorShape refusalShape = new([2, 256]);
         byte[] packedIq = new byte[2 * (int)refusalShape.RowStrideBytes(QuantFormat.IQ4_XS)]; // two rows of IQ4_XS packing for shape [2, 256]
 
-        NotSupportedException gemvError = Assert.Throws<NotSupportedException>(
-            () => cuda.Gemv(new float[256], new WeightRef(packedIq, refusalShape, QuantFormat.IQ4_XS), new float[2]));
-        Assert.Contains("CudaBackend ('cuda')", gemvError.Message);
-        Assert.Contains("IQ4_XS", gemvError.Message);
-
+        Assert.True(cuda.SupportsGemv(QuantFormat.IQ4_XS), "the CUDA seam stopped executing its IQ4_XS GEMV");
         NotSupportedException gemmError = Assert.Throws<NotSupportedException>(
             () => cuda.GemmBatch(new float[256], 1, new WeightRef(packedIq, refusalShape, QuantFormat.IQ4_XS), new float[2]));
         Assert.Contains("CudaBackend ('cuda')", gemmError.Message);
-        Assert.False(cuda.SupportsGemm(QuantFormat.F16)); // the blocked matmul has no CUDA path yet at all
+        Assert.Contains("no blocked matmul kernel for format IQ4_XS", gemmError.Message, StringComparison.Ordinal);
 
         ModelException kernelRefusal = Assert.Throws<ModelException>(
             () => TransformerModel.Open(gguf, cuda, maxContextTokens: 32, logLine: null, PrefillKernel.Gemm, CudaWholeModelRoute("parity-cuda-gemm")));
         Assert.Contains("gemm", kernelRefusal.Message);
 
-        // The same capability fact against a quantized file: a cuda-named route naming a format the seam has no GEMV
-        // kernel for is refused at model open — naming the model, the format, and this backend — before any weight pass
-        // dispatches, so the mid-decode refusal above is what a route can no longer reach.
+        // The same capability fact against a quantized file: a cuda-named route naming a format its compute backend reports no GEMV kernel for is
+        // refused at model open — naming the model, the format, and this backend — before any weight pass dispatches. This seam carries an IQ3_S
+        // kernel today (asserted just below), so the refusal runs through the stand-in's chosen answer: what stays pinned here is that a route can
+        // no longer reach the mid-decode refusal, while nothing falls back to CPU for a device-named segment.
         string quantizedPath = SyntheticLlamaGguf.WriteQuantizedMatrices(
             "parity-cuda-iq3s", QuantFormat.IQ3_S, new SyntheticLlamaGguf.Geometry(Layers: 2, HiddenSize: 256, HeadCount: 2, KvHeadCount: 2, FeedForwardLength: 512));
         _tempFiles.Add(quantizedPath);
 
+        Assert.True(CudaBackend.HasGemvKernel(QuantFormat.IQ3_S), "the CUDA seam stopped reporting its IQ3_S GEMV kernel"); // the refusal below is a stand-in answer, not this backend's own fact.
+
         using GgufFile quantizedGguf = GgufFile.Open(quantizedPath);
+        using CpuBackend hostKernels = new();
 
         ModelException loadRefusal = Assert.Throws<ModelException>(
-            () => TransformerModel.Open(quantizedGguf, cuda, maxContextTokens: 32, logLine: null, PrefillKernel.GemV, CudaWholeModelRoute("parity-cuda-iq3s")));
+            () => TransformerModel.Open(quantizedGguf, new CudaCapabilityStandIn(hostKernels, QuantFormat.IQ3_S), maxContextTokens: 32, logLine: null, PrefillKernel.GemV, CudaWholeModelRoute("parity-cuda-iq3s")));
         Assert.Contains("model 'parity-cuda-iq3s'", loadRefusal.Message);
         Assert.Contains("IQ3_S", loadRefusal.Message);
         Assert.Contains("no GEMV kernel", loadRefusal.Message);
@@ -255,6 +261,61 @@ public sealed class CudaBackendParityTests : IDisposable
 
         Assert.True(bestIdx >= 0, "logit vector had no selectable entry");
         return bestIdx;
+    }
+
+    /// <summary>
+    /// A compute backend answering device <c>cuda</c> with the CUDA backend's own GEMV capability facts while its kernels stay host-side, so a
+    /// refusal lane can pin the load-time gate against a format this seam actually carries today. Formats named in <c>cudaMissingFormats</c>
+    /// report as unsupported here even though the real seam resolves a kernel for every accepted format — that is how the refusal lanes keep
+    /// exercising gate machinery over a capability answer this stand-in chooses to give, without production claiming a gap it no longer has. The
+    /// wrapped CPU backend stays owned by the test.
+    /// </summary>
+    private sealed class CudaCapabilityStandIn : IBackend
+    {
+        private readonly CpuBackend _inner;
+        private readonly QuantFormat[] _cudaMissingFormats;
+
+        public CudaCapabilityStandIn(CpuBackend inner, params QuantFormat[] cudaMissingFormats)
+        {
+            ArgumentNullException.ThrowIfNull(inner);
+            _inner = inner;
+            _cudaMissingFormats = cudaMissingFormats ?? [];
+        }
+
+        public string DeviceId => CudaBackend.DeviceIdValue;
+
+        public Lair.Contracts.WeightTier WeightTier => Lair.Contracts.WeightTier.Dram;
+
+        public bool SupportsGemv(QuantFormat format) => Array.IndexOf(_cudaMissingFormats, format) < 0 && CudaBackend.HasGemvKernel(format);
+
+        public bool SupportsGemm(QuantFormat format) => false;
+
+        public MemoryHandle AllocateAligned(long bytes, int alignment) => _inner.AllocateAligned(bytes, alignment);
+
+        public void FreeAligned(MemoryHandle handle) => _inner.FreeAligned(handle);
+
+        public IKvDeviceMirror OpenKvMirror(KvMirrorRequest request) => _inner.OpenKvMirror(request);
+
+        public void Gemv(ReadOnlySpan<float> x, WeightRef w, Span<float> output) => _inner.Gemv(x, w, output);
+
+        public void GemvBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs) => _inner.GemvBatch(inputs, count, w, outputs);
+
+        public void GemmBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs) => throw new NotSupportedException("this stand-in carries no blocked matmul");
+
+        public void DequantRow(WeightRef w, int row, Span<float> output) => _inner.DequantRow(w, row, output);
+
+        public float Dot(ReadOnlySpan<float> a, ReadOnlySpan<float> b) => _inner.Dot(a, b);
+
+        public void Axpy(float alpha, ReadOnlySpan<float> x, Span<float> y) => _inner.Axpy(alpha, x, y);
+
+        public void Fill(Span<float> y, float v) => _inner.Fill(y, v);
+
+        public void Scale(Span<float> y, float s) => _inner.Scale(y, s);
+
+        public void Dispose()
+        {
+            // The CPU backend this stand-in reads through belongs to the test that opened it.
+        }
     }
 }
 

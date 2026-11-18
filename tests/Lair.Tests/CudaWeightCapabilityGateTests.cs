@@ -15,11 +15,13 @@ namespace Lair.Tests;
 /// the weight formats that segment runs refuses at model open, naming the model, the offending format, the segment, and
 /// that backend — the posture every other unimplemented capability takes, and the replacement for the mid-decode
 /// <c>Unsupported</c> throw that used to surface the same fact after work had dispatched. The gate consults the backend's
-    /// own capability answer, so the CUDA formats the seam executes today (<c>F32</c>, <c>F16</c>, <c>BF16</c>, <c>Q8_0</c>,
-/// <c>Q5_0</c>, <c>Q2_0</c>, <c>Q4_K</c>, <c>Q5_K</c>, <c>Q6_K</c>, <c>Q2_K</c>, and <c>Q3_K</c>) still resolve and open
-/// unchanged, a CPU-only route is untouched, and nothing falls back to CPU for a device-named segment. The CUDA capability
-/// facts are read through the backend's static kernel coverage, so no test here opens a device: the refusal is a load-time
-/// decision over the tensor table.
+/// own capability answer, so the CUDA formats the seam executes today (<c>F32</c>, <c>F16</c>, <c>BF16</c>, <c>Q8_0</c>,
+/// <c>Q5_0</c>, <c>Q2_0</c>, <c>Q4_K</c>, <c>Q5_K</c>, <c>Q6_K</c>, <c>Q2_K</c>, <c>Q3_K</c>, and the seven i-quant formats
+/// <c>IQ4_NL</c>, <c>IQ4_XS</c>, <c>IQ2_XXS</c>, <c>IQ2_XS</c>, <c>IQ2_S</c>, <c>IQ3_XXS</c>, and <c>IQ3_S</c>) still resolve
+/// and open unchanged, a CPU-only route is untouched, and nothing falls back to CPU for a device-named segment. The refusal lanes name their
+/// missing format through the test-local stand-in rather than through a real capability gap: the CUDA capability facts are read through the
+/// backend's static kernel coverage, so no test here opens a device, and the refusal is a load-time decision over the tensor table.
+
 /// </summary>
 [Trait("Category", "Loader")]
 [Trait("Category", "Config")]
@@ -69,7 +71,7 @@ public sealed class CudaWeightCapabilityGateTests : IDisposable
 
         using GgufFile gguf = GgufFile.Open(path);
         using CpuBackend hostKernels = new(threads: 2);
-        CudaCapabilityStandIn cuda = new(hostKernels);
+        CudaCapabilityStandIn cuda = new(hostKernels, QuantFormat.IQ3_S); // the stand-in reports IQ3_S as missing so this lane still exercises load-time refusal machinery.
 
         ModelException error = Assert.Throws<ModelException>(
             () => TransformerModel.Open(gguf, cuda, maxContextTokens: 32, logLine: null, PrefillKernel.GemV, route));
@@ -100,7 +102,7 @@ public sealed class CudaWeightCapabilityGateTests : IDisposable
 
         using GgufFile gguf = GgufFile.Open(path);
         using CpuBackend cpu = new(threads: 2);
-        CudaCapabilityStandIn cuda = new(cpu);
+        CudaCapabilityStandIn cuda = new(cpu, QuantFormat.IQ3_S);
 
         ModelException error = Assert.Throws<ModelException>(
             () => TransformerModel.Open(gguf, cpu, maxContextTokens: 32, logLine: null, PrefillKernel.GemV, route, [cuda, cpu]));
@@ -132,7 +134,7 @@ public sealed class CudaWeightCapabilityGateTests : IDisposable
 
         using GgufFile gguf = GgufFile.Open(path);
         using CpuBackend cpu = new(threads: 2);
-        CudaCapabilityStandIn cuda = new(cpu);
+        CudaCapabilityStandIn cuda = new(cpu, QuantFormat.IQ3_S);
 
         ModelException error = Assert.Throws<ModelException>(
             () => TransformerModel.Open(gguf, cpu, maxContextTokens: 32, logLine: null, PrefillKernel.GemV, route, [cpu, cuda]));
@@ -160,7 +162,7 @@ public sealed class CudaWeightCapabilityGateTests : IDisposable
 
         using GgufFile gguf = GgufFile.Open(path);
         using CpuBackend cpu = new(threads: 2);
-        CudaCapabilityStandIn cuda = new(cpu);
+        CudaCapabilityStandIn cuda = new(cpu, QuantFormat.IQ3_S);
 
         ModelException error = Assert.Throws<ModelException>(
             () => TransformerModel.Open(gguf, cpu, maxContextTokens: 32, logLine: null, PrefillKernel.GemV, route, prefillsBackend: cuda));
@@ -211,7 +213,7 @@ public sealed class CudaWeightCapabilityGateTests : IDisposable
     }
 
     [Fact]
-    public void CpuOnlyRoute_NamingFormatCudaLacks_OpensUnchanged_AndItsBackendClaimsEveryFormat()
+    public void CpuOnlyRoute_NamingAQuantFormatTheSeamAlsoCarries_OpensUnchanged_AndItsBackendClaimsEveryFormat()
     {
         string path = SyntheticLlamaGguf.WriteQuantizedMatrices("gate-cpu-iq3s", QuantFormat.IQ3_S, QuantizedShape);
         _tempFiles.Add(path);
@@ -251,13 +253,13 @@ public sealed class CudaWeightCapabilityGateTests : IDisposable
     [InlineData(QuantFormat.Q2_K, true)]
     [InlineData(QuantFormat.Q3_K, true)]
     [InlineData(QuantFormat.Q2_0, true)]
-    [InlineData(QuantFormat.IQ2_XXS, false)]
-    [InlineData(QuantFormat.IQ2_XS, false)]
-    [InlineData(QuantFormat.IQ2_S, false)]
-    [InlineData(QuantFormat.IQ3_XXS, false)]
-    [InlineData(QuantFormat.IQ3_S, false)]
-    [InlineData(QuantFormat.IQ4_NL, false)]
-    [InlineData(QuantFormat.IQ4_XS, false)]
+    [InlineData(QuantFormat.IQ2_XXS, true)] // the seam now carries GEMV kernels for every accepted format; refusal lanes above pin gate machinery through a stand-in that reports chosen formats as missing.
+    [InlineData(QuantFormat.IQ2_XS, true)]
+    [InlineData(QuantFormat.IQ2_S, true)]
+    [InlineData(QuantFormat.IQ3_XXS, true)]
+    [InlineData(QuantFormat.IQ3_S, true)]
+    [InlineData(QuantFormat.IQ4_NL, true)]
+    [InlineData(QuantFormat.IQ4_XS, true)]
     public void CudaGemvCapability_CoversExactlyTheFormatsTheSeamCarries(QuantFormat format, bool supported) =>
         Assert.Equal(supported, CudaBackend.HasGemvKernel(format));
 
@@ -268,23 +270,27 @@ public sealed class CudaWeightCapabilityGateTests : IDisposable
     /// <summary>
     /// A compute backend answering device <c>cuda</c> with the CUDA backend's own GEMV capability facts while its kernels
     /// stay host-side: the load-time gate decides on the capability answer and the tensor table alone, so the refusal these
-    /// tests pin never reaches a kernel and no test opens a driver. The wrapped CPU backend stays owned by the test.
+    /// tests pin never reaches a kernel and no test opens a driver. The wrapped CPU backend stays owned by the test. Formats named in
+    /// <c>cudaMissingFormats</c> report as unsupported here even though the real seam carries kernels for every format today - that is how
+    /// the refusal lanes keep exercising load-time gate machinery against a capability answer this stand-in chooses to give.
     /// </summary>
     private sealed class CudaCapabilityStandIn : IBackend
     {
         private readonly CpuBackend _inner;
+        private readonly QuantFormat[] _cudaMissingFormats;
 
-        public CudaCapabilityStandIn(CpuBackend inner)
+        public CudaCapabilityStandIn(CpuBackend inner, params QuantFormat[] cudaMissingFormats)
         {
             ArgumentNullException.ThrowIfNull(inner);
             _inner = inner;
+            _cudaMissingFormats = cudaMissingFormats ?? [];
         }
 
         public string DeviceId => CudaBackend.DeviceIdValue;
 
         public Lair.Contracts.WeightTier WeightTier => Lair.Contracts.WeightTier.Dram;
 
-        public bool SupportsGemv(QuantFormat format) => CudaBackend.HasGemvKernel(format);
+        public bool SupportsGemv(QuantFormat format) => Array.IndexOf(_cudaMissingFormats, format) < 0 && CudaBackend.HasGemvKernel(format);
 
         public bool SupportsGemm(QuantFormat format) => false;
 

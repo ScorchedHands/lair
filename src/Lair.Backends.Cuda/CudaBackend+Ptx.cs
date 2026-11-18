@@ -25,7 +25,8 @@ public sealed partial class CudaBackend
         int blockBytes,
         string extraU32Regs,
         IEnumerable<string> headerLines,
-        IEnumerable<string> groupArms)
+        IEnumerable<string> groupArms,
+        bool tabLoad = false) // the IQ4 kernels carry a scratch table pointer beside their other device operands.
     {
         ArgumentNullException.ThrowIfNull(headerLines);
         ArgumentNullException.ThrowIfNull(groupArms);
@@ -38,9 +39,23 @@ public sealed partial class CudaBackend
             "    .param .u64 out_ptr,",
             "    .param .u32 rows_arg,",
             "    .param .u32 cols_arg,",
-            "    .param .u32 count_arg",
+
+        ];
+
+        if (tabLoad)
+        {
+            lines.Add("    .param .u32 count_arg,"); // the table parameter rides last in the list: host kernelParams append its address after the six common ones.
+            lines.Add("    .param .u64 tab_ptr");
+        }
+        else
+        {
+            lines.Add("    .param .u32 count_arg");
+        }
+
+        lines.AddRange(
+        [
             ") {",
-            "    .reg .u64 w, xin, o, blockAddr, addr;",
+            tabLoad ? "    .reg .u64 w, xin, o, blockAddr, addr, tab;" : "    .reg .u64 w, xin, o, blockAddr, addr;", // the table cursor rides beside the other bases.
                         // `col`/`cabs` are the group-relative and row-absolute column cursors every arm in this family runs on.
             $"    .reg .u32 row, bb, rows_, cols_, cnt_, tid, t0, strideBlocks, strideBytes, rowBase, base, col, cabs{extraU32Regs};",
 
@@ -56,6 +71,7 @@ public sealed partial class CudaBackend
             "    ld.param.u32 rows_, [rows_arg];",
             "    ld.param.u32 cols_, [cols_arg];",
             "    ld.param.u32 cnt_, [count_arg];",
+            tabLoad ? "    ld.param.u64 tab, [tab_ptr];" : "", // the IQ4 kernels bind their scratch table cursor right beside the other bases.
             "",
             "    mov.u32 tid, %ctaid.x;",
             "    mov.u32 t0, %ntid.x;",
@@ -85,7 +101,8 @@ public sealed partial class CudaBackend
             "_block:",
             "    setp.ge.u32 p, base, cols_;",
             "    @p bra _store;",
-        ];
+
+        ]);
 
         lines.AddRange(headerLines);
         lines.AddRange(groupArms);
@@ -193,5 +210,8 @@ public sealed partial class CudaBackend
     private static readonly byte[] PtxBytes = Encoding.UTF8.GetBytes(
         PtxHeader + "\n" + GemvF32Ptx + "\n" + GemvF16Ptx + "\n" + GemvBf16Ptx + "\n" + GemvQ4KPtx + "\n" + BuildGemvQ6KPtx() +
         "\n" + BuildGemvQ8_0Ptx() + "\n" + BuildGemvQ5_0Ptx() + "\n" + BuildGemvQ2_0Ptx() +
-        "\n" + BuildGemvQ5KPtx() + "\n" + BuildGemvQ2KPtx() + "\n" + BuildGemvQ3KPtx() + "\0");
+        "\n" + BuildGemvQ5KPtx() + "\n" + BuildGemvQ2KPtx() + "\n" + BuildGemvQ3KPtx() +
+        "\n" + BuildGemvIQ4NPtx() + "\n" + BuildGemvIQ4XPtx() + "\n" + BuildGemvIQ2XXSPtx() +
+        "\n" + BuildGemvIQ2XSPtx() + "\n" + BuildGemvIQ2SPtx() + "\n" + BuildGemvIQ3XPtx() +
+        "\n" + BuildGemvIQ3SPtx() + "\0");
 }
