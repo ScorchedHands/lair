@@ -1629,8 +1629,8 @@ CUDA dense matmul (`GemmBatch`) plus the toolchain decision — flips `SupportsG
 
 #### Implementation Items
 
-- [_] CUDA dense matmul kernel family — tiled dequant-once + dot/reuse for supported formats; flip `SupportsGemm` per set (see DN-M5.3-1)
-  - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — `GemmBatch` output lands within the inherited band vs the CPU reference, batch==solo.
+- [✓] CUDA blocked-matmul kernel family — windowed dequant-once + dot/reuse for `Q8_0`/`Q5_0`/`Q2_0`, every K-quant, and `IQ4_NL`/`IQ4_XS`; `SupportsGemm` reports those formats and refuses others (see DN-M5.3-1)
+  - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — `GemmBatch` output lands within the inherited band vs the CPU reference, batch==solo. Verified with windowed PTX kernels for `Q8_0`, `Q5_0`, `Q2_0`, `Q4_K`, `Q6_K`, `Q5_K`, `Q2_K`, `Q3_K`, `IQ4_NL`, and `IQ4_XS`; targeted `Category=Cuda` passed 147/147 and `Category=Kernel|Parity` passed 520/520.
 - [_] Prefill GEMM capability gate + selection — `PrefillKernel.Gemm` dispatches only for formats with kernels; unsupported refuses at load naming them (see DN-M5.3-3)
   - Verify: `dotnet test --filter Category=Config|Loader -c Release` — a CUDA route selecting `Gemm` on an unsupported format refuses at load; supported routes select it without per-layer throws.
 - [_] Hand-written WMMA dense matmul for unquantized f32/f16 in the PTX seam (see DN-M5.3-2)
@@ -1638,7 +1638,7 @@ CUDA dense matmul (`GemmBatch`) plus the toolchain decision — flips `SupportsG
 
 #### Tests
 
-- [_] Automated Kernel/Parity: CUDA GEMM for supported formats within the inherited band (batch==solo)
+- [✓] Automated Kernel/Parity: CUDA GEMM for supported formats within the inherited band (batch==solo). Verified with targeted `Category=Cuda` 147/147 and `Category=Kernel|Parity` 520/520.
 - [_] Automated Config/Loader: `PrefillKernel.Gemm` on an unsupported format refuses at load naming it; supported formats select it cleanly
 - [_] Manual Bench Gate: read the committed report and confirm both the GEMM default and any cuBLAS reconsideration follow measured numbers
 
