@@ -18,7 +18,8 @@ namespace Lair.Tests;
 /// answer from registered host bytes, and row dequantization — host-side scalar math with no accumulation chain — must agree bit
 /// for bit with CpuBackend's expansion. Formats without a kernel here keep refusing rather than running through another device; the blocked-matmul
 /// family now runs on this seam too — each packed quant format walks its own GEMV unpacking once per activation-row window instead of once per vector,
-/// inside that format's recorded band — while F32, F16, and BF16 still refuse a dense matrix naming this backend.
+/// inside that format's recorded band — while the unquantized F32/F16/BF16 dense matmul keeps its own bit-for-bit posture against the scalar oracle in
+/// <see cref="CudaDenseGemmTests"/>, and only the Q8_K i-quants refuse a dense matrix naming this backend.
 /// </summary>
 [Trait("Category", "Kernel")]
 [Trait("Category", "Cuda")]

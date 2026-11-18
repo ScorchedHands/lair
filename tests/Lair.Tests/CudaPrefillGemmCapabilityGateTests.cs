@@ -20,7 +20,7 @@ namespace Lair.Tests;
 /// window shape that happens to work. The capability facts these lanes read are the CUDA seam's static coverage
 /// (<see cref="CudaBackend.HasGemmKernel"/> / <see cref="CudaBackend.HasGemvKernel"/>) through a device-<c>cuda</c>
 /// stand-in whose kernels stay host-side, so no test here opens a driver; refusal lanes name formats the real seam
-/// genuinely carries no kernel for (F32/F16/BF16 dense matmul and the sub-4-bit i-quants), not chosen-away facts. The
+/// genuinely carries no kernel for (the sub-4-bit i-quants), not chosen-away facts. The
 /// CPU posture's own honesty — supported formats select cleanly, unsupported ones refuse naming them — is pinned in the
 /// sibling <see cref="PrefillGemmCapabilityGateTests"/>. All of these share one serialized lane with the other suites
 /// that open engines on this box.
@@ -161,25 +161,28 @@ public sealed class CudaPrefillGemmCapabilityGateTests : IDisposable
         Assert.DoesNotContain("no GEMV kernel", error.Message, StringComparison.Ordinal); // this is the dense-matrix gate, not the row-pass gate
     }
 
-    [Fact]
-    public void WholeModelCudaRoute_UnquantizedDenseFormat_RefusesAtOpenNamingSelectionFormatAndBackend()
+    [Theory]
+    [InlineData(QuantFormat.F32)]
+    [InlineData(QuantFormat.F16)]
+    [InlineData(QuantFormat.BF16)]
+    public void WholeModelCudaRoute_UnquantizedDenseFormat_OpensOnGemmAndReportsIt(QuantFormat format)
     {
-        // F32/F16/BF16 stay refused until their WMMA dense matmul lands: the route names them at load rather than running a window through some other kernel.
-        string path = SyntheticLlamaGguf.Write("gemm-cuda-f16", withReasoningMarkers: true, QuantFormat.F16, QuantizedShape);
+        // The unquantized trio now carries its own windowed dense matmul on this seam, so the selection is what a whole-model 'cuda' route resolves for them.
+        Assert.True(CudaBackend.HasGemmKernel(format), $"the CUDA seam stopped reporting its {format} blocked matmul");
+
+        string path = SyntheticLlamaGguf.Write($"gemm-cuda-{format}", withReasoningMarkers: true, format, QuantizedShape);
         _tempFiles.Add(path);
 
-        ModelRoute route = WholeModelCudaRoute("gemm-cuda-f16");
+        ModelRoute route = WholeModelCudaRoute($"gemm-cuda-{format}");
 
         using GgufFile gguf = GgufFile.Open(path);
         using CpuBackend hostKernels = new(threads: 2);
         CountingCudaCapabilityStandIn cuda = new(hostKernels);
 
-        ModelException error = Assert.Throws<ModelException>(
-            () => TransformerModel.Open(gguf, cuda, maxContextTokens: 32, logLine: null, PrefillKernel.Gemm, route));
+        using TransformerModel model = TransformerModel.Open(gguf, cuda, maxContextTokens: 32, logLine: null, PrefillKernel.Gemm, route);
 
-        Assert.Contains("prefill kernel 'gemm'", error.Message, StringComparison.Ordinal);
-        Assert.Contains("F16", error.Message, StringComparison.Ordinal);
-        Assert.Contains($"'{CudaDeviceId}'", error.Message, StringComparison.Ordinal);
+        Assert.Equal(PrefillKernel.Gemm, model.ResolvedPrefillKernel); // no load-time refusal naming a format this seam multiplies in bulk
+        Assert.Contains(format, model.MatmulWeightFormats);
     }
 
     [Theory]
@@ -193,9 +196,9 @@ public sealed class CudaPrefillGemmCapabilityGateTests : IDisposable
     [InlineData(QuantFormat.Q3_K, true)]
     [InlineData(QuantFormat.IQ4_NL, true)] // the IQ4 pair carries a windowed kernel even though this suite's synthetic writer ships no block geometry for it
     [InlineData(QuantFormat.IQ4_XS, true)]
-    [InlineData(QuantFormat.F32, false)]
-    [InlineData(QuantFormat.F16, false)]
-    [InlineData(QuantFormat.BF16, false)]
+    [InlineData(QuantFormat.F32, true)] // the unquantized trio carries windowed dense matmul here today.
+    [InlineData(QuantFormat.F16, true)]
+    [InlineData(QuantFormat.BF16, true)]
     [InlineData(QuantFormat.IQ2_XXS, false)] // the sub-4-bit i-quants stay refused until their dense path lands
     [InlineData(QuantFormat.IQ2_XS, false)]
     [InlineData(QuantFormat.IQ2_S, false)]

@@ -8,8 +8,12 @@ public sealed partial class CudaBackend
     // Address arithmetic stays in computed-register form throughout: this driver seam rejects [base+reg] load forms, so
     // each element address is mad'd from its index, widened, shifted by the element size, and added to the base. Half
     // and bf16 weights widen through integer bit math into a per-thread local slot reloaded as f32; cvt.f16 forms are
-    // rejected outright (CUDA_ERROR_INVALID_PTX) on this seam. Accumulation is plain mul then add in ascending column
-    // order - the same chain the scalar CPU reference uses, so one device result matches one host dot bit for bit.
+    // rejected outright (CUDA_ERROR_INVALID_PTX) on this seam. Accumulation is written as plain mul then add in ascending column
+    // order, the chain shape the scalar CPU reference walks - which is what makes one windowed launch answer bit-for-bit what repeated
+    // single-vector launches answer on-device. Across the PCIe seam that chain lands inside each format's recorded band of the host dot
+    // rather than on its bits: a multiply and an accumulate written back to back fold into one fused operation in the driver's JIT, so
+    // last-bit agreement lives between two device launches, not between devices (the per-format bands every CUDA parity gate measures
+    // against are recorded test-side).
     private const string PtxHeader =
         ".version 7.0\n" +
         ".target sm_50\n" +
@@ -213,5 +217,5 @@ public sealed partial class CudaBackend
         "\n" + BuildGemvQ5KPtx() + "\n" + BuildGemvQ2KPtx() + "\n" + BuildGemvQ3KPtx() +
         "\n" + BuildGemvIQ4NPtx() + "\n" + BuildGemvIQ4XPtx() + "\n" + BuildGemvIQ2XXSPtx() +
         "\n" + BuildGemvIQ2XSPtx() + "\n" + BuildGemvIQ2SPtx() + "\n" + BuildGemvIQ3XPtx() +
-        "\n" + BuildGemvIQ3SPtx() + BuildGemmFamilyPtx() + "\0");
+        "\n" + BuildGemvIQ3SPtx() + BuildGemmFamilyPtx() + BuildDenseGemmFamilyPtx() + "\0");
 }

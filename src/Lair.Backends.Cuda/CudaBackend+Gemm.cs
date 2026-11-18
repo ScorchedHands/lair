@@ -18,20 +18,25 @@ public sealed partial class CudaBackend
 
     /// <summary>
     /// The capability fact every CUDA blocked-matmul posture answers from: exactly the formats this backend resolves a windowed function handle for.
-    /// Every packed block quant (Q8_0, Q5_0, Q2_0, Q4_K, Q6_K, Q5_K, Q2_K, Q3_K) and the IQ4 pair carry one today — each is its own GEMV kernel's
-    /// unpacking walked once per activation-row window instead of once per vector. The unquantized F32/F16/BF16 formats answer false because their
-    /// dense matmul is the WMMA work this phase has not landed, and the Q8_K i-quant family (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S) answers false
-    /// until its windowed kernel lands: a route naming any of them keeps refusing at load rather than running through some other device's kernel.
+    /// Every packed block quant (Q8_0, Q5_0, Q2_0, Q4_K, Q6_K, Q5_K, Q2_K, Q3_K) and the IQ4 pair carry one — each is its own GEMV kernel's unpacking
+    /// walked once per activation-row window instead of once per vector — and so do the unquantized F32, F16, and BF16 formats, whose dense matmul is that
+    /// format's own embedded-PTX weight widening (plain f32 loads, integer-bit half widening, or the bf16 high-half shift) walked once per window with no
+    /// conversion to another precision. The Q8_K i-quant family (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S) answers false until its windowed kernel lands: a
+    /// route naming any of them keeps refusing at load rather than running through some other device's kernel.
     /// </summary>
     public static bool HasGemmKernel(QuantFormat format) => format switch
     {
-        QuantFormat.Q8_0 or QuantFormat.Q5_0 or QuantFormat.Q2_0 or QuantFormat.Q4_K or QuantFormat.Q6_K
+        QuantFormat.F32 or QuantFormat.F16 or QuantFormat.BF16
+            or QuantFormat.Q8_0 or QuantFormat.Q5_0 or QuantFormat.Q2_0 or QuantFormat.Q4_K or QuantFormat.Q6_K
             or QuantFormat.Q5_K or QuantFormat.Q2_K or QuantFormat.Q3_K or QuantFormat.IQ4_NL or QuantFormat.IQ4_XS => true,
-        _ => false, // F32/F16/BF16 have no blocked matmul in this build yet, and neither do the Q8_K i-quants.
+        _ => false, // only the Q8_K i-quants lack a windowed kernel in this build.
     };
 
     private IntPtr GemmKernelFor(QuantFormat format) => format switch
     {
+        QuantFormat.F32 => _gemmF32,
+        QuantFormat.F16 => _gemmF16,
+        QuantFormat.BF16 => _gemmBf16,
         QuantFormat.Q8_0 => _gemmQ8_0,
         QuantFormat.Q5_0 => _gemmQ5_0,
         QuantFormat.Q2_0 => _gemmQ2_0,
@@ -47,9 +52,9 @@ public sealed partial class CudaBackend
 
     private static NotSupportedException UnsupportedGemm(QuantFormat format) => new(
         $"CudaBackend ('{DeviceIdValue}') has no blocked matmul kernel for format {format}: the CUDA seam carries windowed " +
-        "blocked-matmul kernels for Q8_0, Q5_0, Q2_0, Q4_K, Q6_K, Q5_K, Q2_K, Q3_K, IQ4_NL, and IQ4_XS today; F32, F16, and BF16 " +
-        "carry none (their dense matmul is the unquantized WMMA work this build has not landed) and neither do the Q8_K i-quants " +
-        "(IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, and IQ3_S), so this weight pass is refused naming that backend rather than run through a CPU fallback.");
+        "blocked-matmul kernels for F32, F16, BF16, Q8_0, Q5_0, Q2_0, Q4_K, Q6_K, Q5_K, Q2_K, Q3_K, IQ4_NL, and IQ4_XS today " +
+        "(each one its own GEMV kernel's unpacking walked once per activation-row window), while the Q8_K i-quants (IQ2_XXS, " +
+        "IQ2_XS, IQ2_S, IQ3_XXS, and IQ3_S) carry none, so this weight pass is refused naming that backend rather than run through a CPU fallback.");
 
     /// <inheritdoc/>
     public void GemmBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs)
