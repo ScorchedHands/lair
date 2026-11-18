@@ -1631,15 +1631,15 @@ CUDA dense matmul (`GemmBatch`) plus the toolchain decision — flips `SupportsG
 
 - [✓] CUDA blocked-matmul kernel family — windowed dequant-once + dot/reuse for `Q8_0`/`Q5_0`/`Q2_0`, every K-quant, and `IQ4_NL`/`IQ4_XS`; `SupportsGemm` reports those formats and refuses others (see DN-M5.3-1)
   - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — `GemmBatch` output lands within the inherited band vs the CPU reference, batch==solo. Verified with windowed PTX kernels for `Q8_0`, `Q5_0`, `Q2_0`, `Q4_K`, `Q6_K`, `Q5_K`, `Q2_K`, `Q3_K`, `IQ4_NL`, and `IQ4_XS`; targeted `Category=Cuda` passed 147/147 and `Category=Kernel|Parity` passed 520/520.
-- [_] Prefill GEMM capability gate + selection — `PrefillKernel.Gemm` dispatches only for formats with kernels; unsupported refuses at load naming them (see DN-M5.3-3)
-  - Verify: `dotnet test --filter Category=Config|Loader -c Release` — a CUDA route selecting `Gemm` on an unsupported format refuses at load; supported routes select it without per-layer throws.
+- [✓] Prefill GEMM capability gate + selection — `PrefillKernel.Gemm` dispatches only when every resolved prompt-window backend has blocked matmul kernels for that window's dense formats; unsupported refuses at load naming the segment/backend/format (see DN-M5.3-3)
+  - Verify: `dotnet test --filter Category=Config|Loader -c Release` — a CUDA route selecting `Gemm` on an unsupported format refuses at load; supported routes select it without per-layer throws. Verified with whole-model, hybrid/offloaded-prefill span gates and hot re-point refusal tests; targeted `Category=Config|Loader` passed 441/441, `Category=Cuda` passed 182/182, and `Category=Prefill|Parity` passed 175/175.
 - [_] Hand-written WMMA dense matmul for unquantized f32/f16 in the PTX seam (see DN-M5.3-2)
   - Verify: `dotnet test --filter Category=Kernel -c Release` on CUDA — WMMA path within band vs scalar reference; no native library linked (`CudaBackend+Ptx` only).
 
 #### Tests
 
 - [✓] Automated Kernel/Parity: CUDA GEMM for supported formats within the inherited band (batch==solo). Verified with targeted `Category=Cuda` 147/147 and `Category=Kernel|Parity` 520/520.
-- [_] Automated Config/Loader: `PrefillKernel.Gemm` on an unsupported format refuses at load naming it; supported formats select it cleanly
+- [✓] Automated Config/Loader: `PrefillKernel.Gemm` on an unsupported format refuses at load naming it; supported formats select it cleanly. Verified with whole-model, hybrid/offloaded-prefill span gates and hot re-point refusal tests under targeted `Category=Config|Loader`, `Category=Cuda`, and `Category=Prefill|Parity`.
 - [_] Manual Bench Gate: read the committed report and confirm both the GEMM default and any cuBLAS reconsideration follow measured numbers
 
 #### Open Items
