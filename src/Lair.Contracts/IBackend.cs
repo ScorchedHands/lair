@@ -49,6 +49,14 @@ public interface IBackend : IDisposable
     void GemvBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs);
 
     /// <summary>
+    /// Whether this backend's GEMV kernels — single-vector and batched alike — execute for weights in
+    /// <paramref name="format"/>. A resolved route segment naming a format this backend reports as unsupported is refused
+    /// at load naming the model, that format, and this backend, rather than raised mid-forward or run through some other
+    /// device's kernels.
+    /// </summary>
+    bool SupportsGemv(QuantFormat format);
+
+    /// <summary>
     /// Blocked matmul over dequantized weight tiles: <paramref name="count"/> activation vectors (each exactly cols
     /// long) stored consecutively in <paramref name="inputs"/> multiply the same weight matrix, with each weight tile
     /// dequantized once and consumed by every activation vector of the batch. Outputs use the same

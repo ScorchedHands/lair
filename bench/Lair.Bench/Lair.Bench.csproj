@@ -13,6 +13,7 @@
     <ProjectReference Include="..\..\src\Lair.Contracts\Lair.Contracts.csproj" />
     <ProjectReference Include="..\..\src\Lair.Loader\Lair.Loader.csproj" />
     <ProjectReference Include="..\..\src\Lair.Backends.Cpu\Lair.Backends.Cpu.csproj" />
+    <ProjectReference Include="..\..\src\Lair.Backends.Cuda\Lair.Backends.Cuda.csproj" />
     <ProjectReference Include="..\..\src\Lair.Kv\Lair.Kv.csproj" />
     <ProjectReference Include="..\..\src\Lair.Models\Lair.Models.csproj" />
     <ProjectReference Include="..\..\src\Lair.Tokenizer\Lair.Tokenizer.csproj" />

@@ -6,9 +6,13 @@ using Lair.Contracts;
 namespace Lair.Backends.Cuda;
 
 /// <summary>
-/// CUDA compute backend: packed weight tensors reach device memory one of two ways per instance. The default posture
-/// copies each tensor to device memory once per instance and every dense GEMV, single or batched, runs as an embedded
-    /// PTX kernel against those copies for F32, F16, BF16, Q4_K, and Q6_K weights. The host-mapped posture instead registers each
+    /// CUDA compute backend: packed weight tensors reach device memory one of two ways per instance. The default posture
+    /// copies each tensor to device memory once per instance and every dense GEMV, single or batched, runs as an embedded
+    /// PTX kernel against those copies for F32, F16, BF16, Q8_0, Q5_0, Q2_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ4_NL, and IQ4_XS
+    /// weights - the two IQ4 layouts dot against FP activations with fused nibble-table lookups against pinned scratch - plus
+    /// the five sub-4-bit i-quants (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, and IQ3_S), whose kernels instead consume a host-side Q8_K
+    /// quantization of each activation vector crossed over PCIe beside their pinned grid tables. The host-mapped posture instead registers each
+
 /// tensor's live host region with the driver and launches the same kernels against the device pointer the registration
 /// answers with, so no weight tensor is ever copied into persistent device memory and the weights stay resident exactly
 /// where the weight source holds them. Formats with no kernel here refuse naming this backend rather than run through
@@ -34,6 +38,19 @@ public sealed partial class CudaBackend : IBackend
     private readonly IntPtr _gemvBf16;
     private readonly IntPtr _gemvQ4K;
     private readonly IntPtr _gemvQ6K;
+    private readonly IntPtr _gemvQ8_0;
+    private readonly IntPtr _gemvQ5_0;
+    private readonly IntPtr _gemvQ2_0;
+    private readonly IntPtr _gemvQ5K;
+    private readonly IntPtr _gemvQ2K;
+    private readonly IntPtr _gemvQ3K;
+    private readonly IntPtr _gemvIQ4Nl;
+    private readonly IntPtr _gemvIQ4Xs;
+    private readonly IntPtr _gemvIQ2XXS;
+    private readonly IntPtr _gemvIQ2XS;
+    private readonly IntPtr _gemvIQ2S;
+    private readonly IntPtr _gemvIQ3X;
+    private readonly IntPtr _gemvIQ3S;
 
     private bool _disposed;
 
@@ -93,6 +110,19 @@ public sealed partial class CudaBackend : IBackend
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvBf16, _module, "gemv_bf16"));
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ4K, _module, "gemv_q4k"));
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ6K, _module, "gemv_q6k"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ8_0, _module, "gemv_q8_0"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ5_0, _module, "gemv_q5_0"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ2_0, _module, "gemv_q2_0"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ5K, _module, "gemv_q5k"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ2K, _module, "gemv_q2k"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvQ3K, _module, "gemv_q3k"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvIQ4Nl, _module, "gemv_iq4nl"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvIQ4Xs, _module, "gemv_iq4xs"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvIQ2XXS, _module, "gemv_iq2xxs"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvIQ2XS, _module, "gemv_iq2xs"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvIQ2S, _module, "gemv_iq2s"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvIQ3X, _module, "gemv_iq3xxs"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemvIQ3S, _module, "gemv_iq3s"));
             }
             catch
             {
@@ -176,6 +206,26 @@ public sealed partial class CudaBackend : IBackend
 
     public bool SupportsGemm(QuantFormat format) => false;
 
+    /// <summary>
+    /// Whether this backend's GEMV kernels execute for weights in <paramref name="format"/>: the CUDA seam carries GEMV
+    /// kernels for <see cref="QuantFormat.F32"/>, <see cref="QuantFormat.F16"/>, <see cref="QuantFormat.BF16"/>,
+    /// <see cref="QuantFormat.Q8_0"/>, <see cref="QuantFormat.Q5_0"/>, <see cref="QuantFormat.Q2_0"/>,
+    /// <see cref="QuantFormat.Q4_K"/>, <see cref="QuantFormat.Q5_K"/>, <see cref="QuantFormat.Q6_K"/>,
+    /// <see cref="QuantFormat.Q2_K"/>, and <see cref="QuantFormat.Q3_K"/> only, so a route naming any other format is
+    /// refused at load naming this backend rather than raised mid-decode by <see cref="SelectGemv"/> or run through some
+    /// other device's kernels.
+    /// </summary>
+    public bool SupportsGemv(QuantFormat format) => HasGemvKernel(format);
+
+    /// <summary>
+    /// The capability fact every CUDA GEMV posture answers from: the formats the embedded PTX GEMV kernels this backend resolves
+    /// function handles for — every QuantFormat the seam now carries. A load-time capability gate consults it through
+    /// <see cref="SupportsGemv"/>; it stays static so the posture is inspectable without opening a device. The sub-4-bit i-quant
+    /// family answers true here because its integer-dot kernels ride on host-side Q8_K quantization of the activation, and the IQ4
+    /// pair rides on fused nibble-table lookups against pinned scratch — no format left in the enum lacks a kernel today.
+    /// </summary>
+    public static bool HasGemvKernel(QuantFormat format) => true; // every QuantFormat member now resolves a GEMV function handle here
+
     // Row dequantization stays host-side: it expands one row for embedding lookups and norm vectors, not a matrix
     // traversal, with the same scalar math every backend already agrees on. Formats without an expansion here refuse
     // naming this backend instead of borrowing another device's kernel.
@@ -215,6 +265,45 @@ public sealed partial class CudaBackend : IBackend
                     break;
                 case QuantFormat.Q6_K:
                     DequantQ6KRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.Q8_0:
+                    DequantQ8_0Row(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.Q5_0:
+                    DequantQ5_0Row(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.Q2_0:
+                    DequantQ2_0Row(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.Q5_K:
+                    DequantQ5KRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.Q2_K:
+                    DequantQ2KRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.Q3_K:
+                    DequantQ3KRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.IQ4_NL:
+                    DequantIQ4NlRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.IQ4_XS:
+                    DequantIQ4XRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.IQ2_XXS:
+                    DequantIQ2XXSRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.IQ2_XS:
+                    DequantIQ2XSRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.IQ2_S:
+                    DequantIQ2SRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.IQ3_XXS:
+                    DequantIQ3XRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
+                    break;
+                case QuantFormat.IQ3_S:
+                    DequantIQ3SRow(new ReadOnlySpan<byte>(rowPtr, (int)stride), cols, output);
                     break;
                 default:
                     throw Unsupported(w.Format, "row dequantization");
@@ -285,6 +374,7 @@ public sealed partial class CudaBackend : IBackend
             SetCurrentContext();
 
             ReleaseKvMirrors(); // mirrors flush and release their pins while this instance's context is still current
+            FreeIqScratch(); // the pinned i-quant tables belong to this context too, so they go before it does
             FreeDeviceWeightAllocations();
             ReleaseHostMappedRegions();
             ReleaseTimingEvents(); // the launch-timing pair belongs to this context too, so it goes before the context does
@@ -307,6 +397,12 @@ public sealed partial class CudaBackend : IBackend
         (int rows, int cols) = ValidateShape(w);
         IntPtr function = KernelFor(w.Format); // refuses formats with no kernel before any device work starts
 
+        if (w.Format is QuantFormat.IQ2_XXS or QuantFormat.IQ2_XS or QuantFormat.IQ2_S or QuantFormat.IQ3_XXS or QuantFormat.IQ3_S)
+        {
+            RunGemvQ8K(w, activations, count, output, function); // the sub-4-bit family dots against a host-side Q8_K quantization of the activation instead.
+            return;
+        }
+
         nuint weightBytes = checked((nuint)(rows * w.Shape.RowStrideBytes(w.Format)));
         nuint xBytes = checked((nuint)count * (nuint)cols * sizeof(float));
         nuint outBytes = checked((nuint)count * (nuint)rows * sizeof(float));
@@ -327,6 +423,12 @@ public sealed partial class CudaBackend : IBackend
                 }
             }
 
+            bool iqTab = w.Format is QuantFormat.IQ4_NL or QuantFormat.IQ4_XS; // these two kernels look every nibble up in the shared scratch table.
+            if (iqTab)
+            {
+                EnsureIqScratch(); // bound once per instance beside every other pinned table this seam reads.
+            }
+
             ulong deviceX = 0;
             ulong deviceOut = 0;
             try
@@ -345,13 +447,19 @@ public sealed partial class CudaBackend : IBackend
                     uint rowsU = (uint)rows;
                     uint colsU = (uint)cols;
                     uint countU = (uint)count;
-                    void** kernelParams = stackalloc void*[6];
+                    ulong tabBase = _tabIq4Values; // only the IQ4 pair reads it: every other kernel in this family declares six parameters.
+                    void** kernelParams = stackalloc void*[iqTab ? 7 : 6];
                     kernelParams[0] = &deviceWeights;
                     kernelParams[1] = &deviceX;
                     kernelParams[2] = &deviceOut;
                     kernelParams[3] = &rowsU;
                     kernelParams[4] = &colsU;
                     kernelParams[5] = &countU;
+
+                    if (iqTab)
+                    {
+                        kernelParams[6] = &tabBase; // the scratch table cursor rides last, matching every other launch parameter order on this seam.
+                    }
 
                     uint blocks = (uint)((rows + KernelThreads - 1) / KernelThreads);
                     bool timed = BeginKernelTiming(); // device-measured busy time for exactly this launch, when the seam is open here
@@ -396,11 +504,26 @@ public sealed partial class CudaBackend : IBackend
         QuantFormat.BF16 => _gemvBf16,
         QuantFormat.Q4_K => _gemvQ4K,
         QuantFormat.Q6_K => _gemvQ6K,
+        QuantFormat.Q8_0 => _gemvQ8_0,
+        QuantFormat.Q5_0 => _gemvQ5_0,
+        QuantFormat.Q2_0 => _gemvQ2_0,
+        QuantFormat.Q5_K => _gemvQ5K,
+        QuantFormat.Q2_K => _gemvQ2K,
+        QuantFormat.Q3_K => _gemvQ3K,
+        QuantFormat.IQ4_NL => _gemvIQ4Nl,
+        QuantFormat.IQ4_XS => _gemvIQ4Xs,
+        QuantFormat.IQ2_XXS => _gemvIQ2XXS,
+        QuantFormat.IQ2_XS => _gemvIQ2XS,
+        QuantFormat.IQ2_S => _gemvIQ2S,
+        QuantFormat.IQ3_XXS => _gemvIQ3X,
+        QuantFormat.IQ3_S => _gemvIQ3S,
         _ => throw Unsupported(format, "GEMV"),
     };
 
     private static NotSupportedException Unsupported(QuantFormat format, string kernel) => new(
-        $"CudaBackend ('{DeviceIdValue}') has no {kernel} kernel for format {format}: the CUDA seam carries F32, F16, BF16, Q4_K, and Q6_K kernels only, " +
+        $"CudaBackend ('{DeviceIdValue}') has no {kernel} kernel for format {format}: the CUDA seam carries GEMV kernels " +
+        "for every QuantFormat it accepts today (F32, F16, BF16, Q8_0, Q5_0, Q2_0, Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ4_NL, " +
+        "IQ4_XS, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, and IQ3_S) and blocked-matmul kernels none of them, " +
         "so this weight pass is refused naming that backend rather than run through a CPU fallback.");
 
     private static (int Rows, int Cols) ValidateShape(WeightRef w)

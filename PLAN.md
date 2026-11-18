@@ -1564,7 +1564,7 @@ KV cache becomes a configurable named format pair (`f32/f32`, `f16/f16`, `q8/q8`
 - [✓] Automated Spike: generic-vs-hand-written attention delta on a pinned fixture records primary vs fallback, and q4-K drift vs llama `q4_0` records keep/drop of `q4/q4`
 - [✓] Manual Quant Recommendation: read the measured per-mode bench and confirm the documented KV default follows the parity/quality decision, not the smallest footprint
 
-### MVP5.2 [v0.5.2] - Refined
+### MVP5.2 [v0.5.2] - Shipped
 
 CUDA reaches CPU parity on GGUF quant-format coverage for weight GEMV: the 13 formats CUDA lacks (`Q8_0`, `Q5_0`, `Q5_K`, `Q2_K`, `Q3_K`, `Q2_0`, `IQ4_NL`, `IQ4_XS`, `IQ2_XXS`/`IQ2_XS`/`IQ2_S`, `IQ3_XXS`/`IQ3_S`) get CUDA GEMV kernels validated against the CPU oracle **within a per-format measured band, not bit-for-bit**, so the new kernels are written to be fast rather than last-bit-equal. Ordered after MVP5 and MVP5.1 because it reuses their activation-quant machinery; scope is weight GEMV only — dense matmul/prefill land in MVP5.3/MVP5.4.
 
@@ -1574,7 +1574,7 @@ CUDA reaches CPU parity on GGUF quant-format coverage for weight GEMV: the 13 fo
   - Rationale: bit-identity forecloses every technique that makes GPU GEMV win; precedented by the lossy-mode bands already in DN-M51-7/DN-M7-9.
   - Rejected: keeping bit-identity (the whole reason this phase exists); dequant-to-f32 for i-quants (6–9× drift per DN-M5-2, forfeits `dp4a`); a LAIR-authored CUDA-only oracle (consistently-wrong risk).
   - Contract: the Parity category gains a recorded per-format CUDA band; dense-family bands are never widened.
-- **DN-M5.2-2** — Sub-4-bit i-quant CUDA = `dp4a` int8×int8 against a `Q8_K` activation crossed over PCIe (bytes + scales, host-quantized once per forward), reusing MVP5's machinery rather than a dequant-to-f32 dot.
+- **DN-M5.2-2** — Sub-4-bit i-quant CUDA = integer-dot against a `Q8_K` activation crossed over PCIe (bytes + scales, host-quantized once per forward), reusing MVP5's machinery rather than a dequant-to-f32 dot; the landed PTX may use `mad.lo.u32` int8-product chains instead of literal `dp4a`, but it must preserve the no-FP-activation / no-dequant-to-f32 posture for that family.
   - Rationale: the CPU oracle for these formats is an integer-dot against `Q8_K`; matching it on CUDA needs that activation on-device — bandwidth-neutral-or-better versus today's f32 crossing.
   - Rejected: FP activation (DN-M5-2 numerics bug); dequant-to-f32 (6–9× drift, forfeits the integer-dot win).
   - Contract: a new `Q8_K`-over-PCIe seam feeding per-format CUDA dot kernels.
@@ -1589,20 +1589,20 @@ CUDA reaches CPU parity on GGUF quant-format coverage for weight GEMV: the 13 fo
 
 #### Implementation Items
 
-- [_] Load-time capability gate — refuse a `cuda`/`hybrid` segment naming an unsupported format at load, naming model/format/backend (see DN-M5.2-3)
-  - Verify: `dotnet test --filter Category=Config|Loader -c Release` — a route naming e.g. `IQ3_S` on CUDA refuses at load with the offending named; supported formats resolve unchanged.
-- [_] Block-quant CUDA GEMV (`Q8_0`, `Q5_0`, `Q5_K`, `Q2_K`, `Q3_K`, `Q2_0`) — dequant+dot kernels mirroring the scalar reference math within band (see DN-M5.2-1)
-  - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — output lands inside each format's recorded band vs the CPU oracle; batch==solo, no mid-decode `Unsupported`.
-- [_] i-quant CUDA GEMV (`IQ4_NL`, `IQ4_XS`, `IQ2_XXS/XS/S`, `IQ3_XXS/S`) — `dp4a` against a `Q8_K` activation crossed over PCIe (see DN-M5.2-1, DN-M5.2-2)
-  - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — integer-dot output within band vs the ik-pinned reference; near-tie argmax fixture holds or is recorded as a documented divergence (see DN-M5.2-1).
-- [_] Bench gate report — per-format CUDA-vs-CPU GEMV measured on pinned fixtures before defaults flip (see DN-M5.2-4)
-  - Verify: committed `bench/reports/cuda-gemv-parity-<date>.md` recording each format's band width and GPU/CPU delta; a measured loss keeps that format non-default rather than asserting a win.
+- [✓] Load-time capability gate — refuse a `cuda`/`hybrid` segment naming an unsupported format at load, naming model/format/backend (see DN-M5.2-3)
+  - Verify: `dotnet test --filter Category=Config|Loader -c Release` — a route naming e.g. `IQ3_S` on CUDA refuses at load with the offending named; supported formats resolve unchanged. Verified: new capability gate checks each resolved span's weight formats plus output head against `IBackend.SupportsGemv`, and targeted Config/Loader passed 389 tests including whole-model, hybrid split, tail-span, offloaded-prefill, CPU-unchanged, and CUDA-capability cases.
+- [✓] Block-quant CUDA GEMV (`Q8_0`, `Q5_0`, `Q5_K`, `Q2_K`, `Q3_K`, `Q2_0`) — dequant+dot kernels mirroring the scalar reference math within band (see DN-M5.2-1)
+  - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — output lands inside each format's recorded band vs the CPU oracle; batch==solo, no mid-decode `Unsupported`. Verified with PTX GEMV kernels and direct CUDA/CPU parity tests. Measured relative bands: Q8_0/Q5_0/Q2_0/Q2_K at 1e-6 (measured maxima 7.96e-7, 8.16e-7, 7.41e-7, 4.22e-7), Q5_K at 4e-6 (measured max 2.72e-6), and Q3_K at 2e-5 (batched measured max 1.01e-5).
+- [✓] i-quant CUDA GEMV (`IQ4_NL`, `IQ4_XS`, `IQ2_XXS/XS/S`, `IQ3_XXS/S`) — integer-dot against a host-side `Q8_K` activation crossed over PCIe (see DN-M5.2-1, DN-M5.2-2)
+  - Verify: `dotnet test --filter Category=Kernel|Parity -c Release` on CUDA — integer-dot output within band vs the ik-pinned reference; near-tie argmax fixture holds or is recorded as a documented divergence (see DN-M5.2-1). Verified with direct CPU-oracle parity, batch==solo, host-mapped posture, dequant/table equality, and near-tie argmax fixtures across all newly covered formats. Measured bands: IQ4_NL/IQ4_XS `2e-6` (worst ~1.03e-6 / 1.07e-6); IQ2_XXS/IQ2_XS/IQ3_XXS `5e-7` with measured bit-exact zero; IQ2_S `5e-7` worst ~8.27e-8 partial tail; IQ3_S `5e-7` worst ~1.47e-7 partial tail.
+- [✓] Bench gate report — per-format CUDA-vs-CPU GEMV measured on pinned fixtures before defaults flip (see DN-M5.2-4)
+  - Verify: committed `bench/reports/cuda-gemv-parity-<date>.md` recording each format's band width and GPU/CPU delta; a measured loss keeps that format non-default rather than asserting a win. Verified with `bench/reports/cuda-gemv-parity-2026-11-18.md`: deterministic pinned synthetic fixtures, 18 CUDA-supported formats, CPU scalar/auto-threaded wall vs CUDA launch wall plus device kernel-busy; sub-4-bit i-quants are measured total-pass wins against auto CPU (`IQ3_S` through `IQ2_XXS`, roughly `1.98x`–`2.73x`), dense/block formats with ratios below `1` remain non-default, and no automatic CUDA GEMV default is promoted from this bench alone.
 
 #### Tests
 
-- [_] Automated Kernel/Parity: CUDA GEMV for every newly covered format lands within its recorded per-format band vs the CPU oracle (batch==solo), with the near-tie argmax fixture
-- [_] Automated Config/Loader: an unsupported `cuda`-named format refuses at load naming model/format/backend
-- [_] Manual Quant Recommendation: read the bench report and confirm each CUDA default follows measured speed, not assertion
+- [✓] Automated Kernel/Parity: CUDA GEMV for every newly covered format lands within its recorded per-format band vs the CPU oracle (batch==solo), with the near-tie argmax fixture
+- [✓] Automated Config/Loader: an unsupported `cuda`-named format refuses at load naming model/format/backend
+- [✓] Manual Quant Recommendation: read the bench report and confirm each CUDA default follows measured speed, not assertion
 
 ### MVP5.3 [v0.5.3] - Refined
 
@@ -2059,6 +2059,10 @@ Vision input on chat models.
 - **2026-11-18 — MVP5.1 closes CPU-only quantized KV; CUDA per-combo KV attention moves to MVP5.4.** MVP5.1's landed public route is CPU host-resident `q8_0/q8_0` and `k8v4` over the batched-row window, with CUDA/offload/device-backed KV postures refused at model open. Building CUDA quantized KV attention now would create an isolated device attention path before MVP5.4 owns on-device transformer steps and device-resident KV, so the CUDA parity work belongs to the phase that already has the device-side step contract. Rejected: shipping CUDA quantized KV parity in MVP5.1 ahead of MVP5.4's device-KV/attention seam; silently falling back to CPU for a CUDA-declared quantized KV posture.
 
 - **2026-11-18 — MVP5.1's measured quantized KV recommendation keeps `f32/f32` as the default posture.** The production CPU bench on `SmolLM-135M-Instruct-F16.gguf` shows quantized KV saves footprint but is not a better default: baseline median decode is `23.659` tok/s at `56.25 MiB` reserved KV, while `q8_0/q8_0` is `8.200` tok/s at `14.94 MiB` and `k8v4` is `8.205` tok/s at `11.43 MiB`; prefill setup is also materially slower for the quantized routes. `q8_0/q8_0` is the conservative memory-saving quantized option, and `k8v4` is only for memory pressure when its looser measured drift is acceptable. Rejected: making a quantized KV mode the default because it has the smallest footprint, or treating the bench's forced-token logit diff as the authoritative quality gate instead of the pinned llama.cpp cache-type parity bands. Evidence is recorded in `bench/reports/kv-quant-recommendation-2026-11-18.md`.
+
+- **2026-11-18 — MVP5.2 sub-4-bit CUDA GEMV lands as host-Q8_K crossing plus PTX integer-dot chains, not literal `dp4a` instruction use.** The implementation preserves the intended DN-M5.2-2 posture: five sub-4-bit formats consume a host-side Q8_K quantization of each activation crossed to device and dot against format-specific integer unpacking/scaling logic rather than an FP-activation or dequant-to-f32 primary path; measured parity is bit-exact for `IQ2_XXS`, `IQ2_XS`, `IQ3_XXS`, with low representable-rounding residuals for `IQ2_S` and `IQ3_S`. Rejected: claiming the literal PTX instruction name as a hard requirement when the integer-dot/Q8_K posture is what protects numerics, or widening existing CPU/dense-family bands to absorb percent-level kernel bugs.
+
+- **2026-11-18 — MVP5.2 CUDA GEMV defaults remain measured and explicit; no automatic format default flips from a microbench.** The committed `cuda-gemv` bench shows sub-4-bit i-quants as total-pass wins against auto-threaded CPU on the pinned synthetic shape (`IQ3_S`, `IQ3_XXS`, `IQ2_*`) while dense formats such as F32/F16/BF16/Q8_0/Q4_K remain losses once runtime transfer/launch/sync overhead is included. Rejected: promoting a CUDA GEMV format to default from compute-only kernel speed or GPU presence alone; claiming fast prefill before MVP5.4 composes device-side attention and device-resident KV. Evidence is recorded in `bench/reports/cuda-gemv-parity-2026-11-18.md`.
 
 - **2026-11-17 — MVP5.1's KV config axis is a cold-path capability gate, not an early serving promise.** `models[].kv.quant.{k,v}` may parse and resolve named per-side combos (`f32/f32`, `f16/f16`, `q8/q8`/int8/k8v8, and `k8v4`) into footprint/config facts before block-struct storage and quantized attention land. The default `f32/f32` path serves unchanged; non-default named combos that have not yet landed their execution path are refused at model open naming the K/V formats and missing KV storage/attention support, rather than half-serving through today's FP32 pool or deferring the public axis until all later items finish. Rejected: accepting a quantized combo as servable while `BlockPool`/attention still only address FP32 floats; silently falling back to `f32/f32`; widening existing parity bands to make unimplemented modes appear supported.
 

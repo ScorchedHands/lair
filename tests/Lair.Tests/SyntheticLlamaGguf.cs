@@ -157,6 +157,173 @@ internal static class SyntheticLlamaGguf
         return path;
     }
 
+    /// <summary>
+    /// Writes one tiny synthetic llama-shaped GGUF whose matrix roles — the token embedding, every attention and
+    /// feed-forward projection, and the tied output head they carry — store in <paramref name="matrixFormat"/>, while
+    /// every norm vector stays <c>F32</c> exactly as a quantized conversion ships them. Payload bytes carry the declared
+    /// format's block geometry exactly (whole blocks per row, so the container reader accepts the file); their contents
+    /// are a fixed pattern no test that opens one of these files decodes. The declared geometry keeps every tensor's
+    /// fastest dimension a whole number of the block size the format requires.
+    /// </summary>
+    public static string WriteQuantizedMatrices(string modelName, QuantFormat matrixFormat, Geometry geometry)
+    {
+        using MemoryStream stream = new();
+        using BinaryWriter writer = new(stream, Encoding.UTF8, leaveOpen: true);
+
+        string[] tokens = ["<unk>", "hello", "world", "!", "<s>", "</s>", "<think>", "</think>"];
+        int[] tokenTypes = [2, 1, 1, 1, 4, 5, 1, 1];
+        int vocabSize = tokens.Length;
+
+        int headDim = geometry.HiddenSize / geometry.HeadCount;
+        int qRows = geometry.HeadCount * headDim;
+        int kvRows = geometry.KvHeadCount * headDim;
+
+        List<(string Name, int[] Dims, QuantFormat Format)> tensors = [new("token_embd.weight", [vocabSize, geometry.HiddenSize], matrixFormat)];
+        for (int layer = 0; layer < geometry.Layers; layer++)
+        {
+            tensors.Add(($"blk.{layer}.attn_q.weight", [qRows, geometry.HiddenSize], matrixFormat));
+            tensors.Add(($"blk.{layer}.attn_k.weight", [kvRows, geometry.HiddenSize], matrixFormat));
+            tensors.Add(($"blk.{layer}.attn_v.weight", [kvRows, geometry.HiddenSize], matrixFormat));
+            tensors.Add(($"blk.{layer}.attn_output.weight", [geometry.HiddenSize, qRows], matrixFormat));
+            tensors.Add(($"blk.{layer}.ffn_gate.weight", [geometry.FeedForwardLength, geometry.HiddenSize], matrixFormat));
+            tensors.Add(($"blk.{layer}.ffn_up.weight", [geometry.FeedForwardLength, geometry.HiddenSize], matrixFormat));
+            tensors.Add(($"blk.{layer}.ffn_down.weight", [geometry.HiddenSize, geometry.FeedForwardLength], matrixFormat));
+            tensors.Add(($"blk.{layer}.attn_norm.weight", [geometry.HiddenSize], QuantFormat.F32));
+            tensors.Add(($"blk.{layer}.ffn_norm.weight", [geometry.HiddenSize], QuantFormat.F32));
+        }
+
+        tensors.Add(new("output_norm.weight", [geometry.HiddenSize], QuantFormat.F32));
+
+        writer.Write(0x46554747u); // "GGUF"
+        writer.Write(3u);          // version
+        writer.Write((ulong)tensors.Count);
+        writer.Write(19ul);        // 18 metadata keys plus the chat template
+
+        WriteStringKv(writer, "general.architecture", "llama");
+        WriteStringKv(writer, "general.name", modelName);
+        WriteInt32Kv(writer, "llama.embedding_length", geometry.HiddenSize);
+        WriteInt32Kv(writer, "llama.block_count", geometry.Layers);
+        WriteInt32Kv(writer, "llama.attention.head_count", geometry.HeadCount);
+        WriteInt32Kv(writer, "llama.attention.head_count_kv", geometry.KvHeadCount);
+        WriteInt32Kv(writer, "llama.feed_forward_length", geometry.FeedForwardLength);
+        WriteFloat32Kv(writer, "llama.rope.freq_base", 10_000f);
+        WriteFloat32Kv(writer, "llama.attention.layer_norm_rms_epsilon", 1e-5f);
+        WriteInt32Kv(writer, "llama.vocab_size", vocabSize);
+        WriteStringKv(writer, "tokenizer.ggml.model", "gpt2");
+        WriteStringArrayKv(writer, "tokenizer.ggml.tokens", tokens);
+        WriteInt32ArrayKv(writer, "tokenizer.ggml.token_type", tokenTypes);
+        WriteStringArrayKv(writer, "tokenizer.ggml.merges", []);
+        WriteUint32Kv(writer, "tokenizer.ggml.bos_token_id", 4);
+        WriteUint32Kv(writer, "tokenizer.ggml.eos_token_id", 5);
+        WriteUint32Kv(writer, "tokenizer.ggml.unknown_token_id", 0);
+        WriteBoolKv(writer, "tokenizer.ggml.add_bos_token", false);
+        WriteStringKv(writer, "tokenizer.chat_template", ChatMlTemplate);
+
+        long offset = 0;
+        foreach ((string name, int[] dims, QuantFormat format) in tensors)
+        {
+            WriteString(writer, name);
+            writer.Write((uint)dims.Length);
+            for (int d = dims.Length - 1; d >= 0; d--) // GGUF stores dims fastest-varying first
+            {
+                writer.Write((ulong)dims[d]);
+            }
+
+            writer.Write(BlockFormat.GgmlTypeId(format));
+            writer.Write((ulong)offset);
+
+            offset += TensorBytes(dims, format);
+        }
+
+        long headerLength = stream.Position;
+        long dataStart = (headerLength + 31) / 32 * 32; // GGUF default alignment is 32
+        for (long i = headerLength; i < dataStart; i++)
+        {
+            writer.Write((byte)0);
+        }
+
+        int ordinal = 0;
+        foreach ((int[] dims, QuantFormat format) in tensors.Select(t => (t.Dims, t.Format)))
+        {
+            long bytes = TensorBytes(dims, format);
+            for (long b = 0; b < bytes; b++)
+            {
+                writer.Write((byte)((ordinal * 31 + b * 7) % 251)); // a fixed pattern: whole blocks of plausible block bytes
+            }
+
+            ordinal++;
+        }
+
+        writer.Flush();
+
+        string path = Path.Combine(Path.GetTempPath(), $"lair-quantized-matrices-{Guid.NewGuid():N}.gguf");
+        File.WriteAllBytes(path, stream.ToArray());
+        return path;
+    }
+
+    /// <summary>The block geometry one matrix format stores in: bytes per block, elements per block, and the ggml type id the container names it by.</summary>
+    private static class BlockFormat
+    {
+        public static uint GgmlTypeId(QuantFormat format) => format switch
+        {
+            QuantFormat.F32 => 0u,
+            QuantFormat.F16 => 1u,
+            QuantFormat.Q5_0 => 6u,
+            QuantFormat.Q8_0 => 8u,
+            QuantFormat.Q2_K => 10u,
+            QuantFormat.Q3_K => 11u,
+            QuantFormat.Q4_K => 12u,
+            QuantFormat.Q5_K => 13u,
+            QuantFormat.Q6_K => 14u,
+            QuantFormat.IQ3_S => 21u,
+            QuantFormat.Q2_0 => 42u, // the project's own type id for its Q2_0 block layout
+            _ => 30u, // BF16
+        };
+
+        public static int TypeSize(QuantFormat format) => format switch
+        {
+            QuantFormat.F32 => 4,
+            QuantFormat.F16 => 2,
+            QuantFormat.BF16 => 2,
+            QuantFormat.Q5_0 => 22,
+            QuantFormat.Q8_0 => 34,
+            QuantFormat.Q2_K => 84,
+            QuantFormat.Q3_K => 110,
+            QuantFormat.Q4_K => 144,
+            QuantFormat.Q5_K => 176,
+            QuantFormat.Q6_K => 210,
+            QuantFormat.IQ3_S => 110,
+            QuantFormat.Q2_0 => 18,
+            _ => throw new ArgumentException($"no block geometry for {format}", nameof(format)),
+        };
+
+        public static int BlockSize(QuantFormat format) => format switch
+        {
+            QuantFormat.F32 or QuantFormat.F16 or QuantFormat.BF16 => 1,
+            QuantFormat.Q5_0 or QuantFormat.Q8_0 => 32,
+            QuantFormat.Q2_0 => 64,
+            QuantFormat.Q4_K or QuantFormat.Q5_K or QuantFormat.Q6_K or QuantFormat.Q2_K or QuantFormat.Q3_K or QuantFormat.IQ3_S => 256,
+            _ => throw new ArgumentException($"no block geometry for {format}", nameof(format)),
+        };
+    }
+
+    private static long TensorBytes(int[] dims, QuantFormat format)
+    {
+        long elements = 1;
+        foreach (int dim in dims)
+        {
+            elements *= dim;
+        }
+
+        int block = BlockFormat.BlockSize(format);
+        if (elements % block != 0)
+        {
+            throw new ArgumentException($"declared geometry is not a whole number of {format} blocks", nameof(dims));
+        }
+
+        return elements / block * BlockFormat.TypeSize(format);
+    }
+
     private static uint GgmlTypeId(QuantFormat format) => format switch
     {
         QuantFormat.F32 => 0u,
