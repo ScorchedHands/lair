@@ -4,6 +4,18 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-11-18
+
+### Added
+
+- Quantized KV cache format pair: `models[].kv.quant.{k,v}` resolves per-side KV storage formats with `f32/f32` as the default. CPU host-resident quantized serving accepts `q8_0/q8_0` (also spelled `q8`, `int8`, or `k8v8`) and `q8_0/q4_0` (`k8v4`) through typed block pools, generic KV sequences, and closed quantized attention routes; unsupported posture pairs, device-backed KV postures, non-`gemv` prefill kernels, dedicated prefill lanes, CUDA splits, and the dropped `q4_0/q4_0` pair refuse at model open.
+- `Lair.Bench kv-quant [model.gguf] [--modes baseline,q8q8,k8v4] [--threads N] [--context C] [--decode D] [--windows N]`: measures production CPU quantized KV decode routes against the FP32 baseline, reporting median/min/max decode tok/s, prefill setup cost, footprint, argmax sanity, and max-abs-logit drift against the same run's baseline probe.
+- Quantized KV parity fixtures and gates for `q8_0/q8_0` and `k8v4` against pinned llama.cpp cache-type references, with measured bands `0.25` and `0.50` nats respectively.
+
+### Changed
+
+- KV pools, sequences, prefix-cache plumbing, and model-open routes now carry a resolved KV format pair; the default FP32 path remains bit-identical while quantized CPU serving opens a fixed closed route at model open rather than branching per token.
+
 ## [0.5.0] - 2026-11-17
 
 ### Added

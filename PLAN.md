@@ -179,7 +179,7 @@ graph TD
 - `IConfigSource` — default watched config file
 - `IModelLoader` — default GGUF mmap
 - `IWeightSource` — default `MmapTensorSource`; byte-reduction experiments plug in as alternate providers
-- `IKvFormat` — default `f32/f32` (bit-identical); quantized modes (`f16`/`q8`/`q4`, incl. `k8v4`) as a per-side format pair behind `BlockPool<TK,TV>` / `LayerOps<TK,TV>` (MVP5.1)
+- `IKvFormat` — default `f32/f32` (bit-identical); CPU host-resident quantized modes `q8_0/q8_0` and `q8_0/q4_0` (`k8v4`) as a per-side format pair behind `BlockPool<TK,TV>` / `LayerOps<TK,TV>`; CUDA per-combo quantized KV attention lands with MVP5.4
 
 ### Data model
 
@@ -1511,7 +1511,7 @@ Sub-4-bit i-quants decode at the Q4_K/IQ4_XS cost on AVX2, not the measured ≈6
 - [X] **Sub4-bit parity reference lineage** — committed fixtures are stock llama.cpp b12032 outputs, but the integer-dot rewrite moves LAIR's calibrated logprob values (e.g. `parity-llama32-udiq3xxs.json` prompt 1 token 1070 moved -4.7337 → -4.4798). No pinned ik binary/toolchain was available in the work window.
   - Decision: owner accepted measured-drift parity for this lineage on 2026-11-17; fixtures retain b12032 top-logprobs as external comparison and regenerate `lair_logprob` calibration entries from current LAIR output, with drift recorded rather than tolerance widened.
 
-### MVP5.1 [v0.5.1] - In Progress
+### MVP5.1 [v0.5.1] - Shipped
 
 KV cache becomes a configurable named format pair (`f32/f32`, `f16/f16`, `q8/q8`/int8/k8v8, and `k8v4`) with copy-less storage and an in-kernel quantized-dot attention path; the measured-failed `q4/q4` combo is dropped. Ordered after MVP5 because it reuses the same activation-quant machinery.
 
@@ -1561,8 +1561,8 @@ KV cache becomes a configurable named format pair (`f32/f32`, `f16/f16`, `q8/q8`
 - [✓] Automated Config/Kv: the named combos resolve, sizing/footprint follows declared formats, direct-pool `BytesPerBlock` proves each descriptor's footprint even while non-default serving is refused until execution support lands, and `f32/f32` remains default
 - [✓] Automated Kv: quantized block round-trip bit-identity and CoW-without-requantize
 - [✓] Automated Parity CPU: `f32/f32` bit-identical to the pinned oracle; each landed CPU quantized mode within its recorded band against the matching llama/ik cache-type output (`q8_0/q8_0` and `k8v4`)
-- [_] Automated Spike: generic-vs-hand-written attention delta on a pinned fixture records primary vs fallback, and q4-K drift vs llama `q4_0` records keep/drop of `q4/q4`
-- [_] Manual Quant Recommendation: read the measured per-mode bench and confirm the documented KV default follows the parity/quality decision, not the smallest footprint
+- [✓] Automated Spike: generic-vs-hand-written attention delta on a pinned fixture records primary vs fallback, and q4-K drift vs llama `q4_0` records keep/drop of `q4/q4`
+- [✓] Manual Quant Recommendation: read the measured per-mode bench and confirm the documented KV default follows the parity/quality decision, not the smallest footprint
 
 ### MVP5.2 [v0.5.2] - Refined
 
@@ -2057,6 +2057,8 @@ Vision input on chat models.
 - **2026-11-18 — MVP5.1's CPU quantized KV serving route closes against pinned llama.cpp b12032 cache-type references on `SmolLM-135M-Instruct-F16.gguf`.** The public named combos now serve through fixed closed routes opened at model open: `q8_0/q8_0` and `k8v4` (`q8_0/q4_0`). Generated fixtures use llama-server `/completion` with matching `-ctk/-ctv`, LAIR calibration uses the same quantized CPU route, and `Category=Parity` gates argmax membership in reference top-5 plus calibrated reproduction inside mode bands. Measured relevant drift: q8_0/q8_0 max 0.1347 nats recorded at band 0.25; k8v4 max 0.3856 nats recorded at band 0.50. CUDA per-combo KV attention moves to MVP5.4, so MVP5.1 closes CPU-only. Evidence is recorded in `bench/reports/kv-cache-type-parity-2026-11-18.md`.
 
 - **2026-11-18 — MVP5.1 closes CPU-only quantized KV; CUDA per-combo KV attention moves to MVP5.4.** MVP5.1's landed public route is CPU host-resident `q8_0/q8_0` and `k8v4` over the batched-row window, with CUDA/offload/device-backed KV postures refused at model open. Building CUDA quantized KV attention now would create an isolated device attention path before MVP5.4 owns on-device transformer steps and device-resident KV, so the CUDA parity work belongs to the phase that already has the device-side step contract. Rejected: shipping CUDA quantized KV parity in MVP5.1 ahead of MVP5.4's device-KV/attention seam; silently falling back to CPU for a CUDA-declared quantized KV posture.
+
+- **2026-11-18 — MVP5.1's measured quantized KV recommendation keeps `f32/f32` as the default posture.** The production CPU bench on `SmolLM-135M-Instruct-F16.gguf` shows quantized KV saves footprint but is not a better default: baseline median decode is `23.659` tok/s at `56.25 MiB` reserved KV, while `q8_0/q8_0` is `8.200` tok/s at `14.94 MiB` and `k8v4` is `8.205` tok/s at `11.43 MiB`; prefill setup is also materially slower for the quantized routes. `q8_0/q8_0` is the conservative memory-saving quantized option, and `k8v4` is only for memory pressure when its looser measured drift is acceptable. Rejected: making a quantized KV mode the default because it has the smallest footprint, or treating the bench's forced-token logit diff as the authoritative quality gate instead of the pinned llama.cpp cache-type parity bands. Evidence is recorded in `bench/reports/kv-quant-recommendation-2026-11-18.md`.
 
 - **2026-11-17 — MVP5.1's KV config axis is a cold-path capability gate, not an early serving promise.** `models[].kv.quant.{k,v}` may parse and resolve named per-side combos (`f32/f32`, `f16/f16`, `q8/q8`/int8/k8v8, and `k8v4`) into footprint/config facts before block-struct storage and quantized attention land. The default `f32/f32` path serves unchanged; non-default named combos that have not yet landed their execution path are refused at model open naming the K/V formats and missing KV storage/attention support, rather than half-serving through today's FP32 pool or deferring the public axis until all later items finish. Rejected: accepting a quantized combo as servable while `BlockPool`/attention still only address FP32 floats; silently falling back to `f32/f32`; widening existing parity bands to make unimplemented modes appear supported.
 
