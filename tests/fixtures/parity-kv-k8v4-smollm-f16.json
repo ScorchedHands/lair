@@ -1,0 +1,167 @@
+{
+  "model_file": "models/SmolLM-135M-Instruct-F16.gguf",
+  "model_sha256": "1fc02c21fba7874b15955d21dc59182aeae382abea412419ffd2fbaa84861790",
+  "llama_cpp_tag": "b12032",
+  "llama_cpp_asset": "llama-b12032-bin-win-cpu-x64.zip",
+  "kv_quant": {
+    "v": "q4_0",
+    "k": "q8_0"
+  },
+  "quantized_kv_band": 0.5,
+  "reference_mode": "llama-server /completion, temperature 0, n_probs 5, threads 8, cache types q8_0/q4_0 (server mode is the pinned reference; CLI mode disagrees with it on identical prompts)",
+  "decode": {
+    "context": 1024,
+    "temperature": 0.0
+  },
+  "generated_utc": "2026-11-18T06:45:05Z",
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "max_tokens": 48,
+      "output": " $100,000,000$, and the population is $100,000,000$. The population is expected to grow by $100,000,00",
+      "top_logprobs": [
+        {
+          "id": 1885,
+          "token": " $",
+          "logprob": -1.5922605991363525,
+          "lair_logprob": -1.5591
+        },
+        {
+          "id": 260,
+          "token": " the",
+          "logprob": -2.2567780017852783,
+          "lair_logprob": -2.0715
+        },
+        {
+          "id": 4723,
+          "token": " approximately",
+          "logprob": -2.2638866901397705,
+          "lair_logprob": -2.6262
+        },
+        {
+          "id": 216,
+          "token": " ",
+          "logprob": -2.465345621109009,
+          "lair_logprob": -2.3998
+        },
+        {
+          "id": 24927,
+          "token": " €",
+          "logprob": -3.026038408279419,
+          "lair_logprob": -3.0994
+        }
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "max_tokens": 48,
+      "output": ", there was a man named John. He had a son named John. John was a very smart man. He was very good at math and science. He was also very good at writing. He was very good at writing stories. He",
+      "top_logprobs": [
+        {
+          "id": 28,
+          "token": ",",
+          "logprob": -0.1656101495027542,
+          "lair_logprob": -0.1393
+        },
+        {
+          "id": 665,
+          "token": " there",
+          "logprob": -3.585275411605835,
+          "lair_logprob": -3.9709
+        },
+        {
+          "id": 281,
+          "token": " in",
+          "logprob": -3.588787794113159,
+          "lair_logprob": -3.788
+        },
+        {
+          "id": 253,
+          "token": " a",
+          "logprob": -4.322160720825195,
+          "lair_logprob": -4.4359
+        },
+        {
+          "id": 260,
+          "token": " the",
+          "logprob": -4.76178503036499,
+          "lair_logprob": -5.047
+        }
+      ]
+    },
+    {
+      "prompt": "def fibonacci(n):\n",
+      "max_tokens": 48,
+      "output": "\tif n == 0:\n\t\treturn 0\n\telif n == 1:\n\t\treturn 1\n\telse:\n\t\treturn fibonacci(n-1) + fibonacci(n-2)",
+      "top_logprobs": [
+        {
+          "id": 197,
+          "token": "\t",
+          "logprob": -0.9976044297218323,
+          "lair_logprob": -1.1914
+        },
+        {
+          "id": 19,
+          "token": "#",
+          "logprob": -1.7915210723876953,
+          "lair_logprob": -1.7531
+        },
+        {
+          "id": 3725,
+          "token": "```",
+          "logprob": -2.1542320251464844,
+          "lair_logprob": -1.8158
+        },
+        {
+          "id": 5406,
+          "token": "return",
+          "logprob": -3.0576095581054688,
+          "lair_logprob": -2.7137
+        },
+        {
+          "id": 3391,
+          "token": "assert",
+          "logprob": -3.3757076263427734,
+          "lair_logprob": -3.6145
+        }
+      ]
+    },
+    {
+      "prompt": "<|im_start|>user\nReply with a single sentence about the planet Mars.\n<|im_end|>\n<|im_start|>assistant\n",
+      "max_tokens": 48,
+      "output": "Mars is a planet that is not a star. It is a planet that is not a star. Mars is a planet that is not a star.\n\nMars is a planet that is not a star. Mars is a planet that is",
+      "top_logprobs": [
+        {
+          "id": 38861,
+          "token": "Mars",
+          "logprob": -0.9674679636955261,
+          "lair_logprob": -0.9017
+        },
+        {
+          "id": 504,
+          "token": "The",
+          "logprob": -1.8300586938858032,
+          "lair_logprob": -1.7533
+        },
+        {
+          "id": 198,
+          "token": "\n",
+          "logprob": -2.6417746543884277,
+          "lair_logprob": -2.7745
+        },
+        {
+          "id": 57,
+          "token": "I",
+          "logprob": -2.803230047225952,
+          "lair_logprob": -2.9916
+        },
+        {
+          "id": 33,
+          "token": "1",
+          "logprob": -4.046119213104248,
+          "lair_logprob": -4.2669
+        }
+      ]
+    }
+  ]
+}
