@@ -1549,7 +1549,7 @@ KV cache becomes a configurable named format pair (`f32/f32`, `f16/f16`, `q8/q8`
   - Verify: corrected q4-K measurement shows primary p4 max relevant delta 4.0019 nats with one missing relevant token plus broader fixture failures; `q4/q4` is dropped without adding a passing Parity fixture or widening bands. See `bench/reports/q4-k-viability-2026-11-17.md`.
 - [✓] KV format descriptor + `models[].kv.quant.{k,v}` config axis (cold path) — enumerate the named combos, parse/validate them into a cold-path descriptor before pool construction, record the resolved pair in load-time model facts, and drive footprint plus `BlockPool.BytesPerBlock` from that descriptor; serve only combos whose storage and attention execution path has landed, refusing non-default combinations at model open naming K/V format and missing KV support until later items land (see DN-M51-1, DN-M51-2, DN-M51-3)
   - Verify: `dotnet test --filter Category=Config|Kv` — an unknown or invalid combo reports the offending K/V name; valid alternative named combos resolve to descriptors whose footprint and direct-pool `BytesPerBlock` reflect declared formats even while engine serving refuses until their execution path lands; `f32/f32` remains the default when unset.
-- [_] Generic block-struct storage — `BlockPool<TK,TV>` with q8_0/q4_0 as fixed-size payload+scale structs, preserving zero-copy block-granularity `.Slice` reads (see DN-M51-2)
+- [✓] Generic block-struct storage — `BlockPool<TK,TV>` with q8_0/q4_0 as fixed-size payload+scale structs, preserving zero-copy block-granularity `.Slice` reads (see DN-M51-2)
   - Verify: `dotnet test --filter Category=Kv` — a quantized block round-trips bit-identically to its own writer (1T==4T, batch==solo), and copy-on-write copies the quantized block whole without re-quantizing.
 - [_] In-kernel quantized-dot attention (CPU) — `LayerOps<TK,TV>` over `IKvFormat<TSelf>` static-abstract dot/accumulate, reusing MVP5's activation-quant machinery for the K-dot (see DN-M51-2, DN-M51-5, DN-M51-6)
   - Verify: `dotnet test --filter Category=Parity` — `f32/f32` reproduces the pinned reference bit-identically; each quantized mode lands within its recorded band against the matching llama/ik cache-type output.
@@ -1559,7 +1559,7 @@ KV cache becomes a configurable named format pair (`f32/f32`, `f16/f16`, `q8/q8`
 #### Tests
 
 - [✓] Automated Config/Kv: the named combos resolve, sizing/footprint follows declared formats, direct-pool `BytesPerBlock` proves each descriptor's footprint even while non-default serving is refused until execution support lands, and `f32/f32` remains default
-- [_] Automated Kv: quantized block round-trip bit-identity and CoW-without-requantize
+- [✓] Automated Kv: quantized block round-trip bit-identity and CoW-without-requantize
 - [_] Automated Parity: `f32/f32` bit-identical to the pinned oracle; each quantized mode within its recorded band against the matching llama/ik cache-type output (CPU and CUDA)
 - [_] Automated Spike: generic-vs-hand-written attention delta on a pinned fixture records primary vs fallback, and q4-K drift vs llama `q4_0` records keep/drop of `q4/q4`
 - [_] Manual Quant Recommendation: read the measured per-mode bench and confirm the documented KV default follows the parity/quality decision, not the smallest footprint
