@@ -12,7 +12,7 @@ using Lair.Tokenizer;
 
 if (args.Length == 0)
 {
-    Console.WriteLine("usage: Lair.Bench <gemv|gguf-dump|gemv-file|prefill-profile|kv-spike|kv-micro|q4-parity|kv-quant|cuda-gemv|cuda-gemm|help>");
+    Console.WriteLine("usage: Lair.Bench <gemv|gguf-dump|gemv-file|prefill-profile|kv-spike|kv-micro|q4-parity|kv-quant|cuda-gemv|cuda-gemm|cuda-prefill|help>");
     return 1;
 }
 
@@ -28,6 +28,7 @@ return args[0] switch
     "kv-quant" => KvQuantDecodeBench.Run(args), // Manual Quant Recommendation measurement: production quantized KV serving routes against the FP32 baseline, bench-only with no posture or config change
     "cuda-gemv" => CudaGemvBench.Run(args), // Bench Gate measurement: per-format CUDA-vs-CPU GEMV over deterministic pinned synthetic fixtures (CPU scalar-oracle and auto-threaded wall time vs CUDA launch wall plus device-measured kernel-busy), bench-only with no posture or config change
     "cuda-gemm" => CudaGemmBench.Run(args), // Bench Gate measurement: per-format CUDA-vs-CPU blocked matmul over the same pinned fixtures (CPU scalar-oracle and auto-threaded wall time on each format's own weight-pass route - GemmBatch where SupportsGemm is true, otherwise batched-row GemvBatch - vs CUDA launch wall plus device-measured kernel-busy), bench-only with no posture or config change
+    "cuda-prefill" => CudaPrefillBench.Run(args), // Composition measurement: CPU dense prefill vs CUDA device-step composed prefill over the pinned dense fixture (whole-prefill wall time per arm, kernel-busy and runtime-transfer tallies for the CUDA arm beside its pool's residency facts, one untimed parity basis line per length with no band asserted), bench-only with no posture or config change
     _ => Usage(),
 };
 

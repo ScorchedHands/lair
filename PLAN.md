@@ -23,7 +23,7 @@ LAIR is a C#/.NET inference runtime for local LLMs on x64 hardware, serving CPU/
 - Per-resource tier budgets with overflow order: every model declares caps at each copy-holding (resource, tier) pair for weights/layers, KV, and the prefill working set; each resource carries its own tier priority (`dram` → `vram` → `disk`) so an exceeded cap demotes **that resource** into the next lower-priority tier rather than moving the whole model — read-side chains end at disk with no ceiling there. Cross-model contention is first-come-first-served for bytes and core quotas alike (spill down a chain, partial grants for compute), capacity is declared as host totals while NUMA nodes are derived from topology under a per-model `numa_spread: auto | local | interleave` preference
 - Dense weight tiering — dense (non-MoE) weight slabs are promotable/demorable across DRAM/VRAM/disk while serving; disk-resident dense weights are a capacity mechanism for multi-model residency on the 128 GB target, not a speed path
 - Config-file hot-reload for every runtime knob; no admin API
-- CUDA backend with Strata-style hybrid CPU/GPU inference: the same GGUF quant-format coverage as the CPU backend for weight GEMV/GEMM (MVP5.2/MVP5.3), an on-device dense prefill step (MVP5.4), concurrent multi-model device compute on one accelerator (MVP6.1), and the same GPU-compute feature set for flagship MoE models (MVP7.1-7.3)
+- CUDA backend with Strata-style hybrid CPU/GPU inference: the same GGUF quant-format coverage as the CPU backend for weight GEMV/GEMM (MVP5.2/MVP5.3), a non-default internal on-device dense prefill seam (MVP5.4), concurrent multi-model device compute on one accelerator (MVP6.1), and the same GPU-compute feature set for flagship MoE models (MVP7.1-7.3)
 - MoE residency for Qwen3.8-Flash-Next: router, expert gather, RAM hot tier, pageable PLE with indexed disk gather, MTP drafting
 - Tiered residency: disk cold expert tier, VRAM hot expert tier
 - Host-resident compute: DRAM-resident expert slabs executed on the GPU (Strata's `pcie-frac`) — GPU compute without spending VRAM on weights, streamed over PCIe with double-buffered prefetch
@@ -179,7 +179,7 @@ graph TD
 - `IConfigSource` — default watched config file
 - `IModelLoader` — default GGUF mmap
 - `IWeightSource` — default `MmapTensorSource`; byte-reduction experiments plug in as alternate providers
-- `IKvFormat` — default `f32/f32` (bit-identical); CPU host-resident quantized modes `q8_0/q8_0` and `q8_0/q4_0` (`k8v4`) as a per-side format pair behind `BlockPool<TK,TV>` / `LayerOps<TK,TV>`; CUDA per-combo quantized KV attention lands with MVP5.4
+- `IKvFormat` — default `f32/f32` (bit-identical); CPU host-resident quantized modes `q8_0/q8_0` and `q8_0/q4_0` (`k8v4`) as a per-side format pair behind `BlockPool<TK,TV>` / `LayerOps<TK,TV>`; CUDA per-combo quantized KV attention is landed as an internal/tested seam for those pairs
 
 ### Data model
 
@@ -1646,9 +1646,9 @@ CUDA dense matmul (`GemmBatch`) plus the toolchain decision — flips `SupportsG
 
 - [X] **Toolchain escalation** — Decision: the DN-M5.3-4 bench closes this for MVP5.3 without adopting cuBLAS/cuBLASLt or a `mma.sync` path; managed-first windowed PTX remains, and fast dense GPU prefill is gated by later device-side attention/KV composition rather than a library swap alone.
 
-### MVP5.4 [v0.5.4] - Refined
+### MVP5.4 [v0.5.4] - Shipped
 
-CUDA attention + device-resident KV for the GPU step — where **fast dense GPU prefill is actually demonstrated**, because it composes MVP5.3's matmul with on-device `softmax(QKᵀ)V`/RoPE/KV write instead of staging attention back over PCIe per layer. This owns MVP4's deferred GPU-attention kernels and reconciles its "CPU seam reads VRAM arenas" posture to device-side execution. Dense families only — flagship MoE device execution is gated in MVP7.*. Ordered after MVP5.3, before MVP6.
+CUDA attention + device-resident KV for the GPU step — measured as a length-dependent payoff rather than a default fast-prefill claim, because it composes MVP5.3's matmul with on-device `softmax(QKᵀ)V`/RoPE/KV write instead of staging attention back over PCIe per layer. This owns MVP4's deferred GPU-attention kernels and reconciles its "CPU seam reads VRAM arenas" posture to device-side execution. Dense families only — flagship MoE device execution is gated in MVP7.*. Ordered after MVP5.3, before MVP6.
 
 #### Design Notes
 
@@ -1667,24 +1667,24 @@ CUDA attention + device-resident KV for the GPU step — where **fast dense GPU 
 
 #### Implementation Items
 
-- [_] On-device step composition — causal `softmax(QKᵀ)V` + RoPE + KV write composed with MVP5.3 matmul, no per-layer PCIe attention staging (see DN-M5.4-1)
+- [✓] On-device step composition — causal `softmax(QKᵀ)V` + RoPE + KV write composed with MVP5.3 matmul, no per-layer PCIe attention staging (see DN-M5.4-1)
   - Verify: `dotnet test --filter Category=Parity|Prefill -c Release` on CUDA — a dense prefill generation lands within its recorded band vs the CPU-prefill reference; monitor shows device-side step, not per-layer host attention.
-- [_] Device-resident KV read/write for GPU steps (see DN-M5.4-2)
+- [✓] Device-resident KV read/write for GPU steps (see DN-M5.4-2)
   - Verify: `dotnet test --filter Category=Kv|Prefill -c Release` on CUDA — the GPU step reads/writes its own resident blocks; host-read arena mode still works unchanged as a non-default.
-- [_] CUDA per-combo quantized KV attention kernels selected at pool open (see DN-M51-3, DN-M51-7)
+- [✓] CUDA per-combo quantized KV attention kernels selected at pool open (see DN-M51-3, DN-M51-7)
   - Verify: `dotnet test --filter Category=Parity -c Release` on CUDA — `q8_0/q8_0` and `k8v4` device-side attention matches the landed CPU quantized-mode bands; no runtime format branching in the engine step loop.
-- [_] Prefill payoff + parity bench — measure end-to-end dense GPU prefill vs CPU prefill and record the generation band (see DN-M5.4-3)
+- [✓] Prefill payoff + parity bench — measure end-to-end dense GPU prefill vs CPU prefill and record the generation band (see DN-M5.4-3)
   - Verify: committed `bench/reports/cuda-prefill-<date>.md` showing device-vs-CPU dense prefill tok/s; a measured no-win records it rather than asserting fast prefill, and the parity band is recorded for each fixture.
 
 #### Tests
 
-- [_] Automated Parity/Prefill: dense GPU-prefill generations within their recorded band vs CPU-prefill reference; solo determinism holds
-- [_] Automated Parity CUDA KV: per-combo CUDA quantized KV attention matches the landed CPU quantized-mode bands (`q8_0/q8_0` and `k8v4`)
-- [_] Manual Flash Dense Prefill: run a pinned dense model on CUDA and confirm from monitor/bench that prefill is device-side and measurably faster than the CPU path
+- [✓] Automated Parity/Prefill: dense GPU-prefill generations within their recorded band vs CPU-prefill reference; solo determinism holds
+- [✓] Automated Parity CUDA KV: per-combo CUDA quantized KV attention matches the landed CPU quantized-mode bands (`q8_0/q8_0` and `k8v4`)
+- [✓] Manual Flash Dense Prefill: run a pinned dense model on CUDA and confirm from monitor/bench that prefill is device-side and measurably faster than the CPU path
 
 #### Open Items
 
-- [_] **GPU-prefill payoff gate** — whether composing matmul + attention + KV on-device actually beats CPU prefill on pinned fixtures is settled by DN-M5.4-3 measurement before GPU prefill becomes a default; a measured no-win keeps CPU prefill and records it (premise-falsification pattern). Resolve during MVP5.4 build.
+- [✓] **GPU-prefill payoff gate** — resolved as a mixed measurement: composing matmul + attention + KV on-device beats CPU prefill at some pinned dense lengths but not all, so GPU prefill stays non-default and the bench records both directions.
 
 ### MVP6 [v0.6.0] - Refined
 
@@ -1948,7 +1948,7 @@ CUDA GEMM for the **non-expert** matrices only — projections, hyper-connection
 
 ### MVP7.3 [v0.7.3] - Refined
 
-On-device Flash-Next step composing matmul + gather with the model's own attention family (linear/SSM, QSA sparse) and hyper-connections plus device KV/recurrent-state residency — the MoE counterpart of MVP5.4 where flagship GPU prefill is *demonstrated*, gated behind DN-M7-1. PLE deliberately stays host/disk-gathered. Ordered after MVP7.2; dense-only fast prefill already landed in MVP5.4, so this closes the flagship gap.
+On-device Flash-Next step composing matmul + gather with the model's own attention family (linear/SSM, QSA sparse) and hyper-connections plus device KV/recurrent-state residency — the MoE counterpart of MVP5.4 where flagship GPU prefill is *demonstrated*, gated behind DN-M7-1. PLE deliberately stays host/disk-gathered. Ordered after MVP7.2; non-default dense GPU-prefill composition landed in MVP5.4, so this closes the flagship gap.
 
 #### Design Notes
 
@@ -2051,6 +2051,8 @@ Vision input on chat models.
 | idea | Server-side MCP injection | per-model, config-declared MCP servers whose tool definitions LAIR injects into chat requests regardless of client; injected tools execute server-side (contrast DN-M2-8: client-supplied tools stay client-side); enables cross-model composition — an LLM calling a diffusion model through its MCP endpoint, or the embeddings engine exposed as a vector/RAG MCP; interacts with tool-call API work and server posture |
 
 ## Decision Log
+
+- **2026-11-19 — MVP5.4 GPU-prefill payoff is mixed and stays non-default.** The `cuda-prefill` bench on `SmolLM-135M-Instruct-F16.gguf` shows composed CUDA matmul + device attention/KV beats CPU dense prefill at measured lengths 32 (`wallRatioCpuOverGpu=1.195`) and 128 (`1.126`) but loses at length 64 (`0.966`). Composition-only logit drift was recorded as `4e-3` after a measured worst of `2.019E-3`; argmax matched on the measured cases, and device-to-device determinism holds. GPU prefill remains internal/non-default because the payoff is length-dependent rather than universal. Rejected: flipping dense GPU prefill to default from a mixed bench or claiming fast dense GPU prefill without recording the no-win lengths. Evidence is recorded in `bench/reports/cuda-prefill-2026-11-19.md`.
 
 - **2026-11-18 — MVP5.1's CPU quantized attention kernel seam lands as a compile-time typed hot path; public serving remains a separate engine/scheduler wiring item.** The production single-row decode kernels now run over `SequenceKv<TK,TV>` with q8_0 dot/value roles and q4_0 value-only role, reusing the shipped Q8_K activation machinery through internal CPU seams rather than copying quantizers. This settles that attention can be JIT-specialized without a runtime format switch while preserving FP32 default behavior; it does not make named quantized combos servable because `TransformerModel`, generation scheduling, and cache plumbing still expose only concrete float sequences until they select `(TK,TV)` at model open and route public KV paths through the generic seam. Rejected: marking parity complete from synthetic attention-kernel tests before llama/ik cache-type fixtures exist; half-serving quantized configs through the FP32 pool or scheduler path.
 

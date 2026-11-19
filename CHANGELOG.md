@@ -4,6 +4,15 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] - 2026-11-19
+
+### Added
+
+- CUDA device-side dense prefill composition for internal/bench postures: `CudaDeviceStep` composes staging, on-device KV write, causal attention/RoPE with existing CUDA matmul paths through an explicit non-default seam. Device-resident KV read/write is available for GPU steps while host-read arena modes remain unchanged as non-defaults.
+- CUDA per-combo quantized KV attention kernels selected at pool open for `q8_0/q8_0` and `k8v4`, with composition-only parity bands recorded against CPU references; unsupported combos/postures refuse rather than falling back. Public device-backed serving posture remains unchanged where the engine does not yet select those seams by default.
+- `Lair.Bench cuda-prefill [model.gguf] [--lengths L1,L2,...] [--reps R]`: measures CPU dense prefill against CUDA composed device-step prefill on pinned dense fixtures, printing wall medians/min/max, tok/s, ratios, kernel-busy/runtime-transfer tallies, KV residency facts, and untimed parity basis lines without asserting bands.
+- Committed `bench/reports/cuda-prefill-2026-11-19.md` records the MVP5.4 payoff gate as mixed: wins at measured lengths 32/128 on this host but loses at length 64, so GPU prefill stays non-default.
+
 ## [0.5.3] - 2026-11-18
 
 ### Added
