@@ -198,6 +198,22 @@ public sealed record ModelConfig
     public int? MaxConcurrentRequests { get; init; }
 
     /// <summary>
+    /// How many submissions this model may hold waiting for a concurrency slot before new ones are refused. Null (absent) or an
+    /// explicit 0 keeps today's posture: a submission arriving while every admission slot is held is refused immediately rather
+    /// than queued. A positive value lets such submissions block on the slot instead, each revalidated against context, KV capacity,
+    /// and budget chains when a slot frees; nothing a queued submission waits for costs the pool or a token budget before its own
+    /// admission. Sequences already admitted are untouched by a hot edit of this key, and so are submissions that were already waiting.
+    /// </summary>
+    public int? MaxQueuedRequests { get; init; }
+
+    /// <summary>
+    /// How long a submission may block waiting for an admission slot before it answers with the overloaded refusal. A present value
+    /// must be 1 or greater, in milliseconds. Null (absent) resolves to the documented default when queueing is enabled and carries
+    /// no meaning while queueing is disabled — with <c>max_queued_requests</c> at zero nothing waits, so this key changes no refusal posture there.
+    /// </summary>
+    public int? QueueTimeoutMs { get; init; }
+
+    /// <summary>
     /// The published source this model's files are pinned to — the repo, the revision as declared, and the file set with each
     /// file's pinned hash and size — or null when the entry says nothing about provenance, which serves the declared local
     /// path exactly as every model does today. The loader validates this block's shape at load like every other block;

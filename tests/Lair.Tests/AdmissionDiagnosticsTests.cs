@@ -184,6 +184,108 @@ public sealed class AdmissionDiagnosticsTests : IDisposable
     }
 
     [Fact]
+    public async Task Models_ReportsRequestQueuePostureAdditively_BesideTheConcurrencyFacts()
+    {
+        await using SyntheticServer uncued = await SyntheticServer.StartAsync(
+            NewSyntheticModel(), maxConcurrentRequests: 2, threadQuota: 2);
+
+        JsonElement immediate = await GetFirstModelEntryAsync(uncued);
+
+        // The queue keys ride every entry the way the cap keys do: a null depth plus the immediate posture says nothing queues and an over-cap
+        // submission is refused outright, exactly as it has always been.
+        Assert.True(immediate.TryGetProperty("max_queued_requests", out JsonElement absentDepth));
+        Assert.Equal(JsonValueKind.Null, absentDepth.ValueKind);
+        Assert.Equal("immediate", immediate.GetProperty("request_queue_posture").GetString());
+        Assert.Equal(0, immediate.GetProperty("queued_requests").GetInt32());
+        Assert.Equal(0, immediate.GetProperty("queue_timeout_ms").GetInt32());
+
+        // Earlier facts keep reading exactly as they did: the queue facts are additive payload beside them, never a reshaped envelope.
+        Assert.Equal(2, immediate.GetProperty("max_concurrent_requests").GetInt32());
+        Assert.Equal("capped", immediate.GetProperty("concurrency_cap_posture").GetString());
+
+        await using SyntheticServer bounded = await SyntheticServer.StartAsync(
+            NewSyntheticModel(), maxConcurrentRequests: 2, threadQuota: 2, maxQueuedRequests: 4);
+
+        JsonElement waiting = await GetFirstModelEntryAsync(bounded);
+
+        Assert.Equal(4, waiting.GetProperty("max_queued_requests").GetInt32());
+        Assert.Equal("bounded", waiting.GetProperty("request_queue_posture").GetString());
+        Assert.Equal(0, waiting.GetProperty("queued_requests").GetInt32()); // nothing waits right now on a freshly opened engine
+        Assert.Equal(RequestQueuePostures.DefaultQueueTimeoutMs, waiting.GetProperty("queue_timeout_ms").GetInt32()); // the documented default a declared cap resolves to
+
+        await using SyntheticServer declared = await SyntheticServer.StartAsync(
+            NewSyntheticModel(), maxConcurrentRequests: 2, threadQuota: 2, maxQueuedRequests: 4, queueTimeoutMs: 12_500);
+
+        JsonElement ceiling = await GetFirstModelEntryAsync(declared);
+        Assert.Equal(12_500, ceiling.GetProperty("queue_timeout_ms").GetInt32()); // a declared ceiling replaces the default on the advertised surface too
+    }
+
+    [Fact]
+    public async Task MaxQueuedRequestsHotEdit_ReadvertisesOnModelsEndpoint_WithoutRestart()
+    {
+        await using SyntheticServer server = await SyntheticServer.StartAsync(
+            NewSyntheticModel(), maxConcurrentRequests: 2, threadQuota: 2, maxQueuedRequests: 4, queueTimeoutMs: 12_500);
+
+        IReadOnlyList<FieldResult> applied = server.Engine.ApplyConfiguration(
+            server.Engine.EffectiveConfiguration with
+            {
+                Models = [server.Engine.EffectiveConfiguration.Models[0] with { MaxQueuedRequests = 9, QueueTimeoutMs = 4_000 }],
+            });
+
+        FieldResult depth = Assert.Single(applied, result => result.Change.Field == "models[0].max_queued_requests");
+        Assert.Equal(ConfigApplyOutcome.Applied, depth.Outcome);
+
+        FieldResult ceiling = Assert.Single(applied, result => result.Change.Field == "models[0].queue_timeout_ms");
+        Assert.Equal(ConfigApplyOutcome.Applied, ceiling.Outcome);
+
+        JsonElement entry = await GetFirstModelEntryAsync(server);
+        Assert.Equal(9, entry.GetProperty("max_queued_requests").GetInt32()); // the advertised depth follows the live edit
+        Assert.Equal("bounded", entry.GetProperty("request_queue_posture").GetString());
+
+        Assert.Equal(4_000, entry.GetProperty("queue_timeout_ms").GetInt32()); // and the advertised wait follows its own live edit
+    }
+
+
+    [Fact]
+    public async Task QueueDepthContention_RefusesSubmission_AndRingNamesQueueFull()
+    {
+        await using SyntheticServer server = await SyntheticServer.StartAsync(
+            NewSyntheticModel(), maxContextTokens: 512, kvBlocks: 8, maxConcurrentRequests: 1, maxQueuedRequests: 1);
+
+        (EngineBusyException busy, GenerationResult queuedAdmitted) = await RunUntilQueueFullAsync(server);
+
+        Assert.Equal("engine_overloaded", busy.Code); // the bounded overload family at the wire, same as its quota and capacity siblings
+        Assert.Contains("max_queued_requests", busy.Message); // the refusal names the depth posture it ran against
+        Assert.Contains(server.ModelName, busy.Message);
+
+        Assert.False(string.IsNullOrEmpty(queuedAdmitted.Text), "the submission holding the queue seat produced no text after the slot freed");
+
+        AdmissionRefusalEntry refusal = Assert.Single(
+            server.Bus.RecentAdmissionRefusals(),
+            entry => entry.Kind == AdmissionRefusalKinds.QueueFull); // the refusal the caller saw is the refusal the operator sees
+        Assert.Equal(server.ModelName, refusal.Model);
+    }
+
+    [Fact]
+    public async Task QueueTimeoutContention_RefusesSubmission_AndRingNamesQueueTimeout()
+    {
+        // A ceiling far shorter than the held sequence's own runtime: a submission that enters this engine's queue while its only slot is held cannot be
+        // admitted before its wait expires, so the timeout refusal is what contention produces here rather than an admission race.
+        await using SyntheticServer server = await SyntheticServer.StartAsync(
+            NewSyntheticModel(), maxContextTokens: 512, kvBlocks: 8, maxConcurrentRequests: 1, maxQueuedRequests: 2, queueTimeoutMs: 60);
+
+        EngineBusyException busy = await RunUntilQueueTimeoutAsync(server);
+        Assert.Equal("engine_overloaded", busy.Code); // the same bounded overload family at the wire as every other admission refusal here
+        Assert.Contains("queue_timeout_ms", busy.Message); // the refusal names its own wait ceiling and this model
+        Assert.Contains(server.ModelName, busy.Message);
+
+        AdmissionRefusalEntry refusal = Assert.Single(
+            server.Bus.RecentAdmissionRefusals(),
+            entry => entry.Kind == AdmissionRefusalKinds.QueueTimeout);
+        Assert.Equal(server.ModelName, refusal.Model);
+    }
+
+    [Fact]
     public async Task RecentAdmissionRefusals_SurviveIdleWindows_AndRideTheNextPublishedSnapshot()
     {
         string path = NewSyntheticModel();
@@ -320,6 +422,70 @@ public sealed class AdmissionDiagnosticsTests : IDisposable
     }
 
     [Fact]
+    public async Task Snapshots_CarryRequestQueuePosture_AndLiveDepth_InTheMetricsVocabulary()
+    {
+        using BusHarness harness = new();
+        await using EngineMetricsBus bus = new(
+            "queue-facts-model", harness.Scheduler, harness.Pool, cache: null, NullLoggerFactory.Instance, TimeSpan.FromMilliseconds(30));
+
+        // The configured posture rides the attached facts like every other configuration-backed field here; the live depth is sampled from the owning
+        // facade's own seat accounting at each publish. A bus with neither seam attached keeps reading these slots as nothing queued instead of zero-filled guesses about a host that queues nothing.
+        bus.AttachModelFacts(new ModelFacts(
+            Type: "chat",
+            WorkerThreads: 4,
+            CoreSet: "0-7",
+            ThreadQuota: null,
+            DecodeDevice: "cpu",
+            PrefillDevice: "cpu",
+            KvResidency: "dram",
+            PrefillKernel: "gemv",
+            MatmulWeightFormats: "F32",
+            MaxConcurrentRequests: 4,
+            MaxQueuedRequests: 6,
+            QueueTimeoutMs: 15_000));
+
+        bus.AttachQueueDepthProvider(() => 3); // what the owning facade reports as submissions waiting for a held slot right now
+
+        bus.RecordAdmissionRefusal(AdmissionRefusalKinds.QueueFull, "queue-facts-model", "queue full refusal");
+        bus.RecordAdmissionRefusal(AdmissionRefusalKinds.QueueTimeout, "queue-facts-model", "queue timeout refusal");
+
+        int[] prompt = [.. harness.Tokenizer.Encode("world!")];
+        PipelineHandle handle = harness.Scheduler.Submit(new ScheduledRequest
+        {
+            PromptTokens = prompt,
+            MaxTokens = 4,
+            Sampling = new SamplingParams { Temperature = 0f },
+            EosId = harness.Tokenizer.EosId,
+        }, CancellationToken.None);
+        _ = await handle.Completion;
+
+        using CancellationTokenSource deadline = new(TimeSpan.FromSeconds(60));
+        IReadOnlyList<MetricsSnapshot> ring = await WaitForPublishedSnapshotAsync(bus, deadline.Token);
+        MetricsSnapshot snapshot = ring[0];
+
+        Assert.Equal(3, snapshot.QueuedRequests); // the live depth published with this snapshot
+        Assert.Equal(6, snapshot.MaxQueuedRequests); // and the posture that bounded it
+        Assert.Equal(15_000, snapshot.QueueTimeoutMs);
+
+        IReadOnlyList<AdmissionRefusalEntry> refusals = snapshot.AdmissionRefusals!;
+        Assert.Equal("queue timeout refusal", refusals[0].Reason);
+        Assert.Equal(AdmissionRefusalKinds.QueueTimeout, refusals[0].Kind);
+        Assert.Equal("queue full refusal", refusals[1].Reason);
+        Assert.Equal(AdmissionRefusalKinds.QueueFull, refusals[1].Kind);
+
+        using JsonDocument document = JsonDocument.Parse(snapshot.ToJson());
+        JsonElement root = document.RootElement;
+        foreach (JsonProperty property in root.EnumerateObject())
+        {
+            Assert.StartsWith("metrics_", property.Name); // the queue facts speak the same vocabulary as every earlier snapshot field
+        }
+
+        Assert.Equal(3, root.GetProperty("metrics_queued_requests").GetInt32());
+        Assert.Equal(6, root.GetProperty("metrics_max_queued_requests").GetInt32());
+        Assert.Equal(15_000, root.GetProperty("metrics_queue_timeout_ms").GetInt32());
+    }
+
+    [Fact]
     public async Task MonitorStream_SnapshotsCarryAdmissionRefusalDiagnostics_OnTheOperatorSurface()
     {
         string path = NewSyntheticModel();
@@ -437,6 +603,226 @@ public sealed class AdmissionDiagnosticsTests : IDisposable
             ct.ThrowIfCancellationRequested();
             await Task.Delay(50, CancellationToken.None);
         }
+    }
+
+    // Drives this engine until a submission is refused because its model's queue of submissions waiting for a held concurrency slot was already full.
+    // The holding sequence proves it was admitted (its first streamed token) and parks on its own steps; the queued probe claims this engine's only seat,
+    // which the depth read confirms before the beyond-depth probe arrives. An attempt whose sequences settled too early retries with fresh state.
+    private static async Task<(EngineBusyException Busy, GenerationResult QueuedAdmitted)> RunUntilQueueFullAsync(SyntheticServer server)
+    {
+        const int maxAttempts = 60;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            using CancellationTokenSource holdLive = new();
+            TaskCompletionSource<bool> firstToken = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            int parkedTokens = 0;
+            GenerationRequest live = new()
+            {
+                Model = server.ModelName,
+                IsChat = false,
+                Prompt = "world!world!", // four tokens from declared pieces: the sequence is non-empty under any tokenizer posture here
+                MaxTokens = 24,
+                Temperature = 0f,
+                Stream = true,
+                OnToken = _ =>
+                {
+                    firstToken.TrySetResult(true);
+
+                    if (parkedTokens < 3)
+                    {
+                        parkedTokens++;
+
+                        // Hold this engine's only admission slot across the whole attempt below: the seat claim and the refusal that follows it are
+                        // observed against a slot that is demonstrably still held.
+                        Thread.Sleep(250);
+                    }
+                },
+            };
+
+            Task<GenerationResult> liveTask = server.Engine.GenerateAsync(live, holdLive.Token);
+
+            if (await Task.WhenAny(firstToken.Task, liveTask) != firstToken.Task || liveTask.IsCompleted)
+            {
+                _ = await liveTask; // the holding sequence finished before it proved admission: retry with fresh state
+                continue;
+            }
+
+            GenerationRequest queuedProbe = new()
+            {
+                Model = server.ModelName,
+                IsChat = false,
+                Prompt = "world!", // two declared-piece tokens: what this gate probes is queue depth, never tokenization
+                MaxTokens = 4,
+                Temperature = 0f,
+            };
+
+            Task<GenerationResult> queuedTask = server.Engine.GenerateAsync(queuedProbe, CancellationToken.None);
+
+            if (!await WaitForQueueDepthAsync(server.Engine, atLeast: 1))
+            {
+                try
+                {
+                    _ = await liveTask;
+                }
+                catch (OperationCanceledException)
+                {
+                    // The held sequence ended while the depth was being observed; nothing this gate owns depends on its outcome.
+                }
+
+                _ = await queuedTask; // the seat was never observably held: retry with fresh state
+                continue;
+            }
+
+            GenerationRequest beyondDepth = new()
+            {
+                Model = server.ModelName,
+                IsChat = false,
+                Prompt = "world!",
+                MaxTokens = 4,
+                Temperature = 0f,
+            };
+
+            try
+            {
+                _ = await server.Engine.GenerateAsync(beyondDepth, CancellationToken.None); // admitted: the held state had already settled — retry with fresh state
+            }
+            catch (EngineBusyException busy)
+            {
+                GenerationResult queuedAdmitted = await queuedTask; // its seat was real: it completes once the holding sequence frees the slot
+
+                try
+                {
+                    _ = await liveTask;
+                }
+                catch (OperationCanceledException)
+                {
+                    // The refusal path may have ended it first; nothing this gate owns depends on its outcome.
+                }
+
+                return (busy, queuedAdmitted);
+            }
+
+            try
+            {
+                _ = await queuedTask;
+            }
+            catch (EngineBusyException)
+            {
+                // This attempt's probe was refused instead of admitted: the next one starts from fresh state.
+            }
+
+            try
+            {
+                _ = await liveTask;
+            }
+            catch (OperationCanceledException)
+            {
+                // Settled as part of this failed attempt.
+            }
+        }
+
+        throw new InvalidOperationException($"no submission was refused for queue depth across {maxAttempts} attempts — the held slot and its queue seat never overlapped");
+    }
+
+    private static async Task<bool> WaitForQueueDepthAsync(GenerationService engine, int atLeast)
+    {
+        // Polls this facade's own live queue depth: a submission holds a seat only while it is actually waiting for an admission slot.
+        const int maxPolls = 200;
+
+        for (int poll = 1; poll <= maxPolls; poll++)
+        {
+            if (engine.QueuedRequestCount >= atLeast)
+            {
+                return true;
+            }
+
+            await Task.Delay(25);
+        }
+
+        return false;
+    }
+
+    // Drives this engine until a submission waiting in its model's queue for a held concurrency slot runs out of that model's bounded wait. The holding
+    // sequence parks on several of its own streamed tokens — far longer than the ceiling under test — so the refusal is what an expired wait produces here,
+    // not a race against a run that happened to finish first. An attempt whose sequences settled early retries with fresh state.
+    private static async Task<EngineBusyException> RunUntilQueueTimeoutAsync(SyntheticServer server)
+    {
+        const int maxAttempts = 60;
+
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            using CancellationTokenSource holdLive = new();
+            TaskCompletionSource<bool> firstToken = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            int parkedTokens = 0;
+            GenerationRequest live = new()
+            {
+                Model = server.ModelName,
+                IsChat = false,
+                Prompt = "world!world!", // four tokens from declared pieces: the sequence is non-empty under any tokenizer posture here
+                MaxTokens = 24,
+                Temperature = 0f,
+                Stream = true,
+                OnToken = _ =>
+                {
+                    firstToken.TrySetResult(true);
+
+                    if (parkedTokens < 3)
+                    {
+                        parkedTokens++;
+                        Thread.Sleep(250); // hold this engine's only admission slot well past the wait ceiling under test
+                    }
+                },
+            };
+
+            Task<GenerationResult> liveTask = server.Engine.GenerateAsync(live, holdLive.Token);
+
+            if (await Task.WhenAny(firstToken.Task, liveTask) != firstToken.Task || liveTask.IsCompleted)
+            {
+                _ = await liveTask; // the holding sequence finished before it proved admission: retry with fresh state
+                continue;
+            }
+
+            GenerationRequest waitingProbe = new()
+            {
+                Model = server.ModelName,
+                IsChat = false,
+                Prompt = "world!", // two declared-piece tokens: what this gate probes is the bounded wait, never tokenization
+                MaxTokens = 4,
+                Temperature = 0f,
+            };
+
+            try
+            {
+                _ = await server.Engine.GenerateAsync(waitingProbe, CancellationToken.None); // admitted before its wait expired: retry with fresh state
+            }
+            catch (EngineBusyException busy)
+            {
+                try
+                {
+                    _ = await liveTask;
+                }
+                catch (OperationCanceledException)
+                {
+                    // The refusal path may have ended the held sequence first; nothing this gate owns depends on its outcome.
+                }
+
+                return busy;
+            }
+
+            try
+            {
+                _ = await liveTask;
+            }
+            catch (OperationCanceledException)
+            {
+                // Settled as part of this failed attempt.
+            }
+        }
+
+        throw new InvalidOperationException($"no submission ran out of its queue wait across {maxAttempts} attempts — no bounded wait ever expired against a held slot");
     }
 
     // Drives the facade until a submission is refused while another sequence holds what admission needs: the live
@@ -617,7 +1003,9 @@ public sealed class AdmissionDiagnosticsTests : IDisposable
             int? threadQuota = null,
             IReadOnlySet<int>? coreSet = null,
             int maxContextTokens = 512,
-            int kvBlocks = 8)
+            int kvBlocks = 8,
+            int? maxQueuedRequests = null,
+            int? queueTimeoutMs = null)
         {
             LairConfig config = new()
             {
@@ -635,6 +1023,8 @@ public sealed class AdmissionDiagnosticsTests : IDisposable
                         MaxContextTokens = maxContextTokens,
                         KvBlocks = kvBlocks,
                         MaxConcurrentRequests = maxConcurrentRequests,
+                        MaxQueuedRequests = maxQueuedRequests,
+                        QueueTimeoutMs = queueTimeoutMs,
                         Placement = new PlacementConfig
                         {
                             ThreadQuota = threadQuota,

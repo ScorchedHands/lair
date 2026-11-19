@@ -97,6 +97,22 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
     private ModelInfo _modelInfo; // reference-swapped under the reload gate so observers read a complete record
     private ReloadSummary? _lastReload;
 
+    // The request-queue posture submissions admitted now are bounded by: how many may wait for a concurrency slot (zero queues nothing, which is today's
+    // immediate refusal), and how long each of those waits gets before it answers the timeout refusal. Resolved when the engine opens from
+    // the configuration in force — a declared ceiling or the documented default where queueing is enabled with no ceiling named; zero wait while
+    // nothing queues — and retargeted by new-request-only reloads, so already-waiting submissions keep the posture they entered on.
+    private int _maxQueuedRequests;
+    private int _queueTimeoutMs;
+
+    // Submissions holding a queue seat right now: waiting for a concurrency slot, admitted nowhere, spending no pool block and no token budget yet.
+    // The depth lives here rather than inside the scheduler because a queued submission spans several admission decisions — it waits, revalidates,
+    // and submits again under one seat — while each individual Submit call stays exactly as immediate as it has always been.
+    private int _queuedSubmissions;
+
+    // Cancelled once this engine stops accepting new submissions (a served-model removal draining what already runs). Submissions waiting on a queue
+    // seat watch it so they answer the retirement refusal promptly instead of sitting out their bounded wait for a slot that will never free.
+    private readonly CancellationTokenSource _retiring = new();
+
     /// <summary>The metrics bus attached by the API host, if any — null for hosts that never attach one.</summary>
     internal EngineMetricsBus? Metrics => _metrics;
 
@@ -182,6 +198,24 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
         _scheduler = scheduler;
         _current = config;
         _modelInfo = info;
+
+        // The queue posture is a fact of this open from the first submission onward: absent or zero capacity means nothing queues and every admission
+        // refusal stays immediate, while an enabled queue resolves its wait to the declared ceiling or the documented default. Nothing here re-reads
+        // config per request — live edits retarget these values through the reload paths that already exist for other new-request-only keys.
+        (_maxQueuedRequests, _queueTimeoutMs) = ResolveQueuePosture(config.Models[0]);
+    }
+
+    // Resolves what one model's queue posture means in force: no capacity configured leaves both halves at their nothing-posture defaults (no wait
+    // applies when nothing queues), and an enabled queue always carries a concrete bounded wait even where the config declared only the cap.
+    private static (int MaxQueuedRequests, int QueueTimeoutMs) ResolveQueuePosture(ModelConfig model)
+    {
+        if (model.MaxQueuedRequests is null || model.MaxQueuedRequests.Value <= 0)
+        {
+            return (0, 0); // nothing queues: every admission refusal stays immediate and no bounded wait applies
+        }
+
+        int configuredCap = Math.Max(1, model.MaxQueuedRequests.Value);
+        return (configuredCap, model.QueueTimeoutMs ?? RequestQueuePostures.DefaultQueueTimeoutMs);
     }
 
     /// <summary>The served model's advertised facts; requests must name <see cref="ModelInfo.Id"/>. Recomputed when a hot-reloaded field changes what the engine advertises.</summary>
@@ -214,6 +248,30 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
     /// <summary>The configured kind of the served model as advertised on <c>/v1/models</c>. The config loader accepts only "chat" in this build; surfaces that must exclude embed models filter on this fact instead of an assumption.</summary>
     public string ModelType => _current.Models[0].Type;
 
+    /// <summary>Submissions waiting right now for a concurrency slot on this engine — the live depth of its request queue, and zero whenever nothing queues. None of them holds an admission slot, a pool block, or any token budget yet.</summary>
+    public int QueuedRequestCount => Volatile.Read(ref _queuedSubmissions);
+
+    /// <summary>The queue cap submissions admitted now are bounded by — how many may wait for an admission slot before further ones answer the queue-full refusal — or null while nothing queues. A live edit retargets it without disturbing what already waits.</summary>
+    public int? MaxQueuedRequests
+    {
+        get
+        {
+            int cap = Volatile.Read(ref _maxQueuedRequests);
+            return cap > 0 ? cap : null; // zero is this engine's nothing-queues posture, advertised as the absence of a cap rather than a depth of zero
+        }
+    }
+
+    /// <summary>The bounded wait a submission gets for its admission slot, in milliseconds: the declared ceiling, or the documented default where queueing is enabled with no ceiling named; zero while nothing queues.</summary>
+    public int QueueTimeoutMs => Volatile.Read(ref _queueTimeoutMs);
+
+    /// <summary>
+    /// Tells this engine it has stopped accepting new submissions because its host is retiring it out of the served set. Submissions already waiting
+    /// on a queue seat answer the retirement refusal instead of sitting out their bounded wait for a slot that will never free; sequences admitted
+    /// before now keep running and draining exactly as they always have, and nothing here touches them or their resources. Idempotent — a host may
+    /// signal it again while its drain proceeds.
+    /// </summary>
+    public void MarkRetiring() => _retiring.Cancel();
+
     /// <summary>
     /// Attaches the metrics bus that samples this engine's counters and feeds <c>/monitor/stream</c>. The API host
     /// calls it once while building the app; hosts that never attach one simply produce no snapshots. Idempotent:
@@ -240,6 +298,10 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
         // each tick samples. An engine that opened no accelerator backend attaches a provider that answers null, so its
         // snapshots carry nothing in those slots rather than an idle-hardware reading.
         bus.AttachAcceleratorProvider(BuildAcceleratorAccounting);
+
+        // The monitor's request-queue depth is this facade's own seat accounting, sampled at each publish: what submissions blocked on a held slot
+        // right now. Their configured posture rides the model facts below, so snapshots report both halves of the queue without either side polling.
+        bus.AttachQueueDepthProvider(() => Volatile.Read(ref _queuedSubmissions));
 
         _metrics = bus;
         return bus;
@@ -295,7 +357,12 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
         UpdateCandidate: _updateCandidate,
         // The CPU integer-dot posture this engine's opened backend runs, read from the fact open resolved — not re-derived here.
         CpuIsa: _backend.ResolvedSelection.ResolvedIsa,
-        CpuGather: _backend.ResolvedSelection.GatherMode);
+        CpuGather: _backend.ResolvedSelection.GatherMode,
+
+        // The request-queue posture in force for submissions admitted now — this engine's own resolved values (a live edit retargets them alongside
+        // every other new-request-only fact), so snapshots name the cap and bounded wait a submission actually gets instead of re-deriving either.
+        MaxQueuedRequests: MaxQueuedRequests,
+        QueueTimeoutMs: Volatile.Read(ref _queueTimeoutMs));
 
     // Sums what each compute backend this open owns answers about its own device work: cumulative kernel busy time and
     // runtime copy tallies since that instance opened, plus the weight residency it holds in persistent device memory now.
@@ -694,6 +761,26 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
                             $"admission cap {change.OldValue} -> {change.NewValue}: submissions from now on are refused once every slot of the new cap is held; sequences already admitted keep their slots and finish normally"));
                         break;
 
+                    case "models[0].max_queued_requests":
+                        // The posture swap is a volatile record: submissions admitted from now on queue against the new depth, while what already
+                        // waits keeps waiting under the seat it took — its bounded wait was resolved when it entered, and re-bounding mid-wait would
+                        // be refusing something that already paid for its place. A raised cap also lets a later submission's first refusal land at
+                        // the scheduler seam instead of the facade's queue-full check.
+                        (_maxQueuedRequests, _queueTimeoutMs) = ResolveQueuePosture(candidate.Models[0]);
+                        effective = effective with { Models = [effective.Models[0] with { MaxQueuedRequests = candidate.Models[0].MaxQueuedRequests }] };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"request queue {change.OldValue} -> {change.NewValue}: submissions from now on wait for a held admission slot up to this depth before answering the queue-full refusal; submissions already waiting keep their place and their original bounded wait"));
+                        break;
+
+                    case "models[0].queue_timeout_ms":
+                        // Same posture swap as its cap sibling: the ceiling applies to waits entered from now on. A submission already inside a wait
+                        // was budgeted when it started, so re-timing it here would silently extend or cut short a refusal decision someone is waiting on.
+                        (_maxQueuedRequests, _queueTimeoutMs) = ResolveQueuePosture(candidate.Models[0]);
+                        effective = effective with { Models = [effective.Models[0] with { QueueTimeoutMs = candidate.Models[0].QueueTimeoutMs }] };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"queue wait {change.OldValue} -> {change.NewValue}: submissions from now on answer the queue-timeout refusal once their bounded wait for an admission slot expires; submissions already waiting keep the ceiling they entered with"));
+                        break;
+
                     case "models[0].placement.numa_spread":
                         // The preference is recorded for later placement decisions; the node this engine opened on, the posture its
                         // worker pool masks to, and the posture its weight pages first-touched to stay as the open resolved them.
@@ -782,6 +869,227 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
 
             return results;
         }
+    }
+
+    // The context ceiling an admitted sequence must clear, checked at the facade exactly where admission decides — once before a submission's first
+    // attempt and again on every wake from waiting for a concurrency slot. A queued submission is therefore re-decided against what this engine can
+    // back when it retries rather than against what was true when it first arrived, and the refusal it raises stays exactly the budget refusal a fresh
+    // submission gets: same error shape, recorded in the monitor's diagnostic ring the same way. Waiting changes nothing about what cannot fit answers with.
+    private void EnsurePromptFitsWindow(int promptCount)
+    {
+        if (promptCount < Model.ContextLength)
+        {
+            return;
+        }
+
+        // The token-budget refusal is recorded where it decides: the monitor's diagnostic ring sees exactly what admission turned away, while this
+        // request still answers through its own error shape.
+        ContextLengthExceededException contextRefusal = new(promptCount, Model.ContextLength, Model.Id);
+        _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.ContextLength, Model.Id, contextRefusal.Message);
+        throw contextRefusal;
+    }
+
+    // Submits one request against this engine's admission seam, queueing it when the model's posture says a submission may wait for a concurrency slot.
+    // A model with no queue configured takes today's path untouched: one immediate Submit whose refusals map exactly as they always have. With queueing
+    // enabled, a submission refused because every admission slot is held claims one bounded seat in this facade's queue — waiting without holding an
+    // admission slot, a pool block, or any token budget — then re-enters admission whenever the scheduler signals room, clearing the context ceiling
+    // again on each wake. A seat releases when its submission is admitted, refused, or cancelled; every refusal answers the same bounded overload
+    // taxonomy the immediate refusals use, so a queued request never invents an error surface of its own.
+    private async ValueTask<PipelineHandle> SubmitAdmissionWithQueueAsync(ScheduledRequest scheduled, int promptCount, CancellationToken ct)
+    {
+        int maxQueued = Volatile.Read(ref _maxQueuedRequests);
+        if (maxQueued <= 0)
+        {
+            return SubmitMapped(scheduled, ct); // nothing queues: the unchanged immediate-refusal posture
+        }
+
+        try
+        {
+            return _scheduler.Submit(scheduled, ct); // an open cap admits exactly as it always did; the queue costs nothing when no slot is held
+        }
+        catch (SchedulerConcurrencyFullException)
+        {
+            // Every admission slot of this model's cap is held. Under a queue posture that is not yet a refusal — it is the condition the queue exists for.
+        }
+        catch (SchedulerFullException full)
+        {
+            throw KvCapacityRefusal(full);
+        }
+        catch (BudgetExhaustedException exhausted)
+        {
+            throw BudgetExhaustionRefusal(exhausted);
+        }
+
+        if (!TryTakeQueueSeat(maxQueued))
+        {
+            throw QueueFullRefusal(maxQueued);
+        }
+
+        // The wait budget is the ceiling in force when this submission entered, captured here so a live edit of the key cannot re-time a wait already underway.
+        int timeoutMs = Volatile.Read(ref _queueTimeoutMs);
+        try
+        {
+            return await WaitForAdmissionAsync(scheduled, promptCount, timeoutMs, ct);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _queuedSubmissions); // admitted, refused, or cancelled: the seat this submission held is released either way
+        }
+    }
+
+    private PipelineHandle SubmitMapped(ScheduledRequest scheduled, CancellationToken ct)
+    {
+        try
+        {
+            return _scheduler.Submit(scheduled, ct);
+        }
+        catch (SchedulerFullException full)
+        {
+            throw KvCapacityRefusal(full);
+        }
+        catch (SchedulerConcurrencyFullException quota)
+        {
+            throw ConcurrencyQuotaRefusal(quota);
+        }
+        catch (BudgetExhaustedException exhausted)
+        {
+            throw BudgetExhaustionRefusal(exhausted);
+        }
+    }
+
+    // Waits for room at this engine's admission seam and re-enters submission whenever the scheduler signals it, under one bounded wait budget. Each wake
+    // clears the context ceiling again before retrying; a freed slot taken by another waiter simply means waiting again inside the same budget rather than
+    // being refused twice. A caller that walks away mid-wait is cancelled like any other abandoned request, and an engine retiring while this submission
+    // waits answers the retirement refusal now instead of outlasting its ceiling for a slot that will never free.
+    private async ValueTask<PipelineHandle> WaitForAdmissionAsync(
+        ScheduledRequest scheduled, int promptCount, int timeoutMs, CancellationToken ct)
+    {
+        using CancellationTokenSource retireGate = CancellationTokenSource.CreateLinkedTokenSource(ct, _retiring.Token);
+
+        long startedAt = TimeProvider.System.GetTimestamp();
+        while (true)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(GenerationService), "the engine this submission was waiting on has been disposed");
+            }
+
+            long elapsedMs = (long)TimeProvider.System.GetElapsedTime(startedAt).TotalMilliseconds;
+            if (elapsedMs >= timeoutMs)
+            {
+                throw QueueTimeoutRefusal(timeoutMs);
+            }
+
+            bool freed = await _scheduler.WaitForAdmissionSlotAsync(TimeSpan.FromMilliseconds(timeoutMs - elapsedMs), retireGate.Token);
+
+            if (ct.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(ct); // the caller walked away while queued: nothing was admitted and no budget was spent
+            }
+
+            if (_retiring.IsCancellationRequested)
+            {
+                throw ModelRetiringRefusal();
+            }
+
+            _ = freed; // a false answer is this wait's own ceiling expiring (or the seam closing); the loop top turns either into its refusal next pass
+
+            EnsurePromptFitsWindow(promptCount);
+
+            try
+            {
+                return _scheduler.Submit(scheduled, ct);
+            }
+            catch (SchedulerConcurrencyFullException)
+            {
+                // The room this wake signalled was taken by another submission first — a retry decision inside one wait budget, not a refusal to record.
+            }
+            catch (SchedulerFullException full)
+            {
+                throw KvCapacityRefusal(full);
+            }
+            catch (BudgetExhaustedException exhausted)
+            {
+                throw BudgetExhaustionRefusal(exhausted);
+            }
+        }
+    }
+
+    private bool TryTakeQueueSeat(int maxQueued)
+    {
+        // One claimed seat per waiting submission, bounded by the depth in force now. The claim spans this submission's whole wait — revalidations and
+        // retries included — because what a queued request occupies is its place in line here, not anything inside an individual admission decision.
+        while (true)
+        {
+            int observed = Volatile.Read(ref _queuedSubmissions);
+            if (observed >= maxQueued)
+            {
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(ref _queuedSubmissions, observed + 1, observed) == observed)
+            {
+                return true;
+            }
+        }
+    }
+
+    private EngineBusyException ConcurrencyQuotaRefusal(SchedulerConcurrencyFullException quota)
+    {
+        // A submission past this model's concurrency cap is the engine-busy refusal it has always answered with: same bounded overload family at the
+        // wire, naming max_concurrent_requests and the served model. Nothing already admitted was disturbed by it; the monitor records the refusal for
+        // operators exactly as its kv_capacity sibling does. This mapping stays reached only where nothing queues — a queue posture turns this condition
+        // into waiting instead of refusing here.
+        EngineBusyException busy = EngineBusyException.ForConcurrencyQuota(Model.Id, quota.MaxConcurrentRequests);
+        _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.ConcurrencyQuota, Model.Id, busy.Message);
+        return busy;
+    }
+
+    private EngineBusyException KvCapacityRefusal(SchedulerFullException full)
+    {
+        // The scheduler's capacity vocabulary is an engine-busy condition at this facade: surface it as the API-level EngineBusyException naming
+        // kv_capacity and the served model rather than leaking a scheduling type to callers. No lifecycle frames were published — a refused admission
+        // never entered the stream, but its refusal lands in the monitor's diagnostic ring so an operator sees what blocked.
+        EngineBusyException busy = EngineBusyException.ForKvCapacity(Model.Id, full.FreeSlots);
+        _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.KvCapacity, Model.Id, busy.Message);
+        return busy;
+    }
+
+    private EngineBusyException BudgetExhaustionRefusal(BudgetExhaustedException exhausted)
+    {
+        // A submission the host ledger's shared chain could not seat anywhere is a bounded overload refusal: the exhausted chain is host accounting across
+        // opened pools, not this engine's own KV cap re-deciding anything, so it surfaces through the same overload family at the wire with the
+        // budget-exhaustion code. Nothing already admitted was disturbed; the monitor records the refusal exactly as its kv_capacity and quota siblings do.
+        EngineBusyException busy = EngineBusyException.ForBudgetExhaustion(Model.Id, exhausted.Resource, exhausted.Tier, exhausted.Breakdown);
+        _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.BudgetExhaustion, Model.Id, busy.Message);
+        return busy;
+    }
+
+    private EngineBusyException QueueFullRefusal(int maxQueued)
+    {
+        // A submission arriving while the queue is already at depth refused with its own limit named — max_queued_requests and the model it belongs to.
+        // Nothing queued was disturbed, no seat beyond this refusal's absence exists, and no pool block or token budget changed hands over any of it.
+        EngineBusyException busy = EngineBusyException.ForQueueFull(Model.Id, maxQueued);
+        _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.QueueFull, Model.Id, busy.Message);
+        return busy;
+    }
+
+    private EngineBusyException QueueTimeoutRefusal(int timeoutMs)
+    {
+        // A submission that waited out its bounded wait answers the same overload family with the ceiling it ran against named. Its seat releases in the
+        // caller's finally block, and every sequence admitted before this decision is untouched by it.
+        EngineBusyException busy = EngineBusyException.ForQueueTimeout(Model.Id, timeoutMs);
+        _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.QueueTimeout, Model.Id, busy.Message);
+        return busy;
+    }
+
+    private EngineBusyException ModelRetiringRefusal()
+    {
+        // A queued submission whose engine began draining answers the retirement refusal it would have gotten had it arrived after the removal: same code,
+        // recorded like every other admission refusal here. It never becomes a success and never re-enters admission while its host releases resources.
+        EngineBusyException busy = EngineBusyException.ForModelRetiring(Model.Id);
+        _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.ModelRetiring, Model.Id, busy.Message);
+        return busy;
     }
 
     /// <summary>Records a live KV soft-cap application on the host ledger when this engine has a standing claim for that resource.</summary>
@@ -1979,14 +2287,7 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
             ? EncodeChat(request, tools, cancellationToken)
             : EncodeCompletion(request);
 
-        if (prompt.Count >= Model.ContextLength)
-        {
-            // The token-budget refusal is recorded where it decides: the monitor's diagnostic ring sees exactly what
-            // admission turned away, while this request still answers through its own error shape.
-            ContextLengthExceededException contextRefusal = new(prompt.Count, Model.ContextLength, Model.Id);
-            _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.ContextLength, Model.Id, contextRefusal.Message);
-            throw contextRefusal;
-        }
+        EnsurePromptFitsWindow(prompt.Count); // the same ceiling a queued submission clears again on every wake from waiting for an admission slot
 
         ModelConfig modelConfig = EffectiveConfiguration.Models[0];
         ResolvedTokenBudgets budgets = ResolveTokenBudgets(request, modelConfig, plan);
@@ -2078,38 +2379,10 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
             },
         };
 
-        try
-        {
-            handle = _scheduler.Submit(scheduled, stopSignal.Token);
-        }
-        catch (SchedulerFullException full)
-        {
-            // The scheduler's capacity vocabulary is an engine-busy condition at this facade: surface it as the API-level EngineBusyException
-            // naming kv_capacity and the served model rather than leaking a scheduling type to callers. No lifecycle frames were published — a
-            // refused admission never entered the stream, but its refusal lands in the monitor's diagnostic ring so an operator sees what blocked.
-            EngineBusyException busy = EngineBusyException.ForKvCapacity(Model.Id, full.FreeSlots);
-            _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.KvCapacity, Model.Id, busy.Message);
-            throw busy;
-        }
-        catch (SchedulerConcurrencyFullException quota)
-        {
-            // A submission past this model's concurrency cap is the other engine-busy refusal: same bounded overload family at the wire, with a
-            // message naming max_concurrent_requests and the served model. Nothing already admitted was disturbed by it; the monitor records the
-            // refusal for operators exactly as its kv_capacity sibling does.
-            EngineBusyException busy = EngineBusyException.ForConcurrencyQuota(Model.Id, quota.MaxConcurrentRequests);
-            _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.ConcurrencyQuota, Model.Id, busy.Message);
-            throw busy;
-        }
-        catch (BudgetExhaustedException exhausted)
-        {
-            // A submission the host ledger's shared chain could not seat anywhere is the third bounded overload refusal: the exhausted chain is
-            // host accounting across opened pools, not this engine's own KV cap re-deciding anything, so it surfaces through the same overload
-            // family at the wire with the budget-exhaustion code. Nothing already admitted was disturbed; the monitor records the refusal exactly
-            // as its kv_capacity and quota siblings do.
-            EngineBusyException busy = EngineBusyException.ForBudgetExhaustion(Model.Id, exhausted.Resource, exhausted.Tier, exhausted.Breakdown);
-            _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.BudgetExhaustion, Model.Id, busy.Message);
-            throw busy;
-        }
+        // Admission follows this model's queue posture: immediate refusals when nothing queues (the unchanged path, same taxonomy as always), or a bounded
+        // wait for a concurrency slot under a configured depth, revalidating the context ceiling on every wake. Every refusal — capacity, quota, queue full,
+        // queue timeout, budget exhaustion — surfaces through this facade's existing error shapes; nothing here admits anything the scheduler would not have.
+        handle = await SubmitAdmissionWithQueueAsync(scheduled, prompt.Count, stopSignal.Token);
 
         if (tracker is RequestTracker admitted)
         {
@@ -2255,6 +2528,10 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
         }
 
         _disposed = true;
+
+        // Submissions waiting on a queue seat here stop at once: the seam that would free their slot is going away with this engine, and nothing about
+        // teardown should make them discover that only when their own bounded wait expires. A registry drain already signalled this idempotently.
+        _retiring.Cancel();
 
         // The metrics sampler notices disposal at its next tick and completes every open stream subscription on the
         // way out; it is not worth blocking engine teardown on one sampling delay, so this is deliberately unawaited.

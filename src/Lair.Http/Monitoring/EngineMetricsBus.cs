@@ -94,6 +94,10 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     // snapshot shape they had before this seam existed, with these slots reading as nothing rather than zero-filled.
     private Func<AcceleratorAccounting?>? _acceleratorProvider;
 
+    // The owning facade's request-queue depth: submissions blocked on a held concurrency slot right now, read once per publish. A host that
+    // queues nothing attaches no provider, so the depth field keeps its inert zero default exactly as it read before this seam existed.
+    private Func<int>? _queueDepthProvider;
+
     // Recent admission refusals recorded by the owning facade: oldest-drops ring under the fan-out lock, newest
     // first in every read, so a snapshot's diagnostic array is one small deterministic slice of what admission
     // refused most recently. The cumulative total counts every refusal since open, ring retention aside.
@@ -322,6 +326,18 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(provider);
         Volatile.Write(ref _acceleratorProvider, provider);
+    }
+
+    /// <summary>
+    /// Wires the request-queue depth an owning facade holds: how many of its submissions are blocked waiting for a concurrency slot right now.
+    /// One volatile delegate swap read at each publish; with no provider attached — every host that queues nothing — snapshots keep reading this
+    /// field as zero exactly as they did before this seam existed. The configured queue posture rides the attached model facts instead, because
+    /// it is what a hot edit retargets for later submissions rather than something sampled per tick.
+    /// </summary>
+    public void AttachQueueDepthProvider(Func<int> provider)
+    {
+        ArgumentNullException.ThrowIfNull(provider);
+        Volatile.Write(ref _queueDepthProvider, provider);
     }
 
     /// <summary>
@@ -610,6 +626,14 @@ public sealed class EngineMetricsBus : IAsyncDisposable
 
                 AdmissionRefusalsTotal: Volatile.Read(ref _admissionRefusalTotal),
                 AdmissionRefusals: RecentAdmissionRefusals(), // already holding the fan-out lock here; Monitor re-entry is safe on this thread
+
+                // Additive request-queue posture (earlier shapes untouched): live depth from the owning facade's seam — submissions blocked on a held
+                // concurrency slot, none of which has taken an admission slot or spent pool or token budget yet — while the configured cap and bounded
+                // wait ride the attached facts exactly like every other configuration-backed field here. A host with no queue seam reports zero depth.
+                QueuedRequests: Volatile.Read(ref _queueDepthProvider) is Func<int> depthProvider ? Math.Max(0, depthProvider()) : 0,
+                MaxQueuedRequests: facts?.MaxQueuedRequests,
+                QueueTimeoutMs: facts?.QueueTimeoutMs ?? 0,
+
                 LedgerOccupancy: facts?.LedgerOccupancy,
 
                 // Additive compute-grant facts (earlier shapes untouched): requested against granted rides the attached facts so a model

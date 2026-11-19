@@ -454,6 +454,20 @@ public sealed class GenerationScheduler : IDisposable
     }
 
     /// <summary>
+    /// Waits until this scheduler's admission gate has room for another pipeline, up to <paramref name="budget"/>, and answers whether that
+    /// room appeared before the wait ran out or <paramref name="ct"/> cancelled. It reserves nothing: a resolved-true answer says only that a slot
+    /// came free (or the cap widened), so the caller still submits through <see cref="Submit"/> and is decided there — capacity, budget chains,
+    /// and every other admission limit apply exactly as they do to a fresh submission. A scheduler already disposing answers false rather than
+    /// leaving submissions waiting on room that can no longer be freed. Hosts that bound how long their submissions wait for a slot use this seam;
+    /// <see cref="Submit"/> itself stays immediate-refusal, so an uncapped or fail-fast posture never blocks here at all.
+    /// </summary>
+    public Task<bool> WaitForAdmissionSlotAsync(TimeSpan budget, CancellationToken ct) =>
+        _disposed ? Task.FromResult(false) : _progress.WaitForFreeSlotAsync(budget, ct);
+
+    /// <summary>Submissions this scheduler's admission gate currently has waiting for room — the depth its wait list holds right now. Observers read it as a snapshot; nothing here bounds how many submissions their host lets wait.</summary>
+    public int AdmissionWaitDepth => _progress.WaitingForSlotCount;
+
+    /// <summary>
     /// Re-resolves the stepping segment's worker-thread quota to a new live value (or null to leave it at the engine's own thread choice).
     /// It takes effect from the next composition on: headroom checks for future merged steps bound against this value instead of what load
     /// resolved, while pipelines already admitted keep their slots and finish normally — lowering a quota retargets which candidates may join
@@ -508,6 +522,11 @@ public sealed class GenerationScheduler : IDisposable
         }
 
         _disposed = true;
+
+        // Submissions waiting for a slot this scheduler can no longer free are answered now rather than left to their own deadlines: the step
+        // loop that returns slots is stopping, so nothing they wait on still exists.
+        _progress.CloseWaiters();
+
         _inbox.Writer.TryComplete();
         _thread.GetAwaiter().GetResult();
     }

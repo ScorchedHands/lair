@@ -62,6 +62,12 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
         public TaskCompletionSource BeginDrain()
         {
             Posture = ServedPosture.Draining;
+
+            // Submissions this engine already has waiting on a queue seat answer the retirement refusal now rather than sitting out their bounded wait
+            // for an admission slot that will never free. Already-admitted sequences are untouched: they keep running, and each one releases its
+            // in-flight count through Lease disposal exactly as before, so this drain completes the same way it always has.
+            Engine?.MarkRetiring();
+
             TaskCompletionSource drained = new(TaskCreationOptions.RunContinuationsAsynchronously);
             _drainedSignal = drained;
 

@@ -653,6 +653,102 @@ public sealed class ConfigTests : IDisposable
     }
 
     [Fact]
+    public void Load_RequestQueueKeys_ParseAndDefaultToNothingQueued()
+    {
+        LairConfig bounded = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_queued_requests: 4
+                queue_timeout_ms: 12500
+            """));
+
+        Assert.Equal(4, bounded.Models[0].MaxQueuedRequests);
+        Assert.Equal(12_500, bounded.Models[0].QueueTimeoutMs);
+
+        LairConfig absent = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """));
+
+        // Absent keys keep today's posture outright: nothing queues and no bounded wait is declared for something that never waits.
+        Assert.Null(absent.Models[0].MaxQueuedRequests);
+        Assert.Null(absent.Models[0].QueueTimeoutMs);
+
+        LairConfig explicitZero = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_queued_requests: 0
+            """));
+
+        Assert.Equal(0, explicitZero.Models[0].MaxQueuedRequests); // an explicit zero states the same immediate-refusal posture the absent key carries
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(-7)]
+    public void Load_MaxQueuedRequestsNegative_Fails(int depth)
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_queued_requests: {depth}
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains($"models[0].max_queued_requests {depth}", error.Message);
+        Assert.Contains("'max_queued_requests' must be 0 or greater", error.Message); // zero is the documented disabled posture; only a negative number is refused
+    }
+
+    [Fact]
+    public void Load_MaxQueuedRequestsNonInteger_Fails()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_queued_requests: two
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].max_queued_requests must be an integer value.", error.Message);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-2)]
+    public void Load_QueueTimeoutTooSmall_Fails(int ceiling)
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                queue_timeout_ms: {ceiling}
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains($"models[0].queue_timeout_ms {ceiling}", error.Message);
+        Assert.Contains("'queue_timeout_ms' must be 1 or greater", error.Message); // a present ceiling is a real wait: zero would say nothing without saying so
+    }
+
+    [Fact]
+    public void Load_QueueTimeoutNonInteger_Fails()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                queue_timeout_ms: two
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].queue_timeout_ms must be an integer value.", error.Message);
+    }
+
+    [Fact]
     public void ValidateCoreSetsDisjoint_OverlappingModels_NamesBothModels()
     {
         List<ModelConfig> models =

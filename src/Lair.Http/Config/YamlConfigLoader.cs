@@ -21,7 +21,7 @@ public static class YamlConfigLoader
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel", "cpu"];
     private static readonly string[] CpuKeys = ["isa"];
     private static readonly string[] UiKeys = ["recent_requests"];
-    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "kv", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "budgets", "source"];
+    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "kv", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "max_queued_requests", "queue_timeout_ms", "budgets", "source"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit", "numa_spread", "gpu_layers"];
 
     /// <summary>The keys one model entry's KV block may declare.</summary>
@@ -521,6 +521,27 @@ public static class YamlConfigLoader
                 $"models[{index}].max_concurrent_requests {maxConcurrentRequests} is invalid: 'max_concurrent_requests' must be 1 or greater.");
         }
 
+        // Per-model request queue: absent means today's fail-fast posture, and an explicit 0 states that same posture outright — the
+        // documented default is zero-disabled. A positive value bounds how many submissions may wait for a concurrency slot before
+        // further ones are refused with the overloaded shape. Only a negative number is rejected here, naming the model entry, key,
+        // and offending value exactly as the other sized keys do.
+        int? maxQueuedRequests = TryInteger(keys, "max_queued_requests", $"models[{index}].max_queued_requests");
+        if (maxQueuedRequests is < 0)
+        {
+            throw new ConfigException(
+                $"models[{index}].max_queued_requests {maxQueuedRequests} is invalid: 'max_queued_requests' must be 0 or greater, where 0 keeps the immediate refusal posture.");
+        }
+
+        // How long a waiting submission may block for its slot. A present value must be 1 millisecond or greater; absent resolves to
+        // the documented default when queueing is enabled. Declared while queueing stands disabled it validates and reports like any
+        // other key, but no submission waits, so no refusal posture changes.
+        int? queueTimeoutMs = TryInteger(keys, "queue_timeout_ms", $"models[{index}].queue_timeout_ms");
+        if (queueTimeoutMs is < 1)
+        {
+            throw new ConfigException(
+                $"models[{index}].queue_timeout_ms {queueTimeoutMs} is invalid: 'queue_timeout_ms' must be 1 or greater.");
+        }
+
         KvFormatPair kvQuant = ParseKvQuant(keys, index);
 
         return new ModelConfig
@@ -537,6 +558,8 @@ public static class YamlConfigLoader
             MaxReasoningTokens = maxReasoningTokens,
             MaxResponseTokens = maxResponseTokens,
             MaxConcurrentRequests = maxConcurrentRequests,
+            MaxQueuedRequests = maxQueuedRequests,
+            QueueTimeoutMs = queueTimeoutMs,
             Budgets = budgets,
             LegacyKvBlocksDeclared = declaredKvBlocks is not null,
             Source = ParseSource(keys, index, name),

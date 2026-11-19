@@ -37,8 +37,8 @@ public static class MonitorEventSchema
 /// <summary>
 /// The limit-kind vocabulary the monitor uses for recorded admission refusals, naming the same blocking limits the
 /// request layer's refusals name: the KV pool cannot back the request's prompt plus token budget, the resolved
-/// context window leaves no token free for generation, or every admission slot of the model's concurrency cap is
-/// held. A recorded refusal is a diagnostic copy of a refusal its caller already answered — these names describe
+/// context window leaves no token free for generation, every admission slot of the model's concurrency cap is
+/// held, a submission waiting for such a slot found the model's queue full or its bounded wait expired. A recorded refusal is a diagnostic copy of a refusal its caller already answered — these names describe
 /// which limit blocked, never a new error surface.
 /// </summary>
 public static class AdmissionRefusalKinds
@@ -51,6 +51,12 @@ public static class AdmissionRefusalKinds
 
     /// <summary>Every admission slot of the model's <c>max_concurrent_requests</c> cap is held by sequences already admitted.</summary>
     public const string ConcurrencyQuota = "concurrency_quota";
+
+    /// <summary>A submission waiting for an admission slot arrived while every seat of the model's <c>max_queued_requests</c> queue was already taken.</summary>
+    public const string QueueFull = "queue_full";
+
+    /// <summary>A submission waiting for an admission slot waited out its model's bounded <c>queue_timeout_ms</c> wait with no concurrency slot freeing.</summary>
+    public const string QueueTimeout = "queue_timeout";
 
     /// <summary>The host ledger's shared copy-holding chain could not seat this submission's reservation anywhere — host accounting across opened pools, not the pool's own cap.</summary>
     public const string BudgetExhaustion = "budget_exhaustion";

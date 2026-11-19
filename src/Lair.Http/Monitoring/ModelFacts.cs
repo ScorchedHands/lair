@@ -101,4 +101,10 @@ public sealed record ModelFacts(
     string? CpuIsa = null,
 
     /// <summary>The grid staging that resolved encoding feeds this backend's sub-4-bit dots (<c>scalar</c>, <c>gather</c>) — never a mode the opened posture cannot run. Additive: null until CPU selection facts attach.</summary>
-    string? CpuGather = null);
+    string? CpuGather = null,
+
+    /// <summary>The queue cap configured for this model — how many submissions may wait for a concurrency slot before further ones are refused — or null while nothing queues, which is today's immediate-refusal posture. A live edit re-pushes it with the rest of the facts.</summary>
+    int? MaxQueuedRequests = null,
+
+    /// <summary>The bounded wait configured for submissions waiting on that queue, in milliseconds: what a declared ceiling states or the documented default where the model queues without naming one; zero while nothing queues. Additive: reads as nothing until the owning service attaches queue facts.</summary>
+    int QueueTimeoutMs = 0);

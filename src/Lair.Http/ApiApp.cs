@@ -159,10 +159,14 @@ public static class ApiApp
     }
 
     // One advertised instance as one models-list entry. The concurrency cap is the value admissions enforce now (a live edit re-publishes it through
-    // the model facts swap); an uncapped model reports the posture explicitly so a reader never infers "no cap" from a missing key. Route segments ride in execution order, exactly as load resolved them.
+    // the model facts swap); an uncapped model reports the posture explicitly so a reader never infers "no cap" from a missing key. Route segments ride
+    // in execution order, exactly as load resolved them. The queue facts follow the same always-reported shape: the configured depth and bounded wait for
+    // submissions waiting on a held slot, plus this engine's live queue depth right now — every value read live so an observer sees what admissions do
+    // next rather than what some earlier snapshot said about it.
     private static ModelEntry ModelEntryOf(GenerationService gen)
     {
         int? concurrencyCap = gen.Model.MaxConcurrentRequests;
+        int? maxQueuedRequests = gen.MaxQueuedRequests;
         IReadOnlyList<ModelRouteSegment> routeSegments = [.. gen.ResolvedRoute.Segments.Select(segment => new ModelRouteSegment(
             segment.DeviceId,
             WeightTierNames.Of(segment.WeightTier),
@@ -184,7 +188,11 @@ public static class ApiApp
             gen.Model.SparseFfnStrategy,
             concurrencyCap,
             concurrencyCap is null ? ConcurrencyCapPostures.Uncapped : "capped",
-            routeSegments);
+            routeSegments,
+            MaxQueuedRequests: maxQueuedRequests,
+            RequestQueuePosture: maxQueuedRequests is null ? RequestQueuePostures.Immediate : RequestQueuePostures.Bounded,
+            QueuedRequests: gen.QueuedRequestCount,
+            QueueTimeoutMs: gen.QueueTimeoutMs);
     }
 
     // Conventional .NET SPA hosting: the ClientApp bundle is staged into the web root (wwwroot/ui) by the

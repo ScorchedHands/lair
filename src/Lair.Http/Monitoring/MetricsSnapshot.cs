@@ -213,7 +213,20 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_cpu_isa")] string? CpuIsa = null,
 
     /// <summary>The grid staging that encoding feeds the sub-4-bit i-quant dots (<c>scalar</c>, <c>gather</c>); null until CPU selection facts attach.</summary>
-    [property: JsonPropertyName("metrics_cpu_gather")] string? CpuGather = null)
+    [property: JsonPropertyName("metrics_cpu_gather")] string? CpuGather = null,
+
+    // Additive request-queue posture (earlier shapes untouched): the live depth is what submissions blocked on a held concurrency slot
+    // this engine currently holds — none of them has taken an admission slot or spent pool or token budget yet — while the two configured
+    // values ride the attached facts. A model whose queue stands disabled reports zero depth and null capacity, which reads as nothing queued at all.
+
+    /// <summary>Submissions waiting right now for a concurrency slot on this engine; zero whenever nothing queues.</summary>
+    [property: JsonPropertyName("metrics_queued_requests")] int QueuedRequests = 0,
+
+    /// <summary>The configured queue cap for this model — how many submissions may wait for an admission slot before further ones are refused — or null while nothing queues.</summary>
+    [property: JsonPropertyName("metrics_max_queued_requests")] int? MaxQueuedRequests = null,
+
+    /// <summary>The bounded wait a submission gets for its admission slot, in milliseconds — declared ceiling or documented default when queueing is enabled; zero while nothing queues.</summary>
+    [property: JsonPropertyName("metrics_queue_timeout_ms")] int QueueTimeoutMs = 0)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

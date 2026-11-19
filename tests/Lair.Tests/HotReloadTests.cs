@@ -540,6 +540,104 @@ public sealed class HotReloadTests
         Assert.False(string.IsNullOrEmpty(raised[0].Text) || string.IsNullOrEmpty(raised[1].Text));
     }
 
+    [Fact]
+    public async Task RequestQueueKeysEditMidServe_AppliesAsNewRequests_QueuesLaterSubmissions_WithoutPreemptingInFlight()
+    {
+        if (ModelFixture.Resolve() is null)
+        {
+            return; // real-model tests skip when the fixture is absent
+        }
+
+        using LiveConfigHarness harness = new(BuildYaml(kvBlocks: 24, maxBatchTokens: 8, maxContextTokens: 512, maxConcurrentRequests: 1));
+
+        Task<GenerationResult> holding = await StartHoldingSequenceAsync(harness.Engine);
+        await WaitForAsync(() => harness.Engine.Stats.ActiveSequenceCount >= 1, "the holding sequence never admitted");
+
+        // With no queue configured at open, a submission while the only slot is held answers today's immediate refusal posture unchanged.
+        EngineBusyException immediate = await Assert.ThrowsAsync<EngineBusyException>(
+            () => harness.Engine.GenerateAsync(Completion("Describe the sea briefly.", 4), CancellationToken.None));
+        Assert.Contains(ModelName, immediate.Message);
+        Assert.Contains("max_concurrent_requests", immediate.Message);
+
+        // Enabling the queue mid-serve is new-request-only: what already runs keeps running, and a submission arriving from now on waits for its slot
+        // instead of being refused outright.
+        harness.EditYaml(BuildYaml(kvBlocks: 24, maxBatchTokens: 8, maxContextTokens: 512, maxConcurrentRequests: 1, maxQueuedRequests: 2));
+        ReloadSummary depthSummary = await harness.WaitForSummaryAsync(
+            s => s.Results.Any(r => r.Field == "models[0].max_queued_requests" && r.Outcome == "applied"),
+            "the max_queued_requests edit never reached the engine as an applied new-requests change");
+        Assert.Contains(depthSummary.Results, r => r.Field == "models[0].max_queued_requests" && r.MutationClass == MutationClassNames.NewRequests);
+
+        Task<GenerationResult> queued = harness.Engine.GenerateAsync(Completion("Describe the harbor briefly.", 6), CancellationToken.None);
+        await WaitForAsync(() => harness.Engine.QueuedRequestCount >= 1, "the later submission never entered this engine's request queue");
+
+        GenerationResult heldOutcome = await holding; // its sequence finished normally through the edit that queued a later one behind it
+        Assert.Equal(24, heldOutcome.CompletionTokens);
+
+        GenerationResult queuedOutcome = await queued; // admitted when the slot its model's posture now queues for came free
+        Assert.False(string.IsNullOrEmpty(queuedOutcome.Text));
+        Assert.Equal(0, harness.Engine.QueuedRequestCount); // every seat released as its submission was admitted
+
+        // Lowering the bounded wait mid-serve follows the same mutation class and binds later submissions at once: a ceiling far shorter than what is
+        // running cannot be beaten by an admission that has not freed yet.
+        harness.EditYaml(BuildYaml(
+            kvBlocks: 24, maxBatchTokens: 8, maxContextTokens: 512, maxConcurrentRequests: 1, maxQueuedRequests: 2, queueTimeoutMs: 60));
+        ReloadSummary timeoutSummary = await harness.WaitForSummaryAsync(
+            s => s.Results.Any(r => r.Field == "models[0].queue_timeout_ms" && r.Outcome == "applied"),
+            "the queue_timeout_ms edit never reached the engine as an applied new-requests change");
+        Assert.Contains(timeoutSummary.Results, r => r.Field == "models[0].queue_timeout_ms" && r.MutationClass == MutationClassNames.NewRequests);
+
+        Task<GenerationResult> secondHolding = await StartHoldingSequenceAsync(harness.Engine);
+        EngineBusyException timedOut = await Assert.ThrowsAsync<EngineBusyException>(
+            () => harness.Engine.GenerateAsync(Completion("Describe the harbor briefly.", 4), CancellationToken.None));
+        Assert.Equal("engine_overloaded", timedOut.Code); // the same bounded overload family at the wire as every other admission refusal here
+        Assert.Contains(ModelName, timedOut.Message);
+        Assert.Contains("queue_timeout_ms", timedOut.Message);
+
+        GenerationResult secondHeld = await secondHolding; // nothing already admitted was preempted by a submission that ran out of its wait
+        Assert.Equal(24, secondHeld.CompletionTokens);
+
+        // The posture governs admission, not a permanent wall: with the slot free again, an ordinary submission is admitted normally.
+        GenerationResult refilled = await harness.Engine.GenerateAsync(Completion("Describe the sea in one sentence.", 6), CancellationToken.None);
+        Assert.False(string.IsNullOrEmpty(refilled.Text));
+    }
+
+    // Starts a sequence that proves it was admitted (its first streamed token) and then parks on its own steps, so gates below observe admission state
+    // against a slot that is demonstrably held rather than racing whatever order two submissions happened to take.
+    private static async Task<Task<GenerationResult>> StartHoldingSequenceAsync(GenerationService engine)
+    {
+        TaskCompletionSource<bool> firstToken = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        int parkedTokens = 0;
+        GenerationRequest holding = new()
+        {
+            Model = ModelName,
+            IsChat = false,
+            Prompt = SharedPrefix(3) + " A lighthouse keeper catalogued every passing ship.",
+            MaxTokens = 24,
+            Temperature = 0f,
+            Stream = true,
+            OnToken = _ =>
+            {
+                firstToken.TrySetResult(true);
+
+                if (parkedTokens < 3)
+                {
+                    parkedTokens++;
+                    Thread.Sleep(500); // hold this engine's only admission slot long enough for queue state to be observed against it
+                }
+            },
+        };
+
+        Task<GenerationResult> task = engine.GenerateAsync(holding, CancellationToken.None);
+
+        if (await Task.WhenAny(firstToken.Task, task) != firstToken.Task || task.IsCompleted)
+        {
+            throw new InvalidOperationException("the holding sequence finished before it proved admission — its slot was never observably held");
+        }
+
+        return task;
+    }
+
     // --- fixture plumbing -----------------------------------------------------------------
 
     private static string SharedPrefix(int sentences) => string.Join(" ", Enumerable.Repeat(Pangram, sentences));
@@ -561,7 +659,9 @@ public sealed class HotReloadTests
         int blockSize = 16,
         string? modelPathOverride = null,
         int? maxConcurrentRequests = null,
-        int? prefillStepBudgetMs = null)
+        int? prefillStepBudgetMs = null,
+        int? maxQueuedRequests = null,
+        int? queueTimeoutMs = null)
     {
         string modelPath = modelPathOverride ?? ModelFixture.Resolve()!;
 
@@ -594,6 +694,16 @@ public sealed class HotReloadTests
         if (maxConcurrentRequests is int cap)
         {
             yaml += $"\n    max_concurrent_requests: {cap}\n";
+        }
+
+        if (maxQueuedRequests is int depth)
+        {
+            yaml += $"\n    max_queued_requests: {depth}\n";
+        }
+
+        if (queueTimeoutMs is int ceiling)
+        {
+            yaml += $"\n    queue_timeout_ms: {ceiling}\n";
         }
 
         yaml += "\n    placement:" +
