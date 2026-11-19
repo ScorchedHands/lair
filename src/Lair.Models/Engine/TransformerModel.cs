@@ -70,6 +70,12 @@ public sealed class TransformerModel : IDisposable
     // forwards never consult the lane side.
     private readonly IBackend _prefillsBackend;
 
+    // The composed attention window this engine's prompt windows run their attention through when a device prefill
+    // posture was opened for it: null everywhere else, which is every default path and the whole decode side. Supplied at
+    // open by whoever opened the step — like an alternate weight source, its lifetime stays under that caller and model
+    // disposal never releases it. Non-null only behind the internal seam no host configuration path reaches.
+    private readonly IDeviceAttentionStep? _devicePrefill;
+
     private readonly IWeightSource _weights;
 
     // The resolved prefill kernel selection: pinned at open, re-pointed only through ApplyPrefillKernel, and read
@@ -82,6 +88,9 @@ public sealed class TransformerModel : IDisposable
     // order with repeats collapsed. It is what a blocked-matmul selection needs kernels for: every format it lists has
     // to have one before that selection can run this file, and they are the names an unsupported file reports back.
     private readonly IReadOnlyList<QuantFormat> _matmulFormats;
+
+    // The name every load-time and re-point capability refusal this engine raises calls this model by — general.name when the file declares it, its path otherwise. Held so a hot re-point refused over resolved execution spans names the same identity an open refusal did.
+    private readonly string _modelDisplay;
 
     // Only a source this instance created is its own to release: a caller-supplied source stays under the caller's
     // lifetime rules and must outlive the model.
@@ -381,12 +390,24 @@ public sealed class TransformerModel : IDisposable
     /// <summary>The attention route this engine's forwards run, as the closed route type its pair resolved to.</summary>
     internal string ResolvedKvAttentionRoute => _q8q8Attention is not null ? "q8_0/q8_0" : _q8q4Attention is not null ? "q8_0/q4_0" : "f32/f32";
 
+    /// <summary>Whether this engine composes its prompt windows' per-layer attention through an opened device step. Assembly-internal: only a bench or test open installs one, and every default posture answers false.</summary>
+    internal bool DevicePrefillActive => _devicePrefill is not null;
+
+    /// <summary>The KV storage the opened composition writes and walks its causal read from — "none" while no composition stands, the pool's resident device store when the step bound to one, and a private arena otherwise. Assembly-internal.</summary>
+    internal string DevicePrefillKvResidency => _devicePrefill switch
+    {
+        null => "none",
+        { KvStoreBacked: true } => "pool device store",
+        _ => "private arena",
+    };
+
     /// <summary>
     /// Re-points the engine's prefill path selection. The new value is read fresh at the next prefill window
     /// boundary, so sequences already mid-window finish that window on the route they started with — the same
     /// boundary discipline a chunk-width edit keeps. A selection this build has no kernel for is refused naming it
     /// and what is missing; nothing falls back to the route that works. The dense-matrix selection is also refused
-    /// when one of this engine's own weight formats has no blocked matmul, naming that format.
+    /// when any resolved prompt-window range carries a weight format its own execution backend has no blocked matmul
+    /// for, naming that format beside the segment and backend it was resolved onto — the same gate model open runs.
     /// </summary>
     public void ApplyPrefillKernel(PrefillKernel kernel)
     {
@@ -402,6 +423,14 @@ public sealed class TransformerModel : IDisposable
         {
             throw QuantizedPrefillRefusal(kernel);
         }
+
+        // The device prefill posture composes every prompt window's attention through the opened step and takes its dense weight passes through the blocked matmul: a hot re-point off that selection would run windows through some other route behind an opened composition, so it refuses naming both sides exactly as open did — the running selection stays in force.
+        if (_devicePrefill is not null && kernel != PrefillKernel.Gemm)
+        {
+            throw DevicePrefillSelectionRefusal(kernel);
+        }
+
+        ValidateSpanMatmulCapability(kernel, _modelDisplay, Plan.Route, _fileTensors, _prefillSpans); // the re-point answers to the same per-span capability gate model open does; a refused selection leaves the running route untouched.
 
         _prefillKernel = kernel;
     }
@@ -429,23 +458,30 @@ public sealed class TransformerModel : IDisposable
     public IReadOnlyList<QuantFormat> MatmulWeightFormats => _matmulFormats;
 
     // Whether a selection has kernels for this engine's own weights. The batched-row window and its row-tiled variant
-    // always do; the dense-matrix window does only when every dense weight matrix it multiplies activation rows
-    // against is a format the backend's blocked matmul executes. Decided from the same list an unsupported file names.
+    // always do; the dense-matrix window needs this file to carry dense weight matrices at all, and every compute backend
+    // that will multiply activation rows against them must report a blocked matmul for their formats — which is decided
+    // per resolved execution span by ValidateSpanMatmulCapability, from the backend each prompt-window range actually runs on.
     private bool KernelExecutes(PrefillKernel kernel) => kernel switch
     {
         PrefillKernel.GemV or PrefillKernel.Tiled => true,
-        PrefillKernel.Gemm => FormatsWithoutKernels().Count is 0 && _matmulFormats.Count > 0,
+        PrefillKernel.Gemm => _matmulFormats.Count > 0,
         _ => false,
     };
 
-    // The dense weight formats this engine carries that its backend has no blocked matmul for. Empty when every one of
-    // them runs through the dense-matrix window; otherwise exactly the names a refusal reports.
-    private List<QuantFormat> FormatsWithoutKernels()
+    // The dense weight formats this engine carries that one compute backend has no blocked matmul for. Empty when every
+    // one of them runs through the dense-matrix window on that backend; otherwise exactly the names a refusal reports.
+    private List<QuantFormat> FormatsWithoutKernels(IBackend engine) => MatmulFormatsWithoutKernels(_matmulFormats, engine);
+
+    // The formats one resolved prompt-window range carries through the dense-matrix window that its own resolved backend has no blocked matmul for: ResolveMatmulFormats' role list read over just this span's layers. Sparse FFN roles are excluded because expert matrices stay on batched row passes whatever selection is resolved — exactly as every forward of this engine runs them today.
+    private static List<QuantFormat> SpanMatmulGaps(ModelPlan plan, LogicalTensorTable tensors, ExecutionSpan prefill) =>
+        MatmulFormatsWithoutKernels(CollectWeightFormats(plan, tensors, prefill.LayerStart, prefill.LayerEnd, includeSparse: false), prefill.Backend);
+
+    private static List<QuantFormat> MatmulFormatsWithoutKernels(IReadOnlyList<QuantFormat> formats, IBackend engine)
     {
         List<QuantFormat> missing = [];
-        foreach (QuantFormat format in _matmulFormats)
+        foreach (QuantFormat format in formats)
         {
-            if (!_backend.SupportsGemm(format))
+            if (!engine.SupportsGemm(format))
             {
                 missing.Add(format);
             }
@@ -454,20 +490,53 @@ public sealed class TransformerModel : IDisposable
         return missing;
     }
 
+    // The capability gate the dense-matrix selection answers to: when that selection is resolved, every prompt-window span's own layer range must be formats its own resolved backend multiplies through a blocked matmul. A gap refuses at load — before any window dispatches, and with no fall back to another kernel or device — naming the model, the segment and the backend resolved for it, the offending format(s), and that this build carries no dense-matrix path there. The batched-row windows answer empty whatever a file carries, so every other posture is untouched by this gate.
+    private void ValidateSpanMatmulCapability(PrefillKernel kernel, string model, ModelRoute route, LogicalTensorTable tensors, ExecutionSpan[] prefill)
+    {
+        if (kernel != PrefillKernel.Gemm)
+        {
+            return;
+        }
+
+        for (int index = 0; index < prefill.Length && index < route.Segments.Count; index++)
+        {
+            List<QuantFormat> missing = SpanMatmulGaps(Plan, tensors, prefill[index]);
+
+            if (missing.Count > 0)
+            {
+                throw MatmulGapRefusal(model, route.Segments[index], index, prefill[index].Backend, missing);
+            }
+        }
+    }
+
+    // Which wording a dense-matrix gap gets: when the backend answering it is this engine's own opened compute backend on its own device, the shape an unrunnable selection has always carried — the value beside this file's own formats and that backend; when a route resolved some other execution backend for that position, the segment and its backend are named instead.
+    private ModelException MatmulGapRefusal(string model, DeviceSegment segment, int index, IBackend engine, List<QuantFormat> missing) =>
+        ReferenceEquals(engine, _backend) && string.Equals(segment.DeviceId, _backend.DeviceId, StringComparison.Ordinal)
+            ? KernelRefusal(PrefillKernel.Gemm)
+            : MatmulSpanRefusal(model, segment, index, engine, missing);
+
+    // The refusal wording a prompt-window span naming a format its own resolved compute backend cannot multiply in bulk answers: the model, the segment and the device resolved for it, the offending dense weight format(s), and that this build carries no blocked matmul there — beside the two windows that always run. It extends the load-time GEMV capability refusal shape to the window shape a split route or an offloaded prompt side selects, replacing any per-layer throw the same format would have raised after work dispatched.
+    private static ModelException MatmulSpanRefusal(string model, DeviceSegment segment, int index, IBackend engine, List<QuantFormat> missing) => new(
+        $"model '{model}', {segment.Describe(index)}: prefill kernel '{PrefillKernelNames.Gemm}' needs blocked matmul kernels for weight format(s) {string.Join(", ", missing)}, and the compute backend " +
+        $"'{engine.DeviceId}' resolved for this segment reports none — no dense-matrix path exists in this build for them on that device, so this model is refused at load naming the selection, the format, " +
+        $"and its backend rather than raised when a prompt window dispatches — resolve placement onto a segment whose backend multiplies these formats in bulk, re-quantize this file to one '{engine.DeviceId}' " +
+        $"does, or run it through '{PrefillKernelNames.GemV}' / '{PrefillKernelNames.Tiled}', which forward every format through batched row passes");
+
     // The one refusal wording an unrunnable prefill selection gets, at open and on apply alike: it names the value, what
     // the forward engine lacks for it, and the selections that execute today. For the dense-matrix selection it also
-    // names this file's own weight formats when they are the reason the selection cannot run.
+    // names this file's own weight formats when they are the reason the selection cannot run, beside the compute backend
+    // that reports no blocked matmul for them — which is why a route spanning two devices refuses per segment instead.
     private ModelException KernelRefusal(PrefillKernel kernel)
     {
         string name = PrefillKernelNames.Of(kernel);
-        List<QuantFormat> missing = kernel == PrefillKernel.Gemm ? FormatsWithoutKernels() : [];
+        List<QuantFormat> missing = kernel == PrefillKernel.Gemm ? FormatsWithoutKernels(_backend) : [];
 
         if (missing.Count > 0)
         {
             return new ModelException(
                 $"prefill kernel '{name}' is not implemented by the forward engine: architecture '{Plan.Architecture}' " +
-                $"carries dense weight matrices of format(s) {string.Join(", ", missing)} and no {name} attention/weight path exists in this build for them — " +
-                $"the window shape that multiplies a whole sub-batch against one matrix runs only where every dense weight matrix is {QuantFormat.Q8_0}, {QuantFormat.Q4_K}, or {QuantFormat.IQ4_XS} today, " +
+                $"carries dense weight matrices of format(s) {string.Join(", ", missing)} and no {name} attention/weight path exists in this build for them on the compute backend " +
+                $"'{_backend.DeviceId}' — the window shape that multiplies a whole sub-batch against one matrix runs only where every dense weight matrix has a blocked matmul kernel there, " +
                 $"while every other family forwards its prompt windows through batched row passes — set engine.prefill_kernel to '{PrefillKernelNames.GemV}' or " +
                 $"'{PrefillKernelNames.Tiled}' (or omit it) to run this file");
         }
@@ -489,6 +558,80 @@ public sealed class TransformerModel : IDisposable
 
     // The quantized-KV posture refusals one open shares: which posture the pair arrived beside, and what a quantized pair's
     // CPU-kernel-only, host-resident, batched-row route does not carry.
+    // The opened device composition is installed once, against exactly what this engine resolved its prompt windows to run on: the dense-matrix selection it composes under, the span posture those windows stay inside, the KV storage shape the step's write and walk address, a plan whose head geometry the step walks unchanged, an arena that covers every position this context can reach, and staging wide enough for the sub-batch width these windows actually run. Every refusal names both sides — what was opened beside what this engine resolves — because nothing here re-points a composition onto some other posture behind it.
+    private IDeviceAttentionStep InstallDevicePrefill(IDeviceAttentionStep step, int maxContextTokens)
+    {
+        ArgumentNullException.ThrowIfNull(step);
+
+        if (_prefillKernel != PrefillKernel.Gemm)
+        {
+            throw DevicePrefillSelectionRefusal(_prefillKernel);
+        }
+
+        if (!ReferenceEquals(_prefillsBackend, _backend))
+        {
+            throw DevicePrefillPostureRefusal(_prefillsLane is not null ? "a dedicated prefill lane" : "an offloaded prefill backend");
+        }
+
+        // A quantized pair never reaches here: its own posture gate already refuses any selection but the batched-row window, and this composition resolves only the dense-matrix one — the refusal that fires names the formats and the route they run on.
+
+        if (Plan.SparseFfn is { } routing)
+        {
+            throw new ModelException(
+                $"model '{_modelDisplay}' opens a device attention step over a sparse-FFN block routing {routing.ExpertCount} experts: " +
+                "the opened composition stages dense per-layer attention windows only — omit the device step to run this file's expert routing on its batched row passes");
+        }
+
+        if (step.LayerCount != Plan.LayerCount)
+        {
+            throw DevicePrefillGeometryRefusal("layers", step.LayerCount, Plan.LayerCount);
+        }
+
+        if (step.HeadDim != Plan.HeadDim)
+        {
+            throw DevicePrefillGeometryRefusal("head dimension", step.HeadDim, Plan.HeadDim);
+        }
+
+        if (step.KvHeadCount != Plan.KvHeadCount)
+        {
+            throw DevicePrefillGeometryRefusal("kv-head count", step.KvHeadCount, Plan.KvHeadCount);
+        }
+
+        if (step.HeadCount != Plan.HeadCount)
+        {
+            throw DevicePrefillGeometryRefusal("query head count", step.HeadCount, Plan.HeadCount);
+        }
+
+        if (step.MaxPositions < maxContextTokens)
+        {
+            throw new ModelException(
+                $"model '{_modelDisplay}' resolves a context of {maxContextTokens} tokens, but the opened device attention step holds storage for {step.MaxPositions} positions: " +
+                "a composed window may only read and write positions that storage covers — open a step over this context, or shorten it");
+        }
+
+        if (step.MaxWindowRows < _effectivePrefillRowWidth)
+        {
+            throw new ModelException(
+                $"model '{_modelDisplay}' runs prompt windows in sub-batches of {_effectivePrefillRowWidth} rows, but the opened device attention step stages at most " +
+                $"{step.MaxWindowRows} rows — open a step that stages this engine's resolved row width, or narrow the window");
+        }
+
+        return step;
+    }
+
+    private ModelException DevicePrefillSelectionRefusal(PrefillKernel kernel) => new(
+        $"model '{_modelDisplay}': an opened device attention step composes prompt windows under prefill kernel '{PrefillKernelNames.Gemm}', and this engine resolves " +
+        $"'{PrefillKernelNames.Of(kernel)}' — the composition takes its dense weight passes through the blocked matmul beside the device-side write and causal walk, so it opens with " +
+        $"'{PrefillKernelNames.Gemm}' or not at all; a re-point away from it is refused rather than run behind an opened composition");
+
+    private ModelException DevicePrefillPostureRefusal(string posture) => new(
+        $"model '{_modelDisplay}': the opened device attention step composes prompt windows inside this engine's own resolved spans on device " +
+        $"'{_backend.DeviceId}', and {posture} moves them onto execution backend '{_prefillsBackend.DeviceId}' it was not opened against — resolve placement onto one span beside the composition, or omit the device step");
+
+    private ModelException DevicePrefillGeometryRefusal(string fact, int openedValue, int resolvedValue) => new(
+        $"model '{_modelDisplay}' resolves {fact} {resolvedValue}, but the opened device attention step declares {openedValue}: a composed window walks this engine's own plan unchanged — " +
+        "open a step for this model geometry or omit it");
+
     private ModelException QuantizedPostureRefusal(string posture) => new(
         $"this model opens quantized KV storage k='{KvSideFormatNames.Of(_kvFormats.K)}' v='{KvSideFormatNames.Of(_kvFormats.V)}' " +
         $"beside {posture}: quantized attention runs CPU kernels over host-resident KV through the batched-row window only — " +
@@ -690,6 +833,23 @@ public sealed class TransformerModel : IDisposable
         new(file, backend, maxContextTokens, weights, logLine: null, profileOverride: null, prefillKernel, prefillRowWidth);
 
     /// <summary>
+    /// Opens the engine with a device attention composition installed on its prompt windows: every sub-batch's per-layer
+    /// RoPE, KV write, and causal walk stay exactly as this engine runs them today for the host side, while each layer's
+    /// whole window is additionally composed through <paramref name="devicePrefill"/> — one staged crossing in and one
+    /// attention result back per layer instead of a score row, a softmax state, and every K/V read crossed per position.
+    /// The composition arrives under the alternate-<see cref="IWeightSource"/> lifetime rule: whoever opened the step owns
+    /// it, it must outlive this engine's forwards, and model disposal never releases it. Assembly-internal — no host
+    /// configuration path reaches it; bench and test opens resolve candidate compositions through this seam only. A step
+    /// whose geometry facts disagree with what this file's plan resolves is refused at open naming both sides, as is a
+    /// posture the composition cannot run inside: anything but the dense-matrix selection, a lane or offload side that
+    /// moves windows onto another backend, quantized KV storage, and expert-routed feed-forward blocks.
+    /// </summary>
+    internal static TransformerModel Open(
+        GgufFile file, IBackend backend, int maxContextTokens, Action<string>? logLine, PrefillKernel prefillKernel, ModelRoute route,
+        IDeviceAttentionStep devicePrefill, IBackend? prefillsBackend = null) =>
+        new(file, backend, maxContextTokens, weights: null, logLine, profileOverride: null, prefillKernel, prefillRowWidth: 0, route, prefillsBackend, prefillsLane: null, crossingBackends: null, budgets: null, kvFormats: null, quantizedDot: null, devicePrefill);
+
+    /// <summary>
     /// Opens the engine over a resolved route whose execution positions are answered by compute backends supplied for them. Element
     /// <c>i</c> of <paramref name="crossingBackends"/> answers position <c>i + 1</c> when the set covers every position after the first — so two
     /// spans that agree on device and residency stay distinct ranges of layers rather than collapsing into one pass, and the first span keeps
@@ -855,6 +1015,9 @@ public sealed class TransformerModel : IDisposable
         // device-named segment, and the check reads the tensor table alone: an unsupported route never spends a weight view.
         ValidateSpanWeightCapability(ModelDisplayName(file), file.Tensors, route, decodeSide, prefillSide);
 
+        // The dense-matrix selection answers to the same per-span gate: a prompt-window range naming a weight format its own resolved backend has no blocked matmul for refuses here at load — before any window dispatches and with no fall back to another kernel or device — rather than raising one weight pass late.
+        ValidateSpanMatmulCapability(_prefillKernel, ModelDisplayName(file), route, file.Tensors, prefillSide);
+
         return (decodeSide, prefillSide);
     }
 
@@ -930,7 +1093,7 @@ public sealed class TransformerModel : IDisposable
         return name.Length > 0 ? name : file.Path;
     }
 
-    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV, int prefillRowWidth = 0, ModelRoute? route = null, IBackend? prefillsBackend = null, PrefillLaneLayout? prefillsLane = null, IReadOnlyList<IBackend>? crossingBackends = null, ResolvedBudgetSet? budgets = null, KvFormatPair? kvFormats = null, IntegerDotPath? quantizedDot = null)
+    private TransformerModel(GgufFile file, IBackend backend, int maxContextTokens, IWeightSource? weights = null, Action<string>? logLine = null, ModelProfile? profileOverride = null, PrefillKernel prefillKernel = PrefillKernel.GemV, int prefillRowWidth = 0, ModelRoute? route = null, IBackend? prefillsBackend = null, PrefillLaneLayout? prefillsLane = null, IReadOnlyList<IBackend>? crossingBackends = null, ResolvedBudgetSet? budgets = null, KvFormatPair? kvFormats = null, IntegerDotPath? quantizedDot = null, IDeviceAttentionStep? devicePrefill = null)
     {
         ArgumentNullException.ThrowIfNull(file);
         ArgumentNullException.ThrowIfNull(backend);
@@ -940,6 +1103,7 @@ public sealed class TransformerModel : IDisposable
         Plan = profileOverride is null ? ModelPlans.Resolve(file, logLine) : ModelPlans.Resolve(file, profileOverride, logLine);
         Desc = Plan.ToDesc();
         MaxContextTokens = maxContextTokens;
+        _modelDisplay = ModelDisplayName(file); // every capability refusal this engine raises — at open and on a re-point alike — calls this model by the same name the structured load lines report.
 
         // The formats this file's dense weight matrices carry, read from the plan's tensor map before any payload is
         // touched: it decides whether a selection that multiplies a whole sub-batch against one matrix can run here at
@@ -949,9 +1113,10 @@ public sealed class TransformerModel : IDisposable
         // A prefill kernel selection this engine has no kernel for is refused at open, the posture every other
         // unimplemented capability takes: the selection stays visible in the resolved value's vocabulary, the
         // refusal names it and what is missing, and nothing falls back to the route that happens to work. The batched-
-        // row window and its row-tiled variant run for every family; the dense-matrix shape runs only where this file's
-        // own weight formats all have a blocked matmul. The check lands before any tensor maps are built, so an
-        // unrunnable selection never spends a weight view on it.
+        // row window and its row-tiled variant run for every family; the dense-matrix shape needs this file to carry
+        // dense weight matrices at all, and which compute backend must report a blocked matmul for each of their
+        // formats is decided per resolved execution span below. Both checks land before any tensor maps or weight views
+        // are built, so an unrunnable selection never spends either on it.
         if (!KernelExecutes(prefillKernel))
         {
             throw KernelRefusal(prefillKernel);
@@ -1116,6 +1281,12 @@ public sealed class TransformerModel : IDisposable
         _laneRowCapacity = _prefillsLane is null
             ? 0
             : _prefillClamp is null ? _rowCapacity : Math.Min(_rowCapacity, Math.Max(1, _prefillClamp.AllowedRowWidth));
+
+        // The device prefill posture lands beside the resolved spans and row width it composes against: every fact of the opened step is checked against this engine's own plan here, a refused composition spends no weight view, and nothing about the decode side changes — host attention still answers single-token forwards exactly as before.
+        if (devicePrefill is not null)
+        {
+            _devicePrefill = InstallDevicePrefill(devicePrefill, maxContextTokens);
+        }
 
         // Only now does the weight view get created: a refused kernel selection or row count never spends one, which is
         // what keeps a failed open from holding the file's mmap alive behind its own refusal.
@@ -1834,9 +2005,19 @@ public sealed class TransformerModel : IDisposable
                     kv.WriteV(position, l, batchV.AsSpan(r * kvRegion, kvRegion));
                 }
 
-                for (int r = 0; r < rows; r++)
+                if (_devicePrefill is { } deviceStep)
                 {
-                    attention.Apply(engine, batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, basePosition + offset + r, attnScale, Plan.AttentionSoftcap, layerWindow, batchAttnOut.AsSpan(r * qkvRegion, qkvRegion));
+                    // The composed posture hands one layer of the whole sub-batch to the opened step in a single call: the rows land in the KV storage that walk reads, and every score row, softmax state, and K/V read it resolves stays on the far side of the seam — exactly what the per-row host kernel below does position by position over this sequence's blocks. The host RoPE pass and the host KV writes above stay in force: they keep this engine's own decode path reading bytes that never moved device-side.
+                    deviceStep.RunAttentionWindow(
+                        l, basePosition + offset, batchQ.AsSpan(0, rows * qkvRegion), batchK.AsSpan(0, rows * kvRegion), batchV.AsSpan(0, rows * kvRegion),
+                        attnScale, Plan.AttentionSoftcap, layerWindow, batchAttnOut.AsSpan(0, rows * qkvRegion));
+                }
+                else
+                {
+                    for (int r = 0; r < rows; r++)
+                    {
+                        attention.Apply(engine, batchQ.AsSpan(r * qkvRegion, qkvRegion), Plan.HeadCount, Plan.KvHeadCount, Plan.HeadDim, kv, l, basePosition + offset + r, attnScale, Plan.AttentionSoftcap, layerWindow, batchAttnOut.AsSpan(r * qkvRegion, qkvRegion));
+                    }
                 }
 
                 ReadOnlySpan<byte> bytes = _weights.Resolve(_wo[l]);

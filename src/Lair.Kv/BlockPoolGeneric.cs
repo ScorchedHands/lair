@@ -70,6 +70,18 @@ public sealed unsafe class BlockPool<TK, TV> : IKvPool, IDisposable
     private readonly int _kSideBytesPerLayer;
     private readonly int _vSideBytesPerLayer;
 
+    // Residency seam, resolved once at pool open. A host-only quantized pool opens no device mirror and is the posture
+    // every quantized pool has always run. A device-backed quantized residency declares a leading block range whose
+    // group bytes carry a persistent device copy through the backend's KV mirror, and the device-step posture hands that
+    // copy to a GPU step as a store its attention walk reads. The combo the store carries is resolved from the format
+    // pair here — the single place a quantized device attention kernel is selected — so a step never branches on a
+    // format per position. Unsupported combos refuse at open naming the format and posture rather than opening a store
+    // no device attention kernel here can walk.
+    private readonly BlockResidencyMode _residency;
+    private readonly KvMirrorExecution _execution;
+    private readonly int _deviceBackedBlocks;
+    private readonly IKvDeviceMirror? _deviceMirror;
+
     private bool _disposed;
 
     /// <summary>
@@ -77,9 +89,36 @@ public sealed unsafe class BlockPool<TK, TV> : IKvPool, IDisposable
     /// carries (<c>q8_0</c>, <c>q4_0</c>) are accepted: float sides refuse with actionable messages because their addressing is
     /// the non-generic pool's, and a struct whose geometry disagrees with the named pair (values-per-block or group bytes) also
     /// refuses. The arena allocation, its layout, and the free-list order mirror <see cref="BlockPool"/>'s exactly for whichever
-    /// quantized side bytes the pair names.
+    /// quantized side bytes the pair names. This is the host-only posture every quantized pool has always run.
     /// </summary>
     public BlockPool(int blockTokens, int layerCount, int kvHeads, int headDim, int capacityBlocks, IBackend backend, KvFormatPair formats)
+        : this(blockTokens, layerCount, kvHeads, headDim, capacityBlocks, backend, formats, BlockResidencyMode.Dram, KvMirrorExecution.HostArenaRead)
+    {
+    }
+
+    /// <summary>
+    /// Opens a quantized pool with an explicit residency mode and execution posture. <see cref="BlockResidencyMode.Dram"/>
+    /// opens no device mirror and is the host-only posture. <see cref="BlockResidencyMode.Vram"/> declares every block id
+    /// device-backed and <see cref="BlockResidencyMode.Split"/> divides the ids so the leading range is device-backed; both
+    /// ask the backend for a KV mirror over this arena covering exactly that range. <see cref="KvMirrorExecution.DeviceStep"/>
+    /// hands that copy to a GPU step as a store its attention walk reads. A device-backed quantized residency resolves the
+    /// combo the store carries from the format pair here — the single place a quantized device attention kernel is selected —
+    /// and refuses an unsupported combo (a q4_0 K side, or a q4_0/q4_0 pair) or a host-only residency naming the format,
+    /// tier, and posture rather than opening a store no device attention kernel here can walk.
+    /// </summary>
+    public BlockPool(int blockTokens, int layerCount, int kvHeads, int headDim, int capacityBlocks, IBackend backend, KvFormatPair formats, BlockResidencyMode residency, KvMirrorExecution execution)
+        : this(blockTokens, layerCount, kvHeads, headDim, capacityBlocks, backend, formats, residency, execution, DeclaredDeviceRange(residency, capacityBlocks), mirrorOwner: null)
+    {
+    }
+
+    /// <summary>
+    /// Opens a quantized pool whose device-backed range was resolved by its caller rather than derived here. The host
+    /// allocation and free list stay owned by <paramref name="backend"/>; only the persistent device copy of the declared
+    /// leading block range belongs to <paramref name="mirrorOwner"/>, which is how a quantized device-backed reservation runs
+    /// while compute stays on the backend that owns this arena. A mirror owner with no device-resident storage refuses
+    /// naming itself, exactly as when this pool asks its own allocator.
+    /// </summary>
+    public BlockPool(int blockTokens, int layerCount, int kvHeads, int headDim, int capacityBlocks, IBackend backend, KvFormatPair formats, BlockResidencyMode residency, KvMirrorExecution execution, int deviceBackedBlocks, IBackend? mirrorOwner)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(blockTokens);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(layerCount);
@@ -90,6 +129,9 @@ public sealed unsafe class BlockPool<TK, TV> : IKvPool, IDisposable
 
         ThrowForQuantizedSide(formats.K, "k", nameof(KvFormatPair.K));
         ThrowForQuantizedSide(formats.V, "v", nameof(KvFormatPair.V));
+
+        ValidateDeclaredDeviceRange(residency, capacityBlocks, deviceBackedBlocks);
+        KvMirrorFormatCombo combo = ValidateExecutionCombo(residency, execution, deviceBackedBlocks, formats);
 
         BlockTokens = blockTokens;
         LayerCount = layerCount;
@@ -167,6 +209,48 @@ public sealed unsafe class BlockPool<TK, TV> : IKvPool, IDisposable
         _budgetBlocks = capacityBlocks; // no cap until one is set: a fresh pool budgets its whole reservation
         _layerWindowTokens = new int[layerCount];
         _windowedLayerCount = 0;
+
+        // Residency resolves against the ids this pool hands out, ascending — the device-backed range is the leading ids, and
+        // a split reservation puts its host-only tail on the ids allocation reaches last. The combo resolved above is the
+        // layout the mirror's store carries and the device attention kernel a bound step selects.
+        _residency = residency;
+        _execution = execution;
+        _deviceBackedBlocks = deviceBackedBlocks;
+
+        if (_deviceBackedBlocks > 0)
+        {
+            try
+            {
+                _deviceMirror = (mirrorOwner ?? backend).OpenKvMirror(new KvMirrorRequest
+                {
+                    HostArenaBase = (nint)_arena.Pointer,
+                    HostArenaBytes = _totalBytes,
+                    BytesPerBlock = BytesPerBlock,
+                    FirstBlockId = 0,
+                    BlockCount = _deviceBackedBlocks,
+                    Tier = WeightTier.Vram,
+                    ResourceName = "quantized kv block arena",
+                    Execution = execution,
+                    BlockTokens = blockTokens,
+                    LayerCount = layerCount,
+                    KvDim = KvDim,
+                    Combo = combo,
+                    KGroupBytes = kGroupBytes,
+                    VGroupBytes = vGroupBytes,
+                    GroupsPerTokenK = _kGroupsPerToken,
+                    GroupsPerTokenV = _vGroupsPerToken,
+                    KSideBytesPerLayer = _kSideBytesPerLayer,
+                    LayerRegionBytes = layerRegionBytes,
+                });
+            }
+            catch
+            {
+                // A backend that refuses the residency leaves no half-open pool behind: the arena this constructor just took
+                // from the backend goes back before the refusal reaches the caller.
+                backend.FreeAligned(_arena);
+                throw;
+            }
+        }
     }
 
     public int BlockTokens { get; }
@@ -290,7 +374,7 @@ public sealed unsafe class BlockPool<TK, TV> : IKvPool, IDisposable
         }
     }
 
-    /// <summary>Closes one admission window; the shared ceiling resets once every open window has closed.</summary>
+    /// <summary>Closes one admission window; the shared ceiling resets once every open window has closed. Closing a window is also this pool's residency flush point: everything an admitted sequence wrote into device-backed blocks crosses to its device copy at the window's end, so the next admission never sees a stale range.</summary>
     public void EndAdmissionWindow()
     {
         lock (_windowGate)
@@ -301,16 +385,95 @@ public sealed unsafe class BlockPool<TK, TV> : IKvPool, IDisposable
                 Volatile.Write(ref _windowCeiling, -1);
             }
         }
+
+        FlushDeviceMirror(); // window-end flush runs outside the gate: driver work must not hold the ceiling lock against admitting threads
     }
 
-    /// <summary>This pool's residency posture: quantized blocks are host-only in this build, so every quantized pool reports <see cref="BlockResidencyMode.Dram"/>.</summary>
-    public BlockResidencyMode Residency => BlockResidencyMode.Dram;
+    /// <summary>The residency mode this pool opened with: which block ids carry a device-resident copy alongside their host bytes. A host-only quantized pool reports <see cref="BlockResidencyMode.Dram"/>.</summary>
+    public BlockResidencyMode Residency => _residency;
 
-    /// <summary>How many leading block ids are declared device-backed — always zero here: a quantized pool opens no device mirror.</summary>
-    public int DeviceBackedBlockCount => 0;
+    /// <summary>The execution posture this pool's device-backed range runs in: host-read residency accounting, or the store a GPU step reads. A host-only pool reports the host-read posture.</summary>
+    public KvMirrorExecution Execution => _execution;
 
-    /// <summary>True when this physical id carries a persistent device copy — always false here.</summary>
-    public bool IsDeviceBacked(int physicalBlockId) => false;
+    /// <summary>True when this pool's device-backed range is a store a GPU step reads and writes on-device rather than a copy a host seam reads back.</summary>
+    public bool DeviceExecuted => _deviceMirror?.Execution == KvMirrorExecution.DeviceStep;
+
+    /// <summary>How many leading block ids are declared device-backed. Zero for a host-only pool.</summary>
+    public int DeviceBackedBlockCount => _deviceBackedBlocks;
+
+    /// <summary>True when this physical id falls inside the device-backed range and its bytes carry a persistent copy on the device.</summary>
+    public bool IsDeviceBacked(int physicalBlockId) => _deviceMirror is not null && (uint)physicalBlockId < (uint)_deviceBackedBlocks;
+
+    /// <summary>
+    /// Hands this pool's device-backed range to a device step as a store, in this pool's block layout. A host-only pool or
+    /// a host-read residency answers false: nothing here exposes device bytes as a store to read.
+    /// </summary>
+    public bool TryGetDeviceStore(out KvDeviceStore store)
+    {
+        ThrowIfDisposed();
+        if (_deviceMirror is null)
+        {
+            store = default;
+            return false;
+        }
+
+        return _deviceMirror.TryGetDeviceStore(out store);
+    }
+
+    /// <summary>The mirror that owns this pool's device-backed range, when this pool runs the device-step posture and a device step is to be bound to it. Null for a host-only pool or a host-read residency.</summary>
+    public IKvDeviceMirror? DeviceStepMirror => DeviceExecuted ? _deviceMirror : null;
+
+    /// <summary>Device-backed blocks a GPU step wrote on-device through this pool's store. Zero unless this pool runs the device-step posture.</summary>
+    public int DeviceWrittenBlocks => _deviceMirror?.DeviceWrittenBlocks ?? 0;
+
+    /// <summary>Bytes of persistent device-resident KV storage this pool's mirror holds — zero for a host-only pool.</summary>
+    public long DeviceMirrorBytes => _deviceMirror?.DeviceBytes ?? 0;
+
+    /// <summary>Distinct device-backed blocks whose whole payload has crossed to the device copy at least once.</summary>
+    public int DeviceMirrorCrossedBlocks => _deviceMirror?.CrossedBlocks ?? 0;
+
+    /// <summary>Total block payloads copied host-to-device across every crossing this pool caused, counting each crossing.</summary>
+    public long DeviceMirrorCrossedBytes => _deviceMirror?.CrossedBytes ?? 0;
+
+    /// <summary>Device-backed blocks written since their last crossing — what the next flush still owes.</summary>
+    public int DeviceMirrorPendingWrites => _deviceMirror?.PendingWrites ?? 0;
+
+    /// <summary>
+    /// Copies one device-backed block's whole payload from this pool's device store back into <paramref name="output"/>,
+    /// the explicit host observation of bytes a device step wrote and the host arena does not hold. A host-only pool or a
+    /// host-read residency refuses: their host arena already is the copy a host read uses.
+    /// </summary>
+    public void ReadDeviceBlockToHost(int physicalBlockId, Span<float> output)
+    {
+        ThrowIfDisposed();
+        if (_deviceMirror is null || _deviceMirror.Execution != KvMirrorExecution.DeviceStep)
+        {
+            throw new InvalidOperationException(
+                $"block {physicalBlockId}: this pool's residency runs the host-read posture — its host arena already is the " +
+                "copy a host read uses, so it has no device store to read a block back from.");
+        }
+
+        _deviceMirror.ReadBlockToHost(physicalBlockId, output);
+    }
+
+    /// <summary>Copies every dirty device-backed block to its device copy and clears the pending set. A host-only pool, or a mirror with nothing pending, does nothing.</summary>
+    public void FlushDeviceMirror()
+    {
+        ThrowIfDisposed();
+        _deviceMirror?.Flush();
+    }
+
+    // Records that one block's host bytes changed so its next crossing carries them. Reads never call this: only write
+    // paths do — a fresh allocation about to be filled, a copy-on-write destination, and a quantizing K/V write.
+    internal void MarkWritten(int physicalBlockId) => MarkDeviceDirty(physicalBlockId);
+
+    private void MarkDeviceDirty(int physicalBlockId)
+    {
+        if (_deviceMirror is not null && (uint)physicalBlockId < (uint)_deviceBackedBlocks)
+        {
+            _deviceMirror.MarkDirty(physicalBlockId);
+        }
+    }
 
     /// <summary>Opens the sequence type this pool's storage is addressed by: the typed sequence whose reads and writes address this pool's groups.</summary>
     public IKvSequence NewSequence() => new SequenceKv<TK, TV>(this);
@@ -344,6 +507,7 @@ public sealed unsafe class BlockPool<TK, TV> : IKvPool, IDisposable
         }
 
         _refCounts[id] = 1;
+        MarkDeviceDirty(id); // a freshly handed-out device-backed block is about to receive host writes its device copy does not hold yet
         return id;
     }
 
@@ -372,6 +536,8 @@ public sealed unsafe class BlockPool<TK, TV> : IKvPool, IDisposable
 
         if (--_refCounts[physicalBlockId] == 0)
         {
+            MarkDeviceDirty(physicalBlockId); // the last owner let go: whatever its device copy holds must be brought in line with the host bytes now sitting here
+            FlushDeviceMirror();
             _freeStack[_freeTop++] = physicalBlockId;
         }
     }
@@ -398,6 +564,7 @@ public sealed unsafe class BlockPool<TK, TV> : IKvPool, IDisposable
     {
         ThrowIfDisposed();
         ValidateBlockId(blockId);
+        MarkDeviceDirty(blockId);
         return new Span<byte>(_base + (long)blockId * BytesPerBlock, (int)BytesPerBlock);
     }
 
@@ -497,6 +664,8 @@ public sealed unsafe class BlockPool<TK, TV> : IKvPool, IDisposable
             return;
         }
 
+        FlushDeviceMirror(); // the last crossing happens while the arena is still alive: a disposed mirror must not be left holding stale bytes
+        _deviceMirror?.Dispose();
         _backend.FreeAligned(_arena);
         _disposed = true;
     }
@@ -507,8 +676,11 @@ public sealed unsafe class BlockPool<TK, TV> : IKvPool, IDisposable
         return new Span<byte>(_base + offset, sideBytes);
     }
 
-    private Span<byte> MutableSideSpan(int blockId, int layer, bool isV, int sideBytes) =>
-        SideSpan(blockId, layer, isV, sideBytes);
+    private Span<byte> MutableSideSpan(int blockId, int layer, bool isV, int sideBytes)
+    {
+        MarkDeviceDirty(blockId); // a whole-side write lands host bytes the device copy must be brought in line with
+        return SideSpan(blockId, layer, isV, sideBytes);
+    }
 
     private Span<byte> TokenSpan(int blockId, int layer, bool isV, int tokenSlot, int tokenBytes)
     {
@@ -520,8 +692,76 @@ public sealed unsafe class BlockPool<TK, TV> : IKvPool, IDisposable
         return new Span<byte>(_base + offset, tokenBytes);
     }
 
-    private Span<byte> MutableTokenSpan(int blockId, int layer, bool isV, int tokenSlot, int tokenBytes) =>
-        TokenSpan(blockId, layer, isV, tokenSlot, tokenBytes);
+    private Span<byte> MutableTokenSpan(int blockId, int layer, bool isV, int tokenSlot, int tokenBytes)
+    {
+        MarkDeviceDirty(blockId); // a quantizing K/V write lands host bytes the device copy must be brought in line with
+        return TokenSpan(blockId, layer, isV, tokenSlot, tokenBytes);
+    }
+
+    // The device-backed range each residency declares for itself over a reservation of this size: none at all host-only,
+    // the whole reservation accelerator-resident, and half — at least one block — when divided. Leading ids either way.
+    private static int DeclaredDeviceRange(BlockResidencyMode residency, int capacityBlocks) => residency switch
+    {
+        BlockResidencyMode.Vram => capacityBlocks,
+        BlockResidencyMode.Split => Math.Max(1, capacityBlocks / 2),
+        _ => 0,
+    };
+
+    private static int ValidateDeclaredDeviceRange(BlockResidencyMode residency, int capacityBlocks, int deviceBackedBlocks) => residency switch
+    {
+        BlockResidencyMode.Dram when deviceBackedBlocks != 0 => throw new ArgumentException(
+            $"a host-only residency declares no device-backed block range; {deviceBackedBlocks} blocks were declared", nameof(deviceBackedBlocks)),
+
+        BlockResidencyMode.Vram when deviceBackedBlocks != capacityBlocks => throw new ArgumentOutOfRangeException(
+            nameof(deviceBackedBlocks),
+            $"an accelerator-resident residency covers the whole reservation of {capacityBlocks} blocks, not {deviceBackedBlocks}"),
+
+        BlockResidencyMode.Split when deviceBackedBlocks < 1 || deviceBackedBlocks > Math.Max(1, capacityBlocks / 2) => throw new ArgumentOutOfRangeException(
+            nameof(deviceBackedBlocks),
+            $"a divided residency of {capacityBlocks} blocks device-backs at least one leading block and never more than half the reservation " +
+            $"({Math.Max(1, capacityBlocks / 2)}); {deviceBackedBlocks} was declared"),
+
+        _ => deviceBackedBlocks,
+    };
+
+    // A device-step quantized execution needs both a device-backed range to execute against and a combo a CUDA quantized
+    // attention kernel stands for. The quantized attention route dots a q8_0 K side against a prepared query and decodes a
+    // q8_0 or q4_0 V side, so those two combos — q8_0/q8_0 and q8_0/q4_0 — are the only quantized posture a device step
+    // opens here. A host-only residency has no range, and any other quantized pair (a q4_0 K side, or the dropped
+    // q4_0/q4_0) has no device attention kernel in this build, so each refuses naming the model resource, tier, format,
+    // and posture rather than opening a store no kernel here can walk.
+    private static KvMirrorFormatCombo ValidateExecutionCombo(BlockResidencyMode residency, KvMirrorExecution execution, int deviceBackedBlocks, KvFormatPair formats)
+    {
+        if (execution != KvMirrorExecution.DeviceStep)
+        {
+            return KvMirrorFormatCombo.Float; // a host-read quantized mirror carries the pair's own bytes; no attention kernel is selected
+        }
+
+        if (residency == BlockResidencyMode.Dram || deviceBackedBlocks == 0)
+        {
+            throw new ArgumentException(
+                $"a device-step KV execution declares blocks a GPU step reads and writes on-device, but the '{BlockResidencyModeNames.Of(residency)}' " +
+                "residency opens no device-backed range to execute against — declare 'vram' or 'split' residency beside a device-step execution.",
+                nameof(execution));
+        }
+
+        if (formats.K == KvSideFormat.Q8_0 && formats.V == KvSideFormat.Q8_0)
+        {
+            return KvMirrorFormatCombo.Q8Q8;
+        }
+
+        if (formats.K == KvSideFormat.Q8_0 && formats.V == KvSideFormat.Q4_0)
+        {
+            return KvMirrorFormatCombo.K8V4;
+        }
+
+        throw new ArgumentException(
+            $"a device-step quantized KV execution selects a CUDA quantized attention kernel for the 'q8_0/q8_0' and 'q8_0/q4_0' " +
+            $"combos, but this pool declares k='{KvSideFormatNames.Of(formats.K)}' v='{KvSideFormatNames.Of(formats.V)}' at tier " +
+            $"{WeightTier.Vram} over a '{BlockResidencyModeNames.Of(residency)}' device-backed range: that pair has no device attention " +
+            "kernel here, so it refuses naming the format and posture rather than walking quantized bytes with a float kernel.",
+            nameof(execution));
+    }
 
     private static void ThrowForQuantizedSide(KvSideFormat side, string name, string paramName)
     {
