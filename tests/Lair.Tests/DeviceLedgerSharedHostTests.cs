@@ -158,6 +158,46 @@ public sealed class DeviceLedgerSharedHostTests : IDisposable
         Assert.True(result.CompletionTokens > 0);
     }
 
+    [Fact]
+    public void SharedLedger_ReportedOpenedTier_BacksLaterClaimsAtThatPosition_WithoutDisturbingStandingClaims()
+    {
+        DeviceLedger ledger = new([new CapacitySeam { Tier = BudgetTier.Dram, Resource = BudgetResource.Weights, Capacity = 1 }]);
+
+        ClaimOutcome first = ledger.RegisterClaim("ledger-open-a", WeightsChain(BudgetTier.Dram), amount: 1); // the only system-memory seat is taken.
+        Assert.True(first.Seated);
+        Assert.Equal(BudgetTier.Dram, first.Claim!.Tier);
+
+        Assert.True(ledger.ReportOpenedTier(BudgetTier.Vram, BudgetResource.Weights, capacity: 2)); // an engine opened beside this one brought accelerator weight backing the earlier opens never established.
+
+        ClaimOutcome second = ledger.RegisterClaim("ledger-open-b", WeightsChain(BudgetTier.Dram, BudgetTier.Vram), amount: 1);
+        Assert.True(second.Seated);
+        Assert.Equal(BudgetTier.Vram, second.Claim!.Tier); // a claim registered after that position was accounted seats there...
+        Assert.True(second.Claim.Demoted);                 // ...as its own chain's demotion, not as a displacement of the seated holder.
+
+        DeviceLedgerClaim standing = Assert.Single(ledger.ClaimsAt(BudgetTier.Dram, BudgetResource.Weights));
+        Assert.Equal("ledger-open-a", standing.Model);     // what already stood there stayed whole.
+        Assert.Equal(1L, standing.Amount);
+    }
+
+    [Fact]
+    public void SharedLedger_ReportedOpenedTier_LeavesAStatedPostureExactlyAsReported()
+    {
+        DeviceLedger ledger = new([new CapacitySeam { Tier = BudgetTier.Vram, Resource = BudgetResource.Weights, Capacity = 4 }]);
+
+        Assert.False(ledger.ReportOpenedTier(BudgetTier.Vram, BudgetResource.Weights, capacity: 9)); // a position this ledger already accounts against is not restated by a later open.
+
+        CapacitySeam stated = Assert.Single(ledger.Seams, seam => seam.Tier == BudgetTier.Vram && seam.Resource == BudgetResource.Weights);
+        Assert.Equal(4L, stated.Capacity); // the first posture reported for a tier stays authoritative.
+    }
+
+    // A hand-built weight chain over the positions a claim walks: every position here holds working copies and states no ceiling of its own,
+    // so what decides where a claim lands is this ledger's seams alone.
+    private static ResolvedBudgetChain WeightsChain(params BudgetTier[] tiers) => new()
+    {
+        Resource = BudgetResource.Weights,
+        Tiers = [.. tiers.Select(tier => new ResolvedBudgetTier { Tier = tier })],
+    };
+
     private string SyntheticModel(string modelName)
     {
         string path = SyntheticLlamaGguf.Write(modelName);

@@ -90,6 +90,9 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
     // The served posture as one immutable snapshot: instances in declared order, replaced whole under the reload gate while readers take a volatile read.
     private ServedInstance[] _posture = [];
 
+    // Background opens for added models, chained so each runs after the addition started before it — the order claims register against host accounting follows the declared order of the pass that queued them. Extended only under the reload gate.
+    private Task _pendingLoads = Task.CompletedTask;
+
     // The configuration whose model list produced the current posture — the baseline a candidate's raw-scalar extraction reads against and the shape per-instance views carry their engine/server/ui values from.
     private LairConfig _candidateBase;
 
@@ -120,7 +123,7 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
         ILogger? logger,
         IModelHubTransport? transport,
         DeviceLedger? ledger,
-        ComputeCapacityLedger? compute)
+        ComputeCapacityLedger? compute = null)
     {
         ArgumentNullException.ThrowIfNull(config);
         if (config.Models.Count == 0)
@@ -161,6 +164,12 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
         {
             foreach (ServedInstance instance in opened)
             {
+                // Claims release before pools free, exactly as a removal releases them: a declared posture that cannot open every model it
+                // declares serves nothing, so the claims its earlier opens seated must leave the host accounting rather than stand there
+                // under names no engine holds — otherwise a refused startup would keep occupying tiers and cores.
+                _ = registry._ledger?.ReleaseClaims(instance.Name);
+                _ = registry._compute?.ReleaseGrant(instance.Name);
+
                 instance.Engine?.Dispose();
             }
 
@@ -444,13 +453,14 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
         }
 
         ServedInstance instance = new() { Name = declared.Name, Declaration = declared };
+
+        // The posture gains the pending instance and its open joins the load queue under one gate: additions seat in declared order, each
+        // walking the host accounting after every claim already held — including what an earlier addition of this same pass seated.
         lock (_reloadGate)
         {
             RebuildPosture([.. Volatile.Read(ref _posture), instance]);
+            _pendingLoads = _pendingLoads.ContinueWith(_ => LoadAddedModel(instance), CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
         }
-
-        // The load reads the newest declaration and candidate shape at the moment its open actually runs, so an edit landing while it queues is followed rather than raced past.
-        _ = Task.Run(() => LoadAddedModel(instance));
 
         FieldChange change = new($"models[{candidateIndex}]", "(absent)", CanonicalModel(declared), ConfigMutationClass.Live);
         return new FieldResult(
@@ -461,6 +471,17 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
 
     private void LoadAddedModel(ServedInstance instance)
     {
+        if (_disposed)
+        {
+            lock (_reloadGate)
+            {
+                RebuildPosture(Volatile.Read(ref _posture).Where(held => !ReferenceEquals(held, instance)).ToArray()); // host shutdown already took the whole posture down.
+            }
+
+            return;
+        }
+
+        // The load reads the newest declaration and candidate shape at the moment its open actually runs, so an edit landing while it queued is followed rather than raced past.
         LairConfig view = _candidateBase with { Models = [instance.Declaration] };
         try
         {
@@ -475,16 +496,35 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
 
             _logger?.LogInformation("registry_add model='{Model}' outcome=served", instance.Name);
         }
+        catch (BudgetExhaustedException exhausted)
+        {
+            // A chain the live posture cannot seat against claims already held: the refusal names model, resource, tier, and ledger
+            // breakdown in its own words. Nothing already serving was disturbed — no claim of this addition stands behind it either, since
+            // an open that produced no engine releases what it had registered before failing.
+            _logger?.LogError(
+                "model_load_failed model='{Model}' outcome=refused resource='{Resource}' tier='{Tier}' error={Reason}",
+                instance.Name,
+                BudgetResourceNames.Of(exhausted.Resource),
+                BudgetTierNames.Of(exhausted.Tier),
+                exhausted.Message);
+
+            RemoveUnseatedAddition(instance);
+        }
         catch (Exception ex) when (ex is not OutOfMemoryException and not StackOverflowException)
         {
-            // A load the live posture cannot seat — an exhausted budget chain against claims already held, or a backend this host cannot open —
-            // refuses naming model, resource, tier, and ledger breakdown exactly as its own exception words it. Nothing already serving was disturbed.
+            // Any other posture this host cannot open — a chain naming an unopened residency, or a backend it has no device for — refuses the
+            // same way: added to nothing, advertised by nobody, every live instance untouched.
             _logger?.LogError("model_load_failed model='{Model}' outcome=refused error={Reason}", instance.Name, ex.Message);
 
-            lock (_reloadGate)
-            {
-                RebuildPosture(Volatile.Read(ref _posture).Where(held => !ReferenceEquals(held, instance)).ToArray());
-            }
+            RemoveUnseatedAddition(instance);
+        }
+    }
+
+    private void RemoveUnseatedAddition(ServedInstance instance)
+    {
+        lock (_reloadGate)
+        {
+            RebuildPosture(Volatile.Read(ref _posture).Where(held => !ReferenceEquals(held, instance)).ToArray());
         }
     }
 

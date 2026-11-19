@@ -1717,7 +1717,7 @@ Many models at once, each with its own placement policy.
 
 - [✓] Model registry — concurrent instances, add/remove via config reload (see DN-M6-1)
   - Verify: `dotnet test --filter Category=Registry` — model added and removed via config edit while another model serves; no request failures outside the removed model.
-- [_] Device budgets — admission control riding the DN-M314-10 ledger across VRAM + DRAM pools (see DN-M6-2)
+- [✓] Device budgets — admission control riding the DN-M314-10 ledger across VRAM + DRAM pools (see DN-M6-2)
   - Verify: ledger test — cross-model over-commit spills each resource down its own chain rather than rejecting, a model whose final copy-holding tier is exhausted is refused naming model/resource/tier plus the ledger breakdown, and startup weight-cap exhaustion stays a load failure.
 - [_] Scheduler fairness — pipeline admission order, FIFO within a model, per-model priority, core-set partitioning (see DN-M6-4; preemption stays out until MVP8 per DN-M6-2)
   - Verify: two-model load test — per-model ITL stays within budget while the other model saturates its core set, and no running sequence is ever preempted.
@@ -1731,7 +1731,7 @@ Many models at once, each with its own placement policy.
 #### Tests
 
 - [✓] Automated Registry: hot add/remove under load
-- [_] Automated Budget: ledger rejection paths and quota accounting
+- [✓] Automated Budget: ledger rejection paths and quota accounting
 - [_] Automated Fairness: cross-model ITL isolation
 - [_] Automated Queue: queue-full, queue timeout, no pre-admission KV/token reservation, and queue-depth reporting
 - [_] Automated Embeddings: pooling parity vs reference fixtures

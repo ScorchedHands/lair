@@ -1402,6 +1402,12 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
         {
             splitExecution?.Dispose(); // a route or budget this configuration cannot resolve must not leave an opened accelerator backend standing.
             kvMirrorExecution?.Dispose(); // nor one opened only to hold device-backed blocks.
+
+            // Nothing served from here on, so the worker share this open seated is handed back to the host accounting: an open that never
+            // produced an engine must not leave a phantom holder occupying cores against later models. No claim has registered yet at this
+            // point — capacity claims land further down, once the tensor table and pools exist.
+            _ = compute.ReleaseGrant(modelConfig.Name);
+
             throw;
         }
 
@@ -1412,6 +1418,22 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
         // Claims register in this open's order: weights once the tensor table is read, prefill from the activation
         // posture the engine families hold, a device-backed block range as its own standing claim before any pool opens, and the KV reservation as the pool opens.
         ledger ??= OpenHostLedger(modelConfig.Name, config.Host, splitExecution, kvStorageOwner, logger);
+
+        // A supplied host accounting learns about the residencies this open establishes but its earlier opens never did: accelerator memory
+        // holding device-resident weight copies (bounded by the ceiling 'host.vram_mb' declares for it when one is stated), prompt windows
+        // crossing to a device-backed working set, and the block position a resolved device-backed mirror holds. A posture that accounting
+        // already states stays as reported; an engine carrying its own ledger finds every position here already present, so today's posture
+        // reads identically either way — only claims registered after this point can seat against what was just opened.
+        if (splitExecution is not null && splitExecution.WeightTier == Lair.Contracts.WeightTier.Vram)
+        {
+            _ = ledger.ReportOpenedTier(BudgetTier.Vram, BudgetResource.Weights, config.Host?.VramMb);
+            _ = ledger.ReportOpenedTier(BudgetTier.Vram, BudgetResource.PrefillBuffers, capacity: null);
+        }
+
+        if (kvStorageOwner is not null)
+        {
+            _ = ledger.ReportOpenedTier(BudgetTier.Vram, BudgetResource.Kv, capacity: null);
+        }
 
         GgufFile? file = null;
         TransformerModel? model = null;
@@ -1867,6 +1889,14 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
         }
         catch
         {
+            // Claims register as this open proceeds — weights once the tensor table is read, then prefill, a device-backed block range,
+            // and the reservation. An exhaustion or any other refusal partway through leaves those earlier seats standing under this model's
+            // name on whatever accounting it registered against, so an open that produced no engine releases them before its pools go away:
+            // a model nothing serves must not occupy tiers or cores a later claim would need. A ledger this open built for itself is simply
+            // dropped with the failed open; only shared host accounting needs the release stated.
+            _ = ledger.ReleaseClaims(modelConfig.Name);
+            _ = compute.ReleaseGrant(modelConfig.Name);
+
             scheduler?.Dispose();
             pool?.Dispose();
             model?.Dispose();
