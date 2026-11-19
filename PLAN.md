@@ -1701,7 +1701,7 @@ Many models at once, each with its own placement policy.
   - Rejected: best-effort oversubscription (thrash); preempt-to-fittest (needs MVP8 tiers).
   - Contract: ledger in scheduler, riding DN-M314-10's first-come claims and DN-M314-9's per-resource chains; runtime KV or prefill tier exhaustion rejects new admissions with `budget_exhausted` and the ledger breakdown (DN-M314-12), startup weight-cap exhaustion stays a load failure, and `engine_overloaded` / `context_length_exceeded` keep their existing meanings.
 - **DN-M6-3** — Embeddings: encoder-only forward, mean pooling default with CLS option and `normalize` flag; input batching reuses the merged batch steps DN-M314-2 composes.
-  - Contract: `/v1/embeddings` OpenAI shape; registry `type: embed`; embedding batches ride the same route-merged steps the arbiter composes.
+  - Contract: `/v1/embeddings` OpenAI shape accepts a string or array of inputs; registry `type: embed`; model posture declares optional flat keys `pooling: mean | cls` (default `mean`) and `normalize` boolean (default false, raw pooled vectors); embedding batches ride the same route-merged steps the arbiter composes.
 - **DN-M6-4** — Scheduler fairness: core-set partitioning is the isolation mechanism; FIFO within a model, per-model priority; no default core oversubscription (opt-in overcommit lands in MVP3.14 as `core_overcommit`, DN-M314-16).
   - Contract: scheduler admission order.
 - **DN-M6-5** — Request queueing is an admission posture, not a scheduler priority: `models[].max_queued_requests` caps submissions waiting for a concurrency slot, and `models[].queue_timeout_ms` bounds how long an OpenAI-compatible request blocks before it receives the overloaded error. Queued submissions hold no KV blocks or token budgets until admission; when a slot frees, each queued request is revalidated against context, KV, budgets, and route quota.
@@ -1723,7 +1723,7 @@ Many models at once, each with its own placement policy.
   - Verify: two-model load test — per-model ITL stays within budget while the other model saturates its core set, and no running sequence is ever preempted.
 - [✓] Request queue — `models[].max_queued_requests` and `models[].queue_timeout_ms` with blocking OpenAI-compatible admission, revalidation on slot release, and queue-depth reporting (see DN-M6-5)
   - Verify: `dotnet test --filter Category=Scheduling|Api -c Release` — queue-full refuses with `engine_overloaded`; timeout refuses with `engine_overloaded`; queued requests do not hold KV blocks or token budgets before admission; admitted queued requests revalidate and complete normally; monitor reports queue depth.
-- [_] Embeddings endpoint — `/v1/embeddings`, encoder-only models (ModernBERT-class) (see DN-M6-3)
+- [→] Embeddings endpoint — `/v1/embeddings`, encoder-only models (ModernBERT-class) (see DN-M6-3)
   - Verify: `dotnet test --filter Category=Embeddings` — pooled vectors match reference fixtures within FP tolerance.
 - [_] Flagship scenario — GPU-heavy coding model + CPU-only embedding model side by side
   - Verify: manual — both models serve concurrent load; monitor shows per-model device portioning.
@@ -1734,7 +1734,7 @@ Many models at once, each with its own placement policy.
 - [✓] Automated Budget: ledger rejection paths and quota accounting
 - [✓] Automated Fairness: cross-model ITL isolation
 - [✓] Automated Queue: queue-full, queue timeout, no pre-admission KV/token reservation, and queue-depth reporting
-- [_] Automated Embeddings: pooling parity vs reference fixtures
+- [→] Automated Embeddings: pooling parity vs reference fixtures
 
 ### MVP6.1 [v0.6.1] - Refined
 
@@ -2081,6 +2081,8 @@ Vision input on chat models.
 - **2026-11-17 — MVP5's gather-vs-scalar probe is a fixed synthetic engine-open benchmark, not a public config axis or vendor guess.** The CPU backend resolves one grid encoding per process on representative synthetic i-quant blocks under both scalar-index and vector-gather staging paths; the faster path above noise becomes the load-time plan value for every later engine open. Bench forced-mode runs remain the evidence gate for prefetch/gather benefit, while all encodings stay bit-identical to the integer oracle. Rejected: public `gather` knob (no user-facing tuning need yet), vendor heuristics that can misclassify a CPU without measurement, and per-row encoding switches (nondeterminism plus dispatch tax).
 
 - **2026-11-17 — MVP5's grid probe measures representative synthetic Q8_K GEMVs rather than staging loops alone.** The earlier synthetic benchmark timed only `Stage*` helpers and selected scalar on the dev box while forced tensor bench showed gather faster across all pinned sub4-bit formats; the cached engine-open probe now opens two forced CPU backends with prefetch off, runs fixed 128×1024 IQ fixtures through both encodings, interleaves best-of passes, rejects a collapse or selects Gather only when aggregate timing wins by >~4%. This keeps no public knob and preserves bit-identical output; bench evidence now shows auto resolving gather on the dev box with `SUB4BIT` grid comparison +11.579% warm at reps80/maxrows256/threads1, while forced prefetch comparison resolves gather for both sides and reports aggregate prefetched path +2.810% faster (exact bit-identical) at reps200.
+
+- **2026-11-19 — MVP6 embedding serving gets explicit public posture keys before code lands.** `/v1/embeddings` accepts OpenAI-compatible string or array inputs, registry model type `embed`, and per-model flat config keys `pooling: mean | cls` (default `mean`) plus a boolean `normalize` key whose default is false so raw pooled vectors remain the reference-parity surface. Rejected: hiding pooling/normalization behind endpoint request fields only; normalizing by default because it changes fixture parity without measured need; inventing a separate embedding config object when this posture belongs to one model entry like placement and budgets already do.
 
 - **2026-11-19 — MVP6 request queueing gets an explicit default timeout: 30 seconds when `models[].max_queued_requests` is above zero.** The phase contract already says queued submissions block until admitted or timed out, but leaves the bounded wait numeric; settling it as `queue_timeout_ms: 30000` keeps OpenAI clients from hanging indefinitely while staying long enough for ordinary slot handoff on this fleet and matching the monitor panel's illustrative queue-timeout posture. Rejected: an unbounded default, a sub-second timeout that turns transient queueing into false overload, and a per-request override when the model-level posture is what MVP6 defines.
 
