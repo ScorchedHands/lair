@@ -26,7 +26,16 @@ namespace Lair.Backends.Cuda;
 /// Activation vectors and outputs cross the PCIe
 /// seam per call in either posture, and a KV arena stays host-resident for attention reads in both: the device KV mirror
 /// seam opens a persistent device copy of a declared block range that dirty blocks cross on flush, which is residency
-/// accounting only — no device-side attention kernel stands behind a mirror, and opening one implies none.
+/// accounting only — no device-side attention kernel stands behind a mirror, and opening one implies none. Beside the
+/// weight-pass family this seam also carries the on-device transformer-step family: <see cref="OpenDeviceStep"/> opens
+/// persistent device buffers for one step's rotary tables, staged window rows, and per-layer KV arena, and the step's
+/// rotation, KV write, and causal <c>softmax(QK^T)V</c> walk run against those buffers as embedded PTX, so a dense step
+/// crosses the seam once for its staged window and once for its attention result rather than per layer. That arena is
+/// the step's own storage, not a mirror: a mirror still holds bytes for residency, and no kernel here reads one. A step
+/// opened over a mirror's device store — the device-step execution posture of a <c>vram</c> or <c>split</c> KV residency
+/// — takes that reconciliation further: its KV write and attention walk address the pool's own resident blocks through
+/// the pool's block layout, so the resident copy is the storage the GPU step reads and writes rather than a copy a host
+/// seam reads back.
 /// </summary>
 public sealed partial class CudaBackend : IBackend
 {
@@ -71,6 +80,14 @@ public sealed partial class CudaBackend : IBackend
     private readonly IntPtr _gemmF32;
     private readonly IntPtr _gemmF16;
     private readonly IntPtr _gemmBf16;
+    private readonly IntPtr _ropePairs;
+    private readonly IntPtr _ropeHalf;
+    private readonly IntPtr _kvStore;
+    private readonly IntPtr _kvStorePaged;
+    private readonly IntPtr _attnCausal;
+    private readonly IntPtr _attnCausalPaged;
+    private readonly IntPtr _attnCausalQ8Q8;
+    private readonly IntPtr _attnCausalK8V4;
 
     private bool _disposed;
 
@@ -156,6 +173,14 @@ public sealed partial class CudaBackend : IBackend
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemmF32, _module, "gemm_f32"));
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemmF16, _module, "gemm_f16"));
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _gemmBf16, _module, "gemm_bf16"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _ropePairs, _module, "rope_pairs"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _ropeHalf, _module, "rope_half"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _kvStore, _module, "kv_store"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _kvStorePaged, _module, "kv_store_paged"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _attnCausal, _module, "attn_causal"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _attnCausalPaged, _module, "attn_causal_paged"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _attnCausalQ8Q8, _module, "attn_causal_paged_q8q8"));
+                CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _attnCausalK8V4, _module, "attn_causal_paged_k8v4"));
             }
             catch
             {
@@ -400,6 +425,7 @@ public sealed partial class CudaBackend : IBackend
             SetCurrentContext();
 
             ReleaseKvMirrors(); // mirrors flush and release their pins while this instance's context is still current
+            ReleaseDeviceSteps(); // a step's buffers belong to this context too, so they go before it does
             FreeIqScratch(); // the pinned i-quant tables belong to this context too, so they go before it does
             FreeDeviceWeightAllocations();
             ReleaseHostMappedRegions();

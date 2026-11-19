@@ -1646,7 +1646,7 @@ CUDA dense matmul (`GemmBatch`) plus the toolchain decision — flips `SupportsG
 
 - [X] **Toolchain escalation** — Decision: the DN-M5.3-4 bench closes this for MVP5.3 without adopting cuBLAS/cuBLASLt or a `mma.sync` path; managed-first windowed PTX remains, and fast dense GPU prefill is gated by later device-side attention/KV composition rather than a library swap alone.
 
-### MVP5.4 [v0.5.4] - Refined
+### MVP5.4 [v0.5.4] - In Progress
 
 CUDA attention + device-resident KV for the GPU step — where **fast dense GPU prefill is actually demonstrated**, because it composes MVP5.3's matmul with on-device `softmax(QKᵀ)V`/RoPE/KV write instead of staging attention back over PCIe per layer. This owns MVP4's deferred GPU-attention kernels and reconciles its "CPU seam reads VRAM arenas" posture to device-side execution. Dense families only — flagship MoE device execution is gated in MVP7.*. Ordered after MVP5.3, before MVP6.
 
@@ -1667,11 +1667,11 @@ CUDA attention + device-resident KV for the GPU step — where **fast dense GPU 
 
 #### Implementation Items
 
-- [_] On-device step composition — causal `softmax(QKᵀ)V` + RoPE + KV write composed with MVP5.3 matmul, no per-layer PCIe attention staging (see DN-M5.4-1)
+- [✓] On-device step composition — causal `softmax(QKᵀ)V` + RoPE + KV write composed with MVP5.3 matmul, no per-layer PCIe attention staging (see DN-M5.4-1)
   - Verify: `dotnet test --filter Category=Parity|Prefill -c Release` on CUDA — a dense prefill generation lands within its recorded band vs the CPU-prefill reference; monitor shows device-side step, not per-layer host attention.
-- [_] Device-resident KV read/write for GPU steps (see DN-M5.4-2)
+- [✓] Device-resident KV read/write for GPU steps (see DN-M5.4-2)
   - Verify: `dotnet test --filter Category=Kv|Prefill -c Release` on CUDA — the GPU step reads/writes its own resident blocks; host-read arena mode still works unchanged as a non-default.
-- [_] CUDA per-combo quantized KV attention kernels selected at pool open (see DN-M51-3, DN-M51-7)
+- [✓] CUDA per-combo quantized KV attention kernels selected at pool open (see DN-M51-3, DN-M51-7)
   - Verify: `dotnet test --filter Category=Parity -c Release` on CUDA — `q8_0/q8_0` and `k8v4` device-side attention matches the landed CPU quantized-mode bands; no runtime format branching in the engine step loop.
 - [_] Prefill payoff + parity bench — measure end-to-end dense GPU prefill vs CPU prefill and record the generation band (see DN-M5.4-3)
   - Verify: committed `bench/reports/cuda-prefill-<date>.md` showing device-vs-CPU dense prefill tok/s; a measured no-win records it rather than asserting fast prefill, and the parity band is recorded for each fixture.
@@ -1679,7 +1679,7 @@ CUDA attention + device-resident KV for the GPU step — where **fast dense GPU 
 #### Tests
 
 - [_] Automated Parity/Prefill: dense GPU-prefill generations within their recorded band vs CPU-prefill reference; solo determinism holds
-- [_] Automated Parity CUDA KV: per-combo CUDA quantized KV attention matches the landed CPU quantized-mode bands (`q8_0/q8_0` and `k8v4`)
+- [✓] Automated Parity CUDA KV: per-combo CUDA quantized KV attention matches the landed CPU quantized-mode bands (`q8_0/q8_0` and `k8v4`)
 - [_] Manual Flash Dense Prefill: run a pinned dense model on CUDA and confirm from monitor/bench that prefill is device-side and measurably faster than the CPU path
 
 #### Open Items
