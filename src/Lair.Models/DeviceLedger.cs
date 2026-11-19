@@ -484,6 +484,33 @@ public sealed class DeviceLedger
         }
     }
 
+    /// <summary>
+    /// Releases every claim one model holds on this ledger — the answer a host gives when that model's engine is being
+    /// torn down. Released claims free their tier seats for later registrations and admissions immediately; nothing already
+    /// seated moves, re-runs first-come selection, or changes order otherwise. Returns what was released so the caller can
+    /// report it. A model holding no claims releases nothing and reports none.
+    /// </summary>
+    public IReadOnlyList<DeviceLedgerClaim> ReleaseClaims(string model)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(model);
+
+        lock (_gate)
+        {
+            List<DeviceLedgerClaim> released = [];
+            for (int index = _claims.Count - 1; index >= 0; index--)
+            {
+                if (_claims[index].Model == model)
+                {
+                    released.Add(_claims[index]);
+                    _claims.RemoveAt(index);
+                }
+            }
+
+            released.Reverse(); // reported in the registration order they were seated in
+            return released;
+        }
+    }
+
     private DeviceLedgerClaim Seat(string model, BudgetResource resource, BudgetTier tier, long amount, int chainPosition, bool demoted, bool atOriginStore)
     {
         DeviceLedgerClaim claim = new()

@@ -88,6 +88,23 @@ public sealed record ReloadFieldResult(
     [property: JsonPropertyName("detail")] string Detail);
 
 /// <summary>
+/// What a hot-reload host applies candidate configurations to and reads its reload bookkeeping from. Both served shapes —
+/// one live engine and a multi-model registry of them — present this same face, so the watcher's validation, diffing,
+/// per-field logging, and summary reporting stay written once for whichever shape is serving.
+/// </summary>
+public interface IConfigApplyTarget
+{
+    /// <summary>The configuration currently in force: candidates applied so far merged over what was opened or last reloaded.</summary>
+    LairConfig EffectiveConfiguration { get; }
+
+    /// <summary>Entry point of the change-application pipeline for one validated candidate: every classified difference is dispatched and answered per-field.</summary>
+    IReadOnlyList<FieldResult> ApplyConfiguration(LairConfig candidate);
+
+    /// <summary>Records the outcome of one reload attempt (applied or rejected) for programmatic observation by hosts and tests.</summary>
+    void ReportReload(ReloadSummary summary);
+}
+
+/// <summary>
 /// The mutation table: which config field belongs to which mutation class, and the diff that turns a reloaded
 /// candidate into classified per-field changes. Every key the loader accepts is covered; anything not explicitly
 /// hot-reloadable (listener settings, backend sizing, pinning sets, model identity) classifies as restart-only so an

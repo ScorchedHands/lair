@@ -374,13 +374,28 @@ public static class YamlConfigLoader
         }
 
         List<YamlNode> entries = [.. ((YamlSequenceNode)node).Children];
-        if (entries.Count != 1)
+        if (entries.Count == 0)
         {
-            throw new ConfigException(
-                $"{where} must contain exactly one model because this build serves a single model (found {entries.Count}).");
+            throw new ConfigException($"{where} must declare at least one model entry.");
         }
 
-        return [ParseModel(entries[0], 0)];
+        // Every declared entry parses through the same per-model validation; names are what requests and reload diffs route by, so two entries may not share one.
+        List<ModelConfig> models = [];
+        for (int index = 0; index < entries.Count; index++)
+        {
+            ModelConfig parsed = ParseModel(entries[index], index);
+
+            int prior = models.FindIndex(held => string.Equals(held.Name, parsed.Name, StringComparison.Ordinal));
+            if (prior >= 0)
+            {
+                throw new ConfigException(
+                    $"models[{index}].name '{parsed.Name}' duplicates models[{prior}].name: every served model is named distinctly — give each entry its own 'name'.");
+            }
+
+            models.Add(parsed);
+        }
+
+        return models;
     }
 
     private static ModelConfig ParseModel(YamlNode node, int index)
@@ -887,9 +902,7 @@ public static class YamlConfigLoader
         ArgumentNullException.ThrowIfNull(models);
 
         // Two pinned models sharing a core id contend for the same execution resources and make the pinning contract
-        // meaningless. The current build serves exactly one model, so this rule guards the multi-model path that the
-        // placement vocabulary is written for; it validates parsed model objects directly so callers without a YAML
-        // document apply the same rule. A model that opts into core overcommit relaxes the rule for its own claim only:
+        // meaningless, so this rule guards every model entry one configuration declares — startup declarations are checked pair by pair here, while an addition to a live serve meets its own rule against what already-served models still pin. The check validates parsed model objects directly so callers without a YAML document apply the same rule. A model that opts into core overcommit relaxes the rule for its own claim only:
         // it may share cores an earlier claim already holds, while every other pair keeps today's refusal naming both models.
         Dictionary<int, string> owners = [];
         for (int index = 0; index < models.Count; index++)

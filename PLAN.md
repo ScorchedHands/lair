@@ -1686,7 +1686,7 @@ CUDA attention + device-resident KV for the GPU step — measured as a length-de
 
 - [✓] **GPU-prefill payoff gate** — resolved as a mixed measurement: composing matmul + attention + KV on-device beats CPU prefill at some pinned dense lengths but not all, so GPU prefill stays non-default and the bench records both directions.
 
-### MVP6 [v0.6.0] - Refined
+### MVP6 [v0.6.0] - In Progress
 
 Many models at once, each with its own placement policy.
 
@@ -1715,7 +1715,7 @@ Many models at once, each with its own placement policy.
 
 #### Implementation Items
 
-- [_] Model registry — concurrent instances, add/remove via config reload (see DN-M6-1)
+- [✓] Model registry — concurrent instances, add/remove via config reload (see DN-M6-1)
   - Verify: `dotnet test --filter Category=Registry` — model added and removed via config edit while another model serves; no request failures outside the removed model.
 - [_] Device budgets — admission control riding the DN-M314-10 ledger across VRAM + DRAM pools (see DN-M6-2)
   - Verify: ledger test — cross-model over-commit spills each resource down its own chain rather than rejecting, a model whose final copy-holding tier is exhausted is refused naming model/resource/tier plus the ledger breakdown, and startup weight-cap exhaustion stays a load failure.
@@ -1730,7 +1730,7 @@ Many models at once, each with its own placement policy.
 
 #### Tests
 
-- [_] Automated Registry: hot add/remove under load
+- [✓] Automated Registry: hot add/remove under load
 - [_] Automated Budget: ledger rejection paths and quota accounting
 - [_] Automated Fairness: cross-model ITL isolation
 - [_] Automated Queue: queue-full, queue timeout, no pre-admission KV/token reservation, and queue-depth reporting

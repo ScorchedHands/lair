@@ -21,17 +21,34 @@ namespace Lair.Http;
 /// <c>/v1/chat/completions</c> (JSON and SSE), <c>/v1/completions</c> (JSON and SSE), <c>/v1/models</c>,
 /// <c>/healthz</c>, and the operator stream <c>/monitor/stream</c>. Every response carries an
 /// <c>x-lair-request-id</c> header and one structured log line; engine exceptions are converted to the OpenAI
-/// error shape <c>{error:{message,type,code}}</c>.
+/// error shape <c>{error:{message,type,code}}</c>. The registry overload builds the same surface over a live
+/// <see cref="ModelRegistry"/>: every request names its model and routes to that instance's engine — an id no
+/// served instance answers comes back as today's unknown-model refusal, and a retiring instance refuses new work
+/// with the retirement code while it drains — and <c>/v1/models</c> advertises every served instance. The operator
+/// stream samples the first advertised instance's snapshot bus.
 /// </summary>
 public static class ApiApp
 {
     /// <summary>Correlation header carried by every response, including errors.</summary>
     public const string RequestIdHeader = "x-lair-request-id";
 
-    public static WebApplication Build(LairConfig config, GenerationService gen)
+    public static WebApplication Build(LairConfig config, GenerationService gen) => BuildCore(config, gen, registry: null);
+
+    /// <summary>Builds the same HTTP surface over a live model registry: requests name their model and route to that instance; every served instance is advertised.</summary>
+    public static WebApplication Build(LairConfig config, ModelRegistry registry)
+    {
+        ArgumentNullException.ThrowIfNull(registry);
+
+        return BuildCore(config, engine: null, registry);
+    }
+
+    private static WebApplication BuildCore(LairConfig config, GenerationService? engine, ModelRegistry? registry)
     {
         ArgumentNullException.ThrowIfNull(config);
-        ArgumentNullException.ThrowIfNull(gen);
+        if (engine is null && registry is null)
+        {
+            throw new ArgumentException("the HTTP surface needs a served shape to build over: an opened engine or a live model registry.", nameof(engine));
+        }
 
         WebApplicationBuilder builder = WebApplication.CreateBuilder([]);
 
@@ -91,57 +108,83 @@ public static class ApiApp
 
         // A HttpContext-only lambda binds to the RequestDelegate overload, which discards a returned
         // IResult, so the result is executed explicitly here.
-        app.MapPost("/v1/chat/completions", async (HttpContext http) =>
-            await HandleChat(await ReadChatBodyAsync(http.Request), gen, http).ExecuteAsync(http));
+        if (registry is null)
+        {
+            app.MapPost("/v1/chat/completions", async (HttpContext http) =>
+                await HandleChat(await ReadChatBodyAsync(http.Request), gen: engine!, http).ExecuteAsync(http));
 
-        app.MapPost("/v1/completions", async (HttpContext http) =>
-            await HandleCompletion(await ReadBodyAsync<CompletionBody>(http.Request), gen, http).ExecuteAsync(http));
+            app.MapPost("/v1/completions", async (HttpContext http) =>
+                await HandleCompletion(await ReadBodyAsync<CompletionBody>(http.Request), gen: engine!, http).ExecuteAsync(http));
+        }
+        else
+        {
+            // Routing happens the moment the body is in hand — before any per-model validation — so a request naming an unserved model, or one still draining out of the serve, gets its refusal without touching an instance it does not name. The lease stays open for the whole response (a stream completes inside ExecuteAsync), which is exactly what drain completion waits on: releasing it signals this retiring instance when its last admitted generation finishes.
+            app.MapPost("/v1/chat/completions", async (HttpContext http) =>
+            {
+                ChatRequestInput input = await ReadChatBodyAsync(http.Request);
+
+                using ModelRegistry.Lease lease = registry.BeginRequest(input.Body.Model ?? string.Empty);
+                await HandleChat(input, lease.Engine, http).ExecuteAsync(http);
+            });
+
+            app.MapPost("/v1/completions", async (HttpContext http) =>
+            {
+                CompletionBody body = await ReadBodyAsync<CompletionBody>(http.Request);
+
+                using ModelRegistry.Lease lease = registry.BeginRequest(body.Model ?? string.Empty);
+                await HandleCompletion(body, lease.Engine, http).ExecuteAsync(http);
+            });
+        }
 
         app.MapGet("/v1/models", () =>
         {
-            // The advertised concurrency cap is the value admissions enforce now (a live edit re-publishes it through
-            // the model facts swap); an uncapped model reports the posture explicitly so a reader never infers "no cap"
-            // from a missing key. Route segments ride in execution order, exactly as load resolved them.
-            int? concurrencyCap = gen.Model.MaxConcurrentRequests;
-            IReadOnlyList<ModelRouteSegment> routeSegments = [.. gen.ResolvedRoute.Segments.Select(segment => new ModelRouteSegment(
-                segment.DeviceId,
-                WeightTierNames.Of(segment.WeightTier),
-                segment.BatchCap,
-                segment.Quota.Threads,
-                GenerationService.FormatCoreRanges(segment.Quota.Cores)))];
+            // One envelope, one entry per served instance in declared order — a single-model serve renders exactly what it rendered before this overload existed.
+            IReadOnlyList<GenerationService> served = registry is null ? [engine!] : registry.AdvertisedEngines();
 
-            ModelsResponse models = new(
-                "list",
-                [new ModelEntry(
-                    gen.Model.Id,
-                    "model",
-                    DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    "lair",
-                    gen.Model.ContextLength,
-                    gen.Model.Quant,
-                    gen.Model.Architecture,
-                    gen.ModelType,
-                    gen.Model.ToolParser,
-                    gen.Model.Reasoning,
-                    gen.Model.SparseFfnStrategy,
-                    concurrencyCap,
-                    concurrencyCap is null ? ConcurrencyCapPostures.Uncapped : "capped",
-                    routeSegments)]);
-
-            return Results.Json(models, statusCode: 200);
+            return Results.Json(new ModelsResponse("list", [.. served.Select(ModelEntryOf)]), statusCode: 200);
         });
 
         app.MapGet("/healthz", () => Results.Json(new HealthResponse("ok", true)));
 
         // Operator surface, deliberately outside /v1/*: one SSE event per engine snapshot. The bus attaches here so
-        // only serving hosts sample; chat-style hosts never pay for it.
-        EngineMetricsBus metrics = gen.AttachMetrics(app.Services.GetRequiredService<ILoggerFactory>(), MetricsSnapshotInterval);
+        // only serving hosts sample; chat-style hosts never pay for it. A registry serves the first advertised instance's snapshots — every other instance keeps its own bus and joins this stream when later items expand what a monitor covers.
+        GenerationService monitored = engine ?? registry!.MetricsEngine;
+        EngineMetricsBus metrics = monitored.AttachMetrics(app.Services.GetRequiredService<ILoggerFactory>(), MetricsSnapshotInterval);
 
         app.MapGet("/monitor/stream", async (HttpContext http) => await MonitorStreamHandler.HandleAsync(http, metrics));
 
         MapWebUi(app);
 
         return app;
+    }
+
+    // One advertised instance as one models-list entry. The concurrency cap is the value admissions enforce now (a live edit re-publishes it through
+    // the model facts swap); an uncapped model reports the posture explicitly so a reader never infers "no cap" from a missing key. Route segments ride in execution order, exactly as load resolved them.
+    private static ModelEntry ModelEntryOf(GenerationService gen)
+    {
+        int? concurrencyCap = gen.Model.MaxConcurrentRequests;
+        IReadOnlyList<ModelRouteSegment> routeSegments = [.. gen.ResolvedRoute.Segments.Select(segment => new ModelRouteSegment(
+            segment.DeviceId,
+            WeightTierNames.Of(segment.WeightTier),
+            segment.BatchCap,
+            segment.Quota.Threads,
+            GenerationService.FormatCoreRanges(segment.Quota.Cores)))];
+
+        return new ModelEntry(
+            gen.Model.Id,
+            "model",
+            DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            "lair",
+            gen.Model.ContextLength,
+            gen.Model.Quant,
+            gen.Model.Architecture,
+            gen.ModelType,
+            gen.Model.ToolParser,
+            gen.Model.Reasoning,
+            gen.Model.SparseFfnStrategy,
+            concurrencyCap,
+            concurrencyCap is null ? ConcurrencyCapPostures.Uncapped : "capped",
+            routeSegments);
     }
 
     // Conventional .NET SPA hosting: the ClientApp bundle is staged into the web root (wwwroot/ui) by the

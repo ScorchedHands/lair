@@ -26,7 +26,7 @@ namespace Lair.Http;
 /// concurrency quota (<c>max_concurrent_requests</c> fully held by admitted sequences), and <see cref="ContextLengthExceededException"/> for the
 /// resolved token-budget window; each names the served model.
 /// </summary>
-public sealed class GenerationService : IDisposable
+public sealed class GenerationService : IDisposable, IConfigApplyTarget
 {
     private readonly GgufFile _file;
     private readonly CpuBackend _backend;
@@ -99,6 +99,14 @@ public sealed class GenerationService : IDisposable
 
     /// <summary>The metrics bus attached by the API host, if any — null for hosts that never attach one.</summary>
     internal EngineMetricsBus? Metrics => _metrics;
+
+    // The host device ledger this engine's claims stand on and the compute accounting its worker grant seated against. A host
+    // opening several engines beside each other adopts these from the first open so every later model registers its claims after
+    // what is already held — the same shared-accounting posture the supplied-ledger opens have always had, now reachable by a
+    // composing host instead of only by callers that pre-built one. Internal for hosts and tests; disposal never releases them.
+    internal DeviceLedger? HostDeviceLedger => _ledger;
+
+    internal ComputeCapacityLedger? HostCompute => _compute;
 
     /// <summary>The resolved dedicated prefill-lane layout this model opened with — null for every shared-posture model. The load-resolved split live quota edits map against. Internal diagnostics for hosts and tests; monitor reporting is a later seam.</summary>
     internal PrefillLaneLayout? DedicatedPrefillLanes => _prefillsLane;

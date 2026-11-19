@@ -16,7 +16,7 @@ if (args.Length == 1 && (args[0] is "--version" or "-v"))
 if (args.Length == 3 && args[0] == "serve" && args[1] == "-c")
 {
     LairConfig config;
-    GenerationService engine;
+    ModelRegistry registry;
     using Microsoft.Extensions.Logging.ILoggerFactory loggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(builder =>
         builder.AddSimpleConsole(options => options.SingleLine = true).SetMinimumLevel(LogLevel.Information));
     try
@@ -25,7 +25,7 @@ if (args.Length == 3 && args[0] == "serve" && args[1] == "-c")
         // A model that declares a published source is verified against its pack manifest (and fetched if absent) through
         // the live hub seam before its GGUF opens; a model without a source is untouched by this seam. A gated repo is
         // read with the operator's environment-supplied token, which the seam keeps out of the manifest and the logs.
-        engine = GenerationService.Open(config, loggerFactory.CreateLogger("Lair.Http.GenerationService"), ledger: null, compute: null, transport: new HuggingFaceHubTransport(new EnvironmentHubTokenProvider()));
+        registry = ModelRegistry.Open(config, loggerFactory.CreateLogger("Lair.Http.GenerationService"), new HuggingFaceHubTransport(new EnvironmentHubTokenProvider()));
     }
     catch (Exception ex)
     {
@@ -33,7 +33,7 @@ if (args.Length == 3 && args[0] == "serve" && args[1] == "-c")
         return 1;
     }
 
-    using (engine)
+    using (registry)
     using (CancellationTokenSource shutdown = new())
     {
         int interrupts = 0;
@@ -47,13 +47,13 @@ if (args.Length == 3 && args[0] == "serve" && args[1] == "-c")
             }
         };
 
-        WebApplication app = ApiApp.Build(config, engine);
+        WebApplication app = ApiApp.Build(config, registry);
 
-        // Hot reload belongs to the serving posture only: this watcher coalesces config edits and pushes validated changes through the engine's change-application bus. Declared last so it disposes before the engine it watches.
-        using ConfigWatcher hotReload = new(args[2], engine);
+        // Hot reload belongs to the serving posture only: this watcher coalesces config edits and pushes validated changes through every served model's change-application bus — including adds and removals of declared models. Declared last so it disposes before the registry it watches.
+        using ConfigWatcher hotReload = new(args[2], registry);
         hotReload.Start();
 
-        Console.WriteLine($"lair serving '{engine.Model.Id}' on http://{config.Server.Bind}:{config.Server.Port}");
+        Console.WriteLine($"lair serving {string.Join(", ", registry.AdvertisedIds().Select(id => $"'{id}'"))} on http://{config.Server.Bind}:{config.Server.Port}");
         await ((IHost)app).RunAsync(shutdown.Token);
     }
 
@@ -177,7 +177,7 @@ if (args.Length >= 1 && args[0] == "model")
 
 Console.Error.WriteLine("""
     usage:
-      lair serve -c <configPath>   serve the configured model over the OpenAI-compatible HTTP API
+      lair serve -c <configPath>   serve the configured models over the OpenAI-compatible HTTP API
       lair chat -c <configPath>    chat with the configured model in an interactive REPL
       lair monitor [-u URL] [--interval ms]  render live engine stats from a serving server (default http://127.0.0.1:8080)
       lair model fetch|check|list [-c <configPath>]  fetch, report update candidates for, and list pinned model packs

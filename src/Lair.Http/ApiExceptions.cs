@@ -49,7 +49,8 @@ public sealed class ContextLengthExceededException : Exception
 /// <summary>
 /// The engine cannot admit this request right now: either its prompt plus token budget exceeds what the KV pool can back (kv_capacity), or every
 /// admission slot of the model's concurrency cap is held by sequences already admitted (max_concurrent_requests), or the host device ledger's shared
-/// copy-holding chain exhausted before this submission's reservation could be seated anywhere (budget exhaustion). All refusals surface through
+/// copy-holding chain exhausted before this submission's reservation could be seated anywhere (budget exhaustion), or the named model has been removed
+/// from the served set and is draining what already runs instead of accepting new work (retirement). All refusals surface through
 /// this one overload-family type so callers keep a single bounded error shape; each factory names the limit kind, the model it belongs to, and the
 /// wire code that distinguishes it — the capacity and quota refusals keep the code they have always answered with, and a ledger exhaustion answers
 /// with its own. The default form covers an engine-side failure observed mid-run, where no fresh admission decision exists to name.
@@ -69,7 +70,7 @@ public sealed class EngineBusyException : Exception
         Code = code;
     }
 
-    /// <summary>The wire error code this refusal answers with: <c>engine_overloaded</c> for the capacity and quota refusals, <c>budget_exhausted</c> for a host-ledger chain exhaustion.</summary>
+    /// <summary>The wire error code this refusal answers with: <c>engine_overloaded</c> for the capacity and quota refusals, <c>budget_exhausted</c> for a host-ledger chain exhaustion, <c>model_retiring</c> for a submission naming a model being drained out of the served set.</summary>
     public string Code { get; }
 
     /// <summary>The refusal for a submission whose prompt plus token budget outruns the KV pool's free slots (kv_capacity).</summary>
@@ -90,6 +91,11 @@ public sealed class EngineBusyException : Exception
         new($"model '{modelId}' cannot admit this request against its budgets: the host ledger exhausted the '{Lair.Models.BudgetResourceNames.Of(resource)}' copy-holding chain at tier " +
             $"'{Lair.Models.BudgetTierNames.Of(tier)}'. {breakdown}. Retry once the running generations finish, or raise the ceiling this chain declares in the config.",
             "budget_exhausted");
+
+    /// <summary>The refusal for a submission naming a model the host is retiring out of its served set: the model stopped accepting new requests while its already-admitted work drains toward release. It rides the same bounded overload family — the posture that blocks is retirement, not capacity or quota — with its own code so callers can tell a transient overload from a withdrawal.</summary>
+    public static EngineBusyException ForModelRetiring(string modelId) =>
+        new($"model '{modelId}' no longer accepts requests: it has been removed from the served models list and is draining what already runs before its resources are released. Re-serve it by adding it back to the config's models list, or request a model id that stays listed.",
+            "model_retiring");
 }
 
 /// <summary>

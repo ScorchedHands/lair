@@ -54,6 +54,9 @@ public static class AdmissionRefusalKinds
 
     /// <summary>The host ledger's shared copy-holding chain could not seat this submission's reservation anywhere — host accounting across opened pools, not the pool's own cap.</summary>
     public const string BudgetExhaustion = "budget_exhaustion";
+
+    /// <summary>The named model has been removed from the served models list and is draining already-admitted work instead of accepting new submissions.</summary>
+    public const string ModelRetiring = "model_retiring";
 }
 
 /// <summary>

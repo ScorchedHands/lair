@@ -96,7 +96,7 @@ public sealed class ConfigTests : IDisposable
     }
 
     [Fact]
-    public void Load_TwoModels_Fails()
+    public void Load_TwoModels_ParsesBothInDeclaredOrder()
     {
         string modelPath = TempModelFile();
         string yaml = $"""
@@ -107,10 +107,26 @@ public sealed class ConfigTests : IDisposable
                 path: '{modelPath}'
             """;
 
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+
+        Assert.Equal(["first", "second"], config.Models.Select(model => model.Name));
+    }
+
+    [Fact]
+    public void Load_DuplicateModelNames_Fails()
+    {
+        string modelPath = TempModelFile();
+        string yaml = $"""
+            models:
+              - name: same
+                path: '{modelPath}'
+              - name: same
+                path: '{modelPath}'
+            """;
+
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
-        Assert.Contains("exactly one model", error.Message);
-        Assert.Contains("single model", error.Message);
-        Assert.Contains("found 2", error.Message);
+        Assert.Contains("duplicates", error.Message);
+        Assert.Contains("'same'", error.Message);
     }
 
     [Fact]
@@ -119,8 +135,7 @@ public sealed class ConfigTests : IDisposable
         ConfigException error = Assert.Throws<ConfigException>(
             () => YamlConfigLoader.Load(WriteConfig("models: []")));
 
-        Assert.Contains("exactly one model", error.Message);
-        Assert.Contains("found 0", error.Message);
+        Assert.Contains("at least one model", error.Message);
     }
 
     [Fact]
