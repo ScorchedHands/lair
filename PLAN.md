@@ -1719,7 +1719,7 @@ Many models at once, each with its own placement policy.
   - Verify: `dotnet test --filter Category=Registry` — model added and removed via config edit while another model serves; no request failures outside the removed model.
 - [✓] Device budgets — admission control riding the DN-M314-10 ledger across VRAM + DRAM pools (see DN-M6-2)
   - Verify: ledger test — cross-model over-commit spills each resource down its own chain rather than rejecting, a model whose final copy-holding tier is exhausted is refused naming model/resource/tier plus the ledger breakdown, and startup weight-cap exhaustion stays a load failure.
-- [_] Scheduler fairness — pipeline admission order, FIFO within a model, per-model priority, core-set partitioning (see DN-M6-4; preemption stays out until MVP8 per DN-M6-2)
+- [✓] Scheduler fairness — pipeline admission order, FIFO within a model, per-model priority, core-set partitioning (see DN-M6-4; preemption stays out until MVP8 per DN-M6-2)
   - Verify: two-model load test — per-model ITL stays within budget while the other model saturates its core set, and no running sequence is ever preempted.
 - [_] Request queue — `models[].max_queued_requests` and `models[].queue_timeout_ms` with blocking OpenAI-compatible admission, revalidation on slot release, and queue-depth reporting (see DN-M6-5)
   - Verify: `dotnet test --filter Category=Scheduling|Api -c Release` — queue-full refuses with `engine_overloaded`; timeout refuses with `engine_overloaded`; queued requests do not hold KV blocks or token budgets before admission; admitted queued requests revalidate and complete normally; monitor reports queue depth.
@@ -1732,7 +1732,7 @@ Many models at once, each with its own placement policy.
 
 - [✓] Automated Registry: hot add/remove under load
 - [✓] Automated Budget: ledger rejection paths and quota accounting
-- [_] Automated Fairness: cross-model ITL isolation
+- [✓] Automated Fairness: cross-model ITL isolation
 - [_] Automated Queue: queue-full, queue timeout, no pre-admission KV/token reservation, and queue-depth reporting
 - [_] Automated Embeddings: pooling parity vs reference fixtures
 
