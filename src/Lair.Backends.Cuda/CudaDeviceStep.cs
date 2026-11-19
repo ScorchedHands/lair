@@ -26,7 +26,7 @@ namespace Lair.Backends.Cuda;
 /// is the contract this seam reads against, on every layer and on both the prefill window and the decode step.
 /// </para>
 /// </summary>
-public sealed unsafe class CudaDeviceStep : IDisposable
+public sealed unsafe class CudaDeviceStep : IDisposable, IDeviceAttentionStep
 {
     // The rotation and KV-write blocks stride over their work at this width; the attention block is one lane per head
     // dimension, so its block width is the request's head dimension and every lane covers exactly one accumulator.
@@ -801,6 +801,39 @@ public sealed unsafe class CudaDeviceStep : IDisposable
         {
             StageWindow(qRows, kRows, vRows);
             ApplyRope(positionBase);
+            WriteKv(layer, positionBase);
+            Attend(layer, positionBase, attnScale, softcap, window, output);
+        }
+        finally
+        {
+            _backend.ExitDeviceWork();
+        }
+    }
+
+    /// <summary>
+    /// The composed window an engine's device prefill posture runs per layer: stage the rows, write their key/value
+    /// bytes into this step's storage at these positions, and walk causal attention over that storage. Unlike
+    /// <see cref="RunStep"/>, no rotation happens here — the rows arrive with the composing engine's own rotary pass
+    /// already applied against its resolved tables, bases, and pairings, which is what keeps a composed window's rope
+    /// bytes byte-identical to the host reference while only the KV write and the attention walk move device-side.
+    /// </summary>
+    public void RunAttentionWindow(
+        int layer,
+        int positionBase,
+        ReadOnlySpan<float> qRows,
+        ReadOnlySpan<float> kRows,
+        ReadOnlySpan<float> vRows,
+        float attnScale,
+        float softcap,
+        int window,
+        Span<float> output)
+    {
+        ThrowIfDisposed();
+
+        _backend.EnterDeviceWork();
+        try
+        {
+            StageWindow(qRows, kRows, vRows);
             WriteKv(layer, positionBase);
             Attend(layer, positionBase, attnScale, softcap, window, output);
         }

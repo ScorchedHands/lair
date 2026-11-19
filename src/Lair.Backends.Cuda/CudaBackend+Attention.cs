@@ -1,5 +1,7 @@
 namespace Lair.Backends.Cuda;
 
+using System.Numerics;
+
 using Lair.Contracts;
 
 public sealed partial class CudaBackend
@@ -47,6 +49,44 @@ public sealed partial class CudaBackend
         ArgumentNullException.ThrowIfNull(kvStore);
         ThrowIfDisposed();
         return new CudaDeviceStep(this, request, kvStore);
+    }
+
+    /// <summary>
+    /// Opens the composed attention window an engine's device prefill posture runs each prompt layer through: the step
+    /// family above, answered in the model layout the request states rather than in whatever head staging the walk needs.
+    /// A grouped-query group the committed shift mapping already divides answers with a plain device step; a group it
+    /// cannot express — nine query heads over three kv-heads is that shape today — runs through padded head staging over
+    /// the same kernels, so no model layout reaches a mapping the walk does not hold and no kernel here changes. The KV
+    /// store arrives exactly as <see cref="OpenDeviceStep(CudaDeviceStepRequest, IKvDeviceMirror)"/> takes it: bound when
+    /// one is supplied (the device-step posture of a resident pool), private-arena when none is, with the same geometry
+    /// refusals naming both sides either way. The caller owns what this opens and disposes it after its last forward.
+    /// </summary>
+    public IDeviceAttentionStep OpenAttentionStep(CudaDeviceStepRequest request, IKvDeviceMirror? kvStore = null)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ThrowIfDisposed();
+
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(request.HeadCount);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(request.KvHeadCount);
+
+        if (request.HeadCount % request.KvHeadCount != 0)
+        {
+            throw new ArgumentException(
+                $"composed step request HeadCount {request.HeadCount} is not a whole multiple of KvHeadCount {request.KvHeadCount}: " +
+                "grouped-query attention maps consecutive query heads onto one kv-head.",
+                nameof(request));
+        }
+
+        int groupReal = request.HeadCount / request.KvHeadCount;
+        if (BitOperations.IsPow2((uint)groupReal))
+        {
+            return new CudaDeviceStep(this, request, kvStore);
+        }
+
+        // The padded shape: each real head keeps its kv-head's group slot and the partial groups' tails pad out to whole power-of-two groups. Validate through that layout so every other geometry rule — head dimension, arena size, window width — answers exactly as a plain step request would.
+        int stagedHeads = checked(request.KvHeadCount * (int)BitOperations.RoundUpToPowerOf2((uint)groupReal));
+
+        return new CudaGroupedAttentionStep(new CudaDeviceStep(this, request with { HeadCount = stagedHeads }, kvStore), request.HeadCount, request.KvHeadCount);
     }
 
     /// <summary>Device steps currently open on this instance.</summary>
