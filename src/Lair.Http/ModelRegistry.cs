@@ -93,6 +93,11 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
     private DeviceLedger? _ledger;
     private ComputeCapacityLedger? _compute;
 
+    // The monitor attach posture a serving host registered for this registry: every advertised engine gets its
+    // snapshot bus through it — at registration, and again for every model a later reload opens — so one host
+    // samples every instance it advertises. Null until a host asks for monitor buses.
+    private MonitorAttach? _monitorAttach;
+
     // The served posture as one immutable snapshot: instances in declared order, replaced whole under the reload gate while readers take a volatile read.
     private ServedInstance[] _posture = [];
 
@@ -203,15 +208,32 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
             .Where(instance => instance.Posture is ServedPosture.Ready or ServedPosture.Draining && instance.Engine is not null)
             .Select(instance => instance.Engine!)];
 
-    /// <summary>The first advertised engine — the one whose snapshot bus a monitor stream samples while multi-instance monitoring stays out of scope.</summary>
-    internal GenerationService MetricsEngine
+    /// <summary>
+    /// Attaches a snapshot bus to every advertised engine and remembers the same attach for every model a later
+    /// reload opens: a serving host samples every instance it advertises, hot additions included. Idempotent per
+    /// engine — an engine already carrying a bus keeps it — and buses are handed back in declared order so the
+    /// host can wire its monitor stream over them.
+    /// </summary>
+    internal IReadOnlyList<EngineMetricsBus> AttachMonitorBuses(ILoggerFactory loggerFactory, TimeSpan interval, MonitorEventLineage lineage)
     {
-        get
-        {
-            ServedInstance? primary = Volatile.Read(ref _posture)
-                .FirstOrDefault(instance => instance.Posture == ServedPosture.Ready && instance.Engine is not null);
+        ArgumentNullException.ThrowIfNull(loggerFactory);
+        ArgumentNullException.ThrowIfNull(lineage);
 
-            return primary?.Engine ?? throw new InvalidOperationException("the registry advertises no opened engine to sample monitor snapshots from.");
+        lock (_reloadGate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, typeof(ModelRegistry));
+
+            _monitorAttach = new MonitorAttach(loggerFactory, interval, lineage);
+
+            List<EngineMetricsBus> buses = [];
+            foreach (GenerationService engine in Volatile.Read(ref _posture)
+                .Where(instance => instance.Posture is ServedPosture.Ready or ServedPosture.Draining && instance.Engine is not null)
+                .Select(instance => instance.Engine!))
+            {
+                buses.Add(engine.AttachMetrics(loggerFactory, interval, lineage));
+            }
+
+            return buses;
         }
     }
 
@@ -301,6 +323,13 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
                 instance.SignalDrained(); // the last in-flight request of a retiring model finished: its release may proceed.
             }
         }
+    }
+
+    // One host's monitor attach posture, replayed onto every engine this registry opens: the logger factory, the
+    // snapshot cadence, and the host event line every bus on this serve publishes through.
+    private sealed record MonitorAttach(ILoggerFactory LoggerFactory, TimeSpan Interval, MonitorEventLineage Lineage)
+    {
+        public void Apply(GenerationService engine) => engine.AttachMetrics(LoggerFactory, Interval, Lineage);
     }
 
     /// <summary>
@@ -499,6 +528,11 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
             {
                 RebuildPosture(Volatile.Read(ref _posture)); // the snapshot identity stays put; only this instance's posture changed.
             }
+
+            // The host's monitor attach, when one was registered, replays onto this freshly opened instance too: a
+            // hot addition joins the same event line and snapshot cadence every advertised engine already publishes
+            // through, so streams attached after it loads sample it as well.
+            Volatile.Read(ref _monitorAttach)?.Apply(engine);
 
             _logger?.LogInformation("registry_add model='{Model}' outcome=served", instance.Name);
         }

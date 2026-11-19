@@ -1725,6 +1725,8 @@ Many models at once, each with its own placement policy.
   - Verify: `dotnet test --filter Category=Scheduling|Api -c Release` — queue-full refuses with `engine_overloaded`; timeout refuses with `engine_overloaded`; queued requests do not hold KV blocks or token budgets before admission; admitted queued requests revalidate and complete normally; monitor reports queue depth.
 - [✓] Embeddings endpoint — `/v1/embeddings`, encoder-only models (dense encoder-mode checkpoints; ModernBERT-class GGUF families remain Backlog) (see DN-M6-3)
   - Verify: `dotnet test --filter Category=Embeddings` — pooled vectors match reference fixtures within FP tolerance.
+- [✓] Monitor multi-instance snapshots — every advertised engine feeds `/monitor/stream` with shared event ids and per-model route/device facts (see DN-M6-1 and DN-M6-5)
+  - Verify: `dotnet test --filter Category=MonitorStream|Registry` — two served models produce snapshot frames for both models on one stream, each carrying its own model id and route segments.
 - [_] Flagship scenario — GPU-heavy coding model + CPU-only embedding model side by side
   - Verify: manual — both models serve concurrent load; monitor shows per-model device portioning.
 
@@ -1735,6 +1737,7 @@ Many models at once, each with its own placement policy.
 - [✓] Automated Fairness: cross-model ITL isolation
 - [✓] Automated Queue: queue-full, queue timeout, no pre-admission KV/token reservation, and queue-depth reporting
 - [✓] Automated Embeddings: pooling parity vs reference fixtures
+- [✓] Automated Monitor Multi-Instance: one stream carries snapshots from every advertised engine
 
 ### MVP6.1 [v0.6.1] - Refined
 
@@ -2085,6 +2088,8 @@ Vision input on chat models.
 - **2026-11-19 — MVP6 embedding serving gets explicit public posture keys before code lands.** `/v1/embeddings` accepts OpenAI-compatible string or array inputs, registry model type `embed`, and per-model flat config keys `pooling: mean | cls` (default `mean`) plus a boolean `normalize` key whose default is false so raw pooled vectors remain the reference-parity surface. Rejected: hiding pooling/normalization behind endpoint request fields only; normalizing by default because it changes fixture parity without measured need; inventing a separate embedding config object when this posture belongs to one model entry like placement and budgets already do.
 
 - **2026-11-19 — MVP6 embedding serving lands on the existing dense encoder seam and the facade's encoder lane; ModernBERT-native layouts stay Backlog.** `/v1/embeddings` now serves `type: embed` models through bidirectional encoder forwards, with `pooling: mean|cls` and `normalize` shaping pooled vectors, multiple inputs composed through merged encoder batch rows, and submissions riding the same bounded request-queue posture as generation submissions. Dedicated ModernBERT-class tensor layouts and quantized encoder routes were not invented in this item; they remain model-family backlog work. Rejected: claiming ModernBERT-native checkpoint coverage from synthetic dense encoder tests, forcing encode-only requests through decode pipeline machinery, or bypassing the model's queue posture.
+
+- **2026-11-19 — MVP6 monitor streams fan in every advertised engine over one host event line.** Registry serves now attach each engine's snapshot bus to a shared counter and fan-out lock, so `/monitor/stream` samples all advertised models with unique ids and per-model route facts; hot additions join the same attach posture for later stream connections. Rejected: leaving multi-instance monitoring on only the first advertised engine while MVP6 claims concurrent serving, or inventing a second monitor endpoint just to avoid shared event-id replay.
 
 - **2026-11-19 — MVP6 request queueing gets an explicit default timeout: 30 seconds when `models[].max_queued_requests` is above zero.** The phase contract already says queued submissions block until admitted or timed out, but leaves the bounded wait numeric; settling it as `queue_timeout_ms: 30000` keeps OpenAI clients from hanging indefinitely while staying long enough for ordinary slot handoff on this fleet and matching the monitor panel's illustrative queue-timeout posture. Rejected: an unbounded default, a sub-second timeout that turns transient queueing into false overload, and a per-request override when the model-level posture is what MVP6 defines.
 

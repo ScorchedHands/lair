@@ -289,9 +289,10 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
     /// <summary>
     /// Attaches the metrics bus that samples this engine's counters and feeds <c>/monitor/stream</c>. The API host
     /// calls it once while building the app; hosts that never attach one simply produce no snapshots. Idempotent:
-    /// a second call returns the already-attached bus.
+    /// a second call returns the already-attached bus. A supplied host event line lets several engines' buses publish
+    /// into one monitor stream without colliding event ids; without one the bus keeps its own id line.
     /// </summary>
-    internal EngineMetricsBus AttachMetrics(ILoggerFactory loggerFactory, TimeSpan interval)
+    internal EngineMetricsBus AttachMetrics(ILoggerFactory loggerFactory, TimeSpan interval, MonitorEventLineage? eventLineage = null)
     {
         ArgumentNullException.ThrowIfNull(loggerFactory);
         if (_metrics is not null)
@@ -300,7 +301,7 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
         }
 
         PrefixCache? cache = _cacheForMetrics;
-        EngineMetricsBus bus = new(Model.Id, _scheduler, _pool, cache, loggerFactory, interval);
+        EngineMetricsBus bus = new(Model.Id, _scheduler, _pool, cache, loggerFactory, interval, eventLineage: eventLineage);
 
         // The monitor's request-side state starts from the configuration in force: the recent-request ring capacity,
         // the live in-flight views a resync can dump, and the model facts snapshots carry additively.

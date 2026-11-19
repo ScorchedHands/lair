@@ -25,7 +25,7 @@ namespace Lair.Http;
 /// <see cref="ModelRegistry"/>: every request names its model and routes to that instance's engine — an id no
 /// served instance answers comes back as today's unknown-model refusal, and a retiring instance refuses new work
 /// with the retirement code while it drains — and <c>/v1/models</c> advertises every served instance. The operator
-/// stream samples the first advertised instance's snapshot bus.
+/// stream samples every advertised instance's snapshot bus over one host event line.
 /// </summary>
 public static class ApiApp
 {
@@ -160,16 +160,33 @@ public static class ApiApp
         app.MapGet("/healthz", () => Results.Json(new HealthResponse("ok", true)));
 
         // Operator surface, deliberately outside /v1/*: one SSE event per engine snapshot. The bus attaches here so
-        // only serving hosts sample; chat-style hosts never pay for it. A registry serves the first advertised instance's snapshots — every other instance keeps its own bus and joins this stream when later items expand what a monitor covers.
-        GenerationService monitored = engine ?? registry!.MetricsEngine;
-        EngineMetricsBus metrics = monitored.AttachMetrics(app.Services.GetRequiredService<ILoggerFactory>(), MetricsSnapshotInterval);
+        // only serving hosts sample; chat-style hosts never pay for it. Every advertised instance gets its own bus on
+        // one host event line: a registry's stream carries every model it advertises, a model a reload opens later
+        // joins streams attached after its load, and ids stay unique across engines because every bus draws from the
+        // same line.
+        MonitorEventLineage monitorLineage = new();
+        ILoggerFactory loggerFactory = app.Services.GetRequiredService<ILoggerFactory>();
 
-        app.MapGet("/monitor/stream", async (HttpContext http) => await MonitorStreamHandler.HandleAsync(http, metrics));
+        if (registry is null)
+        {
+            IReadOnlyList<EngineMetricsBus> monitored = [engine!.AttachMetrics(loggerFactory, MetricsSnapshotInterval, monitorLineage)];
+            app.MapGet("/monitor/stream", async (HttpContext http) => await MonitorStreamHandler.HandleAsync(http, monitored));
+        }
+        else
+        {
+            registry.AttachMonitorBuses(loggerFactory, MetricsSnapshotInterval, monitorLineage);
+            app.MapGet("/monitor/stream", async (HttpContext http) => await MonitorStreamHandler.HandleAsync(http, MonitorBusesOf(registry)));
+        }
 
         MapWebUi(app);
 
         return app;
     }
+
+    // The snapshot buses every advertised instance carries right now, in declared order: what a monitor stream
+    // samples when it attaches, so an instance a reload opened after this app was built joins streams attached after it.
+    private static IReadOnlyList<EngineMetricsBus> MonitorBusesOf(ModelRegistry registry) =>
+        [.. registry.AdvertisedEngines().Select(served => served.Metrics).OfType<EngineMetricsBus>()];
 
     // One advertised instance as one models-list entry. The concurrency cap is the value admissions enforce now (a live edit re-publishes it through
     // the model facts swap); an uncapped model reports the posture explicitly so a reader never infers "no cap" from a missing key. Route segments ride

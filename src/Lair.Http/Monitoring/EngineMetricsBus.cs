@@ -22,7 +22,10 @@ namespace Lair.Http.Monitoring;
 /// Every stream event — snapshots, request lifecycle frames, and resync dumps alike — carries one server-scoped
 /// id from a single incrementing counter: the SSE frame's <c>id:</c>, also embedded in snapshot payloads as
 /// <c>metrics_event_seq</c>. Ids are assigned under the fan-out lock so publish order matches id order, and each
-/// event kind keeps its own per-subscriber queue. A slow consumer never blocks publishing: snapshots coalesce to a
+/// event kind keeps its own per-subscriber queue. A bus attached to a <see cref="MonitorEventLineage"/> takes its
+/// ids and its fan-out lock from that line instead of its own, so every bus a host samples shares one id space and
+/// one ordering lock — frames from different engines interleave on one stream without ever repeating an id; a bus
+/// with no lineage keeps its own counter and lock. A slow consumer never blocks publishing: snapshots coalesce to a
 /// latest-pending slot (the subscriber only ever sees the newest one), request frames ride a bounded queue whose
 /// oldest entries drop under pressure — both counted in <c>metrics_dropped_events_total</c>. Completed requests
 /// also land in a recent-request ring sized by the live <see cref="SetRecentRequestCapacity"/> knob. Ids survive
@@ -61,16 +64,22 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     // request threads and read as volatile longs at each tick.
     private long _requestsStop;
 
+    // The host event line this bus publishes through, or null when it keeps its own counter and lock.
+    private readonly MonitorEventLineage? _lineage;
+
     // Server-scoped event id: every frame this bus delivers takes the next value, so Last-Event-ID names one
     // point in one total stream regardless of which subscriber or event kind produced it. Assigned under the
-    // fan-out lock together with delivery, keeping publish order and id order aligned.
+    // fan-out lock together with delivery, keeping publish order and id order aligned. With a host lineage
+    // attached the line lives there instead and every bus sharing it draws from the same counter; this field
+    // then stays unused and the lineage's own counter answers instead.
     private long _eventSeq;
 
     // Fan-out serialization: snapshot publishing (sampler thread) and request lifecycle publishing (request
     // threads) share one short critical section — assign id, store to rings, hand frames to subscriber queues.
     // Queue writes never block (coalescing slot + bounded drop-oldest channels), so the lock is held only for
-    // bookkeeping even when a consumer stalls.
-    private readonly object _fanout = new();
+    // bookkeeping even when a consumer stalls. Supplied by the host lineage when one is attached, so ids from
+    // every bus on that line are handed out and delivered in one global order.
+    private readonly object _fanout;
 
     // Recent completed requests: newest-first ring sized by the live ui.recent_requests knob. Shrinking just
     // narrows what reads see (oldest entries drop); growing admits more again, re-seating only the retained tail.
@@ -117,7 +126,8 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         PrefixCache? cache,
         ILoggerFactory loggerFactory,
         TimeSpan interval,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        MonitorEventLineage? eventLineage = null)
     {
         ArgumentNullException.ThrowIfNull(modelId);
         ArgumentNullException.ThrowIfNull(scheduler);
@@ -131,6 +141,8 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         _cache = cache;
         _interval = interval;
         _time = timeProvider ?? TimeProvider.System;
+        _lineage = eventLineage;
+        _fanout = eventLineage?.Fanout ?? new object();
         _logger = loggerFactory.CreateLogger<EngineMetricsBus>();
         _recentRequests = new RequestPayload[_recentCapacity];
 
@@ -205,8 +217,8 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     /// <summary>Stream frames dropped at subscriber queues since the bus opened — how often slow consumers lost events.</summary>
     public long DroppedEventsTotal => Volatile.Read(ref _droppedEvents);
 
-    /// <summary>The highest event id any frame this bus has delivered carries (0 before the first).</summary>
-    public long LatestEventId => Volatile.Read(ref _eventSeq);
+    /// <summary>The highest event id any frame this bus has delivered carries (0 before the first). On a host event line this is the line's newest id, shared by every bus attached to it.</summary>
+    public long LatestEventId => _lineage is MonitorEventLineage lineage ? lineage.LatestEventId : Volatile.Read(ref _eventSeq);
 
     /// <summary>The id of the oldest snapshot still in the ring — 0 when the ring holds none. Reconnect ids below it predate retained history.</summary>
     public long OldestRetainedSnapshotId => _ringTotal == 0
@@ -418,7 +430,7 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         MonitorFrame frame;
         lock (_fanout)
         {
-            long id = ++_eventSeq;
+            long id = TakeEventId();
             frame = new MonitorFrame(id, eventName, payload.ToJson());
 
             if (eventName == MonitorEventNames.RequestComplete)
@@ -580,7 +592,7 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 ProcessWorkingSetMb: Math.Round(current.WorkingSetMb, 1),
                 ProcessCpuPercent: windowMs > 0 ? Math.Round(cpuMs / windowMs * 100.0, 2) : 0.0,
                 EventsVersion: MonitorEventSchema.Version,
-                EventSeq: _eventSeq + 1, // the id this snapshot is about to take — embedded so payloads and SSE frames agree
+                EventSeq: PeekEventId() + 1, // the id this snapshot is about to take — embedded so payloads and SSE frames agree
                 DroppedEventsTotal: Volatile.Read(ref _droppedEvents),
 
                 // Additive operator-view fields (v1 shape untouched): pool geometry always known here; identity and
@@ -657,7 +669,7 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 PcieTransfersTotal: transferCallsTotal,
                 PersistentVramBytes: persistentVramBytes);
 
-            long id = ++_eventSeq;
+            long id = TakeEventId();
             frame = new MonitorFrame(id, MonitorEventNames.Snapshot, snapshot.ToJson());
 
             _ring[_ringTotal % RingCapacity] = snapshot;
@@ -675,6 +687,13 @@ public sealed class EngineMetricsBus : IAsyncDisposable
 
         _logger.LogInformation("metrics_snapshot={SnapshotJson}", frame.Json);
     }
+
+    // Event-id plumbing: on a host event line every bus sharing it draws from the line's counter under the line's
+    // lock, so ids stay unique and ordered across engines; with no line the bus counts its own, exactly as before.
+    // Both paths run inside the fan-out lock, so the id a publish takes is the next one on its line.
+    private long TakeEventId() => _lineage is MonitorEventLineage lineage ? lineage.NextEventId() : ++_eventSeq;
+
+    private long PeekEventId() => _lineage is MonitorEventLineage lineage ? lineage.LatestEventId : Volatile.Read(ref _eventSeq);
 
     // Completed payloads land in the recent ring as the same immutable payload objects that were published, so a
     // resync hands out exactly what live delivery carried. The ring's capacity bound (live knob) is what trims them.
