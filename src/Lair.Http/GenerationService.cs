@@ -109,6 +109,11 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
     // and submits again under one seat — while each individual Submit call stays exactly as immediate as it has always been.
     private int _queuedSubmissions;
 
+    // The encoder lane every forward of an encode-only model runs through: one composed encoder pass at a time on this engine, so encoder forwards contend
+    // only with each other and never with a decode step — which is what makes that posture safe to serve without the scheduler's stepping machinery. A submission
+    // finding the lane held takes its place in this facade's request queue exactly like a generation submission does, under the same depth and bounded wait.
+    private readonly SemaphoreSlim _encoderLane = new(1);
+
     // Cancelled once this engine stops accepting new submissions (a served-model removal draining what already runs). Submissions waiting on a queue
     // seat watch it so they answer the retirement refusal promptly instead of sitting out their bounded wait for a slot that will never free.
     private readonly CancellationTokenSource _retiring = new();
@@ -245,8 +250,17 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
     /// <summary>Worker count the served model's CPU backend actually runs with, after engine threads and the model's thread quota are combined.</summary>
     public int EffectiveWorkerCount => _backend.EffectiveWorkerCount;
 
-    /// <summary>The configured kind of the served model as advertised on <c>/v1/models</c>. The config loader accepts only "chat" in this build; surfaces that must exclude embed models filter on this fact instead of an assumption.</summary>
-    public string ModelType => _current.Models[0].Type;
+    /// <summary>The configured kind of the served model as advertised on <c>/v1/models</c>: <c>chat</c> samples decoded sequences through the scheduler, and <c>embed</c> serves encoder forwards only. Surfaces that route by posture read this fact instead of an assumption.</summary>
+    public string ModelType => Volatile.Read(ref _current).Models[0].Type;
+
+    /// <summary>True when this engine's model is opened in the encode-only serving posture: its requests run bidirectional encoder forwards and answer vectors, no decode pipeline ever advances on it, and the chat and completion surfaces refuse it before any submission.</summary>
+    public bool ServesEncoderPosture => Volatile.Read(ref _current).Models[0].Type == ModelTypeValues.Embed;
+
+    /// <summary>The sentence-vector pooling choice requests admitted now read: <c>mean</c> or <c>cls</c>. A live edit retitles later requests only.</summary>
+    public string PoolingMode => Volatile.Read(ref _current).Models[0].Pooling;
+
+    /// <summary>Whether vectors are L2-normalized after pooling for requests admitted now. A live edit retitles later requests only.</summary>
+    public bool NormalizesPooledVectors => Volatile.Read(ref _current).Models[0].Normalize;
 
     /// <summary>Submissions waiting right now for a concurrency slot on this engine — the live depth of its request queue, and zero whenever nothing queues. None of them holds an admission slot, a pool block, or any token budget yet.</summary>
     public int QueuedRequestCount => Volatile.Read(ref _queuedSubmissions);
@@ -779,6 +793,23 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
                         effective = effective with { Models = [effective.Models[0] with { QueueTimeoutMs = candidate.Models[0].QueueTimeoutMs }] };
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
                             $"queue wait {change.OldValue} -> {change.NewValue}: submissions from now on answer the queue-timeout refusal once their bounded wait for an admission slot expires; submissions already waiting keep the ceiling they entered with"));
+                        break;
+
+                    case "models[0].pooling":
+                        // The choice is read when a request pools what its encoder forward produced, so this swap retitles later requests outright and
+                        // leaves every vector already answered on the posture its request ran with. Nothing an engine computed changes.
+                        effective = effective with { Models = [effective.Models[0] with { Pooling = candidate.Models[0].Pooling }] };
+                        RefreshAdvertisedModel(effective);
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"encoder requests admitted from now on pool hidden states as {candidate.Models[0].Pooling}; vectors already answered follow the choice their request started with"));
+                        break;
+
+                    case "models[0].normalize":
+                        // Same response-shape swap as its pooling sibling: normalization happens after pooling on the way out, so only later requests see it.
+                        effective = effective with { Models = [effective.Models[0] with { Normalize = candidate.Models[0].Normalize }] };
+                        RefreshAdvertisedModel(effective);
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            $"encoder requests admitted from now on return {(candidate.Models[0].Normalize ? "L2-normalized" : "raw pooled")} vectors; vectors already answered keep the posture their request started with"));
                         break;
 
                     case "models[0].placement.numa_spread":
@@ -2234,6 +2265,16 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
             throw new ModelNotFoundException(request.Model);
         }
 
+        // An encode-only model has no decode pipeline to submit to: its forward engine runs bidirectional encoder passes and answers vectors, so a sampled
+        // request would either run the wrong posture or produce nothing. The refusal lands before any tokenization, budget resolution, or scheduler submission —
+        // naming both endpoints this facade serves for sampling and what to do instead — exactly as the HTTP surface refuses it on one endpoint at a time.
+        if (ServesEncoderPosture)
+        {
+            throw new ArgumentException(
+                $"model '{Model.Id}' is served as type 'embed': the chat and completion endpoints require a model opened with type 'chat'. Run this model through /v1/embeddings, or declare it with type 'chat' to sample from it.",
+                nameof(request));
+        }
+
         cancellationToken.ThrowIfCancellationRequested();
 
         if (request.PresencePenalty is < -2f or > 2f)
@@ -2518,6 +2559,289 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
             reasoning.Regions.Count > 0 ? reasoning.Regions : null,
             plan.Reasoning,
             budgetExhausted);
+    }
+
+    /// <summary>
+    /// Runs one encoder call to completion on this engine's encode-only serving posture: every input is tokenized exactly like an ordinary prompt, forwarded
+    /// through merged encoder batches that preserve input order and index, pooled per the model's configured sentence-vector posture, and normalized after
+    /// pooling when the configuration asks for it. Admission follows the same bounded queue posture every generation submission uses — a submission finding this
+    /// engine's single encoder lane held takes one seat in this facade's request queue under <c>max_queued_requests</c> within its bounded wait, spending no pool
+    /// block and no token budget while it waits — and every refusal answers the existing overload taxonomy rather than an error surface of its own. No decode
+    /// step ever runs here: an encoder forward has no sampled tokens to publish, so this path mints no request-lifecycle frames on the monitor stream.
+    /// </summary>
+    public async Task<EmbeddingOutcome> EmbedAsync(EmbeddingRequest request, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ObjectDisposedException.ThrowIf(_disposed, typeof(GenerationService));
+
+        if (!string.Equals(request.Model, Model.Id, StringComparison.Ordinal))
+        {
+            throw new ModelNotFoundException(request.Model);
+        }
+
+        // The mirror of the sampling refusal: a model opened for prompt-and-sample serving has no encoder posture advertised, so an embedding request naming it is refused before any forward runs — naming the endpoint and both postures.
+        if (!ServesEncoderPosture)
+        {
+            throw new ArgumentException(
+                $"'{Model.Id}' is served as type '{ModelType}': /v1/embeddings requires a model opened with type 'embed'. Declare this model with type 'embed', or send the request to the chat or completion endpoints.",
+                nameof(request));
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (request.Inputs is null || request.Inputs.Count == 0)
+        {
+            throw new ArgumentException("an embedding request requires at least one input text in 'inputs'.", nameof(request));
+        }
+
+        // The response-shape posture is captured once for this call, exactly like the output-parser plan a generation runs on: a reload retitles requests admitted after it and leaves this one on what it started with.
+        ModelConfig posture = Volatile.Read(ref _current).Models[0];
+
+        List<int[]> tokenLists = [];
+        int totalInputTokens = 0;
+        long neededBlocks = 0;
+        for (int i = 0; i < request.Inputs.Count; i++)
+        {
+            string text = request.Inputs[i] ?? throw new ArgumentException($"inputs[{i}] is null: every embedding input must be a string.", nameof(request));
+
+            IReadOnlyList<int> ids = _tokenizer.AddBosToken ? _tokenizer.EncodeWithBos(text) : _tokenizer.Encode(text);
+
+            if (ids.Count == 0)
+            {
+                throw new ArgumentException(
+                    $"inputs[{i}] tokenizes to no tokens: an embedding input must carry at least one token the encoder forward can read.",
+                    nameof(request));
+            }
+
+            // The two ceilings a prompt-side input has to clear before any work runs, named with what to change: this engine's per-call encoder window and this model's addressed context extent.
+            if (ids.Count > TransformerModel.MaxEncodeTokens)
+            {
+                throw new ArgumentException(
+                    $"inputs[{i}] tokenizes to {ids.Count} tokens, past the {TransformerModel.MaxEncodeTokens}-token ceiling one encoder forward carries. Shorten the input.",
+                    nameof(request));
+            }
+
+            if (ids.Count > Model.ContextLength)
+            {
+                throw new ArgumentException(
+                    $"inputs[{i}] tokenizes to {ids.Count} tokens, past this model's resolved context window of {Model.ContextLength}. Shorten the input or raise max_context_tokens.",
+                    nameof(request));
+            }
+
+            tokenLists.Add([.. ids]);
+            totalInputTokens += ids.Count;
+            neededBlocks += (ids.Count + _pool.BlockTokens - 1) / _pool.BlockTokens; // one fresh sequence per input: its positions occupy whole blocks of the pool
+        }
+
+        if (neededBlocks > _pool.EffectiveFreeBlocks)
+        {
+            throw EncoderKvCapacityRefusal(neededBlocks);
+        }
+
+        await using EncoderLaneLease lane = await AcquireEncoderLaneAsync(cancellationToken).ConfigureAwait(false);
+
+        List<EmbeddingVector> vectors = [];
+        int cursor = 0;
+        while (cursor < tokenLists.Count)
+        {
+            // Compose the next encoder batch from inputs in order: as many sequences as one merged call carries, stopping at its row capacity so a later slice composes as its own call. Input index survives the split because each vector lands where its input was read.
+            int take = 0;
+            int rows = 0;
+            while (take < TransformerModel.MaxEncodeSequences && cursor + take < tokenLists.Count)
+            {
+                int length = tokenLists[cursor + take].Length;
+                if (rows != 0 && rows + length > TransformerModel.MaxEncodeBatchRows)
+                {
+                    break;
+                }
+
+                rows += length;
+                take++;
+            }
+
+            List<SequenceKv> sequences = [];
+            try
+            {
+                for (int s = 0; s < take; s++)
+                {
+                    IKvSequence sequence = _pool.NewSequence(); // the sequence type this pool's storage is addressed by, exactly as a pipeline opens one
+
+                    if (sequence is not SequenceKv floatSequence)
+                    {
+                        throw new ModelEncoderUnsupportedException(
+                            Model.Id,
+                            $"this engine opened kv k='{Lair.Kv.KvSideFormatNames.Of(_pool.Formats.K)}' v='{Lair.Kv.KvSideFormatNames.Of(_pool.Formats.V)}': the encoder pass reads float KV slots, and this pool hands out another sequence type — omit kv.quant to serve this model in the FP32 posture");
+                    }
+
+                    sequences.Add(floatSequence);
+                }
+
+                IReadOnlyList<float[]> encoded = EncodeBatchMapped(tokenLists.GetRange(cursor, take), sequences);
+
+                for (int s = 0; s < take; s++)
+                {
+                    float[] rowsOfOneInput = encoded[s];
+                    int hidden = _model.Desc.HiddenSize;
+                    float[] vector = new float[hidden];
+
+                    if (posture.Pooling == PoolingModeValues.Cls)
+                    {
+                        Pooling.FirstToken(rowsOfOneInput, hidden, vector); // the first position's row verbatim
+                    }
+                    else
+                    {
+                        Pooling.MeanPool(rowsOfOneInput, hidden, vector);
+                    }
+
+                    if (posture.Normalize)
+                    {
+                        Pooling.NormalizeL2(vector); // after pooling, never before: a mean over normalized rows is not the same vector as a normalized mean
+                    }
+
+                    vectors.Add(new EmbeddingVector(vector, tokenLists[cursor + s].Length));
+                }
+            }
+            finally
+            {
+                foreach (SequenceKv sequence in sequences)
+                {
+                    sequence.Dispose(); // every position this forward wrote returns to the pool as soon as its vector is pooled
+                }
+            }
+
+            cursor += take;
+        }
+
+        return new EmbeddingOutcome(vectors, totalInputTokens, posture.Pooling, posture.Normalize);
+    }
+
+    private IReadOnlyList<float[]> EncodeBatchMapped(List<int[]> tokenLists, List<SequenceKv> sequences)
+    {
+        try
+        {
+            return _model.EncodeBatch(tokenLists, sequences);
+        }
+        catch (ModelException ex)
+        {
+            // The engine's own refusal text names which posture this model resolved to and what would carry it; that is the actionable shape here.
+            throw new ModelEncoderUnsupportedException(Model.Id, ex.Message);
+        }
+        catch (KvFullException ex)
+        {
+            // The forward already had its sequences opened when the pool ran out, so the honest counts are what this call's positions needed and what the pool can back right now — the same refusal a submission refused up front carries.
+            long neededBlocks = 0;
+            foreach (int[] ids in tokenLists)
+            {
+                neededBlocks += (ids.Length + _pool.BlockTokens - 1) / _pool.BlockTokens;
+            }
+
+            EngineBusyException busy = EngineBusyException.ForEncoderKvCapacity(Model.Id, neededBlocks, _pool.EffectiveFreeBlocks);
+            _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.KvCapacity, Model.Id, $"{busy.Message} (mid-forward: {ex.Message})");
+            throw busy;
+        }
+    }
+
+    // Takes this engine's encoder lane, queueing the submission when its posture says one may wait for the lane. A free lane is taken outright — today's immediate
+    // posture with no seat spent — and a held lane becomes either an immediate bounded-overload refusal (nothing queues) or exactly the same seated, time-bounded
+    // wait a generation submission gets when every admission slot of its cap is held. Nothing here reserves KV blocks or token budget before the lane is in hand.
+    private async ValueTask<EncoderLaneLease> AcquireEncoderLaneAsync(CancellationToken ct)
+    {
+        if (_encoderLane.Wait(0))
+        {
+            return new EncoderLaneLease(this); // nothing contends: no queue seat, no wait, and no pool block spent before the forward runs
+        }
+
+        int maxQueued = Volatile.Read(ref _maxQueuedRequests);
+        if (maxQueued <= 0)
+        {
+            throw EncoderBusyRefusal();
+        }
+
+        if (!TryTakeQueueSeat(maxQueued))
+        {
+            throw QueueFullRefusal(maxQueued);
+        }
+
+        // The wait budget is the ceiling in force when this submission entered, captured here so a live edit of the key cannot re-time a wait already underway.
+        int timeoutMs = Volatile.Read(ref _queueTimeoutMs);
+        try
+        {
+            return await WaitForEncoderLaneAsync(timeoutMs, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _queuedSubmissions); // admitted, refused, or cancelled: the seat this submission held is released either way
+        }
+    }
+
+    private async ValueTask<EncoderLaneLease> WaitForEncoderLaneAsync(int timeoutMs, CancellationToken ct)
+    {
+        using CancellationTokenSource retireGate = CancellationTokenSource.CreateLinkedTokenSource(ct, _retiring.Token);
+
+        long startedAt = TimeProvider.System.GetTimestamp();
+        while (true)
+        {
+            if (_disposed)
+            {
+                throw new ObjectDisposedException(nameof(GenerationService), "the engine this submission was waiting on has been disposed");
+            }
+
+            long elapsedMs = (long)TimeProvider.System.GetElapsedTime(startedAt).TotalMilliseconds;
+            if (elapsedMs >= timeoutMs)
+            {
+                throw QueueTimeoutRefusal(timeoutMs);
+            }
+
+            bool freed = await _encoderLane.WaitAsync(TimeSpan.FromMilliseconds(timeoutMs - elapsedMs), retireGate.Token).ConfigureAwait(false);
+
+            if (ct.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(ct); // the caller walked away while queued: nothing was admitted and no block was spent
+            }
+
+            if (_retiring.IsCancellationRequested)
+            {
+                throw ModelRetiringRefusal();
+            }
+
+            if (freed)
+            {
+                return new EncoderLaneLease(this);
+            }
+
+            // A false answer is this wait's own ceiling expiring; the loop top turns it into its refusal on the next pass, exactly as a generation submission waiting for an admission slot re-decides inside one budget.
+        }
+    }
+
+    private EngineBusyException EncoderBusyRefusal()
+    {
+        // A held encoder lane with nothing queued behind it is this posture's bounded overload refusal: same family at the wire, naming what blocks and what would let a submission wait instead.
+        EngineBusyException busy = EngineBusyException.ForEncoderLaneBusy(Model.Id);
+        _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.ConcurrencyQuota, Model.Id, busy.Message);
+        return busy;
+    }
+
+    private EngineBusyException EncoderKvCapacityRefusal(long neededBlocks)
+    {
+        // An encoder forward writes every input position's K/V before it pools anything, so the whole call's positions have to fit what the pool can back. Refusing up front names both counts instead of failing mid-forward with half its streams written.
+        EngineBusyException busy = EngineBusyException.ForEncoderKvCapacity(Model.Id, neededBlocks, _pool.EffectiveFreeBlocks);
+        _metrics?.RecordAdmissionRefusal(AdmissionRefusalKinds.KvCapacity, Model.Id, busy.Message);
+        return busy;
+    }
+
+    // One held encoder lane: released when the call that took it returns, whether its vectors were pooled or its forward refused.
+    private sealed class EncoderLaneLease : IAsyncDisposable
+    {
+        private GenerationService? _owner;
+
+        public EncoderLaneLease(GenerationService owner) => _owner = owner;
+
+        public ValueTask DisposeAsync()
+        {
+            GenerationService? owner = Interlocked.Exchange(ref _owner, null);
+            owner?._encoderLane.Release();
+            return ValueTask.CompletedTask;
+        }
     }
 
     public void Dispose()

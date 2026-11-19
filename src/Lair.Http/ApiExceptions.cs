@@ -107,6 +107,34 @@ public sealed class EngineBusyException : Exception
     public static EngineBusyException ForQueueTimeout(string modelId, int queueTimeoutMs) =>
         new($"model '{modelId}' cannot admit this request against its request queue: no admission slot freed within {queueTimeoutMs} ms of 'queue_timeout_ms', so the wait ended with every concurrency slot still held. Retry once a running generation finishes, or raise max_concurrent_requests in the config.",
             "engine_overloaded");
+
+    /// <summary>The refusal for an encoder submission arriving while this engine's single encoder forward lane is already held and nothing queues behind it. The posture that blocks here is serialization itself — one encoder pass runs at a time on such a model, so declaring <c>max_queued_requests</c> turns this immediate refusal into the same bounded wait every other queued submission gets.</summary>
+    public static EngineBusyException ForEncoderLaneBusy(string modelId) =>
+        new($"model '{modelId}' cannot admit this request against its encoder lane: an encoder forward is already running on this engine and no 'max_queued_requests' posture lets submissions wait for the lane. Retry once that embedding finishes, or declare max_queued_requests in the config.",
+            "engine_overloaded");
+
+    /// <summary>The refusal for a submission whose vectors outrun what the KV pool can back right now: an encoder forward writes every input position's K/V before it pools anything, so the whole batch has to fit the pool's free blocks up front.</summary>
+    public static EngineBusyException ForEncoderKvCapacity(string modelId, long neededBlocks, int freeBlocks) =>
+        new($"model '{modelId}' cannot admit this request against its kv_capacity: {neededBlocks} KV blocks back these inputs' encoder positions and only {freeBlocks} are free in the pool right now. Retry once the running requests finish, or raise kv_blocks in the config.",
+            "engine_overloaded");
+}
+
+/// <summary>
+/// The loaded model cannot run the encoder posture this request needs: its execution route crosses backends and an encoder forward rents streams past
+/// what those crossings stage, its opened KV pair carries only causal quantized attention kernels where bidirectional reads need FP32 storage, or its plan
+/// routes experts through a block the encoder pass has no routing for. The refusal names which posture the model resolved to — never a generic engine fault —
+/// so an operator can tell what to change: open one span, omit <c>kv.quant</c>, or serve a dense checkpoint on this endpoint.
+/// </summary>
+public sealed class ModelEncoderUnsupportedException : Exception
+{
+    public ModelEncoderUnsupportedException(string modelId, string detail)
+        : base($"model '{modelId}' cannot run this request's encoder forward: {detail}")
+    {
+        ModelId = modelId;
+    }
+
+    /// <summary>The id of the served model whose resolved posture refused.</summary>
+    public string ModelId { get; }
 }
 
 /// <summary>

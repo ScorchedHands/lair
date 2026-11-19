@@ -17,7 +17,8 @@ namespace Lair.Tests;
 /// narrower), encoder shape / finiteness / argument validation on a synthetic two-layer tied-weight GGUF, run-to-run and
 /// thread-count determinism of encode plus pooling across chunk boundaries, mean-vs-CLS divergence, L2 normalization,
 /// sequential one-token encoder positions matching incremental decode bit-for-bit through the shared tied lm_head,
-/// full-window divergence from causal-prefix runs at every position past the first, pure pooling math against
+/// full-window divergence from causal-prefix runs at every position past the first, merged-batch encoder forwards
+/// reproducing per-sequence encodes in input order with their own argument validation, pure pooling math against
 /// hand-computed values, and a skip-if-absent SmolLM F16 pass proving finite unit-norm repeatable distinct pooled vectors.
 /// </summary>
 [Trait("Category", "Embeddings")]
@@ -422,6 +423,132 @@ public sealed class EmbeddingsTests : IDisposable
         }
     }
 
+    // ---------------------------------------------------------------- merged encoder batches
+
+    [Fact]
+    public void EncodeBatch_MergedCall_ReproducesPerSequenceEncode_WithinFloatSlack()
+    {
+        string path = WriteTemp(BuildTinyGguf());
+
+        int[][] tokenLists =
+        [
+            [1, 3, 5, 2],                             // four positions: the ordinary member
+            [4],                                      // one position: the degenerate member beside a wide one
+            [0, 5, 1, 4, 2, 3, 0, 5, 1],             // nine positions: crosses the chunk boundary on its own
+            [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],    // twelve positions: repeated ids still carry distinct positions
+        ];
+
+        using GgufFile gguf = GgufFile.Open(path);
+        using CpuBackend backend = new(threads: 1, allowAvx2: true);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 64);
+
+        using BlockPool pool = NewTinyPool(backend, capacityBlocks: 32);
+
+        List<SequenceKv> batchKv = [];
+        try
+        {
+            foreach (int[] _ in tokenLists)
+            {
+                batchKv.Add(new SequenceKv(pool));
+            }
+
+            IReadOnlyList<float[]> batched = model.EncodeBatch(tokenLists, batchKv);
+
+            Assert.Equal(tokenLists.Length, batched.Count); // one result array per input sequence, in input order
+
+            for (int s = 0; s < tokenLists.Length; s++)
+            {
+                Assert.Equal(tokenLists[s].Length * Hidden, batched[s].Length); // laid out exactly like that sequence's single-call result
+                Assert.Equal(tokenLists[s].Length, batchKv[s].Length);          // every member advanced its own sequence, not a shared one
+
+                using SequenceKv solo = new(pool);
+                float[] single = model.Encode(tokenLists[s], solo); // the independent per-sequence forward this batch must reproduce
+
+                AssertClose(batched[s], single, $"merged batch member {s} vs its independent encode");
+            }
+
+            // Members stay independent: a member sharing content with another lands on the same vector, and a member with different content does not.
+            Assert.True(!BitsEqual(batched[0], batched[1]), "members with different tokens must not share a hidden buffer");
+        }
+        finally
+        {
+            foreach (SequenceKv kv in batchKv)
+            {
+                kv.Dispose();
+            }
+        }
+    }
+
+    [Fact]
+    public void EncodeBatch_PreservesMemberOrder_RepeatInputsMatch_AndRejectsBadArguments()
+    {
+        string path = WriteTemp(BuildTinyGguf());
+
+        using GgufFile gguf = GgufFile.Open(path);
+        using CpuBackend backend = new(threads: 1, allowAvx2: true);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 64);
+
+        using BlockPool pool = NewTinyPool(backend, capacityBlocks: 32);
+
+        int[] a = [1, 2, 3, 4];
+        int[] b = [5, 0, 1];
+
+        using (SequenceKv kvA1 = new(pool))
+        using (SequenceKv kvB = new(pool))
+        using (SequenceKv kvA2 = new(pool))
+        {
+            IReadOnlyList<float[]> batched = model.EncodeBatch([a, b, a], [kvA1, kvB, kvA2]);
+
+            // Order is the order the inputs arrived in: slot 0 and slot 2 are the same content, and they answer with the same bits.
+            Assert.Equal(3, batched.Count);
+            AssertBitsEqual(batched[0], batched[2], "the same token list twice in one merged call");
+            Assert.True(!BitsEqual(batched[0], batched[1]), "different members must not answer with the same vector");
+
+            using SequenceKv solo = new(pool);
+            AssertClose(batched[1], model.Encode(b, solo), "batch member 1 vs its independent encode");
+        }
+
+        using SequenceKv guard = new(pool);
+
+        // Shape refusals name the batch's own ceilings; a rejected call never touches a sequence.
+        Assert.Throws<ArgumentException>(() => model.EncodeBatch([], []));
+        Assert.Throws<ArgumentException>(() => model.EncodeBatch([a], [guard, guard]));
+        Assert.Throws<ArgumentException>(() => model.EncodeBatch([a, a], [guard]));
+
+        IReadOnlyList<IReadOnlyList<int>> tooMany = [.. Enumerable.Repeat((IReadOnlyList<int>)new[] { 1 }, TransformerModel.MaxEncodeSequences + 1)];
+        IReadOnlyList<SequenceKv> tooManyKv = [.. Enumerable.Repeat(guard, TransformerModel.MaxEncodeSequences + 1)];
+        ArgumentException countError = Assert.Throws<ArgumentException>(() => model.EncodeBatch(tooMany, tooManyKv));
+        Assert.Contains("sequences", countError.Message);
+
+        // An empty member and a null entry are named by index; oversized members name the per-sequence ceiling.
+        IReadOnlyList<IReadOnlyList<int>> withEmpty = [a, [], b];
+        Assert.Throws<ArgumentException>(() => model.EncodeBatch(withEmpty, [guard, guard, guard]));
+        IReadOnlyList<IReadOnlyList<int>> withNull = new IReadOnlyList<int>[] { a, null!, b };
+        ArgumentException nullError = Assert.Throws<ArgumentException>(() => model.EncodeBatch(withNull, [guard, guard, guard]));
+        Assert.Contains("entry 1", nullError.Message);
+
+        // Rows past what one merged call rents compose as several calls instead: the refusal names the row ceiling.
+        string path2 = WriteTemp(BuildTinyGguf());
+        using GgufFile wideGguf = GgufFile.Open(path2);
+        using CpuBackend wideBackend = new(threads: 1, allowAvx2: true);
+        using TransformerModel wideModel = TransformerModel.Open(wideGguf, wideBackend, maxContextTokens: TransformerModel.MaxEncodeTokens);
+
+        int[] wide = new int[TransformerModel.MaxEncodeTokens];
+        for (int i = 0; i < wide.Length; i++)
+        {
+            wide[i] = i % Vocab;
+        }
+
+        IReadOnlyList<IReadOnlyList<int>> tooManyRows = [.. Enumerable.Repeat((IReadOnlyList<int>)wide, TransformerModel.MaxEncodeBatchRows / TransformerModel.MaxEncodeTokens + 1)];
+        IReadOnlyList<SequenceKv> rowKv = [.. Enumerable.Repeat(guard, tooManyRows.Count)];
+        ArgumentException rowError = Assert.Throws<ArgumentException>(() => wideModel.EncodeBatch(tooManyRows, rowKv));
+        Assert.Contains("token rows", rowError.Message);
+
+        // A bad token id anywhere in the batch is refused before any sequence advances.
+        Assert.Throws<ArgumentException>(() => model.EncodeBatch([a, [Vocab]], [guard, guard]));
+        Assert.Equal(0, guard.Length);
+    }
+
     // ---------------------------------------------------------------- pooling helpers
 
     [Fact]
@@ -572,6 +699,22 @@ public sealed class EmbeddingsTests : IDisposable
         }
 
         return max;
+    }
+
+    /// <summary>Compares two encoder outputs value-by-value against the same forward run a different way: every slot finite and within 1e-5 absolute of its independent result — the slack float accumulation orderings leave, nowhere near enough to call two directions equal.</summary>
+    private static void AssertClose(ReadOnlySpan<float> actual, ReadOnlySpan<float> expected, string context)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+
+        for (int i = 0; i < expected.Length; i++)
+        {
+            Assert.True(float.IsFinite(actual[i]), $"{context}: slot {i} is not finite");
+            Assert.True(
+                Math.Abs(actual[i] - expected[i]) <= 1e-5,
+                $"{context}: slot {i} expected {expected[i]:G9}, got {actual[i]:G9}");
+        }
+
+        Assert.True(MaxAbs(expected) > 1e-6f, $"{context}: the reference forward looks degenerate");
     }
 
     /// <summary>Compares two float windows on the raw bits of the floats: NaN payloads and signed zeros must match too.</summary>

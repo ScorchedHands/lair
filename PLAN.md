@@ -1723,7 +1723,7 @@ Many models at once, each with its own placement policy.
   - Verify: two-model load test — per-model ITL stays within budget while the other model saturates its core set, and no running sequence is ever preempted.
 - [✓] Request queue — `models[].max_queued_requests` and `models[].queue_timeout_ms` with blocking OpenAI-compatible admission, revalidation on slot release, and queue-depth reporting (see DN-M6-5)
   - Verify: `dotnet test --filter Category=Scheduling|Api -c Release` — queue-full refuses with `engine_overloaded`; timeout refuses with `engine_overloaded`; queued requests do not hold KV blocks or token budgets before admission; admitted queued requests revalidate and complete normally; monitor reports queue depth.
-- [→] Embeddings endpoint — `/v1/embeddings`, encoder-only models (ModernBERT-class) (see DN-M6-3)
+- [✓] Embeddings endpoint — `/v1/embeddings`, encoder-only models (dense encoder-mode checkpoints; ModernBERT-class GGUF families remain Backlog) (see DN-M6-3)
   - Verify: `dotnet test --filter Category=Embeddings` — pooled vectors match reference fixtures within FP tolerance.
 - [_] Flagship scenario — GPU-heavy coding model + CPU-only embedding model side by side
   - Verify: manual — both models serve concurrent load; monitor shows per-model device portioning.
@@ -1734,7 +1734,7 @@ Many models at once, each with its own placement policy.
 - [✓] Automated Budget: ledger rejection paths and quota accounting
 - [✓] Automated Fairness: cross-model ITL isolation
 - [✓] Automated Queue: queue-full, queue timeout, no pre-admission KV/token reservation, and queue-depth reporting
-- [→] Automated Embeddings: pooling parity vs reference fixtures
+- [✓] Automated Embeddings: pooling parity vs reference fixtures
 
 ### MVP6.1 [v0.6.1] - Refined
 
@@ -2030,7 +2030,7 @@ Vision input on chat models.
 | idea | Vulkan/Metal backends | deferred; LAIR commits to CPU + CUDA |
 | idea | Multi-GPU placement / >1 accelerator partitioning | the fleet carries a single CUDA device (`cuDeviceGet(..., 0)`); concurrent multi-model compute on one accelerator lands in MVP6.1, and partitioning across >1 GPU stays deferred until a target box actually has multiple GPUs to measure against |
 | idea | Multimodal image input | Strata has it; LAIR later |
-| idea | Embeddings model families | ModernBERT-class GGUF quants, pooling modes |
+| idea | Embeddings model families | ModernBERT-class GGUF quants and encoder-native tensor layouts |
 | question | License | MIT / Apache 2.0 / private — dotLLM is GPLv3: study ideas, never copy code |
 | bug | 2DPC DIMM derate | production box derates 2400→2133 MT/s; more RAM ≠ speed |
 | bug | Monitor CLI on a torn event stream | killing the server while `lair monitor` is attached throws an unhandled `System.IO.IOException` in `MonitorCommand.RunAsync` (`src/Lair.Host/MonitorCommand.cs:54`) instead of ending cleanly — guard the reader and exit with a notice |
@@ -2083,6 +2083,8 @@ Vision input on chat models.
 - **2026-11-17 — MVP5's grid probe measures representative synthetic Q8_K GEMVs rather than staging loops alone.** The earlier synthetic benchmark timed only `Stage*` helpers and selected scalar on the dev box while forced tensor bench showed gather faster across all pinned sub4-bit formats; the cached engine-open probe now opens two forced CPU backends with prefetch off, runs fixed 128×1024 IQ fixtures through both encodings, interleaves best-of passes, rejects a collapse or selects Gather only when aggregate timing wins by >~4%. This keeps no public knob and preserves bit-identical output; bench evidence now shows auto resolving gather on the dev box with `SUB4BIT` grid comparison +11.579% warm at reps80/maxrows256/threads1, while forced prefetch comparison resolves gather for both sides and reports aggregate prefetched path +2.810% faster (exact bit-identical) at reps200.
 
 - **2026-11-19 — MVP6 embedding serving gets explicit public posture keys before code lands.** `/v1/embeddings` accepts OpenAI-compatible string or array inputs, registry model type `embed`, and per-model flat config keys `pooling: mean | cls` (default `mean`) plus a boolean `normalize` key whose default is false so raw pooled vectors remain the reference-parity surface. Rejected: hiding pooling/normalization behind endpoint request fields only; normalizing by default because it changes fixture parity without measured need; inventing a separate embedding config object when this posture belongs to one model entry like placement and budgets already do.
+
+- **2026-11-19 — MVP6 embedding serving lands on the existing dense encoder seam and the facade's encoder lane; ModernBERT-native layouts stay Backlog.** `/v1/embeddings` now serves `type: embed` models through bidirectional encoder forwards, with `pooling: mean|cls` and `normalize` shaping pooled vectors, multiple inputs composed through merged encoder batch rows, and submissions riding the same bounded request-queue posture as generation submissions. Dedicated ModernBERT-class tensor layouts and quantized encoder routes were not invented in this item; they remain model-family backlog work. Rejected: claiming ModernBERT-native checkpoint coverage from synthetic dense encoder tests, forcing encode-only requests through decode pipeline machinery, or bypassing the model's queue posture.
 
 - **2026-11-19 — MVP6 request queueing gets an explicit default timeout: 30 seconds when `models[].max_queued_requests` is above zero.** The phase contract already says queued submissions block until admitted or timed out, but leaves the bounded wait numeric; settling it as `queue_timeout_ms: 30000` keeps OpenAI clients from hanging indefinitely while staying long enough for ordinary slot handoff on this fleet and matching the monitor panel's illustrative queue-timeout posture. Rejected: an unbounded default, a sub-second timeout that turns transient queueing into false overload, and a per-request override when the model-level posture is what MVP6 defines.
 

@@ -211,7 +211,7 @@ public sealed class ConfigTests : IDisposable
     }
 
     [Fact]
-    public void Load_NonChatModelType_Fails()
+    public void Load_EmbedModelType_Parses_AndOtherTypesFailNamingTheAcceptedSet()
     {
         string yaml = $"""
             models:
@@ -220,10 +220,67 @@ public sealed class ConfigTests : IDisposable
                 type: embed
             """;
 
-        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
-        Assert.Contains("models[0].type 'embed'", error.Message);
-        Assert.Contains("embed models are not supported in this build", error.Message);
-        Assert.Contains("'chat' is the only accepted value", error.Message);
+        LairConfig embed = YamlConfigLoader.Load(WriteConfig(yaml));
+        Assert.Equal("embed", embed.Models[0].Type); // the encode-only serving posture the embeddings endpoint answers with
+
+        LairConfig chat = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: chat-test
+                path: '{TempModelFile()}'
+            """));
+        Assert.Equal("chat", chat.Models[0].Type); // an absent key keeps the sampling posture the only default this loader has ever resolved
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: vector-test
+                path: '{TempModelFile()}'
+                type: vector
+            """)));
+        Assert.Contains("models[0].type 'vector' is invalid for model 'vector-test'", error.Message);
+        Assert.Contains("'type' accepts only 'chat' or 'embed'", error.Message);
+    }
+
+    [Fact]
+    public void Load_PoolingAndNormalize_ParseDefaultAndValidate()
+    {
+        LairConfig declared = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: embed-test
+                path: '{TempModelFile()}'
+                type: embed
+                pooling: cls
+                normalize: true
+            """));
+        Assert.Equal("cls", declared.Models[0].Pooling);
+        Assert.True(declared.Models[0].Normalize);
+
+        LairConfig defaulted = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: embed-test
+                path: '{TempModelFile()}'
+                type: embed
+            """));
+        Assert.Equal("mean", defaulted.Models[0].Pooling); // the average-over-positions recipe an absent key resolves to
+        Assert.False(defaulted.Models[0].Normalize);       // raw pooled vectors answer unless the config asks for unit length
+
+        ConfigException pooling = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: embed-test
+                path: '{TempModelFile()}'
+                type: embed
+                pooling: max
+            """)));
+        Assert.Contains("models[0].pooling 'max' is invalid for model 'embed-test'", pooling.Message);
+        Assert.Contains("'pooling' accepts only 'mean' or 'cls'", pooling.Message);
+
+        ConfigException normalize = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: embed-test
+                path: '{TempModelFile()}'
+                type: embed
+                normalize: sometimes
+            """)));
+        Assert.Contains("models[0].normalize", normalize.Message);
     }
 
     [Fact]

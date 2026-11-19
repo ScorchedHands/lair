@@ -21,7 +21,7 @@ public static class YamlConfigLoader
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel", "cpu"];
     private static readonly string[] CpuKeys = ["isa"];
     private static readonly string[] UiKeys = ["recent_requests"];
-    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "kv", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "max_queued_requests", "queue_timeout_ms", "budgets", "source"];
+    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "kv", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "max_queued_requests", "queue_timeout_ms", "pooling", "normalize", "budgets", "source"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit", "numa_spread", "gpu_layers"];
 
     /// <summary>The keys one model entry's KV block may declare.</summary>
@@ -424,11 +424,13 @@ public static class YamlConfigLoader
             throw new ConfigException($"models[{index}].path '{path}' does not exist on disk.");
         }
 
-        string type = TryText(keys, "type", $"models[{index}].type") ?? "chat";
-        if (type != "chat")
+        // Serving posture: chat (default) or embed. A chat entry behaves exactly as it always did; an embed entry opens the model's
+        // encode-only serving posture, and any other spelling fails naming the path, the model, the value, and both accepted values.
+        string type = TryText(keys, "type", $"models[{index}].type") ?? ModelTypeValues.Chat;
+        if (type is not (ModelTypeValues.Chat or ModelTypeValues.Embed))
         {
             throw new ConfigException(
-                $"models[{index}].type '{type}' is invalid: embed models are not supported in this build and 'chat' is the only accepted value.");
+                $"models[{index}].type '{type}' is invalid for model '{name}': 'type' accepts only '{ModelTypeValues.Chat}' or '{ModelTypeValues.Embed}'.");
         }
 
         int maxContextTokens = TryInteger(keys, "max_context_tokens", $"models[{index}].max_context_tokens") ?? 4096;
@@ -542,6 +544,18 @@ public static class YamlConfigLoader
                 $"models[{index}].queue_timeout_ms {queueTimeoutMs} is invalid: 'queue_timeout_ms' must be 1 or greater.");
         }
 
+        // Sentence-vector posture, read by embedding requests only and absent-by-default in both halves. An unrecognized pooling choice fails
+        // naming the path, model, value, and accepted set exactly as the tool-parser and reasoning choices do; a present normalize must be a
+        // boolean like every other flag key here. A chat entry may declare either key without effect: what an embed request answers with follows them.
+        string pooling = TryText(keys, "pooling", $"models[{index}].pooling") ?? PoolingModeValues.Mean;
+        if (pooling is not (PoolingModeValues.Mean or PoolingModeValues.Cls))
+        {
+            throw new ConfigException(
+                $"models[{index}].pooling '{pooling}' is invalid for model '{name}': 'pooling' accepts only '{PoolingModeValues.Mean}' or '{PoolingModeValues.Cls}'.");
+        }
+
+        bool normalize = TryBoolean(keys, "normalize", $"models[{index}].normalize") ?? false;
+
         KvFormatPair kvQuant = ParseKvQuant(keys, index);
 
         return new ModelConfig
@@ -560,6 +574,8 @@ public static class YamlConfigLoader
             MaxConcurrentRequests = maxConcurrentRequests,
             MaxQueuedRequests = maxQueuedRequests,
             QueueTimeoutMs = queueTimeoutMs,
+            Pooling = pooling,
+            Normalize = normalize,
             Budgets = budgets,
             LegacyKvBlocksDeclared = declaredKvBlocks is not null,
             Source = ParseSource(keys, index, name),

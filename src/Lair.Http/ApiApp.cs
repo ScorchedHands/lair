@@ -115,6 +115,10 @@ public static class ApiApp
 
             app.MapPost("/v1/completions", async (HttpContext http) =>
                 await HandleCompletion(await ReadBodyAsync<CompletionBody>(http.Request), gen: engine!, http).ExecuteAsync(http));
+
+            // Encoder-only serving: the same named-model routing and error taxonomy as every other endpoint, with the vectors an encoder forward pooled answered in OpenAI's list envelope. Admission — including this model's request queue posture over its single encoder lane — happens inside the facade that already bounds submissions.
+            app.MapPost("/v1/embeddings", async (HttpContext http) =>
+                await HandleEmbedding(await ReadEmbeddingBodyAsync(http.Request), gen: engine!, http).ExecuteAsync(http));
         }
         else
         {
@@ -133,6 +137,15 @@ public static class ApiApp
 
                 using ModelRegistry.Lease lease = registry.BeginRequest(body.Model ?? string.Empty);
                 await HandleCompletion(body, lease.Engine, http).ExecuteAsync(http);
+            });
+
+            // The same routing posture as its sampling siblings: the named instance is resolved before any per-model validation, and the lease stays open across the encoder call so a retiring instance drains what it admitted before releasing.
+            app.MapPost("/v1/embeddings", async (HttpContext http) =>
+            {
+                EmbeddingBody body = await ReadEmbeddingBodyAsync(http.Request);
+
+                using ModelRegistry.Lease lease = registry.BeginRequest(body.Model ?? string.Empty);
+                await HandleEmbedding(body, lease.Engine, http).ExecuteAsync(http);
             });
         }
 
@@ -192,7 +205,11 @@ public static class ApiApp
             MaxQueuedRequests: maxQueuedRequests,
             RequestQueuePosture: maxQueuedRequests is null ? RequestQueuePostures.Immediate : RequestQueuePostures.Bounded,
             QueuedRequests: gen.QueuedRequestCount,
-            QueueTimeoutMs: gen.QueueTimeoutMs);
+            QueueTimeoutMs: gen.QueueTimeoutMs,
+
+            // The sentence-vector posture keys ride only on an encode-only instance — they decide what its embedding answers look like and nothing about what a sampling model returns, so the null-ignore serializer leaves a chat entry exactly as it was. Each value is read live for the same reason the queue facts are: a hot edit re-publishes what admissions do next.
+            Pooling: gen.ServesEncoderPosture ? gen.PoolingMode : null,
+            Normalize: gen.ServesEncoderPosture ? gen.NormalizesPooledVectors : null);
     }
 
     // Conventional .NET SPA hosting: the ClientApp bundle is staged into the web root (wwwroot/ui) by the
@@ -310,6 +327,13 @@ public static class ApiApp
     {
         ChatCompletionBody body = input.Body;
 
+        // A model opened in encode-only serving posture has no sampled generation to answer with: the refusal lands before any budget resolution or submission, naming this endpoint and both postures so a caller knows where this model's requests belong.
+        if (gen.ServesEncoderPosture)
+        {
+            return InvalidRequest(
+                $"model '{gen.Model.Id}' is served as type 'embed': /v1/chat/completions requires a model opened with type 'chat'. Send its requests to /v1/embeddings, or declare it with type 'chat' to sample from it.");
+        }
+
         if (body.Messages is null || body.Messages.Count == 0)
         {
             return InvalidRequest("a chat request requires a non-empty 'messages' list");
@@ -358,6 +382,13 @@ public static class ApiApp
 
     private static IResult HandleCompletion(CompletionBody body, GenerationService gen, HttpContext http)
     {
+        // The sampling sibling of the chat refusal: an encode-only model answers pooled vectors and never samples a continuation, so this endpoint refuses it before any budget resolution or submission.
+        if (gen.ServesEncoderPosture)
+        {
+            return InvalidRequest(
+                $"model '{gen.Model.Id}' is served as type 'embed': /v1/completions requires a model opened with type 'chat'. Send its requests to /v1/embeddings, or declare it with type 'chat' to sample from it.");
+        }
+
         if (body.Prompt is null)
         {
             return InvalidRequest("a completion request requires a 'prompt'");
@@ -400,6 +431,77 @@ public static class ApiApp
         };
 
         return RunGeneration(request, gen, http);
+    }
+
+    // Encoder-only serving: pooled sentence vectors in OpenAI's list envelope, one datum per input at the index that input arrived at. What shapes the vectors — pooling mode and normalization — is a posture of the served model, not something this body can ask for; what an encode call consumed reports as prompt-side usage only, since nothing was generated to count.
+    private static IResult HandleEmbedding(EmbeddingBody body, GenerationService gen, HttpContext http)
+    {
+        // The sampling endpoints' mirror refusal: a model opened for decoding answers sampled continuations and never pooled vectors, so it is refused here naming this endpoint and both postures before any tokenization or admission.
+        if (!gen.ServesEncoderPosture)
+        {
+            return InvalidRequest(
+                $"model '{gen.Model.Id}' is served as type 'chat': /v1/embeddings requires a model opened with type 'embed'. Sample from it through the chat or completion endpoints, or declare it with type 'embed' to embed against it.");
+        }
+
+        if (body.Inputs is null || body.Inputs.Count == 0)
+        {
+            return InvalidRequest("an embeddings request requires a non-empty 'input': one text or a list of texts");
+        }
+
+        EmbeddingRequest request = new()
+        {
+            Model = body.Model ?? string.Empty,
+            Inputs = body.Inputs,
+            RequestId = RequestIdOf(http),
+        };
+
+        // Encoder admission answers in place — the facade's bounded queue wait resolves before any forward composes — so this endpoint completes synchronously exactly as a non-streaming generation does.
+        EmbeddingOutcome outcome = gen.EmbedAsync(request, http.RequestAborted).GetAwaiter().GetResult();
+
+        return Results.Json(new EmbeddingResponse(
+            "list",
+            gen.Model.Id,
+            [.. outcome.Vectors.Select((vector, index) => new EmbeddingDatum(index, vector.Values))],
+            new EmbeddingUsage(outcome.TotalInputTokens, outcome.TotalInputTokens)), statusCode: 200);
+    }
+
+    // OpenAI accepts both input spellings — one string or a list of strings — so the body is read from its raw document rather than bound to one shape. A wrong element type names itself exactly as every other malformed-field refusal does; an absent key stays null so the handler answers with the request-shape message instead.
+    private static async Task<EmbeddingBody> ReadEmbeddingBodyAsync(HttpRequest request)
+    {
+        using JsonDocument document = await JsonDocument.ParseAsync(request.Body, cancellationToken: request.HttpContext.RequestAborted);
+        JsonElement root = document.RootElement;
+
+        string? model = root.TryGetProperty("model", out JsonElement modelElement) && modelElement.ValueKind == JsonValueKind.String ? modelElement.GetString() : null;
+
+        if (!root.TryGetProperty("input", out JsonElement input))
+        {
+            return new EmbeddingBody(model, Inputs: null);
+        }
+
+        switch (input.ValueKind)
+        {
+            case JsonValueKind.String:
+                return new EmbeddingBody(model, [input.GetString() ?? string.Empty]);
+
+            case JsonValueKind.Array:
+                List<string> texts = [];
+                int index = 0;
+                foreach (JsonElement item in input.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.String)
+                    {
+                        throw new ArgumentException($"'input[{index}]' must be a string: an embeddings input is one text or a list of texts.");
+                    }
+
+                    texts.Add(item.GetString() ?? string.Empty);
+                    index++;
+                }
+
+                return new EmbeddingBody(model, texts);
+
+            default:
+                throw new ArgumentException($"'input' must be a string or a list of strings, got JSON {input.ValueKind.ToString().ToLowerInvariant()}.");
+        }
     }
 
     // Sampling-knob ranges checked before the request reaches the engine; null means every value is in range.
@@ -690,6 +792,9 @@ public static class ApiApp
         {
             ModelNotFoundException => (404, "invalid_request_error", "model_not_found"),
             ContextLengthExceededException => (400, "invalid_request_error", "context_length_exceeded"),
+
+            // A posture refusal, not a server fault: the model resolved something this endpoint cannot run, and the message already names what to change. It answers where every other request-shape refusal lands so an operator reads it beside them.
+            ModelEncoderUnsupportedException => (400, "invalid_request_error", "encoder_unsupported"),
             EngineBusyException busy => (503, "engine_overloaded_error", busy.Code),
             TemplateRenderFailedException => (400, "invalid_request_error", "invalid_request"),
             ArgumentException or JsonException => (400, "invalid_request_error", "invalid_request"),

@@ -2611,6 +2611,12 @@ public sealed class TransformerModel : IDisposable
     /// <summary>Largest token count a single <see cref="Encode"/> call may forward.</summary>
     public const int MaxEncodeTokens = 256;
 
+    /// <summary>Row ceiling of the engine's merged encoder forwards: the largest number of sequences one <see cref="EncodeBatch"/> call composes, mirroring what one decode batch advances.</summary>
+    public const int MaxEncodeSequences = MaxBatchSequences;
+
+    /// <summary>Largest flattened token row count one <see cref="EncodeBatch"/> call rents its position-major streams for: four whole encoder sequences' worth of rows. A wider set of inputs composes as several calls, in order.</summary>
+    public const int MaxEncodeBatchRows = 4 * MaxEncodeTokens;
+
     /// <summary>
     /// Encoder-only forward: runs the whole token sequence through every layer with full-sequence (bidirectional)
     /// attention — each query position scores against all positions of its own sequence's KV contents instead of a
@@ -2642,21 +2648,7 @@ public sealed class TransformerModel : IDisposable
         ArgumentNullException.ThrowIfNull(kv);
 
         // The encoder pass rents chunked streams beyond this engine's batched row capacity, and a crossing stages rows only through storage sized for the batched forwards. A split route refuses here naming what it does not carry rather than forwarding part of an encoder sequence whole-model on one backend behind the step.
-        if (_mainSpans.Length > 1)
-        {
-            throw new ModelException(
-                $"architecture '{Plan.Architecture}' resolves a route this engine crosses between backends, and its encoder forward rents streams past the row capacity those crossings stage through — open this model as one span to encode it");
-        }
-
-        // The encoder pass runs the FP32 bidirectional attention kernels over float KV reads: a quantized engine's closed
-        // route carries the causal quantized kernels only, so encoding a quantized model refuses naming the pair rather
-        // than reading quantized groups as floats.
-        if (!_kvFormats.IsFloatStorage)
-        {
-            throw new ModelException(
-                $"this model opened kv k='{KvSideFormatNames.Of(_kvFormats.K)}' v='{KvSideFormatNames.Of(_kvFormats.V)}': the encoder pass runs the FP32 bidirectional attention kernels over float KV reads, " +
-                "and no quantized encoder route exists in this build — omit kv.quant to encode this model in the FP32 posture");
-        }
+        EnsureEncoderForwardPosture();
 
         int n = tokens.Count;
         if (n == 0 || n > MaxEncodeTokens)
@@ -2674,12 +2666,7 @@ public sealed class TransformerModel : IDisposable
                 nameof(tokens));
         }
 
-        if (_sparseFfn is { } encoderSparse)
-        {
-            throw new ModelException(
-                $"architecture '{Plan.Architecture}' declares a sparse-FFN block with {encoderSparse.ExpertCount} experts " +
-                $"routing {encoderSparse.RoutedExpertsPerToken} per token: the encoder forward runs dense gate/up/down blocks only");
-        }
+        EnsureDenseEncoderBlocks();
 
         int qkvRegion = Plan.HeadCount * Plan.HeadDim;
         int kvRegion = Plan.KvHeadCount * Plan.HeadDim;
@@ -2874,6 +2861,359 @@ public sealed class TransformerModel : IDisposable
             poolBuffers.Return(chunkProj, clearArray: false);
             poolBuffers.Return(chunkGateUp, clearArray: false);
             poolBuffers.Return(chunkUp, clearArray: false);
+        }
+    }
+
+    /// <summary>
+    /// Merged encoder forward over several sequences in one composition: every dense weight matrix of a layer is traversed
+    /// once for the whole batch's rows through <see cref="IBackend.GemvBatch"/>, exactly as <see cref="DecodeBatch"/> merges
+    /// decode steps, while each sequence still attends only over its own finished KV span — attention stays per-sequence
+    /// because a bidirectional query scores against that sequence's positions and nobody else's. The flattened stream is
+    /// position-major across the whole batch: chunk-row windows of up to <see cref="EncodeChunkTokens"/> rows run per layer
+    /// for norms, projections, RoPE at each row's own absolute position, and the gated activation, so a window can carry the
+    /// tail of one sequence beside the head of the next. Every phase runs the same operations, in the same order, over the
+    /// same values as an independent <see cref="Encode"/> call per sequence: batching changes which rows share a weight pass,
+    /// not what any row computes. Results are returned per input sequence, each array laid out exactly like that sequence's
+    /// single-call result (<c>hidden[position * HiddenSize + i]</c>) and caller-owned, in the order the inputs were given.
+    /// </summary>
+    /// <exception cref="ArgumentException">
+    /// The two lists differ in length, fewer than one or more than <see cref="MaxEncodeSequences"/> sequences were given, a
+    /// list entry is null, any sequence holds no tokens or more than <see cref="MaxEncodeTokens"/>, the batch's rows exceed
+    /// <see cref="MaxEncodeBatchRows"/>, a token id is outside the vocabulary, or appending a sequence would exceed this
+    /// model's max context. A rejected call touches no sequence's KV.
+    /// </exception>
+    public IReadOnlyList<float[]> EncodeBatch(IReadOnlyList<IReadOnlyList<int>> tokenLists, IReadOnlyList<SequenceKv> kvs)
+    {
+        ArgumentNullException.ThrowIfNull(tokenLists);
+        ArgumentNullException.ThrowIfNull(kvs);
+
+        int sequences = tokenLists.Count;
+        if (sequences != kvs.Count)
+        {
+            throw new ArgumentException($"tokenLists has {tokenLists.Count} entries but kvs has {kvs.Count}: one token list per sequence is required.", nameof(kvs));
+        }
+
+        if (sequences == 0 || sequences > MaxEncodeSequences)
+        {
+            throw new ArgumentException($"an encoder batch must hold between 1 and {MaxEncodeSequences} sequences, got {sequences}.", nameof(tokenLists));
+        }
+
+        EnsureEncoderForwardPosture();
+
+        int[] lengths = new int[sequences];
+        long totalRows = 0;
+        for (int s = 0; s < sequences; s++)
+        {
+            IReadOnlyList<int> tokens = tokenLists[s] ?? throw new ArgumentException($"tokenLists entry {s} is null.", nameof(tokenLists));
+            SequenceKv kv = kvs[s] ?? throw new ArgumentException($"kvs entry {s} is null.", nameof(kvs));
+
+            int n = tokens.Count;
+            if (n == 0 || n > MaxEncodeTokens)
+            {
+                throw new ArgumentException(
+                    $"sequence {s} holds {n} encoder tokens: an encoder forward must hold between 1 and {MaxEncodeTokens} tokens.",
+                    nameof(tokenLists));
+            }
+
+            if (kv.Length + n > MaxContextTokens)
+            {
+                throw new ArgumentException(
+                    $"{n} encoder tokens starting at position {kv.Length} exceed this model's max context of {MaxContextTokens}.",
+                    nameof(kvs));
+            }
+
+            lengths[s] = n;
+            totalRows += n;
+        }
+
+        if (totalRows > MaxEncodeBatchRows)
+        {
+            throw new ArgumentException(
+                $"a merged encoder batch carries between 1 and {MaxEncodeBatchRows} token rows across its sequences, got {totalRows}: compose these inputs as several calls.",
+                nameof(tokenLists));
+        }
+
+        EnsureDenseEncoderBlocks();
+
+        return EncodeBatchBody(tokenLists, kvs, lengths);
+    }
+
+    // The merged encoder composition: flattened position-major streams over the whole batch plus chunk-local scratch for each
+    // window's batched GEMVs. Row ownership and absolute positions resolve once here — every window below addresses rows through
+    // that map instead of re-deriving sequence boundaries, and attention groups queries by their own sequence.
+    private IReadOnlyList<float[]> EncodeBatchBody(IReadOnlyList<IReadOnlyList<int>> tokenLists, IReadOnlyList<SequenceKv> kvs, int[] lengths)
+    {
+        int sequences = tokenLists.Count;
+
+        int hidden = Plan.HiddenSize;
+        int qkvRegion = Plan.HeadCount * Plan.HeadDim;
+        int kvRegion = Plan.KvHeadCount * Plan.HeadDim;
+        int inter = Plan.IntermediateSize;
+        float attnScale = _attnScale;
+
+        int totalRows = 0;
+        int[] rowStarts = new int[sequences];
+        for (int s = 0; s < sequences; s++)
+        {
+            rowStarts[s] = totalRows;
+            totalRows += lengths[s];
+        }
+
+        // Which sequence each flattened row belongs to, and the absolute position its K/V lands at: RoPE, KV addressing, and
+        // attention grouping all read this map, so no window below re-derives a sequence boundary.
+        int[] rowSequence = new int[totalRows];
+        int[] rowPosition = new int[totalRows];
+        int[] basePositions = new int[sequences];
+
+        ArrayPool<float> poolBuffers = ArrayPool<float>.Shared;
+
+        float[] cur = poolBuffers.Rent(totalRows * hidden);          // residual carrier per row; becomes the final stream
+        float[] normed = poolBuffers.Rent(totalRows * hidden);       // rmsnorm result feeding the QKV / FFN GEMVs
+        float[] qAll = poolBuffers.Rent(totalRows * qkvRegion);      // every position's rotated queries, kept for attention
+        float[] attnOut = poolBuffers.Rent(totalRows * qkvRegion);   // concatenated heads per position before wo
+        float[] chunkNormed = poolBuffers.Rent(EncodeChunkTokens * hidden);
+        float[] chunkQ = poolBuffers.Rent(EncodeChunkTokens * qkvRegion);
+        float[] chunkK = poolBuffers.Rent(EncodeChunkTokens * kvRegion);
+        float[] chunkV = poolBuffers.Rent(EncodeChunkTokens * kvRegion);
+        float[] chunkProj = poolBuffers.Rent(EncodeChunkTokens * hidden);
+        float[] chunkGateUp = poolBuffers.Rent(EncodeChunkTokens * inter);
+        float[] chunkUp = poolBuffers.Rent(EncodeChunkTokens * inter);
+
+        try
+        {
+            // Embedding lookup across the flattened stream: each token's dequantized row seeds that position's input stream.
+            ReadOnlySpan<byte> embBytes = _weights.Resolve(_tokenEmbd);
+            WeightRef embRef = new(embBytes, _tokenEmbd.Shape, _tokenEmbd.Format);
+            for (int s = 0; s < sequences; s++)
+            {
+                IReadOnlyList<int> tokens = tokenLists[s];
+                for (int i = 0; i < lengths[s]; i++)
+                {
+                    if ((uint)tokens[i] >= (uint)Plan.VocabSize)
+                    {
+                        throw new ArgumentException($"token id {tokens[i]} at index {i} of sequence {s} is outside the vocabulary of {Plan.VocabSize}.", nameof(tokenLists));
+                    }
+
+                    _backend.DequantRow(embRef, tokens[i], cur.AsSpan((rowStarts[s] + i) * hidden, hidden));
+                }
+            }
+
+            ApplyInputEmbeddingScale(cur.AsSpan(0, totalRows * hidden));
+
+            // Reserve every sequence's positions up front so later layer passes address them by absolute position.
+            for (int s = 0; s < sequences; s++)
+            {
+                int basePosition = kvs[s].Length;
+                basePositions[s] = basePosition;
+
+                for (int i = 0; i < lengths[s]; i++)
+                {
+                    rowSequence[rowStarts[s] + i] = s;
+                    rowPosition[rowStarts[s] + i] = basePosition + i;
+                    kvs[s].Append();
+                }
+            }
+
+            int windowCount = (totalRows + EncodeChunkTokens - 1) / EncodeChunkTokens;
+
+            for (int l = 0; l < Plan.LayerCount; l++)
+            {
+                int layerWindow = LayerAttentionWindow(l);
+
+                // Phase 1: pre-attention norm, QKV GEMVs (+bias), RoPE at each row's absolute position, and the K/V writes —
+                // one window of rows per weight pass across the whole batch. Queries stay in qAll so no position's attention
+                // runs before every position's K/V exists.
+                for (int w = 0; w < windowCount; w++)
+                {
+                    int firstRow = w * EncodeChunkTokens;
+                    int m = Math.Min(EncodeChunkTokens, totalRows - firstRow);
+
+                    for (int i = 0; i < m; i++)
+                    {
+                        ApplyNorm(cur.AsSpan((firstRow + i) * hidden, hidden), _attnNormWeight[l], _attnNormBias[l], chunkNormed.AsSpan(i * hidden, hidden));
+                    }
+
+                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, AttentionQueryWeight(l), chunkQ.AsSpan(0, m * qkvRegion));
+
+                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, AttentionKeyWeight(l), chunkK.AsSpan(0, m * kvRegion));
+
+                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, AttentionValueWeight(l), chunkV.AsSpan(0, m * kvRegion));
+
+                    for (int i = 0; i < m; i++)
+                    {
+                        int row = firstRow + i;
+                        SequenceKv owner = kvs[rowSequence[row]];
+                        int position = rowPosition[row];
+
+                        AddBias(chunkQ.AsSpan(i * qkvRegion, qkvRegion), _biasQ[l]);
+                        AddBias(chunkK.AsSpan(i * kvRegion, kvRegion), _biasK[l]);
+                        AddBias(chunkV.AsSpan(i * kvRegion, kvRegion), _biasV[l]);
+
+                        ApplyQkNorm(chunkQ.AsSpan(i * qkvRegion, qkvRegion), _attnQNorm[l]);
+                        ApplyQkNorm(chunkK.AsSpan(i * kvRegion, kvRegion), _attnKNorm[l]);
+
+                        ApplyRopeHeads(chunkQ.AsSpan(i * qkvRegion, qkvRegion), Plan.HeadCount, position, windowedLayer: layerWindow > 0);
+                        ApplyRopeHeads(chunkK.AsSpan(i * kvRegion, kvRegion), Plan.KvHeadCount, position, windowedLayer: layerWindow > 0);
+
+                        owner.WriteK(position, l, chunkK.AsSpan(i * kvRegion, kvRegion));
+                        owner.WriteV(position, l, chunkV.AsSpan(i * kvRegion, kvRegion));
+
+                        // Sequence-relative slot in the batch-wide query stream: attention reads queries where they live.
+                        chunkQ.AsSpan(i * qkvRegion, qkvRegion).CopyTo(qAll.AsSpan(row * qkvRegion, qkvRegion));
+                    }
+                }
+
+                // Phase 2: attention per sequence — each window of that sequence's own queries scores against its finished KV,
+                // over every position on a layer whose resolved window is zero and over [max(0, q - window + 1), q] on one that
+                // resolves a positive window. No query ever reads another sequence's K/V.
+                for (int s = 0; s < sequences; s++)
+                {
+                    int start = rowStarts[s];
+                    int length = lengths[s];
+
+                    for (int c = 0, chunkCount = (length + EncodeChunkTokens - 1) / EncodeChunkTokens; c < chunkCount; c++)
+                    {
+                        int m = Math.Min(EncodeChunkTokens, length - c * EncodeChunkTokens);
+
+                        LayerOps.BidirectionalAttention(
+                            _backend,
+                            qAll.AsSpan((start + c * EncodeChunkTokens) * qkvRegion, m * qkvRegion),
+                            queryCount: m,
+                            queryPositionOffset: basePositions[s] + c * EncodeChunkTokens,
+                            fromPosition: 0,
+                            toPosition: basePositions[s] + length - 1,
+                            Plan.HeadCount,
+                            Plan.KvHeadCount,
+                            Plan.HeadDim,
+                            kvs[s],
+                            l,
+                            attnScale,
+                            Plan.AttentionSoftcap,
+                            layerWindow,
+                            attnOut.AsSpan((start + c * EncodeChunkTokens) * qkvRegion, m * qkvRegion));
+                    }
+                }
+
+                // Phase 3: output projection (+bias) and the ffn_inp residual add on each row's own stream.
+                for (int w = 0; w < windowCount; w++)
+                {
+                    int firstRow = w * EncodeChunkTokens;
+                    int m = Math.Min(EncodeChunkTokens, totalRows - firstRow);
+
+                    ReadOnlySpan<byte> bytes = _weights.Resolve(_wo[l]);
+                    _backend.GemvBatch(attnOut.AsSpan(firstRow * qkvRegion, m * qkvRegion), m, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), chunkProj.AsSpan(0, m * hidden));
+
+                    for (int i = 0; i < m; i++)
+                    {
+                        AddBias(chunkProj.AsSpan(i * hidden, hidden), _biasO[l]);
+
+                        // Post-sublayer placement: this position's attention output joins its stream only after the post-attention norm.
+                        ApplyPostSublayerNorm(chunkProj.AsSpan(i * hidden, hidden), _postAttnNorm[l]);
+
+                        Span<float> posCur = cur.AsSpan((firstRow + i) * hidden, hidden);
+                        ReadOnlySpan<float> proj = chunkProj.AsSpan(i * hidden, hidden);
+                        for (int x = 0; x < hidden; x++)
+                        {
+                            posCur[x] += proj[x];
+                        }
+
+                        ApplyNorm(posCur, _ffnNormWeight[l], _ffnNormBias[l], normed.AsSpan((firstRow + i) * hidden, hidden));
+                    }
+                }
+
+                // Phase 4: gate/up GEMVs and the gated activation per window.
+                for (int w = 0; w < windowCount; w++)
+                {
+                    int firstRow = w * EncodeChunkTokens;
+                    int m = Math.Min(EncodeChunkTokens, totalRows - firstRow);
+
+                    _backend.GemvBatch(normed.AsSpan(firstRow * hidden, m * hidden), m, FeedForwardGateWeight(l), chunkGateUp.AsSpan(0, m * inter));
+
+                    _backend.GemvBatch(normed.AsSpan(firstRow * hidden, m * hidden), m, FeedForwardUpWeight(l), chunkUp.AsSpan(0, m * inter));
+
+                    for (int i = 0; i < m; i++)
+                    {
+                        ApplyActivation(chunkGateUp.AsSpan(i * inter, inter), chunkUp.AsSpan(i * inter, inter));
+                    }
+
+                    // Phase 5: down GEMV and the ffn_out residual add, completing this layer for every row of the window.
+                    ReadOnlySpan<byte> bytes = _weights.Resolve(_ffnDown[l]);
+                    _backend.GemvBatch(chunkGateUp.AsSpan(0, m * inter), m, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), chunkProj.AsSpan(0, m * hidden));
+
+                    for (int i = 0; i < m; i++)
+                    {
+                        // Post-sublayer placement: this position's feed-forward output joins its stream only after the post-feed-forward norm.
+                        ApplyPostSublayerNorm(chunkProj.AsSpan(i * hidden, hidden), _postFfnNorm[l]);
+
+                        Span<float> posCur = cur.AsSpan((firstRow + i) * hidden, hidden);
+                        ReadOnlySpan<float> proj = chunkProj.AsSpan(i * hidden, hidden);
+                        for (int x = 0; x < hidden; x++)
+                        {
+                            posCur[x] += proj[x]; // ffn_out + ffn_inp: this position's input stream for the next layer
+                        }
+                    }
+                }
+            }
+
+            float[][] encoded = new float[sequences][]; // one caller-owned buffer per sequence, exact size — pooling helpers consume each row-wise
+            for (int s = 0; s < sequences; s++)
+            {
+                int length = lengths[s];
+                float[] rows = new float[length * hidden];
+
+                for (int i = 0; i < length; i++)
+                {
+                    ApplyNorm(cur.AsSpan((rowStarts[s] + i) * hidden, hidden), _outputNormWeight, _outputNormBias, rows.AsSpan(i * hidden, hidden));
+                }
+
+                encoded[s] = rows;
+            }
+
+            return encoded;
+        }
+        finally
+        {
+            poolBuffers.Return(cur, clearArray: false);
+            poolBuffers.Return(normed, clearArray: false);
+            poolBuffers.Return(qAll, clearArray: false);
+            poolBuffers.Return(attnOut, clearArray: false);
+            poolBuffers.Return(chunkNormed, clearArray: false);
+            poolBuffers.Return(chunkQ, clearArray: false);
+            poolBuffers.Return(chunkK, clearArray: false);
+            poolBuffers.Return(chunkV, clearArray: false);
+            poolBuffers.Return(chunkProj, clearArray: false);
+            poolBuffers.Return(chunkGateUp, clearArray: false);
+            poolBuffers.Return(chunkUp, clearArray: false);
+        }
+    }
+
+    // The posture every encoder forward needs, stated once for both the single-sequence and merged-batch entry points: a route this engine crosses
+    // between backends cannot stage an encoder's streams, and a quantized pair closes only causal kernels. Both refusals name what they lack rather
+    // than forwarding part of a sequence on one backend or reading quantized groups as floats.
+    private void EnsureEncoderForwardPosture()
+    {
+        if (_mainSpans.Length > 1)
+        {
+            throw new ModelException(
+                $"architecture '{Plan.Architecture}' resolves a route this engine crosses between backends, and its encoder forward rents streams past the row capacity those crossings stage through — open this model as one span to encode it");
+        }
+
+        if (!_kvFormats.IsFloatStorage)
+        {
+            throw new ModelException(
+                $"this model opened kv k='{KvSideFormatNames.Of(_kvFormats.K)}' v='{KvSideFormatNames.Of(_kvFormats.V)}': the encoder pass runs the FP32 bidirectional attention kernels over float KV reads, " +
+                "and no quantized encoder route exists in this build — omit kv.quant to encode this model in the FP32 posture");
+        }
+    }
+
+    // Encoder forwards run dense gate/up/down blocks only: an expert-routed block has no encoder-side routing pass. Shared by both encoder entry points.
+    private void EnsureDenseEncoderBlocks()
+    {
+        if (_sparseFfn is { } encoderSparse)
+        {
+            throw new ModelException(
+                $"architecture '{Plan.Architecture}' declares a sparse-FFN block with {encoderSparse.ExpertCount} experts " +
+                $"routing {encoderSparse.RoutedExpertsPerToken} per token: the encoder forward runs dense gate/up/down blocks only");
         }
     }
 

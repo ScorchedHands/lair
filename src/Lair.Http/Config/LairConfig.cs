@@ -131,7 +131,13 @@ public sealed record ModelConfig
 
     public required string Path { get; init; }
 
-    public string Type { get; init; } = "chat";
+    /// <summary>
+    /// What this model serves: <c>chat</c> (default — prompt forwards feed sampled decode, exactly as every model does today) or
+    /// <c>embed</c> (encode-only serving posture: requests run bidirectional encoder forwards and answer sentence vectors, the chat
+    /// and completion endpoints refuse it, and no decode pipeline ever advances on it). Which posture a loaded instance runs is
+    /// established when the engine opens, so changing this key is a restart-only edit.
+    /// </summary>
+    public string Type { get; init; } = ModelTypeValues.Chat;
 
     public int MaxContextTokens { get; init; } = 4096;
 
@@ -214,6 +220,20 @@ public sealed record ModelConfig
     public int? QueueTimeoutMs { get; init; }
 
     /// <summary>
+    /// How an embedding request's encoder forward collapses its per-position hidden states into the vector it answers with:
+    /// <c>mean</c> (default — the average over every position) or <c>cls</c> (the first position's row verbatim). The choice reads
+    /// what a request already tokenized, so a live edit retitles later requests only; nothing an encoder forward already computed changes.
+    /// </summary>
+    public string Pooling { get; init; } = PoolingModeValues.Mean;
+
+    /// <summary>
+    /// Whether pooled vectors are L2-normalized before they answer. Default false returns the raw pooled vector exactly as pooling
+    /// produced it; true scales it to unit length (a zero vector stays untouched). Like <c>pooling</c>, this is a response-shape choice,
+    /// so a live edit retitles later requests only.
+    /// </summary>
+    public bool Normalize { get; init; }
+
+    /// <summary>
     /// The published source this model's files are pinned to — the repo, the revision as declared, and the file set with each
     /// file's pinned hash and size — or null when the entry says nothing about provenance, which serves the declared local
     /// path exactly as every model does today. The loader validates this block's shape at load like every other block;
@@ -249,6 +269,26 @@ public sealed record SourceFileConfig
 
     /// <summary>The declared byte size of this file; null (absent) declares no size.</summary>
     public long? Size { get; init; }
+}
+
+/// <summary>The accepted values of a model entry's <c>type</c>: prompt-and-sample serving, or encode-only sentence-vector serving.</summary>
+public static class ModelTypeValues
+{
+    /// <summary>Prompt forwards feed sampled decode through the generation scheduler — today's behavior, and what an absent key resolves to.</summary>
+    public const string Chat = "chat";
+
+    /// <summary>The model serves encoder forwards only: its requests run bidirectional encode passes and answer sentence vectors, and no decode pipeline ever advances on it.</summary>
+    public const string Embed = "embed";
+}
+
+/// <summary>The accepted values of a model entry's <c>pooling</c>: how an encoder forward's per-position hidden states collapse into one vector.</summary>
+public static class PoolingModeValues
+{
+    /// <summary>Average every position's final hidden row — the default sentence-vector recipe, and what an absent key resolves to.</summary>
+    public const string Mean = "mean";
+
+    /// <summary>Take the first position's final hidden row verbatim (CLS-style extraction).</summary>
+    public const string Cls = "cls";
 }
 
 /// <summary>The accepted values of <c>placement.prefill_lane</c>: one execution backend for every forward, or a dedicated worker lane for prompt forwards.</summary>

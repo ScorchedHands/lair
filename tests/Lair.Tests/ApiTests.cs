@@ -357,14 +357,27 @@ public class ApiTests : IClassFixture<ApiFixture>
     }
 
     [Fact]
-    public async Task Embeddings_Responds404UntilImplemented()
+    public async Task Embeddings_AgainstSamplingModel_RefusesWithInvalidRequest_WithoutRunningAForward()
     {
+        // The shared fixture opens its model in sampling posture, so this endpoint refuses it before any tokenization or admission: the OpenAI-shaped refusal names both postures and where this model's embedding requests belong.
         HttpResponseMessage response = await PostJsonRawAsync(
             "/v1/embeddings",
             $"{{\"model\":\"{ApiFixture.ModelName}\",\"input\":\"hello\"}}");
 
-        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.True(response.Headers.TryGetValues(ApiApp.RequestIdHeader, out _));
+
+        JsonElement error = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement.GetProperty("error");
+        Assert.Equal("invalid_request_error", error.GetProperty("type").GetString());
+        Assert.Equal("invalid_request", error.GetProperty("code").GetString());
+        Assert.Contains("/v1/embeddings", error.GetProperty("message").GetString());
+
+        // The refusal is about posture, not a broken request: the same model still samples on its own endpoint afterwards.
+        HttpResponseMessage sampling = await PostJsonRawAsync(
+            "/v1/completions",
+            $"{{\"model\":\"{ApiFixture.ModelName}\",\"prompt\":\"hello\",\"max_tokens\":4,\"temperature\":0}}");
+
+        Assert.Equal(HttpStatusCode.OK, sampling.StatusCode);
     }
 
     private string Url(string path) => _fixture.BaseUrl + path;

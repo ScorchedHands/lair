@@ -228,6 +228,18 @@ public static class ConfigMutationTable
             changes.Add(new FieldChange("models[0].queue_timeout_ms", TextOrNone(oldModel.QueueTimeoutMs), TextOrNone(newModel.QueueTimeoutMs), ConfigMutationClass.NewRequestsOnly));
         }
 
+        // The sentence-vector posture keys decide what a request answers with, not what any forward computed: both classify new-requests-only, so a live
+        // edit retitles later embedding requests while a vector already pooled follows the posture its request started on.
+        if (newModel.Pooling != oldModel.Pooling)
+        {
+            changes.Add(new FieldChange("models[0].pooling", oldModel.Pooling, newModel.Pooling, ConfigMutationClass.NewRequestsOnly));
+        }
+
+        if (newModel.Normalize != oldModel.Normalize)
+        {
+            changes.Add(new FieldChange("models[0].normalize", Text(oldModel.Normalize), Text(newModel.Normalize), ConfigMutationClass.NewRequestsOnly));
+        }
+
         AddBudgetChanges(changes, oldModel, newModel);
 
         // The source block is a structural pin like budgets' chain orders and per-node overrides: it reports through one
@@ -351,8 +363,11 @@ public static class ConfigMutationTable
         "models[0].max_response_tokens" => ConfigMutationClass.NewRequestsOnly,
         "models[0].max_concurrent_requests" => ConfigMutationClass.NewRequestsOnly,
 
-        // Both queue keys bound submissions that have not been admitted yet: the cap and the bounded wait retarget later submissions only.
+        // Both queue keys bound submissions that have not been admitted yet: the cap and the bounded wait retarget later submissions only. The pooling
+        // choice and normalize flag say how a request's vectors are shaped, so they retitle requests admitted from now on as well; what a model's type is
+        // established when its engine opens and stays at the table's default restart-only class beside it.
         "models[0].max_queued_requests" or "models[0].queue_timeout_ms" => ConfigMutationClass.NewRequestsOnly,
+        "models[0].pooling" or "models[0].normalize" => ConfigMutationClass.NewRequestsOnly,
         "models[0].placement.numa_spread" => ConfigMutationClass.NewRequestsOnly,
         "models[0].placement.core_overcommit" => ConfigMutationClass.RestartOnly,
         // The KV residency mode says how this model's block pools are seated across host and device storage. Reseating an
@@ -491,6 +506,10 @@ public static class ConfigMutationTable
         yield return ("models[0].max_queued_requests", ScalarText(model, "max_queued_requests"));
         yield return ("models[0].queue_timeout_ms", ScalarText(model, "queue_timeout_ms"));
 
+        // The sentence-vector posture keys are plain scalars beside the queue knobs they sit next to in a config entry.
+        yield return ("models[0].pooling", ScalarText(model, "pooling"));
+        yield return ("models[0].normalize", ScalarText(model, "normalize"));
+
         YamlDotNet.RepresentationModel.YamlMappingNode? placement = Child(model, "placement");
         yield return ("models[0].placement.device", ScalarText(placement, "device"));
         yield return ("models[0].placement.kv_residency", ScalarText(placement, "kv_residency"));
@@ -560,6 +579,8 @@ public static class ConfigMutationTable
         "models[0].max_concurrent_requests" => TextOrNone(current.Models[0].MaxConcurrentRequests),
         "models[0].max_queued_requests" => TextOrNone(current.Models[0].MaxQueuedRequests),
         "models[0].queue_timeout_ms" => TextOrNone(current.Models[0].QueueTimeoutMs),
+        "models[0].pooling" => current.Models[0].Pooling,
+        "models[0].normalize" => Text(current.Models[0].Normalize),
         "models[0].placement.device" => current.Models[0].Placement.Device,
         "models[0].placement.kv_residency" => current.Models[0].Placement.KvResidency,
         "models[0].placement.prefill" => current.Models[0].Placement.Prefill,
