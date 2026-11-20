@@ -228,6 +228,16 @@ public static class ConfigMutationTable
             changes.Add(new FieldChange("models[0].queue_timeout_ms", TextOrNone(oldModel.QueueTimeoutMs), TextOrNone(newModel.QueueTimeoutMs), ConfigMutationClass.NewRequestsOnly));
         }
 
+        // The device fair-share bounds how much device work a *future* boundary may launch for this model; a sequence already launched
+        // keeps its window slot until its forward returns, so a live edit retargets later composition without disturbing in-flight work —
+        // the same Live posture a stepping segment's thread quota carries, where quota headroom follows the new value from the next
+        // composition on. It is not an admission posture (nothing about a submission's admission reads it), so it is not
+        // new-requests-only: an already-admitted sequence's later steps see the new cap, which is exactly what a fair-share window is.
+        if (newModel.ComputeShare != oldModel.ComputeShare)
+        {
+            changes.Add(new FieldChange("models[0].compute_share", TextOrNone(oldModel.ComputeShare), TextOrNone(newModel.ComputeShare), ConfigMutationClass.Live));
+        }
+
         // The sentence-vector posture keys decide what a request answers with, not what any forward computed: both classify new-requests-only, so a live
         // edit retitles later embedding requests while a vector already pooled follows the posture its request started on.
         if (newModel.Pooling != oldModel.Pooling)
@@ -354,6 +364,9 @@ public static class ConfigMutationTable
         // KV format pair physical layout and attention execution are resolved when the model opens.
         "models[0].kv.quant.k" or "models[0].kv.quant.v" => ConfigMutationClass.RestartOnly,
         "models[0].placement.thread_quota" => ConfigMutationClass.Live,
+        // The device fair-share re-resolves headroom for future compositions only — in-flight sequences keep their window slots until
+        // their forwards return — so it classifies live exactly where the stepping quota beside it does.
+        "models[0].compute_share" => ConfigMutationClass.Live,
         "ui.recent_requests" => ConfigMutationClass.Live,
         "models[0].max_context_tokens" => ConfigMutationClass.NewRequestsOnly,
         "models[0].force_fenced_tools" => ConfigMutationClass.NewRequestsOnly,
@@ -506,6 +519,9 @@ public static class ConfigMutationTable
         yield return ("models[0].max_queued_requests", ScalarText(model, "max_queued_requests"));
         yield return ("models[0].queue_timeout_ms", ScalarText(model, "queue_timeout_ms"));
 
+        // The device fair-share is a plain scalar beside the queue knobs it sits next to in a config entry.
+        yield return ("models[0].compute_share", ScalarText(model, "compute_share"));
+
         // The sentence-vector posture keys are plain scalars beside the queue knobs they sit next to in a config entry.
         yield return ("models[0].pooling", ScalarText(model, "pooling"));
         yield return ("models[0].normalize", ScalarText(model, "normalize"));
@@ -579,6 +595,7 @@ public static class ConfigMutationTable
         "models[0].max_concurrent_requests" => TextOrNone(current.Models[0].MaxConcurrentRequests),
         "models[0].max_queued_requests" => TextOrNone(current.Models[0].MaxQueuedRequests),
         "models[0].queue_timeout_ms" => TextOrNone(current.Models[0].QueueTimeoutMs),
+        "models[0].compute_share" => TextOrNone(current.Models[0].ComputeShare),
         "models[0].pooling" => current.Models[0].Pooling,
         "models[0].normalize" => Text(current.Models[0].Normalize),
         "models[0].placement.device" => current.Models[0].Placement.Device,

@@ -21,7 +21,7 @@ public static class YamlConfigLoader
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel", "cpu"];
     private static readonly string[] CpuKeys = ["isa"];
     private static readonly string[] UiKeys = ["recent_requests"];
-    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "kv", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "max_queued_requests", "queue_timeout_ms", "pooling", "normalize", "budgets", "source"];
+    private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "kv", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "max_queued_requests", "queue_timeout_ms", "compute_share", "pooling", "normalize", "budgets", "source"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit", "numa_spread", "gpu_layers"];
 
     /// <summary>The keys one model entry's KV block may declare.</summary>
@@ -544,6 +544,20 @@ public static class YamlConfigLoader
                 $"models[{index}].queue_timeout_ms {queueTimeoutMs} is invalid: 'queue_timeout_ms' must be 1 or greater.");
         }
 
+        // Per-model device fair-share: absent declares no share — step composition bounds this model by its segment batch caps and quota
+        // headroom alone, exactly as before this key existed. A present value is the percent of one host device co-scheduling window this
+        // model's launched device work may hold and must be an integer from 1 to 100; a rejected value fails naming the model entry, the
+        // model, the key, the offending number, and the accepted range like the other sized keys do. What a model without an
+        // accelerator-backed segment declares here is validated the same way and bounds nothing until a device-backed segment exists —
+        // the posture every declared posture this build cannot yet carry keeps.
+        int? computeShare = TryInteger(keys, "compute_share", $"models[{index}].compute_share");
+        if (computeShare is < 1 or > 100)
+        {
+            throw new ConfigException(
+                $"models[{index}].compute_share {computeShare} is invalid for model '{name}': 'compute_share' must be an integer from 1 to 100 — " +
+                "the percent of one device co-scheduling window this model may hold its launched device work in — or absent to declare no share.");
+        }
+
         // Sentence-vector posture, read by embedding requests only and absent-by-default in both halves. An unrecognized pooling choice fails
         // naming the path, model, value, and accepted set exactly as the tool-parser and reasoning choices do; a present normalize must be a
         // boolean like every other flag key here. A chat entry may declare either key without effect: what an embed request answers with follows them.
@@ -574,6 +588,7 @@ public static class YamlConfigLoader
             MaxConcurrentRequests = maxConcurrentRequests,
             MaxQueuedRequests = maxQueuedRequests,
             QueueTimeoutMs = queueTimeoutMs,
+            ComputeShare = computeShare,
             Pooling = pooling,
             Normalize = normalize,
             Budgets = budgets,

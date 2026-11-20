@@ -74,6 +74,13 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
     private ComputeCapacityLedger? _compute;
     private ComputeGrant? _computeGrant;
 
+    // The host device co-scheduling seam this engine advances its scheduler under, when its resolved route names an accelerator-backed
+    // segment: the seam bounds how much device work this model may launch at each step boundary through its compute share, and never
+    // preempts a sequence already running. Supplied by hosts that co-schedule several engines on one device — then every resident model
+    // shares one window — and otherwise this engine's own seam over the device its route resolved onto. A model whose route names no
+    // device segment carries no seam: its composition stays bounded by its segment caps and quotas exactly as before this seam existed.
+    private DeviceCoScheduler? _coScheduler;
+
     // The placement this engine's worker claim seated on: the node (or nodes) placement chose for this model beside the posture it
     // declared and the posture placement applied. Established when the engine opens — a live edit of the spread key records the new
     // preference for later placement decisions while this value, the opened worker pool, and the posture its weight pages first-touched
@@ -129,6 +136,9 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
     internal DeviceLedger? HostDeviceLedger => _ledger;
 
     internal ComputeCapacityLedger? HostCompute => _compute;
+
+    /// <summary>The device co-scheduling window this engine's scheduler advances its composition under, or null when its resolved route names no accelerator-backed segment. A host opening several engines beside each other adopts this from the first open so every later model resident on the same device advances one window instead than a window of its own. Internal for hosts and tests; disposal releases this model's seat, not the window itself.</summary>
+    internal DeviceCoScheduler? HostCoScheduler => _coScheduler;
 
     /// <summary>The resolved dedicated prefill-lane layout this model opened with — null for every shared-posture model. The load-resolved split live quota edits map against. Internal diagnostics for hosts and tests; monitor reporting is a later seam.</summary>
     internal PrefillLaneLayout? DedicatedPrefillLanes => _prefillsLane;
@@ -795,6 +805,20 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
                         effective = effective with { Models = [effective.Models[0] with { QueueTimeoutMs = candidate.Models[0].QueueTimeoutMs }] };
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
                             $"queue wait {change.OldValue} -> {change.NewValue}: submissions from now on answer the queue-timeout refusal once their bounded wait for an admission slot expires; submissions already waiting keep the ceiling they entered with"));
+                        break;
+
+                    case "models[0].compute_share":
+                        // The device fair-share re-resolves headroom for future compositions only: a raised share lets later boundaries
+                        // launch more of this model's candidates, a lowered share retargets which candidates a later composition may
+                        // launch, and every sequence already launched keeps its window slot until its forward returns — nothing in
+                        // flight is preempted. A model whose resolved route names no device segment records the posture against no
+                        // window at all, the same warn-and-accept posture its load reported.
+                        _scheduler.ApplyComputeShare(candidate.Models[0].ComputeShare);
+                        effective = effective with { Models = [effective.Models[0] with { ComputeShare = candidate.Models[0].ComputeShare }] };
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Applied,
+                            _coScheduler is not null
+                                ? $"device fair-share {change.OldValue} -> {change.NewValue} against device '{_coScheduler.DeviceId}': future step compositions bound against the new share from the next boundary's grant on; sequences already launched keep their window slots until their forwards return, so nothing in flight is preempted"
+                                : $"device fair-share {change.OldValue} -> {change.NewValue}: this model's resolved route names no accelerator-backed segment, so no device co-scheduling window bounds it — the posture records for a placement that opens one, and sequences already launched keep running, so nothing in flight is preempted"));
                         break;
 
                     case "models[0].pooling":
@@ -1472,8 +1496,13 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
     /// way: an injected one carries both what the host reported about nodes and every share seated ahead of this model, so a later claim is
     /// clamped to what its predecessors left instead of being refused or preempting them; a null one opens fresh accounting over this process's
     /// reported topology. No host configuration path reaches either seam — they are programmatic seams. <paramref name="cpuFeatures"/> is a third programmatic CPU-posture seam: production opens leave it null and detect the process posture, while tests may state one explicitly so an unavailable forced ISA can be proven to refuse before any backend exists.
+    /// <paramref name="coScheduler"/> is the fourth programmatic seam: the host window several engines resident on one accelerator share, so each
+    /// model's own scheduler advances under one bounded device fair-share rather than a window of its own. A model whose resolved route names
+    /// that seam's device registers its seat with its declared <c>compute_share</c> (absent means resident-but-unbounded by fair-share); a
+    /// supplied seam naming some other device is not this model's window, and a model resolving onto a device no seam was supplied for gets
+    /// this engine's own seam over that device. A model whose route names no device segment advances under no seam at all.
     /// </summary>
-    public static GenerationService Open(LairConfig config, ILogger? logger, DeviceLedger? ledger, ComputeCapacityLedger? compute, IModelHubTransport? transport = null, CpuFeaturePosture? cpuFeatures = null)
+    public static GenerationService Open(LairConfig config, ILogger? logger, DeviceLedger? ledger, ComputeCapacityLedger? compute, IModelHubTransport? transport = null, CpuFeaturePosture? cpuFeatures = null, DeviceCoScheduler? coScheduler = null)
     {
         ArgumentNullException.ThrowIfNull(config);
         if (config.Models.Count == 0)
@@ -1724,6 +1753,11 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
 
                 ThreadQuota = modelConfig.Placement.ThreadQuota,
                 CoreSet = modelConfig.Placement.CoreSet,
+
+                // The declared device fair-share lands on every accelerator-backed segment the route resolves, unchanged, for step
+                // composition to consume against the host window; a CPU-only route carries it nowhere, and resolution refuses an
+                // out-of-range value naming the offending segment.
+                AcceleratorComputeSharePercent = modelConfig.ComputeShare,
             });
 
             // The model's declared budgets resolve against the pools this service opens for it, here and once: each chain lands as what an
@@ -1750,6 +1784,57 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
             _ = compute.ReleaseGrant(modelConfig.Name);
 
             throw;
+        }
+
+        // The device co-scheduling window this model advances its own scheduler under: its resolved route names an accelerator-backed
+        // segment whenever a placement put a span on a device, and a model resident there takes a seat in that device's window whether or
+        // not it declares a share — a resident model without a declared share is unbounded by fair-share, which is exactly how every
+        // model advanced before this seam existed. A host co-scheduling several engines on one device supplies one seam per device so
+        // their windows are shared; a supplied seam naming some other device is not this model's window, and a model resolving onto a
+        // device no matching seam was supplied for gets this engine's own seam over that device. A model whose route names no device
+        // segment advances under no seam at all, and a declared share there bounds nothing until a placement opens a device-backed
+        // segment — reported warn-and-accept against the resolved route, the posture every declared posture this build cannot yet carry keeps.
+        string? residentDevice = null;
+        foreach (DeviceSegment segment in route.Segments)
+        {
+            if (!string.Equals(segment.DeviceId, ModelRoute.CpuDeviceId, StringComparison.Ordinal))
+            {
+                residentDevice = segment.DeviceId;
+                break;
+            }
+        }
+
+        DeviceCoScheduler? engineCoScheduler = null;
+        if (residentDevice is not null)
+        {
+            if (coScheduler is not null && string.Equals(coScheduler.DeviceId, residentDevice, StringComparison.Ordinal))
+            {
+                engineCoScheduler = coScheduler; // the host's shared window for the device this model resolves onto
+            }
+            else
+            {
+                if (coScheduler is not null && modelConfig.ComputeShare is not null)
+                {
+                    logger?.LogWarning(
+                        "compute_share model='{Model}' share={Share} window_mismatch supplied_device={Supplied} resolved_device={Resolved}: the supplied device co-scheduling seam bounds the supplied device, and this model's route advances on the resolved one — this model takes its own seat on that device instead",
+                        modelConfig.Name,
+                        modelConfig.ComputeShare,
+                        coScheduler.DeviceId,
+                        residentDevice);
+                }
+
+                engineCoScheduler = new DeviceCoScheduler(residentDevice);
+            }
+
+            engineCoScheduler.RegisterModel(modelConfig.Name, modelConfig.ComputeShare);
+        }
+        else if (modelConfig.ComputeShare is int declaredShare)
+        {
+            logger?.LogWarning(
+                "compute_share model='{Model}' share={Share} bounds nothing: this model's resolved route [{Segments}] names no accelerator-backed segment, so no device co-scheduling window exists for it to bound",
+                modelConfig.Name,
+                declaredShare,
+                string.Join(", ", route.Segments.Select((segment, position) => segment.Describe(position))));
         }
 
         // The ledger this engine's claims account against: a supplied one is a host's shared accounting across several
@@ -2094,7 +2179,8 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
                 maxConcurrentRequests: modelConfig.MaxConcurrentRequests ?? GenerationScheduler.UncappedConcurrencyCap,
                 modelName: modelConfig.Name,
                 prefillStepBudgetMs: config.Engine.PrefillStepBudgetMs,
-                ledger: ledger);
+                ledger: ledger,
+                coScheduler: engineCoScheduler);
 
             // The chat template is parsed once here, at model load, and cached for the loaded instance's lifetime: no
             // per-request parse and no lazy first-request parse. An unparseable template fails model startup fast,
@@ -2220,6 +2306,7 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
             service._reservationKvClaimTier = reservationKvClaimTier; // a live block-budget edit retargets exactly the seat this claim took
             service._compute = compute; // the core accounting this model's grant seated against, shared with any engine opened beside it
             service._computeGrant = computeGrant; // requested against granted, reported on monitor facts beside the live worker count
+            service._coScheduler = engineCoScheduler; // the device window this model's scheduler advances its composition under, shared with any engine opened beside it on the same device
             service._placement = placement; // the node this engine seated on, reported on monitor facts beside its grant
             service._updateCandidate = updateCandidate; // the report-only candidate this pinned pack has against hub HEAD, reported additively on the monitor
             file = null;
@@ -2237,6 +2324,10 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
             // dropped with the failed open; only shared host accounting needs the release stated.
             _ = ledger.ReleaseClaims(modelConfig.Name);
             _ = compute.ReleaseGrant(modelConfig.Name);
+
+            // A window seat this open took before it failed leaves the host accounting too: an engine nothing serves must not hold
+            // device step slots a later resident model would need.
+            _ = engineCoScheduler?.UnregisterModel(modelConfig.Name);
 
             scheduler?.Dispose();
             pool?.Dispose();
@@ -2930,6 +3021,11 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
         // The scheduler releases every sequence's blocks before the pool they belong to goes away; the forward
         // engine's mmap view must be released before the file handle it maps.
         _scheduler.Dispose();
+
+        // This model leaves its device window seat once its scheduler has stopped advancing: the window itself outlives one engine when a
+        // host shares it, so only this model's seat is released here and every other resident model keeps its own.
+        _ = _coScheduler?.UnregisterModel(Model.Id);
+
         _pool.Dispose();
         _model.Dispose(); // the engine releases every staging arena to the backend that allocated it before any backend goes away.
         _file.Dispose();

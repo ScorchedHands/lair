@@ -46,6 +46,9 @@ public sealed record RouteRequest
     /// <summary>The streaming-multiprocessor share declared for this model's accelerator-backed segments (greater than 0 and at most 100); null claims none. Declared the same internal way as the stream priority.</summary>
     public double? AcceleratorSmSharePercent { get; init; }
 
+    /// <summary>The device fair-share declared for this model's accelerator-backed segments (1 through 100): the percent of one host co-scheduling window its launched device work may hold, landed unchanged on each resolved device segment for step composition to consume. Declared the same internal way as the stream priority and SM share — resolution validates the range and promises no enforcement against any device ledger.</summary>
+    public int? AcceleratorComputeSharePercent { get; init; }
+
     /// <summary>An explicit batch cap for the resolved segments; null takes the engine's own ceiling on sequences one step advances. A value outside that range refuses naming each offending segment.</summary>
     public int? BatchCap { get; init; }
 }
@@ -153,7 +156,12 @@ public static class ModelRoutes
                 BatchCap = request.BatchCap ?? Engine.TransformerModel.MaxBatchSequences,
                 Quota = IsCpuDevice(stage.DeviceId)
                     ? new SegmentQuota { Threads = request.ThreadQuota, Cores = request.CoreSet }
-                    : new SegmentQuota { StreamPriority = request.AcceleratorStreamPriority, SmSharePercent = request.AcceleratorSmSharePercent },
+                    : new SegmentQuota
+                    {
+                        StreamPriority = request.AcceleratorStreamPriority,
+                        SmSharePercent = request.AcceleratorSmSharePercent,
+                        ComputeSharePercent = request.AcceleratorComputeSharePercent,
+                    },
             };
 
             ValidateSegment(request, segments.Count, segment);
@@ -274,6 +282,16 @@ public static class ModelRoutes
         {
             throw new ModelException(
                 $"model '{model}', {segment.Describe(index)}: SM share '{segment.Quota.SmSharePercent}' is invalid — an accelerator segment's streaming-multiprocessor share must be greater than 0 and at most 100, or absent to claim none");
+        }
+
+        // The device fair-share a caller declared lands the same way: a range check here, consumption at step composition later. A
+        // share outside 1..100 refuses naming the model, the segment, and the accepted form rather than landing a number nothing
+        // could honor — the same posture every other declared share on a backed segment keeps.
+        if (segment.Quota.ComputeSharePercent is < 1 or > 100)
+        {
+            throw new ModelException(
+                $"model '{model}', {segment.Describe(index)}: compute share '{segment.Quota.ComputeSharePercent}' is invalid — an accelerator segment's device fair-share must be an integer from 1 to 100 " +
+                $"(the percent of one co-scheduling window this model may hold its launched device work in), or absent to claim none");
         }
 
         return;

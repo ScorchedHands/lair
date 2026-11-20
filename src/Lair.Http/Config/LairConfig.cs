@@ -220,6 +220,16 @@ public sealed record ModelConfig
     public int? QueueTimeoutMs { get; init; }
 
     /// <summary>
+    /// This model's device fair-share: the percent (1 through 100) of one host device co-scheduling window its launched device work may
+    /// hold against the accelerator its resolved route advances on. Null (absent) declares no share: step composition bounds this model by
+    /// its segment batch caps and quota headroom alone, exactly as before this key existed. A present value bounds how much device work a
+    /// later boundary may launch for this model — an over-subscribed candidate defers naming the share, the model, and the device segment
+    /// the window bounds — and never preempts a sequence already running: the cap retargets future launches, and a model whose share would
+    /// round below one window slot still gets one. Like a stepping segment's thread quota, a live edit follows from the next composition on.
+    /// </summary>
+    public int? ComputeShare { get; init; }
+
+    /// <summary>
     /// How an embedding request's encoder forward collapses its per-position hidden states into the vector it answers with:
     /// <c>mean</c> (default — the average over every position) or <c>cls</c> (the first position's row verbatim). The choice reads
     /// what a request already tokenized, so a live edit retitles later requests only; nothing an encoder forward already computed changes.

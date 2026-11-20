@@ -47,7 +47,20 @@ internal enum CompositionBlock
 
     /// <summary>The shared route names no segment at the position this composition steps on, so nothing can merge onto it here.</summary>
     SegmentShape,
+
+    /// <summary>The host device co-scheduling window has no step slot left for this candidate: the model's fair-share cap against the device segment its route advances on is fully held by what that model already launched.</summary>
+    DeviceShare,
 }
+
+/// <summary>
+/// The device fair-share headroom one composition is bounded by: how many device step slots the host co-scheduling window granted this
+/// model for this boundary, the share percent that grant came from, the model it belongs to, the device segment whose work the window
+/// bounds, and the resolved plan whose candidates it bounds. A composition carrying one admits at most <see cref="GrantedStepSlots"/>
+/// candidates of that plan's group and defers the rest naming all of it; every other group in the same call composes bounded by its own
+/// segment's caps and quotas alone — one model's window occupancy never bounds another model's step. A composition carrying none is
+/// bounded by the segment's own batch cap and quotas exactly as before any fair-share existed.
+/// </summary>
+internal sealed record DeviceShareLimit(int GrantedStepSlots, int SharePercent, string ModelName, string SegmentDescription, ModelPlan Plan);
 
 /// <summary>A candidate the arbiter kept out of this composition, with the limit that blocked it and a reason naming which quota or cap ran out. A deferral is not an admission refusal: the pipeline keeps its advancement slot and its whole-lifetime capacity reservation, rides no forward at this boundary, and composes again at the next one.</summary>
 internal sealed record DeferredStepCandidate(StepCandidate Candidate, int SegmentIndex, CompositionBlock Block, string Reason);
@@ -141,10 +154,17 @@ internal sealed class StepCompositionArbiter
     /// identical across runs — and each admission re-checks residency compatibility against the stepping segment, that segment's batch
     /// cap, and its quota headroom for the pipelines already admitted; <paramref name="steppingQuotaOverride"/> replaces only that last
     /// check's numbers with a live re-resolution of the stepped segment's quota when one is in force, leaving route identity, caps, and
-    /// residency claims as load resolved them. Every candidate left out lands in that group's deferral list with the limit that blocked it
-    /// named; a deferred candidate is refused nowhere else and composes again at the next boundary.
+    /// residency claims as load resolved them. When the host carries this model through a device co-scheduling window,
+    /// <paramref name="deviceShare"/> bounds how many candidates the window granted this boundary: candidates past the granted slots defer
+    /// naming the model, its compute share, and the device segment the window bounds, alongside the same deferral posture every other
+    /// limit uses. Every candidate left out lands in that group's deferral list with the limit that blocked it named; a deferred candidate
+    /// is refused nowhere else and composes again at the next boundary.
     /// </summary>
-    public CompositionReport Compose(IReadOnlyList<StepCandidate> candidates, int steppingSegmentIndex, SegmentQuota? steppingQuotaOverride = null)
+    public CompositionReport Compose(
+        IReadOnlyList<StepCandidate> candidates,
+        int steppingSegmentIndex,
+        SegmentQuota? steppingQuotaOverride = null,
+        DeviceShareLimit? deviceShare = null)
     {
         ArgumentNullException.ThrowIfNull(candidates);
 
@@ -186,11 +206,16 @@ internal sealed class StepCompositionArbiter
             // stays as load resolved it.
             SegmentQuota quota = namesSegment ? steppingQuotaOverride ?? route.Segments[steppingSegmentIndex].Quota : new();
 
+            // A granted device limit belongs to the plan it was granted for: only that plan's group defers against the window, and every
+            // other group in the same call composes bounded by its own segment's caps and quotas alone.
+            DeviceShareLimit? groupShare = deviceShare is { } limit && ReferenceEquals(key.Plan, limit.Plan) ? limit : null;
+
             List<StepCandidate> admitted = [];
             List<DeferredStepCandidate> refused = [];
             int[] pinnedCores = namesSegment ? OrderedCores(quota.Cores) : [];
             int threadClaims = 0;
             int coreClaims = 0;
+            int deviceSlotsUsed = 0;
 
             foreach (StepCandidate candidate in groups[g])
             {
@@ -250,6 +275,20 @@ internal sealed class StepCompositionArbiter
                     continue;
                 }
 
+                // The host device window's grant for this boundary: candidates past the slots the co-scheduler handed this model advance
+                // on a later boundary instead. The deferral names the share that bounded it, the model it belongs to, and the device
+                // segment whose work the window bounds — the same posture every other composition limit uses, and never an admission refusal.
+                if (groupShare is { } share && deviceSlotsUsed >= share.GrantedStepSlots)
+                {
+                    refused.Add(new DeferredStepCandidate(
+                        candidate,
+                        steppingSegmentIndex,
+                        CompositionBlock.DeviceShare,
+                        $"pipeline {candidate.PipelineId} waits for headroom in the device co-scheduling window: {DeviceCoScheduler.CapText(share.ModelName, share.SharePercent, share.SegmentDescription)} " +
+                        $"and the sequences already launched for this model hold all {share.GrantedStepSlots} slot(s) granted for this boundary."));
+                    continue;
+                }
+
                 admitted.Add(candidate);
 
                 // Each pipeline joining a merged step holds one share of what the stepping segment declares against it: one worker thread
@@ -263,6 +302,11 @@ internal sealed class StepCompositionArbiter
                 if (pinnedCores.Length > 0)
                 {
                     coreClaims++;
+                }
+
+                if (deviceShare is not null)
+                {
+                    deviceSlotsUsed++;
                 }
             }
 

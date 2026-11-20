@@ -120,6 +120,15 @@ public sealed class GenerationScheduler : IDisposable
     // rather than splitting per segment; what steps each side of such a crossing is the work that opens backends per device.
     private readonly int _steppingSegment;
 
+    // The host device co-scheduling seam this model advances under, when its caller carries it: the seam bounds how much device work
+    // this model may launch at each boundary through its own scheduler, and this scheduler consults the seam's grant for exactly that —
+    // which candidates ride the next merged window — before launching anything. Null bounds nothing: composition is bounded by the
+    // stepping segment's own caps and quotas exactly as before the seam existed. The route position whose segment names the seam's
+    // device is what a deferral names; -1 when this model's resolved route carries no segment on that device, in which case the seam
+    // bounds nothing here and every boundary composes as it always did.
+    private readonly DeviceCoScheduler? _coScheduler;
+    private readonly int _coScheduledSegment;
+
     // The stepping segment's quota as currently in force for future compositions: seeded from what load resolved and replaced wholesale
     // when a live knob re-resolves it (see ApplySteppingThreadQuota), so headroom checks read the current value rather than stale
     // load-time numbers while route identity — segments, batch caps, residency claims — stays exactly as load resolved it. Volatile
@@ -156,7 +165,8 @@ public sealed class GenerationScheduler : IDisposable
     /// <param name="modelName">The served model's id, named in every admission refusal so each one says which limit kind blocked it. Null keeps the generic wording.</param>
     /// <param name="prefillStepBudgetMs">Wall-clock budget, in milliseconds (1 or greater), that future prefill steps aim at; null forwards chunks at <paramref name="maxBatchTokens"/> exactly as before this knob existed. A present value sizes each chunk from measured step cost instead — see <see cref="ApplyPrefillStepBudget"/>.</param>
     /// <param name="ledger">The host device ledger this scheduler reports its landed KV reservations to, when its caller keeps host-scoped accounting. Supplying one observes chain decisions after the existing admission seams decide — a landed sequence rides inside what its model already seats, so no step is bounded and nothing admitted is disturbed; only a chain every position of which other models hold refuses that submission with <see cref="BudgetExhaustedException"/>. Null — what every scheduler built without host accounting uses — behaves exactly as before the ledger seam existed.</param>
-    public GenerationScheduler(TransformerModel model, IKvPool pool, int maxBatchTokens, PrefixCache? cache = null, int maxConcurrentRequests = UncappedConcurrencyCap, string? modelName = null, int? prefillStepBudgetMs = null, DeviceLedger? ledger = null)
+    /// <param name="coScheduler">The host device co-scheduling seam this model advances its own scheduler under, when its caller carries the model through one: the seam bounds how much device work this model may launch at a boundary through its compute share, and a candidate past the granted slots defers with the share and device segment named while every already-launched sequence keeps running. A model whose resolved route names no segment on the seam's device is bounded by nothing there; null — what every scheduler built without the seam uses — composes bounded by the stepping segment's own caps and quotas exactly as before the seam existed.</param>
+    public GenerationScheduler(TransformerModel model, IKvPool pool, int maxBatchTokens, PrefixCache? cache = null, int maxConcurrentRequests = UncappedConcurrencyCap, string? modelName = null, int? prefillStepBudgetMs = null, DeviceLedger? ledger = null, DeviceCoScheduler? coScheduler = null)
     {
         ArgumentNullException.ThrowIfNull(model);
         ArgumentNullException.ThrowIfNull(pool);
@@ -181,6 +191,22 @@ public sealed class GenerationScheduler : IDisposable
         // quota starts at what load resolved and follows live re-resolution from there (see ApplySteppingThreadQuota).
         _steppingSegment = model.Plan.Route.Segments.Count - 1;
         _steppingQuota = model.Plan.Route.Segments[_steppingSegment].Quota;
+
+        // The seam's device is what this model's resolved route is searched for: the first segment naming it is the one a window
+        // deferral names, and a route carrying no such segment leaves the seam bound to nothing here.
+        _coScheduler = coScheduler;
+        _coScheduledSegment = -1;
+        if (coScheduler is not null)
+        {
+            for (int index = 0; index < model.Plan.Route.Segments.Count; index++)
+            {
+                if (string.Equals(model.Plan.Route.Segments[index].DeviceId, coScheduler.DeviceId, StringComparison.Ordinal))
+                {
+                    _coScheduledSegment = index;
+                    break;
+                }
+            }
+        }
 
         _inbox = Channel.CreateUnbounded<RequestPipeline>();
 
@@ -486,6 +512,29 @@ public sealed class GenerationScheduler : IDisposable
         _steppingQuota = _steppingQuota with { Threads = threadQuota };
     }
 
+    /// <summary>
+    /// Re-resolves this model's device fair-share (its percent of one co-scheduling window, 1 through 100, or null to declare no share
+    /// again) against the host co-scheduling seam this scheduler advances under. It takes effect from the next boundary's grant on: a
+    /// raised share lets later windows launch more of this model's candidates, a lowered share retargets which candidates a later
+    /// composition may launch, and every sequence already launched keeps its window slot until its forward returns — a live re-share
+    /// never preempts device work in flight. A scheduler carrying no seam, or whose resolved route names no segment on the seam's
+    /// device, bounds nothing here and records the edit as a no-op: composition stays bounded by the stepping segment's own caps and
+    /// quotas exactly as before the seam existed.
+    /// </summary>
+    public void ApplyComputeShare(int? computeSharePercent)
+    {
+        if (computeSharePercent is < 1 or > 100)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(computeSharePercent),
+                "a model's compute share must be an integer from 1 to 100 — the percent of one device co-scheduling window — or null to declare no share.");
+        }
+
+        ObjectDisposedException.ThrowIf(_disposed, typeof(GenerationScheduler));
+
+        _ = _coScheduler?.UpdateComputeShare(_modelName ?? "engine", computeSharePercent);
+    }
+
     /// <summary>The outcome of applying a new KV block budget to the pool this scheduler admits against.</summary>
     public readonly record struct KvBudgetApply(int AppliedBlocks, int EvictedCacheEntries);
 
@@ -693,7 +742,40 @@ public sealed class GenerationScheduler : IDisposable
         // load-time numbers, while route identity and shape stay exactly as load resolved them. A candidate kept out holds its slot and
         // reservation, rides no forward at this boundary, and composes again at the next one — a deferral is never an admission refusal;
         // nothing about a merged window moves another pipeline's tokens, because each samples from its own logits row.
-        CompositionReport report = _composition.Compose(_candidates, _steppingSegment, _steppingQuota);
+        // The host device window's grant for this boundary, when this model advances its own scheduler under one: the seam decides how
+        // many of these candidates this model may launch device work for right now, and composition defers the excess naming the share,
+        // the model, and the device segment the window bounds. The consult reads only what this model has already launched — sequences
+        // admitted at earlier boundaries keep their slots until their forwards return — so a window deferral never preempts a step in
+        // flight, and a model the seam does not budget composes bounded by its segment caps and quotas exactly as before the seam existed.
+        DeviceShareLimit? deviceShare = null;
+        if (_coScheduler is not null && _coScheduledSegment >= 0 && _modelName is not null)
+        {
+            DeviceCoScheduler.CoScheduleGrant grant = _coScheduler.RequestStepSlots(_modelName, _candidates.Count);
+            if (grant.ShareBound)
+            {
+                deviceShare = new DeviceShareLimit(
+                    grant.GrantedSlots,
+                    grant.SharePercent!.Value,
+                    _modelName,
+                    _model.Plan.Route.Segments[_coScheduledSegment].Describe(_coScheduledSegment),
+                    _model.Plan);
+            }
+        }
+
+        CompositionReport report = _composition.Compose(_candidates, _steppingSegment, _steppingQuota, deviceShare);
+
+        // The boundary's launches enter the window before their forwards run: the slots the admitted sequences hold are this model's
+        // occupancy while its device work is live, and they return below only once those forwards complete.
+        if (deviceShare is not null)
+        {
+            int launched = 0;
+            foreach (StepComposition composition in report.Compositions)
+            {
+                launched += composition.Composed.Count;
+            }
+
+            _coScheduler!.ReserveStepSlots(_modelName!, launched);
+        }
 
         int advancedThisStep = 0;
         foreach (StepComposition composition in report.Compositions)
@@ -739,6 +821,14 @@ public sealed class GenerationScheduler : IDisposable
             Stats.WindowSequenceSum += _window.Count;
 
             advancedThisStep += _window.Count;
+        }
+
+        // Every forward this boundary launched has returned by here — each window completes on this thread — so the window slots the
+        // stepped sequences held come back now: a slot frees when the device work that held it is genuinely done, never before. A
+        // candidate the window kept out launched nothing and consumed nothing, and only what actually advanced releases a slot.
+        if (deviceShare is not null)
+        {
+            _coScheduler!.CompleteStepSlots(_modelName!, advancedThisStep);
         }
 
         // A dedicated lane's chunk joined at this boundary: the prompt window ran beside every decode window above, and its logits are read here — after the join — so nothing samples from a forward still writing. The pipeline that finished prefilling starts decoding now and rides the next boundary's window; a shared-posture step already advanced it inline before composition began.

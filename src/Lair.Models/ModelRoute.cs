@@ -110,4 +110,7 @@ public sealed record SegmentQuota
 
     /// <summary>The share of an accelerator's streaming multiprocessors this segment holds (greater than 0 and at most 100); null claims none. As with the stream priority, a CPU segment leaves it unclaimed.</summary>
     public double? SmSharePercent { get; init; }
+
+    /// <summary>The model's device fair-share against this accelerator-backed segment (1 through 100): the percent of one host co-scheduling window this model may hold its launched device work in, landed from <c>models[].compute_share</c> so step composition bounds future launches by it. Null claims no fair-share — the segment's own batch cap and quota headroom bound composition exactly as before the share existed. A CPU segment never carries one: a compute share bounds device work, not host participation, which <see cref="Threads"/> and <see cref="Cores"/> already express.</summary>
+    public int? ComputeSharePercent { get; init; }
 }

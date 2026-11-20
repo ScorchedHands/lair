@@ -1,6 +1,7 @@
 using Lair.Host.Config;
 using Lair.Http.Monitoring;
 using Lair.Models;
+using Lair.Models.Scheduling;
 using Microsoft.Extensions.Logging;
 
 namespace Lair.Http;
@@ -93,6 +94,11 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
     private DeviceLedger? _ledger;
     private ComputeCapacityLedger? _compute;
 
+    // The device co-scheduling window every instance of this registry advances its composition under, once any opened engine resolves
+    // onto an accelerator-backed device: adopted from the first engine that carries one, so every later model resident on that device
+    // shares one bounded fair-share window instead of a window of its own. A registry serving only host-resident models carries none.
+    private DeviceCoScheduler? _coScheduler;
+
     // The monitor attach posture a serving host registered for this registry: every advertised engine gets its
     // snapshot bus through it — at registration, and again for every model a later reload opens — so one host
     // samples every instance it advertises. Null until a host asks for monitor buses.
@@ -134,7 +140,8 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
         ILogger? logger,
         IModelHubTransport? transport,
         DeviceLedger? ledger,
-        ComputeCapacityLedger? compute = null)
+        ComputeCapacityLedger? compute = null,
+        DeviceCoScheduler? coScheduler = null)
     {
         ArgumentNullException.ThrowIfNull(config);
         if (config.Models.Count == 0)
@@ -158,13 +165,19 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
                     logger,
                     registry._ledger ?? ledger,
                     registry._compute ?? compute,
-                    transport);
+                    transport,
+                    cpuFeatures: null,
+                    coScheduler: registry._coScheduler ?? coScheduler);
 
                 if (registry._ledger is null)
                 {
                     registry._ledger = engine.HostDeviceLedger;
                     registry._compute = engine.HostCompute;
                 }
+
+                // The first engine that resolves onto a device carries this registry's window: every later model resident on that device
+                // advances the same bounded fair-share, and a registry whose models stay host-resident adopts nothing.
+                registry._coScheduler ??= engine.HostCoScheduler;
 
                 instance.Engine = engine;
                 instance.Posture = ServedPosture.Ready;
@@ -520,7 +533,11 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
         LairConfig view = _candidateBase with { Models = [instance.Declaration] };
         try
         {
-            GenerationService engine = GenerationService.Open(view, _logger, _ledger, _compute, _transport);
+            GenerationService engine = GenerationService.Open(view, _logger, _ledger, _compute, _transport, cpuFeatures: null, coScheduler: _coScheduler);
+
+            // A hot addition resolving onto a device this registry has no window for yet adopts this engine's, so a model added to a
+            // host-resident serve still shares its device with every model a later addition opens beside it.
+            _coScheduler ??= engine.HostCoScheduler;
 
             // The host's monitor attach, when one was registered, replays onto this freshly opened instance before it
             // advertises: a hot addition joins the same event line and snapshot cadence every advertised engine already

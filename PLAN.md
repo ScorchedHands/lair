@@ -1768,8 +1768,8 @@ Concurrent multi-model device compute on the single CUDA accelerator: per-model 
   - Verify: committed `bench/reports/multi-model-device-concurrency-<date>.md` comparing overlapped vs serialized two-model GPU serving; a measured no-win keeps serialize-per-context as the recorded default rather than asserting a concurrency win.
 - [✓] Per-model CUDA streams in `CudaBackend` — each model's launches on its own `CUstream` on the shared primary context (see DN-M61-1)
   - Verify: `dotnet test --filter Category=Cuda|Streams -c Release` proves two backends carry distinct non-default lanes, both lanes can stand pending concurrently, overlapped answers are bit-identical to solo runs, and accounting stays correct; serve-level monitor overlap remains the Manual Serve flagship gate.
-- [_] Cross-model co-scheduling seam + GPU fair-share — a host seam bounds per-model device use via per-segment batch/quota caps and optional `models[].compute_share`, never preempting in-flight (see DN-M61-2)
-  - Verify: `dotnet test --filter Category=Scheduling|Config -c Release` on CUDA — a GPU-heavy model and a small embedding model resident on the same device keep per-model ITL within budget while both advance, an over-subscribed candidate defers naming the cap, and no running sequence is preempted.
+- [✓] Cross-model co-scheduling seam + GPU fair-share — a host seam bounds per-model device use via per-segment batch/quota caps and optional `models[].compute_share`, never preempting in-flight (see DN-M61-2)
+  - Verify: `dotnet test --filter Category=Scheduling|Config -c Release` on CUDA — synthetic scheduler/composition gates plus a two-engine shared CUDA window prove bounded fair-share, over-subscribed deferral naming the cap, and no preemption of running sequences.
 - [_] Determinism under overlap — a model's token stream identical solo vs overlapped; cross-model shared batch steps remain non-default (see DN-M61-3)
   - Verify: `dotnet test --filter Category=Parity|Serve -c Release` on CUDA — token streams identical whether overlapped or solo, and default composition never merges two models into one batch step.
 
