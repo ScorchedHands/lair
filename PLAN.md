@@ -1780,10 +1780,6 @@ Concurrent multi-model device compute on the single CUDA accelerator: per-model 
 - [_] Automated Parity (CUDA): token-stream determinism solo vs overlapped
 - [_] Manual Serve (CUDA): flagship scenario extended to two GPU models on the 4090 with the monitor showing overlapping device steps and per-model tok/s
 
-#### Open Items
-
-- [_] **Co-scheduling payoff gate** — whether stream overlap beats serialized launches on the single-device fleet is settled by the DN-M61-1 bench item before streams become default; a measured no-win keeps serialize-per-context and records it. Resolve before MVP6.1 build.
-
 ### MVP7 [v0.7.0] - Refined
 
 Qwen3.8-Flash-Next runs: sparse MoE with residency management.
@@ -2086,6 +2082,8 @@ Vision input on chat models.
 - **2026-11-17 — MVP5's grid probe measures representative synthetic Q8_K GEMVs rather than staging loops alone.** The earlier synthetic benchmark timed only `Stage*` helpers and selected scalar on the dev box while forced tensor bench showed gather faster across all pinned sub4-bit formats; the cached engine-open probe now opens two forced CPU backends with prefetch off, runs fixed 128×1024 IQ fixtures through both encodings, interleaves best-of passes, rejects a collapse or selects Gather only when aggregate timing wins by >~4%. This keeps no public knob and preserves bit-identical output; bench evidence now shows auto resolving gather on the dev box with `SUB4BIT` grid comparison +11.579% warm at reps80/maxrows256/threads1, while forced prefetch comparison resolves gather for both sides and reports aggregate prefetched path +2.810% faster (exact bit-identical) at reps200.
 
 - **2026-11-19 — Whole-suite load can starve the NUMA affinity sampling gate.** MVP6's full suite hit `NumaPlacementTests.NodeDerivedAffinity_KeepsWorkerExecutionsInsideTheChosenNode_WhereTheHostCanPin` once (22 sampled worker executions against a 100-execution floor), the isolated rerun passed in 90 ms, and the repeat-run whole suite was green. Treat this as another full-suite gate family to read "green on repeat runs" with an isolated rerun when it appears; no product posture changed because the gate samples worker affinity under a fixed deadline.
+
+- **2026-11-19 — MVP6.1 keeps its payoff gate as a build-first measurement spike.** The existing DN-M61-1 bench item is the first implementation step because stream overlap cannot be measured honestly without a non-default CUDA stream seam; streams, fair-share bounds, and determinism tests proceed only if that bench shows pay-off, while a no-win records serialize-per-context posture and defers/records the remaining MVP6.1 items rather than asserting concurrency.
 
 - **2026-11-19 — MVP6 ships with monitor corrections discovered by the flagship scenario.** The first live two-model serve exposed that encoder-only engines were invisible on `/monitor/stream` because snapshot publication keyed only decode activity, and hot-added models could advertise ready before their bus was attached. Shipped posture: every advertised engine publishes through a host-scoped event line; embed facades mint request-lifecycle frames and drive additive encode-side counters (`metrics_active_encoder_requests`, `metrics_encoder_requests_total`, `metrics_encoder_tokens_forwarded_total`, `metrics_encoder_tok_s`); registry attach happens before hot-added engines are advertised ready. Flagship evidence: `/v1/models` advertised both models, chat completed on a GPU-heavy coding model with CUDA/VRAM + CPU/DRAM route facts and non-zero persistent VRAM/GPU utilization, embeddings answered two input arrays against `cpu-embed`, and monitor snapshots carried both model ids with per-model device portioning.
 
