@@ -18,25 +18,30 @@ namespace Lair.Http.Monitoring;
 /// surface, not part of the OpenAI-compatible API contract.
 /// </summary>
 /// <remarks>
-/// Reconnect semantics (Last-Event-ID): a frame id names one point in the bus's single total event sequence, but
-/// request frames and coalesced snapshots are transient — only snapshots persist for replay, newest-last inside the
-/// 300-snapshot ring. On connect with a <c>Last-Event-ID</c> header: ids naming retained snapshots re-deliver every
-/// snapshot newer than them (oldest first), then one fresh <c>resync</c> closes whatever transient state replay
-/// cannot carry — in-flight requests and completed-request entries lost to coalescing. An id older than the whole
-/// ring, or an id that matches nothing retained (a request/resync frame's id, or a snapshot already evicted), gets
-/// a <c>resync</c> instead of partial replay: current state plus whatever snapshots are still retained, never an
-/// error. An id at or above the newest known event means the client is caught up and receives only the live tail.
-/// A connect without the header (a fresh stream) starts straight on the live tail like before. Snapshots published
-/// while a replay is being written may also arrive through the live subscription — clients dedupe by frame id, so
-/// an at-most-once duplicate costs nothing and no missed event can slip past either channel.
+/// Reconnect semantics (Last-Event-ID): a frame id names one point in the host's single total event sequence — every
+/// bus a stream samples publishes through one <see cref="MonitorEventLineage"/>, so ids never repeat across engines —
+/// but request frames and coalesced snapshots are transient, and only snapshots persist for replay, newest-last
+/// inside each bus's 300-snapshot ring. On connect with a <c>Last-Event-ID</c> header the header is judged against
+/// each bus separately: ids naming retained snapshots re-deliver every snapshot newer than them, oldest-first across
+/// all buses, then one fresh <c>resync</c> per bus closes whatever transient state replay cannot carry for that engine
+/// — in-flight requests and completed-request entries lost to coalescing. An id older than a bus's whole ring, or
+/// naming nothing that bus retained (a request/resync frame's id, or a snapshot already evicted), gets that bus's
+/// <c>resync</c> instead of partial replay: current state plus whatever snapshots are still retained, never an
+/// error. An id at or above every bus's newest known event means the client is caught up and receives only the live
+/// tail. A connect without the header (a fresh stream) starts straight on the live tail like before. Snapshots
+/// published while a replay is being written may also arrive through the live subscription — clients dedupe by frame
+/// id, so an at-most-once duplicate costs nothing and no missed event can slip past either channel.
 /// </remarks>
 internal static class MonitorStreamHandler
 {
     private const int CommentIntervalMs = 15_000;
 
-    public static async Task HandleAsync(HttpContext http, EngineMetricsBus bus)
+    public static async Task HandleAsync(HttpContext http, EngineMetricsBus bus) =>
+        await HandleAsync(http, [bus]);
+
+    public static async Task HandleAsync(HttpContext http, IReadOnlyList<EngineMetricsBus> buses)
     {
-        ArgumentNullException.ThrowIfNull(bus);
+        ArgumentNullException.ThrowIfNull(buses);
 
         ILogger logger = http.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger(typeof(MonitorStreamHandler));
 
@@ -44,13 +49,25 @@ internal static class MonitorStreamHandler
         http.Response.ContentType = "text/event-stream";
         http.Response.Headers.CacheControl = "no-cache";
 
-        MonitorSubscription subscription = bus.Subscribe();
+        if (buses.Count == 0)
+        {
+            // Nothing to sample: answer an empty live stream rather than a fault — the same clean close a shutdown
+            // mid-stream produces. Serving hosts always advertise at least one bus, so this is a defensive posture.
+            await WriteRawAsync(http, ": connected\n\n"u8.ToArray(), ct);
+            return;
+        }
+
+        // One subscription per sampled bus: every engine's frames land on this one stream, and a bus whose engine
+        // is disposed mid-stream drops out — its queued frames drain, then it stops voting — while the rest keep
+        // flowing. The pairing stays positional so detach unsubscribes exactly what attach opened.
+        List<EngineMetricsBus> sampled = [.. buses];
+        List<MonitorSubscription> subscriptions = [.. sampled.Select(bus => bus.Subscribe())];
         try
         {
             string? lastEventIdHeader = http.Request.Headers["Last-Event-ID"];
             logger.LogInformation(
-                "monitor_stream event=attach id={SubscriberId} last_event_id={LastEventId}",
-                subscription.Id,
+                "monitor_stream event=attach buses={BusCount} last_event_id={LastEventId}",
+                sampled.Count,
                 lastEventIdHeader ?? "(none)");
 
             // A comment frame first: the client learns the stream is live before anything else lands.
@@ -58,37 +75,7 @@ internal static class MonitorStreamHandler
 
             if (TryParseLastEventId(lastEventIdHeader, out long headerId))
             {
-                bool staleBeyondRing = bus.PublishedTotal > EngineMetricsBus.RingCapacity
-                    && headerId < bus.OldestRetainedSnapshotId;
-
-                if (staleBeyondRing)
-                {
-                    // The id predates everything the ring kept — replaying all 300 retained frames would pretend
-                    // at completeness a state dump answers better.
-                    await WriteResyncAsync(http, bus, ct);
-                }
-                else
-                {
-                    IReadOnlyList<MonitorFrame> missed = bus.SnapshotReplayAfter(headerId);
-
-                    foreach (MonitorFrame frame in missed)
-                    {
-                        await WriteFrameAsync(http, frame, ct);
-                    }
-
-                    if (missed.Count == 0 && headerId < bus.LatestEventId)
-                    {
-                        // Nothing snapshot-newer exists for this id but the bus has moved past it: the client's
-                        // last seen event was transient. Converge through resync instead of guessing.
-                        await WriteResyncAsync(http, bus, ct);
-                    }
-
-                    if (missed.Count > 0)
-                    {
-                        // Replay carried snapshots only; one state dump restores in-flight and completed requests too.
-                        await WriteResyncAsync(http, bus, ct);
-                    }
-                }
+                await ReplayAsync(http, sampled, headerId, ct);
             }
 
             while (true)
@@ -99,7 +86,7 @@ internal static class MonitorStreamHandler
                     frameCts.CancelAfter(CommentIntervalMs);
                     try
                     {
-                        frame = await ReadNextAsync(subscription, frameCts.Token);
+                        frame = await ReadNextAsync(subscriptions, frameCts.Token);
                     }
                     catch (OperationCanceledException) when (!ct.IsCancellationRequested)
                     {
@@ -114,7 +101,7 @@ internal static class MonitorStreamHandler
         }
         catch (ChannelClosedException)
         {
-            // The bus completed the subscription (host shutdown): end the stream quietly.
+            // Every sampled bus completed its subscription (host shutdown): end the stream quietly.
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -122,75 +109,124 @@ internal static class MonitorStreamHandler
         }
         finally
         {
-            logger.LogInformation("monitor_stream event=detach id={SubscriberId}", subscription.Id);
-            bus.Unsubscribe(subscription);
+            logger.LogInformation("monitor_stream event=detach buses={BusCount}", sampled.Count);
+            for (int index = 0; index < subscriptions.Count; index++)
+            {
+                sampled[index].Unsubscribe(subscriptions[index]);
+            }
+        }
+    }
+
+    // Reconnect replay for a Last-Event-ID header, judged per sampled bus: retained snapshots newer than the header
+    // re-deliver oldest-first across every bus — ids are host-unique and monotonic, so the merged walk needs no
+    // dedupe — and each bus whose transient state replay cannot carry closes with its own resync. A bus whose header
+    // predates its whole ring resyncs instead of pretending a full replay; a bus that already sits at or above the
+    // header contributes nothing and lives on through the live tail.
+    private static async Task ReplayAsync(HttpContext http, IReadOnlyList<EngineMetricsBus> buses, long headerId, CancellationToken ct)
+    {
+        List<MonitorFrame> missed = [];
+        List<EngineMetricsBus> resyncBuses = [];
+
+        foreach (EngineMetricsBus bus in buses)
+        {
+            bool staleBeyondRing = bus.PublishedTotal > EngineMetricsBus.RingCapacity
+                && headerId < bus.OldestRetainedSnapshotId;
+
+            if (staleBeyondRing)
+            {
+                // The id predates everything this bus's ring kept — replaying all its retained frames would pretend
+                // at completeness a state dump answers better.
+                resyncBuses.Add(bus);
+                continue;
+            }
+
+            IReadOnlyList<MonitorFrame> frames = bus.SnapshotReplayAfter(headerId);
+
+            if (frames.Count == 0)
+            {
+                if (headerId < bus.LatestEventId)
+                {
+                    // Nothing snapshot-newer exists for this id but this bus has moved past it: the client's last
+                    // seen event was transient. Converge through resync instead of guessing.
+                    resyncBuses.Add(bus);
+                }
+
+                continue; // caught up on this bus, or naming nothing it retained while it never advanced
+            }
+
+            missed.AddRange(frames);
+            resyncBuses.Add(bus); // replay carried snapshots only; this bus's in-flight and completed requests ride its resync
+        }
+
+        missed.Sort(static (a, b) => a.Id.CompareTo(b.Id)); // oldest-first across buses: host ids order the whole replay
+        foreach (MonitorFrame frame in missed)
+        {
+            await WriteFrameAsync(http, frame, ct);
+        }
+
+        foreach (EngineMetricsBus bus in resyncBuses)
+        {
+            await WriteResyncAsync(http, bus, ct);
         }
     }
 
     private static readonly byte[] SsePrefix = "data: "u8.ToArray();
     private static readonly byte[] Newline = "\n\n"u8.ToArray();
 
-    // Waits for the next frame from either queue — snapshots coalesced to their newest, request frames in order.
-    // A closed queue loses its vote; both closed surfaces as ChannelClosedException through a final read attempt.
-    private static async Task<MonitorFrame> ReadNextAsync(MonitorSubscription subscription, CancellationToken ct)
+    // Waits for the next frame from any sampled bus — snapshots coalesced to their newest per bus, request frames in
+    // order. A bus whose subscription closed loses its vote once its queued frames have drained; the read surfaces
+    // ChannelClosedException only when every sampled bus has closed, which is how host shutdown ends the stream.
+    private static async Task<MonitorFrame> ReadNextAsync(List<MonitorSubscription> subscriptions, CancellationToken ct)
     {
         while (true)
         {
-            if (subscription.Snapshots.Reader.TryRead(out MonitorFrame? snapshot))
+            // Hand back anything already queued, newest-pending snapshot before that bus's request frames.
+            foreach (MonitorSubscription subscription in subscriptions)
             {
-                return snapshot!;
+                if (subscription.Snapshots.Reader.TryRead(out MonitorFrame? snapshot))
+                {
+                    return snapshot!;
+                }
+
+                if (subscription.Requests.Reader.TryRead(out MonitorFrame? request))
+                {
+                    return request!;
+                }
             }
 
-            if (subscription.Requests.Reader.TryRead(out MonitorFrame? request))
+            List<Task<bool>> waits = [];
+            foreach (MonitorSubscription subscription in subscriptions)
             {
-                return request!;
+                if (subscription.Snapshots.Reader.Completion.IsCompleted && subscription.Requests.Reader.Completion.IsCompleted)
+                {
+                    continue; // this bus is drained and closed: no vote left, the rest keep the stream alive
+                }
+
+                waits.Add(subscription.Snapshots.Reader.WaitToReadAsync(ct).AsTask());
+                waits.Add(subscription.Requests.Reader.WaitToReadAsync(ct).AsTask());
             }
 
-            Task<bool> snapshots = subscription.Snapshots.Reader.WaitToReadAsync(ct).AsTask();
-            Task<bool> requests = subscription.Requests.Reader.WaitToReadAsync(ct).AsTask();
+            if (waits.Count == 0)
+            {
+                // Every queue completed: the next read throws ChannelClosedException, which HandleAsync treats as host shutdown.
+                ct.ThrowIfCancellationRequested();
+                return await subscriptions[0].Snapshots.Reader.ReadAsync(ct);
+            }
 
             // Observe faults on whichever wait loses the race — a cancelled loser must not surface as an
             // unobserved task exception when it finalizes.
-            _ = snapshots.ContinueWith(static faulted => _ = faulted.Exception, TaskContinuationOptions.OnlyOnFaulted);
-            _ = requests.ContinueWith(static faulted => _ = faulted.Exception, TaskContinuationOptions.OnlyOnFaulted);
-
-            Task winner = await Task.WhenAny(snapshots, requests);
-
-            if (winner == snapshots)
+            foreach (Task<bool> wait in waits)
             {
-                bool open = await snapshots;
-                if (!open)
-                {
-                    return await ReadAfterClosedAsync(subscription, ct); // Close() completes both queues together: whatever the other still holds drains next
-                }
-
-                continue;
+                _ = wait.ContinueWith(static faulted => _ = faulted.Exception, TaskContinuationOptions.OnlyOnFaulted);
             }
 
-            bool requestsOpen = await requests;
-            if (!requestsOpen)
+            Task winner = await Task.WhenAny(waits);
+
+            if (!await (Task<bool>)winner)
             {
-                return await ReadAfterClosedAsync(subscription, ct);
+                continue; // this queue closed; whatever the other queues still hold drains on the next pass
             }
         }
-    }
-
-    // One queue closed: hand back whatever the other still holds, ending with ChannelClosedException once both are done.
-    private static async Task<MonitorFrame> ReadAfterClosedAsync(MonitorSubscription subscription, CancellationToken ct)
-    {
-        if (subscription.Snapshots.Reader.TryRead(out MonitorFrame? snapshot))
-        {
-            return snapshot!;
-        }
-
-        if (subscription.Requests.Reader.TryRead(out MonitorFrame? request))
-        {
-            return request!;
-        }
-
-        // Both queues completed: the next read throws ChannelClosedException, which HandleAsync treats as host shutdown.
-        ct.ThrowIfCancellationRequested();
-        return await subscription.Snapshots.Reader.ReadAsync(ct);
     }
 
     private static bool TryParseLastEventId(string? header, out long id) =>

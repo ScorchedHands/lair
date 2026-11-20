@@ -332,6 +332,37 @@ public sealed class ComputeCapacityLedger
     }
 
     /// <summary>
+    /// Releases one model's seated worker share — the answer a host gives when that model's engine is being torn down. The
+    /// grant leaves the registration table and its exclusive cores return to what later claims may seat against, per node;
+    /// every other claim keeps its position, clamp, and overlap posture exactly as it registered them (a clamped share does
+    /// not widen itself because capacity came free). Returns true when a grant was released. A model holding no grant
+    /// releases nothing and reports false.
+    /// </summary>
+    public bool ReleaseGrant(string model)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(model);
+
+        lock (_gate)
+        {
+            int index = _grants.FindIndex(claim => claim.Model == model);
+            if (index < 0)
+            {
+                return false;
+            }
+
+            ComputeGrant released = _grants[index];
+            _grants.RemoveAt(index);
+            _exclusiveCores -= released.ExclusiveCores;
+            foreach (KeyValuePair<int, int> allocation in released.NodeAllocations)
+            {
+                _nodeExclusive[allocation.Key] -= allocation.Value;
+            }
+
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Reads declared tier totals against this posture. Nothing here accepts or rejects a configuration: a mismatch is reported so its
     /// owner can log it warn-and-accept, and a byte total the host never reported reads as incomparable rather than as disagreement with
     /// what an operator declared.

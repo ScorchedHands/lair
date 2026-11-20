@@ -96,7 +96,7 @@ public sealed class ConfigTests : IDisposable
     }
 
     [Fact]
-    public void Load_TwoModels_Fails()
+    public void Load_TwoModels_ParsesBothInDeclaredOrder()
     {
         string modelPath = TempModelFile();
         string yaml = $"""
@@ -107,10 +107,26 @@ public sealed class ConfigTests : IDisposable
                 path: '{modelPath}'
             """;
 
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+
+        Assert.Equal(["first", "second"], config.Models.Select(model => model.Name));
+    }
+
+    [Fact]
+    public void Load_DuplicateModelNames_Fails()
+    {
+        string modelPath = TempModelFile();
+        string yaml = $"""
+            models:
+              - name: same
+                path: '{modelPath}'
+              - name: same
+                path: '{modelPath}'
+            """;
+
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
-        Assert.Contains("exactly one model", error.Message);
-        Assert.Contains("single model", error.Message);
-        Assert.Contains("found 2", error.Message);
+        Assert.Contains("duplicates", error.Message);
+        Assert.Contains("'same'", error.Message);
     }
 
     [Fact]
@@ -119,8 +135,7 @@ public sealed class ConfigTests : IDisposable
         ConfigException error = Assert.Throws<ConfigException>(
             () => YamlConfigLoader.Load(WriteConfig("models: []")));
 
-        Assert.Contains("exactly one model", error.Message);
-        Assert.Contains("found 0", error.Message);
+        Assert.Contains("at least one model", error.Message);
     }
 
     [Fact]
@@ -196,7 +211,7 @@ public sealed class ConfigTests : IDisposable
     }
 
     [Fact]
-    public void Load_NonChatModelType_Fails()
+    public void Load_EmbedModelType_Parses_AndOtherTypesFailNamingTheAcceptedSet()
     {
         string yaml = $"""
             models:
@@ -205,10 +220,67 @@ public sealed class ConfigTests : IDisposable
                 type: embed
             """;
 
-        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
-        Assert.Contains("models[0].type 'embed'", error.Message);
-        Assert.Contains("embed models are not supported in this build", error.Message);
-        Assert.Contains("'chat' is the only accepted value", error.Message);
+        LairConfig embed = YamlConfigLoader.Load(WriteConfig(yaml));
+        Assert.Equal("embed", embed.Models[0].Type); // the encode-only serving posture the embeddings endpoint answers with
+
+        LairConfig chat = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: chat-test
+                path: '{TempModelFile()}'
+            """));
+        Assert.Equal("chat", chat.Models[0].Type); // an absent key keeps the sampling posture the only default this loader has ever resolved
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: vector-test
+                path: '{TempModelFile()}'
+                type: vector
+            """)));
+        Assert.Contains("models[0].type 'vector' is invalid for model 'vector-test'", error.Message);
+        Assert.Contains("'type' accepts only 'chat' or 'embed'", error.Message);
+    }
+
+    [Fact]
+    public void Load_PoolingAndNormalize_ParseDefaultAndValidate()
+    {
+        LairConfig declared = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: embed-test
+                path: '{TempModelFile()}'
+                type: embed
+                pooling: cls
+                normalize: true
+            """));
+        Assert.Equal("cls", declared.Models[0].Pooling);
+        Assert.True(declared.Models[0].Normalize);
+
+        LairConfig defaulted = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: embed-test
+                path: '{TempModelFile()}'
+                type: embed
+            """));
+        Assert.Equal("mean", defaulted.Models[0].Pooling); // the average-over-positions recipe an absent key resolves to
+        Assert.False(defaulted.Models[0].Normalize);       // raw pooled vectors answer unless the config asks for unit length
+
+        ConfigException pooling = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: embed-test
+                path: '{TempModelFile()}'
+                type: embed
+                pooling: max
+            """)));
+        Assert.Contains("models[0].pooling 'max' is invalid for model 'embed-test'", pooling.Message);
+        Assert.Contains("'pooling' accepts only 'mean' or 'cls'", pooling.Message);
+
+        ConfigException normalize = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: embed-test
+                path: '{TempModelFile()}'
+                type: embed
+                normalize: sometimes
+            """)));
+        Assert.Contains("models[0].normalize", normalize.Message);
     }
 
     [Fact]
@@ -635,6 +707,102 @@ public sealed class ConfigTests : IDisposable
 
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
         Assert.Contains("models[0].max_concurrent_requests must be an integer value.", error.Message);
+    }
+
+    [Fact]
+    public void Load_RequestQueueKeys_ParseAndDefaultToNothingQueued()
+    {
+        LairConfig bounded = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_queued_requests: 4
+                queue_timeout_ms: 12500
+            """));
+
+        Assert.Equal(4, bounded.Models[0].MaxQueuedRequests);
+        Assert.Equal(12_500, bounded.Models[0].QueueTimeoutMs);
+
+        LairConfig absent = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+            """));
+
+        // Absent keys keep today's posture outright: nothing queues and no bounded wait is declared for something that never waits.
+        Assert.Null(absent.Models[0].MaxQueuedRequests);
+        Assert.Null(absent.Models[0].QueueTimeoutMs);
+
+        LairConfig explicitZero = YamlConfigLoader.Load(WriteConfig($"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_queued_requests: 0
+            """));
+
+        Assert.Equal(0, explicitZero.Models[0].MaxQueuedRequests); // an explicit zero states the same immediate-refusal posture the absent key carries
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(-7)]
+    public void Load_MaxQueuedRequestsNegative_Fails(int depth)
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_queued_requests: {depth}
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains($"models[0].max_queued_requests {depth}", error.Message);
+        Assert.Contains("'max_queued_requests' must be 0 or greater", error.Message); // zero is the documented disabled posture; only a negative number is refused
+    }
+
+    [Fact]
+    public void Load_MaxQueuedRequestsNonInteger_Fails()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                max_queued_requests: two
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].max_queued_requests must be an integer value.", error.Message);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-2)]
+    public void Load_QueueTimeoutTooSmall_Fails(int ceiling)
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                queue_timeout_ms: {ceiling}
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains($"models[0].queue_timeout_ms {ceiling}", error.Message);
+        Assert.Contains("'queue_timeout_ms' must be 1 or greater", error.Message); // a present ceiling is a real wait: zero would say nothing without saying so
+    }
+
+    [Fact]
+    public void Load_QueueTimeoutNonInteger_Fails()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                queue_timeout_ms: two
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].queue_timeout_ms must be an integer value.", error.Message);
     }
 
     [Fact]

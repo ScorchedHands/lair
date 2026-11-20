@@ -405,6 +405,41 @@ public sealed class DeviceLedger
     }
 
     /// <summary>
+    /// Records one tier this host now backs for one resource where no seam stood before — the answer a shared ledger gets when an engine
+    /// opened beside it brings a residency its earlier opens never established: accelerator memory holding weight copies, prompt windows
+    /// crossing to a device-backed working set, or a block pool whose persistent copies live on a device. A position this ledger already
+    /// accounts against is left exactly as reported — the first posture stated for a tier stays authoritative, and no seated claim moves,
+    /// re-runs first-come selection, or changes amount because new backing appeared; only later registrations and admissions may seat there.
+    /// Returns true when a seam opened where none existed, false when this ledger already accounted against that position.
+    /// </summary>
+    public bool ReportOpenedTier(BudgetTier tier, BudgetResource resource, long? capacity)
+    {
+        if (!Enum.IsDefined(tier) || !Enum.IsDefined(resource))
+        {
+            throw new ModelException(
+                $"a reported opened tier names '{tier}' for resource '{resource}': a seam accounts against a known residency and a known budgetable resource");
+        }
+
+        if (capacity is < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(capacity), "a reported capacity is a ceiling of 0 or greater, or null to state the unbounded posture.");
+        }
+
+        lock (_gate)
+        {
+            if (_seams.ContainsKey((tier, resource)))
+            {
+                return false; // already accounted against: what this ledger states for that position stands as reported.
+            }
+
+            CapacitySeam opened = new() { Tier = tier, Resource = resource, Capacity = capacity };
+            _seams[(tier, resource)] = opened;
+            _seamTable.Add(opened);
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Re-reports one tier's capacity posture — the answer a host gives when the totals behind its opened seams change.
     /// Seated claims stay whole: an earlier claim is never revoked or displaced by a lowered total, only what later
     /// admissions and registrations may still seat tightens to it, so a tier whose standing claims now exceed its stated
@@ -481,6 +516,33 @@ public sealed class DeviceLedger
             DeviceLedgerClaim current = _claims[index];
             _claims[index] = current with { Amount = newAmount };
             return true;
+        }
+    }
+
+    /// <summary>
+    /// Releases every claim one model holds on this ledger — the answer a host gives when that model's engine is being
+    /// torn down. Released claims free their tier seats for later registrations and admissions immediately; nothing already
+    /// seated moves, re-runs first-come selection, or changes order otherwise. Returns what was released so the caller can
+    /// report it. A model holding no claims releases nothing and reports none.
+    /// </summary>
+    public IReadOnlyList<DeviceLedgerClaim> ReleaseClaims(string model)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(model);
+
+        lock (_gate)
+        {
+            List<DeviceLedgerClaim> released = [];
+            for (int index = _claims.Count - 1; index >= 0; index--)
+            {
+                if (_claims[index].Model == model)
+                {
+                    released.Add(_claims[index]);
+                    _claims.RemoveAt(index);
+                }
+            }
+
+            released.Reverse(); // reported in the registration order they were seated in
+            return released;
         }
     }
 

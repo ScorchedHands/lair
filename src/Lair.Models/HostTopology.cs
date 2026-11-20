@@ -87,7 +87,7 @@ public static unsafe partial class HostTopologyProbe
 
     private static readonly object _probeGate = new();
 
-    // Reads are unsynchronized on purpose: one extra probe under the gate is harmless, and every later read returns the cached posture.
+    // Reads stay unsynchronized on the fast path: every caller reports one posture, because the first probe through the gate publishes it and later callers report what was published rather than probing again. Several engines opening beside each other therefore account against the same reported machine.
     private static HostTopology? _cachedPosture;
 
     /// <summary>
@@ -105,9 +105,14 @@ public static unsafe partial class HostTopologyProbe
 
         lock (_probeGate)
         {
-            cached ??= Probe();
-            Volatile.Write(ref _cachedPosture, cached);
-            return cached;
+            HostTopology? published = Volatile.Read(ref _cachedPosture); // a caller that reached the gate behind another reports what was already probed.
+            if (published is null)
+            {
+                published = Probe();
+                Volatile.Write(ref _cachedPosture, published);
+            }
+
+            return published;
         }
     }
 

@@ -48,10 +48,12 @@ public sealed class ContextLengthExceededException : Exception
 
 /// <summary>
 /// The engine cannot admit this request right now: either its prompt plus token budget exceeds what the KV pool can back (kv_capacity), or every
-/// admission slot of the model's concurrency cap is held by sequences already admitted (max_concurrent_requests), or the host device ledger's shared
-/// copy-holding chain exhausted before this submission's reservation could be seated anywhere (budget exhaustion). All refusals surface through
+/// admission slot of the model's concurrency cap is held by sequences already admitted (max_concurrent_requests), or a submission waiting for such a
+/// slot ran out of room in the model's queue (max_queued_requests) or out of its bounded wait (queue_timeout_ms), or the host device ledger's shared
+/// copy-holding chain exhausted before this submission's reservation could be seated anywhere (budget exhaustion), or the named model has been removed
+/// from the served set and is draining what already runs instead of accepting new work (retirement). All refusals surface through
 /// this one overload-family type so callers keep a single bounded error shape; each factory names the limit kind, the model it belongs to, and the
-/// wire code that distinguishes it — the capacity and quota refusals keep the code they have always answered with, and a ledger exhaustion answers
+/// wire code that distinguishes it — the capacity, quota, and queue refusals keep the code they have always answered with, and a ledger exhaustion answers
 /// with its own. The default form covers an engine-side failure observed mid-run, where no fresh admission decision exists to name.
 /// </summary>
 public sealed class EngineBusyException : Exception
@@ -69,7 +71,7 @@ public sealed class EngineBusyException : Exception
         Code = code;
     }
 
-    /// <summary>The wire error code this refusal answers with: <c>engine_overloaded</c> for the capacity and quota refusals, <c>budget_exhausted</c> for a host-ledger chain exhaustion.</summary>
+    /// <summary>The wire error code this refusal answers with: <c>engine_overloaded</c> for the capacity, quota, and request-queue refusals, <c>budget_exhausted</c> for a host-ledger chain exhaustion, <c>model_retiring</c> for a submission naming a model being drained out of the served set.</summary>
     public string Code { get; }
 
     /// <summary>The refusal for a submission whose prompt plus token budget outruns the KV pool's free slots (kv_capacity).</summary>
@@ -90,6 +92,49 @@ public sealed class EngineBusyException : Exception
         new($"model '{modelId}' cannot admit this request against its budgets: the host ledger exhausted the '{Lair.Models.BudgetResourceNames.Of(resource)}' copy-holding chain at tier " +
             $"'{Lair.Models.BudgetTierNames.Of(tier)}'. {breakdown}. Retry once the running generations finish, or raise the ceiling this chain declares in the config.",
             "budget_exhausted");
+
+    /// <summary>The refusal for a submission naming a model the host is retiring out of its served set: the model stopped accepting new requests while its already-admitted work drains toward release. It rides the same bounded overload family — the posture that blocks is retirement, not capacity or quota — with its own code so callers can tell a transient overload from a withdrawal.</summary>
+    public static EngineBusyException ForModelRetiring(string modelId) =>
+        new($"model '{modelId}' no longer accepts requests: it has been removed from the served models list and is draining what already runs before its resources are released. Re-serve it by adding it back to the config's models list, or request a model id that stays listed.",
+            "model_retiring");
+
+    /// <summary>The refusal for a submission arriving while every admission slot of the model's concurrency cap is held and the model's queue of submissions waiting for a slot is already full. The limit posture named is <c>max_queued_requests</c>: raising it admits more waiters, freeing a running generation frees a slot for whoever is already waiting.</summary>
+    public static EngineBusyException ForQueueFull(string modelId, int maxQueuedRequests) =>
+        new($"model '{modelId}' cannot admit this request against its request queue: all admission slots of 'max_concurrent_requests' are held and {maxQueuedRequests} submissions are already waiting for one under 'max_queued_requests'. Retry once a running generation finishes, or raise max_queued_requests in the config.",
+            "engine_overloaded");
+
+    /// <summary>The refusal for a submission that waited for an admission slot longer than the model's bounded wait allows. The limit posture named is <c>queue_timeout_ms</c>: every concurrency slot stayed held for the whole wait, so raising either this ceiling or 'max_concurrent_requests' changes what a later submission can expect.</summary>
+    public static EngineBusyException ForQueueTimeout(string modelId, int queueTimeoutMs) =>
+        new($"model '{modelId}' cannot admit this request against its request queue: no admission slot freed within {queueTimeoutMs} ms of 'queue_timeout_ms', so the wait ended with every concurrency slot still held. Retry once a running generation finishes, or raise max_concurrent_requests in the config.",
+            "engine_overloaded");
+
+    /// <summary>The refusal for an encoder submission arriving while this engine's single encoder forward lane is already held and nothing queues behind it. The posture that blocks here is serialization itself — one encoder pass runs at a time on such a model, so declaring <c>max_queued_requests</c> turns this immediate refusal into the same bounded wait every other queued submission gets.</summary>
+    public static EngineBusyException ForEncoderLaneBusy(string modelId) =>
+        new($"model '{modelId}' cannot admit this request against its encoder lane: an encoder forward is already running on this engine and no 'max_queued_requests' posture lets submissions wait for the lane. Retry once that embedding finishes, or declare max_queued_requests in the config.",
+            "engine_overloaded");
+
+    /// <summary>The refusal for a submission whose vectors outrun what the KV pool can back right now: an encoder forward writes every input position's K/V before it pools anything, so the whole batch has to fit the pool's free blocks up front.</summary>
+    public static EngineBusyException ForEncoderKvCapacity(string modelId, long neededBlocks, int freeBlocks) =>
+        new($"model '{modelId}' cannot admit this request against its kv_capacity: {neededBlocks} KV blocks back these inputs' encoder positions and only {freeBlocks} are free in the pool right now. Retry once the running requests finish, or raise kv_blocks in the config.",
+            "engine_overloaded");
+}
+
+/// <summary>
+/// The loaded model cannot run the encoder posture this request needs: its execution route crosses backends and an encoder forward rents streams past
+/// what those crossings stage, its opened KV pair carries only causal quantized attention kernels where bidirectional reads need FP32 storage, or its plan
+/// routes experts through a block the encoder pass has no routing for. The refusal names which posture the model resolved to — never a generic engine fault —
+/// so an operator can tell what to change: open one span, omit <c>kv.quant</c>, or serve a dense checkpoint on this endpoint.
+/// </summary>
+public sealed class ModelEncoderUnsupportedException : Exception
+{
+    public ModelEncoderUnsupportedException(string modelId, string detail)
+        : base($"model '{modelId}' cannot run this request's encoder forward: {detail}")
+    {
+        ModelId = modelId;
+    }
+
+    /// <summary>The id of the served model whose resolved posture refused.</summary>
+    public string ModelId { get; }
 }
 
 /// <summary>

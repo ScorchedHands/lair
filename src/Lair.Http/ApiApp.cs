@@ -21,17 +21,34 @@ namespace Lair.Http;
 /// <c>/v1/chat/completions</c> (JSON and SSE), <c>/v1/completions</c> (JSON and SSE), <c>/v1/models</c>,
 /// <c>/healthz</c>, and the operator stream <c>/monitor/stream</c>. Every response carries an
 /// <c>x-lair-request-id</c> header and one structured log line; engine exceptions are converted to the OpenAI
-/// error shape <c>{error:{message,type,code}}</c>.
+/// error shape <c>{error:{message,type,code}}</c>. The registry overload builds the same surface over a live
+/// <see cref="ModelRegistry"/>: every request names its model and routes to that instance's engine — an id no
+/// served instance answers comes back as today's unknown-model refusal, and a retiring instance refuses new work
+/// with the retirement code while it drains — and <c>/v1/models</c> advertises every served instance. The operator
+/// stream samples every advertised instance's snapshot bus over one host event line.
 /// </summary>
 public static class ApiApp
 {
     /// <summary>Correlation header carried by every response, including errors.</summary>
     public const string RequestIdHeader = "x-lair-request-id";
 
-    public static WebApplication Build(LairConfig config, GenerationService gen)
+    public static WebApplication Build(LairConfig config, GenerationService gen) => BuildCore(config, gen, registry: null);
+
+    /// <summary>Builds the same HTTP surface over a live model registry: requests name their model and route to that instance; every served instance is advertised.</summary>
+    public static WebApplication Build(LairConfig config, ModelRegistry registry)
+    {
+        ArgumentNullException.ThrowIfNull(registry);
+
+        return BuildCore(config, engine: null, registry);
+    }
+
+    private static WebApplication BuildCore(LairConfig config, GenerationService? engine, ModelRegistry? registry)
     {
         ArgumentNullException.ThrowIfNull(config);
-        ArgumentNullException.ThrowIfNull(gen);
+        if (engine is null && registry is null)
+        {
+            throw new ArgumentException("the HTTP surface needs a served shape to build over: an opened engine or a live model registry.", nameof(engine));
+        }
 
         WebApplicationBuilder builder = WebApplication.CreateBuilder([]);
 
@@ -91,57 +108,125 @@ public static class ApiApp
 
         // A HttpContext-only lambda binds to the RequestDelegate overload, which discards a returned
         // IResult, so the result is executed explicitly here.
-        app.MapPost("/v1/chat/completions", async (HttpContext http) =>
-            await HandleChat(await ReadChatBodyAsync(http.Request), gen, http).ExecuteAsync(http));
+        if (registry is null)
+        {
+            app.MapPost("/v1/chat/completions", async (HttpContext http) =>
+                await HandleChat(await ReadChatBodyAsync(http.Request), gen: engine!, http).ExecuteAsync(http));
 
-        app.MapPost("/v1/completions", async (HttpContext http) =>
-            await HandleCompletion(await ReadBodyAsync<CompletionBody>(http.Request), gen, http).ExecuteAsync(http));
+            app.MapPost("/v1/completions", async (HttpContext http) =>
+                await HandleCompletion(await ReadBodyAsync<CompletionBody>(http.Request), gen: engine!, http).ExecuteAsync(http));
+
+            // Encoder-only serving: the same named-model routing and error taxonomy as every other endpoint, with the vectors an encoder forward pooled answered in OpenAI's list envelope. Admission — including this model's request queue posture over its single encoder lane — happens inside the facade that already bounds submissions.
+            app.MapPost("/v1/embeddings", async (HttpContext http) =>
+                await HandleEmbedding(await ReadEmbeddingBodyAsync(http.Request), gen: engine!, http).ExecuteAsync(http));
+        }
+        else
+        {
+            // Routing happens the moment the body is in hand — before any per-model validation — so a request naming an unserved model, or one still draining out of the serve, gets its refusal without touching an instance it does not name. The lease stays open for the whole response (a stream completes inside ExecuteAsync), which is exactly what drain completion waits on: releasing it signals this retiring instance when its last admitted generation finishes.
+            app.MapPost("/v1/chat/completions", async (HttpContext http) =>
+            {
+                ChatRequestInput input = await ReadChatBodyAsync(http.Request);
+
+                using ModelRegistry.Lease lease = registry.BeginRequest(input.Body.Model ?? string.Empty);
+                await HandleChat(input, lease.Engine, http).ExecuteAsync(http);
+            });
+
+            app.MapPost("/v1/completions", async (HttpContext http) =>
+            {
+                CompletionBody body = await ReadBodyAsync<CompletionBody>(http.Request);
+
+                using ModelRegistry.Lease lease = registry.BeginRequest(body.Model ?? string.Empty);
+                await HandleCompletion(body, lease.Engine, http).ExecuteAsync(http);
+            });
+
+            // The same routing posture as its sampling siblings: the named instance is resolved before any per-model validation, and the lease stays open across the encoder call so a retiring instance drains what it admitted before releasing.
+            app.MapPost("/v1/embeddings", async (HttpContext http) =>
+            {
+                EmbeddingBody body = await ReadEmbeddingBodyAsync(http.Request);
+
+                using ModelRegistry.Lease lease = registry.BeginRequest(body.Model ?? string.Empty);
+                await HandleEmbedding(body, lease.Engine, http).ExecuteAsync(http);
+            });
+        }
 
         app.MapGet("/v1/models", () =>
         {
-            // The advertised concurrency cap is the value admissions enforce now (a live edit re-publishes it through
-            // the model facts swap); an uncapped model reports the posture explicitly so a reader never infers "no cap"
-            // from a missing key. Route segments ride in execution order, exactly as load resolved them.
-            int? concurrencyCap = gen.Model.MaxConcurrentRequests;
-            IReadOnlyList<ModelRouteSegment> routeSegments = [.. gen.ResolvedRoute.Segments.Select(segment => new ModelRouteSegment(
-                segment.DeviceId,
-                WeightTierNames.Of(segment.WeightTier),
-                segment.BatchCap,
-                segment.Quota.Threads,
-                GenerationService.FormatCoreRanges(segment.Quota.Cores)))];
+            // One envelope, one entry per served instance in declared order — a single-model serve renders exactly what it rendered before this overload existed.
+            IReadOnlyList<GenerationService> served = registry is null ? [engine!] : registry.AdvertisedEngines();
 
-            ModelsResponse models = new(
-                "list",
-                [new ModelEntry(
-                    gen.Model.Id,
-                    "model",
-                    DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                    "lair",
-                    gen.Model.ContextLength,
-                    gen.Model.Quant,
-                    gen.Model.Architecture,
-                    gen.ModelType,
-                    gen.Model.ToolParser,
-                    gen.Model.Reasoning,
-                    gen.Model.SparseFfnStrategy,
-                    concurrencyCap,
-                    concurrencyCap is null ? ConcurrencyCapPostures.Uncapped : "capped",
-                    routeSegments)]);
-
-            return Results.Json(models, statusCode: 200);
+            return Results.Json(new ModelsResponse("list", [.. served.Select(ModelEntryOf)]), statusCode: 200);
         });
 
         app.MapGet("/healthz", () => Results.Json(new HealthResponse("ok", true)));
 
         // Operator surface, deliberately outside /v1/*: one SSE event per engine snapshot. The bus attaches here so
-        // only serving hosts sample; chat-style hosts never pay for it.
-        EngineMetricsBus metrics = gen.AttachMetrics(app.Services.GetRequiredService<ILoggerFactory>(), MetricsSnapshotInterval);
+        // only serving hosts sample; chat-style hosts never pay for it. Every advertised instance gets its own bus on
+        // one host event line: a registry's stream carries every model it advertises, a model a reload opens later
+        // joins streams attached after its load, and ids stay unique across engines because every bus draws from the
+        // same line.
+        MonitorEventLineage monitorLineage = new();
+        ILoggerFactory loggerFactory = app.Services.GetRequiredService<ILoggerFactory>();
 
-        app.MapGet("/monitor/stream", async (HttpContext http) => await MonitorStreamHandler.HandleAsync(http, metrics));
+        if (registry is null)
+        {
+            IReadOnlyList<EngineMetricsBus> monitored = [engine!.AttachMetrics(loggerFactory, MetricsSnapshotInterval, monitorLineage)];
+            app.MapGet("/monitor/stream", async (HttpContext http) => await MonitorStreamHandler.HandleAsync(http, monitored));
+        }
+        else
+        {
+            registry.AttachMonitorBuses(loggerFactory, MetricsSnapshotInterval, monitorLineage);
+            app.MapGet("/monitor/stream", async (HttpContext http) => await MonitorStreamHandler.HandleAsync(http, MonitorBusesOf(registry)));
+        }
 
         MapWebUi(app);
 
         return app;
+    }
+
+    // The snapshot buses every advertised instance carries right now, in declared order: what a monitor stream
+    // samples when it attaches, so an instance a reload opened after this app was built joins streams attached after it.
+    private static IReadOnlyList<EngineMetricsBus> MonitorBusesOf(ModelRegistry registry) =>
+        [.. registry.AdvertisedEngines().Select(served => served.Metrics).OfType<EngineMetricsBus>()];
+
+    // One advertised instance as one models-list entry. The concurrency cap is the value admissions enforce now (a live edit re-publishes it through
+    // the model facts swap); an uncapped model reports the posture explicitly so a reader never infers "no cap" from a missing key. Route segments ride
+    // in execution order, exactly as load resolved them. The queue facts follow the same always-reported shape: the configured depth and bounded wait for
+    // submissions waiting on a held slot, plus this engine's live queue depth right now — every value read live so an observer sees what admissions do
+    // next rather than what some earlier snapshot said about it.
+    private static ModelEntry ModelEntryOf(GenerationService gen)
+    {
+        int? concurrencyCap = gen.Model.MaxConcurrentRequests;
+        int? maxQueuedRequests = gen.MaxQueuedRequests;
+        IReadOnlyList<ModelRouteSegment> routeSegments = [.. gen.ResolvedRoute.Segments.Select(segment => new ModelRouteSegment(
+            segment.DeviceId,
+            WeightTierNames.Of(segment.WeightTier),
+            segment.BatchCap,
+            segment.Quota.Threads,
+            GenerationService.FormatCoreRanges(segment.Quota.Cores)))];
+
+        return new ModelEntry(
+            gen.Model.Id,
+            "model",
+            DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            "lair",
+            gen.Model.ContextLength,
+            gen.Model.Quant,
+            gen.Model.Architecture,
+            gen.ModelType,
+            gen.Model.ToolParser,
+            gen.Model.Reasoning,
+            gen.Model.SparseFfnStrategy,
+            concurrencyCap,
+            concurrencyCap is null ? ConcurrencyCapPostures.Uncapped : "capped",
+            routeSegments,
+            MaxQueuedRequests: maxQueuedRequests,
+            RequestQueuePosture: maxQueuedRequests is null ? RequestQueuePostures.Immediate : RequestQueuePostures.Bounded,
+            QueuedRequests: gen.QueuedRequestCount,
+            QueueTimeoutMs: gen.QueueTimeoutMs,
+
+            // The sentence-vector posture keys ride only on an encode-only instance — they decide what its embedding answers look like and nothing about what a sampling model returns, so the null-ignore serializer leaves a chat entry exactly as it was. Each value is read live for the same reason the queue facts are: a hot edit re-publishes what admissions do next.
+            Pooling: gen.ServesEncoderPosture ? gen.PoolingMode : null,
+            Normalize: gen.ServesEncoderPosture ? gen.NormalizesPooledVectors : null);
     }
 
     // Conventional .NET SPA hosting: the ClientApp bundle is staged into the web root (wwwroot/ui) by the
@@ -259,6 +344,13 @@ public static class ApiApp
     {
         ChatCompletionBody body = input.Body;
 
+        // A model opened in encode-only serving posture has no sampled generation to answer with: the refusal lands before any budget resolution or submission, naming this endpoint and both postures so a caller knows where this model's requests belong.
+        if (gen.ServesEncoderPosture)
+        {
+            return InvalidRequest(
+                $"model '{gen.Model.Id}' is served as type 'embed': /v1/chat/completions requires a model opened with type 'chat'. Send its requests to /v1/embeddings, or declare it with type 'chat' to sample from it.");
+        }
+
         if (body.Messages is null || body.Messages.Count == 0)
         {
             return InvalidRequest("a chat request requires a non-empty 'messages' list");
@@ -307,6 +399,13 @@ public static class ApiApp
 
     private static IResult HandleCompletion(CompletionBody body, GenerationService gen, HttpContext http)
     {
+        // The sampling sibling of the chat refusal: an encode-only model answers pooled vectors and never samples a continuation, so this endpoint refuses it before any budget resolution or submission.
+        if (gen.ServesEncoderPosture)
+        {
+            return InvalidRequest(
+                $"model '{gen.Model.Id}' is served as type 'embed': /v1/completions requires a model opened with type 'chat'. Send its requests to /v1/embeddings, or declare it with type 'chat' to sample from it.");
+        }
+
         if (body.Prompt is null)
         {
             return InvalidRequest("a completion request requires a 'prompt'");
@@ -349,6 +448,84 @@ public static class ApiApp
         };
 
         return RunGeneration(request, gen, http);
+    }
+
+    // Encoder-only serving: pooled sentence vectors in OpenAI's list envelope, one datum per input at the index that input arrived at. What shapes the vectors — pooling mode and normalization — is a posture of the served model, not something this body can ask for; what an encode call consumed reports as prompt-side usage only, since nothing was generated to count.
+    private static IResult HandleEmbedding(EmbeddingBody body, GenerationService gen, HttpContext http)
+    {
+        // The sampling endpoints' mirror refusal: a model opened for decoding answers sampled continuations and never pooled vectors, so it is refused here naming this endpoint and both postures before any tokenization or admission.
+        if (!gen.ServesEncoderPosture)
+        {
+            return InvalidRequest(
+                $"model '{gen.Model.Id}' is served as type 'chat': /v1/embeddings requires a model opened with type 'embed'. Sample from it through the chat or completion endpoints, or declare it with type 'embed' to embed against it.");
+        }
+
+        if (body.Inputs is null || body.Inputs.Count == 0)
+        {
+            return InvalidRequest("an embeddings request requires a non-empty 'input': one text or a list of texts");
+        }
+
+        EmbeddingRequest request = new()
+        {
+            Model = body.Model ?? string.Empty,
+            Inputs = body.Inputs,
+            RequestId = RequestIdOf(http),
+        };
+
+        if (AuditOf(http) is RequestAudit audit)
+        {
+            audit.Model = request.Model;
+        }
+
+        // Encoder admission answers in place — the facade's bounded queue wait resolves before any forward composes — so this endpoint completes synchronously exactly as a non-streaming generation does. Its log row carries the prompt side only: an encoder call generated nothing, and that is reported as zero rather than left unread.
+        EmbeddingOutcome outcome = gen.EmbedAsync(request, http.RequestAborted).GetAwaiter().GetResult();
+
+        AuditOf(http)?.Encoding(outcome.TotalInputTokens);
+
+        return Results.Json(new EmbeddingResponse(
+            "list",
+            gen.Model.Id,
+            [.. outcome.Vectors.Select((vector, index) => new EmbeddingDatum(index, vector.Values))],
+            new EmbeddingUsage(outcome.TotalInputTokens, outcome.TotalInputTokens)), statusCode: 200);
+    }
+
+    // OpenAI accepts both input spellings — one string or a list of strings — so the body is read from its raw document rather than bound to one shape. A wrong element type names itself exactly as every other malformed-field refusal does; an absent key stays null so the handler answers with the request-shape message instead.
+    private static async Task<EmbeddingBody> ReadEmbeddingBodyAsync(HttpRequest request)
+    {
+        using JsonDocument document = await JsonDocument.ParseAsync(request.Body, cancellationToken: request.HttpContext.RequestAborted);
+        JsonElement root = document.RootElement;
+
+        string? model = root.TryGetProperty("model", out JsonElement modelElement) && modelElement.ValueKind == JsonValueKind.String ? modelElement.GetString() : null;
+
+        if (!root.TryGetProperty("input", out JsonElement input))
+        {
+            return new EmbeddingBody(model, Inputs: null);
+        }
+
+        switch (input.ValueKind)
+        {
+            case JsonValueKind.String:
+                return new EmbeddingBody(model, [input.GetString() ?? string.Empty]);
+
+            case JsonValueKind.Array:
+                List<string> texts = [];
+                int index = 0;
+                foreach (JsonElement item in input.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.String)
+                    {
+                        throw new ArgumentException($"'input[{index}]' must be a string: an embeddings input is one text or a list of texts.");
+                    }
+
+                    texts.Add(item.GetString() ?? string.Empty);
+                    index++;
+                }
+
+                return new EmbeddingBody(model, texts);
+
+            default:
+                throw new ArgumentException($"'input' must be a string or a list of strings, got JSON {input.ValueKind.ToString().ToLowerInvariant()}.");
+        }
     }
 
     // Sampling-knob ranges checked before the request reaches the engine; null means every value is in range.
@@ -639,6 +816,9 @@ public static class ApiApp
         {
             ModelNotFoundException => (404, "invalid_request_error", "model_not_found"),
             ContextLengthExceededException => (400, "invalid_request_error", "context_length_exceeded"),
+
+            // A posture refusal, not a server fault: the model resolved something this endpoint cannot run, and the message already names what to change. It answers where every other request-shape refusal lands so an operator reads it beside them.
+            ModelEncoderUnsupportedException => (400, "invalid_request_error", "encoder_unsupported"),
             EngineBusyException busy => (503, "engine_overloaded_error", busy.Code),
             TemplateRenderFailedException => (400, "invalid_request_error", "invalid_request"),
             ArgumentException or JsonException => (400, "invalid_request_error", "invalid_request"),
@@ -681,6 +861,13 @@ public static class ApiApp
         {
             PromptTokens = result.PromptTokens;
             CompletionTokens = result.CompletionTokens;
+        }
+
+        /// <summary>An encoder call's facts: what its inputs consumed, and nothing generated — an encode-only posture answers vectors, so the completion side is zero by fact rather than unread.</summary>
+        public void Encoding(int promptTokens)
+        {
+            PromptTokens = promptTokens;
+            CompletionTokens = 0;
         }
     }
 }

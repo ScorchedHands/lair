@@ -11,7 +11,9 @@ namespace Lair.Http.Monitoring;
 /// points record each Nth token's total elapsed milliseconds since generation opened — sparkline-ready pairs whose
 /// latest point is the request's current tok/s rate. Series are newest-last over a fixed window (64 samples): older
 /// points drop first, so long generations report recent speed rather than their whole history. Views handed to
-/// resyncs read only volatile fields, never the sequence itself.
+/// resyncs read only volatile fields, never the sequence itself. An encoder-only call shares this lifecycle path without
+/// ever observing a token: its frames carry prompt size and elapsed time, <c>generated_tokens</c> stays zero because
+/// nothing was generated, and no sample series is built — which is exactly what that posture can honestly report.
 /// </summary>
 internal sealed class RequestTracker
 {

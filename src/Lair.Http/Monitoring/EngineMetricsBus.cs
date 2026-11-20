@@ -10,19 +10,24 @@ namespace Lair.Http.Monitoring;
 /// In-process metrics bus for one engine: cheap scheduler counters plus pool and cache state are sampled at a
 /// fixed cadence into immutable <see cref="MetricsSnapshot"/>s, kept newest-first in a bounded ring (oldest drop),
 /// fanned out to independent per-subscriber queues that live streams read without ever blocking the publisher,
-/// and written as structured JSON log lines. While the engine idles — no sequences active and nothing completed
-/// since the previous tick — ticks are quiet: no snapshot, no log line until something moves again; any interval
-/// that saw completions publishes even if load ended mid-window, so a burst's tail is never lost from logs or
-/// stream history. Collection cost per published tick is a handful of volatile reads plus process facts, and the
-/// counters themselves ride step boundaries regardless of consumers: with nobody subscribed this changes nothing
-/// measurable about generation paths. The baseline window rolls forward on every tick so each snapshot's rates
-/// describe its own interval rather than since engine open.
+/// and written as structured JSON log lines. While the engine idles — no sequences active, no encoder forward
+/// running, and nothing completed on either side since the previous tick — ticks are quiet: no snapshot, no log line
+/// until something moves again; any interval that saw completions publishes even if load ended mid-window, so a
+/// burst's tail is never lost from logs or stream history. Collection cost per published tick is a handful of volatile
+/// reads plus process facts, and the counters themselves ride step boundaries regardless of consumers: with nobody
+/// subscribed this changes nothing measurable about generation paths. The baseline window rolls forward on every tick so
+/// each snapshot's rates describe its own interval rather than since engine open. Encode-only serving posture activity —
+/// which advances no scheduler sequence at all — rides the encoder counters the owning facade writes around each encoder
+/// call, so a model opened as <c>embed</c> publishes snapshots while it works instead of staying silent forever.
 /// </summary>
 /// <remarks>
 /// Every stream event — snapshots, request lifecycle frames, and resync dumps alike — carries one server-scoped
 /// id from a single incrementing counter: the SSE frame's <c>id:</c>, also embedded in snapshot payloads as
 /// <c>metrics_event_seq</c>. Ids are assigned under the fan-out lock so publish order matches id order, and each
-/// event kind keeps its own per-subscriber queue. A slow consumer never blocks publishing: snapshots coalesce to a
+/// event kind keeps its own per-subscriber queue. A bus attached to a <see cref="MonitorEventLineage"/> takes its
+/// ids and its fan-out lock from that line instead of its own, so every bus a host samples shares one id space and
+/// one ordering lock — frames from different engines interleave on one stream without ever repeating an id; a bus
+/// with no lineage keeps its own counter and lock. A slow consumer never blocks publishing: snapshots coalesce to a
 /// latest-pending slot (the subscriber only ever sees the newest one), request frames ride a bounded queue whose
 /// oldest entries drop under pressure — both counted in <c>metrics_dropped_events_total</c>. Completed requests
 /// also land in a recent-request ring sized by the live <see cref="SetRecentRequestCapacity"/> knob. Ids survive
@@ -61,16 +66,37 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     // request threads and read as volatile longs at each tick.
     private long _requestsStop;
 
+    // Encoder-lane activity, written by the owning facade around every encoder-only call this engine serves: how many
+    // encoder forwards are running right now, which calls ran every one of their inputs through to pooled vectors, and
+    // what positions those completed forwards carried. These exist because an encode-only engine advances no decode
+    // step at all — its work would otherwise be invisible on the stream — while every decode-side counter above keeps
+    // reading exactly as its own scheduler wrote it: a snapshot of an embed model reports zero decode activity because
+    // that is literally what happened, and names its real work in these fields instead.
+    private long _encoderActive;                    // encoder calls inside their forward stage right now
+    private long _encoderRequestsCompleted;         // encoder calls whose every input reached a pooled vector
+    private long _encoderTokensForwardedTotal;      // positions carried by encoder forwards that completed
+
+    // Encode-side baseline pair, rolled forward with the same tick as EngineSample's own baseline: each published
+    // window describes what forwarded since the previous check, never an idle stretch accumulated into a rate.
+    private long _previousEncoderRequestsCompleted;
+    private long _previousEncoderTokensForwardedTotal;
+
+    // The host event line this bus publishes through, or null when it keeps its own counter and lock.
+    private readonly MonitorEventLineage? _lineage;
+
     // Server-scoped event id: every frame this bus delivers takes the next value, so Last-Event-ID names one
     // point in one total stream regardless of which subscriber or event kind produced it. Assigned under the
-    // fan-out lock together with delivery, keeping publish order and id order aligned.
+    // fan-out lock together with delivery, keeping publish order and id order aligned. With a host lineage
+    // attached the line lives there instead and every bus sharing it draws from the same counter; this field
+    // then stays unused and the lineage's own counter answers instead.
     private long _eventSeq;
 
     // Fan-out serialization: snapshot publishing (sampler thread) and request lifecycle publishing (request
     // threads) share one short critical section — assign id, store to rings, hand frames to subscriber queues.
     // Queue writes never block (coalescing slot + bounded drop-oldest channels), so the lock is held only for
-    // bookkeeping even when a consumer stalls.
-    private readonly object _fanout = new();
+    // bookkeeping even when a consumer stalls. Supplied by the host lineage when one is attached, so ids from
+    // every bus on that line are handed out and delivered in one global order.
+    private readonly object _fanout;
 
     // Recent completed requests: newest-first ring sized by the live ui.recent_requests knob. Shrinking just
     // narrows what reads see (oldest entries drop); growing admits more again, re-seating only the retained tail.
@@ -94,6 +120,10 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     // snapshot shape they had before this seam existed, with these slots reading as nothing rather than zero-filled.
     private Func<AcceleratorAccounting?>? _acceleratorProvider;
 
+    // The owning facade's request-queue depth: submissions blocked on a held concurrency slot right now, read once per publish. A host that
+    // queues nothing attaches no provider, so the depth field keeps its inert zero default exactly as it read before this seam existed.
+    private Func<int>? _queueDepthProvider;
+
     // Recent admission refusals recorded by the owning facade: oldest-drops ring under the fan-out lock, newest
     // first in every read, so a snapshot's diagnostic array is one small deterministic slice of what admission
     // refused most recently. The cumulative total counts every refusal since open, ring retention aside.
@@ -113,7 +143,8 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         PrefixCache? cache,
         ILoggerFactory loggerFactory,
         TimeSpan interval,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        MonitorEventLineage? eventLineage = null)
     {
         ArgumentNullException.ThrowIfNull(modelId);
         ArgumentNullException.ThrowIfNull(scheduler);
@@ -127,6 +158,8 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         _cache = cache;
         _interval = interval;
         _time = timeProvider ?? TimeProvider.System;
+        _lineage = eventLineage;
+        _fanout = eventLineage?.Fanout ?? new object();
         _logger = loggerFactory.CreateLogger<EngineMetricsBus>();
         _recentRequests = new RequestPayload[_recentCapacity];
 
@@ -201,8 +234,8 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     /// <summary>Stream frames dropped at subscriber queues since the bus opened — how often slow consumers lost events.</summary>
     public long DroppedEventsTotal => Volatile.Read(ref _droppedEvents);
 
-    /// <summary>The highest event id any frame this bus has delivered carries (0 before the first).</summary>
-    public long LatestEventId => Volatile.Read(ref _eventSeq);
+    /// <summary>The highest event id any frame this bus has delivered carries (0 before the first). On a host event line this is the line's newest id, shared by every bus attached to it.</summary>
+    public long LatestEventId => _lineage is MonitorEventLineage lineage ? lineage.LatestEventId : Volatile.Read(ref _eventSeq);
 
     /// <summary>The id of the oldest snapshot still in the ring — 0 when the ring holds none. Reconnect ids below it predate retained history.</summary>
     public long OldestRetainedSnapshotId => _ringTotal == 0
@@ -211,6 +244,43 @@ public sealed class EngineMetricsBus : IAsyncDisposable
 
     /// <summary>Records a request that ended on a stop literal, so finish-reason tallies match HTTP outcomes.</summary>
     public void RecordStopCompletion() => Interlocked.Increment(ref _requestsStop);
+
+    /// <summary>
+    /// Records that an encoder-only call this engine serves has entered its forward stage. The in-flight count is what
+    /// makes a long encode pass visible: it keeps the engine classified busy — publishing snapshots while nothing decodes
+    /// on this model — and every completed or abandoned call pairs one <see cref="EndEncoderRequest"/> against it.
+    /// </summary>
+    public void BeginEncoderRequest() => Interlocked.Increment(ref _encoderActive);
+
+    /// <summary>
+    /// Credits the positions one encoder batch carried through to pooled vectors. Called per composed batch that
+    /// completed, so a call refused partway credits what its finished batches actually forwarded rather than nothing.
+    /// </summary>
+    public void RecordEncoderPositions(long positions)
+    {
+        if (positions > 0)
+        {
+            Interlocked.Add(ref _encoderTokensForwardedTotal, positions);
+        }
+    }
+
+    /// <summary>
+    /// Records that an encoder-only call left its forward stage — every input pooled or not. The in-flight count drops
+    /// either way; only a call whose inputs all reached pooled vectors counts toward the completed-call tally, so a
+    /// cancelled or failed encode never inflates it while the positions its finished batches forwarded stay credited.
+    /// </summary>
+    public void EndEncoderRequest(bool allInputsPooled)
+    {
+        if (Interlocked.Decrement(ref _encoderActive) < 0)
+        {
+            Volatile.Write(ref _encoderActive, 0); // pairing is exact at the call site; this only keeps a published count from going negative under a host bug
+        }
+
+        if (allInputsPooled)
+        {
+            Interlocked.Increment(ref _encoderRequestsCompleted);
+        }
+    }
 
     /// <summary>
     /// Records one admission refusal the owning facade observed: the limit kind that blocked the submission (from
@@ -325,6 +395,18 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     }
 
     /// <summary>
+    /// Wires the request-queue depth an owning facade holds: how many of its submissions are blocked waiting for a concurrency slot right now.
+    /// One volatile delegate swap read at each publish; with no provider attached — every host that queues nothing — snapshots keep reading this
+    /// field as zero exactly as they did before this seam existed. The configured queue posture rides the attached model facts instead, because
+    /// it is what a hot edit retargets for later submissions rather than something sampled per tick.
+    /// </summary>
+    public void AttachQueueDepthProvider(Func<int> provider)
+    {
+        ArgumentNullException.ThrowIfNull(provider);
+        Volatile.Write(ref _queueDepthProvider, provider);
+    }
+
+    /// <summary>
     /// Opens an independent subscription: snapshots published from now on coalesce into the subscriber's latest-
     /// pending slot (a slow reader only ever sees the newest one) and request frames queue on a bounded channel.
     /// Callers hand it back through <see cref="Unsubscribe"/> when their stream ends; the bus completes every open
@@ -402,7 +484,7 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         MonitorFrame frame;
         lock (_fanout)
         {
-            long id = ++_eventSeq;
+            long id = TakeEventId();
             frame = new MonitorFrame(id, eventName, payload.ToJson());
 
             if (eventName == MonitorEventNames.RequestComplete)
@@ -477,8 +559,11 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         }
 
         // The window rolls forward on every tick — quiet ones included — so rates always describe the interval since
-        // the previous check instead of accumulating idle stretches into a diluted average.
+        // the previous check instead of accumulating idle stretches into a diluted average. Both baseline pairs roll
+        // together: an encode-only engine has no decode counters to advance, and its own pair is what keeps its rate honest.
         _previous = current with { TimestampMs = nowMs };
+        _previousEncoderRequestsCompleted = Volatile.Read(ref _encoderRequestsCompleted);
+        _previousEncoderTokensForwardedTotal = Volatile.Read(ref _encoderTokensForwardedTotal);
     }
 
     private void FlushFinal()
@@ -491,10 +576,16 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         }
     }
 
-    // Busy means sequences are advancing right now or something completed since the previous tick — a burst that
-    // ended between ticks still gets its closing snapshot. Otherwise the engine is idle and stays quiet.
+    // Busy means sequences are advancing right now, an encoder forward is running on this engine, or something completed
+    // since the previous tick — decode-side or encode-side: a burst that ended between ticks still gets its closing
+    // snapshot. Otherwise the engine is idle and stays quiet; scheduler counters alone would leave an encode-only serve
+    // permanently silent, because it advances no scheduler sequence at all.
     private bool IsActive(EngineSample current) =>
-        Volatile.Read(ref _stats.ActiveSequenceCount) > 0 || CurrentsDiffer(current, _previous);
+        Volatile.Read(ref _stats.ActiveSequenceCount) > 0
+        || Volatile.Read(ref _encoderActive) > 0
+        || CurrentsDiffer(current, _previous)
+        || Volatile.Read(ref _encoderRequestsCompleted) != _previousEncoderRequestsCompleted
+        || Volatile.Read(ref _encoderTokensForwardedTotal) != _previousEncoderTokensForwardedTotal;
 
     private static bool CurrentsDiffer(EngineSample a, EngineSample b) =>
         a.DecodeTokensAdvanced != b.DecodeTokensAdvanced
@@ -512,6 +603,13 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         long stepsDelta = current.DecodeSteps - _previous.DecodeSteps;
         long occupancySumDelta = current.WindowSequenceSum - _previous.WindowSequenceSum;
         double cpuMs = current.ProcessCpuMs - _previous.ProcessCpuMs;
+
+        // Encode-side readings and their window delta, taken from this bus's own counters: an encode-only engine has no
+        // scheduler counter to sample, so these are the only place its work is visible at all.
+        long encoderActive = Volatile.Read(ref _encoderActive);
+        long encoderRequestsCompleted = Volatile.Read(ref _encoderRequestsCompleted);
+        long encoderTokensForwarded = Volatile.Read(ref _encoderTokensForwardedTotal);
+        long encodeDelta = encoderTokensForwarded - _previousEncoderTokensForwardedTotal;
 
         // Additive accelerator facts (earlier shapes untouched): kernel busy is windowed like every other rate here —
         // device-measured microseconds advanced within this interval over the interval's own wall time — while runtime
@@ -564,7 +662,7 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 ProcessWorkingSetMb: Math.Round(current.WorkingSetMb, 1),
                 ProcessCpuPercent: windowMs > 0 ? Math.Round(cpuMs / windowMs * 100.0, 2) : 0.0,
                 EventsVersion: MonitorEventSchema.Version,
-                EventSeq: _eventSeq + 1, // the id this snapshot is about to take — embedded so payloads and SSE frames agree
+                EventSeq: PeekEventId() + 1, // the id this snapshot is about to take — embedded so payloads and SSE frames agree
                 DroppedEventsTotal: Volatile.Read(ref _droppedEvents),
 
                 // Additive operator-view fields (v1 shape untouched): pool geometry always known here; identity and
@@ -610,6 +708,14 @@ public sealed class EngineMetricsBus : IAsyncDisposable
 
                 AdmissionRefusalsTotal: Volatile.Read(ref _admissionRefusalTotal),
                 AdmissionRefusals: RecentAdmissionRefusals(), // already holding the fan-out lock here; Monitor re-entry is safe on this thread
+
+                // Additive request-queue posture (earlier shapes untouched): live depth from the owning facade's seam — submissions blocked on a held
+                // concurrency slot, none of which has taken an admission slot or spent pool or token budget yet — while the configured cap and bounded
+                // wait ride the attached facts exactly like every other configuration-backed field here. A host with no queue seam reports zero depth.
+                QueuedRequests: Volatile.Read(ref _queueDepthProvider) is Func<int> depthProvider ? Math.Max(0, depthProvider()) : 0,
+                MaxQueuedRequests: facts?.MaxQueuedRequests,
+                QueueTimeoutMs: facts?.QueueTimeoutMs ?? 0,
+
                 LedgerOccupancy: facts?.LedgerOccupancy,
 
                 // Additive compute-grant facts (earlier shapes untouched): requested against granted rides the attached facts so a model
@@ -631,9 +737,19 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 GpuUtilizationPercent: gpuUtilizationPercent,
                 PcieTransferBytesTotal: transferBytesTotal,
                 PcieTransfersTotal: transferCallsTotal,
-                PersistentVramBytes: persistentVramBytes);
+                PersistentVramBytes: persistentVramBytes,
 
-            long id = ++_eventSeq;
+                // Additive encoder-lane facts (earlier shapes untouched): what this engine's encode-only serving posture
+                // actually ran, written by the owning facade around each encoder call. The rate is windowed like every
+                // other rate here — positions forwarded in this interval over this interval's own wall time — while the
+                // two tallies read cumulative-since-open and the active count reads right now. An engine serving no
+                // encoder posture publishes all four at their inert defaults rather than a decode-side inference.
+                ActiveEncoderRequests: (int)Math.Max(0, encoderActive),
+                EncoderRequestsTotal: encoderRequestsCompleted,
+                EncoderTokensForwardedTotal: encoderTokensForwarded,
+                EncoderTokensPerSecWindowed: Math.Round(encodeDelta * 1000.0 / windowMs, 2));
+
+            long id = TakeEventId();
             frame = new MonitorFrame(id, MonitorEventNames.Snapshot, snapshot.ToJson());
 
             _ring[_ringTotal % RingCapacity] = snapshot;
@@ -651,6 +767,13 @@ public sealed class EngineMetricsBus : IAsyncDisposable
 
         _logger.LogInformation("metrics_snapshot={SnapshotJson}", frame.Json);
     }
+
+    // Event-id plumbing: on a host event line every bus sharing it draws from the line's counter under the line's
+    // lock, so ids stay unique and ordered across engines; with no line the bus counts its own, exactly as before.
+    // Both paths run inside the fan-out lock, so the id a publish takes is the next one on its line.
+    private long TakeEventId() => _lineage is MonitorEventLineage lineage ? lineage.NextEventId() : ++_eventSeq;
+
+    private long PeekEventId() => _lineage is MonitorEventLineage lineage ? lineage.LatestEventId : Volatile.Read(ref _eventSeq);
 
     // Completed payloads land in the recent ring as the same immutable payload objects that were published, so a
     // resync hands out exactly what live delivery carried. The ring's capacity bound (live knob) is what trims them.

@@ -22,7 +22,8 @@ namespace Lair.Models.Scheduling;
 /// can address, fit that segment's batch cap, and leave quota headroom against it for what already joined — so a group whose route spans
 /// several segments merges as one step rather than splitting per device or segment. A candidate kept out of one merged window by those
 /// limits is deferred with the blocking limit named, holds its admission slot, and rides a later boundary: composition deferral never turns
-/// into an admission refusal. Pipelines run in a fixed order (ascending id) on this thread, each with its own sampler. Admission counts the
+/// into an admission refusal. Pipelines run in a fixed order on this thread — ascending pipeline id, and ids are handed out at admission in submission
+/// order, so the oldest admitted sequence of this model advances first at every boundary — each with its own sampler. Admission counts the
 /// blocks a pipeline will cross over its whole lifetime, so an admitted pipeline never trips <see cref="KvFullException"/> mid-run; when
 /// the free list runs short and a prefix cache is attached, admission first reclaims cached prompt-prefix blocks (least-recently-used
 /// first, never disturbing active pipelines) before rejecting. Admitted pipelines adopt leading cached prompt-prefix blocks instead of
@@ -240,7 +241,8 @@ public sealed class GenerationScheduler : IDisposable
     /// Admits one request as a pipeline and returns its handle: the submission first takes an admission slot from this scheduler's
     /// concurrency cap — refused immediately with <see cref="SchedulerConcurrencyFullException"/> naming the model and its quota when every
     /// slot is already held by admitted sequences, rather than queued behind them — and only then pays for what the pool must hold for its
-    /// whole run. The pipeline starts advancing at the next step boundary and never runs on more than one thread. Admission spends from the
+    /// whole run. The pipeline starts advancing at the next step boundary, never runs on more than one thread, and carries the sequence number this admission
+    /// handed out — so boundaries take admitted pipelines of this model in submission order, whatever order the caller threads reached the inbox in. Admission spends from the
     /// pool's effective free side: with a prefix cache attached, admission pressure first evicts least-recently-used cached blocks (only
     /// those no active pipeline still references) and rechecks capacity before failing, so an admitted pipeline never trips
     /// <see cref="KvFullException"/> mid-run — its whole-lifetime reservation opens with its admission. A refusal releases everything it
@@ -279,6 +281,8 @@ public sealed class GenerationScheduler : IDisposable
         }
 
         int needed = BlocksNeeded(request.PromptTokens.Length, generationCeiling);
+
+        long sequence; // assigned under the gate below, before this submission's pipeline is built with it.
 
         lock (_gate)
         {
@@ -347,9 +351,12 @@ public sealed class GenerationScheduler : IDisposable
             }
 
             Stats.SequencesAdmitted++;
+
+            // The sequence number is handed out here, under the same gate that took this submission's admission slot: ascending id is what every boundary advances in, so an admitted pipeline's place ahead of later submissions is fixed by its arrival at admission rather than by whichever caller thread happens to reach the inbox first.
+            sequence = Interlocked.Increment(ref _nextId);
         }
 
-        RequestPipeline pipeline = new(request, ct, _pool, Interlocked.Increment(ref _nextId));
+        RequestPipeline pipeline = new(request, ct, _pool, sequence);
         pipeline.HoldsSlot = true; // taken under the gate above and returned exactly once, when this pipeline finishes
 
         // The admission window carries this submission's reserved headroom across its whole run: if a budget shrink
@@ -447,6 +454,20 @@ public sealed class GenerationScheduler : IDisposable
     }
 
     /// <summary>
+    /// Waits until this scheduler's admission gate has room for another pipeline, up to <paramref name="budget"/>, and answers whether that
+    /// room appeared before the wait ran out or <paramref name="ct"/> cancelled. It reserves nothing: a resolved-true answer says only that a slot
+    /// came free (or the cap widened), so the caller still submits through <see cref="Submit"/> and is decided there — capacity, budget chains,
+    /// and every other admission limit apply exactly as they do to a fresh submission. A scheduler already disposing answers false rather than
+    /// leaving submissions waiting on room that can no longer be freed. Hosts that bound how long their submissions wait for a slot use this seam;
+    /// <see cref="Submit"/> itself stays immediate-refusal, so an uncapped or fail-fast posture never blocks here at all.
+    /// </summary>
+    public Task<bool> WaitForAdmissionSlotAsync(TimeSpan budget, CancellationToken ct) =>
+        _disposed ? Task.FromResult(false) : _progress.WaitForFreeSlotAsync(budget, ct);
+
+    /// <summary>Submissions this scheduler's admission gate currently has waiting for room — the depth its wait list holds right now. Observers read it as a snapshot; nothing here bounds how many submissions their host lets wait.</summary>
+    public int AdmissionWaitDepth => _progress.WaitingForSlotCount;
+
+    /// <summary>
     /// Re-resolves the stepping segment's worker-thread quota to a new live value (or null to leave it at the engine's own thread choice).
     /// It takes effect from the next composition on: headroom checks for future merged steps bound against this value instead of what load
     /// resolved, while pipelines already admitted keep their slots and finish normally — lowering a quota retargets which candidates may join
@@ -501,6 +522,11 @@ public sealed class GenerationScheduler : IDisposable
         }
 
         _disposed = true;
+
+        // Submissions waiting for a slot this scheduler can no longer free are answered now rather than left to their own deadlines: the step
+        // loop that returns slots is stopping, so nothing they wait on still exists.
+        _progress.CloseWaiters();
+
         _inbox.Writer.TryComplete();
         _thread.GetAwaiter().GetResult();
     }

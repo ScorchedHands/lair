@@ -15,13 +15,13 @@ public static class MonitorEventNames
     /// <summary>A per-model engine snapshot; payload is a <see cref="MetricsSnapshot"/>.</summary>
     public const string Snapshot = "snapshot";
 
-    /// <summary>A generation entered the scheduler: its id, model, endpoint kind, and prompt size are known from here on.</summary>
+    /// <summary>An admitted request began its work on this engine — a generation entering the scheduler, or an encoder call entering its forward stage: its id, model, endpoint kind, and prompt size are known from here on.</summary>
     public const string RequestStart = "request_start";
 
-    /// <summary>An in-flight request advanced: generated-so-far count, elapsed time, current tok/s rate, and sampled tok/s series.</summary>
+    /// <summary>An in-flight request advanced: generated-so-far count, elapsed time, current tok/s rate, and sampled tok/s series. Encoder-only calls produce no update frames — nothing advances token by token between their start and completion.</summary>
     public const string RequestUpdate = "request_update";
 
-    /// <summary>A generation finished with a status (eos, length, stop literal, cancellation, or failure) and its full tok/s sample series.</summary>
+    /// <summary>A request finished with a status (eos, length, stop literal, cancellation, or failure) and its full tok/s sample series; an encoder-only call reports <c>encoded</c> instead of a sampling finish reason.</summary>
     public const string RequestComplete = "request_complete";
 
     /// <summary>A connect-time state dump: the current in-flight request set plus the recent completed-request ring. Sent when a reconnect cannot fully replay from event ids (unknown, stale, or too-coalesced id) so clients always converge to live truth.</summary>
@@ -37,8 +37,8 @@ public static class MonitorEventSchema
 /// <summary>
 /// The limit-kind vocabulary the monitor uses for recorded admission refusals, naming the same blocking limits the
 /// request layer's refusals name: the KV pool cannot back the request's prompt plus token budget, the resolved
-/// context window leaves no token free for generation, or every admission slot of the model's concurrency cap is
-/// held. A recorded refusal is a diagnostic copy of a refusal its caller already answered — these names describe
+/// context window leaves no token free for generation, every admission slot of the model's concurrency cap is
+/// held, a submission waiting for such a slot found the model's queue full or its bounded wait expired. A recorded refusal is a diagnostic copy of a refusal its caller already answered — these names describe
 /// which limit blocked, never a new error surface.
 /// </summary>
 public static class AdmissionRefusalKinds
@@ -52,8 +52,17 @@ public static class AdmissionRefusalKinds
     /// <summary>Every admission slot of the model's <c>max_concurrent_requests</c> cap is held by sequences already admitted.</summary>
     public const string ConcurrencyQuota = "concurrency_quota";
 
+    /// <summary>A submission waiting for an admission slot arrived while every seat of the model's <c>max_queued_requests</c> queue was already taken.</summary>
+    public const string QueueFull = "queue_full";
+
+    /// <summary>A submission waiting for an admission slot waited out its model's bounded <c>queue_timeout_ms</c> wait with no concurrency slot freeing.</summary>
+    public const string QueueTimeout = "queue_timeout";
+
     /// <summary>The host ledger's shared copy-holding chain could not seat this submission's reservation anywhere — host accounting across opened pools, not the pool's own cap.</summary>
     public const string BudgetExhaustion = "budget_exhaustion";
+
+    /// <summary>The named model has been removed from the served models list and is draining already-admitted work instead of accepting new submissions.</summary>
+    public const string ModelRetiring = "model_retiring";
 }
 
 /// <summary>

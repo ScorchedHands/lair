@@ -280,7 +280,7 @@ public sealed class ConcurrencyTests
 
     // ---------------------------------------------------------------- helpers
 
-    internal static GenerationService OpenService(int kvBlocks, int maxContextTokens, int maxBatchTokens = 512, int? maxConcurrentRequests = null, int? prefillStepBudgetMs = null)
+    internal static GenerationService OpenService(int kvBlocks, int maxContextTokens, int maxBatchTokens = 512, int? maxConcurrentRequests = null, int? prefillStepBudgetMs = null, int? maxQueuedRequests = null, int? queueTimeoutMs = null)
     {
         string modelPath = ModelFixture.Resolve() ?? throw new InvalidOperationException(
             $"GGUF fixture '{ModelFixture.SmolLmRelativePath}' was not found walking up from the test assembly directory.");
@@ -298,6 +298,8 @@ public sealed class ConcurrencyTests
                     MaxContextTokens = maxContextTokens,
                     KvBlocks = kvBlocks,
                     MaxConcurrentRequests = maxConcurrentRequests,
+                    MaxQueuedRequests = maxQueuedRequests,
+                    QueueTimeoutMs = queueTimeoutMs,
                 },
             ],
         });

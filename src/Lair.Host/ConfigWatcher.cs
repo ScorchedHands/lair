@@ -8,12 +8,13 @@ namespace Lair.Host;
 /// turns every edit burst into exactly one reload pass — the coalescing timer restarts on each event, so atomic-save
 /// patterns (temp-file write then rename onto the config name) and editors that touch the file repeatedly settle into
 /// a single attempt once writes go quiet. Each pass re-reads through the normal loader (full validation), diffs the
-/// candidate against what is in force, and dispatches every difference through <see cref="GenerationService.ApplyConfiguration"/>
-/// by mutation class. A broken edit never touches the running engine: validation failure logs a loud rejection — with
-/// per-field refusals naming each changed key's mutation class when the file still parses enough to name them — and the
-/// candidate is dropped whole. Applied and refused outcomes are mirrored as structured <c>config_reload field=... class=... outcome=...</c>
-/// log lines plus one compact JSON summary line, and every completed attempt lands on <see cref="GenerationService.LastReload"/>
-/// for programmatic observation. Only the serve verb wires this; chat and monitor hosts never watch anything.
+/// candidate against what is in force, and dispatches every difference through <see cref="IConfigApplyTarget.ApplyConfiguration"/>
+/// by mutation class — whichever shape is serving, one live engine or a multi-model registry. A broken edit never touches
+/// what is running: validation failure logs a loud rejection — with per-field refusals naming each changed key's mutation
+/// class when the file still parses enough to name them — and the candidate is dropped whole. Applied and refused outcomes
+/// are mirrored as structured <c>config_reload field=... class=... outcome=...</c> log lines plus one compact JSON summary
+/// line, and every completed attempt lands on the served target's reload summary store for programmatic observation. Only
+/// the serve verb wires this; chat and monitor hosts never watch anything.
 /// </summary>
 public sealed class ConfigWatcher : IDisposable
 {
@@ -26,7 +27,7 @@ public sealed class ConfigWatcher : IDisposable
     private const int SettleRetryMs = 100;
 
     private readonly string _configPath;
-    private readonly GenerationService _engine;
+    private readonly IConfigApplyTarget _target;
     private readonly Action<string> _logLine;
     private readonly object _stateGate = new();
 
@@ -40,12 +41,24 @@ public sealed class ConfigWatcher : IDisposable
     /// <param name="engine">The live engine that owns the change-application pipeline and the reload summary store.</param>
     /// <param name="logLine">Sink for each structured log line; defaults to console output. Hosts (and tests) may capture instead.</param>
     public ConfigWatcher(string configPath, GenerationService engine, Action<string>? logLine = null)
+        : this(configPath, (IConfigApplyTarget)engine ?? throw new ArgumentNullException(nameof(engine)), logLine)
+    {
+    }
+
+    /// <param name="configPath">The served configuration file to watch.</param>
+    /// <param name="registry">The live model registry whose instances own the change-application pipelines and the reload summary store; every declared model's edits, additions, and removals ride this watcher exactly as a single engine's do.</param>
+    /// <param name="logLine">Sink for each structured log line; defaults to console output. Hosts (and tests) may capture instead.</param>
+    public ConfigWatcher(string configPath, ModelRegistry registry, Action<string>? logLine = null)
+        : this(configPath, (IConfigApplyTarget)registry ?? throw new ArgumentNullException(nameof(registry)), logLine)
+    {
+    }
+
+    private ConfigWatcher(string configPath, IConfigApplyTarget target, Action<string>? logLine)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(configPath);
-        ArgumentNullException.ThrowIfNull(engine);
 
         _configPath = Path.GetFullPath(configPath);
-        _engine = engine;
+        _target = target;
         _logLine = logLine ?? Console.WriteLine;
     }
 
@@ -132,7 +145,7 @@ public sealed class ConfigWatcher : IDisposable
         if (!TryWaitForSettledRead(out string? settleError))
         {
             Log($"config_reload outcome=rejected error={Quote(settleError ?? "the configuration file stayed unreadable")}");
-            _engine.ReportReload(ReloadSummary.FromResults([], false, settleError ?? "the configuration file stayed unreadable"));
+            _target.ReportReload(ReloadSummary.FromResults([], false, settleError ?? "the configuration file stayed unreadable"));
             return;
         }
 
@@ -155,7 +168,7 @@ public sealed class ConfigWatcher : IDisposable
             // Loud rejection, candidate dropped whole: nothing was applied and the running engine keeps every current value.
             // When the file still parsed enough to name its changed keys, each one is reported with its mutation class so a
             // refused restart-only edit says exactly that even though validation rejected it before application.
-            IReadOnlyList<FieldResult> refusals = ConfigMutationTable.ExtractEdits(_engine.EffectiveConfiguration, _configPath)
+            IReadOnlyList<FieldResult> refusals = ConfigMutationTable.ExtractEdits(_target.EffectiveConfiguration, _configPath)
                 .Select(change => new FieldResult(
                     change,
                     ConfigApplyOutcome.Refused,
@@ -168,11 +181,11 @@ public sealed class ConfigWatcher : IDisposable
             }
 
             Log($"config_reload outcome=rejected error={Quote(validationError!)}");
-            _engine.ReportReload(ReloadSummary.FromResults(refusals, false, validationError));
+            _target.ReportReload(ReloadSummary.FromResults(refusals, false, validationError));
             return;
         }
 
-        IReadOnlyList<FieldResult> results = _engine.ApplyConfiguration(candidate);
+        IReadOnlyList<FieldResult> results = _target.ApplyConfiguration(candidate);
         foreach (FieldResult result in results)
         {
             Log(FieldLine(result));
@@ -183,7 +196,7 @@ public sealed class ConfigWatcher : IDisposable
             Log($"config_reload_summary={ReloadSummary.FromResults(results, true, null).ToJson()}");
         }
 
-        _engine.ReportReload(ReloadSummary.FromResults(results, true, null));
+        _target.ReportReload(ReloadSummary.FromResults(results, true, null));
     }
 
     // Exclusive-open retry: an editor mid-save (or a rename still landing) surfaces as a sharing violation; keep

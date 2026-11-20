@@ -136,13 +136,42 @@ internal sealed record ChunkDelta(
 /// <summary><c>/v1/models</c> envelope.</summary>
 internal sealed record ModelsResponse(string Object, IReadOnlyList<ModelEntry> Data);
 
+/// <summary>Parsed body of <c>/v1/embeddings</c>: the model id plus every input text in declared order. Both OpenAI spellings of <c>input</c> — one string or a list of strings — arrive as this same list; an absent key stays null so the handler can name it.</summary>
+internal sealed record EmbeddingBody(string? Model, IReadOnlyList<string>? Inputs);
+
+/// <summary><c>/v1/embeddings</c> result: OpenAI's list envelope carrying one datum per input at its own index, and prompt-side token accounting for what every input consumed. The sentence-vector posture that shaped these vectors is the model's configured pooling choice — a fact about the served model, not something this body can override.</summary>
+internal sealed record EmbeddingResponse(
+    string Object,
+    string Model,
+    IReadOnlyList<EmbeddingDatum> Data,
+    [property: JsonPropertyName("usage")] EmbeddingUsage Usage);
+
+/// <summary>One answered vector: its index in the request's inputs and the floats pooling produced for it.</summary>
+internal sealed record EmbeddingDatum(int Index, IReadOnlyList<float> Embedding, string Object = "embedding");
+
+/// <summary>Token accounting reported with every embeddings result. An encode-only request generates nothing, so only prompt-side counts exist and total carries them.</summary>
+internal sealed record EmbeddingUsage(
+    [property: JsonPropertyName("prompt_tokens")] int PromptTokens,
+    [property: JsonPropertyName("total_tokens")] int TotalTokens);
+
 /// <summary>The wire name of an admission concurrency cap that bounds nothing: the key is always reported, and this value says no cap applies rather than leaving a reader to infer it from absence. The same posture string rides every uncapped model's entry.</summary>
 internal static class ConcurrencyCapPostures
 {
     public const string Uncapped = "uncapped";
 }
 
-/// <summary>One advertised model: OpenAI baseline fields plus the context/quant/architecture metadata, the configured model kind, the tool output parser resolved for the model at load, and the sparse-FFN strategy its plan resolved when it routes experts. The type field is additive payload so chat surfaces can exclude embed models on a fact; it defaults to "chat" because the config loader accepts no other value in this build. A model with no expert-routed block carries no strategy value, and the null-ignore serializer omits the key there. The concurrency facts are always reported: <c>max_concurrent_requests</c> names the cap configured for admissions now (live hot edits included) or JSON null when nothing bounds it, paired with <c>concurrency_cap_posture</c> — that cap's name or <c>uncapped</c>; <c>route_segments</c> lists the resolved execution route in order, each segment naming its device, residency tier, batch cap, and resolved quota.</summary>
+/// <summary>The wire name of a model's request-queue posture: <c>immediate</c> says nothing queues and an over-cap submission is refused the moment every admission slot is held, while <c>bounded</c> says submissions may wait for a slot up to the entry's queue cap within its bounded wait before answering the overload refusal. The same posture string rides every model's entry so a reader never infers a queue from a missing key.</summary>
+internal static class RequestQueuePostures
+{
+    public const string Immediate = "immediate";
+
+    public const string Bounded = "bounded";
+
+    /// <summary>The bounded wait, in milliseconds, a submission gets for its admission slot when the model queues without naming one: what an enabled queue actually enforces where the config declared only the cap. A declared ceiling replaces it; nothing queued means no wait applies at all.</summary>
+    public const int DefaultQueueTimeoutMs = 30_000;
+}
+
+/// <summary>One advertised model: OpenAI baseline fields plus the context/quant/architecture metadata, the configured model kind (<c>chat</c> samples decoded sequences, <c>embed</c> serves encoder forwards only), the tool output parser resolved for the model at load, and the sparse-FFN strategy its plan resolved when it routes experts. The type field is additive payload so chat surfaces can exclude embed models on a fact; an absent config key resolves to "chat". A model with no expert-routed block carries no strategy value, and the null-ignore serializer omits the key there. The concurrency facts are always reported: <c>max_concurrent_requests</c> names the cap configured for admissions now (live hot edits included) or JSON null when nothing bounds it, paired with <c>concurrency_cap_posture</c> — that cap's name or <c>uncapped</c>; <c>route_segments</c> lists the resolved execution route in order, each segment naming its device, residency tier, batch cap, and resolved quota. The request-queue facts ride alongside them: <c>max_queued_requests</c> names how many submissions may wait for a held admission slot before further ones answer the queue-full refusal (null while nothing queues), paired with <c>request_queue_posture</c>, <c>queued_requests</c> gives the live depth of that queue right now — none of it admitted, holding no pool block or token budget yet — and <c>queue_timeout_ms</c> states the bounded wait a waiting submission gets for its slot. The sentence-vector posture keys report what an embedding request against this model answers with: <c>pooling</c> names the choice (<c>mean</c> or <c>cls</c>) and <c>normalize</c> says whether pooled vectors are L2-normalized — both present only on a model opened in encode-only serving posture, since they decide nothing about what a sampling model returns.</summary>
 internal sealed record ModelEntry(
     string Id,
     string Object,
@@ -157,7 +186,13 @@ internal sealed record ModelEntry(
     string? SparseFfnStrategy = null,
     [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.Never)] int? MaxConcurrentRequests = null,
     string ConcurrencyCapPosture = ConcurrencyCapPostures.Uncapped,
-    IReadOnlyList<ModelRouteSegment>? RouteSegments = null);
+    IReadOnlyList<ModelRouteSegment>? RouteSegments = null,
+    [property: System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.Never)] int? MaxQueuedRequests = null,
+    string RequestQueuePosture = RequestQueuePostures.Immediate,
+    int QueuedRequests = 0,
+    int QueueTimeoutMs = 0,
+    string? Pooling = null,
+    bool? Normalize = null);
 
 /// <summary><c>/healthz</c> body.</summary>
 internal sealed record HealthResponse(string Status, bool ModelReady);
