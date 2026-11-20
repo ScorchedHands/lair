@@ -76,6 +76,11 @@ public sealed class GgufTokenizer
     private readonly bool _addBos;
     private readonly Dictionary<string, int[]> _encodeCache = new(StringComparer.Ordinal);
 
+    // Concurrent submissions against one engine share this tokenizer's memo: the dictionary itself is guarded so a structural insert or the
+    // limit-triggered clear can never race another thread's read. Only the cache touches take this gate — tokenization work stays outside it,
+    // and two threads encoding the same text compute identical results either way.
+    private readonly object _encodeCacheGate = new();
+
     private GgufTokenizer(
         string[] pieces,
         int[] types,
@@ -421,9 +426,16 @@ public sealed class GgufTokenizer
     private IReadOnlyList<int> EncodeCached(string text, bool withBos)
     {
         string key = withBos ? "\u0000bos\u0000" + text : text;
-        if (_encodeCache.TryGetValue(key, out int[]? cached))
+
+        int[]? cachedResult;
+        lock (_encodeCacheGate)
         {
-            return cached;
+            _encodeCache.TryGetValue(key, out cachedResult);
+        }
+
+        if (cachedResult is not null)
+        {
+            return cachedResult;
         }
 
         List<int> ids = [];
@@ -462,12 +474,17 @@ public sealed class GgufTokenizer
         }
 
         int[] result = ids.ToArray();
-        if (_encodeCache.Count >= EncodeCacheLimit)
+
+        lock (_encodeCacheGate)
         {
-            _encodeCache.Clear();
+            if (_encodeCache.Count >= EncodeCacheLimit)
+            {
+                _encodeCache.Clear();
+            }
+
+            _encodeCache[key] = result;
         }
 
-        _encodeCache[key] = result;
         return result;
     }
 

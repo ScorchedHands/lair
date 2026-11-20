@@ -31,7 +31,7 @@ public sealed class TokenBudgetAttributionApiTests
 
         await using ServedModel served = await OpenAsync(modelPath, maxReasoningTokens: 8, maxResponseTokens: null);
 
-        JsonElement body = await PostJsonAsync(served, """{"model":"qwen3-token-budget-attribution","messages":[{"role":"user","content":"What is the capital of France? Explain your reasoning, then answer."}]}""");
+        JsonElement body = await PostJsonAsync(served, """{"model":"qwen3-token-budget-attribution","temperature":0,"messages":[{"role":"user","content":"What is the capital of France? Explain your reasoning, then answer."}]}""");
 
         Assert.Equal("length", body.GetProperty("choices")[0].GetProperty("finish_reason").GetString());
         Assert.Equal("reasoning", body.GetProperty("budget_exhausted").GetString());
@@ -48,7 +48,7 @@ public sealed class TokenBudgetAttributionApiTests
 
         await using ServedModel served = await OpenAsync(modelPath, maxReasoningTokens: 256, maxResponseTokens: 4);
 
-        JsonElement body = await PostJsonAsync(served, """{"model":"qwen3-token-budget-attribution","messages":[{"role":"user","content":"What is the capital of France? Explain your reasoning, then answer."}]}""");
+        JsonElement body = await PostJsonAsync(served, """{"model":"qwen3-token-budget-attribution","temperature":0,"messages":[{"role":"user","content":"What is the capital of France? Explain your reasoning, then answer."}]}""");
 
         Assert.Equal("length", body.GetProperty("choices")[0].GetProperty("finish_reason").GetString());
         Assert.Equal("response", body.GetProperty("budget_exhausted").GetString());

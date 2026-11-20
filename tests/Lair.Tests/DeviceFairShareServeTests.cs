@@ -16,6 +16,7 @@ namespace Lair.Tests;
 /// answers, and a deferral never preempts a sequence already launched.
 /// </summary>
 [Trait("Category", "Cuda")]
+[Trait("Category", "Serve")] // this suite's solo-vs-contended token identity is part of the serve-gate surface MVP6.1 verifies on CUDA
 [Collection("model-loaded")] // shares the serialized engine lane with the suites that measure working-set envelopes here: an extra accelerator context must never overlap their measurements
 public sealed class DeviceFairShareServeTests : IDisposable
 {
