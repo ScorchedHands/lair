@@ -226,7 +226,25 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_max_queued_requests")] int? MaxQueuedRequests = null,
 
     /// <summary>The bounded wait a submission gets for its admission slot, in milliseconds — declared ceiling or documented default when queueing is enabled; zero while nothing queues.</summary>
-    [property: JsonPropertyName("metrics_queue_timeout_ms")] int QueueTimeoutMs = 0)
+    [property: JsonPropertyName("metrics_queue_timeout_ms")] int QueueTimeoutMs = 0,
+
+    // Additive encoder-lane facts (earlier shapes untouched): the work an encode-only serving posture actually does. A
+    // model opened as type embed advances no scheduler sequence, so every decode-side field above reads zero for it by
+    // fact — these carry what its encoder forwards really ran, written by the owning facade around each encoder call and
+    // never inferred from request counts or configuration. An engine that serves no encoder posture reports all four at
+    // their inert defaults: nothing encoded rather than a number an operator could mistake for decode activity.
+
+    /// <summary>Encoder calls running through this engine's forward stage right now; zero whenever none is.</summary>
+    [property: JsonPropertyName("metrics_active_encoder_requests")] int ActiveEncoderRequests = 0,
+
+    /// <summary>Encoder-only calls whose every input reached a pooled vector since this bus opened — a call cancelled or refused partway counts toward its forwarded positions but not here.</summary>
+    [property: JsonPropertyName("metrics_encoder_requests_total")] long EncoderRequestsTotal = 0,
+
+    /// <summary>Cumulative token positions carried through encoder forwards that completed their pooling step — what an encode pass actually read, batch by batch.</summary>
+    [property: JsonPropertyName("metrics_encoder_tokens_forwarded_total")] long EncoderTokensForwardedTotal = 0,
+
+    /// <summary>Windowed encoder throughput: positions forwarded in this snapshot's window per second. Zero on a decode-side engine because nothing there forwards through an encoder pass.</summary>
+    [property: JsonPropertyName("metrics_encoder_tok_s")] double EncoderTokensPerSecWindowed = 0)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

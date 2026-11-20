@@ -373,7 +373,7 @@ These are **not available on this branch**. Each is listed with its status so a 
 |---|---|---|
 | Packaged release artifacts: a committed publish profile, CI packaging, and a distributable archive | planned | The self-contained single-file `win-x64` publish documented under "Getting the executable" works today, but no publish profile or packaging step is committed in the repository, so a release has to be built locally. |
 | Native AOT packaging | planned | Backlog idea (startup cost reduction); nothing implemented. |
-| Multi-model serving, so `serve`/`chat`/`model` operate on more than one model | planned | This build serves exactly one model; `models:` must list exactly one entry, and `model check`/`list` iterate packs accordingly. |
+| Concurrent GPU-compute overlap across models on the same CUDA device | planned | Multi-model serving is capacity/admission accounting only; `serve`, chat, and model-listing already operate across declared `chat`/`embed` entries today. |
 | Whole-model CUDA monitor/tier counters beyond the shipped hybrid split | planned | GPU utilization, PCIe transfer bytes/copies, and persistent device VRAM are shipped for CUDA-backed serves; whole-model CUDA execution, broader tier occupancy, and CUDA kernels across all loader-accepted quant formats remain planned. |
 | `embed` model serving (`type: embed`) reachable from `serve` | planned | The config key is validated today but only `chat` is accepted. |
 

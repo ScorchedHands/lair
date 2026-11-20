@@ -85,8 +85,9 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
     // not be consulted. It feeds only the monitor's additive candidate fact — never the load path, a fetch, or a pin.
     private string? _updateCandidate;
 
-    // Generations currently publishing monitor lifecycle frames, keyed by their stream request id — the in-flight
-    // half of a resync state dump. Trackers are added at admission and removed when their completion frame publishes.
+    // Requests currently publishing monitor lifecycle frames, keyed by their stream request id — the in-flight half of a
+    // resync state dump. Both serving postures land here: admitted generations and admitted encoder calls. Trackers are
+    // added at admission and removed when their completion frame publishes.
     private readonly ConcurrentDictionary<string, RequestTracker> _monitoredRequests = new(StringComparer.Ordinal);
 
     // Change-application state: the configuration currently in force (restart-only refusals keep their old values),
@@ -2568,7 +2569,10 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
     /// pooling when the configuration asks for it. Admission follows the same bounded queue posture every generation submission uses — a submission finding this
     /// engine's single encoder lane held takes one seat in this facade's request queue under <c>max_queued_requests</c> within its bounded wait, spending no pool
     /// block and no token budget while it waits — and every refusal answers the existing overload taxonomy rather than an error surface of its own. No decode
-    /// step ever runs here: an encoder forward has no sampled tokens to publish, so this path mints no request-lifecycle frames on the monitor stream.
+    /// step ever runs here, so nothing on this path has sampled tokens to report: an admitted encoder call still mints its request-lifecycle frames (start at
+    /// admission, one completion frame carrying the status it ended on) and drives the bus's encode-side counters — in-flight forwards, completed calls, positions
+    /// forwarded — which is what makes a model opened as <c>embed</c> visible on <c>/monitor/stream</c> at all. Its frames carry no tok/s series because there was
+    /// nothing produced token by token to sample.
     /// </summary>
     public async Task<EmbeddingOutcome> EmbedAsync(EmbeddingRequest request, CancellationToken cancellationToken)
     {
@@ -2641,76 +2645,126 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
 
         await using EncoderLaneLease lane = await AcquireEncoderLaneAsync(cancellationToken).ConfigureAwait(false);
 
+        // Monitor lifecycle keys on the caller's correlation id when one was given (the API host passes the same value it answers with in x-lair-request-id); programmatic callers get a generated id so their stream rows still correlate. An encoder call samples nothing, so its frames carry prompt size and elapsed time only — there is no tok/s series between start and completion to report, because nothing was produced token by token.
+        EngineMetricsBus? bus = _metrics;
+        RequestTracker? tracker = null;
+
+        if (bus is not null)
+        {
+            string monitorRequestId = !string.IsNullOrWhiteSpace(request.RequestId) ? request.RequestId! : Guid.NewGuid().ToString("N");
+            tracker = new(bus, monitorRequestId, Model.Id, "embeddings", totalInputTokens);
+            _monitoredRequests[monitorRequestId] = tracker; // an encoder call in flight belongs in a resync dump exactly like a generation in flight does
+            tracker.PublishStart();
+        }
+
+        bool forwardRan = false; // pairs one bus end against the one begin this call made, whatever its outcome
+        string completionStatus = "encoded";
+
         List<EmbeddingVector> vectors = [];
         int cursor = 0;
-        while (cursor < tokenLists.Count)
+
+        try
         {
-            // Compose the next encoder batch from inputs in order: as many sequences as one merged call carries, stopping at its row capacity so a later slice composes as its own call. Input index survives the split because each vector lands where its input was read.
-            int take = 0;
-            int rows = 0;
-            while (take < TransformerModel.MaxEncodeSequences && cursor + take < tokenLists.Count)
+            if (bus is not null)
             {
-                int length = tokenLists[cursor + take].Length;
-                if (rows != 0 && rows + length > TransformerModel.MaxEncodeBatchRows)
-                {
-                    break;
-                }
-
-                rows += length;
-                take++;
+                bus.BeginEncoderRequest(); // an encoder forward runs on this engine now — the fact that keeps its snapshots publishing even though no scheduler sequence advances here
+                forwardRan = true;
             }
 
-            List<SequenceKv> sequences = [];
-            try
+            while (cursor < tokenLists.Count)
             {
-                for (int s = 0; s < take; s++)
+                // Compose the next encoder batch from inputs in order: as many sequences as one merged call carries, stopping at its row capacity so a later slice composes as its own call. Input index survives the split because each vector lands where its input was read.
+                int take = 0;
+                int rows = 0;
+                while (take < TransformerModel.MaxEncodeSequences && cursor + take < tokenLists.Count)
                 {
-                    IKvSequence sequence = _pool.NewSequence(); // the sequence type this pool's storage is addressed by, exactly as a pipeline opens one
-
-                    if (sequence is not SequenceKv floatSequence)
+                    int length = tokenLists[cursor + take].Length;
+                    if (rows != 0 && rows + length > TransformerModel.MaxEncodeBatchRows)
                     {
-                        throw new ModelEncoderUnsupportedException(
-                            Model.Id,
-                            $"this engine opened kv k='{Lair.Kv.KvSideFormatNames.Of(_pool.Formats.K)}' v='{Lair.Kv.KvSideFormatNames.Of(_pool.Formats.V)}': the encoder pass reads float KV slots, and this pool hands out another sequence type — omit kv.quant to serve this model in the FP32 posture");
+                        break;
                     }
 
-                    sequences.Add(floatSequence);
+                    rows += length;
+                    take++;
                 }
 
-                IReadOnlyList<float[]> encoded = EncodeBatchMapped(tokenLists.GetRange(cursor, take), sequences);
-
-                for (int s = 0; s < take; s++)
+                List<SequenceKv> sequences = [];
+                try
                 {
-                    float[] rowsOfOneInput = encoded[s];
-                    int hidden = _model.Desc.HiddenSize;
-                    float[] vector = new float[hidden];
+                    for (int s = 0; s < take; s++)
+                    {
+                        IKvSequence sequence = _pool.NewSequence(); // the sequence type this pool's storage is addressed by, exactly as a pipeline opens one
 
-                    if (posture.Pooling == PoolingModeValues.Cls)
-                    {
-                        Pooling.FirstToken(rowsOfOneInput, hidden, vector); // the first position's row verbatim
-                    }
-                    else
-                    {
-                        Pooling.MeanPool(rowsOfOneInput, hidden, vector);
-                    }
+                        if (sequence is not SequenceKv floatSequence)
+                        {
+                            throw new ModelEncoderUnsupportedException(
+                                Model.Id,
+                                $"this engine opened kv k='{Lair.Kv.KvSideFormatNames.Of(_pool.Formats.K)}' v='{Lair.Kv.KvSideFormatNames.Of(_pool.Formats.V)}': the encoder pass reads float KV slots, and this pool hands out another sequence type — omit kv.quant to serve this model in the FP32 posture");
+                        }
 
-                    if (posture.Normalize)
-                    {
-                        Pooling.NormalizeL2(vector); // after pooling, never before: a mean over normalized rows is not the same vector as a normalized mean
+                        sequences.Add(floatSequence);
                     }
 
-                    vectors.Add(new EmbeddingVector(vector, tokenLists[cursor + s].Length));
+                    IReadOnlyList<float[]> encoded = EncodeBatchMapped(tokenLists.GetRange(cursor, take), sequences);
+
+                    for (int s = 0; s < take; s++)
+                    {
+                        float[] rowsOfOneInput = encoded[s];
+                        int hidden = _model.Desc.HiddenSize;
+                        float[] vector = new float[hidden];
+
+                        if (posture.Pooling == PoolingModeValues.Cls)
+                        {
+                            Pooling.FirstToken(rowsOfOneInput, hidden, vector); // the first position's row verbatim
+                        }
+                        else
+                        {
+                            Pooling.MeanPool(rowsOfOneInput, hidden, vector);
+                        }
+
+                        if (posture.Normalize)
+                        {
+                            Pooling.NormalizeL2(vector); // after pooling, never before: a mean over normalized rows is not the same vector as a normalized mean
+                        }
+
+                        vectors.Add(new EmbeddingVector(vector, tokenLists[cursor + s].Length));
+                    }
                 }
+                finally
+                {
+                    foreach (SequenceKv sequence in sequences)
+                    {
+                        sequence.Dispose(); // every position this forward wrote returns to the pool as soon as its vector is pooled
+                    }
+                }
+
+                cursor += take;
+                bus?.RecordEncoderPositions(rows); // this batch's positions reached pooled vectors: credit them even if a later batch of the same call never does
             }
-            finally
+        }
+        catch (OperationCanceledException)
+        {
+            completionStatus = "cancelled";
+            throw;
+        }
+        catch
+        {
+            // A posture or pool refusal this far into the call is still one encoder call that ended without pooling every input it was given.
+            completionStatus = "failed";
+            throw;
+        }
+        finally
+        {
+            if (forwardRan)
             {
-                foreach (SequenceKv sequence in sequences)
-                {
-                    sequence.Dispose(); // every position this forward wrote returns to the pool as soon as its vector is pooled
-                }
+                bus!.EndEncoderRequest(allInputsPooled: completionStatus == "encoded");
             }
 
-            cursor += take;
+            if (tracker is RequestTracker finished)
+            {
+                _monitoredRequests.TryRemove(finished.RequestId, out _);
+                finished.Complete(completionStatus, cachedTokens: 0, finishReason: null); // nothing sampled means no finish reason to report, and this path consults no prefix cache, so it reused none
+            }
         }
 
         return new EmbeddingOutcome(vectors, totalInputTokens, posture.Pooling, posture.Normalize);

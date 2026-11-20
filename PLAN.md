@@ -1686,7 +1686,7 @@ CUDA attention + device-resident KV for the GPU step — measured as a length-de
 
 - [✓] **GPU-prefill payoff gate** — resolved as a mixed measurement: composing matmul + attention + KV on-device beats CPU prefill at some pinned dense lengths but not all, so GPU prefill stays non-default and the bench records both directions.
 
-### MVP6 [v0.6.0] - In Progress
+### MVP6 [v0.6.0] - Shipped
 
 Many models at once, each with its own placement policy.
 
@@ -1695,7 +1695,7 @@ Many models at once, each with its own placement policy.
 - **DN-M6-1** — Registry and hot swap: models declared in config with `type: chat|embed`; add loads in the background and serves when ready; remove drains in-flight requests, then frees pools.
   - Rationale: model changes ride the same hot-reload bus as every other knob; drain-then-free avoids mid-flight collapse.
   - Rejected: restart-to-change-model; immediate unload (kills in-flight requests).
-  - Contract: registry in `lair.http` + `IConfigSource`; a hot-added model takes its tier claims after every model already holding them (DN-M314-10's claim order), and a drained model releases its claims before its pools free.
+  - Contract: registry in `lair.http` + `IConfigSource`; a hot-added model takes its tier claims after every model already holding them (DN-M314-10's claim order), a hot-added engine attaches to the host monitor before being advertised ready, and a drained model releases its claims before its pools free.
 - **DN-M6-2** — Global ledger admission: DRAM quota, VRAM pool, and core sets are accounted at load time; runtime KV exhaustion rejects new requests, never preempts running ones.
   - Rationale: preemption needs swap to disk — that machinery arrives in MVP8; until then the honest answer is refusal.
   - Rejected: best-effort oversubscription (thrash); preempt-to-fittest (needs MVP8 tiers).
@@ -1725,10 +1725,10 @@ Many models at once, each with its own placement policy.
   - Verify: `dotnet test --filter Category=Scheduling|Api -c Release` — queue-full refuses with `engine_overloaded`; timeout refuses with `engine_overloaded`; queued requests do not hold KV blocks or token budgets before admission; admitted queued requests revalidate and complete normally; monitor reports queue depth.
 - [✓] Embeddings endpoint — `/v1/embeddings`, encoder-only models (dense encoder-mode checkpoints; ModernBERT-class GGUF families remain Backlog) (see DN-M6-3)
   - Verify: `dotnet test --filter Category=Embeddings` — pooled vectors match reference fixtures within FP tolerance.
-- [✓] Monitor multi-instance snapshots — every advertised engine feeds `/monitor/stream` with shared event ids and per-model route/device facts (see DN-M6-1 and DN-M6-5)
-  - Verify: `dotnet test --filter Category=MonitorStream|Registry` — two served models produce snapshot frames for both models on one stream, each carrying its own model id and route segments.
-- [_] Flagship scenario — GPU-heavy coding model + CPU-only embedding model side by side
-  - Verify: manual — both models serve concurrent load; monitor shows per-model device portioning.
+- [✓] Monitor multi-instance snapshots — every advertised engine feeds `/monitor/stream` with shared event ids, per-model route/device facts, and encoder-only engine activity counters (see DN-M6-1, DN-M6-3, and DN-M6-5)
+  - Verify: `dotnet test --filter Category=MonitorStream|Registry` — two served models produce snapshot frames for both models on one stream, each carrying its own model id and route segments; an encoder-only engine publishes while active.
+- [✓] Flagship scenario — GPU-heavy coding model + CPU-only embedding model side by side
+  - Verify: manual — `/v1/models` advertised both models, chat completed on `gpu-coding`, embeddings answered on `cpu-embed`, and monitor snapshots carried per-model route/device facts for both.
 
 #### Tests
 
@@ -1737,7 +1737,7 @@ Many models at once, each with its own placement policy.
 - [✓] Automated Fairness: cross-model ITL isolation
 - [✓] Automated Queue: queue-full, queue timeout, no pre-admission KV/token reservation, and queue-depth reporting
 - [✓] Automated Embeddings: pooling parity vs reference fixtures
-- [✓] Automated Monitor Multi-Instance: one stream carries snapshots from every advertised engine
+- [✓] Automated Monitor Multi-Instance: one stream carries snapshots from every advertised engine, including an encoder-only engine publishing encode-side facts beside a sampling engine
 
 ### MVP6.1 [v0.6.1] - Refined
 
@@ -2084,6 +2084,10 @@ Vision input on chat models.
 - **2026-11-17 — MVP5's gather-vs-scalar probe is a fixed synthetic engine-open benchmark, not a public config axis or vendor guess.** The CPU backend resolves one grid encoding per process on representative synthetic i-quant blocks under both scalar-index and vector-gather staging paths; the faster path above noise becomes the load-time plan value for every later engine open. Bench forced-mode runs remain the evidence gate for prefetch/gather benefit, while all encodings stay bit-identical to the integer oracle. Rejected: public `gather` knob (no user-facing tuning need yet), vendor heuristics that can misclassify a CPU without measurement, and per-row encoding switches (nondeterminism plus dispatch tax).
 
 - **2026-11-17 — MVP5's grid probe measures representative synthetic Q8_K GEMVs rather than staging loops alone.** The earlier synthetic benchmark timed only `Stage*` helpers and selected scalar on the dev box while forced tensor bench showed gather faster across all pinned sub4-bit formats; the cached engine-open probe now opens two forced CPU backends with prefetch off, runs fixed 128×1024 IQ fixtures through both encodings, interleaves best-of passes, rejects a collapse or selects Gather only when aggregate timing wins by >~4%. This keeps no public knob and preserves bit-identical output; bench evidence now shows auto resolving gather on the dev box with `SUB4BIT` grid comparison +11.579% warm at reps80/maxrows256/threads1, while forced prefetch comparison resolves gather for both sides and reports aggregate prefetched path +2.810% faster (exact bit-identical) at reps200.
+
+- **2026-11-19 — Whole-suite load can starve the NUMA affinity sampling gate.** MVP6's full suite hit `NumaPlacementTests.NodeDerivedAffinity_KeepsWorkerExecutionsInsideTheChosenNode_WhereTheHostCanPin` once (22 sampled worker executions against a 100-execution floor), the isolated rerun passed in 90 ms, and the repeat-run whole suite was green. Treat this as another full-suite gate family to read "green on repeat runs" with an isolated rerun when it appears; no product posture changed because the gate samples worker affinity under a fixed deadline.
+
+- **2026-11-19 — MVP6 ships with monitor corrections discovered by the flagship scenario.** The first live two-model serve exposed that encoder-only engines were invisible on `/monitor/stream` because snapshot publication keyed only decode activity, and hot-added models could advertise ready before their bus was attached. Shipped posture: every advertised engine publishes through a host-scoped event line; embed facades mint request-lifecycle frames and drive additive encode-side counters (`metrics_active_encoder_requests`, `metrics_encoder_requests_total`, `metrics_encoder_tokens_forwarded_total`, `metrics_encoder_tok_s`); registry attach happens before hot-added engines are advertised ready. Flagship evidence: `/v1/models` advertised both models, chat completed on a GPU-heavy coding model with CUDA/VRAM + CPU/DRAM route facts and non-zero persistent VRAM/GPU utilization, embeddings answered two input arrays against `cpu-embed`, and monitor snapshots carried both model ids with per-model device portioning.
 
 - **2026-11-19 — MVP6 embedding serving gets explicit public posture keys before code lands.** `/v1/embeddings` accepts OpenAI-compatible string or array inputs, registry model type `embed`, and per-model flat config keys `pooling: mean | cls` (default `mean`) plus a boolean `normalize` key whose default is false so raw pooled vectors remain the reference-parity surface. Rejected: hiding pooling/normalization behind endpoint request fields only; normalizing by default because it changes fixture parity without measured need; inventing a separate embedding config object when this posture belongs to one model entry like placement and budgets already do.
 

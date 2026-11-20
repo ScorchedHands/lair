@@ -4,6 +4,25 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-11-19
+
+### Added
+
+- Multi-model serving through a registry and hot config reload: `models:` accepts one or more distinct chat/embedding model entries, each with its own placement policy, concurrency cap, request queue posture, budgets, source pin, and monitor route facts. A drained removed model releases in-flight requests before freeing pools; a hot-added model takes tier claims after models already holding them. GPU compute kernels across multiple CUDA-resident models still serialize through the single primary context.
+- `/v1/embeddings` OpenAI-compatible encoder-only serving for `type: embed` models with flat per-model `pooling: mean | cls` (default `mean`) and `normalize` posture, merged encoder batches preserving input order/index, prompt-side usage accounting, no sampling knobs, and chat-surface refusal before submission.
+- Bounded request queue posture through optional `models[].max_queued_requests` and `models[].queue_timeout_ms`; queued submissions hold no KV blocks or token budgets until admission, revalidate when a slot frees, and answer `engine_overloaded` on full/timeout refusals with actionable limits named. `/v1/models` and monitor snapshots carry live queue depth/caps/timeouts.
+- Monitor fan-in across every advertised engine: `/monitor/stream` samples each served model through host-scoped event ids and per-model route/device facts, including encoder-only engines publishing active/completed encode counters, forwarded-position totals, encoder tok/s windows, and embedding request lifecycle frames.
+
+### Changed
+
+- Device budgets now partition VRAM/DRAM/core claims across multiple resident models with first-come claim order and tier spilldown; runtime KV/prefill exhaustion refuses new admissions naming model/resource/tier plus ledger breakdown while startup weight-cap exhaustion remains a load failure.
+- Scheduler admission is ordered per-model pipeline submission, FIFO within each model, core-set partitioning for isolation, and no default core oversubscription unless `core_overcommit: true`.
+
+### Fixed
+
+- Hot-added models now attach to the host monitor before being advertised ready, so `/monitor/stream` carries a newly loaded engine without waiting for its first snapshot tick.
+- Encoder-only engines publish snapshots while encoding activity is active or immediately after an encoder burst instead of staying silent because they advance no decode scheduler sequence.
+
 ## [0.5.4] - 2026-11-19
 
 ### Added

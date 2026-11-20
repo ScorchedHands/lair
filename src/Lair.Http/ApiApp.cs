@@ -472,8 +472,15 @@ public static class ApiApp
             RequestId = RequestIdOf(http),
         };
 
-        // Encoder admission answers in place — the facade's bounded queue wait resolves before any forward composes — so this endpoint completes synchronously exactly as a non-streaming generation does.
+        if (AuditOf(http) is RequestAudit audit)
+        {
+            audit.Model = request.Model;
+        }
+
+        // Encoder admission answers in place — the facade's bounded queue wait resolves before any forward composes — so this endpoint completes synchronously exactly as a non-streaming generation does. Its log row carries the prompt side only: an encoder call generated nothing, and that is reported as zero rather than left unread.
         EmbeddingOutcome outcome = gen.EmbedAsync(request, http.RequestAborted).GetAwaiter().GetResult();
+
+        AuditOf(http)?.Encoding(outcome.TotalInputTokens);
 
         return Results.Json(new EmbeddingResponse(
             "list",
@@ -854,6 +861,13 @@ public static class ApiApp
         {
             PromptTokens = result.PromptTokens;
             CompletionTokens = result.CompletionTokens;
+        }
+
+        /// <summary>An encoder call's facts: what its inputs consumed, and nothing generated — an encode-only posture answers vectors, so the completion side is zero by fact rather than unread.</summary>
+        public void Encoding(int promptTokens)
+        {
+            PromptTokens = promptTokens;
+            CompletionTokens = 0;
         }
     }
 }

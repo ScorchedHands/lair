@@ -10,13 +10,15 @@ namespace Lair.Http.Monitoring;
 /// In-process metrics bus for one engine: cheap scheduler counters plus pool and cache state are sampled at a
 /// fixed cadence into immutable <see cref="MetricsSnapshot"/>s, kept newest-first in a bounded ring (oldest drop),
 /// fanned out to independent per-subscriber queues that live streams read without ever blocking the publisher,
-/// and written as structured JSON log lines. While the engine idles — no sequences active and nothing completed
-/// since the previous tick — ticks are quiet: no snapshot, no log line until something moves again; any interval
-/// that saw completions publishes even if load ended mid-window, so a burst's tail is never lost from logs or
-/// stream history. Collection cost per published tick is a handful of volatile reads plus process facts, and the
-/// counters themselves ride step boundaries regardless of consumers: with nobody subscribed this changes nothing
-/// measurable about generation paths. The baseline window rolls forward on every tick so each snapshot's rates
-/// describe its own interval rather than since engine open.
+/// and written as structured JSON log lines. While the engine idles — no sequences active, no encoder forward
+/// running, and nothing completed on either side since the previous tick — ticks are quiet: no snapshot, no log line
+/// until something moves again; any interval that saw completions publishes even if load ended mid-window, so a
+/// burst's tail is never lost from logs or stream history. Collection cost per published tick is a handful of volatile
+/// reads plus process facts, and the counters themselves ride step boundaries regardless of consumers: with nobody
+/// subscribed this changes nothing measurable about generation paths. The baseline window rolls forward on every tick so
+/// each snapshot's rates describe its own interval rather than since engine open. Encode-only serving posture activity —
+/// which advances no scheduler sequence at all — rides the encoder counters the owning facade writes around each encoder
+/// call, so a model opened as <c>embed</c> publishes snapshots while it works instead of staying silent forever.
 /// </summary>
 /// <remarks>
 /// Every stream event — snapshots, request lifecycle frames, and resync dumps alike — carries one server-scoped
@@ -63,6 +65,21 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     // Request completions that ended on a stop literal — the one finish fact only the facade can see — written by
     // request threads and read as volatile longs at each tick.
     private long _requestsStop;
+
+    // Encoder-lane activity, written by the owning facade around every encoder-only call this engine serves: how many
+    // encoder forwards are running right now, which calls ran every one of their inputs through to pooled vectors, and
+    // what positions those completed forwards carried. These exist because an encode-only engine advances no decode
+    // step at all — its work would otherwise be invisible on the stream — while every decode-side counter above keeps
+    // reading exactly as its own scheduler wrote it: a snapshot of an embed model reports zero decode activity because
+    // that is literally what happened, and names its real work in these fields instead.
+    private long _encoderActive;                    // encoder calls inside their forward stage right now
+    private long _encoderRequestsCompleted;         // encoder calls whose every input reached a pooled vector
+    private long _encoderTokensForwardedTotal;      // positions carried by encoder forwards that completed
+
+    // Encode-side baseline pair, rolled forward with the same tick as EngineSample's own baseline: each published
+    // window describes what forwarded since the previous check, never an idle stretch accumulated into a rate.
+    private long _previousEncoderRequestsCompleted;
+    private long _previousEncoderTokensForwardedTotal;
 
     // The host event line this bus publishes through, or null when it keeps its own counter and lock.
     private readonly MonitorEventLineage? _lineage;
@@ -227,6 +244,43 @@ public sealed class EngineMetricsBus : IAsyncDisposable
 
     /// <summary>Records a request that ended on a stop literal, so finish-reason tallies match HTTP outcomes.</summary>
     public void RecordStopCompletion() => Interlocked.Increment(ref _requestsStop);
+
+    /// <summary>
+    /// Records that an encoder-only call this engine serves has entered its forward stage. The in-flight count is what
+    /// makes a long encode pass visible: it keeps the engine classified busy — publishing snapshots while nothing decodes
+    /// on this model — and every completed or abandoned call pairs one <see cref="EndEncoderRequest"/> against it.
+    /// </summary>
+    public void BeginEncoderRequest() => Interlocked.Increment(ref _encoderActive);
+
+    /// <summary>
+    /// Credits the positions one encoder batch carried through to pooled vectors. Called per composed batch that
+    /// completed, so a call refused partway credits what its finished batches actually forwarded rather than nothing.
+    /// </summary>
+    public void RecordEncoderPositions(long positions)
+    {
+        if (positions > 0)
+        {
+            Interlocked.Add(ref _encoderTokensForwardedTotal, positions);
+        }
+    }
+
+    /// <summary>
+    /// Records that an encoder-only call left its forward stage — every input pooled or not. The in-flight count drops
+    /// either way; only a call whose inputs all reached pooled vectors counts toward the completed-call tally, so a
+    /// cancelled or failed encode never inflates it while the positions its finished batches forwarded stay credited.
+    /// </summary>
+    public void EndEncoderRequest(bool allInputsPooled)
+    {
+        if (Interlocked.Decrement(ref _encoderActive) < 0)
+        {
+            Volatile.Write(ref _encoderActive, 0); // pairing is exact at the call site; this only keeps a published count from going negative under a host bug
+        }
+
+        if (allInputsPooled)
+        {
+            Interlocked.Increment(ref _encoderRequestsCompleted);
+        }
+    }
 
     /// <summary>
     /// Records one admission refusal the owning facade observed: the limit kind that blocked the submission (from
@@ -505,8 +559,11 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         }
 
         // The window rolls forward on every tick — quiet ones included — so rates always describe the interval since
-        // the previous check instead of accumulating idle stretches into a diluted average.
+        // the previous check instead of accumulating idle stretches into a diluted average. Both baseline pairs roll
+        // together: an encode-only engine has no decode counters to advance, and its own pair is what keeps its rate honest.
         _previous = current with { TimestampMs = nowMs };
+        _previousEncoderRequestsCompleted = Volatile.Read(ref _encoderRequestsCompleted);
+        _previousEncoderTokensForwardedTotal = Volatile.Read(ref _encoderTokensForwardedTotal);
     }
 
     private void FlushFinal()
@@ -519,10 +576,16 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         }
     }
 
-    // Busy means sequences are advancing right now or something completed since the previous tick — a burst that
-    // ended between ticks still gets its closing snapshot. Otherwise the engine is idle and stays quiet.
+    // Busy means sequences are advancing right now, an encoder forward is running on this engine, or something completed
+    // since the previous tick — decode-side or encode-side: a burst that ended between ticks still gets its closing
+    // snapshot. Otherwise the engine is idle and stays quiet; scheduler counters alone would leave an encode-only serve
+    // permanently silent, because it advances no scheduler sequence at all.
     private bool IsActive(EngineSample current) =>
-        Volatile.Read(ref _stats.ActiveSequenceCount) > 0 || CurrentsDiffer(current, _previous);
+        Volatile.Read(ref _stats.ActiveSequenceCount) > 0
+        || Volatile.Read(ref _encoderActive) > 0
+        || CurrentsDiffer(current, _previous)
+        || Volatile.Read(ref _encoderRequestsCompleted) != _previousEncoderRequestsCompleted
+        || Volatile.Read(ref _encoderTokensForwardedTotal) != _previousEncoderTokensForwardedTotal;
 
     private static bool CurrentsDiffer(EngineSample a, EngineSample b) =>
         a.DecodeTokensAdvanced != b.DecodeTokensAdvanced
@@ -540,6 +603,13 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         long stepsDelta = current.DecodeSteps - _previous.DecodeSteps;
         long occupancySumDelta = current.WindowSequenceSum - _previous.WindowSequenceSum;
         double cpuMs = current.ProcessCpuMs - _previous.ProcessCpuMs;
+
+        // Encode-side readings and their window delta, taken from this bus's own counters: an encode-only engine has no
+        // scheduler counter to sample, so these are the only place its work is visible at all.
+        long encoderActive = Volatile.Read(ref _encoderActive);
+        long encoderRequestsCompleted = Volatile.Read(ref _encoderRequestsCompleted);
+        long encoderTokensForwarded = Volatile.Read(ref _encoderTokensForwardedTotal);
+        long encodeDelta = encoderTokensForwarded - _previousEncoderTokensForwardedTotal;
 
         // Additive accelerator facts (earlier shapes untouched): kernel busy is windowed like every other rate here —
         // device-measured microseconds advanced within this interval over the interval's own wall time — while runtime
@@ -667,7 +737,17 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 GpuUtilizationPercent: gpuUtilizationPercent,
                 PcieTransferBytesTotal: transferBytesTotal,
                 PcieTransfersTotal: transferCallsTotal,
-                PersistentVramBytes: persistentVramBytes);
+                PersistentVramBytes: persistentVramBytes,
+
+                // Additive encoder-lane facts (earlier shapes untouched): what this engine's encode-only serving posture
+                // actually ran, written by the owning facade around each encoder call. The rate is windowed like every
+                // other rate here — positions forwarded in this interval over this interval's own wall time — while the
+                // two tallies read cumulative-since-open and the active count reads right now. An engine serving no
+                // encoder posture publishes all four at their inert defaults rather than a decode-side inference.
+                ActiveEncoderRequests: (int)Math.Max(0, encoderActive),
+                EncoderRequestsTotal: encoderRequestsCompleted,
+                EncoderTokensForwardedTotal: encoderTokensForwarded,
+                EncoderTokensPerSecWindowed: Math.Round(encodeDelta * 1000.0 / windowMs, 2));
 
             long id = TakeEventId();
             frame = new MonitorFrame(id, MonitorEventNames.Snapshot, snapshot.ToJson());

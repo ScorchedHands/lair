@@ -1,6 +1,6 @@
 # LAIR — User Documentation
 
-LAIR (Local AI Inference Runtime) is a C#/.NET runtime that serves a GGUF LLM on your own machine behind an OpenAI-compatible HTTP API, with a terminal chat REPL, a live CLI monitor, and a browser monitor. It **consumes published GGUF quant files as they are** — it does not convert, requantize, or reformat models. By default it binds loopback only (`127.0.0.1`) and serves **one model per process**. Administration is the config file: there is no admin API and no CLI command that mutates a running server; a live server changes only through its watched `lair.yaml`.
+LAIR (Local AI Inference Runtime) is a C#/.NET runtime that serves GGUF chat and embedding models on your own machine behind an OpenAI-compatible HTTP API, with a terminal chat REPL, a live CLI monitor, and a browser monitor. It **consumes published GGUF quant files as they are** — it does not convert, requantize, or reformat models. By default it binds loopback only (`127.0.0.1`) and serves **multiple declared model entries per process**, each with its own placement policy. Administration is the config file: there is no admin API and no CLI command that mutates a running server; a live server changes only through its watched `lair.yaml`.
 
 This page is the base overview. The authoritative detail lives in [reference/CLI.md](reference/CLI.md) and [reference/CONFIG.md](reference/CONFIG.md).
 
@@ -55,7 +55,7 @@ Config paths are read relative to the working directory you launch `lair` from, 
 ## What LAIR does not do
 
 - It does not convert, requantize, or export models: a GGUF you point at it is the model it runs.
-- It does not serve more than one model per process, and it does not serve embeddings — `models:` accepts exactly one entry and `type` accepts `chat` only.
+- It does not overlap GPU compute kernels across models resident on the same CUDA device; multi-model serving partitions capacity and admission only.
 - It does not offer an admin API or any CLI command that changes a running server; the watched config file is the only write path.
 - It does not authenticate requests or multi-tenant: exposure is governed by `server.bind` alone. `placement.device` and `placement.prefill` accept `auto`/`cpu` only; whole-model accelerator placement is not accepted through those keys. Hybrid accelerator execution is requested through `placement.gpu_layers` and only for the CUDA kernel formats supported today.
 
@@ -63,14 +63,15 @@ Config paths are read relative to the working directory you launch `lair` from, 
 
 ### OpenAI-compatible HTTP API
 
-`serve` exposes exactly these routes; anything else is a 404 (`/v1/embeddings` is **not** served in this build):
+`serve` exposes chat, completion, embeddings, model-listing, health, monitor, and UI routes; anything else is a 404:
 
 | Route | Method | Notes |
 |---|---|---|
 | `/v1/chat/completions` | POST | JSON or SSE (`"stream": true`); `tools`/`tool_choice`, `logprobs`/`top_logprobs`, `presence_penalty`/`frequency_penalty`, `logit_bias`, `seed`, `stop`, `temperature`/`top_p`/`top_k`, `max_tokens` (default 128), `max_reasoning_tokens`/`max_response_tokens` |
 | `/v1/completions` | POST | Legacy text completions, JSON or SSE, same sampling fields |
-| `/v1/models` | GET | Advertises `context_length`, the byte-dominant `quant`, `architecture`, model `type`, the resolved `tool_parser` and `reasoning` policy, sparse-FFN strategy, the concurrency-cap posture, and the resolved route segments |
-| `/monitor/stream` | GET | SSE engine snapshots (every 2 s) plus request lifecycle events; consumed by `monitor` and the Web UI; integer-dot CPU serves report resolved `metrics_cpu_isa` and `metrics_cpu_gather`; CUDA-backed serves also publish GPU-busy, PCIe transfer totals, and persistent device VRAM bytes |
+| `/v1/embeddings` | POST | OpenAI embeddings for encoder-only models; accepts a string or array of inputs and answers one vector per input at its request index |
+| `/v1/models` | GET | Advertises `context_length`, the byte-dominant `quant`, `architecture`, model `type`, the resolved `tool_parser` and `reasoning` policy, sparse-FFN strategy, concurrency/queue posture, encoder `pooling`/`normalize` posture when present, and the resolved route segments |
+| `/monitor/stream` | GET | SSE engine snapshots (every 2 s) plus request lifecycle events; consumed by `monitor` and the Web UI; integer-dot CPU serves report resolved `metrics_cpu_isa` and `metrics_cpu_gather`; encoder-only engines publish active/completed encode counters and encoder throughput; CUDA-backed serves also publish GPU-busy, PCIe transfer totals, and persistent device VRAM bytes |
 | `/healthz` | GET | `{"status":"ok","model_ready":true}` readiness probe |
 | `/ui` | GET | Web UI (tabbed monitor + browser chat client); `GET /` redirects permanently to `/ui/` |
 
@@ -144,7 +145,7 @@ Some of the following is available only in part where the row says so; status la
 |---|---|---|
 | Whole-model CUDA execution and device-side transformer work | **in progress** | weight-GEMV kernels across all loader-accepted quant formats are available today through hybrid `gpu_layers` layer-split execution; CUDA hybrid execution now covers measured CUDA GEMM formats for dense/quantized tensors; explicit default whole-model `device: cuda` serving remains unshipped; CUDA dense prefill composition with on-device attention/KV is landed as a non-default internal seam only. |
 | Quantized KV CUDA attention | in progress | CPU host-resident quantized KV pairs (`q8_0/q8_0` and `q8_0/q4_0`) are available today; CUDA per-combo quantized KV attention is landed as an internal/tested seam for those pairs, while public device-backed quantized KV serving remains unshipped. |
-| Embeddings endpoint and multi-model serving (`type: embed`) | planned | `/v1/embeddings` for encoder-only models, and several models resident in one process, each with its own placement policy |
+| Embeddings endpoint and multi-model serving (`type: embed`) | shipped | `/v1/embeddings` for encoder-only models, several `chat`/`embed` model entries resident in one process with per-model placement policy; GPU compute kernels across multiple CUDA-resident models still serialize through the single primary context. |
 | Sparse-MoE residency management, PLE, MTP drafting | planned | Router-driven expert gather with hot/cold tiers, pageable n-gram tables with their own budgets, speculative drafting with accept-rate reporting. Dense-resident MoE serves today; gather, tiered expert residency, PLE, and drafting do not |
 | Residency spanning RAM, VRAM, and NVMe | planned, design still tentative | Weight slabs and KV snapshots demoted across tiers while serving, with live budget rebalancing |
 | Vision input on chat models | planned, design still tentative | Image preprocessing and visual-token injection into chat requests; no config shape has been settled |

@@ -521,6 +521,12 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
         try
         {
             GenerationService engine = GenerationService.Open(view, _logger, _ledger, _compute, _transport);
+
+            // The host's monitor attach, when one was registered, replays onto this freshly opened instance before it
+            // advertises: a hot addition joins the same event line and snapshot cadence every advertised engine already
+            // publishes through, so streams attached after it loads sample it as well.
+            Volatile.Read(ref _monitorAttach)?.Apply(engine);
+
             instance.Engine = engine;
             instance.Posture = ServedPosture.Ready;
 
@@ -528,11 +534,6 @@ public sealed class ModelRegistry : IDisposable, IConfigApplyTarget
             {
                 RebuildPosture(Volatile.Read(ref _posture)); // the snapshot identity stays put; only this instance's posture changed.
             }
-
-            // The host's monitor attach, when one was registered, replays onto this freshly opened instance too: a
-            // hot addition joins the same event line and snapshot cadence every advertised engine already publishes
-            // through, so streams attached after it loads sample it as well.
-            Volatile.Read(ref _monitorAttach)?.Apply(engine);
 
             _logger?.LogInformation("registry_add model='{Model}' outcome=served", instance.Name);
         }

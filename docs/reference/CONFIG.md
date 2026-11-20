@@ -95,13 +95,13 @@ host:
 
 ## `models`
 
-A list that must contain **exactly one** entry: this build serves a single model, and zero or several entries are refused (`must contain exactly one model … (found N)`).
+A list that must declare **at least one** entry. Multiple entries are served concurrently by one registry; duplicate `name` values are refused, and an empty list is refused (`must declare at least one model entry`).
 
 | Key | Type / allowed values | Default | Controls |
 |---|---|---|---|
 | `models[].name` | string, required | — | The model id the API serves and every log line names. |
 | `models[].path` | string, non-empty, required | — | The GGUF file to open. It must exist on disk **unless** the entry declares `source:`, in which case it may name a file that a fetch will create. |
-| `models[].type` | `chat` only | `chat` | Model kind. Any other value is refused: `embed models are not supported in this build`. |
+| `models[].type` | `chat` \| `embed` | `chat` | Model kind. `chat` samples decoded sequences; `embed` opens encode-only serving posture and answers `/v1/embeddings`. Any other value is refused naming the accepted values. |
 | `models[].max_context_tokens` | integer ≥ 128 | `4096` | The admission window: requests longer than this are refused with `context_length_exceeded`, and it is what `/v1/models` advertises as `context_length`. |
 | `models[].kv_blocks` | integer ≥ 8 | `256` | The model's live KV block cap. It is a soft cap inside the physical reservation sized when the engine opens, so raising it above that reservation is clamped, not honoured. Equivalent to `budgets.kv.caps.dram_blocks` — see the budgets note. |
 | `models[].kv.quant.k` | `f32` \| `fp32` \| `f16` \| `fp16` \| `q8_0` \| `q8` \| `int8` \| `q4_0` | `f32` | KV K-side storage format. CPU host-resident quantized serving accepts `q8_0/q8_0` and `q8_0/q4_0`; `q4_0/q4_0` is refused as the dropped pair. |
@@ -112,6 +112,10 @@ A list that must contain **exactly one** entry: this build serves a single model
 | `models[].max_reasoning_tokens` | integer ≥ 1, optional | omitted (unbudgeted) | How many tokens a reasoning region may spend before it is closed. **Hard constraint:** it binds only a model whose tokenizer carries `<think>` and `</think>` as whole tokens. A model declaring it on a vocabulary that cannot express either marker is refused at model open naming the model, the key, and the marker. |
 | `models[].max_response_tokens` | integer ≥ 1, optional | omitted (unbudgeted) | How many tokens of visible output the model may generate. Omitted leaves request-level token limits at their existing semantics. |
 | `models[].max_concurrent_requests` | integer ≥ 1, optional | omitted (uncapped) | Hard cap on how many requests this model holds admitted at once. A submission that would exceed it is refused naming the model and its quota slot rather than queued. Omitted bounds nothing. |
+| `models[].max_queued_requests` | integer ≥ 0, optional | omitted (`0`) | How many submissions may wait for a held admission slot before further ones are refused with `engine_overloaded`. `0` keeps the immediate refusal posture; a positive value queues waiters without admitting them, holding no KV block or token budget until a slot frees. |
+| `models[].queue_timeout_ms` | integer ≥ 1, optional | omitted (`30000` when queueing is enabled) | How long a waiting submission may block for an admission slot before it answers the queue-timeout refusal. Declared while `max_queued_requests` is `0`, it validates but changes no refusal posture. |
+| `models[].pooling` | `mean` \| `cls` | `mean` | Encoder sentence-vector recipe used by `/v1/embeddings`. `mean` averages the encoder forward's per-position hidden states; `cls` takes the first position's vector. A chat entry may declare it, but it decides nothing about what a sampling model returns. |
+| `models[].normalize` | boolean | `false` | Whether pooled embedding vectors are L2-normalized after pooling. Default false answers raw pooled vectors exactly as pooling produced them; true scales each non-zero vector to unit length. A chat entry may declare it, but it decides nothing about what a sampling model returns. |
 | `models[].placement` | mapping | see below | Where the model runs. |
 | `models[].source` | mapping | omitted | Published-source pin. See below. |
 | `models[].budgets` | mapping | omitted | Per-resource tier ceilings. See below. |
@@ -283,8 +287,7 @@ Some related vocabulary validates today — see the current tables above for wha
 | `budgets.kv` write-side `disk` caps, `budgets.prefill_buffers` disk caps | planned | The tier vocabulary may name `disk`, but write-side bytes reach storage only where something writes them; today that machinery does not exist for those positions. |
 | Dense weight demotion to `disk` while serving, and live weight-cap edits moving from restart-only to adjustable | planned | Needs refcounted, double-buffered slab migration. Until then weight ceilings are refused live. |
 | `budgets.ple` (a per-resource chain for an n-gram/PLE table, with its own order and caps) | planned | A read-side resource like weights: origin shard uncapped, hot working-set cap per tier. |
-| `models:` accepting more than one entry, and hot add/remove of models through a config edit | planned | Today exactly one entry is accepted and changing a model is a restart. |
-| `models[].type: embed` | planned | Encoder-only models and an embeddings endpoint. |
+| Concurrent GPU-compute overlap across multiple models resident on one CUDA device | planned | Multi-model serving is registry, admission, budget, and monitor accounting today; per-model CUDA stream co-scheduling remains unimplemented. |
 | Runtime-adjustable per-resource tier caps (budget rebalancing while serving) | planned | Physical re-reservation at step boundaries. |
 | Vision input configuration (a vision encoder beside a chat model) | planned, design tentative | No key names have been settled. |
 | `sm_share`-shaped accelerator compute ceilings | not accepted, deliberately | A ceiling that names a partition nothing enforces would make a measured claim impossible to honour; route segments report stream-slot posture only. |
