@@ -1739,7 +1739,7 @@ Many models at once, each with its own placement policy.
 - [✓] Automated Embeddings: pooling parity vs reference fixtures
 - [✓] Automated Monitor Multi-Instance: one stream carries snapshots from every advertised engine, including an encoder-only engine publishing encode-side facts beside a sampling engine
 
-### MVP6.1 [v0.6.1] - Refined
+### MVP6.1 [v0.6.1] - In Progress
 
 Concurrent multi-model device compute on the single CUDA accelerator: per-model CUDA streams on the shared primary context plus a cross-model co-scheduling seam, so two GPU-resident models advance concurrently instead of serializing every kernel launch through one context — the capability MVP6's "serve multiple models concurrently" promise needs but its ledger (DN-M6-7) does not provide. Single-device scope; multi-GPU placement stays in Backlog. Depends on MVP6. Ordered after MVP6, before MVP7.
 
@@ -1764,7 +1764,7 @@ Concurrent multi-model device compute on the single CUDA accelerator: per-model 
 
 #### Implementation Items
 
-- [_] Co-scheduling payoff bench — measure two-model overlapped tok/s vs serialized single-context on pinned fixtures (see DN-M61-1)
+- [✓] Co-scheduling payoff bench — measure two-model overlapped tok/s vs serialized single-context on pinned fixtures (see DN-M61-1); positive paired-ratio payoff on the 4090, with mixed GEMV/GEMM less stable under contention.
   - Verify: committed `bench/reports/multi-model-device-concurrency-<date>.md` comparing overlapped vs serialized two-model GPU serving; a measured no-win keeps serialize-per-context as the recorded default rather than asserting a concurrency win.
 - [_] Per-model CUDA streams in `CudaBackend` — each model's launches on its own `CUstream` on the shared primary context (see DN-M61-1)
   - Verify: `dotnet test --filter Category=Serve -c Release` on CUDA — two models' forwards enqueue on distinct streams and both make progress concurrently (monitor shows overlapping device steps), and each model's outputs are identical to its solo run.
@@ -2084,6 +2084,8 @@ Vision input on chat models.
 - **2026-11-19 — Whole-suite load can starve the NUMA affinity sampling gate.** MVP6's full suite hit `NumaPlacementTests.NodeDerivedAffinity_KeepsWorkerExecutionsInsideTheChosenNode_WhereTheHostCanPin` once (22 sampled worker executions against a 100-execution floor), the isolated rerun passed in 90 ms, and the repeat-run whole suite was green. Treat this as another full-suite gate family to read "green on repeat runs" with an isolated rerun when it appears; no product posture changed because the gate samples worker affinity under a fixed deadline.
 
 - **2026-11-19 — MVP6.1 keeps its payoff gate as a build-first measurement spike.** The existing DN-M61-1 bench item is the first implementation step because stream overlap cannot be measured honestly without a non-default CUDA stream seam; streams, fair-share bounds, and determinism tests proceed only if that bench shows pay-off, while a no-win records serialize-per-context posture and defers/records the remaining MVP6.1 items rather than asserting concurrency.
+
+- **2026-11-19 — MVP6.1's payoff bench shows CUDA stream overlap is worth building.** The bench-only `cuda-concurrency` spike on RTX 4090 pinned fixtures reported bit-exact serialized-vs-overlapped outputs and positive paired `serialized/overlapped` medians for two-GEMV (`1.57`–`2.00`) and two-GEMM (`1.89`–`2.17`) pairs across three runs; mixed GEMV/GEMM was positive in 2 of 3 runs but inconclusive once under contention, so the recorded posture is proceed with per-model streams/co-scheduling while treating mixed-kernel payoff as less stable and keeping absolute ms out of claims.
 
 - **2026-11-19 — MVP6 ships with monitor corrections discovered by the flagship scenario.** The first live two-model serve exposed that encoder-only engines were invisible on `/monitor/stream` because snapshot publication keyed only decode activity, and hot-added models could advertise ready before their bus was attached. Shipped posture: every advertised engine publishes through a host-scoped event line; embed facades mint request-lifecycle frames and drive additive encode-side counters (`metrics_active_encoder_requests`, `metrics_encoder_requests_total`, `metrics_encoder_tokens_forwarded_total`, `metrics_encoder_tok_s`); registry attach happens before hot-added engines are advertised ready. Flagship evidence: `/v1/models` advertised both models, chat completed on a GPU-heavy coding model with CUDA/VRAM + CPU/DRAM route facts and non-zero persistent VRAM/GPU utilization, embeddings answered two input arrays against `cpu-embed`, and monitor snapshots carried both model ids with per-model device portioning.
 
