@@ -122,3 +122,20 @@ This records the decode-side design suggested for the first (CPU-only) pass. It 
 ## 15. Explicit non-goals for the first pass
 
 No CUDA fused decode; no disk weight tier (gated on refcounted double-buffered prefetch staging, PLAN `:104`); no in-engine runtime A/B comparator — compare AC vs ANS as separate config runs diffed from logs/bench reports (PLAN DN-M7-10 modularity invariant).
+
+## 16. LAIR integration candidates from the conclusions
+
+This maps `CONCLUSION.md` into LAIR seams without changing the default path. It is a menu of where a benefit is real, not an implementation phase.
+
+| Conclusion | LAIR seam / shape | Where benefit appears | Gate / caveat |
+|---|---|---|---|
+| rANS weight provider for `Q4_K`, `IQ4_XS`, `IQ3_XXS` | `IWeightSource` provider wrapping `GgufMmapWeightSource` + new `QuantFormat` / `QuantDescriptor` registry entry + staged kernel arm | Dense decode and prefill when model exceeds cache; MoE resident headroom and compressed offloaded-expert traffic | Only with interleaved/SIMD/tANS decode; per-chunk packed fallback; tables grouped over tensor/layer/expert-tensor, not per-expert |
+| Grouping rule from measurements | Chunk-map scope id in `WeightRef`; shared model over whole expert tensors / layers / model tensors | Avoids the measured per-expert table overhead (~2.7% or raw fallback) | Do not entropy-code each expert separately; group experts if expert streams are coded |
+| Tensor-level / large-group quant variation | New published GGUF format or sidecar `IWeightSource` provider only | EntroLLM-style large entropy-coding win: skewed code distributions, potentially 1.3–1.5× decode speed | LAIR has no conversion tooling (PLAN 2026-10-31, DN-M315-2); only useful if source artifacts already use tensor-level/large-group quant or LAIR later supports sidecar quant artifacts |
+| INT8 entropy coding variation | Optional `Q8_0` compressed provider | Capacity win for int8-resident models; more entropy headroom than 4-bit coding | Not a win versus Q4 speed; low priority for LAIR's quant story |
+| Sub-4-bit codebook / index entropy coding | Future `IQ2_*` / codebook format kernels plus entropy-coded index streams | Footprint win far larger than rANS-on-4-bit: 4–8× from 2-bit/ternary quant, plus index entropy | Needs small codebooks (QuIP#/E8P-like); large codebooks (AQLM-like) can thrash L1/L2 and be slower than FP16; LAIR currently does not decode `IQ2_*` expert tensors |
+| KV entropy coding variation | Future KV offload / paged KV tier only | KV capacity and PCIe/NVMe transfer reduction if KV pages are large, independently decodable, and use shared codebooks | Not suitable for the hot random-access attention loop as-is; needs Ecco-style block granularity and parallel decode |
+| GPU fused entropy decode | Future CUDA backend compressed weight/KV tier | VRAM capacity and offload-bandwidth win, not decode speed | Current non-goal; requires parallel LUT/SRAM decode (DFloat11 / Huff-LLM pattern) or decode cost can regress |
+| Codec variants behind `ICodec` | `ICodec` remains the extension seam | tANS/FSE may give rANS-like ratio with simpler CPU decode; Huffman may be better for parallel GPU/KV pipelines | AC remains a measurement reference, not the practical LAIR codec |
+
+**Recommended first LAIR addition, if any:** the smallest useful experiment is a config-flagged rANS provider for large groupings of existing GGUF formats (`Q4_K`, `IQ4_XS`, `IQ3_XXS`) using the staged kernel shape from §8 and the packed fallback from §10. Its benefit is capacity/offload plus ~1.0–1.2× only when decode is interleaved/SIMD. The larger wins from the research conclusions are deferred until LAIR has source formats or sidecar providers that already use tensor-level quant, small-codebook sub-4-bit quant, or block-page KV.
