@@ -20,6 +20,15 @@ public sealed partial class CudaBackend
     // compute call's traffic — it is deliberately absent from the runtime transfer tallies, which answer only activation
     // inputs and kernel outputs crossing during a GEMV. Every byte held here reads off PersistentDeviceWeightBytes for as
     // long as its allocation stands, and drops out of that reading when the instance releases it.
+    //
+    // The fill rides the instance stream and joins it before answering, which is what keeps a resident tensor safe under
+    // per-model streams: the copy that fills this region is enqueued ahead of every launch that will read it on this
+    // lane, and the join guarantees the bytes are on the device before the caller's kernel can consume them. A
+    // synchronous copy would land on the legacy default stream instead, and a non-blocking instance stream never
+    // rendezvouses with that stream — a launch enqueued right after such a copy could read the region before its upload
+    // had landed. The join also bounds the source's lifetime: the caller pins the weight bytes only for this call, so the
+    // upload must be complete when the call answers. The allocation itself stays classic (one-time, per tensor): a
+    // classic allocation is usable on every stream the moment it returns, and the buffer lives until dispose.
     private ulong EnsureDeviceWeights(nint hostPointer, nuint bytes)
     {
         if (_deviceWeights.TryGetValue((hostPointer, (long)bytes), out ulong existing))
@@ -33,8 +42,10 @@ public sealed partial class CudaBackend
 
         unsafe
         {
-            CudaException.ThrowIf("cuMemcpyHtoD_v2", CudaNative.cuMemcpyHtoD(devicePointer, (byte*)hostPointer, bytes));
+            CudaException.ThrowIf("cuMemcpyHtoDAsync_v2", CudaNative.cuMemcpyHtoDAsync(devicePointer, (byte*)hostPointer, bytes, _stream));
         }
+
+        SyncInstanceStream(); // the resident region is device-complete before any launch enqueued on this lane can read it
 
         return devicePointer;
     }

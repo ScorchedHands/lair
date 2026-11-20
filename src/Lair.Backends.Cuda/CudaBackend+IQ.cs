@@ -130,19 +130,30 @@ public sealed partial class CudaBackend
                 ulong deviceOut = 0;
                 try
                 {
-                    CudaException.ThrowIf("cuMemAlloc_v2", CudaNative.cuMemAlloc(out deviceQa, (nuint)qaBytes));
-                    CudaException.ThrowIf("cuMemAlloc_v2", CudaNative.cuMemAlloc(out deviceDa, (nuint)(daFloats * sizeof(float))));
-                    CudaException.ThrowIf("cuMemAlloc_v2", CudaNative.cuMemAlloc(out deviceOut, outBytes));
+                    // Stream-ordered transients on this lane, exactly as the FP-activation family now allocates them.
+                    CudaException.ThrowIf("cuMemAllocAsync", CudaNative.cuMemAllocAsync(out deviceQa, (nuint)qaBytes, _stream));
+                    CudaException.ThrowIf("cuMemAllocAsync", CudaNative.cuMemAllocAsync(out deviceDa, (nuint)(daFloats * sizeof(float)), _stream));
+                    CudaException.ThrowIf("cuMemAllocAsync", CudaNative.cuMemAllocAsync(out deviceOut, outBytes, _stream));
+
+                    // Same pinned staging and instance-lane queueing as the FP-activation family: quants stage at one end of
+                    // the input arena and their scales beside them (qa sizes are whole 256-byte super-blocks, so the second
+                    // region is already aligned), each upload enqueues on this backend's own stream without blocking.
+                    EnsurePinnedIn((nuint)qaBytes + (nuint)(daFloats * sizeof(float)));
 
                     fixed (byte* pQa = qaPool)
                     {
-                        CudaException.ThrowIf("cuMemcpyHtoD_v2", CudaNative.cuMemcpyHtoD(deviceQa, pQa, (nuint)qaBytes));
+                        Buffer.MemoryCopy(pQa, (byte*)_pinnedIn, (long)_pinnedInBytes, qaBytes);
+                        CudaException.ThrowIf("cuMemcpyHtoDAsync_v2", CudaNative.cuMemcpyHtoDAsync(deviceQa, (byte*)_pinnedIn, (nuint)qaBytes, _stream));
+
                         AccountRuntimeCopy(qaBytes); // this call's quantized activation crossing the seam ...
                     }
 
                     fixed (float* pDa = daPool)
                     {
-                        CudaException.ThrowIf("cuMemcpyHtoD_v2", CudaNative.cuMemcpyHtoD(deviceDa, (byte*)pDa, (nuint)(daFloats * sizeof(float))));
+                        Buffer.MemoryCopy(pDa, (byte*)_pinnedIn + qaBytes, (long)(_pinnedInBytes - (nuint)qaBytes), daFloats * sizeof(float));
+
+                        CudaException.ThrowIf("cuMemcpyHtoDAsync_v2", CudaNative.cuMemcpyHtoDAsync(deviceDa, (byte*)_pinnedIn + qaBytes, (nuint)(daFloats * sizeof(float)), _stream));
+
                         AccountRuntimeCopy(daFloats * sizeof(float)); // ... and its per-super-block scales beside it.
                     }
 
@@ -162,23 +173,39 @@ public sealed partial class CudaBackend
 
                     uint blocksG = (uint)((rows + KernelThreads - 1) / KernelThreads); // same row-per-thread grid geometry as every other GEMV in the family.
                     bool timed = BeginKernelTiming(); // device-measured busy time for exactly this launch, when the seam is open here
-                    CudaException.ThrowIf("cuLaunchKernel", CudaNative.cuLaunchKernel(function, blocksG, 1, 1, KernelThreads, 1, 1, 0, IntPtr.Zero, kernelParams, null));
+                    CudaException.ThrowIf("cuLaunchKernel", CudaNative.cuLaunchKernel(function, blocksG, 1, 1, KernelThreads, 1, 1, 0, _stream, kernelParams, null));
                     if (timed)
                     {
                         StampKernelEnd();
                     }
 
-                    CudaException.ThrowIf("cuCtxSynchronize", CudaNative.cuCtxSynchronize());
+                    EnsurePinnedOut(outBytes);
+                    CudaException.ThrowIf("cuMemcpyDtoHAsync_v2", CudaNative.cuMemcpyDtoHAsync((byte*)_pinnedOut, deviceOut, outBytes, _stream));
+
+                    CudaException.ThrowIf("cuMemFreeAsync", CudaNative.cuMemFreeAsync(deviceOut, _stream));
+                    CudaException.ThrowIf("cuMemFreeAsync", CudaNative.cuMemFreeAsync(deviceDa, _stream));
+                    CudaException.ThrowIf("cuMemFreeAsync", CudaNative.cuMemFreeAsync(deviceQa, _stream));
+                    deviceOut = 0;
+                    deviceDa = 0;
+                    deviceQa = 0;
+
+                    SyncInstanceStream(); // joins this instance's own stream only: another model's kernels keep running while this lane drains
                     if (timed)
                     {
-                        FoldKernelElapsed(); // both stamps have completed by the time this instance's context synchronize returns
+                        FoldKernelElapsed(); // both stamps have completed by the time this instance's stream synchronize returns
                     }
 
                     fixed (float* pOut = output)
                     {
-                        CudaException.ThrowIf("cuMemcpyDtoH_v2", CudaNative.cuMemcpyDtoH((byte*)pOut, deviceOut, outBytes));
+                        Buffer.MemoryCopy((byte*)_pinnedOut, pOut, outBytes, outBytes);
                         AccountRuntimeCopy((long)outBytes); // this call's kernel output crossing back to host memory
                     }
+                }
+                catch
+                {
+                    CudaNative.cuStreamSynchronize(_stream); // drain the lane before finally releases its buffers: a failed enqueue may leave earlier staging pending
+
+                    throw;
                 }
                 finally
                 {
@@ -219,7 +246,10 @@ public sealed partial class CudaBackend
 
     // Ensures the fused device scratch of pinned tables exists and answers each table's sub-pointer. cuMemAlloc hands back an
     // aligned base; every region length here is a multiple of four bytes, so grid regions land dword-aligned inside it and
-    // whole-entry loads stay legal without per-table allocations (ksigns and the IQ4 value table ride in scratch too).
+    // whole-entry loads stay legal without per-table allocations (ksigns and the IQ4 value table ride in scratch too). Every
+    // table fill rides the instance stream and the whole scratch joins before answering, exactly as a resident weight copy
+    // does: the launches that index these tables are enqueued on this lane behind the fills, and the join covers the source
+    // tables' own lifetime because each is pinned only for the copy that stages it.
     private void EnsureIqScratch()
     {
         if (_iqScratchDevice != 0)
@@ -235,22 +265,24 @@ public sealed partial class CudaBackend
         _iqScratchDevice = scratch;
 
         int offset = 0;
-        UploadTable(scratch, ref offset, GetKSignsIQ2XS(), out _tabKSigns); // 128 bytes: dword-aligned at the aligned base.
-        UploadTable(scratch, ref offset, Iq4ValueBytes(), out _tabIq4Values); // 16 bytes on top of it: still a multiple of four.
-        UploadTable(scratch, ref offset, GetIq2XXSGrid(), out _tabIq2XXSGrid);
-        UploadTable(scratch, ref offset, GetIq2XSGrid(), out _tabIq2XSGrid);
-        UploadTable(scratch, ref offset, GetIq2SGrid(), out _tabIq2SGrid);
-        UploadTable(scratch, ref offset, GetIq3XXSGrid(), out _tabIq3XGrid);
-        UploadTable(scratch, ref offset, GetIq3SGrid(), out _tabIq3SGrid);
+        UploadTable(scratch, ref offset, GetKSignsIQ2XS(), out _tabKSigns, _stream); // 128 bytes: dword-aligned at the aligned base.
+        UploadTable(scratch, ref offset, Iq4ValueBytes(), out _tabIq4Values, _stream); // 16 bytes on top of it: still a multiple of four.
+        UploadTable(scratch, ref offset, GetIq2XXSGrid(), out _tabIq2XXSGrid, _stream);
+        UploadTable(scratch, ref offset, GetIq2XSGrid(), out _tabIq2XSGrid, _stream);
+        UploadTable(scratch, ref offset, GetIq2SGrid(), out _tabIq2SGrid, _stream);
+        UploadTable(scratch, ref offset, GetIq3XXSGrid(), out _tabIq3XGrid, _stream);
+        UploadTable(scratch, ref offset, GetIq3SGrid(), out _tabIq3SGrid, _stream);
 
-        static void UploadTable(ulong scratch, ref int offset, ReadOnlySpan<byte> table, out ulong deviceBase)
+        SyncInstanceStream(); // every table is device-complete before the first launch that indexes one of them
+
+        static void UploadTable(ulong scratch, ref int offset, ReadOnlySpan<byte> table, out ulong deviceBase, IntPtr stream)
         {
             deviceBase = scratch + (uint)offset; // byte offsets stay dword-aligned by construction: every region length is a multiple of four.
             unsafe
             {
                 fixed (byte* p = table)
                 {
-                    CudaException.ThrowIf("cuMemcpyHtoD_v2", CudaNative.cuMemcpyHtoD(deviceBase, p, (nuint)table.Length));
+                    CudaException.ThrowIf("cuMemcpyHtoDAsync_v2", CudaNative.cuMemcpyHtoDAsync(deviceBase, p, (nuint)table.Length, stream));
                 }
             }
 

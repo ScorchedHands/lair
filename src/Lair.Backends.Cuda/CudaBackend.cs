@@ -181,6 +181,8 @@ public sealed partial class CudaBackend : IBackend
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _attnCausalPaged, _module, "attn_causal_paged"));
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _attnCausalQ8Q8, _module, "attn_causal_paged_q8q8"));
                 CudaException.ThrowIf("cuModuleGetFunction", CudaNative.cuModuleGetFunction(out _attnCausalK8V4, _module, "attn_causal_paged_k8v4"));
+
+                CreateInstanceStream(); // every steady-state launch and staging copy on this seam carries this instance's own non-blocking lane.
             }
             catch
             {
@@ -424,11 +426,14 @@ public sealed partial class CudaBackend : IBackend
             _disposed = true;
             SetCurrentContext();
 
+            SyncInstanceStream(); // drain the instance lane first: every later teardown step assumes no copy or kernel on this backend's stream is still reading host regions or device buffers
             ReleaseKvMirrors(); // mirrors flush and release their pins while this instance's context is still current
             ReleaseDeviceSteps(); // a step's buffers belong to this context too, so they go before it does
             FreeIqScratch(); // the pinned i-quant tables belong to this context too, so they go before it does
             FreeDeviceWeightAllocations();
             ReleaseHostMappedRegions();
+            DestroyInstanceStream(); // the instance lane joins its own pending work and goes before its timing events, module, and context do
+            FreePinnedStaging(); // pinned activation staging arenas belong to this context too: no stream can reach them once it is destroyed
             ReleaseTimingEvents(); // the launch-timing pair belongs to this context too, so it goes before the context does
         }
 
@@ -485,16 +490,24 @@ public sealed partial class CudaBackend : IBackend
             ulong deviceOut = 0;
             try
             {
-                CudaException.ThrowIf("cuMemAlloc_v2", CudaNative.cuMemAlloc(out deviceX, xBytes));
-                CudaException.ThrowIf("cuMemAlloc_v2", CudaNative.cuMemAlloc(out deviceOut, outBytes));
+                // Steady-state transients are stream-ordered on this lane: allocated behind nothing but earlier queued
+                // work here, consumed by the copies and launch enqueued after them, and released back into the lane's pool
+                // behind the download that last touches the result. No classic allocation or free lands in a compute call,
+                // so a second model's stream is never held behind this instance's allocator bookkeeping either.
+                CudaException.ThrowIf("cuMemAllocAsync", CudaNative.cuMemAllocAsync(out deviceX, xBytes, _stream));
+                CudaException.ThrowIf("cuMemAllocAsync", CudaNative.cuMemAllocAsync(out deviceOut, outBytes, _stream));
 
                 unsafe
                 {
+                    // Steady-state staging on this instance's own lane: the activation bytes land in a pinned arena and their upload is enqueued behind everything already queued on the stream, so neither direction blocks inside the driver until this call joins its lane at the end.
                     fixed (float* pIn = activations)
                     {
-                        CudaException.ThrowIf("cuMemcpyHtoD_v2", CudaNative.cuMemcpyHtoD(deviceX, (byte*)pIn, xBytes));
-                        AccountRuntimeCopy((long)xBytes); // this call's activation input crossing the seam
+                        EnsurePinnedIn(xBytes);
+                        Buffer.MemoryCopy(pIn, (byte*)_pinnedIn, _pinnedInBytes, xBytes);
+                        CudaException.ThrowIf("cuMemcpyHtoDAsync_v2", CudaNative.cuMemcpyHtoDAsync(deviceX, (byte*)_pinnedIn, xBytes, _stream));
                     }
+
+                    AccountRuntimeCopy((long)xBytes); // this call's activation input crossing the seam
 
                     uint rowsU = (uint)rows;
                     uint colsU = (uint)cols;
@@ -515,24 +528,40 @@ public sealed partial class CudaBackend : IBackend
 
                     uint blocks = (uint)((rows + KernelThreads - 1) / KernelThreads);
                     bool timed = BeginKernelTiming(); // device-measured busy time for exactly this launch, when the seam is open here
-                    CudaException.ThrowIf("cuLaunchKernel", CudaNative.cuLaunchKernel(function, blocks, 1, 1, KernelThreads, 1, 1, 0, IntPtr.Zero, kernelParams, null));
+                    CudaException.ThrowIf("cuLaunchKernel", CudaNative.cuLaunchKernel(function, blocks, 1, 1, KernelThreads, 1, 1, 0, _stream, kernelParams, null));
                     if (timed)
                     {
                         StampKernelEnd();
                     }
 
-                    CudaException.ThrowIf("cuCtxSynchronize", CudaNative.cuCtxSynchronize());
+                    // The result download is enqueued on the same lane before this call joins it: pinned staging lets the copy queue without a blocking pageable rendezvous, so only this instance's stream is awaited. Both transients then return to the lane's pool behind that download, in order and without a host-side stall.
+                    EnsurePinnedOut(outBytes);
+                    CudaException.ThrowIf("cuMemcpyDtoHAsync_v2", CudaNative.cuMemcpyDtoHAsync((byte*)_pinnedOut, deviceOut, outBytes, _stream));
+
+                    CudaException.ThrowIf("cuMemFreeAsync", CudaNative.cuMemFreeAsync(deviceOut, _stream));
+                    CudaException.ThrowIf("cuMemFreeAsync", CudaNative.cuMemFreeAsync(deviceX, _stream));
+                    deviceOut = 0;
+                    deviceX = 0;
+
+                    SyncInstanceStream(); // joins this instance's own stream only: another model's kernels keep running while this lane drains
                     if (timed)
                     {
-                        FoldKernelElapsed(); // both stamps have completed by the time this instance's context synchronize returns
+                        FoldKernelElapsed(); // both stamps have completed by the time this instance's stream synchronize returns
                     }
 
                     fixed (float* pOut = output)
                     {
-                        CudaException.ThrowIf("cuMemcpyDtoH_v2", CudaNative.cuMemcpyDtoH((byte*)pOut, deviceOut, outBytes));
-                        AccountRuntimeCopy((long)outBytes); // this call's kernel output crossing back to host memory
+                        Buffer.MemoryCopy((byte*)_pinnedOut, pOut, outBytes, outBytes);
                     }
+
+                    AccountRuntimeCopy((long)outBytes); // this call's kernel output crossing back to host memory
                 }
+            }
+            catch
+            {
+                CudaNative.cuStreamSynchronize(_stream); // drain the lane before finally releases its buffers: a failed enqueue may leave earlier staging pending, and a pool chunk only takes the classic free after that explicit join
+
+                throw;
             }
             finally
             {

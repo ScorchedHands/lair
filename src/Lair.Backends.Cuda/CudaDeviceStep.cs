@@ -359,6 +359,11 @@ public sealed unsafe class CudaDeviceStep : IDisposable, IDeviceAttentionStep
             Upload(_cos, cos);
             Upload(_sin, sin);
             _ropeLoaded = true;
+
+            // The tables upload async on the backend lane, so the join here is what keeps the caller's spans alive for
+            // the copy: a rented or reused angle table must not be recycled while an enqueued upload still reads it, and
+            // the resident tables are device-complete before the first rotation consumes them.
+            _backend.SyncInstanceStream();
         }
         finally
         {
@@ -413,6 +418,12 @@ public sealed unsafe class CudaDeviceStep : IDisposable, IDeviceAttentionStep
             Upload(_valueStage, vRows);
             _backend.AccountStepTransfer((long)vRows.Length << 2);
             _stagedRows = rows;
+
+            // The window's rows upload async on the backend lane, so the join here is what bounds the caller's spans:
+            // the host forward reuses the arrays it staged from for the next layer, and a reused buffer must not be
+            // overwritten while an enqueued upload still reads it. The rotation and KV write that consume these rows are
+            // enqueued on the same lane behind the copies, exactly as before.
+            _backend.SyncInstanceStream();
         }
         finally
         {
@@ -451,8 +462,10 @@ public sealed unsafe class CudaDeviceStep : IDisposable, IDeviceAttentionStep
         {
             fixed (float* p = output)
             {
-                CudaException.ThrowIf("cuMemcpyDtoH_v2", CudaNative.cuMemcpyDtoH((byte*)p, stagingBase, (nuint)bytes));
+                CudaException.ThrowIf("cuMemcpyDtoHAsync_v2", CudaNative.cuMemcpyDtoHAsync((byte*)p, stagingBase, (nuint)bytes, _backend.ComputeStream));
             }
+
+            _backend.SyncInstanceStream(); // the read-back rows are resident in the caller's span only after this lane joins
         }
         finally
         {
@@ -505,7 +518,7 @@ public sealed unsafe class CudaDeviceStep : IDisposable, IDeviceAttentionStep
                 _backend.StampStepKernelEnd();
             }
 
-            CudaException.ThrowIf("cuCtxSynchronize", CudaNative.cuCtxSynchronize());
+            _backend.SyncInstanceStream(); // joins this backend's own stream only: a second model's kernels keep running while this step's lane drains
             if (timed)
             {
                 _backend.FoldStepKernelElapsed();
@@ -760,9 +773,11 @@ public sealed unsafe class CudaDeviceStep : IDisposable, IDeviceAttentionStep
 
             fixed (float* pOut = output)
             {
-                CudaException.ThrowIf("cuMemcpyDtoH_v2", CudaNative.cuMemcpyDtoH((byte*)pOut, outDevice, (nuint)outBytes));
-                _backend.AccountStepTransfer(outBytes);
+                CudaException.ThrowIf("cuMemcpyDtoHAsync_v2", CudaNative.cuMemcpyDtoHAsync((byte*)pOut, outDevice, (nuint)outBytes, _backend.ComputeStream));
             }
+
+            _backend.SyncInstanceStream(); // the attention result is resident in the caller's span only after this lane joins
+            _backend.AccountStepTransfer(outBytes);
         }
         finally
         {
@@ -876,6 +891,11 @@ public sealed unsafe class CudaDeviceStep : IDisposable, IDeviceAttentionStep
             Upload(_queries, qRows);
             _backend.AccountStepTransfer((long)qRows.Length << 2);
             _stagedRows = rows;
+
+            // Same lifetime contract as StageWindow's upload: the decode path stages from buffers it recycles between
+            // tokens, so the lane joins before this call answers and the staged queries are device-complete for the
+            // rotation and attention walk enqueued behind them.
+            _backend.SyncInstanceStream();
         }
         finally
         {
@@ -895,6 +915,9 @@ public sealed unsafe class CudaDeviceStep : IDisposable, IDeviceAttentionStep
         _backend.EnterDeviceWork();
         try
         {
+            // Join the backend lane first: a staged window's uploads are async on it, and buffers must not free while an enqueued copy still writes them.
+            _backend.SyncInstanceStream();
+
             // A store-bound step owns no KV arenas — the mirror owns the store it wrote — so only its staging and
             // table allocations come back here. The store itself is released with the pool's mirror.
             foreach (ulong pointer in _kvStore is null
@@ -950,21 +973,22 @@ public sealed unsafe class CudaDeviceStep : IDisposable, IDeviceAttentionStep
         }
     }
 
-    // Launches one step kernel on the backend's gate with the timing pair bracketing exactly this launch, then
-    // synchronizes the context and folds the elapsed answer into the kernel-busy tally — the same device-measured
-    // region every other call site on this seam brackets, whichever kernel and grid the branch built.
+    // Launches one step kernel on the backend's gate with the timing pair bracketing exactly this launch, then joins the
+    // backend instance stream and folds the elapsed answer into the kernel-busy tally — the same device-measured region
+    // every other call site on this seam brackets, whichever kernel and grid the branch built. The launch carries the
+    // backend's own non-blocking stream: a step never queues onto the legacy default stream.
     private void LaunchStepKernel(IntPtr kernel, void** kernelParams, uint gridX, uint gridY, uint blockX)
     {
         bool timed = _backend.BeginStepKernelTiming();
         CudaException.ThrowIf(
             "cuLaunchKernel",
-            CudaNative.cuLaunchKernel(kernel, gridX, gridY, 1, blockX, 1, 1, 0, IntPtr.Zero, kernelParams, null));
+            CudaNative.cuLaunchKernel(kernel, gridX, gridY, 1, blockX, 1, 1, 0, _backend.ComputeStream, kernelParams, null));
         if (timed)
         {
             _backend.StampStepKernelEnd();
         }
 
-        CudaException.ThrowIf("cuCtxSynchronize", CudaNative.cuCtxSynchronize());
+        _backend.SyncInstanceStream();
         if (timed)
         {
             _backend.FoldStepKernelElapsed();
@@ -991,14 +1015,16 @@ public sealed unsafe class CudaDeviceStep : IDisposable, IDeviceAttentionStep
 
         CudaException.ThrowIf(
             "cuLaunchKernel",
-            CudaNative.cuLaunchKernel(function, (uint)rowCount, (uint)regions, 1, StagedKernelThreads, 1, 1, 0, IntPtr.Zero, kernelParams, null));
+            CudaNative.cuLaunchKernel(function, (uint)rowCount, (uint)regions, 1, StagedKernelThreads, 1, 1, 0, _backend.ComputeStream, kernelParams, null));
     }
 
-    private static void Upload(ulong devicePointer, ReadOnlySpan<float> values)
+    // Staged rows upload async on the backend instance stream: the rotation and KV-write launches that consume them are
+    // enqueued behind this copy on the same lane, so stream order covers the dependency without a per-upload join.
+    private void Upload(ulong devicePointer, ReadOnlySpan<float> values)
     {
         fixed (float* p = values)
         {
-            CudaException.ThrowIf("cuMemcpyHtoD_v2", CudaNative.cuMemcpyHtoD(devicePointer, (byte*)p, (nuint)(values.Length * sizeof(float))));
+            CudaException.ThrowIf("cuMemcpyHtoDAsync_v2", CudaNative.cuMemcpyHtoDAsync(devicePointer, (byte*)p, (nuint)(values.Length * sizeof(float)), _backend.ComputeStream));
         }
     }
 }

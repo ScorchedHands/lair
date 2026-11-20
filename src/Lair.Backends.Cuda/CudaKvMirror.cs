@@ -153,10 +153,15 @@ internal sealed unsafe class CudaKvMirror : IKvDeviceMirror
                 // The store starts byte-identical to the pool's own zeroed arena over the declared range: one residency
                 // crossing at open, staged from the arena the mirror already pins, so a position a step has not written
                 // yet reads back as the zeros the pool's arena holds — the same unwritten-slot posture every pool has.
+                // The copy rides the owning backend's instance stream and joins it before answering: a device step that
+                // consumes this store launches on that lane behind the upload, and the join keeps the pool free to write
+                // its own arena again only after the bytes it staged have landed. A legacy-stream copy would order with
+                // nothing here — an instance stream never rendezvouses with the default stream.
                 long rangeOffset = checked((long)request.FirstBlockId * request.BytesPerBlock);
                 CudaException.ThrowIf(
-                    "cuMemcpyHtoD_v2",
-                    CudaNative.cuMemcpyHtoD(allocated, (byte*)(_pinnedBase + rangeOffset), (nuint)deviceBytes));
+                    "cuMemcpyHtoDAsync_v2",
+                    CudaNative.cuMemcpyHtoDAsync(allocated, (byte*)(_pinnedBase + rangeOffset), (nuint)deviceBytes, backend.ComputeStream));
+                backend.SyncInstanceStream();
                 for (int blockId = request.FirstBlockId; blockId < request.FirstBlockId + request.BlockCount; blockId++)
                 {
                     _crossed.Add(blockId);
@@ -279,9 +284,13 @@ internal sealed unsafe class CudaKvMirror : IKvDeviceMirror
             fixed (float* p = output)
             {
                 CudaException.ThrowIf(
-                    "cuMemcpyDtoH_v2",
-                    CudaNative.cuMemcpyDtoH((byte*)p, _devicePointer + (ulong)deviceOffset, (nuint)_request.BytesPerBlock));
+                    "cuMemcpyDtoHAsync_v2",
+                    CudaNative.cuMemcpyDtoHAsync((byte*)p, _devicePointer + (ulong)deviceOffset, (nuint)_request.BytesPerBlock, _backend.ComputeStream));
             }
+
+            // The read-back rides the instance stream and joins it before answering: bytes a step kernel wrote on that
+            // lane are ordered ahead of this copy, and they reach the caller's span only once the lane has drained.
+            _backend.SyncInstanceStream();
         }
         finally
         {
@@ -320,15 +329,21 @@ internal sealed unsafe class CudaKvMirror : IKvDeviceMirror
                 long hostOffset = (long)blockId * _request.BytesPerBlock;
                 long deviceOffset = (long)(blockId - _request.FirstBlockId) * _request.BytesPerBlock;
                 CudaException.ThrowIf(
-                    "cuMemcpyHtoD_v2",
-                    CudaNative.cuMemcpyHtoD(
+                    "cuMemcpyHtoDAsync_v2",
+                    CudaNative.cuMemcpyHtoDAsync(
                         _devicePointer + (ulong)deviceOffset,
                         (byte*)(_request.HostArenaBase + hostOffset),
-                        (nuint)_request.BytesPerBlock));
+                        (nuint)_request.BytesPerBlock,
+                        _backend.ComputeStream));
 
                 _crossed.Add(blockId);
                 _crossedBytes += _request.BytesPerBlock;
             }
+
+            // Every crossing rides the owning backend's instance stream and this join closes it: a device step reading
+            // these blocks launches on that lane behind them, and the pool regains write access to its own arena only
+            // after what it staged here has landed. A legacy-stream copy would order with nothing under per-model streams.
+            _backend.SyncInstanceStream();
 
             _dirty.Clear();
         }
@@ -351,6 +366,11 @@ internal sealed unsafe class CudaKvMirror : IKvDeviceMirror
         _backend.EnterDeviceWork();
         try
         {
+            // Join before releasing either side of the pairing: a host region unregistered or a device buffer freed while
+            // an enqueued copy still reads them would strand that copy against memory this seam no longer owns. The lane
+            // join is what makes both releases safe without reaching for the whole context.
+            _backend.SyncInstanceStream();
+
             CudaNative.cuMemFree(_devicePointer);
             CudaNative.cuMemHostUnregister((void*)_pinnedBase);
         }

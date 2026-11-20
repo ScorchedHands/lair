@@ -120,14 +120,19 @@ public sealed partial class CudaBackend
             ulong deviceOut = 0;
             try
             {
-                CudaException.ThrowIf("cuMemAlloc_v2", CudaNative.cuMemAlloc(out deviceX, xBytes));
-                CudaException.ThrowIf("cuMemAlloc_v2", CudaNative.cuMemAlloc(out deviceOut, outBytes));
+                // Steady-state transients ride this lane exactly as the GEMV family's do: stream-ordered allocation, consumption by work enqueued behind it, and release back into the pool behind the download that last touches the result.
+                CudaException.ThrowIf("cuMemAllocAsync", CudaNative.cuMemAllocAsync(out deviceX, xBytes, _stream));
+                CudaException.ThrowIf("cuMemAllocAsync", CudaNative.cuMemAllocAsync(out deviceOut, outBytes, _stream));
 
                 unsafe
                 {
+                    // Same pinned staging and instance-lane queueing as every GEMV here: the window's activation bytes upload async on this backend's own stream.
                     fixed (float* pIn = activations)
                     {
-                        CudaException.ThrowIf("cuMemcpyHtoD_v2", CudaNative.cuMemcpyHtoD(deviceX, (byte*)pIn, xBytes));
+                        EnsurePinnedIn(xBytes);
+                        Buffer.MemoryCopy(pIn, (byte*)_pinnedIn, _pinnedInBytes, xBytes);
+                        CudaException.ThrowIf("cuMemcpyHtoDAsync_v2", CudaNative.cuMemcpyHtoDAsync(deviceX, (byte*)_pinnedIn, xBytes, _stream));
+
                         AccountRuntimeCopy((long)xBytes); // this call's activation input crossing the seam
                     }
 
@@ -150,24 +155,39 @@ public sealed partial class CudaBackend
 
                     uint blocks = (uint)((rows + KernelThreads - 1) / KernelThreads); // one weight row per thread: same grid geometry as every GEMV in the family.
                     bool timed = BeginKernelTiming(); // device-measured busy time for exactly this launch, when the seam is open here
-                    CudaException.ThrowIf("cuLaunchKernel", CudaNative.cuLaunchKernel(function, blocks, 1, 1, KernelThreads, 1, 1, 0, IntPtr.Zero, kernelParams, null));
+                    CudaException.ThrowIf("cuLaunchKernel", CudaNative.cuLaunchKernel(function, blocks, 1, 1, KernelThreads, 1, 1, 0, _stream, kernelParams, null));
                     if (timed)
                     {
                         StampKernelEnd();
                     }
 
-                    CudaException.ThrowIf("cuCtxSynchronize", CudaNative.cuCtxSynchronize());
+                    EnsurePinnedOut(outBytes);
+                    CudaException.ThrowIf("cuMemcpyDtoHAsync_v2", CudaNative.cuMemcpyDtoHAsync((byte*)_pinnedOut, deviceOut, outBytes, _stream));
+
+                    CudaException.ThrowIf("cuMemFreeAsync", CudaNative.cuMemFreeAsync(deviceOut, _stream));
+                    CudaException.ThrowIf("cuMemFreeAsync", CudaNative.cuMemFreeAsync(deviceX, _stream));
+                    deviceOut = 0;
+                    deviceX = 0;
+
+                    SyncInstanceStream(); // joins this instance's own stream only: another model's kernels keep running while this lane drains
                     if (timed)
                     {
-                        FoldKernelElapsed(); // both stamps have completed by the time this instance's context synchronize returns
+                        FoldKernelElapsed(); // both stamps have completed by the time this instance's stream synchronize returns
                     }
 
                     fixed (float* pOut = output)
                     {
-                        CudaException.ThrowIf("cuMemcpyDtoH_v2", CudaNative.cuMemcpyDtoH((byte*)pOut, deviceOut, outBytes));
+                        Buffer.MemoryCopy((byte*)_pinnedOut, pOut, outBytes, outBytes);
+
                         AccountRuntimeCopy((long)outBytes); // this call's kernel output crossing back to host memory
                     }
                 }
+            }
+            catch
+            {
+                CudaNative.cuStreamSynchronize(_stream); // drain the lane before finally releases its buffers: a failed enqueue may leave earlier staging pending
+
+                throw;
             }
             finally
             {

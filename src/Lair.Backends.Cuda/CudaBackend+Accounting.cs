@@ -4,11 +4,12 @@ public sealed partial class CudaBackend
 {
     // Cumulative engine-side accounting for this instance's device work, read as volatile totals by any observer that
     // samples while kernels run. The kernel-busy total is measured by the device itself: a pair of driver events sits
-    // around each launch on the same stream every launch here already uses, so the answer is how long the kernel was
-    // busy on the device rather than what wall time elapsed around the call site. Runtime transfer totals count only
-    // copies made by compute calls — activation inputs crossing to the device and kernel outputs coming back. The
-    // one-time weight upload a default posture performs when it caches a tensor, host-region registrations, and a KV
-    // mirror's residency crossings each stay outside these tallies: they are residency moves, not a compute call's traffic.
+    // around each launch on this instance's own non-blocking stream — never the legacy NULL/default one — so the answer
+    // is how long the kernel was busy on the device rather than what wall time elapsed around the call site. Runtime
+    // transfer totals count only copies made by compute calls — activation inputs crossing to the device and kernel
+    // outputs coming back, now staged through pinned arenas and queued on the instance stream. The one-time weight upload
+    // a default posture performs when it caches a tensor, host-region registrations, and a KV mirror's residency crossings
+    // each stay outside these tallies: they are residency moves, not a compute call's traffic.
     private long _kernelBusyMicrosecondsTotal;
     private long _runtimeTransferBytesTotal;
     private long _runtimeTransferCallsTotal;
@@ -57,8 +58,9 @@ public sealed partial class CudaBackend
         _timingEnd = end;
     }
 
-    // Answers whether this launch is timed, and records the opening stamp on the default stream when it is. The stamp
-    // lands in stream order after every earlier copy has already crossed, so what follows measures kernel work alone.
+    // Answers whether this launch is timed, and records the opening stamp on the instance's own stream when it is. The
+    // stamp lands in stream order after every earlier staging copy has already crossed, so what follows measures kernel
+    // work alone — exactly the region a whole-context synchronize used to bracket before per-model streams stood up.
     private bool BeginKernelTiming()
     {
         if (_timingStart == 0)
@@ -71,14 +73,14 @@ public sealed partial class CudaBackend
             return false;
         }
 
-        CudaException.ThrowIf("cuEventRecord", CudaNative.cuEventRecord(_timingStart, IntPtr.Zero));
+        CudaException.ThrowIf("cuEventRecord", CudaNative.cuEventRecord(_timingStart, _stream));
         return true;
     }
 
-    // Records the closing stamp immediately after the launch is enqueued, so elapsed time covers exactly this kernel.
-    private void StampKernelEnd() => CudaException.ThrowIf("cuEventRecord", CudaNative.cuEventRecord(_timingEnd, IntPtr.Zero));
+    // Records the closing stamp immediately after the launch is enqueued on the instance stream, so elapsed time covers exactly this kernel.
+    private void StampKernelEnd() => CudaException.ThrowIf("cuEventRecord", CudaNative.cuEventRecord(_timingEnd, _stream));
 
-    // Reads the pair once both stamps have completed — every call site folds elapsed only after its launch's context
+    // Reads the pair once both stamps have completed — every call site folds elapsed only after its launch's stream
     // synchronize returned — and adds whole microseconds to this instance's busy total. A device clock that resolves a
     // sub-microsecond kernel to zero contributes nothing rather than an invented floor.
     private void FoldKernelElapsed()
@@ -102,6 +104,12 @@ public sealed partial class CudaBackend
 
     private void ReleaseTimingEvents()
     {
+        if (_pendingProbe != 0)
+        {
+            CudaNative.cuEventDestroy(_pendingProbe);
+            _pendingProbe = IntPtr.Zero;
+        }
+
         if (_timingStart != 0)
         {
             CudaNative.cuEventDestroy(_timingStart);
