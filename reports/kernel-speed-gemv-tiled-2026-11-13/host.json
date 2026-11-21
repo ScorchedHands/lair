@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kernel-speed-gemv-tiled-2026-11-13",
+  "host": {
+    "hostname": null,
+    "os": null,
+    "cpuModel": null,
+    "physicalCores": null,
+    "logicalProcessors": null,
+    "memoryTotalBytes": null,
+    "device": null,
+    "lane": "CPU serving servers (one at a time)",
+    "notes": [
+      "Host core counts were not recorded in this narrative; recorded as null rather than inferred.",
+      "Kernel values tested through temporary configs: gemv on port 58391, then tiled on port 58392. One server ran at a time.",
+      "Peak working set read from metrics_process_working_set_mb snapshots collected live on /monitor/stream."
+    ]
+  },
+  "serveConfig": {
+    "fixture": "models/Llama-3.2-1B-Instruct-IQ4_XS.gguf",
+    "max_context_tokens": 4096,
+    "kv_blocks": 256,
+    "engine_block_size": 16,
+    "engine_max_batch_tokens": 512,
+    "engine_threads": 0,
+    "placement_thread_quota": 8,
+    "core_pinning": false,
+    "prompt_tokens": 1751
+  }
+}

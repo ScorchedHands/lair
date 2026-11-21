@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUDA GEMV parity and speed gate — 2026-11-18</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 480px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>CUDA GEMV parity and speed gate</h1>
+<div class="meta">
+  reportId: <code>cuda-gemv-parity-2026-11-18</code> ·
+  recorded 2026-11-18 (date only) ·
+  phase: MVP5.2 ·
+  lane: CUDA GEMV parity + speed gate
+</div>
+
+<h2>Host / fixture</h2>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>AVX2</td><td>available</td></tr>
+  <tr><td>Physical cores</td><td>24</td></tr>
+  <tr><td>Logical processors</td><td>32</td></tr>
+  <tr><td>CPU auto workers</td><td>24</td></tr>
+  <tr><td>Device</td><td>not recorded (null)</td></tr>
+  <tr><td>Shape / reps / formats</td><td>rows=512 cols=1024 batch=32 · reps=7 · 18 formats</td></tr>
+  <tr><td>CUDA posture</td><td>device-copy (one-time weight copy untimed)</td></tr>
+</table>
+
+<h2>Speed measurement summary</h2>
+<table>
+  <tr><th>Format</th><th class="num">Packed MiB</th><th class="num">CPU scalar ms</th><th class="num">CPU auto ms</th><th class="num">CUDA wall ms</th><th class="num">Kernel busy µs/rep</th><th class="num">Scalar vs CUDA</th><th class="num">Auto vs CUDA</th><th class="num">Compute-only</th><th class="num">Bench equiv drift</th></tr>
+  <tr><td>F32</td><td class="num">2.00</td><td class="num">38.435</td><td class="num">0.525</td><td class="num">2.270</td><td class="num">1904.4</td><td class="num">16.93</td><td class="num">0.23</td><td class="num">20.18</td><td class="num">0.0063601</td></tr>
+  <tr><td>F16</td><td class="num">1.00</td><td class="num">23.378</td><td class="num">0.498</td><td class="num">2.859</td><td class="num">3026.9</td><td class="num">8.18</td><td class="num">0.17</td><td class="num">7.72</td><td class="num">0.0032998</td></tr>
+  <tr><td>BF16</td><td class="num">1.00</td><td class="num">11.018</td><td class="num">0.621</td><td class="num">2.878</td><td class="num">2476.9</td><td class="num">3.83</td><td class="num">0.22</td><td class="num">4.45</td><td class="num">exact</td></tr>
+  <tr><td>Q8_0</td><td class="num">0.53</td><td class="num">12.950</td><td class="num">0.506</td><td class="num">2.021</td><td class="num">2007.0</td><td class="num">6.41</td><td class="num">0.25</td><td class="num">6.45</td><td class="num">0.00138574</td></tr>
+  <tr><td>Q4_K</td><td class="num">0.28</td><td class="num">11.717</td><td class="num">0.542</td><td class="num">1.714</td><td class="num">1834.6</td><td class="num">6.84</td><td class="num">0.32</td><td class="num">6.39</td><td class="num">8.16e-6</td></tr>
+  <tr><td>Q5_0</td><td class="num">0.34</td><td class="num">17.813</td><td class="num">2.136</td><td class="num">1.957</td><td class="num">1984.9</td><td class="num">9.10</td><td class="num">1.09</td><td class="num">8.97</td><td class="num">0.000996202</td></tr>
+  <tr><td>Q6_K</td><td class="num">0.41</td><td class="num">16.219</td><td class="num">4.156</td><td class="num">1.925</td><td class="num">2089.3</td><td class="num">8.42</td><td class="num">2.16</td><td class="num">7.76</td><td class="num">0.000101947</td></tr>
+  <tr><td>Q5_K</td><td class="num">0.34</td><td class="num">15.537</td><td class="num">2.582</td><td class="num">2.751</td><td class="num">2430.0</td><td class="num">5.65</td><td class="num">0.94</td><td class="num">6.39</td><td class="num">0.000174343</td></tr>
+  <tr><td>Q2_K</td><td class="num">0.16</td><td class="num">12.694</td><td class="num">0.509</td><td class="num">1.476</td><td class="num">1629.9</td><td class="num">8.60</td><td class="num">0.34</td><td class="num">7.79</td><td class="num">0.000332475</td></tr>
+  <tr><td>Q3_K</td><td class="num">0.21</td><td class="num">13.662</td><td class="num">2.109</td><td class="num">1.967</td><td class="num">2006.7</td><td class="num">6.94</td><td class="num">1.07</td><td class="num">6.81</td><td class="num">0.0058546</td></tr>
+  <tr><td>Q2_0</td><td class="num">0.14</td><td class="num">15.100</td><td class="num">0.556</td><td class="num">1.348</td><td class="num">1297.4</td><td class="num">11.20</td><td class="num">0.41</td><td class="num">11.64</td><td class="num">2.476e-5</td></tr>
+  <tr><td>IQ4_NL</td><td class="num">0.28</td><td class="num">17.142</td><td class="num">0.623</td><td class="num">2.496</td><td class="num">2759.4</td><td class="num">6.87</td><td class="num">0.25</td><td class="num">6.21</td><td class="num">0.000803455</td></tr>
+  <tr><td>IQ4_XS</td><td class="num">0.27</td><td class="num">13.917</td><td class="num">0.548</td><td class="num">2.392</td><td class="num">2468.6</td><td class="num">5.82</td><td class="num">0.23</td><td class="num">5.64</td><td class="num">0.00898242</td></tr>
+  <tr><td>IQ2_XXS</td><td class="num">0.13</td><td class="num">17.893</td><td class="num">1.360</td><td class="num">0.572</td><td class="num">413.1</td><td class="num">31.28</td><td class="num">2.38</td><td class="num">43.31</td><td class="num">8.35e-5</td></tr>
+  <tr><td>IQ2_XS</td><td class="num">0.14</td><td class="num">17.504</td><td class="num">1.435</td><td class="num">0.525</td><td class="num">382.9</td><td class="num">33.33</td><td class="num">2.73</td><td class="num">45.72</td><td class="num">0.000858286</td></tr>
+  <tr><td>IQ2_S</td><td class="num">0.16</td><td class="num">18.096</td><td class="num">1.375</td><td class="num">0.529</td><td class="num">351.1</td><td class="num">34.23</td><td class="num">2.60</td><td class="num">51.54</td><td class="num">1.98e-5</td></tr>
+  <tr><td>IQ3_XXS</td><td class="num">0.19</td><td class="num">18.190</td><td class="num">0.729</td><td class="num">0.578</td><td class="num">419.3</td><td class="num">31.45</td><td class="num">1.26</td><td class="num">43.38</td><td class="num">2.446e-5</td></tr>
+  <tr><td>IQ3_S</td><td class="num">0.21</td><td class="num">25.810</td><td class="num">1.120</td><td class="num">0.567</td><td class="num">402.9</td><td class="num">45.50</td><td class="num">1.98</td><td class="num">64.07</td><td class="num">3.047e-5</td></tr>
+</table>
+
+<h2>Auto vs CUDA wall ratio by format</h2>
+<div class="chart-wrap"><canvas id="ratioChart"></canvas></div>
+<div class="chart-wrap"><canvas id="computeChart"></canvas></div>
+
+<h2>Recorded quality bands from tests</h2>
+<table>
+  <tr><th>Format</th><th>Band vs CPU oracle</th><th>Measured worst in parity gate</th></tr>
+  <tr><td>Q8_0</td><td>1e-6 relative</td><td>7.96e-7</td></tr>
+  <tr><td>Q5_0</td><td>1e-6 relative</td><td>8.16e-7</td></tr>
+  <tr><td>Q2_0</td><td>1e-6 relative</td><td>7.41e-7</td></tr>
+  <tr><td>Q5_K</td><td>4e-6 relative</td><td>2.72e-6</td></tr>
+  <tr><td>Q2_K</td><td>1e-6 relative</td><td>4.22e-7</td></tr>
+  <tr><td>Q3_K</td><td>2e-5 relative</td><td>1.01e-5 batched</td></tr>
+  <tr><td>IQ4_NL</td><td>2e-6 relative</td><td>1.03e-6 host-mapped; exact-block ~8.97e-8</td></tr>
+  <tr><td>IQ4_XS</td><td>2e-6 relative</td><td>1.07e-6 batched</td></tr>
+  <tr><td>IQ2_XXS</td><td>5e-7 relative</td><td>bit-exact zero</td></tr>
+  <tr><td>IQ2_XS</td><td>5e-7 relative</td><td>bit-exact zero</td></tr>
+  <tr><td>IQ3_XXS</td><td>5e-7 relative</td><td>bit-exact zero</td></tr>
+  <tr><td>IQ2_S</td><td>5e-7 relative</td><td>8.27e-8 partial final block</td></tr>
+  <tr><td>IQ3_S</td><td>5e-7 relative</td><td>1.47e-7 partial final block</td></tr>
+</table>
+
+<h2>Interpretation / posture</h2>
+<ul>
+  <li>Clear wins: IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S (~1.98-2.73); Q6_K 2.16.</li>
+  <li>Near-tie/slight wins: Q5_0 1.09, Q3_K 1.07.</li>
+  <li>Losses vs auto-threaded CPU: F32 0.23, F16 0.17, BF16 0.22, Q8_0 0.25, Q4_K 0.32, Q2_K 0.34, Q2_0 0.41, IQ4_NL 0.25, IQ4_XS 0.23.</li>
+  <li>No automatic CUDA GEMV format default promoted from this bench alone; dense formats stay opt-in hybrid.</li>
+</ul>
+
+<script>
+const formats = ["F32","F16","BF16","Q8_0","Q4_K","Q5_0","Q6_K","Q5_K","Q2_K","Q3_K","Q2_0","IQ4_NL","IQ4_XS","IQ2_XXS","IQ2_XS","IQ2_S","IQ3_XXS","IQ3_S"];
+const autoVsCuda = [0.23,0.17,0.22,0.25,0.32,1.09,2.16,0.94,0.34,1.07,0.41,0.25,0.23,2.38,2.73,2.60,1.26,1.98];
+const computeOnly = [20.18,7.72,4.45,6.45,6.39,8.97,7.76,6.39,7.79,6.81,11.64,6.21,5.64,43.31,45.72,51.54,43.38,64.07];
+new Chart(document.getElementById("ratioChart"), {
+  type: "bar",
+  data: { labels: formats, datasets: [{ label: "Auto vs CUDA wall ratio", data: autoVsCuda, backgroundColor: "#4c78a8" }] },
+  options: { responsive: true, plugins: { title: { display: true, text: "CUDA GEMV auto-vs-CUDA wall ratio (>1 = CUDA faster)" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "ratio" } } } }
+});
+new Chart(document.getElementById("computeChart"), {
+  type: "bar",
+  data: { labels: formats, datasets: [{ label: "Compute-only ratio", data: computeOnly, backgroundColor: "#f58518" }] },
+  options: { responsive: true, plugins: { title: { display: true, text: "CUDA GEMV compute-only ratio (excludes transfer overhead)" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "ratio" } } } }
+});
+</script>
+</body>
+</html>

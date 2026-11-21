@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kv-format-spike-2026-11-17",
+  "host": {
+    "hostname": null,
+    "os": null,
+    "cpuModel": null,
+    "physicalCores": null,
+    "logicalProcessors": null,
+    "memoryTotalBytes": null,
+    "device": null,
+    "lane": "CPU (single-token decode route)",
+    "threads": 8,
+    "isaResolved": "vnni",
+    "avx2Float": true,
+    "notes": [
+      "Host core counts were not recorded in this narrative; recorded as null rather than inferred.",
+      "Micro run resolved CPU path: isaResolved=vnni avx2Float=True.",
+      "Decision-evidence reruns use context=2048, five timed windows per mode, sequential processes, no competing LAIR/bench work."
+    ]
+  },
+  "modes": {
+    "baseline": "unchanged production LayerOps.CausalAttention over ReadOnlySpan<float> KV reads",
+    "f32block": "generic static-abstract control with FP32 block structs and bit-identical attention math (abstraction-tax measurement for DN-M51-6)",
+    "q8k": "candidate quantized-dot shape using Q8_K K-side integer dot plus signed-Q8 V accumulation through existing CPU activation-quant machinery"
+  }
+}

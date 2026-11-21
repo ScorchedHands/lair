@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUDA co-scheduling payoff — 2026-11-19</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 460px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>MVP6.1 CUDA co-scheduling payoff measurement</h1>
+<div class="meta">
+  reportId: <code>multi-model-device-concurrency-2026-11-19</code> ·
+  recorded 2026-11-19 (date only) ·
+  phase: MVP6.1 ·
+  lane: serialized vs two-stream vs overlapped on RTX 4090
+</div>
+
+<h2>Host / device / fixture</h2>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>OS</td><td>Microsoft Windows 10.0.26200</td></tr>
+  <tr><td>Logical processors</td><td>32</td></tr>
+  <tr><td>Device</td><td>NVIDIA GeForce RTX 4090 (ordinal 0) · driver API 13030</td></tr>
+  <tr><td>Shape / reps / sweeps / pairs</td><td>rows=2048 cols=2048 batch=32 · 15 · 3 · 3</td></tr>
+</table>
+
+<h2>Three-run paired-ratio summary</h2>
+<table>
+  <tr><th>Pair</th><th>Run</th><th class="num">Serialized med ms</th><th class="num">Two-stream med ms</th><th class="num">Overlapped med ms</th><th class="num">Ser/Over</th><th class="num">Two/Over</th><th class="num">Ser/Two</th><th class="num">busy/over wall</th><th>Verdict</th></tr>
+  <tr><td>mixed_gemv_q4k__gemm_f16</td><td>1</td><td class="num">10.9538</td><td class="num">9.8325</td><td class="num">8.2039</td><td class="num">1.38</td><td class="num">1.39</td><td class="num">1.03</td><td class="num">1.29</td><td>inconclusive</td></tr>
+  <tr><td>mixed_gemv_q4k__gemm_f16</td><td>2</td><td class="num">17.6337</td><td class="num">10.8647</td><td class="num">8.9626</td><td class="num">1.66</td><td class="num">1.32</td><td class="num">1.14</td><td class="num">1.94</td><td>positive</td></tr>
+  <tr><td>mixed_gemv_q4k__gemm_f16</td><td>3</td><td class="num">8.3977</td><td class="num">7.8725</td><td class="num">7.4592</td><td class="num">1.28</td><td class="num">1.09</td><td class="num">1.06</td><td class="num">1.09</td><td>positive</td></tr>
+  <tr><td>two_gemv_q8_0__q6_k</td><td>1</td><td class="num">23.0051</td><td class="num">25.5809</td><td class="num">11.1589</td><td class="num">1.57</td><td class="num">2.05</td><td class="num">1.00</td><td class="num">2.03</td><td>positive</td></tr>
+  <tr><td>two_gemv_q8_0__q6_k</td><td>2</td><td class="num">20.0827</td><td class="num">17.9961</td><td class="num">10.3500</td><td class="num">1.94</td><td class="num">2.13</td><td class="num">0.99</td><td class="num">1.90</td><td>positive</td></tr>
+  <tr><td>two_gemv_q8_0__q6_k</td><td>3</td><td class="num">23.4904</td><td class="num">21.8141</td><td class="num">14.2374</td><td class="num">2.00</td><td class="num">1.98</td><td class="num">1.06</td><td class="num">1.56</td><td>positive</td></tr>
+  <tr><td>two_gemm_q8_0__bf16</td><td>1</td><td class="num">13.9433</td><td class="num">14.0805</td><td class="num">2.7224</td><td class="num">2.15</td><td class="num">2.31</td><td class="num">1.03</td><td class="num">5.01</td><td>positive</td></tr>
+  <tr><td>two_gemm_q8_0__bf16</td><td>2</td><td class="num">17.8322</td><td class="num">14.3925</td><td class="num">3.2674</td><td class="num">2.17</td><td class="num">1.92</td><td class="num">1.14</td><td class="num">5.30</td><td>positive</td></tr>
+  <tr><td>two_gemm_q8_0__bf16</td><td>3</td><td class="num">3.7677</td><td class="num">3.4174</td><td class="num">2.0388</td><td class="num">1.89</td><td class="num">1.96</td><td class="num">1.02</td><td class="num">1.65</td><td>positive</td></tr>
+</table>
+
+<h2>Serialized/Overlapped ratio by pair and run</h2>
+<div class="chart-wrap"><canvas id="ratioChart"></canvas></div>
+
+<h2>Gate result</h2>
+<ul>
+  <li>Two-GEMV and two-GEMM pairs were positive in all three runs (serialized/overlapped paired medians 1.57 to 2.17).</li>
+  <li>Mixed GEMV/GEMM pair was positive in two of three runs and inconclusive once (1.28 paired median in run 3).</li>
+  <li>Two-stream control (serialized/two-stream medians 0.99-1.14) shows essentially all payoff comes from submitting both lanes before awaiting either.</li>
+  <li>Bit-for-bit serialized-vs-overlapped output equivalence held for every pair in every run.</li>
+</ul>
+
+<script>
+const labels = ["mixed r1","mixed r2","mixed r3","two_gemv r1","two_gemv r2","two_gemv r3","two_gemm r1","two_gemm r2","two_gemm r3"];
+new Chart(document.getElementById("ratioChart"), {
+  type: "bar",
+  data: { labels, datasets: [
+    { label: "Serialized/Overlapped", data: [1.38,1.66,1.28,1.57,1.94,2.00,2.15,2.17,1.89], backgroundColor: "#4c78a8" },
+    { label: "Two-stream/Overlapped", data: [1.39,1.32,1.09,2.05,2.13,1.98,2.31,1.92,1.96], backgroundColor: "#f58518" }
+  ] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Co-scheduling paired ratios (>1 = faster than overlapped baseline)" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "ratio" } } } }
+});
+</script>
+</body>
+</html>

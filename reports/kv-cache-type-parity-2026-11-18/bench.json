@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kv-cache-type-parity-2026-11-18",
+  "bench": [
+    {
+      "id": "quantized-kv-parity",
+      "harness": "LAIR CPU quantized KV route vs pinned llama.cpp b12032 server mode",
+      "metrics": [
+        { "mode": "q8_0/q8_0", "worstRelevantCandidate": "Once upon a time candidate `(` (id 365)", "maxRelevantDeltaNats": 0.1347, "recordedBandNats": 0.25 },
+        { "mode": "q8_0/q4_0 (k8v4)", "worstRelevantCandidate": "Once upon a time candidate ` there` (id 665)", "maxRelevantDeltaNats": 0.3856, "recordedBandNats": 0.50 }
+      ],
+      "rawTableMarkdown": "| Mode | Worst relevant candidate drift | Max relevant delta | Recorded band |\n|---|---|---:|---:|\n| `q8_0/q8_0` | `Once upon a time` candidate `(` (`id 365`) | 0.1347 nats | 0.25 nats |\n| `q8_0/q4_0` (`k8v4`) | `Once upon a time` candidate ` there` (`id 665`) | 0.3856 nats | 0.50 nats |",
+      "gateShape": "LAIR argmax must appear among the pinned reference top-5 candidates; every calibrated LAIR logprob must reproduce within the normal 0.2 nat reproduction tolerance; candidates inside the 6-nat sampling window below the reference top-1 must stay inside that mode's recorded quantized-KV band; existing dense-family bands are not widened."
+    }
+  ],
+  "fixtureOutputs": [
+    "tests/fixtures/parity-kv-q8q8-smollm-f16.json",
+    "tests/fixtures/parity-kv-k8v4-smollm-f16.json"
+  ],
+  "verification": {
+    "build": "dotnet build Lair.sln -c Release --no-restore -> 0 Warning(s) / 0 Error(s)",
+    "testResults": [
+      { "filter": "Category=Attention", "passed": 10 },
+      { "filter": "Category=Kv", "passed": 77 },
+      { "filter": "Category=Config|Kv", "passed": 439 },
+      { "filter": "Category=Serve", "passed": 26 },
+      { "filter": "Category=Layers|Kernel", "passed": 427 },
+      { "filter": "Category=Parity (after adding quantized KV fixtures)", "passed": 72 },
+      { "filter": "Category=Api (isolated rerun after whole-suite contention flake)", "passed": 101, "total": 101 }
+    ]
+  }
+}

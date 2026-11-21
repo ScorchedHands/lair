@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kernel-speed-gemv-tiled-2026-11-13",
+  "generatedAtUtc": "2026-11-13",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured.",
+  "phase": "MVP3.13",
+  "lane": "Prefill kernel speed proof: gemv vs row-tiled attention on a live serving server",
+  "markdownReport": "../../bench/reports/kernel-speed-gemv-tiled-2026-11-13.md",
+  "rawTableFiles": [],
+  "comparisonNotes": [
+    "Machine-readable baseline for the row-tiled attention kernel decision.",
+    "Combined throughput improved from 23.26 to 24.78 tok/s (+6.5%) with a 6.1% wall-time reduction and peak working set dropping from 1353.8 MB to 1222.8 MB.",
+    "Resolved prompt row width is unchanged between runs (56 weight sub-batches for 1751 tokens), so the gain is attributable to quadratic attention past its crossover floor (>= 1081) rather than fewer weight traversals."
+  ]
+}

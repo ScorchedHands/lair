@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "reportId": "q4-k-viability-2026-11-17",
+  "generatedAtUtc": "2026-11-17",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured.",
+  "phase": "MVP5.1",
+  "lane": "q4-K viability spike: LAIR q4/q4 KV vs llama.cpp b12032 q4_0/q4_0 cache-type",
+  "markdownReport": "../../bench/reports/q4-k-viability-2026-11-17.md",
+  "rawTableFiles": [],
+  "comparisonNotes": [
+    "Machine-readable baseline for the q4/q4 named-KV-option decision.",
+    "Decision: drop q4/q4 from MVP5.1's named KV option set. The public named combo set proceeds as f32/f32, f16/f16, q8/q8/int8/k8v8, and k8v4.",
+    "Measured drift is not a narrow near-tie artifact: primary serving fixture shows 4.0019 nats worst relevant delta with one missing relevant token, Qwen/YaRN fixtures produce argmax-membership failures, and multiple other pinned fixtures exceed the existing quantized-file band.",
+    "The spike does not validate k8v4 by inference from this failure."
+  ]
+}

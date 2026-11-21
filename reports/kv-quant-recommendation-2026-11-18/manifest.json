@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kv-quant-recommendation-2026-11-18",
+  "generatedAtUtc": "2026-11-18",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured.",
+  "phase": "MVP5.1",
+  "lane": "Quantized KV recommendation bench on production CPU serving seams",
+  "markdownReport": "../../bench/reports/kv-quant-recommendation-2026-11-18.md",
+  "rawTableFiles": [],
+  "comparisonNotes": [
+    "Machine-readable baseline for the documented/default KV posture decision.",
+    "Recommendation: keep f32/f32 as the documented/default KV posture. Quantized routes save footprint but decode is materially slower and prefill setup is materially slower than FP32.",
+    "q8_0/q8_0 is the conservative memory-saving quantized option; k8v4 is a memory-pressure option only.",
+    "The production max-abs-logit diff is not the same as pinned llama.cpp cache-type parity drift; the pinned parity report remains the quality gate."
+  ]
+}

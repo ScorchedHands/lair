@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prefill row-width profile — 2026-11-13</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 420px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>Prefill row-width profile</h1>
+<div class="meta">
+  reportId: <code>prefill-rowwidth-2026-11-13</code> ·
+  recorded 2026-11-13 (date only) ·
+  phase: MVP3.13 ·
+  lane: 16 / 32 / 64 rows on both pinned fixtures · chosen row count 32
+</div>
+
+<h2>Row-width tok/s</h2>
+<table>
+  <tr><th>Fixture</th><th class="num">Window</th><th class="num">16 rows tok/s</th><th class="num">32 rows tok/s</th><th class="num">64 rows tok/s</th></tr>
+  <tr><td>Llama-3.2-1B IQ4_XS</td><td class="num">512</td><td class="num">34.90</td><td class="num">39.84</td><td class="num">41.91</td></tr>
+  <tr><td>Llama-3.2-1B IQ4_XS</td><td class="num">1024</td><td class="num">28.62</td><td class="num">30.23</td><td class="num">31.43</td></tr>
+  <tr><td>Llama-3.2-1B IQ4_XS</td><td class="num">2048</td><td class="num">19.57</td><td class="num">20.31</td><td class="num">20.57</td></tr>
+  <tr><td>Qwen3-0.6B Q8_0</td><td class="num">512</td><td class="num">55.93</td><td class="num">55.16</td><td class="num">55.30</td></tr>
+  <tr><td>Qwen3-0.6B Q8_0</td><td class="num">1024</td><td class="num">34.93</td><td class="num">34.56</td><td class="num">33.84</td></tr>
+  <tr><td>Qwen3-0.6B Q8_0</td><td class="num">2048</td><td class="num">18.44</td><td class="num">18.52</td><td class="num">18.37</td></tr>
+</table>
+
+<h2>Activation bytes for one full sub-batch</h2>
+<table>
+  <tr><th>Fixture</th><th class="num">16 rows</th><th class="num">32 rows</th><th class="num">64 rows</th></tr>
+  <tr><td>Llama-3.2-1B IQ4_XS</td><td class="num">1,769,472</td><td class="num">3,538,944</td><td class="num">7,077,888</td></tr>
+  <tr><td>Qwen3-0.6B Q8_0</td><td class="num">983,040</td><td class="num">1,966,080</td><td class="num">3,932,160</td></tr>
+</table>
+
+<h2>tok/s by row width — Llama IQ4_XS</h2>
+<div class="chart-wrap"><canvas id="llamaChart"></canvas></div>
+<h2>tok/s by row width — Qwen3 Q8_0</h2>
+<div class="chart-wrap"><canvas id="qwen3Chart"></canvas></div>
+
+<h2>Reading</h2>
+<ul>
+  <li>Row width changes sub-batch count and activation allocation; it does not change the attention term materially.</li>
+  <li>Fitted crossovers at row count 32 are floors: length &ge; 209 for Qwen and length &ge; 1081 for Llama.</li>
+  <li>Default resolved row count remains 32: 32 beats 16 on Llama at every window and captures most of the 64-row gain, while Qwen stays within noise.</li>
+</ul>
+
+<script>
+const windows = ["512","1024","2048"];
+new Chart(document.getElementById("llamaChart"), {
+  type: "bar",
+  data: { labels: windows, datasets: [
+    { label: "16 rows", data: [34.90,28.62,19.57], backgroundColor: "#4c78a8" },
+    { label: "32 rows", data: [39.84,30.23,20.31], backgroundColor: "#f58518" },
+    { label: "64 rows", data: [41.91,31.43,20.57], backgroundColor: "#72b7b2" }
+  ] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Llama-3.2-1B IQ4_XS prefill tok/s by row width" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "tokens / second" } } } }
+});
+new Chart(document.getElementById("qwen3Chart"), {
+  type: "bar",
+  data: { labels: windows, datasets: [
+    { label: "16 rows", data: [55.93,34.93,18.44], backgroundColor: "#4c78a8" },
+    { label: "32 rows", data: [55.16,34.56,18.52], backgroundColor: "#f58518" },
+    { label: "64 rows", data: [55.30,33.84,18.37], backgroundColor: "#72b7b2" }
+  ] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Qwen3-0.6B Q8_0 prefill tok/s by row width" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "tokens / second" } } } }
+});
+</script>
+</body>
+</html>

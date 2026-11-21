@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kernel-comparison-2026-11-14",
+  "generatedAtUtc": "2026-11-14",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured.",
+  "phase": "MVP3.13",
+  "lane": "Prefill kernel cost comparison across gemv/tiled/gemm on proven-format pinned fixtures",
+  "markdownReport": "../../bench/reports/kernel-comparison-2026-11-14.md",
+  "rawTableFiles": [
+    "../../bench/reports/prefill-kernel-llama-q8-gemv.txt",
+    "../../bench/reports/prefill-kernel-llama-q8-tiled.txt",
+    "../../bench/reports/prefill-kernel-llama-q8-gemm.txt",
+    "../../bench/reports/prefill-kernel-qwen3-gemv.txt",
+    "../../bench/reports/prefill-kernel-qwen3-tiled.txt",
+    "../../bench/reports/prefill-kernel-qwen3-gemm.txt",
+    "../../bench/reports/prefill-kernel-llama-iq4x-mixed.txt"
+  ],
+  "comparisonNotes": [
+    "Machine-readable baseline for later prefill kernel selection decisions.",
+    "Kernel selection is read from the engine, not assumed; mixed-format files are recorded as refusals rather than silently falling back.",
+    "Each kernel was measured in its own bench process so peakWorkingSetMb is per-kernel, not cumulative across kernels.",
+    "The committed IQ4_XS mixed file proves a proven format alone is not enough: gemm refuses naming Q5_K; its peak line is cumulative across the multi-kernel process and is not used for per-kernel memory comparison.",
+    "Fits use best-of-rep passes after warm passes; cross-kernel ordering is directional unless fitted terms and wall time agree."
+  ]
+}

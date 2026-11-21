@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "reportId": "cuda-gemv-parity-2026-11-18",
+  "host": {
+    "hostname": null,
+    "os": null,
+    "cpuModel": null,
+    "avx2": true,
+    "physicalCores": 24,
+    "logicalProcessors": 32,
+    "cpuAutoWorkers": 24,
+    "memoryTotalBytes": null,
+    "device": null,
+    "lane": "CPU + CUDA (device-copy posture)",
+    "notes": [
+      "Host facts recorded in the narrative: AVX2 available, physical cores 24, logical processors 32, CPU auto workers 24.",
+      "GPU device name/driver were not recorded in this narrative; recorded as null rather than inferred.",
+      "CUDA posture: device-copy, with one-time weight copy absorbed in untimed warm-up.",
+      "CUDA wall time includes each call's activation upload, launch, sync, and output download; it excludes only the one-time per-tensor device weight copy."
+    ]
+  },
+  "fixture": {
+    "kind": "deterministic pinned block patterns",
+    "rng": false,
+    "packingClasses": "same packing classes as the GPU parity fixtures",
+    "shape": { "rows": 512, "cols": 1024, "batch": 32 },
+    "reps": 7,
+    "formatsSwept": 18,
+    "cpuArms": "scalar oracle (threads=1, AVX disabled) and auto-threaded engine posture"
+  }
+}

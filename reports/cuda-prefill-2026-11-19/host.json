@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "reportId": "cuda-prefill-2026-11-19",
+  "host": {
+    "hostname": null,
+    "os": null,
+    "cpuModel": null,
+    "physicalCores": null,
+    "logicalProcessors": null,
+    "memoryTotalBytes": null,
+    "device": null,
+    "lane": "CPU + CUDA (device step composed per layer)",
+    "cpuThreads": "auto",
+    "notes": [
+      "Host core counts were not recorded in this narrative; recorded as null rather than inferred.",
+      "GPU device name/driver were not recorded; recorded as null.",
+      "CUDA facts for the full process run: weightCopiesToDevice=211, persistentDeviceWeightBytes=268959744, peakWorkingSetMb=576.0."
+    ]
+  },
+  "model": {
+    "file": "models/SmolLM-135M-Instruct-F16.gguf",
+    "bytes": 270885792,
+    "architecture": "llama",
+    "layers": 30,
+    "hidden": 576,
+    "heads": 9,
+    "kvHeads": 3,
+    "headDim": 64,
+    "vocab": 49152,
+    "resolvedPrefillRowWidth": 32
+  },
+  "fixture": {
+    "lengths": [32, 64, 128],
+    "reps": 3,
+    "arms": "cpu (weightPass=gemv, attention=host per-row over pool blocks) + cuda (device step composed per layer, kvStore=pool device store resident on the device)",
+    "basis": "Both arms forward identical token windows through TransformerModel.Prefill; wall time brackets each whole prefill (one untimed warm-up rep first)."
+  }
+}

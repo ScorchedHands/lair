@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "reportId": "q4-k-viability-2026-11-17",
+  "host": {
+    "hostname": null,
+    "os": null,
+    "cpuModel": null,
+    "physicalCores": null,
+    "logicalProcessors": null,
+    "memoryTotalBytes": null,
+    "device": null,
+    "lane": "CPU (LAIR q4/q4 mirror vs pinned llama.cpp reference, sequenced to avoid core contention)",
+    "threads": 8,
+    "notes": [
+      "Host core counts were not recorded in this narrative; recorded as null rather than inferred.",
+      "Reference engine: pinned llama.cpp b12032 server mode, -ctk q4_0 -ctv q4_0.",
+      "Runtime shape: context 1024, threads 8, greedy sampling with seed 0 and top-5 logprobs captured from llama.cpp server mode.",
+      "Sequencing rule: for each fixture, llama-server is stopped before LAIR starts so the two engines do not contend for CPU cores during measurement."
+    ]
+  },
+  "gatePosture": "Candidates within 6 nats of the reference top-1 must stay inside the quantized-file band (1 nat) and LAIR's argmax must remain among the reference top-5. No dense-family band is widened, and no q4-specific tolerance is adopted unless it clears measurement first."
+}

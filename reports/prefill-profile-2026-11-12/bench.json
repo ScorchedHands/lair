@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "reportId": "prefill-profile-2026-11-12",
+  "bench": [
+    {
+      "id": "fitted-split",
+      "harness": "Lair.Bench prefill-profile",
+      "commands": [
+        "dotnet run --project bench/Lair.Bench -c Release -- prefill-profile models/Llama-3.2-1B-Instruct-IQ4_XS.gguf --threads 8 --reps 3",
+        "dotnet run --project bench/Lair.Bench -c Release -- prefill-profile models/Qwen3-0.6B-Q8_0.gguf --threads 8 --reps 2 --lengths 16,32,64,128,256,512,1024"
+      ],
+      "metrics": [
+        { "fixture": "Llama-3.2-1B IQ4_XS (run 1)", "weightMsPerTraversal": 252.07, "impliedWeightGBs": 2.06, "attentionUsPerPositionPair": 57.3, "crossover": 555 },
+        { "fixture": "Llama-3.2-1B IQ4_XS (run 2)", "weightMsPerTraversal": 344.79, "impliedWeightGBs": 1.51, "attentionUsPerPositionPair": 52.4, "crossover": 827 },
+        { "fixture": "Qwen3-0.6B Q8_0", "weightMsPerTraversal": 126.7, "impliedWeightGBs": 3.70, "attentionUsPerPositionPair": 61.0, "crossover": 266 }
+      ],
+      "rawTableMarkdown": "| fixture | weight ms/traversal | implied weight GB/s | attention us/position-pair | crossover |\n|---|---|---|---|---|\n| Llama-3.2-1B IQ4_XS (run 1) | 252.07 | 2.06 | 57.3 | 555 |\n| Llama-3.2-1B IQ4_XS (run 2) | 344.79 | 1.51 | 52.4 | 827 |\n| Qwen3-0.6B Q8_0 | 126.7 | 3.70 | 61.0 | 266 |"
+    },
+    {
+      "id": "llama-32-1b-iq4xs-run2-full",
+      "note": "Llama run 2, the quieter of the two, in full (raw table from prefill-llama-batched.txt).",
+      "weightFitMsPerTraversal": 344.79,
+      "impliedWeightGBs": 1.51,
+      "attentionFitUsPerPositionPair": 52.415,
+      "crossover": "length >= 827",
+      "rawTableText": "prefill-profile file=models/Llama-3.2-1B-Instruct-IQ4_XS.gguf bytes=743141504 threads=8 maxBatchSequences=16\n  arch=llama layers=16 hidden=2048 heads=32 kvHeads=8 headDim=64 vocab=128256 windowedLayers=0 avx2=True\n  traversalBytes=519831552 outputHeadBytes=0 kvBlocks=136 blockTokens=16 reps=3 perToken=off lengths=16,32,64,128,256,512,1024,1536,2048\n  weightFit=344.79 ms/traversal (least-squares fit over 9 lengths) impliedWeightGB/s=1.51\n  attentionFit=52.415 us per position pair\n  crossover: fitted attention term >= fitted weight term at length >= 827\n      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s\n           16             1         296.8         53.91         344.8           7.1         -55.1          1.51\n           32             2         778.6         41.10         689.6          27.7          61.4          1.51\n           64             4        1559.0         41.05        1379.1         109.0          70.8          1.51\n          128             8        3279.4         39.03        2758.3         432.7          88.4          1.51\n         256            16        7261.5         35.25        5516.6        1724.2          20.7          1.51\n         512            32       17635.4         29.03       11033.2        6883.5        -281.3          1.51\n        1024            64       49286.9         20.78       22066.4       27507.3        -286.8          1.51\n        1536            96       95580.6         16.07       33099.5       61871.3         609.8          1.51\n        2048           128      153853.7         13.31       44132.7      109975.5        -254.5          1.51"
+    },
+    {
+      "id": "qwen3-06b-q8-full",
+      "note": "Qwen3-0.6B Q8_0 full sub-batch table (raw table from prefill-qwen3-batched.txt).",
+      "weightFitMsPerTraversal": 126.66,
+      "impliedWeightGBs": 3.70,
+      "attentionFitUsPerPositionPair": 60.997,
+      "crossover": "length >= 266",
+      "rawTableText": "prefill-profile file=models/Qwen3-0.6B-Q8_0.gguf bytes=639446688 threads=8 maxBatchSequences=16\n  arch=qwen3 layers=28 hidden=1024 heads=16 kvHeads=8 headDim=128 vocab=151936 windowedLayers=0 avx2=True\n  traversalBytes=468185088 outputHeadBytes=0 kvBlocks=72 blockTokens=16 reps=2 perToken=off lengths=16,32,64,128,256,512,1024\n  weightFit=126.66 ms/traversal (least-squares fit over 7 lengths) impliedWeightGB/s=3.70\n  attentionFit=60.997 us per position pair\n  crossover: fitted attention term >= fitted weight term at length >= 266\n      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s\n           16             1         206.2         77.60         126.7           8.3          71.2          3.70\n           32             2         414.4         77.22         253.3          32.2         128.9          3.70\n           64             4         873.3         73.28         506.7         126.9         239.8          3.70\n          128             8        1994.9         64.16        1013.3         503.6         478.0          3.70\n         256            16        4105.6         62.35        2026.6        2006.6          72.4          3.70\n         512            32       11724.2         43.67        4053.2        8010.7        -339.7          3.70\n        1024            64       40189.7         25.48        8106.4       32011.5          71.8          3.70"
+    }
+  ],
+  "reading": [
+    "The weight term is compute-bound, not bandwidth-bound: one traversal streams 496 MB for Llama in 252-345 ms (1.5-2.1 GB/s) and 446 MB for Qwen3 in 127 ms (3.7 GB/s); the batched GEMV dequant arithmetic, not the memory system, is what the weight term pays for.",
+    "Attention becomes the larger term far earlier than the serve-surface numbers suggested: crossover 266 for Qwen3 (kvDim 1024 over 28 layers) and 555-827 for Llama (kvDim 1024 over 16 layers). At 2048 tokens on Llama, attention is 110 s against 44 s of weight reads.",
+    "Batching already removed the weight term's growth with prompt length; the batched curve now degrades with length only because of the attention term."
+  ]
+}

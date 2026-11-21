@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "reportId": "prefill-profile-2026-11-12",
+  "generatedAtUtc": "2026-11-12",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured.",
+  "phase": "MVP3.12",
+  "lane": "Batched prefill cost profile: weight term vs attention term fit",
+  "markdownReport": "../../bench/reports/prefill-profile-2026-11-12.md",
+  "rawTableFiles": [
+    "../../bench/reports/prefill-llama-batched.txt",
+    "../../bench/reports/prefill-qwen3-batched.txt"
+  ],
+  "comparisonNotes": [
+    "Machine-readable baseline for prefill weight-term vs attention-term decisions.",
+    "The weight term is compute-bound, not bandwidth-bound (1.5-3.7 GB/s is well under what the memory system sustains); the attention term is quadratic in prompt length.",
+    "Two identical Llama commands disagree on the weight term by 1.4x (252 vs 345 ms/traversal) while agreeing on the curve's shape; crossover values are floors valid only up to the model's resolved attention windows.",
+    "The raw prefill-llama-batched.txt is the quieter Llama run 2 (344.79 ms/traversal); Llama run 1 (252.07) appears only in the narrative fitted-split table."
+  ]
+}

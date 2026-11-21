@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KV format abstraction spike — 2026-11-17</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 420px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>KV format abstraction spike</h1>
+<div class="meta">
+  reportId: <code>kv-format-spike-2026-11-17</code> ·
+  recorded 2026-11-17 (date only) ·
+  phase: MVP5.1 ·
+  lane: generic LayerOps&lt;TK,TV&gt; vs hand-written FP32 attention
+</div>
+
+<h2>Micro result — Q4_K geometry, threads=8, positions=256</h2>
+<table>
+  <tr><th>Mode</th><th class="num">Median per call</th><th>Range</th><th>Delta vs hand</th></tr>
+  <tr><td>hand FP32 kernel</td><td class="num">443.986 us/call</td><td>437.60–451.39 us</td><td>baseline</td></tr>
+  <tr><td>f32block generic control</td><td class="num">429.359 us/call</td><td>335.99–439.25 us</td><td>-3.3%</td></tr>
+  <tr><td>q8k candidate quantized dot</td><td class="num">270.455 us/call</td><td>256.02–296.86 us</td><td>-38.0%</td></tr>
+</table>
+<div class="note">Generic control equivalence exact (maxAbsDiff=0, meanRelDiff=0). q8k micro error maxAbsDiff=7.091e-4, meanRelDiff=2.872e-2 (not a parity-band result).</div>
+
+<h2>Decode result — Q4_K_M pinned fixture, threads=8, context=2048</h2>
+<table>
+  <tr><th>Mode</th><th class="num">Median tok/s</th><th>Window range</th><th>Delta vs baseline</th></tr>
+  <tr><td>baseline</td><td class="num">7.133</td><td>6.710–7.428</td><td>baseline</td></tr>
+  <tr><td>f32block</td><td class="num">8.229</td><td>7.979–8.552</td><td>+15.4%</td></tr>
+  <tr><td>q8k</td><td class="num">12.319</td><td>12.129–12.642</td><td>+72.7%</td></tr>
+</table>
+
+<h2>Decode result — IQ4_XS pinned fixture, threads=8, context=2048</h2>
+<table>
+  <tr><th>Mode</th><th class="num">Median tok/s</th><th>Window range</th><th>Delta vs baseline</th></tr>
+  <tr><td>baseline</td><td class="num">4.779</td><td>4.658–5.052</td><td>baseline</td></tr>
+  <tr><td>f32block</td><td class="num">8.670</td><td>8.539–9.019</td><td>+81.4%</td></tr>
+  <tr><td>q8k</td><td class="num">13.613</td><td>13.210–13.891</td><td>+184.8%</td></tr>
+</table>
+
+<h2>Decode median tok/s by mode</h2>
+<div class="chart-wrap"><canvas id="decodeChart"></canvas></div>
+
+<h2>Decision consequence</h2>
+<ul>
+  <li>Keep the static-abstract generic LayerOps&lt;TK,TV&gt; seam primary; the hand-specialized fallback is not selected.</li>
+  <li>Measured generic FP32 control (f32block) was faster than today's hand-written FP32 attention path across micro and short-context decode runs.</li>
+  <li>These numbers measure attention/kernel seam cost, not final storage replacement footprint or append-time savings.</li>
+</ul>
+
+<script>
+new Chart(document.getElementById("decodeChart"), {
+  type: "bar",
+  data: {
+    labels: ["baseline","f32block","q8k"],
+    datasets: [
+      { label: "Q4_K_M median tok/s", data: [7.133,8.229,12.319], backgroundColor: "#4c78a8" },
+      { label: "IQ4_XS median tok/s", data: [4.779,8.670,13.613], backgroundColor: "#f58518" }
+    ]
+  },
+  options: { responsive: true, plugins: { title: { display: true, text: "KV format spike decode median tok/s by mode (context 2048)" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "tokens / second" } } } }
+});
+</script>
+</body>
+</html>

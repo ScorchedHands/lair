@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prefill kernel speed proof — gemv vs tiled — 2026-11-13</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 420px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>Prefill kernel speed proof — gemv vs row-tiled attention</h1>
+<div class="meta">
+  reportId: <code>kernel-speed-gemv-tiled-2026-11-13</code> ·
+  recorded 2026-11-13 (date only) ·
+  phase: MVP3.13 ·
+  lane: live serving servers on Llama-3.2-1B IQ4_XS
+</div>
+
+<h2>Serve posture</h2>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>Fixture</td><td>models/Llama-3.2-1B-Instruct-IQ4_XS.gguf</td></tr>
+  <tr><td>max_context_tokens / kv_blocks</td><td>4096 / 256</td></tr>
+  <tr><td>engine block_size / max_batch_tokens / threads</td><td>16 / 512 / 0</td></tr>
+  <tr><td>placement thread_quota</td><td>8 (no core pinning)</td></tr>
+  <tr><td>Ports</td><td>gemv :58391 · tiled :58392</td></tr>
+  <tr><td>Prompt tokens (proven)</td><td>1751</td></tr>
+</table>
+
+<h2>Results</h2>
+<table>
+  <tr><th>Kernel</th><th class="num">Prompt tokens</th><th class="num">Wall seconds</th><th class="num">Prefill tok/s</th><th class="num">Peak working set</th></tr>
+  <tr><td>gemv run 1</td><td class="num">1751</td><td class="num">74.9243887</td><td class="num">23.37</td><td class="num">1353.8 MB</td></tr>
+  <tr><td>gemv run 2</td><td class="num">1751</td><td class="num">75.6483948</td><td class="num">23.15</td><td class="num">1353.8 MB</td></tr>
+  <tr><td>tiled run 1</td><td class="num">1751</td><td class="num">69.7240270</td><td class="num">25.11</td><td class="num">1222.8 MB</td></tr>
+  <tr><td>tiled run 2</td><td class="num">1751</td><td class="num">71.5923544</td><td class="num">24.46</td><td class="num">1222.8 MB</td></tr>
+</table>
+<div class="note">Combined: gemv averaged 23.26 tok/s and tiled averaged 24.78 tok/s — a +6.5% prefill throughput gain with a 6.1% wall-time reduction. Peak working set dropped from 1353.8 MB to 1222.8 MB.</div>
+
+<h2>Per-run prefill tok/s</h2>
+<div class="chart-wrap"><canvas id="speedChart"></canvas></div>
+
+<h2>Reading</h2>
+<ul>
+  <li>Resolved prompt row width is unchanged (56 weight sub-batches for 1751 tokens), so the weight-traversal count does not explain the gain.</li>
+  <li>The gain is attributable to quadratic attention past its crossover floor (length &ge; 1081).</li>
+</ul>
+
+<script>
+const labels = ["gemv run1","gemv run2","tiled run1","tiled run2"];
+new Chart(document.getElementById("speedChart"), {
+  type: "bar",
+  data: { labels, datasets: [{ label: "Prefill tok/s", data: [23.37,23.15,25.11,24.46], backgroundColor: ["#4c78a8","#4c78a8","#f58518","#f58518"] }] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Live gemv vs tiled prefill tok/s (Llama-3.2-1B IQ4_XS, 1751 tokens)" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "tokens / second" } } } }
+});
+</script>
+</body>
+</html>

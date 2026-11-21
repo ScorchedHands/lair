@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kv-quant-recommendation-2026-11-18",
+  "bench": [
+    {
+      "id": "kv-quant-decode-throughput",
+      "command": "dotnet run --project bench/Lair.Bench -c Release --no-build -- kv-quant models/SmolLM-135M-Instruct-F16.gguf --threads 8 --context 1024 --decode 32 --windows 5",
+      "metrics": [
+        { "mode": "f32/f32 baseline", "medianTokPerSec": 23.659, "minTokPerSec": 20.949, "maxTokPerSec": 27.111, "spreadPercent": 26.05, "prefillSetupMs": 14410.1, "reservedKv": "56.25 MiB" },
+        { "mode": "q8_0/q8_0", "medianTokPerSec": 8.200, "minTokPerSec": 7.839, "maxTokPerSec": 8.503, "spreadPercent": 8.10, "prefillSetupMs": 51903.1, "reservedKv": "14.94 MiB" },
+        { "mode": "q8_0/q4_0 (k8v4)", "medianTokPerSec": 8.205, "minTokPerSec": 7.961, "maxTokPerSec": 8.564, "spreadPercent": 7.35, "prefillSetupMs": 49744.1, "reservedKv": "11.43 MiB" }
+      ],
+      "rawTableMarkdown": "| Mode | Median tok/s | Min tok/s | Max tok/s | Spread | Prefill setup ms | Reserved KV |\n|---|---:|---:|---:|---:|---:|---:|\n| `f32/f32` baseline | `23.659` | `20.949` | `27.111` | `26.05%` | `14410.1` | `56.25 MiB` |\n| `q8_0/q8_0` | `8.200` | `7.839` | `8.503` | `8.10%` | `51903.1` | `14.94 MiB` |\n| `q8_0/q4_0` (`k8v4`) | `8.205` | `7.961` | `8.564` | `7.35%` | `49744.1` | `11.43 MiB` |",
+      "perWindowDecodeTokPerSec": {
+        "f32/f32": [22.255,23.659,26.190,27.111,20.949],
+        "q8_0/q8_0": [8.503,8.426,8.200,7.955,7.839],
+        "q8_0/q4_0": [8.564,8.343,8.204,8.205,7.961]
+      }
+    },
+    {
+      "id": "kv-quant-footprint",
+      "metrics": [
+        { "mode": "f32/f32", "bytesPerBlock": 737280, "reservedKv": "56.25 MiB" },
+        { "mode": "q8_0/q8_0", "bytesPerBlock": 195840, "reservedKv": "14.94 MiB" },
+        { "mode": "q8_0/q4_0", "bytesPerBlock": 149760, "reservedKv": "11.43 MiB" }
+      ],
+      "rawTableMarkdown": "| Mode | Bytes per block | Reserved KV |\n|---|---:|---:|\n| `f32/f32` | `737280` | `56.25 MiB` |\n| `q8_0/q8_0` | `195840` | `14.94 MiB` |\n| `q8_0/q4_0` | `149760` | `11.43 MiB` |"
+    },
+    {
+      "id": "kv-quant-equivalence-sanity",
+      "note": "Production-route drift sanity check against the same run's FP32 baseline probe; not the pinned llama.cpp parity gate.",
+      "metrics": [
+        { "mode": "q8_0/q8_0", "probeTopId": "504/49152", "argmaxMatchVsBaseline": true, "maxAbsLogitDiffVsBaseline": 0.1299 },
+        { "mode": "q8_0/q4_0", "probeTopId": "504/49152", "argmaxMatchVsBaseline": true, "maxAbsLogitDiffVsBaseline": 1.5525 }
+      ],
+      "rawTableMarkdown": "| Mode | Probe top id | Argmax match vs baseline | Max abs logit diff vs baseline |\n|---|---:|---:|---:|\n| `q8_0/q8_0` | `504/49152` | true | `0.1299` |\n| `q8_0/q4_0` | `504/49152` | true | `1.5525` |",
+      "pinnedCrossToolBands": { "q8_0/q8_0": "max relevant delta 0.1347 nats, band 0.25 nats", "q8_0/q4_0": "max relevant delta 0.3856 nats, band 0.50 nats" }
+    }
+  ],
+  "recommendation": {
+    "default": "f32/f32",
+    "conservativeMemorySavingQuantizedOption": "q8_0/q8_0",
+    "memoryPressureOptionOnly": "k8v4",
+    "rationale": "Decode is materially slower than the FP32 baseline (8.200 and 8.205 median tok/s vs 23.659); prefill setup is materially slower (51903.1 and 49744.1 ms vs 14410.1 ms). The default does not move to a quantized mode because the recommendation is parity/quality and production posture first, not smallest footprint."
+  }
+}

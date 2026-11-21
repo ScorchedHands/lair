@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "reportId": "prefill-profile-2026-11-12",
+  "host": {
+    "hostname": null,
+    "os": null,
+    "cpuModel": null,
+    "physicalCores": null,
+    "logicalProcessors": null,
+    "memoryTotalBytes": null,
+    "device": null,
+    "lane": "CPU batched prefill (box carries other workloads during these runs)",
+    "threads": 8,
+    "avx2": true,
+    "notes": [
+      "Host core counts were not recorded in this narrative; recorded as null rather than inferred.",
+      "Raw tables record threads=8 and avx2=True.",
+      "Two identical Llama commands disagree on the weight term by 1.4x while agreeing on the curve's shape; a run whose measured costs stop rising with the causal span prints UNRELIABLE instead of a fitted split."
+    ]
+  },
+  "fixtures": [
+    {
+      "name": "models/Llama-3.2-1B-Instruct-IQ4_XS.gguf",
+      "bytes": 743141504,
+      "architecture": "llama",
+      "layers": 16,
+      "hidden": 2048,
+      "heads": 32,
+      "kvHeads": 8,
+      "headDim": 64,
+      "vocab": 128256,
+      "windowedLayers": 0,
+      "traversalBytes": 519831552,
+      "kvBlocks": 136,
+      "blockTokens": 16,
+      "maxBatchSequences": 16
+    },
+    {
+      "name": "models/Qwen3-0.6B-Q8_0.gguf",
+      "bytes": 639446688,
+      "architecture": "qwen3",
+      "layers": 28,
+      "hidden": 1024,
+      "heads": 16,
+      "kvHeads": 8,
+      "headDim": 128,
+      "vocab": 151936,
+      "windowedLayers": 0,
+      "traversalBytes": 468185088,
+      "kvBlocks": 72,
+      "blockTokens": 16,
+      "maxBatchSequences": 16
+    }
+  ]
+}

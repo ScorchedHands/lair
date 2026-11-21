@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kv-cache-type-parity-2026-11-18",
+  "host": {
+    "hostname": null,
+    "os": null,
+    "cpuModel": null,
+    "physicalCores": null,
+    "logicalProcessors": null,
+    "memoryTotalBytes": null,
+    "device": null,
+    "lane": "CPU (LAIR candidate vs pinned llama.cpp reference, sequenced to avoid core contention)",
+    "notes": [
+      "Host core counts were not recorded in this narrative; recorded as null rather than inferred.",
+      "Reference engine: pinned llama.cpp b12032 server mode, /completion, temperature 0, n_probs=5, threads 8, context 1024.",
+      "Sequencing rule: capture all llama-server references first, stop/kill llama-server, then run LAIR calibration so the two engines do not contend for CPU cores during measurement."
+    ]
+  },
+  "model": {
+    "fixture": "models/SmolLM-135M-Instruct-F16.gguf",
+    "sha256": "1fc02c21fba7874b15955d21dc59182aeae382abea412419ffd2fbaa84861790"
+  }
+}

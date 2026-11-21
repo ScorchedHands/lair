@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "reportId": "prefill-rowwidth-2026-11-13",
+  "generatedAtUtc": "2026-11-13",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured.",
+  "phase": "MVP3.13",
+  "lane": "Prefill row-width profile: 16 / 32 / 64 rows on both pinned fixtures",
+  "markdownReport": "../../bench/reports/prefill-rowwidth-2026-11-13.md",
+  "rawTableFiles": [
+    "../../bench/reports/prefill-rowwidth-llama.txt",
+    "../../bench/reports/prefill-rowwidth-qwen3.txt"
+  ],
+  "comparisonNotes": [
+    "Machine-readable baseline for the resolved prefill row width decision.",
+    "Chosen resolved row count: 32. It is the balance point across both fixtures rather than a single-width speed winner.",
+    "For the wider-hidden Llama fixture, 32 rows beats 16 at every measured window and captures most of the gain from raising to 64. For Qwen, 16/32/64 are within measurement noise except that 64 is slightly worse at 1024.",
+    "These runs use --reps 1 (warm plus best-of-one) because each candidate width reopens a real model engine across three long windows."
+  ]
+}

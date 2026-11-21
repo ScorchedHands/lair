@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kv-quant-recommendation-2026-11-18",
+  "host": {
+    "hostname": null,
+    "os": null,
+    "cpuModel": null,
+    "physicalCores": null,
+    "logicalProcessors": null,
+    "memoryTotalBytes": null,
+    "device": null,
+    "lane": "CPU production serving seams",
+    "threads": 8,
+    "isa": "vnni",
+    "processPeakWorkingSetMb": 381.1,
+    "notes": [
+      "Host core counts were not recorded in this narrative; recorded as null rather than inferred.",
+      "This machine was carrying other workloads, so baseline spread is high (26.05%); quantized medians are still clearly below baseline."
+    ]
+  },
+  "model": {
+    "file": "models/SmolLM-135M-Instruct-F16.gguf",
+    "architecture": "llama",
+    "layers": 30,
+    "hidden": 576,
+    "heads": 9,
+    "kvHeads": 3,
+    "headDim": 64,
+    "vocab": 49152
+  },
+  "benchConfig": {
+    "threads": 8,
+    "context": 1024,
+    "decodeTokens": 32,
+    "windows": 5
+  }
+}

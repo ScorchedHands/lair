@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kv-cache-type-parity-2026-11-18",
+  "generatedAtUtc": "2026-11-18",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured.",
+  "phase": "MVP5.1",
+  "lane": "CPU quantized KV cache-type parity vs pinned llama.cpp b12032 server mode",
+  "markdownReport": "../../bench/reports/kv-cache-type-parity-2026-11-18.md",
+  "rawTableFiles": [],
+  "comparisonNotes": [
+    "Machine-readable baseline for quantized KV parity bands.",
+    "Named combos measured: q8_0/q8_0 (public names q8, int8, k8v8) and q8_0/q4_0 (public name k8v4).",
+    "Both modes kept LAIR's argmax inside the pinned llama.cpp top-5 candidates for all four prompts; no candidate was calibrated as present in LAIR and later absent.",
+    "Existing dense-family bands are not widened."
+  ]
+}

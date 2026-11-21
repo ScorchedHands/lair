@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kernel-gemm-rollout-2026-11-14",
+  "generatedAtUtc": "2026-11-14",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured.",
+  "phase": "MVP3.13",
+  "lane": "Prefill kernel rollout proof: gemv vs gemm on a live serving server",
+  "markdownReport": "../../bench/reports/kernel-gemm-rollout-2026-11-14.md",
+  "rawTableFiles": [],
+  "comparisonNotes": [
+    "Machine-readable baseline for live-serve kernel selection decisions.",
+    "The exact-stream equality (identical returned text, finish reason, usage tallies, and SHA-256 on both routes) is the strong result; the speed half reads as 'no consistent throughput win for either route at Q8_0' rather than a settled ordering.",
+    "Live peak working set moved from 1748.5 MB (gemv) to 1738.8 MB (gemm), a -0.6% change within snapshot noise.",
+    "Bench tables on the same fixture at fixed row width point the other way (gemm ahead at every measured length); the live-server run has it 7.7% behind."
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "reportId": "sub4bit-cost-repin-2026-11-17",
+  "host": {
+    "hostname": null,
+    "os": null,
+    "cpuModel": null,
+    "physicalCores": 24,
+    "logicalProcessors": 32,
+    "memoryTotalBytes": null,
+    "device": null,
+    "lane": "CPU GEMV bench + live serving servers",
+    "avx2": true,
+    "quotaThreads": 8,
+    "notes": [
+      "Host facts recorded in the raw tables: physicalCores=24, logicalProcessors=32, quotaThreads=8, avx2=True.",
+      "All three GEMV processes reported: sub4bit axis forcedGrid=auto forcedPrefetch=auto resolvedGrid=gather prefetchHints=on.",
+      "Live-decode reruns used temporary configs outside the repo with max_context_tokens 4096, kv_blocks 256, engine threads 0, model placement.thread_quota 8; one server at a time on ports 59101, 59102, then 59103; startup logs confirmed compute_grant requested=8 granted=8.",
+      "A first pass that omitted thread_quota is excluded from the reported live numbers because it did not match the documented serving posture."
+    ]
+  },
+  "gemvConfig": {
+    "reps": 200,
+    "maxRowsPerTensor": 256,
+    "threads": 8,
+    "backendWorkers": "gemv1T=1 quotaRun=8"
+  }
+}

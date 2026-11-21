@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kv-format-spike-2026-11-17",
+  "bench": [
+    {
+      "id": "micro-q4k-geometry",
+      "command": "Lair.Bench.exe kv-micro --threads 8 --context 256",
+      "geometry": "Q4_K geometry, threads=8, positions=256",
+      "metrics": [
+        { "mode": "hand", "medianPerCallUs": 443.986, "rangeUs": "437.60–451.39 across five samples after warm-up", "deltaVsHand": "baseline" },
+        { "mode": "f32block", "medianPerCallUs": 429.359, "rangeUs": "335.99–439.25", "deltaVsHand": "-3.3%" },
+        { "mode": "q8k", "medianPerCallUs": 270.455, "rangeUs": "256.02–296.86", "deltaVsHand": "-38.0%" }
+      ],
+      "rawTableMarkdown": "| Mode | Median per call | Range | Delta vs hand |\n|---|---:|---:|---:|\n| `hand` FP32 kernel | 443.986 us/call | 437.60–451.39 us across five samples after warm-up | baseline |\n| `f32block` generic control | 429.359 us/call | 335.99–439.25 us | -3.3% |\n| `q8k` candidate quantized dot | 270.455 us/call | 256.02–296.86 us | -38.0% |",
+      "equivalence": "Generic control exact: maxAbsDiff=0, meanRelDiff=0. Candidate quantized shape micro attention error maxAbsDiff=7.091e-4, meanRelDiff=2.872e-2 (not a parity-band result)."
+    },
+    {
+      "id": "decode-q4km",
+      "command": "Lair.Bench.exe kv-spike --threads 8 --context 2048 --decode 64 --windows 5 --modes baseline,f32block,q8k",
+      "geometry": "Q4_K_M pinned fixture, threads=8, context=2048",
+      "metrics": [
+        { "mode": "baseline", "medianTokPerSec": 7.133, "windowRange": "6.710–7.428", "deltaVsBaseline": "baseline" },
+        { "mode": "f32block", "medianTokPerSec": 8.229, "windowRange": "7.979–8.552", "deltaVsBaseline": "+15.4%" },
+        { "mode": "q8k", "medianTokPerSec": 12.319, "windowRange": "12.129–12.642", "deltaVsBaseline": "+72.7%" }
+      ],
+      "rawTableMarkdown": "| Mode | Median tok/s | Window range | Delta vs baseline median |\n|---|---:|---:|---:|\n| `baseline` FP32 production attention | 7.133 | 6.710–7.428 | baseline |\n| `f32block` generic control | 8.229 | 7.979–8.552 | +15.4% |\n| `q8k` candidate quantized dot | 12.319 | 12.129–12.642 | +72.7% |",
+      "probeContinuity": "All modes kept the same forced continuation argmax (probeTopId=791/128256). f32block logit drift vs baseline 0.0000; q8k probe drift 0.3664 (candidate-shape observation only)."
+    },
+    {
+      "id": "decode-iq4xs",
+      "command": "Lair.Bench.exe kv-spike models/Llama-3.2-1B-Instruct-IQ4_XS.gguf --threads 8 --context 2048 --decode 64 --windows 5 --modes baseline,f32block,q8k",
+      "geometry": "IQ4_XS pinned fixture, threads=8, context=2048",
+      "metrics": [
+        { "mode": "baseline", "medianTokPerSec": 4.779, "windowRange": "4.658–5.052", "deltaVsBaseline": "baseline" },
+        { "mode": "f32block", "medianTokPerSec": 8.670, "windowRange": "8.539–9.019", "deltaVsBaseline": "+81.4%" },
+        { "mode": "q8k", "medianTokPerSec": 13.613, "windowRange": "13.210–13.891", "deltaVsBaseline": "+184.8%" }
+      ],
+      "rawTableMarkdown": "| Mode | Median tok/s | Window range | Delta vs baseline median |\n|---|---:|---:|---:|\n| `baseline` FP32 production attention | 4.779 | 4.658–5.052 | baseline |\n| `f32block` generic control | 8.670 | 8.539–9.019 | +81.4% |\n| `q8k` candidate quantized dot | 13.613 | 13.210–13.891 | +184.8% |",
+      "probeContinuity": "All modes kept the same forced continuation argmax (probeTopId=791/128256). f32block logit drift vs baseline 0.0000; q8k probe drift 0.3947 (candidate-shape observation only)."
+    }
+  ],
+  "decisionConsequence": "DN-M51-6's primary path remains: cold descriptor + generic static-abstract block structs (IKvFormat<TSelf>, BlockPool<TK,TV>, LayerOps<TK,TV>). The fallback hand-specialized per-combo hot kernels are not adopted for the abstraction-tax reason."
+}

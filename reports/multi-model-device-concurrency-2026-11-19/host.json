@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "reportId": "multi-model-device-concurrency-2026-11-19",
+  "host": {
+    "hostname": null,
+    "os": "Microsoft Windows 10.0.26200",
+    "cpuModel": null,
+    "physicalCores": null,
+    "logicalProcessors": 32,
+    "memoryTotalBytes": null,
+    "lane": "CUDA two-model co-scheduling",
+    "notes": [
+      "Host osDescription and logicalProcessors recorded in the narrative; cpuModel/physicalCores were not recorded and are null.",
+      "Other GPU compute processes were active during the runs, so absolute medians are contention-contaminated."
+    ]
+  },
+  "device": {
+    "ordinal": 0,
+    "name": "NVIDIA GeForce RTX 4090",
+    "driverApiVersion": 13030
+  },
+  "fixture": {
+    "shape": { "rows": 2048, "cols": 2048, "batch": 32 },
+    "repsPerArm": 15,
+    "sweeps": 3,
+    "pairs": 3,
+    "blockPatterns": "deterministic pinned block patterns from cuda-gemv's builder",
+    "activationFamily": "Sin(0.11*c+7*v)*1.3",
+    "arms": "serialized legacy pipeline + twoStreamSerialized control + overlapped two non-blocking CUstreams"
+  }
+}

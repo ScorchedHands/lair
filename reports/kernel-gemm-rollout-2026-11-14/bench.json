@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kernel-gemm-rollout-2026-11-14",
+  "bench": [
+    {
+      "id": "exact-stream-correctness",
+      "note": "One identical request on both servers — deterministic prompt, temperature 0, max_tokens 32.",
+      "metrics": [
+        { "server": "gemv :58411", "returnedText": " 1, 2) 2, 3) 3, 4) 4, 5) 5, 6) 6", "finishReason": "length", "promptTokens": 28, "completionTokens": 32, "totalTokens": 60, "sha256": "ED4E24F7798615B60EF00F4B1F72611FE3DB0B52A52EC09EF39F1468DD8246E5" },
+        { "server": "gemm :58412", "returnedText": " 1, 2) 2, 3) 3, 4) 4, 5) 5, 6) 6", "finishReason": "length", "promptTokens": 28, "completionTokens": 32, "totalTokens": 60, "sha256": "ED4E24F7798615B60EF00F4B1F72611FE3DB0B52A52EC09EF39F1468DD8246E5" }
+      ],
+      "rawTableMarkdown": "| Server | Returned text | finish_reason | usage (prompt / completion / total) | SHA-256 of returned text |\n|---|---|---|---|---|\n| gemv :58411 | ` 1, 2) 2, 3) 3, 4) 4, 5) 5, 6) 6` | `length` | 28 / 32 / 60 | `ED4E24F7…D8246E5` |\n| gemm :58412 | ` 1, 2) 2, 3) 3, 4) 4, 5) 5, 6) 6` | `length` | 28 / 32 / 60 | `ED4E24F7…D8246E5` |",
+      "conclusion": "Identical on both routes; selecting gemm does not move the arithmetic on a file whose formats it runs."
+    },
+    {
+      "id": "long-prompt-speed",
+      "note": "Each request: fresh nonce prompt, temperature 0, max_tokens 1. Wall seconds measured around the HTTP call; prompt tokens from server-reported usage.",
+      "metrics": [
+        { "kernel": "gemv", "run": 1, "promptTokens": 1759, "wallSeconds": 95.07, "prefillTokPerSec": 18.50, "peakWorkingSetMb": 1748.5 },
+        { "kernel": "gemv", "run": 2, "promptTokens": 1760, "wallSeconds": 96.50, "prefillTokPerSec": 18.24, "peakWorkingSetMb": null },
+        { "kernel": "gemm", "run": 1, "promptTokens": 1762, "wallSeconds": 102.31, "prefillTokPerSec": 17.22, "peakWorkingSetMb": 1738.8 },
+        { "kernel": "gemm", "run": 2, "promptTokens": 1755, "wallSeconds": 105.22, "prefillTokPerSec": 16.68, "peakWorkingSetMb": null }
+      ],
+      "combined": { "gemvTokensForwarded": 3519, "gemvSeconds": 191.57, "gemvTokPerSec": 18.37, "gemmTokensForwarded": 3517, "gemmSeconds": 207.53, "gemmTokPerSec": 16.95, "deltaPercent": -7.7, "peakWorkingSetDeltaPercent": -0.6 },
+      "rawTableMarkdown": "| Kernel | Run | Prompt tokens | Wall seconds | Prefill tok/s | Peak working set (live) |\n|---|---|---:|---:|---:|---:|\n| gemv | 1 | 1759 | 95.07 | 18.50 | 1748.5 MB |\n| gemv | 2 | 1760 | 96.50 | 18.24 | — (same process) |\n| gemm | 1 | 1762 | 102.31 | 17.22 | 1738.8 MB |\n| gemm | 2 | 1755 | 105.22 | 16.68 | — (same process) |"
+    },
+    {
+      "id": "bench-table-cross-check",
+      "note": "Bench tables written beside the report on the same fixture at a fixed row width point slightly the other way — gemm ahead of gemv at every measured length.",
+      "metrics": [
+        { "length": 512, "gemmMs": 10936, "gemvMs": 12081 },
+        { "length": 1024, "gemmMs": 37891, "gemvMs": 38125 },
+        { "length": 2048, "gemmMs": 155944, "gemvMs": 161763 }
+      ]
+    }
+  ],
+  "verdicts": [
+    "Exact-stream equality is the strong result and it held on every request pair measured.",
+    "Live speed half: combined 18.37 tok/s for gemv and 16.95 tok/s for gemm, a -7.7% prefill throughput change at this prompt/posture.",
+    "Speed half reads as 'no consistent throughput win for either route at Q8_0' rather than a settled ordering.",
+    "Resolved row width is unchanged by kernel selection: a ~1760-token window splits into ceil(1760/32)=55 weight sub-batches on both routes."
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "reportId": "cuda-gemv-parity-2026-11-18",
+  "generatedAtUtc": "2026-11-18",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured.",
+  "phase": "MVP5.2",
+  "lane": "CUDA GEMV parity and speed gate on pinned synthetic fixtures",
+  "markdownReport": "../../bench/reports/cuda-gemv-parity-2026-11-18.md",
+  "rawTableFiles": [],
+  "comparisonNotes": [
+    "Machine-readable baseline for later CUDA GEMV default/format decisions.",
+    "Sub-4-bit i-quants are measured total-pass wins against auto-threaded CPU (IQ3_S through IQ2_XXS, ~1.98x-2.73x); dense/block formats with ratios below 1 remain non-default.",
+    "No automatic CUDA GEMV format default is promoted from this bench alone.",
+    "Recorded quality bands come from parity tests; bench equivalence drift is a sanity signal on different fixture magnitudes/shape, not a parity band."
+  ]
+}

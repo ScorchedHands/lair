@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kernel-gemm-rollout-2026-11-14",
+  "host": {
+    "hostname": null,
+    "os": null,
+    "cpuModel": null,
+    "physicalCores": null,
+    "logicalProcessors": null,
+    "memoryTotalBytes": null,
+    "device": null,
+    "lane": "CPU serving servers (one at a time, shared box)",
+    "notes": [
+      "Host core counts were not recorded in this narrative; recorded as null rather than inferred.",
+      "Two temporary configs held outside the repository, one server at a time on its own port: gemv on 127.0.0.1:58411, then gemm on 127.0.0.1:58412.",
+      "Monitor reported the same resolved posture on both servers: metrics_worker_threads=8, metrics_thread_quota=8, metrics_kv_capacity_blocks=256, metrics_kv_pool_mb=896.",
+      "metrics_prefill_kernel reported gemv on port 58411 and gemm on port 58412 across every snapshot that carried model facts, with metrics_weight_formats=Q8_0 on both."
+    ]
+  },
+  "serveConfig": {
+    "fixture": "models/Qwen3-0.6B-Q8_0.gguf",
+    "max_context_tokens": 4096,
+    "kv_blocks": 256,
+    "engine_block_size": 16,
+    "engine_max_batch_tokens": 512,
+    "engine_threads": 0,
+    "placement_thread_quota": 8,
+    "core_pinning": false
+  }
+}

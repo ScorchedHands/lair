@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sub-4-bit cost re-pin — 2026-11-17</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 420px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>MVP5 sub-4-bit measured-cost re-pin</h1>
+<div class="meta">
+  reportId: <code>sub4bit-cost-repin-2026-11-17</code> ·
+  recorded 2026-11-17 (date only) ·
+  phase: MVP5 ·
+  lane: GEMV cost re-pin after the MVP5 integer-dot rewrite · host: 24 physical / 32 logical cores, quota 8, AVX2
+</div>
+
+<h2>Resident single-thread GEMV cost</h2>
+<table>
+  <tr><th>Format group</th><th class="num">Summary resident 1T</th><th>Settled tensor samples</th><th class="num">Cost vs Q4_K baseline</th></tr>
+  <tr><td>IQ2_S in UD file</td><td class="num">553.0 ns/GEMV, 0.270 ns/elt</td><td>504.7–507.0 ns/GEMV; one first-measured sample at 693.4 inflates group summary</td><td class="num">settled ≈1.50–1.51x; summary ≈1.65x</td></tr>
+  <tr><td>IQ2_XS in UD file</td><td class="num">655.3 ns/GEMV, 0.320 ns/elt</td><td>654.7–655.5 ns/GEMV</td><td class="num">≈1.95x</td></tr>
+  <tr><td>IQ3_S in UD file</td><td class="num">692.1 ns/GEMV, 0.338 ns/elt</td><td>691.0–693.4 ns/GEMV</td><td class="num">≈2.06–2.07x</td></tr>
+  <tr><td>IQ3_XXS in UD file</td><td class="num">783.9 ns/GEMV, 0.383 ns/elt</td><td>778.9–788.7 ns/GEMV</td><td class="num">≈2.32–2.35x</td></tr>
+  <tr><td>Q4_K anchor in UD file</td><td class="num">340.9 ns/GEMV, 0.166 ns/elt</td><td>335.9–350.4 ns/GEMV</td><td class="num">same-file baseline, ≈1.01–1.02x</td></tr>
+  <tr><td>IQ4_XS mixed wide rows in UD file</td><td class="num">1381.3 ns/GEMV, 0.169 ns/elt</td><td>1379.3–1382.8 ns/GEMV; contraction width 8192 columns</td><td class="num">per-element cost comparable to dense baselines</td></tr>
+</table>
+<p>Baseline fixture summaries: Q4_K_M resident 1T 335.8 ns/GEMV (0.164 ns/elt); IQ4_XS resident 1T 334.6 ns/GEMV (0.163 ns/elt).</p>
+
+<h2>Live decode measurements (quota 8)</h2>
+<table>
+  <tr><th>Fixture</th><th>Startup CPU selection</th><th class="num">Monitor peak decode</th><th class="num">Peak working set</th><th>Client aggregate runs</th></tr>
+  <tr><td>Q4_K_M</td><td>isa=vnni gather=gather</td><td class="num">12.43 tok/s</td><td class="num">1430.9 MB</td><td>run1 337 / 41.33 s = 8.153; run2 337 / 38.22 = 8.818</td></tr>
+  <tr><td>IQ4_XS</td><td>isa=vnni gather=scalar</td><td class="num">16.46 tok/s</td><td class="num">1344.2 MB</td><td>run1 239 / 16.49 s = 14.491; run2 239 / 15.54 = 15.377</td></tr>
+  <tr><td>UD mixed-tier file</td><td>isa=vnni gather=gather</td><td class="num">12.97 tok/s</td><td class="num">1222.0 MB</td><td>run1 204 / 18.90 s = 10.794; run2 204 / 17.27 = 11.811</td></tr>
+</table>
+
+<h2>Cost vs Q4_K baseline (ns/elt, resident 1T)</h2>
+<div class="chart-wrap"><canvas id="costChart"></canvas></div>
+<h2>Live decode tok/s</h2>
+<div class="chart-wrap"><canvas id="decodeChart"></canvas></div>
+
+<h2>Reading</h2>
+<ul>
+  <li>The old ~6.5x sub-4-bit penalty is not present on this build; measured stable per-element costs are roughly 0.25–0.39 ns/elt against the Q4_K baseline, i.e. about 1.5–2.3x depending on format.</li>
+  <li>IQ3_XXS modestly exceeds the intended ~1–2x band at about 2.3x on this posture; recorded rather than smoothed.</li>
+  <li>IQ4_XS is the fastest measured live fixture (~16.5 monitor-windowed decode tok/s), ahead of Q4_K_M (~12.4) and the mixed-tier sub-4-bit file (~13.0), while staying under the 4 GB working-set ceiling.</li>
+  <li>Server startup selection varied across processes: corrected quota8 runs resolved gather for Q4_K_M/UD and scalar for IQ4_XS; live measurements report actual mode rather than one global encoding.</li>
+</ul>
+
+<script>
+new Chart(document.getElementById("costChart"), {
+  type: "bar",
+  data: { labels: ["IQ2_S","IQ2_XS","IQ3_S","IQ3_XXS","Q4_K anchor"], datasets: [
+    { label: "ns/elt (resident 1T)", data: [0.270,0.320,0.338,0.383,0.166], backgroundColor: "#4c78a8" }
+  ] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Sub-4-bit resident 1T cost vs Q4_K baseline (0.164 ns/elt)" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "ns / element" } } } }
+});
+new Chart(document.getElementById("decodeChart"), {
+  type: "bar",
+  data: { labels: ["Q4_K_M","IQ4_XS","UD mixed-tier"], datasets: [
+    { label: "Monitor peak decode tok/s", data: [12.43,16.46,12.97], backgroundColor: "#f58518" },
+    { label: "Client aggregate run1 tok/s", data: [8.153,14.491,10.794], backgroundColor: "#4c78a8" },
+    { label: "Client aggregate run2 tok/s", data: [8.818,15.377,11.811], backgroundColor: "#72b7b2" }
+  ] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Live decode throughput (quota 8)" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "tokens / second" } } } }
+});
+</script>
+</body>
+</html>

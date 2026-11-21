@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quantized KV recommendation bench — 2026-11-18</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 420px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>MVP5.1 quantized KV recommendation bench</h1>
+<div class="meta">
+  reportId: <code>kv-quant-recommendation-2026-11-18</code> ·
+  recorded 2026-11-18 (date only) ·
+  phase: MVP5.1 ·
+  lane: production CPU serving seams
+</div>
+
+<h2>Model / config</h2>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>Model</td><td>models/SmolLM-135M-Instruct-F16.gguf (llama · 30 layers · hidden 576 · heads 9 · kvHeads 3 · headDim 64 · vocab 49152)</td></tr>
+  <tr><td>Threads / ISA</td><td>8 · vnni</td></tr>
+  <tr><td>Context / decode / windows</td><td>1024 · 32 · 5</td></tr>
+  <tr><td>Process peak working set</td><td>381.1 MB</td></tr>
+</table>
+
+<h2>Measured decode throughput</h2>
+<table>
+  <tr><th>Mode</th><th class="num">Median tok/s</th><th class="num">Min</th><th class="num">Max</th><th class="num">Spread</th><th class="num">Prefill setup ms</th><th class="num">Reserved KV</th></tr>
+  <tr><td>f32/f32 baseline</td><td class="num">23.659</td><td class="num">20.949</td><td class="num">27.111</td><td class="num">26.05%</td><td class="num">14410.1</td><td class="num">56.25 MiB</td></tr>
+  <tr><td>q8_0/q8_0</td><td class="num">8.200</td><td class="num">7.839</td><td class="num">8.503</td><td class="num">8.10%</td><td class="num">51903.1</td><td class="num">14.94 MiB</td></tr>
+  <tr><td>q8_0/q4_0 (k8v4)</td><td class="num">8.205</td><td class="num">7.961</td><td class="num">8.564</td><td class="num">7.35%</td><td class="num">49744.1</td><td class="num">11.43 MiB</td></tr>
+</table>
+
+<h2>Footprint</h2>
+<table>
+  <tr><th>Mode</th><th class="num">Bytes per block</th><th class="num">Reserved KV</th></tr>
+  <tr><td>f32/f32</td><td class="num">737280</td><td class="num">56.25 MiB</td></tr>
+  <tr><td>q8_0/q8_0</td><td class="num">195840</td><td class="num">14.94 MiB</td></tr>
+  <tr><td>q8_0/q4_0</td><td class="num">149760</td><td class="num">11.43 MiB</td></tr>
+</table>
+
+<h2>Median decode tok/s vs reserved KV</h2>
+<div class="chart-wrap"><canvas id="decodeChart"></canvas></div>
+<div class="chart-wrap"><canvas id="footprintChart"></canvas></div>
+
+<h2>Equivalence sanity</h2>
+<table>
+  <tr><th>Mode</th><th>Probe top id</th><th>Argmax match vs baseline</th><th class="num">Max abs logit diff vs baseline</th></tr>
+  <tr><td>q8_0/q8_0</td><td>504/49152</td><td>true</td><td class="num">0.1299</td></tr>
+  <tr><td>q8_0/q4_0</td><td>504/49152</td><td>true</td><td class="num">1.5525</td></tr>
+</table>
+
+<h2>Recommendation</h2>
+<ul>
+  <li>Default: <code>f32/f32</code>.</li>
+  <li>Conservative memory-saving quantized option: <code>q8_0/q8_0</code>.</li>
+  <li>Memory-pressure option only: <code>k8v4</code>, when the smaller KV footprint justifies the larger measured drift.</li>
+  <li>Quantized routes save footprint but decode and prefill setup are materially slower than FP32.</li>
+</ul>
+
+<script>
+const modes = ["f32/f32","q8_0/q8_0","q8_0/q4_0"];
+new Chart(document.getElementById("decodeChart"), {
+  type: "bar",
+  data: { labels: modes, datasets: [{ label: "Median decode tok/s", data: [23.659,8.200,8.205], backgroundColor: "#4c78a8" }] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Quantized KV median decode tok/s" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "tokens / second" } } } }
+});
+new Chart(document.getElementById("footprintChart"), {
+  type: "bar",
+  data: { labels: modes, datasets: [{ label: "Reserved KV (MiB)", data: [56.25,14.94,11.43], backgroundColor: "#f58518" }] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Quantized KV reserved footprint (MiB)" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "MiB" } } } }
+});
+</script>
+</body>
+</html>

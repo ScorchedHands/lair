@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "reportId": "cuda-prefill-2026-11-19",
+  "generatedAtUtc": "2026-11-19",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured.",
+  "phase": "MVP5.4",
+  "lane": "CUDA composed dense prefill payoff measurement on a pinned F16 fixture",
+  "markdownReport": "../../bench/reports/cuda-prefill-2026-11-19.md",
+  "rawTableFiles": [],
+  "comparisonNotes": [
+    "Machine-readable baseline for later device-side prefill default decisions.",
+    "Payoff is mixed rather than universal: CUDA won at lengths 32 (1.195) and 128 (1.126) but lost at length 64 (0.966) on this fixture and host.",
+    "GPU prefill remains internal/non-default; a public default flip would require a stable payoff posture across serving shapes.",
+    "Logit drift values are bench basis only and do not assert or widen parity bands in tests."
+  ]
+}

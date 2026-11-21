@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kernel-speed-gemv-tiled-2026-11-13",
+  "bench": [
+    {
+      "id": "gemv-vs-tiled-live",
+      "harness": "live serving servers via /v1/completions (max_tokens: 1)",
+      "metrics": [
+        { "kernel": "gemv", "run": 1, "promptTokens": 1751, "wallSeconds": 74.9243887, "prefillTokPerSec": 23.37, "peakWorkingSetMb": 1353.8 },
+        { "kernel": "gemv", "run": 2, "promptTokens": 1751, "wallSeconds": 75.6483948, "prefillTokPerSec": 23.15, "peakWorkingSetMb": 1353.8 },
+        { "kernel": "tiled", "run": 1, "promptTokens": 1751, "wallSeconds": 69.7240270, "prefillTokPerSec": 25.11, "peakWorkingSetMb": 1222.8 },
+        { "kernel": "tiled", "run": 2, "promptTokens": 1751, "wallSeconds": 71.5923544, "prefillTokPerSec": 24.46, "peakWorkingSetMb": 1222.8 }
+      ],
+      "combined": { "gemvAvgTokPerSec": 23.26, "tiledAvgTokPerSec": 24.78, "throughputGainPercent": 6.5, "wallTimeReductionPercent": 6.1, "peakWorkingSetFromMb": 1353.8, "peakWorkingSetToMb": 1222.8 },
+      "rawTableMarkdown": "| Kernel | Prompt tokens | Wall seconds | Prefill tok/s | Peak working set |\n|---|---:|---:|---:|---:|\n| gemv run 1 | 1751 | 74.9243887 | 23.37 | 1353.8 MB |\n| gemv run 2 | 1751 | 75.6483948 | 23.15 | 1353.8 MB |\n| tiled run 1 | 1751 | 69.7240270 | 25.11 | 1222.8 MB |\n| tiled run 2 | 1751 | 71.5923544 | 24.46 | 1222.8 MB |",
+      "reading": "Resolved prompt row width is unchanged between the two runs, so both engines split 1751 tokens into 56 weight sub-batches (ceil(1751 / 32)); the weight-traversal count does not explain the gain. The same engine posture has a fitted attention crossover floor at length >= 1081 (prefill-rowwidth-2026-11-13.md)."
+    }
+  ]
+}

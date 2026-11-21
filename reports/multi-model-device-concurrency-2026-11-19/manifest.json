@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "reportId": "multi-model-device-concurrency-2026-11-19",
+  "generatedAtUtc": "2026-11-19",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured.",
+  "phase": "MVP6.1",
+  "lane": "CUDA co-scheduling payoff measurement (serialized vs two-stream vs overlapped)",
+  "markdownReport": "../../bench/reports/multi-model-device-concurrency-2026-11-19.md",
+  "rawTableFiles": [],
+  "rawJsonArtifacts": [
+    "C:\\Users\\Chuck\\AppData\\Local\\Temp\\kilo\\cuda-concurrency-v3-run1.json",
+    "C:\\Users\\Chuck\\AppData\\Local\\Temp\\kilo\\cuda-concurrency-v3-run2.json",
+    "C:\\Users\\Chuck\\AppData\\Local\\Temp\\kilo\\cuda-concurrency-v3-run3.json"
+  ],
+  "comparisonNotes": [
+    "Machine-readable baseline for the MVP6.1 per-model CUDA streams decision.",
+    "Two-GEMV and two-GEMM pairs were positive in all three runs (serialized/overlapped paired medians 1.57 to 2.17); the mixed GEMV/GEMM pair was positive in two of three runs and inconclusive once.",
+    "The two-stream control shows lane machinery and async staging alone are close to today's serialized pipeline (serialized/two-stream medians 0.99-1.14); essentially all measured payoff comes from submitting both lanes before awaiting either.",
+    "Absolute millisecond medians are contention-contaminated on this host; verdicts rest on rep-by-rep paired ratios, not absolute wall medians.",
+    "Bit-for-bit serialized-vs-overlapped output equivalence was true for every pair in every run."
+  ]
+}

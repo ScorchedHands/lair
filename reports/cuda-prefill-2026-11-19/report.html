@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CUDA dense prefill payoff — 2026-11-19</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 420px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>CUDA dense prefill payoff measurement</h1>
+<div class="meta">
+  reportId: <code>cuda-prefill-2026-11-19</code> ·
+  recorded 2026-11-19 (date only) ·
+  phase: MVP5.4 ·
+  lane: CUDA composed dense prefill payoff
+</div>
+
+<h2>Model / fixture</h2>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>File</td><td>models/SmolLM-135M-Instruct-F16.gguf (270,885,792 bytes)</td></tr>
+  <tr><td>Arch / layers / hidden</td><td>llama · 30 · 576</td></tr>
+  <tr><td>Heads / KV heads / head dim / vocab</td><td>9 · 3 · 64 · 49152</td></tr>
+  <tr><td>Resolved prefill row width</td><td>32</td></tr>
+  <tr><td>Lengths / reps / threads</td><td>32,64,128 · 3 · auto</td></tr>
+  <tr><td>Process facts</td><td>weightCopiesToDevice=211 · persistentDeviceWeightBytes=268,959,744 · peakWorkingSetMb=576.0</td></tr>
+</table>
+
+<h2>Median speed summary</h2>
+<table>
+  <tr><th>Length</th><th class="num">CPU median ms (min/max)</th><th class="num">CPU tok/s</th><th class="num">CUDA median ms (min/max)</th><th class="num">CUDA tok/s</th><th class="num">Ratio CPU/CUDA</th><th>GPU wins</th><th class="num">Max abs logit drift</th><th>Argmax match</th></tr>
+  <tr><td>32</td><td class="num">143.51 (137.97/157.05)</td><td class="num">223.0</td><td class="num">120.11 (118.19/124.19)</td><td class="num">266.4</td><td class="num">1.195</td><td>yes</td><td class="num">1.512E-003</td><td>cpu=29 cuda=29</td></tr>
+  <tr><td>64</td><td class="num">232.43 (230.99/239.21)</td><td class="num">275.3</td><td class="num">240.61 (239.45/247.63)</td><td class="num">266.0</td><td class="num">0.966</td><td>no</td><td class="num">2.019E-003</td><td>cpu=65 cuda=65</td></tr>
+  <tr><td>128</td><td class="num">554.38 (544.61/595.84)</td><td class="num">230.9</td><td class="num">492.37 (490.48/498.83)</td><td class="num">260.0</td><td class="num">1.126</td><td>yes</td><td class="num">1.945E-003</td><td>cpu=8547 cuda=8547</td></tr>
+</table>
+
+<h2>tok/s CPU vs CUDA by length</h2>
+<div class="chart-wrap"><canvas id="toksChart"></canvas></div>
+<div class="chart-wrap"><canvas id="ratioChart"></canvas></div>
+
+<h2>CUDA tallies and residency facts</h2>
+<table>
+  <tr><th>Length</th><th class="num">Kernel busy us</th><th class="num">Transfer calls</th><th class="num">Transfer bytes</th><th class="num">Avg bytes/call</th><th class="num">Device-written blocks</th><th class="num">Crossed blocks/bytes</th><th class="num">Resident device KV bytes</th></tr>
+  <tr><td>32</td><td class="num">442509</td><td class="num">2710</td><td class="num">233237760</td><td class="num">86066</td><td class="num">2</td><td class="num">16 / 20643840</td><td class="num">11796480</td></tr>
+  <tr><td>64</td><td class="num">859483</td><td class="num">5410</td><td class="num">465480960</td><td class="num">86041</td><td class="num">4</td><td class="num">16 / 32440320</td><td class="num">11796480</td></tr>
+  <tr><td>128</td><td class="num">1903216</td><td class="num">10810</td><td class="num">929967360</td><td class="num">86028</td><td class="num">8</td><td class="num">16 / 56033280</td><td class="num">11796480</td></tr>
+</table>
+
+<h2>Interpretation</h2>
+<ul>
+  <li>CUDA composed dense prefill won at lengths 32 (1.195) and 128 (1.126), lost at length 64 (0.966) — a length-dependent payoff, not a blanket fast-prefill claim.</li>
+  <li>Device path composes CUDA matmul with on-device attention/KV steps and keeps KV resident in the pool's device store during measured prefill.</li>
+  <li>Composition-only test band for MVP5.4 is 4e-3; measured worst absolute logit drift 2.019E-3; argmax matched across all three lengths.</li>
+  <li>GPU prefill remains internal/non-default.</li>
+</ul>
+
+<script>
+const lengths = ["32","64","128"];
+const cpuToks = [223.0,275.3,230.9];
+const cudaToks = [266.4,266.0,260.0];
+const ratios = [1.195,0.966,1.126];
+new Chart(document.getElementById("toksChart"), {
+  type: "bar",
+  data: { labels: lengths, datasets: [
+    { label: "CPU tok/s", data: cpuToks, backgroundColor: "#4c78a8" },
+    { label: "CUDA tok/s", data: cudaToks, backgroundColor: "#f58518" }
+  ] },
+  options: { responsive: true, plugins: { title: { display: true, text: "CUDA dense prefill tok/s by length (SmolLM-135M F16)" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "tokens / second" } } } }
+});
+new Chart(document.getElementById("ratioChart"), {
+  type: "bar",
+  data: { labels: lengths, datasets: [{ label: "wall ratio CPU/CUDA", data: ratios, backgroundColor: "#72b7b2" }] },
+  options: { responsive: true, plugins: { title: { display: true, text: "CPU/CUDA wall ratio (>1 = CUDA won)" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "ratio" } } } }
+});
+</script>
+</body>
+</html>

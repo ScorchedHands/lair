@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prefill kernel cost comparison — 2026-11-14</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 420px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>Prefill kernel cost comparison</h1>
+<div class="meta">
+  reportId: <code>kernel-comparison-2026-11-14</code> ·
+  recorded 2026-11-14 (date only) ·
+  phase: MVP3.13 ·
+  lane: gemv / tiled / gemm on proven-format pinned fixtures
+</div>
+
+<h2>Llama Q8_0 kernel table</h2>
+<table>
+  <tr><th>Kernel</th><th class="num">Weight fit ms/traversal</th><th class="num">Implied weight GB/s</th><th class="num">Attention fit us/position pair</th><th>Fitted crossover</th><th class="num">512 tok/s</th><th class="num">1024 tok/s</th><th class="num">2048 tok/s</th><th class="num">Peak MB</th></tr>
+  <tr><td>gemv</td><td class="num">439.52</td><td class="num">2.35</td><td class="num">32.491</td><td>&ge; 855</td><td class="num">44.93</td><td class="num">32.99</td><td class="num">21.26</td><td class="num">1532.0</td></tr>
+  <tr><td>tiled</td><td class="num">527.01</td><td class="num">1.96</td><td class="num">24.202</td><td>&ge; 1368</td><td class="num">45.43</td><td class="num">34.34</td><td class="num">24.25</td><td class="num">1531.5</td></tr>
+  <tr><td>gemm</td><td class="num">348.67</td><td class="num">2.97</td><td class="num">32.672</td><td>&ge; 669</td><td class="num">51.03</td><td class="num">36.34</td><td class="num">22.53</td><td class="num">1531.9</td></tr>
+</table>
+
+<h2>Qwen3 Q8_0 kernel table</h2>
+<table>
+  <tr><th>Kernel</th><th class="num">Weight fit ms/traversal</th><th class="num">Implied weight GB/s</th><th class="num">Attention fit us/position pair</th><th>Fitted crossover</th><th class="num">512 tok/s</th><th class="num">1024 tok/s</th><th class="num">2048 tok/s</th><th class="num">Peak MB</th></tr>
+  <tr><td>gemv</td><td class="num">243.46</td><td class="num">1.92</td><td class="num">58.485</td><td>&ge; 274</td><td class="num">39.25</td><td class="num">27.39</td><td class="num">14.79</td><td class="num">1196.9</td></tr>
+  <tr><td>tiled</td><td class="num">277.13</td><td class="num">1.69</td><td class="num">38.104</td><td>&ge; 467</td><td class="num">53.87</td><td class="num">35.54</td><td class="num">20.96</td><td class="num">1196.4</td></tr>
+  <tr><td>gemm</td><td class="num">38.33</td><td class="num">12.21</td><td class="num">54.568</td><td>&ge; 53</td><td class="num">57.92</td><td class="num">35.23</td><td class="num">17.49</td><td class="num">1197.0</td></tr>
+</table>
+
+<h2>tok/s across prompt lengths — Llama Q8_0</h2>
+<div class="chart-wrap"><canvas id="llamaChart"></canvas></div>
+<h2>tok/s across prompt lengths — Qwen3 Q8_0</h2>
+<div class="chart-wrap"><canvas id="qwen3Chart"></canvas></div>
+
+<h2>Mixed-format refusal evidence</h2>
+<div class="note">The pinned <code>models/Llama-3.2-1B-Instruct-IQ4_XS.gguf</code> runs <code>gemv</code> and <code>tiled</code> but refuses <code>gemm</code> naming <code>Q5_K</code>. Its peak line (987.9 MB) is cumulative across the multi-kernel process and is not used for per-kernel memory comparison.</div>
+
+<h2>Reading</h2>
+<ul>
+  <li>On Llama Q8_0, <code>tiled</code> lowers the fitted attention coefficient from 32.491 to 24.202 us/position pair, making it fastest at 2048; <code>gemm</code> lowers fitted weight cost (439.52 to 348.67 ms/traversal) and improves implied bytes/sec but is strongest at shorter lengths.</li>
+  <li>On Qwen3 Q8_0, <code>tiled</code> is the clearest long-prompt win (attention fit 58.485 down to 38.104 us/position pair); <code>gemm</code>'s weight fit moves sharply down but its attention coefficient does not move consistently in this run.</li>
+  <li>Treat kernel ordering as directional where residuals and coefficients disagree with wall time.</li>
+</ul>
+
+<script>
+const lengths = ["512","1024","2048"];
+new Chart(document.getElementById("llamaChart"), {
+  type: "bar",
+  data: { labels: lengths, datasets: [
+    { label: "gemv", data: [44.93,32.99,21.26], backgroundColor: "#4c78a8" },
+    { label: "tiled", data: [45.43,34.34,24.25], backgroundColor: "#f58518" },
+    { label: "gemm", data: [51.03,36.34,22.53], backgroundColor: "#72b7b2" }
+  ] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Llama-3.2-1B Q8_0 prefill tok/s by kernel" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "tokens / second" } } } }
+});
+new Chart(document.getElementById("qwen3Chart"), {
+  type: "bar",
+  data: { labels: lengths, datasets: [
+    { label: "gemv", data: [39.25,27.39,14.79], backgroundColor: "#4c78a8" },
+    { label: "tiled", data: [53.87,35.54,20.96], backgroundColor: "#f58518" },
+    { label: "gemm", data: [57.92,35.23,17.49], backgroundColor: "#72b7b2" }
+  ] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Qwen3-0.6B Q8_0 prefill tok/s by kernel" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "tokens / second" } } } }
+});
+</script>
+</body>
+</html>

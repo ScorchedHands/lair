@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "reportId": "cuda-gemv-parity-2026-11-18",
+  "bench": [
+    {
+      "id": "cuda-gemv-speed-gate",
+      "harness": "Lair.Bench cuda-gemv",
+      "command": "dotnet run --project bench/Lair.Bench -c Release --no-build -- cuda-gemv",
+      "ratioConvention": "Ratios > 1 mean CUDA is faster for that comparison basis. Auto-vs-CUDA wall is the honest serving comparison (both include a full GemvBatch pass; CUDA includes runtime activation/output crossing plus launch/sync overhead).",
+      "metrics": [
+        { "format": "F32", "packedMiB": 2.00, "cpuScalarMs": 38.435, "cpuAutoMs": 0.525, "cudaWallMs": 2.270, "kernelBusyUsPerRep": 1904.4, "scalarVsCudaWall": 16.93, "autoVsCudaWall": 0.23, "computeOnlyRatio": 20.18, "benchEquivalenceMaxRelDrift": 0.0063601 },
+        { "format": "F16", "packedMiB": 1.00, "cpuScalarMs": 23.378, "cpuAutoMs": 0.498, "cudaWallMs": 2.859, "kernelBusyUsPerRep": 3026.9, "scalarVsCudaWall": 8.18, "autoVsCudaWall": 0.17, "computeOnlyRatio": 7.72, "benchEquivalenceMaxRelDrift": 0.0032998 },
+        { "format": "BF16", "packedMiB": 1.00, "cpuScalarMs": 11.018, "cpuAutoMs": 0.621, "cudaWallMs": 2.878, "kernelBusyUsPerRep": 2476.9, "scalarVsCudaWall": 3.83, "autoVsCudaWall": 0.22, "computeOnlyRatio": 4.45, "benchEquivalenceMaxRelDrift": "exact" },
+        { "format": "Q8_0", "packedMiB": 0.53, "cpuScalarMs": 12.950, "cpuAutoMs": 0.506, "cudaWallMs": 2.021, "kernelBusyUsPerRep": 2007.0, "scalarVsCudaWall": 6.41, "autoVsCudaWall": 0.25, "computeOnlyRatio": 6.45, "benchEquivalenceMaxRelDrift": 0.00138574 },
+        { "format": "Q4_K", "packedMiB": 0.28, "cpuScalarMs": 11.717, "cpuAutoMs": 0.542, "cudaWallMs": 1.714, "kernelBusyUsPerRep": 1834.6, "scalarVsCudaWall": 6.84, "autoVsCudaWall": 0.32, "computeOnlyRatio": 6.39, "benchEquivalenceMaxRelDrift": 8.16e-6 },
+        { "format": "Q5_0", "packedMiB": 0.34, "cpuScalarMs": 17.813, "cpuAutoMs": 2.136, "cudaWallMs": 1.957, "kernelBusyUsPerRep": 1984.9, "scalarVsCudaWall": 9.10, "autoVsCudaWall": 1.09, "computeOnlyRatio": 8.97, "benchEquivalenceMaxRelDrift": 0.000996202 },
+        { "format": "Q6_K", "packedMiB": 0.41, "cpuScalarMs": 16.219, "cpuAutoMs": 4.156, "cudaWallMs": 1.925, "kernelBusyUsPerRep": 2089.3, "scalarVsCudaWall": 8.42, "autoVsCudaWall": 2.16, "computeOnlyRatio": 7.76, "benchEquivalenceMaxRelDrift": 0.000101947 },
+        { "format": "Q5_K", "packedMiB": 0.34, "cpuScalarMs": 15.537, "cpuAutoMs": 2.582, "cudaWallMs": 2.751, "kernelBusyUsPerRep": 2430.0, "scalarVsCudaWall": 5.65, "autoVsCudaWall": 0.94, "computeOnlyRatio": 6.39, "benchEquivalenceMaxRelDrift": 0.000174343 },
+        { "format": "Q2_K", "packedMiB": 0.16, "cpuScalarMs": 12.694, "cpuAutoMs": 0.509, "cudaWallMs": 1.476, "kernelBusyUsPerRep": 1629.9, "scalarVsCudaWall": 8.60, "autoVsCudaWall": 0.34, "computeOnlyRatio": 7.79, "benchEquivalenceMaxRelDrift": 0.000332475 },
+        { "format": "Q3_K", "packedMiB": 0.21, "cpuScalarMs": 13.662, "cpuAutoMs": 2.109, "cudaWallMs": 1.967, "kernelBusyUsPerRep": 2006.7, "scalarVsCudaWall": 6.94, "autoVsCudaWall": 1.07, "computeOnlyRatio": 6.81, "benchEquivalenceMaxRelDrift": 0.0058546 },
+        { "format": "Q2_0", "packedMiB": 0.14, "cpuScalarMs": 15.100, "cpuAutoMs": 0.556, "cudaWallMs": 1.348, "kernelBusyUsPerRep": 1297.4, "scalarVsCudaWall": 11.20, "autoVsCudaWall": 0.41, "computeOnlyRatio": 11.64, "benchEquivalenceMaxRelDrift": 2.476e-5 },
+        { "format": "IQ4_NL", "packedMiB": 0.28, "cpuScalarMs": 17.142, "cpuAutoMs": 0.623, "cudaWallMs": 2.496, "kernelBusyUsPerRep": 2759.4, "scalarVsCudaWall": 6.87, "autoVsCudaWall": 0.25, "computeOnlyRatio": 6.21, "benchEquivalenceMaxRelDrift": 0.000803455 },
+        { "format": "IQ4_XS", "packedMiB": 0.27, "cpuScalarMs": 13.917, "cpuAutoMs": 0.548, "cudaWallMs": 2.392, "kernelBusyUsPerRep": 2468.6, "scalarVsCudaWall": 5.82, "autoVsCudaWall": 0.23, "computeOnlyRatio": 5.64, "benchEquivalenceMaxRelDrift": 0.00898242 },
+        { "format": "IQ2_XXS", "packedMiB": 0.13, "cpuScalarMs": 17.893, "cpuAutoMs": 1.360, "cudaWallMs": 0.572, "kernelBusyUsPerRep": 413.1, "scalarVsCudaWall": 31.28, "autoVsCudaWall": 2.38, "computeOnlyRatio": 43.31, "benchEquivalenceMaxRelDrift": 8.35e-5 },
+        { "format": "IQ2_XS", "packedMiB": 0.14, "cpuScalarMs": 17.504, "cpuAutoMs": 1.435, "cudaWallMs": 0.525, "kernelBusyUsPerRep": 382.9, "scalarVsCudaWall": 33.33, "autoVsCudaWall": 2.73, "computeOnlyRatio": 45.72, "benchEquivalenceMaxRelDrift": 0.000858286 },
+        { "format": "IQ2_S", "packedMiB": 0.16, "cpuScalarMs": 18.096, "cpuAutoMs": 1.375, "cudaWallMs": 0.529, "kernelBusyUsPerRep": 351.1, "scalarVsCudaWall": 34.23, "autoVsCudaWall": 2.60, "computeOnlyRatio": 51.54, "benchEquivalenceMaxRelDrift": 1.98e-5 },
+        { "format": "IQ3_XXS", "packedMiB": 0.19, "cpuScalarMs": 18.190, "cpuAutoMs": 0.729, "cudaWallMs": 0.578, "kernelBusyUsPerRep": 419.3, "scalarVsCudaWall": 31.45, "autoVsCudaWall": 1.26, "computeOnlyRatio": 43.38, "benchEquivalenceMaxRelDrift": 2.446e-5 },
+        { "format": "IQ3_S", "packedMiB": 0.21, "cpuScalarMs": 25.810, "cpuAutoMs": 1.120, "cudaWallMs": 0.567, "kernelBusyUsPerRep": 402.9, "scalarVsCudaWall": 45.50, "autoVsCudaWall": 1.98, "computeOnlyRatio": 64.07, "benchEquivalenceMaxRelDrift": 3.047e-5 }
+      ],
+      "rawTableMarkdown": "| Format | Packed MiB | CPU scalar ms | CPU auto ms | CUDA wall ms | Kernel busy µs/rep | Scalar vs CUDA wall | Auto vs CUDA wall | Compute-only ratio | Bench equivalence max rel drift |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n| `F32` | 2.00 | 38.435 | 0.525 | 2.270 | 1904.4 | 16.93 | 0.23 | 20.18 | 0.0063601 |\n| `F16` | 1.00 | 23.378 | 0.498 | 2.859 | 3026.9 | 8.18 | 0.17 | 7.72 | 0.0032998 |\n| `BF16` | 1.00 | 11.018 | 0.621 | 2.878 | 2476.9 | 3.83 | 0.22 | 4.45 | exact |\n| `Q8_0` | 0.53 | 12.950 | 0.506 | 2.021 | 2007.0 | 6.41 | 0.25 | 6.45 | 0.00138574 |\n| `Q4_K` | 0.28 | 11.717 | 0.542 | 1.714 | 1834.6 | 6.84 | 0.32 | 6.39 | 8.16e-6 |\n| `Q5_0` | 0.34 | 17.813 | 2.136 | 1.957 | 1984.9 | 9.10 | 1.09 | 8.97 | 0.000996202 |\n| `Q6_K` | 0.41 | 16.219 | 4.156 | 1.925 | 2089.3 | 8.42 | 2.16 | 7.76 | 0.000101947 |\n| `Q5_K` | 0.34 | 15.537 | 2.582 | 2.751 | 2430.0 | 5.65 | 0.94 | 6.39 | 0.000174343 |\n| `Q2_K` | 0.16 | 12.694 | 0.509 | 1.476 | 1629.9 | 8.60 | 0.34 | 7.79 | 0.000332475 |\n| `Q3_K` | 0.21 | 13.662 | 2.109 | 1.967 | 2006.7 | 6.94 | 1.07 | 6.81 | 0.0058546 |\n| `Q2_0` | 0.14 | 15.100 | 0.556 | 1.348 | 1297.4 | 11.20 | 0.41 | 11.64 | 2.476e-5 |\n| `IQ4_NL` | 0.28 | 17.142 | 0.623 | 2.496 | 2759.4 | 6.87 | 0.25 | 6.21 | 0.000803455 |\n| `IQ4_XS` | 0.27 | 13.917 | 0.548 | 2.392 | 2468.6 | 5.82 | 0.23 | 5.64 | 0.00898242 |\n| `IQ2_XXS` | 0.13 | 17.893 | 1.360 | 0.572 | 413.1 | 31.28 | 2.38 | 43.31 | 8.35e-5 |\n| `IQ2_XS` | 0.14 | 17.504 | 1.435 | 0.525 | 382.9 | 33.33 | 2.73 | 45.72 | 0.000858286 |\n| `IQ2_S` | 0.16 | 18.096 | 1.375 | 0.529 | 351.1 | 34.23 | 2.60 | 51.54 | 1.98e-5 |\n| `IQ3_XXS` | 0.19 | 18.190 | 0.729 | 0.578 | 419.3 | 31.45 | 1.26 | 43.38 | 2.446e-5 |\n| `IQ3_S` | 0.21 | 25.810 | 1.120 | 0.567 | 402.9 | 45.50 | 1.98 | 64.07 | 3.047e-5 |",
+      "verdicts": [
+        "Clear measured wins on this microbench: IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S auto-vs-CUDA wall ratios roughly 1.98-2.73; Q6_K ratio 2.16.",
+        "Near-tie or slight wins: Q5_0 1.09, Q3_K 1.07.",
+        "Losses against auto-threaded CPU on this shape: F32 0.23, F16 0.17, BF16 0.22, Q8_0 0.25, Q4_K 0.32, Q2_K 0.34, Q2_0 0.41, IQ4_NL 0.25, IQ4_XS 0.23.",
+        "Compute-only ratios exclude PCIe/runtime transfer overhead and are not serving speed claims by themselves.",
+        "No automatic CUDA GEMV format default is promoted from this bench alone."
+      ]
+    },
+    {
+      "id": "cuda-gemv-quality-bands",
+      "note": "Authoritative GEMV correctness gates from parity tests. Bench equivalence column is a sanity signal on different fixture magnitudes/shape and does not replace these bands.",
+      "metrics": [
+        { "format": "Q8_0", "bandVsCpuOracle": "1e-6 relative", "measuredWorstInParityGate": "7.96e-7" },
+        { "format": "Q5_0", "bandVsCpuOracle": "1e-6 relative", "measuredWorstInParityGate": "8.16e-7" },
+        { "format": "Q2_0", "bandVsCpuOracle": "1e-6 relative", "measuredWorstInParityGate": "7.41e-7" },
+        { "format": "Q5_K", "bandVsCpuOracle": "4e-6 relative", "measuredWorstInParityGate": "2.72e-6" },
+        { "format": "Q2_K", "bandVsCpuOracle": "1e-6 relative", "measuredWorstInParityGate": "4.22e-7" },
+        { "format": "Q3_K", "bandVsCpuOracle": "2e-5 relative", "measuredWorstInParityGate": "1.01e-5 batched" },
+        { "format": "IQ4_NL", "bandVsCpuOracle": "2e-6 relative", "measuredWorstInParityGate": "1.03e-6 host-mapped; exact-block ~8.97e-8" },
+        { "format": "IQ4_XS", "bandVsCpuOracle": "2e-6 relative", "measuredWorstInParityGate": "1.07e-6 batched" },
+        { "format": "IQ2_XXS", "bandVsCpuOracle": "5e-7 relative", "measuredWorstInParityGate": "measured bit-exact zero in parity gate" },
+        { "format": "IQ2_XS", "bandVsCpuOracle": "5e-7 relative", "measuredWorstInParityGate": "measured bit-exact zero in parity gate" },
+        { "format": "IQ3_XXS", "bandVsCpuOracle": "5e-7 relative", "measuredWorstInParityGate": "measured bit-exact zero in parity gate" },
+        { "format": "IQ2_S", "bandVsCpuOracle": "5e-7 relative", "measuredWorstInParityGate": "8.27e-8 partial final block" },
+        { "format": "IQ3_S", "bandVsCpuOracle": "5e-7 relative", "measuredWorstInParityGate": "1.47e-7 partial final block" }
+      ],
+      "rawTableMarkdown": "| Format | Band vs CPU oracle | Measured worst in parity gate |\n|---|---:|---:|\n| `Q8_0` | `1e-6` relative | `7.96e-7` |\n| `Q5_0` | `1e-6` relative | `8.16e-7` |\n| `Q2_0` | `1e-6` relative | `7.41e-7` |\n| `Q5_K` | `4e-6` relative | `2.72e-6` |\n| `Q2_K` | `1e-6` relative | `4.22e-7` |\n| `Q3_K` | `2e-5` relative | `1.01e-5` batched |\n| `IQ4_NL` | `2e-6` relative | `1.03e-6` host-mapped; exact-block ~8.97e-8 |\n| `IQ4_XS` | `2e-6` relative | `1.07e-6` batched |\n| `IQ2_XXS` | `5e-7` relative | measured bit-exact zero in parity gate |\n| `IQ2_XS` | `5e-7` relative | measured bit-exact zero in parity gate |\n| `IQ3_XXS` | `5e-7` relative | measured bit-exact zero in parity gate |\n| `IQ2_S` | `5e-7` relative | `8.27e-8` partial final block |\n| `IQ3_S` | `5e-7` relative | `1.47e-7` partial final block |",
+      "preExistingLanes": "Pre-existing CUDA GEMV lanes for F32, F16, BF16, Q4_K, and Q6_K retain their prior posture; this gate does not re-band or widen them."
+    }
+  ]
+}

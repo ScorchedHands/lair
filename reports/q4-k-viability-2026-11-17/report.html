@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>q4-K viability spike — 2026-11-17</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 460px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>MVP5.1 q4-K viability spike</h1>
+<div class="meta">
+  reportId: <code>q4-k-viability-2026-11-17</code> ·
+  recorded 2026-11-17 (date only) ·
+  phase: MVP5.1 ·
+  lane: LAIR q4/q4 vs llama.cpp b12032 q4_0/q4_0
+</div>
+
+<h2>Results</h2>
+<table>
+  <tr><th>Fixture</th><th class="num">Worst vs llama q4 (nats)</th><th class="num">Worst vs LAIR baseline (nats)</th><th>Notes</th></tr>
+  <tr><td>Llama-3.2-1B Q4_K_M (primary)</td><td class="num">4.0019</td><td class="num">3.3946</td><td>Primary p4 stays argmax-in-top5 but misses one relevant token and exceeds the quantized band by 4x.</td></tr>
+  <tr><td>Llama-3.2-1B IQ4_XS</td><td class="num">1.3559</td><td class="num">1.3125</td><td>Exceeds band on p4; baseline cross-tool drift also above band.</td></tr>
+  <tr><td>Qwen3-0.6B Q8_0</td><td class="num">3.7929</td><td class="num">4.3014</td><td>Argmax outside top-5 on p1, p2, p4; hard membership failure.</td></tr>
+  <tr><td>Qwen3-0.6B Q8_0 YaRN</td><td class="num">2.0977</td><td class="num">2.6298</td><td>p4 outside top-5; all relevant tokens absent from q4 window.</td></tr>
+  <tr><td>SmolLM-135M F16</td><td class="num">1.0671</td><td class="num">3.0457</td><td>Marginal cross-tool failure; LAIR-to-LAIR q4 cost far above baseline.</td></tr>
+  <tr><td>smollm-135m q8_0</td><td class="num">1.7457</td><td class="num">1.8973</td><td>Exceeds band on p3/p4 despite argmax in top-5.</td></tr>
+  <tr><td>smollm-135m q4_k_m</td><td class="num">2.8091</td><td class="num">3.0266</td><td>Broad drift; not a near-tie-only failure.</td></tr>
+  <tr><td>Llama-3.2-1B Q3_K_S</td><td class="num">1.8759</td><td class="num">1.1218</td><td>p4 misses two relevant tokens while argmax in top-5.</td></tr>
+  <tr><td>Llama-3.2-1B Q2_K</td><td class="num">4.8785</td><td class="num">4.2921</td><td>Primary failure: large drift plus missing relevant token on p4.</td></tr>
+  <tr><td>Llama-3.2-1B UD-IQ3_XXS</td><td class="num">1.1745</td><td class="num">0.9247</td><td>Exceeds band on p2; p1 misses one relevant token.</td></tr>
+  <tr><td>gemma-2-2b-it Q4_K_M</td><td class="num">0.4972</td><td class="num">0.2726</td><td>Clears the gate, but one fixture does not rescue the named combo.</td></tr>
+  <tr><td>Phi-3-mini-4k Q2_K</td><td class="num">1.7777</td><td class="num">1.3713</td><td>Exceeds band on p1/p4 while argmax in top-5.</td></tr>
+</table>
+
+<h2>Worst q4 vs llama q4_0/q4_0 delta by fixture (band = 1 nat)</h2>
+<div class="chart-wrap"><canvas id="deltaChart"></canvas></div>
+
+<h2>Decision</h2>
+<div class="note">Drop <code>q4/q4</code> from MVP5.1's named KV option set. The public named combo set proceeds as <code>f32/f32</code>, <code>f16/f16</code>, <code>q8/q8</code>/int8/k8v8, and <code>k8v4</code>. The spike does not validate k8v4 by inference from this failure.</div>
+
+<h2>Verification</h2>
+<ul>
+  <li>Build: 0 Warning(s) / 0 Error(s).</li>
+  <li>Category=Parity|Kv: Failed 0, Passed 169, Skipped 0.</li>
+</ul>
+
+<script>
+const fixtures = ["Llama Q4_K_M","Llama IQ4_XS","Qwen3 Q8_0","Qwen3 YaRN","SmolLM F16","smollm q8_0","smollm q4_k_m","Llama Q3_K_S","Llama Q2_K","Llama UD-IQ3_XXS","gemma-2 Q4_K_M","Phi-3 Q2_K"];
+new Chart(document.getElementById("deltaChart"), {
+  type: "bar",
+  data: { labels: fixtures, datasets: [
+    { label: "Worst vs llama q4_0/q4_0 (nats)", data: [4.0019,1.3559,3.7929,2.0977,1.0671,1.7457,2.8091,1.8759,4.8785,1.1745,0.4972,1.7777], backgroundColor: "#4c78a8" },
+    { label: "Worst vs LAIR baseline (nats)", data: [3.3946,1.3125,4.3014,2.6298,3.0457,1.8973,3.0266,1.1218,4.2921,0.9247,0.2726,1.3713], backgroundColor: "#f58518" }
+  ] },
+  options: { responsive: true, plugins: { title: { display: true, text: "q4-K viability: worst relevant delta per fixture (quantized band = 1 nat)" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "nats" } } } }
+});
+</script>
+</body>
+</html>

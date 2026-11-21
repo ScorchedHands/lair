@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "reportId": "cuda-gemm-parity-2026-11-18",
+  "generatedAtUtc": "2026-11-18",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured, so generatedAtUtc is date-only rather than a fabricated timestamp.",
+  "phase": "MVP5.3",
+  "lane": "CUDA GEMM (blocked dense matmul) parity and speed gate on pinned synthetic fixtures",
+  "markdownReport": "../../bench/reports/cuda-gemm-parity-2026-11-18.md",
+  "rawTableFiles": [],
+  "comparisonNotes": [
+    "Machine-readable baseline for later CUDA GEMM default/format decisions.",
+    "Comparable CPU-GEMM routes (Q8_0, Q4_K, IQ4_XS) land near tie or slower against auto-threaded CPU blocked matmul; fallback-route wins are not whole-prefill claims.",
+    "No automatic GEMM default and no cuBLAS/cuBLASLt escalation is promoted from this bench alone.",
+    "Drift values are bench measurements only; they do not assert or widen parity bands recorded in tests."
+  ]
+}

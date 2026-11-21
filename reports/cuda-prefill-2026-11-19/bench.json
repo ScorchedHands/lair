@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "reportId": "cuda-prefill-2026-11-19",
+  "bench": [
+    {
+      "id": "cuda-prefill-speed",
+      "harness": "Lair.Bench cuda-prefill",
+      "command": "dotnet run --project bench/Lair.Bench -c Release -- cuda-prefill --lengths 32,64,128 --reps 3",
+      "ratioConvention": "wallRatioCpuOverGpu > 1 means the CPU median wall time was larger than the CUDA median wall time, so CUDA prefill won on that length; values below 1 mean CUDA lost on that measured run.",
+      "metrics": [
+        { "length": 32, "cpuMedianMs": 143.51, "cpuMinMs": 137.97, "cpuMaxMs": 157.05, "cpuTokPerSec": 223.0, "cudaMedianMs": 120.11, "cudaMinMs": 118.19, "cudaMaxMs": 124.19, "cudaTokPerSec": 266.4, "wallRatioCpuOverGpu": 1.195, "gpuWins": true, "maxAbsLogitDrift": 1.512e-3, "argmaxMatch": "cpu=29 cuda=29" },
+        { "length": 64, "cpuMedianMs": 232.43, "cpuMinMs": 230.99, "cpuMaxMs": 239.21, "cpuTokPerSec": 275.3, "cudaMedianMs": 240.61, "cudaMinMs": 239.45, "cudaMaxMs": 247.63, "cudaTokPerSec": 266.0, "wallRatioCpuOverGpu": 0.966, "gpuWins": false, "maxAbsLogitDrift": 2.019e-3, "argmaxMatch": "cpu=65 cuda=65" },
+        { "length": 128, "cpuMedianMs": 554.38, "cpuMinMs": 544.61, "cpuMaxMs": 595.84, "cpuTokPerSec": 230.9, "cudaMedianMs": 492.37, "cudaMinMs": 490.48, "cudaMaxMs": 498.83, "cudaTokPerSec": 260.0, "wallRatioCpuOverGpu": 1.126, "gpuWins": true, "maxAbsLogitDrift": 1.945e-3, "argmaxMatch": "cpu=8547 cuda=8547" }
+      ],
+      "rawTableMarkdown": "| Length | CPU median ms (min/max) | CPU tok/s | CUDA median ms (min/max) | CUDA tok/s | Ratio CPU/CUDA | GPU wins | Max abs logit drift | Argmax match |\n|---:|---:|---:|---:|---:|---:|:--:|---:|:--:|\n| 32 | 143.51 (137.97/157.05) | 223.0 | 120.11 (118.19/124.19) | 266.4 | 1.195 | yes | 1.512E-003 | cpu=29 cuda=29 |\n| 64 | 232.43 (230.99/239.21) | 275.3 | 240.61 (239.45/247.63) | 266.0 | 0.966 | no | 2.019E-003 | cpu=65 cuda=65 |\n| 128 | 554.38 (544.61/595.84) | 230.9 | 492.37 (490.48/498.83) | 260.0 | 1.126 | yes | 1.945E-003 | cpu=8547 cuda=8547 |"
+    },
+    {
+      "id": "cuda-prefill-tallies",
+      "note": "CUDA tallies are cumulative deltas across that arm's timed reps and count compute crossings only; pool residency moves print apart from them.",
+      "metrics": [
+        { "length": 32, "kernelBusyUs": 442509, "runtimeTransferCalls": 2710, "runtimeTransferBytes": 233237760, "avgBytesPerCall": 86066, "deviceWrittenBlocks": 2, "crossedBlocks": 16, "crossedBytes": 20643840, "residentDeviceKvBytes": 11796480 },
+        { "length": 64, "kernelBusyUs": 859483, "runtimeTransferCalls": 5410, "runtimeTransferBytes": 465480960, "avgBytesPerCall": 86041, "deviceWrittenBlocks": 4, "crossedBlocks": 16, "crossedBytes": 32440320, "residentDeviceKvBytes": 11796480 },
+        { "length": 128, "kernelBusyUs": 1903216, "runtimeTransferCalls": 10810, "runtimeTransferBytes": 929967360, "avgBytesPerCall": 86028, "deviceWrittenBlocks": 8, "crossedBlocks": 16, "crossedBytes": 56033280, "residentDeviceKvBytes": 11796480 }
+      ],
+      "rawTableMarkdown": "| Length | Kernel busy us | Runtime transfer calls | Runtime transfer bytes | Avg bytes/call | Device-written blocks | Crossed blocks/bytes | Resident device KV bytes |\n|---:|---:|---:|---:|---:|---:|---:|---:|\n| 32 | 442509 | 2710 | 233237760 | 86066 | 2 | 16 / 20643840 | 11796480 |\n| 64 | 859483 | 5410 | 465480960 | 86041 | 4 | 16 / 32440320 | 11796480 |\n| 128 | 1903216 | 10810 | 929967360 | 86028 | 8 | 16 / 56033280 | 11796480 |",
+      "processRunFacts": { "weightCopiesToDevice": 211, "persistentDeviceWeightBytes": 268959744, "peakWorkingSetMb": 576.0 }
+    }
+  ],
+  "verdicts": [
+    "Payoff is mixed rather than universal: CUDA won at lengths 32 (1.195) and 128 (1.126), lost at length 64 (0.966).",
+    "The honest gate is 'length-dependent payoff', not a blanket fast-prefill claim.",
+    "Composition-only test band recorded for MVP5.4 is 4e-3, with measured worst absolute logit drift 2.019E-3 and argmax membership matching the CPU arm across all three lengths.",
+    "GPU prefill remains internal/non-default."
+  ]
+}

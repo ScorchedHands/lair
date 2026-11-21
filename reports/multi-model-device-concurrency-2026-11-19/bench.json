@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "reportId": "multi-model-device-concurrency-2026-11-19",
+  "bench": [
+    {
+      "id": "cuda-concurrency-three-run",
+      "harness": "Lair.Bench cuda-concurrency",
+      "commands": [
+        "dotnet run --project bench/Lair.Bench -c Release --no-build -- cuda-concurrency --reps 15 --sweeps 3 --out C:\\Users\\Chuck\\AppData\\Local\\Temp\\kilo\\cuda-concurrency-v3-run1.json",
+        "dotnet run --project bench/Lair.Bench -c Release --no-build -- cuda-concurrency --reps 15 --sweeps 3 --out C:\\Users\\Chuck\\AppData\\Local\\Temp\\kilo\\cuda-concurrency-v3-run2.json",
+        "dotnet run --project bench/Lair.Bench -c Release --no-build -- cuda-concurrency --reps 15 --sweeps 3 --out C:\\Users\\Chuck\\AppData\\Local\\Temp\\kilo\\cuda-concurrency-v3-run3.json"
+      ],
+      "ratioConvention": "ratioSerializedOverOverlapped > 1 means today's serialized two-workload pipeline took longer than the overlapped two-stream arm. ratioTwoStreamOverOverlapped isolates concurrency from the cost of lane machinery/async staging. busyConcurrencyRatio > 1 means the device did more kernel-busy work than the overlapped wall time had available.",
+      "metrics": [
+        { "pair": "mixed_gemv_q4k__gemm_f16", "run": 1, "serializedMedMs": 10.9538, "twoStreamMedMs": 9.8325, "overlappedMedMs": 8.2039, "serializedOverOverlapped": 1.38, "twoStreamOverOverlapped": 1.39, "serializedOverTwoStream": 1.03, "busySumOverOverlappedWall": 1.29, "verdict": "inconclusive" },
+        { "pair": "mixed_gemv_q4k__gemm_f16", "run": 2, "serializedMedMs": 17.6337, "twoStreamMedMs": 10.8647, "overlappedMedMs": 8.9626, "serializedOverOverlapped": 1.66, "twoStreamOverOverlapped": 1.32, "serializedOverTwoStream": 1.14, "busySumOverOverlappedWall": 1.94, "verdict": "positive" },
+        { "pair": "mixed_gemv_q4k__gemm_f16", "run": 3, "serializedMedMs": 8.3977, "twoStreamMedMs": 7.8725, "overlappedMedMs": 7.4592, "serializedOverOverlapped": 1.28, "twoStreamOverOverlapped": 1.09, "serializedOverTwoStream": 1.06, "busySumOverOverlappedWall": 1.09, "verdict": "positive" },
+        { "pair": "two_gemv_q8_0__q6_k", "run": 1, "serializedMedMs": 23.0051, "twoStreamMedMs": 25.5809, "overlappedMedMs": 11.1589, "serializedOverOverlapped": 1.57, "twoStreamOverOverlapped": 2.05, "serializedOverTwoStream": 1.00, "busySumOverOverlappedWall": 2.03, "verdict": "positive" },
+        { "pair": "two_gemv_q8_0__q6_k", "run": 2, "serializedMedMs": 20.0827, "twoStreamMedMs": 17.9961, "overlappedMedMs": 10.3500, "serializedOverOverlapped": 1.94, "twoStreamOverOverlapped": 2.13, "serializedOverTwoStream": 0.99, "busySumOverOverlappedWall": 1.90, "verdict": "positive" },
+        { "pair": "two_gemv_q8_0__q6_k", "run": 3, "serializedMedMs": 23.4904, "twoStreamMedMs": 21.8141, "overlappedMedMs": 14.2374, "serializedOverOverlapped": 2.00, "twoStreamOverOverlapped": 1.98, "serializedOverTwoStream": 1.06, "busySumOverOverlappedWall": 1.56, "verdict": "positive" },
+        { "pair": "two_gemm_q8_0__bf16", "run": 1, "serializedMedMs": 13.9433, "twoStreamMedMs": 14.0805, "overlappedMedMs": 2.7224, "serializedOverOverlapped": 2.15, "twoStreamOverOverlapped": 2.31, "serializedOverTwoStream": 1.03, "busySumOverOverlappedWall": 5.01, "verdict": "positive" },
+        { "pair": "two_gemm_q8_0__bf16", "run": 2, "serializedMedMs": 17.8322, "twoStreamMedMs": 14.3925, "overlappedMedMs": 3.2674, "serializedOverOverlapped": 2.17, "twoStreamOverOverlapped": 1.92, "serializedOverTwoStream": 1.14, "busySumOverOverlappedWall": 5.30, "verdict": "positive" },
+        { "pair": "two_gemm_q8_0__bf16", "run": 3, "serializedMedMs": 3.7677, "twoStreamMedMs": 3.4174, "overlappedMedMs": 2.0388, "serializedOverOverlapped": 1.89, "twoStreamOverOverlapped": 1.96, "serializedOverTwoStream": 1.02, "busySumOverOverlappedWall": 1.65, "verdict": "positive" }
+      ],
+      "rawTableMarkdown": "| Pair | Run | Serialized med ms | Two-stream med ms | Overlapped med ms | Serialized/Overlapped | Two-stream/Overlapped | Serialized/Two-stream | busySum/overlapped wall | Verdict |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---|\n| `mixed_gemv_q4k__gemm_f16` | 1 | 10.9538 | 9.8325 | 8.2039 | 1.38 | 1.39 | 1.03 | 1.29 | inconclusive |\n| `mixed_gemv_q4k__gemm_f16` | 2 | 17.6337 | 10.8647 | 8.9626 | 1.66 | 1.32 | 1.14 | 1.94 | positive |\n| `mixed_gemv_q4k__gemm_f16` | 3 | 8.3977 | 7.8725 | 7.4592 | 1.28 | 1.09 | 1.06 | 1.09 | positive |\n| `two_gemv_q8_0__q6_k` | 1 | 23.0051 | 25.5809 | 11.1589 | 1.57 | 2.05 | 1.00 | 2.03 | positive |\n| `two_gemv_q8_0__q6_k` | 2 | 20.0827 | 17.9961 | 10.3500 | 1.94 | 2.13 | 0.99 | 1.90 | positive |\n| `two_gemv_q8_0__q6_k` | 3 | 23.4904 | 21.8141 | 14.2374 | 2.00 | 1.98 | 1.06 | 1.56 | positive |\n| `two_gemm_q8_0__bf16` | 1 | 13.9433 | 14.0805 | 2.7224 | 2.15 | 2.31 | 1.03 | 5.01 | positive |\n| `two_gemm_q8_0__bf16` | 2 | 17.8322 | 14.3925 | 3.2674 | 2.17 | 1.92 | 1.14 | 5.30 | positive |\n| `two_gemm_q8_0__bf16` | 3 | 3.7677 | 3.4174 | 2.0388 | 1.89 | 1.96 | 1.02 | 1.65 | positive |",
+      "equivalence": "Bit-for-bit serialized-vs-overlapped output equivalence was true for every pair in every run."
+    }
+  ],
+  "gateResult": "CUDA stream overlap pays off clearly for same-kernel-family pairs on this 4090, while mixed GEMV/GEMM payoff is less stable under host contention. Essentially all measured payoff comes from submitting both lanes before awaiting either, not from the stream/async staging machinery by itself.",
+  "verification": {
+    "build": "dotnet build -c Release --nologo -> Build succeeded. 0 Warning(s) 0 Error(s)",
+    "test": "dotnet test tests/Lair.Tests -c Release --no-build --nologo --filter \"Category=Cuda\" -> Passed! - Failed: 0, Passed: 248, Skipped: 0, Total: 248, Duration: 6 s"
+  }
+}

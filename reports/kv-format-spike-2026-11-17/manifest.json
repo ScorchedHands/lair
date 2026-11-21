@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kv-format-spike-2026-11-17",
+  "generatedAtUtc": "2026-11-17",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured.",
+  "phase": "MVP5.1",
+  "lane": "KV format abstraction spike: generic LayerOps<TK,TV> vs hand-written FP32 attention",
+  "markdownReport": "../../bench/reports/kv-format-spike-2026-11-17.md",
+  "rawTableFiles": [],
+  "comparisonNotes": [
+    "Machine-readable baseline for the DN-M51-6 seam decision.",
+    "Decision: keep the static-abstract generic LayerOps<TK,TV> seam primary; the hand-specialized fallback is not selected because the measured generic FP32 control (f32block) was faster than today's hand-written FP32 attention path across micro and short-context decode runs on pinned fixtures.",
+    "f32block and q8k keep production FP32 KV writes and add a mirror storage arena, so these numbers measure attention/kernel seam cost, not final storage replacement footprint.",
+    "q8k micro attention error (maxAbsDiff 7.091e-4, meanRelDiff 2.872e-2) is not a parity-band result and does not validate final KV mode quality."
+  ]
+}

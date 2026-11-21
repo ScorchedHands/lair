@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prefill kernel rollout proof — gemv vs gemm — 2026-11-14</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 420px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>Prefill kernel rollout proof — gemv vs gemm on a live server</h1>
+<div class="meta">
+  reportId: <code>kernel-gemm-rollout-2026-11-14</code> ·
+  recorded 2026-11-14 (date only) ·
+  phase: MVP3.13 ·
+  lane: live serving servers on Qwen3-0.6B-Q8_0
+</div>
+
+<h2>Serve posture</h2>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>Fixture</td><td>models/Qwen3-0.6B-Q8_0.gguf</td></tr>
+  <tr><td>max_context_tokens / kv_blocks</td><td>4096 / 256</td></tr>
+  <tr><td>engine block_size / max_batch_tokens / threads</td><td>16 / 512 / 0</td></tr>
+  <tr><td>placement thread_quota</td><td>8 (no core pinning)</td></tr>
+  <tr><td>Ports</td><td>gemv :58411 · gemm :58412</td></tr>
+</table>
+
+<h2>Exact-stream correctness</h2>
+<table>
+  <tr><th>Server</th><th>Returned text</th><th>finish_reason</th><th class="num">usage (prompt/completion/total)</th><th>SHA-256</th></tr>
+  <tr><td>gemv :58411</td><td><code> 1, 2) 2, 3) 3, 4) 4, 5) 5, 6) 6</code></td><td>length</td><td class="num">28 / 32 / 60</td><td>ED4E24F7…D8246E5</td></tr>
+  <tr><td>gemm :58412</td><td><code> 1, 2) 2, 3) 3, 4) 4, 5) 5, 6) 6</code></td><td>length</td><td class="num">28 / 32 / 60</td><td>ED4E24F7…D8246E5</td></tr>
+</table>
+<div class="note">Full hash <code>ED4E24F7798615B60EF00F4B1F72611FE3DB0B52A52EC09EF39F1468DD8246E5</code>, identical on both routes.</div>
+
+<h2>Long-prompt speed</h2>
+<table>
+  <tr><th>Kernel</th><th>Run</th><th class="num">Prompt tokens</th><th class="num">Wall seconds</th><th class="num">Prefill tok/s</th><th class="num">Peak working set (live)</th></tr>
+  <tr><td>gemv</td><td>1</td><td class="num">1759</td><td class="num">95.07</td><td class="num">18.50</td><td class="num">1748.5 MB</td></tr>
+  <tr><td>gemv</td><td>2</td><td class="num">1760</td><td class="num">96.50</td><td class="num">18.24</td><td class="num">— (same process)</td></tr>
+  <tr><td>gemm</td><td>1</td><td class="num">1762</td><td class="num">102.31</td><td class="num">17.22</td><td class="num">1738.8 MB</td></tr>
+  <tr><td>gemm</td><td>2</td><td class="num">1755</td><td class="num">105.22</td><td class="num">16.68</td><td class="num">— (same process)</td></tr>
+</table>
+<div class="note">Combined: gemv 18.37 tok/s (3519 tokens / 191.57 s) vs gemm 16.95 tok/s (3517 tokens / 207.53 s) — a -7.7% prefill throughput change. Peak working set moved the other way, 1748.5 MB to 1738.8 MB (-0.6% within snapshot noise).</div>
+
+<h2>Per-run prefill tok/s</h2>
+<div class="chart-wrap"><canvas id="speedChart"></canvas></div>
+
+<h2>Reading</h2>
+<ul>
+  <li>The exact-stream equality is the strong result and held on every request pair measured.</li>
+  <li>Speed half reads as "no consistent throughput win for either route at Q8_0" rather than a settled ordering.</li>
+  <li>Resolved row width is unchanged by kernel selection: a ~1760-token window splits into ceil(1760/32)=55 weight sub-batches on both routes.</li>
+</ul>
+
+<script>
+const labels = ["gemv run1","gemv run2","gemm run1","gemm run2"];
+new Chart(document.getElementById("speedChart"), {
+  type: "bar",
+  data: { labels, datasets: [{ label: "Prefill tok/s", data: [18.50,18.24,17.22,16.68], backgroundColor: ["#4c78a8","#4c78a8","#f58518","#f58518"] }] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Live gemv vs gemm prefill tok/s (Qwen3-0.6B Q8_0)" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "tokens / second" } } } }
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "reportId": "kernel-comparison-2026-11-14",
+  "host": {
+    "hostname": null,
+    "os": null,
+    "cpuModel": null,
+    "physicalCores": null,
+    "logicalProcessors": null,
+    "memoryTotalBytes": null,
+    "device": null,
+    "lane": "CPU (shared-box measurements, not isolated microbenchmarks)",
+    "threads": 8,
+    "avx2": true,
+    "notes": [
+      "Host core counts were not recorded in this narrative; recorded as null rather than inferred.",
+      "Raw tables record threads=8 and avx2=True.",
+      "Shared-box measurements: OS page-cache state differs between separate kernel processes, so cross-kernel ordering is directional unless fitted terms and wall time agree."
+    ]
+  },
+  "fixtures": [
+    {
+      "name": "Llama-3.2-1B-Instruct-Q8_0.gguf",
+      "bytes": 1321083008,
+      "architecture": "llama",
+      "layers": 16,
+      "hidden": 2048,
+      "heads": 32,
+      "kvHeads": 8,
+      "headDim": 64,
+      "vocab": 128256,
+      "traversalBytes": 1034158080,
+      "reps": 3,
+      "rowWidths": [32]
+    },
+    {
+      "name": "Qwen3-0.6B-Q8_0.gguf",
+      "bytes": 639446688,
+      "architecture": "qwen3",
+      "layers": 28,
+      "hidden": 1024,
+      "heads": 16,
+      "kvHeads": 8,
+      "headDim": 128,
+      "vocab": 151936,
+      "traversalBytes": 468185088,
+      "reps": 2,
+      "rowWidths": [32]
+    },
+    {
+      "name": "Llama-3.2-1B-Instruct-IQ4_XS.gguf (mixed-format refusal evidence)",
+      "bytes": 743141504,
+      "architecture": "llama",
+      "layers": 16,
+      "hidden": 2048,
+      "heads": 32,
+      "kvHeads": 8,
+      "headDim": 64,
+      "vocab": 128256,
+      "traversalBytes": 519831552,
+      "reps": 1,
+      "rowWidths": [32],
+      "note": "gemv and tiled run; gemm refuses naming Q5_K. Peak line is cumulative across the multi-kernel process."
+    }
+  ]
+}

@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CPU quantized KV cache-type parity — 2026-11-18</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 420px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>MVP5.1 CPU quantized KV cache-type parity</h1>
+<div class="meta">
+  reportId: <code>kv-cache-type-parity-2026-11-18</code> ·
+  recorded 2026-11-18 (date only) ·
+  phase: MVP5.1 ·
+  lane: CPU quantized KV vs llama.cpp b12032
+</div>
+
+<h2>Model / reference</h2>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>Fixture</td><td>models/SmolLM-135M-Instruct-F16.gguf</td></tr>
+  <tr><td>SHA-256</td><td>1fc02c21fba7874b15955d21dc59182aeae382abea412419ffd2fbaa84861790</td></tr>
+  <tr><td>Reference engine</td><td>pinned llama.cpp b12032 server mode · /completion · temperature 0 · n_probs=5 · threads 8 · context 1024</td></tr>
+</table>
+
+<h2>Results</h2>
+<table>
+  <tr><th>Mode</th><th>Worst relevant candidate drift</th><th class="num">Max relevant delta</th><th class="num">Recorded band</th></tr>
+  <tr><td>q8_0/q8_0</td><td>Once upon a time candidate <code>(</code> (id 365)</td><td class="num">0.1347 nats</td><td class="num">0.25 nats</td></tr>
+  <tr><td>q8_0/q4_0 (k8v4)</td><td>Once upon a time candidate <code> there</code> (id 665)</td><td class="num">0.3856 nats</td><td class="num">0.50 nats</td></tr>
+</table>
+
+<h2>Measured drift vs recorded band</h2>
+<div class="chart-wrap"><canvas id="driftChart"></canvas></div>
+
+<h2>Verification</h2>
+<table>
+  <tr><th>Filter</th><th class="num">Passed</th></tr>
+  <tr><td>Category=Attention</td><td class="num">10</td></tr>
+  <tr><td>Category=Kv</td><td class="num">77</td></tr>
+  <tr><td>Category=Config|Kv</td><td class="num">439</td></tr>
+  <tr><td>Category=Serve</td><td class="num">26</td></tr>
+  <tr><td>Category=Layers|Kernel</td><td class="num">427</td></tr>
+  <tr><td>Category=Parity (after adding quantized KV fixtures)</td><td class="num">72</td></tr>
+  <tr><td>Category=Api (isolated rerun)</td><td class="num">101/101</td></tr>
+</table>
+
+<h2>Notes</h2>
+<ul>
+  <li>Both modes kept LAIR's argmax inside the pinned llama.cpp top-5 candidates for all four prompts; no candidate was calibrated as present in LAIR and later absent.</li>
+  <li>Existing dense-family bands are not widened.</li>
+</ul>
+
+<script>
+const modes = ["q8_0/q8_0","q8_0/q4_0 (k8v4)"];
+new Chart(document.getElementById("driftChart"), {
+  type: "bar",
+  data: { labels: modes, datasets: [
+    { label: "Max relevant delta (nats)", data: [0.1347,0.3856], backgroundColor: "#4c78a8" },
+    { label: "Recorded band (nats)", data: [0.25,0.50], backgroundColor: "#f58518" }
+  ] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Quantized KV parity: measured drift vs recorded band" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "nats" } } } }
+});
+</script>
+</body>
+</html>

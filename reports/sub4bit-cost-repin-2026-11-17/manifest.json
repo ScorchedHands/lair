@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "reportId": "sub4bit-cost-repin-2026-11-17",
+  "generatedAtUtc": "2026-11-17",
+  "generatedAtUtcNote": "Source narrative records only the run date; no time-of-day was captured.",
+  "phase": "MVP5",
+  "lane": "Measured-cost re-pin for sub-4-bit i-quant cost after the MVP5 integer-dot rewrite",
+  "markdownReport": "../../bench/reports/sub4bit-cost-repin-2026-11-17.md",
+  "rawTableFiles": [
+    "../../bench/reports/gemv-mvp5-q4k-reps200-2026-11-17.txt",
+    "../../bench/reports/gemv-mvp5-iq4xs-reps200-2026-11-17.txt",
+    "../../bench/reports/gemv-mvp5-udiq3xxs-reps200-2026-11-17.txt"
+  ],
+  "comparisonNotes": [
+    "Machine-readable baseline for sub-4-bit cost band decisions.",
+    "The old ~6.5x sub-4-bit penalty is not present on this build; measured stable per-element costs are roughly 0.25-0.39 ns/elt against the Q4_K baseline, i.e. about 1.5-2.3x depending on format.",
+    "IQ3_XXS modestly exceeds the intended ~1-2x band at about 2.3x on this posture; that premise miss is recorded rather than smoothed.",
+    "Live quota8 serve measurements keep IQ4_XS fastest by monitor-windowed decode (~16.5 tok/s) against Q4_K_M (~12.4) and mixed UD (~13.0), under the 4 GB working-set ceiling.",
+    "Server startup selection varied across processes: corrected quota8 runs resolved Gather for Q4_K_M/UD and scalar for IQ4_XS; live measurements report actual mode rather than one global encoding."
+  ]
+}

@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prefill cost profile — 2026-11-12</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.85rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.5rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 420px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<h1>Prefill cost profile</h1>
+<div class="meta">
+  reportId: <code>prefill-profile-2026-11-12</code> ·
+  recorded 2026-11-12 (date only) ·
+  phase: MVP3.12 ·
+  lane: batched prefill weight-term vs attention-term fit
+</div>
+
+<h2>Fitted split</h2>
+<table>
+  <tr><th>Fixture</th><th class="num">Weight ms/traversal</th><th class="num">Implied weight GB/s</th><th class="num">Attention us/position-pair</th><th class="num">Crossover</th></tr>
+  <tr><td>Llama-3.2-1B IQ4_XS (run 1)</td><td class="num">252.07</td><td class="num">2.06</td><td class="num">57.3</td><td class="num">555</td></tr>
+  <tr><td>Llama-3.2-1B IQ4_XS (run 2)</td><td class="num">344.79</td><td class="num">1.51</td><td class="num">52.4</td><td class="num">827</td></tr>
+  <tr><td>Qwen3-0.6B Q8_0</td><td class="num">126.7</td><td class="num">3.70</td><td class="num">61.0</td><td class="num">266</td></tr>
+</table>
+
+<h2>Batched tok/s vs prompt length (Llama run 2 · Qwen3)</h2>
+<div class="chart-wrap"><canvas id="toksChart"></canvas></div>
+<h2>Weight term vs attention term (ms) across lengths</h2>
+<div class="chart-wrap"><canvas id="termChart"></canvas></div>
+
+<h2>Reading</h2>
+<ul>
+  <li>Weight term is compute-bound, not bandwidth-bound (1.5-3.7 GB/s is well under what the memory system sustains); the dequant arithmetic per row is what the traversal pays for.</li>
+  <li>Attention becomes the larger term far earlier than the serve-surface numbers suggested: crossover 266 (Qwen3) and 555-827 (Llama). At 2048 tokens on Llama, attention is 110 s against 44 s of weight reads.</li>
+  <li>Batching already removed the weight term's growth with prompt length; the batched curve now degrades with length only because of the attention term.</li>
+</ul>
+
+<script>
+const lengths = ["16","32","64","128","256","512","1024","1536","2048"];
+new Chart(document.getElementById("toksChart"), {
+  type: "line",
+  data: { labels: ["16","32","64","128","256","512","1024"], datasets: [
+    { label: "Llama IQ4_XS run2 tok/s", data: [53.91,41.10,41.05,39.03,35.25,29.03,20.78], borderColor: "#4c78a8", fill: false },
+    { label: "Qwen3 Q8_0 tok/s", data: [77.60,77.22,73.28,64.16,62.35,43.67,25.48], borderColor: "#f58518", fill: false }
+  ] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Batched prefill tok/s vs prompt length" } }, scales: { y: { beginAtZero: true, title: { display: true, text: "tokens / second" } }, x: { title: { display: true, text: "prompt length" } } } }
+});
+new Chart(document.getElementById("termChart"), {
+  type: "line",
+  data: { labels: ["16","32","64","128","256","512","1024"], datasets: [
+    { label: "Llama weightMs", data: [344.8,689.6,1379.1,2758.3,5516.6,11033.2,22066.4], borderColor: "#4c78a8", fill: false },
+    { label: "Llama attentionMs", data: [7.1,27.7,109.0,432.7,1724.2,6883.5,27507.3], borderColor: "#4c78a8", borderDash: [5,5], fill: false },
+    { label: "Qwen3 weightMs", data: [126.7,253.3,506.7,1013.3,2026.6,4053.2,8106.4], borderColor: "#f58518", fill: false },
+    { label: "Qwen3 attentionMs", data: [8.3,32.2,126.9,503.6,2006.6,8010.7,32011.5], borderColor: "#f58518", borderDash: [5,5], fill: false }
+  ] },
+  options: { responsive: true, plugins: { title: { display: true, text: "Fitted weight term vs attention term (ms)" } }, scales: { y: { type: "logarithmic", title: { display: true, text: "ms (log scale)" } }, x: { title: { display: true, text: "prompt length" } } } }
+});
+</script>
+</body>
+</html>

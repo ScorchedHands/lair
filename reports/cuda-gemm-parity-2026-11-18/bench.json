@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "reportId": "cuda-gemm-parity-2026-11-18",
+  "bench": [
+    {
+      "id": "cuda-gemm-gate",
+      "harness": "Lair.Bench cuda-gemm",
+      "command": "dotnet run --project bench/Lair.Bench -c Release --no-build -- cuda-gemm",
+      "ratioConvention": "ratio_auto_cuda > 1 means CUDA was faster than the auto-threaded CPU route in total measured pass time; kernel-busy microseconds exclude PCIe/runtime transfer overhead and are not comparable to wall milliseconds.",
+      "metrics": [
+        { "format": "F32", "cpuRoute": "gemv fallback", "packedMiB": 2.00, "cpuScalarMs": 40.020, "cpuAutoMs": 0.555, "cudaWallMs": 0.742, "kernelBusyUsPerRep": 432.6, "autoVsCudaRatio": 0.75, "scalarVsKernelBusyComputeOnlyRatio": 92.52, "maxRelativeDrift": 0.0063601 },
+        { "format": "F16", "cpuRoute": "gemv fallback", "packedMiB": 1.00, "cpuScalarMs": 23.253, "cpuAutoMs": 0.376, "cudaWallMs": 0.498, "kernelBusyUsPerRep": 444.3, "autoVsCudaRatio": 0.75, "scalarVsKernelBusyComputeOnlyRatio": 52.34, "maxRelativeDrift": 0.0032998 },
+        { "format": "BF16", "cpuRoute": "gemv fallback", "packedMiB": 1.00, "cpuScalarMs": 10.977, "cpuAutoMs": 0.463, "cudaWallMs": 0.810, "kernelBusyUsPerRep": 455.4, "autoVsCudaRatio": 0.57, "scalarVsKernelBusyComputeOnlyRatio": 24.10, "maxRelativeDrift": 0 },
+        { "format": "Q8_0", "cpuRoute": "gemm comparable", "packedMiB": 0.53, "cpuScalarMs": 6.510, "cpuAutoMs": 0.426, "cudaWallMs": 0.476, "kernelBusyUsPerRep": 421.3, "autoVsCudaRatio": 0.90, "scalarVsKernelBusyComputeOnlyRatio": 15.45, "maxRelativeDrift": 0.00138574 },
+        { "format": "Q5_0", "cpuRoute": "gemv fallback", "packedMiB": 0.34, "cpuScalarMs": 17.561, "cpuAutoMs": 3.334, "cudaWallMs": 0.513, "kernelBusyUsPerRep": 474.1, "autoVsCudaRatio": 6.50, "scalarVsKernelBusyComputeOnlyRatio": 37.04, "maxRelativeDrift": 0.000996202 },
+        { "format": "Q2_0", "cpuRoute": "gemv fallback", "packedMiB": 0.14, "cpuScalarMs": 15.168, "cpuAutoMs": 0.602, "cudaWallMs": 0.437, "kernelBusyUsPerRep": 383.1, "autoVsCudaRatio": 1.38, "scalarVsKernelBusyComputeOnlyRatio": 39.59, "maxRelativeDrift": 0.0002476 },
+        { "format": "Q4_K", "cpuRoute": "gemm comparable", "packedMiB": 0.28, "cpuScalarMs": 6.450, "cpuAutoMs": 0.464, "cudaWallMs": 0.561, "kernelBusyUsPerRep": 490.6, "autoVsCudaRatio": 0.83, "scalarVsKernelBusyComputeOnlyRatio": 13.15, "maxRelativeDrift": 8.16078E-06 },
+        { "format": "Q6_K", "cpuRoute": "gemv fallback", "packedMiB": 0.41, "cpuScalarMs": 16.034, "cpuAutoMs": 4.597, "cudaWallMs": 0.587, "kernelBusyUsPerRep": 536.6, "autoVsCudaRatio": 7.84, "scalarVsKernelBusyComputeOnlyRatio": 29.88, "maxRelativeDrift": 0.000101947 },
+        { "format": "Q5_K", "cpuRoute": "gemv fallback", "packedMiB": 0.34, "cpuScalarMs": 15.341, "cpuAutoMs": 2.475, "cudaWallMs": 0.702, "kernelBusyUsPerRep": 611.3, "autoVsCudaRatio": 3.52, "scalarVsKernelBusyComputeOnlyRatio": 25.10, "maxRelativeDrift": 0.000174343 },
+        { "format": "Q2_K", "cpuRoute": "gemv fallback", "packedMiB": 0.16, "cpuScalarMs": 12.663, "cpuAutoMs": 0.445, "cudaWallMs": 0.517, "kernelBusyUsPerRep": 464.0, "autoVsCudaRatio": 0.86, "scalarVsKernelBusyComputeOnlyRatio": 27.29, "maxRelativeDrift": 0.000332475 },
+        { "format": "Q3_K", "cpuRoute": "gemv fallback", "packedMiB": 0.21, "cpuScalarMs": 14.921, "cpuAutoMs": 2.020, "cudaWallMs": 0.555, "kernelBusyUsPerRep": 519.9, "autoVsCudaRatio": 3.64, "scalarVsKernelBusyComputeOnlyRatio": 28.70, "maxRelativeDrift": 0.0058546 },
+        { "format": "IQ4_NL", "cpuRoute": "gemv fallback", "packedMiB": 0.28, "cpuScalarMs": 16.875, "cpuAutoMs": 0.529, "cudaWallMs": 0.543, "kernelBusyUsPerRep": 492.4, "autoVsCudaRatio": 0.97, "scalarVsKernelBusyComputeOnlyRatio": 34.27, "maxRelativeDrift": 0.000803455 },
+        { "format": "IQ4_XS", "cpuRoute": "gemm comparable", "packedMiB": 0.27, "cpuScalarMs": 6.698, "cpuAutoMs": 0.495, "cudaWallMs": 0.626, "kernelBusyUsPerRep": 572.7, "autoVsCudaRatio": 0.79, "scalarVsKernelBusyComputeOnlyRatio": 11.70, "maxRelativeDrift": 0.00898242 }
+      ],
+      "rawTableMarkdown": "| Format | CPU route | Packed MiB | CPU scalar ms | CPU auto ms | CUDA wall ms | Kernel busy us/rep | Auto vs CUDA ratio | Scalar vs kernel-busy compute-only ratio | Max relative drift |\n|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n| F32 | `gemv` fallback | 2.00 | 40.020 | 0.555 | 0.742 | 432.6 | 0.75 | 92.52 | 0.0063601 |\n| F16 | `gemv` fallback | 1.00 | 23.253 | 0.376 | 0.498 | 444.3 | 0.75 | 52.34 | 0.0032998 |\n| BF16 | `gemv` fallback | 1.00 | 10.977 | 0.463 | 0.810 | 455.4 | 0.57 | 24.10 | 0 |\n| Q8_0 | `gemm` comparable | 0.53 | 6.510 | 0.426 | 0.476 | 421.3 | 0.90 | 15.45 | 0.00138574 |\n| Q5_0 | `gemv` fallback | 0.34 | 17.561 | 3.334 | 0.513 | 474.1 | 6.50 | 37.04 | 0.000996202 |\n| Q2_0 | `gemv` fallback | 0.14 | 15.168 | 0.602 | 0.437 | 383.1 | 1.38 | 39.59 | 0.0002476 |\n| Q4_K | `gemm` comparable | 0.28 | 6.450 | 0.464 | 0.561 | 490.6 | 0.83 | 13.15 | 8.16078E-06 |\n| Q6_K | `gemv` fallback | 0.41 | 16.034 | 4.597 | 0.587 | 536.6 | 7.84 | 29.88 | 0.000101947 |\n| Q5_K | `gemv` fallback | 0.34 | 15.341 | 2.475 | 0.702 | 611.3 | 3.52 | 25.10 | 0.000174343 |\n| Q2_K | `gemv` fallback | 0.16 | 12.663 | 0.445 | 0.517 | 464.0 | 0.86 | 27.29 | 0.000332475 |\n| Q3_K | `gemv` fallback | 0.21 | 14.921 | 2.020 | 0.555 | 519.9 | 3.64 | 28.70 | 0.0058546 |\n| IQ4_NL | `gemv` fallback | 0.28 | 16.875 | 0.529 | 0.543 | 492.4 | 0.97 | 34.27 | 0.000803455 |\n| IQ4_XS | `gemm` comparable | 0.27 | 6.698 | 0.495 | 0.626 | 572.7 | 0.79 | 11.70 | 0.00898242 |",
+      "verdicts": [
+        "Comparable-route formats (Q8_0, Q4_K, IQ4_XS) are the only direct CPU-blocked-matmul comparisons; CUDA lands near tie or slower against auto-threaded CPU blocked matmul (0.90, 0.83, 0.79).",
+        "Fallback-route formats compare CUDA blocked matmul against the batched-row route; several show large wins (Q5_0, Q6_K, Q5_K, Q3_K) but are not whole-prefill claims.",
+        "Unquantized F32/F16/BF16 show total-pass losses against auto-threaded CPU batched-row weight passes despite much faster kernel-busy than scalar.",
+        "Largest relative drift is IQ4_XS (0.00898242) with max absolute drift 0.0546875; drift values do not assert or widen parity bands.",
+        "Toolchain escalation posture: measured shortfall does not justify adopting cuBLAS/cuBLASLt in MVP5.3."
+      ]
+    }
+  ]
+}
