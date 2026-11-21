@@ -582,6 +582,319 @@ public sealed class MoeTests : IDisposable
         Assert.Contains("encoder forward runs dense gate/up/down blocks only", ex.Message);
     }
 
+    // ---------------------------------------------------------------- gather seam: slab views, union amortization, dense-equivalence
+
+    [Fact]
+    public void GatherSlabs_ResolveAsLogicalViewsOfTheStackedRole_AndTheKernelVisitsTheUnionOnceAscending()
+    {
+        // A synthetic stacked role read straight from an array-backed weight source: the slab provider must hand back
+        // the expert's contiguous byte range as a view of the same bytes the stacked resolution covers, and the gather
+        // kernel must visit each listed expert exactly once in the order it was given, handing all three role slabs to
+        // the chain consumer together.
+        const int experts = 4;
+        const int hidden = 6;
+        const int inter = 5;
+
+        float[] gateStack = Stacked(0.10f);
+        float[] upStack = Stacked(0.20f);
+        float[] downStack = Stacked(0.30f);
+
+        Lair.Contracts.LogicalTensor gate = new("blk.0.ffn_gate_exps.weight", new Lair.Contracts.TensorShape([experts, inter, hidden]), Lair.Contracts.QuantFormat.F32, 0, gateStack.Length * 4);
+        Lair.Contracts.LogicalTensor up = new("blk.0.ffn_up_exps.weight", new Lair.Contracts.TensorShape([experts, inter, hidden]), Lair.Contracts.QuantFormat.F32, 0, upStack.Length * 4);
+        Lair.Contracts.LogicalTensor down = new("blk.0.ffn_down_exps.weight", new Lair.Contracts.TensorShape([experts, hidden, inter]), Lair.Contracts.QuantFormat.F32, 0, downStack.Length * 4);
+
+        using ArrayWeightSource source = new()
+        {
+            Payloads = { [gate.Name] = BytesOf(gateStack), [up.Name] = BytesOf(upStack), [down.Name] = BytesOf(downStack) },
+        };
+
+        Lair.Loader.ExpertSlabWeightSource slabs = new(source);
+        Lair.Models.Engine.CpuGatherKernel kernel = new();
+
+        long gateBytes = inter * hidden * 4L;
+        long upBytes = inter * hidden * 4L;
+        long downBytes = hidden * inter * 4L;
+
+        List<int> visited = [];
+        List<(int Expert, ReadOnlyMemory<byte> Gate, ReadOnlyMemory<byte> Up, ReadOnlyMemory<byte> Down)> chains = [];
+
+        kernel.Gather(
+            slabs,
+            new Lair.Contracts.ExpertSlabRole(gate, new Lair.Contracts.TensorShape([inter, hidden]), gateBytes),
+            new Lair.Contracts.ExpertSlabRole(up, new Lair.Contracts.TensorShape([inter, hidden]), upBytes),
+            new Lair.Contracts.ExpertSlabRole(down, new Lair.Contracts.TensorShape([hidden, inter]), downBytes),
+            [1, 3],
+            (int expertIndex, ReadOnlySpan<byte> gateSlab, ReadOnlySpan<byte> upSlab, ReadOnlySpan<byte> downSlab) =>
+            {
+                visited.Add(expertIndex);
+                chains.Add((expertIndex, gateSlab.ToArray(), upSlab.ToArray(), downSlab.ToArray()));
+            });
+
+        Assert.Equal([1, 3], visited); // the union order the caller stated, each expert once
+        Assert.Equal(2, chains.Count);
+
+        for (int c = 0; c < chains.Count; c++)
+        {
+            (int expert, ReadOnlyMemory<byte> gateSlab, ReadOnlyMemory<byte> upSlab, ReadOnlyMemory<byte> downSlab) = chains[c];
+
+            Assert.True(gateSlab.ToArray().SequenceEqual(BytesOf(SliceFloats(gateStack, expert * inter * hidden, inter * hidden))), $"gate slab of expert {expert} must view the stacked role's byte range");
+            Assert.True(upSlab.ToArray().SequenceEqual(BytesOf(SliceFloats(upStack, expert * inter * hidden, inter * hidden))), $"up slab of expert {expert} must view the stacked role's byte range");
+            Assert.True(downSlab.ToArray().SequenceEqual(BytesOf(SliceFloats(downStack, expert * hidden * inter, hidden * inter))), $"down slab of expert {expert} must view the stacked role's byte range");
+        }
+    }
+
+    [Fact]
+    public void Gather_UnionActiveExperts_GathersEachSharedExpertOncePerMergedStep_AndMatchesSoloSteppingBitForBit()
+    {
+        // Two sequences whose routed sets overlap: the merged step must resolve each expert's slab once per role for the
+        // whole step — an expert both sequences routed to is gathered once, not once per sequence — and the gathered
+        // batched output must stay bit-identical to stepping the same sequences alone.
+        MoeSpec spec = new(sharedExpert: true, routerMode: RouterMode.Discriminating);
+        MoeReference reference = new(spec);
+
+        (int[] tokens, int overlapExpert) = FindOverlappingPair(spec, reference);
+
+        string path = WriteTemp(BuildGguf(spec.MetadataPairs(), [.. spec.Tensors()]));
+        using CpuBackend backend = new(threads: 4, allowAvx2: false);
+        using GgufFile gguf = GgufFile.Open(path);
+
+        using GgufMmapWeightSource mmap = new(gguf);
+        CountingSlabSource counting = new(mmap);
+
+        using TransformerModel model = TransformerModel.Open(gguf, counting, backend, maxContextTokens: 8);
+        using BlockPool pool = NewPool(model, backend, capacityBlocks: 8);
+        SequenceKv[] kvs = [new SequenceKv(pool), new SequenceKv(pool)];
+
+        Span<float> batched = model.DecodeBatch(tokens, kvs);
+        int vocab = model.Desc.VocabSize;
+
+        // Every expert the step's union covers resolved exactly once per role: three resolutions per distinct expert,
+        // no repeats — the shared expert appears once even though both sequences selected it.
+        Dictionary<string, List<int>> resolutions = [];
+        foreach ((string tensor, int expert) in counting.SlabResolutions)
+        {
+            if (!tensor.Contains("exps", StringComparison.Ordinal))
+            {
+                continue; // only routed expert roles resolve through slab views
+            }
+
+            if (!resolutions.TryGetValue(tensor, out List<int>? seen))
+            {
+                seen = [];
+                resolutions[tensor] = seen;
+            }
+
+            seen.Add(expert);
+        }
+
+        Assert.Equal(3, resolutions.Count); // gate, up, down
+        foreach ((string tensor, List<int> experts) in resolutions)
+        {
+            Assert.True(experts.Count == experts.Distinct().Count(), $"{tensor}: an expert gathered twice in one merged step — union amortization broken");
+        }
+
+        // The fixture's discriminating router sends every token to experts {0, 2, 3} — each token takes a different
+        // pair, so the pair's shared expert is in that set — and the union must cover it.
+        HashSet<int> union = [.. resolutions.Values.SelectMany(e => e)];
+        Assert.Equal([0, 2, 3], union.OrderBy(e => e)); // the whole union, not per-sequence slots: 4 selection slots gathered as 3 experts
+        Assert.Contains(overlapExpert, union); // the expert both sequences routed to is in the gathered set...
+        Assert.Equal(1, resolutions["blk.0.ffn_gate_exps.weight"].Count(e => e == overlapExpert)); // ...once per role, not once per sequence
+        Assert.Equal(union.Count * 3, resolutions.Values.Sum(e => e.Count));
+
+        // Bit-identical to solo stepping of the same sequences.
+        using TransformerModel soloModel = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
+        using BlockPool soloPool = NewPool(soloModel, backend, capacityBlocks: 8);
+        for (int s = 0; s < tokens.Length; s++)
+        {
+            float[] solo = soloModel.DecodeNext(tokens[s], new SequenceKv(soloPool)).ToArray();
+            AssertBitsEqual(solo, batched.Slice(s * vocab, vocab), $"sequence {s} gathered batch logits vs solo stepping");
+
+            // And the dense-equivalent double-precision reference still describes the gathered arithmetic.
+            Assert.True(
+                Closest(batched.Slice(s * vocab, vocab), reference.LogitsAt([], tokens[s])),
+                $"sequence {s} gathered logits diverged from the dense-equivalent reference: max diff {MaxDiff(batched.Slice(s * vocab, vocab), reference.LogitsAt([], tokens[s])):G9}");
+        }
+    }
+
+    [Fact]
+    public void Gather_BatchedExpertOutput_MatchesDenseEquivalentReferenceMath_BitForBitAcrossOverlappingSelections()
+    {
+        // Four sequences with discriminating routing: every sequence's gathered batched logits must match the
+        // independent double-precision dense-equivalent forward within the existing parity tolerance, and the merged
+        // gather must cover the union of their selections without changing any sequence's arithmetic.
+        MoeSpec spec = new(sharedExpert: true, routerMode: RouterMode.Discriminating);
+        string path = WriteTemp(BuildGguf(spec.MetadataPairs(), [.. spec.Tensors()]));
+
+        using CpuBackend backend = new(threads: 4, allowAvx2: false);
+        using GgufFile gguf = GgufFile.Open(path);
+        using TransformerModel model = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
+
+        int[] tokens = [0, 1, 2, 3];
+        MoeReference reference = new(spec);
+
+        using BlockPool pool = NewPool(model, backend, capacityBlocks: 8);
+        SequenceKv[] kvs = [new SequenceKv(pool), new SequenceKv(pool), new SequenceKv(pool), new SequenceKv(pool)];
+        Span<float> batched = model.DecodeBatch(tokens, kvs);
+
+        HashSet<int> union = [];
+        for (int s = 0; s < tokens.Length; s++)
+        {
+            (int[] ids, _) = reference.RouteFor(reference.SparseBlockStreamFor(tokens[s]));
+            foreach (int id in ids)
+            {
+                union.Add(id);
+            }
+
+            Assert.True(
+                Closest(batched.Slice(s * model.Desc.VocabSize, model.Desc.VocabSize), reference.LogitsAt([], tokens[s])),
+                $"sequence {s} diverged from the dense-equivalent reference math: max diff {MaxDiff(batched.Slice(s * model.Desc.VocabSize, model.Desc.VocabSize), reference.LogitsAt([], tokens[s])):G9}");
+        }
+
+        Assert.True(union.Count >= 2, "the fixture must exercise a union wider than one expert");
+    }
+
+    [Fact]
+    public void Gather_AltternateWeightSourceWithoutSlabSupport_ExecutesThroughTheSlabViewUnchanged()
+    {
+        // A weight source that answers only whole-tensor resolutions (the arena-copied posture): the engine's slab
+        // provider must wrap it with contiguous slab views and the sparse forward must stay bit-identical to the
+        // mmap-backed execution of the same file.
+        MoeSpec spec = new(sharedExpert: true, routerMode: RouterMode.Discriminating);
+        string path = WriteTemp(BuildGguf(spec.MetadataPairs(), [.. spec.Tensors()]));
+
+        ArrayWeightSource arrays = new();
+        foreach (TensorDef tensor in spec.Tensors())
+        {
+            arrays.Payloads[tensor.Name] = BytesOf(tensor.Payload);
+        }
+
+        using CpuBackend backend = new(threads: 4, allowAvx2: false);
+        using GgufFile gguf = GgufFile.Open(path);
+
+        using TransformerModel mmapModel = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
+        using TransformerModel arrayModel = TransformerModel.Open(gguf, arrays, backend, maxContextTokens: 8);
+
+        using BlockPool mmapPool = NewPool(mmapModel, backend, capacityBlocks: 8);
+        using BlockPool arrayPool = NewPool(arrayModel, backend, capacityBlocks: 8);
+
+        int[] tokens = [0, 1, 2, 3];
+        Span<float> mmapLogits = mmapModel.DecodeBatch(tokens, [new SequenceKv(mmapPool), new SequenceKv(mmapPool), new SequenceKv(mmapPool), new SequenceKv(mmapPool)]);
+        Span<float> arrayLogits = arrayModel.DecodeBatch(tokens, [new SequenceKv(arrayPool), new SequenceKv(arrayPool), new SequenceKv(arrayPool), new SequenceKv(arrayPool)]);
+
+        AssertBitsEqual(mmapLogits, arrayLogits, "sparse forward over an alternate weight source through slab views");
+
+        MoeReference reference = new(spec);
+        Assert.True(
+            Closest(arrayLogits.Slice(1 * MoeSpec.Vocab, MoeSpec.Vocab), reference.LogitsAt([], 1)),
+            "the slab-view execution diverged from the dense-equivalent reference");
+    }
+
+    // ---------------------------------------------------------------- gather shared helpers
+
+    // Two fixture tokens whose routed sets share at least one expert: the union-amortization gate needs a real overlap
+    // to prove a shared expert gathers once per merged step.
+    private static (int[] Tokens, int OverlapExpert) FindOverlappingPair(MoeSpec spec, MoeReference reference)
+    {
+        int[][] selections = new int[4][];
+        for (int t = 0; t < 4; t++)
+        {
+            (int[] ids, _) = reference.RouteFor(reference.SparseBlockStreamFor(t));
+            selections[t] = ids;
+        }
+
+        for (int a = 0; a < 4; a++)
+        {
+            for (int b = a + 1; b < 4; b++)
+            {
+                foreach (int id in selections[a])
+                {
+                    if (selections[b].Contains(id))
+                    {
+                        return ([a, b], id);
+                    }
+                }
+            }
+        }
+
+        throw new InvalidOperationException("the discriminating fixture produced no overlapping routed sets across its four tokens");
+    }
+
+    private static float[] Stacked(float baseFactor)
+    {
+        const int experts = 4;
+        const int hidden = 6;
+        const int inter = 5;
+
+        float[] values = new float[experts * inter * hidden];
+        for (int e = 0; e < experts; e++)
+        {
+            for (int i = 0; i < inter * hidden; i++)
+            {
+                values[e * inter * hidden + i] = baseFactor + 0.05f * e + 0.01f * (i % 7);
+            }
+        }
+
+        return values;
+    }
+
+    private static float[] SliceFloats(float[] source, int start, int length)
+    {
+        float[] slice = new float[length];
+        Array.Copy(source, start, slice, 0, length);
+        return slice;
+    }
+
+    private static byte[] BytesOf(float[] values)
+    {
+        byte[] bytes = new byte[values.Length * 4];
+        for (int i = 0; i < values.Length; i++)
+        {
+            BitConverter.TryWriteBytes(bytes.AsSpan(i * 4, 4), values[i]);
+        }
+
+        return bytes;
+    }
+
+    /// <summary>An array-backed whole-tensor weight source: resolves each named tensor's payload from a dictionary, with no slab support of its own.</summary>
+    private sealed class ArrayWeightSource : Lair.Contracts.IWeightSource
+    {
+        public Dictionary<string, byte[]> Payloads { get; } = [];
+
+        public ReadOnlySpan<byte> Resolve(Lair.Contracts.LogicalTensor tensor) =>
+            Payloads.TryGetValue(tensor.Name, out byte[]? bytes) ? bytes : throw new InvalidOperationException($"array fixture has no payload for '{tensor.Name}'");
+
+        public void Dispose()
+        {
+        }
+    }
+
+    /// <summary>A whole-tensor source that also answers slab resolutions, counting every (tensor, expert) slab the gather kernel resolves.</summary>
+    private sealed class CountingSlabSource : Lair.Contracts.IWeightSource, Lair.Contracts.IExpertSlabSource
+    {
+        private readonly Lair.Contracts.IWeightSource _backing;
+        private readonly Lair.Loader.ExpertSlabWeightSource _slabs;
+
+        public CountingSlabSource(Lair.Contracts.IWeightSource backing)
+        {
+            _backing = backing;
+            _slabs = new Lair.Loader.ExpertSlabWeightSource(backing);
+        }
+
+        public List<(string Tensor, int Expert)> SlabResolutions { get; } = [];
+
+        public ReadOnlySpan<byte> Resolve(Lair.Contracts.LogicalTensor tensor) => _backing.Resolve(tensor);
+
+        public ReadOnlySpan<byte> ResolveSlab(Lair.Contracts.LogicalTensor stack, int expertIndex, long expertBytes)
+        {
+            SlabResolutions.Add((stack.Name, expertIndex));
+            return _slabs.ResolveSlab(stack, expertIndex, expertBytes);
+        }
+
+        public void Dispose()
+        {
+        }
+    }
+
     // ---------------------------------------------------------------- shared helpers
 
     private static double RouterDot(MoeSpec spec, double[] input, int expert)

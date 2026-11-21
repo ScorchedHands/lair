@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "reportId": "moe-gather-2026-11-21T15-16-02Z",
+  "generatedAtUtc": "2026-11-21T15:16:02Z",
+  "phase": "MVP7",
+  "branch": "phase/mvp6.1",
+  "lane": "Local CPU gather/dense-equivalent comparison (synthetic qwen2moe fixture)",
+  "goal": "Measure the merged-decode union gather against dense-equivalent solo stepping on identical sequences and token streams, prove bit-identical parity, and record the step\u0027s union active-expert amortization.",
+  "files": [
+    "manifest.json",
+    "host.json",
+    "bench.json",
+    "cli.json",
+    "report.html"
+  ],
+  "comparisonNotes": [
+    "The fixture is synthetic deterministic F32 qwen2moe material: it measures the gather mechanism (union walks, slab views, prefetch staging), not a quantized production model.",
+    "Both arms run identical sequences and token streams over identical file bytes; parity compares every step\u0027s logits bit-for-bit between the merged-decode arm and solo stepping.",
+    "Union stats come from an instrumentation pass that counts slab resolutions through the gather kernel: unionGateResolutionsPerDecodeStep lists gate-role resolutions per decode step summed over the fixture\u0027s layers, while averages and byte tallies are reported per layer step \u2014 each distinct expert of a step\u0027s union resolves exactly one slab per role."
+  ]
+}

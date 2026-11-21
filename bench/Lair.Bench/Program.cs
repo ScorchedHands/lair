@@ -12,7 +12,7 @@ using Lair.Tokenizer;
 
 if (args.Length == 0)
 {
-    Console.WriteLine("usage: Lair.Bench <gemv|gguf-dump|gemv-file|prefill-profile|kv-spike|kv-micro|q4-parity|kv-quant|cuda-gemv|cuda-gemm|cuda-prefill|cuda-concurrency|help>");
+    Console.WriteLine("usage: Lair.Bench <gemv|gguf-dump|gemv-file|prefill-profile|kv-spike|kv-micro|q4-parity|kv-quant|cuda-gemv|cuda-gemm|cuda-prefill|cuda-concurrency|gather|help>");
     return 1;
 }
 
@@ -30,6 +30,7 @@ return args[0] switch
     "cuda-gemm" => CudaGemmBench.Run(args), // Bench Gate measurement: per-format CUDA-vs-CPU blocked matmul over the same pinned fixtures (CPU scalar-oracle and auto-threaded wall time on each format's own weight-pass route - GemmBatch where SupportsGemm is true, otherwise batched-row GemvBatch - vs CUDA launch wall plus device-measured kernel-busy), bench-only with no posture or config change
     "cuda-prefill" => CudaPrefillBench.Run(args), // Composition measurement: CPU dense prefill vs CUDA device-step composed prefill over the pinned dense fixture (whole-prefill wall time per arm, kernel-busy and runtime-transfer tallies for the CUDA arm beside its pool's residency facts, one untimed parity basis line per length with no band asserted), bench-only with no posture or config change
     "cuda-concurrency" => CudaConcurrencyBench.Run(args), // Co-scheduling payoff measurement: two independent weight passes on the same pinned fixtures serialized through today's legacy-stream pipeline versus overlapped across two CU_STREAM_NON_BLOCKING streams in one shared primary context (bench-side hand-rolled launches only, independent of the production stream seam and no posture or config change), bench-only with no posture or config change
+    "gather" => MoeGatherBench.Run(args), // Union-gather measurement: identical sequences and token streams through the engine's merged-decode union gather (contiguous expert slabs gathered once per shared expert per layer step) versus dense-equivalent solo stepping, bit-for-bit parity between arms plus the step's union active-expert amortization over a pinned synthetic qwen2moe fixture, bench-only with no posture or config change
     _ => Usage(),
 };
 

@@ -158,18 +158,31 @@ public sealed class TransformerModel : IDisposable
     private long[] _moeExpertUpBytes = [];
     private long[] _moeExpertDownBytes = [];
 
+    // The expert execution seam for sparse blocks, resolved once at Open: routed experts reach the forward as
+    // contiguous per-expert slabs through an IWeightSource slab provider over this model's weight arena — logical
+    // views, never copies — and every selected chain runs its GEMVs through the gather kernel. A weight source that
+    // already answers slab resolutions is used directly; any other source gets a contiguous-slab view of it here, so
+    // alternate providers keep working unchanged while slabs stay addressable by router top-K pointers and prefetched
+    // before the GEMV consumes them. Null for a model with no sparse block.
+    private IGatherKernel? _gatherKernel;
+    private IExpertSlabSource? _expertSlabs;
+
     // Routing scratch, sized at Open for descriptor-bearing models only. The token path consumes one
-    // routing at a time; the batch path stores every sequence's selection flat, sequence by sequence, so
-    // each expert group can pack its member rows into one batched gate/up/down pass instead of paying a
-    // batch call per member. Selection order is ascending expert index, which is the order the batch path
-    // groups by.
+    // routing at a time; the batch path stores every sequence's selection flat, sequence by sequence, and folds it
+    // into the step's union active-expert set — each selected expert exactly once with its member rows grouped in
+    // sequence order — so one gathered slab feeds every sequence that routed to it this step. Selection order is
+    // ascending expert index, which is both the gather set's order and the accumulation order the dense-equivalent
+    // forward uses per sequence.
 
     private float[] _moeLogits = [];      // experts: router scores for one sequence, consumed during selection
     private int[] _moeIds = [];           // routedExpertsPerToken: selected expert indexes, ascending order
     private float[] _moeWeights = [];     // routedExpertsPerToken: the weight of each selected expert
     private int[] _batchMoeIds = [];      // _rowCapacity * routedExpertsPerToken: per-sequence selections
     private float[] _batchMoeWeights = [];// same length, aligned with _batchMoeIds
-    private int[] _expertMembers = []; // _rowCapacity: member rows of the expert under execution
+    private int[] _moeUnion = [];         // _rowCapacity * routedExpertsPerToken upper bound: the batch's union active-expert set, ascending
+    private int[] _moeUnionCounts = [];   // member rows per union position of the current step (overwritten with group starts during execution)
+    private int[] _moeMembersFlat = [];   // same length: every selection slot's sequence grouped under its expert, in sequence order
+    private float[] _moeMemberWeights = [];// aligned with _moeMembersFlat: each member's routing weight at its own slot
     private float[] _moeSubsetIn = []; // _rowCapacity * hidden: one expert group's activations and down results, packed in place
 
     // Small FP32 vectors preloaded at Open: per-layer norm weights and any biases present in the file. Null
@@ -1398,15 +1411,26 @@ public sealed class TransformerModel : IDisposable
             _moeExpertDownBytes = downBytes;
 
             // Routing scratch and packed-expert storage sized from the descriptor's concrete counts: one selection at
-            // a time for routing plus per-sequence copies of every batched selection, member-row indexes for one
-            // expert group, and one hidden-sized buffer carrying each group's activations and down results in place.
+            // a time for routing plus per-sequence copies of every batched selection, the step's union active-expert
+            // set with its grouped member rows and weights (an upper bound of one entry per selection slot), and one
+            // hidden-sized buffer carrying each group's activations and down results in place.
             _moeLogits = new float[_sparseFfn.ExpertCount];
             _moeIds = new int[_sparseFfn.RoutedExpertsPerToken];
             _moeWeights = new float[_sparseFfn.RoutedExpertsPerToken];
             _batchMoeIds = new int[_rowCapacity * _sparseFfn.RoutedExpertsPerToken];
             _batchMoeWeights = new float[_rowCapacity * _sparseFfn.RoutedExpertsPerToken];
-            _expertMembers = new int[_rowCapacity];
+            _moeUnion = new int[_rowCapacity * _sparseFfn.RoutedExpertsPerToken];
+            _moeUnionCounts = new int[_rowCapacity * _sparseFfn.RoutedExpertsPerToken];
+            _moeMembersFlat = new int[_rowCapacity * _sparseFfn.RoutedExpertsPerToken];
+            _moeMemberWeights = new float[_rowCapacity * _sparseFfn.RoutedExpertsPerToken];
             _moeSubsetIn = new float[_rowCapacity * Plan.HiddenSize];
+
+            // The slab provider over this model's weight arena and the CPU gather kernel every selected chain runs
+            // through, resolved once here so no forward re-resolves either. An injected source that already answers
+            // slab resolutions (a residency or repacked provider) is used directly; anything else — the mmap arena
+            // today, an arena-copied alternate — gets a contiguous-slab view of its own payloads.
+            _expertSlabs = _weights as IExpertSlabSource ?? new ExpertSlabWeightSource(_weights);
+            _gatherKernel = new CpuGatherKernel();
 
             // A declared shared expert is one dense-shaped matrix triplet the routing adds to every token's output,
             // plus — for a family whose reference gates it — one selector vector per layer. An undeclared shared
@@ -1628,7 +1652,10 @@ public sealed class TransformerModel : IDisposable
             MoeWeights = _moeWeights,
             BatchMoeIds = _batchMoeIds,
             BatchMoeWeights = _batchMoeWeights,
-            ExpertMembers = _expertMembers,
+            MoeUnion = _moeUnion,
+            MoeUnionCounts = _moeUnionCounts,
+            MoeMembersFlat = _moeMembersFlat,
+            MoeMemberWeights = _moeMemberWeights,
             SubsetIn = _moeSubsetIn,
             FinalNormed = _normed,
             FinalLogits = _logits,
@@ -1657,7 +1684,10 @@ public sealed class TransformerModel : IDisposable
                 MoeWeights = _moeWeights.Length > 0 ? new float[_moeWeights.Length] : [],
                 BatchMoeIds = new int[_laneRowCapacity * (_sparseFfn?.RoutedExpertsPerToken ?? 0)],
                 BatchMoeWeights = new float[_laneRowCapacity * (_sparseFfn?.RoutedExpertsPerToken ?? 0)],
-                ExpertMembers = new int[_laneRowCapacity],
+                MoeUnion = new int[_laneRowCapacity * (_sparseFfn?.RoutedExpertsPerToken ?? 0)],
+                MoeUnionCounts = new int[_laneRowCapacity * (_sparseFfn?.RoutedExpertsPerToken ?? 0)],
+                MoeMembersFlat = new int[_laneRowCapacity * (_sparseFfn?.RoutedExpertsPerToken ?? 0)],
+                MoeMemberWeights = new float[_laneRowCapacity * (_sparseFfn?.RoutedExpertsPerToken ?? 0)],
                 SubsetIn = new float[_laneRowCapacity * hidden],
                 FinalNormed = new float[hidden],
                 FinalLogits = new float[Plan.VocabSize],
@@ -3897,11 +3927,6 @@ public sealed class TransformerModel : IDisposable
         return vectors;
     }
 
-    // A slice of one expert's resident stack as the weight operand a GEMV over that expert consumes: the contiguous
-    // row range at this role's per-expert byte geometry, carrying the two-dimensional shape resolved for it at Open.
-    private static WeightRef ExpertWeightRef(ReadOnlySpan<byte> payload, long expertBytes, int expertIndex, TensorShape shape, QuantFormat format) =>
-        new(payload.Slice((int)(expertIndex * expertBytes), (int)expertBytes), shape, format);
-
     // Router scoring and top-k selection for one normalized activation vector, shared by both forward paths so a
     // batched step reproduces single-sequence routing exactly. The router emits one score per declared expert; every
     // score is softmaxed together because the reference routes over all experts, then RoutedExpertsPerToken picks run
@@ -4039,50 +4064,49 @@ public sealed class TransformerModel : IDisposable
         return LayerOps.Silu(score) / score;
     }
 
-    // Sparse feed-forward for the current token: routing selects, each selected expert's gate/up/down chain runs over
-    // the normalized stream in ascending expert-index order, and every output accumulates into _proj scaled by its
-    // routing weight — a declared shared expert contributing once under SharedExpertWeight, which is 1f unless the
-    // file ships that block's selector vectors. The caller's post-feed-forward norm
-    // and residual add then run exactly as they do on the dense path.
+    // Sparse feed-forward for the current token: routing selects, then every selected expert's gate/up/down chain runs
+    // over the normalized stream in ascending expert-index order through the gather kernel — each expert's slabs read as
+    // contiguous views of its role stack and prefetched before the GEMVs consume them — and every output accumulates into
+    // _proj scaled by its routing weight; a declared shared expert contributing once under SharedExpertWeight, which is
+    // 1f unless the file ships that block's selector vectors. The gate/up intermediates reuse the dense token buffers; no
+    // copy of any expert tensor exists anywhere. The caller's post-feed-forward norm and residual add then run exactly as
+    // they do on the dense path.
     private void ApplySparseFeedForward(SparseFfnDescriptor sparse, int layer, IBackend engine)
     {
         RouteSparseExperts(sparse, layer, _normed.AsSpan(0, Plan.HiddenSize), _decodeAct, engine);
 
         int hidden = Plan.HiddenSize;
-        Span<float> proj = _proj;
-        proj.Clear(); // the routed and shared contributions accumulate from zero below
+        _proj.AsSpan().Clear(); // the routed and shared contributions accumulate from zero below
 
-        for (int slot = 0; slot < sparse.RoutedExpertsPerToken; slot++)
+        ExpertSlabRole gate = new(_moeExpertGate[layer], _moeExpertGateShape, _moeExpertGateBytes[layer]);
+        ExpertSlabRole up = new(_moeExpertUp[layer], _moeExpertUpShape, _moeExpertUpBytes[layer]);
+        ExpertSlabRole down = new(_moeExpertDown[layer], _moeExpertDownShape, _moeExpertDownBytes[layer]);
+
+        GatherRoutedChain(gate, up, down, _moeIds.AsSpan(0, sparse.RoutedExpertsPerToken), (int expertIndex, ReadOnlySpan<byte> gateSlab, ReadOnlySpan<byte> upSlab, ReadOnlySpan<byte> downSlab) =>
         {
-            ExecuteRoutedExpert(layer, _moeIds[slot], _moeSubsetIn.AsSpan(0, hidden), engine);
-            AccumulateScaled(proj, _moeSubsetIn.AsSpan(0, hidden), _moeWeights[slot]);
-        }
+            engine.Gemv(_normed.AsSpan(0, Plan.HiddenSize), new WeightRef(gateSlab, _moeExpertGateShape, gate.Stack.Format), _gateUp);
+
+            engine.Gemv(_normed.AsSpan(0, Plan.HiddenSize), new WeightRef(upSlab, _moeExpertUpShape, up.Stack.Format), _up);
+
+            ApplyActivation(_gateUp.AsSpan(0, Plan.IntermediateSize), _up.AsSpan(0, Plan.IntermediateSize));
+
+            engine.Gemv(_gateUp.AsSpan(0, Plan.IntermediateSize), new WeightRef(downSlab, _moeExpertDownShape, down.Stack.Format), _moeSubsetIn.AsSpan(0, hidden));
+
+            for (int slot = 0; slot < sparse.RoutedExpertsPerToken; slot++)
+            {
+                if (_moeIds[slot] == expertIndex)
+                {
+                    AccumulateScaled(_proj, _moeSubsetIn.AsSpan(0, hidden), _moeWeights[slot]);
+                    break;
+                }
+            }
+        });
 
         if (sparse.HasSharedExpert)
         {
             RunSharedExpertToken(layer, _moeSubsetIn.AsSpan(0, hidden), engine);
-            AccumulateScaled(proj, _moeSubsetIn.AsSpan(0, hidden), SharedExpertWeight(layer, _normed.AsSpan(0, hidden)));
+            AccumulateScaled(_proj, _moeSubsetIn.AsSpan(0, hidden), SharedExpertWeight(layer, _normed.AsSpan(0, hidden)));
         }
-    }
-
-    // One routed expert's gate/up/down chain over a single activation vector. The gate and up intermediates reuse the
-    // dense token buffers; each GEMV reads this expert's contiguous row range of its resident stacked role at the
-    // per-expert byte geometry resolved at Open, so no copy of any expert tensor exists anywhere.
-    private void ExecuteRoutedExpert(int layer, int expertIndex, Span<float> output, IBackend engine)
-    {
-        LogicalTensor gate = _moeExpertGate[layer];
-        ReadOnlySpan<byte> payload = _weights.Resolve(gate);
-        engine.Gemv(_normed.AsSpan(0, Plan.HiddenSize), ExpertWeightRef(payload, _moeExpertGateBytes[layer], expertIndex, _moeExpertGateShape, gate.Format), _gateUp);
-
-        LogicalTensor up = _moeExpertUp[layer];
-        payload = _weights.Resolve(up);
-        engine.Gemv(_normed.AsSpan(0, Plan.HiddenSize), ExpertWeightRef(payload, _moeExpertUpBytes[layer], expertIndex, _moeExpertUpShape, up.Format), _up);
-
-        ApplyActivation(_gateUp.AsSpan(0, Plan.IntermediateSize), _up.AsSpan(0, Plan.IntermediateSize));
-
-        LogicalTensor down = _moeExpertDown[layer];
-        payload = _weights.Resolve(down);
-        engine.Gemv(_gateUp.AsSpan(0, Plan.IntermediateSize), ExpertWeightRef(payload, _moeExpertDownBytes[layer], expertIndex, _moeExpertDownShape, down.Format), output);
     }
 
     // The shared expert's dense-shaped triplet over a single activation vector: the same gate/up/down GEMVs the dense
@@ -4104,15 +4128,18 @@ public sealed class TransformerModel : IDisposable
         engine.Gemv(_gateUp.AsSpan(0, Plan.IntermediateSize), new WeightRef(bytes, down.Shape, down.Format), output);
     }
 
-    // Sparse feed-forward for one batched step: every sequence routes first (one selection at a time in scratch,
-    // copied into the per-sequence arrays before the next selection runs). Execution then walks selection slots in
-    // ascending order and experts by index within each slot, packing that group's member rows of _batchNormed for one
-    // GemvBatch pass through the expert's resident stack; results accumulate straight into each sequence's projection
-    // stream under its routing weight. A declared shared expert runs last over all sequences, every sequence scaled by
-    // its own SharedExpertWeight. The packed subset buffer carries activations and down results in place, so no copy of any expert tensor or whole-batch
-    // output exists — and because every sequence accumulates its own contributions in the same slot order a single
-    // token does, each batched result is bit-identical to stepping that sequence alone. The caller's post-feed-forward
-    // norm and residual add then run exactly as they do on the dense path.
+    // Sparse feed-forward for one merged decode step: every sequence routes first (one selection at a time in scratch,
+    // copied into the per-sequence arrays before the next selection runs). The selections then fold into this step's
+    // union active-expert set — each selected expert exactly once, ascending, with its member sequences counted — and one
+    // gather pass over that set feeds every sequence: an expert several sequences routed to has its slabs resolved from
+    // the slab provider and prefetched once for the step. Each gathered expert packs its members' rows of _batchNormed
+    // into the subset buffer, runs gate/up/down as batched passes through its slabs, and accumulates each member's down
+    // result straight into that sequence's projection stream under its routing weight. Selections are ascending-sorted
+    // per sequence, so walking the union ascending replays exactly the slot-order accumulation a single token performs:
+    // every batched row reads the same slab bytes and activation vector it read before, and each batched result stays
+    // bit-identical to stepping that sequence alone. A declared shared expert runs last over all sequences, every
+    // sequence scaled by its own SharedExpertWeight. The caller's post-feed-forward norm and residual add then run
+    // exactly as they do on the dense path.
     private void ApplySparseFeedForwardBatch(SparseFfnDescriptor sparse, int layer, int n, ActivationFamily act, IBackend engine)
     {
         int hidden = Plan.HiddenSize;
@@ -4132,22 +4159,15 @@ public sealed class TransformerModel : IDisposable
         Span<float> batchProj = act.BatchProj.AsSpan(0, n * hidden);
         batchProj.Clear(); // the routed and shared contributions accumulate from zero below
 
-        for (int slot = 0; slot < routed; slot++)
-        {
-            for (int expertIndex = 0; expertIndex < sparse.ExpertCount; expertIndex++)
-            {
-                int count = 0;
-                for (int s = 0; s < n; s++)
-                {
-                    if (act.BatchMoeIds[s * routed + slot] == expertIndex)
-                    {
-                        act.ExpertMembers[count++] = s;
-                    }
-                }
+        int unionCount = BuildUnionActiveExperts(n, routed, act);
 
-                ExecuteRoutedExpertBatch(layer, expertIndex, count, slot, routed, act, engine);
-            }
-        }
+        ExpertSlabRole gate = new(_moeExpertGate[layer], _moeExpertGateShape, _moeExpertGateBytes[layer]);
+        ExpertSlabRole up = new(_moeExpertUp[layer], _moeExpertUpShape, _moeExpertUpBytes[layer]);
+        ExpertSlabRole down = new(_moeExpertDown[layer], _moeExpertDownShape, _moeExpertDownBytes[layer]);
+
+        int selectionSlots = n * routed; // only this step's selections are live in the per-sequence arrays
+        GatherRoutedChain(gate, up, down, act.MoeUnion.AsSpan(0, unionCount), (int expertIndex, ReadOnlySpan<byte> gateSlab, ReadOnlySpan<byte> upSlab, ReadOnlySpan<byte> downSlab) =>
+            ExecuteGatheredExpertBatch(expertIndex, selectionSlots, gate.Stack.Format, gateSlab, up.Stack.Format, upSlab, down.Stack.Format, downSlab, act, engine));
 
         if (sparse.HasSharedExpert)
         {
@@ -4155,48 +4175,104 @@ public sealed class TransformerModel : IDisposable
         }
     }
 
-    // One routed expert's gate/up/down chain over the packed member rows of one selection slot: a single batched pass
-    // through its resident stack, bit-identical per row to the token path, with each member's down result accumulated
-    // into that sequence's projection stream under its routing weight as soon as the group completes. The family this route writes through carries the packed subset buffer and gate/up intermediates — the default family's arrays for decode-side steps, the lane's own when a dedicated window runs them. A slot no sequence selected runs nothing at all.
-    private void ExecuteRoutedExpertBatch(int layer, int expertIndex, int count, int slot, int routed, ActivationFamily act, IBackend engine)
+    // Folds this step's per-sequence selections into the union active-expert set: ascending distinct expert indexes with
+    // each expert's member count beside it. Selections are already sorted ascending within a sequence; the insertion
+    // keeps the set itself ascending so the gather walks experts exactly in the order the dense-equivalent forward
+    // accumulates them, and every selection slot lands in exactly one group.
+    private int BuildUnionActiveExperts(int n, int routed, ActivationFamily act)
     {
-        if (count == 0)
+        int[] union = act.MoeUnion;
+        int[] counts = act.MoeUnionCounts;
+
+        int unionCount = 0;
+        for (int s = 0; s < n; s++)
         {
-            return;
+            for (int pick = 0; pick < routed; pick++)
+            {
+                int expertIndex = act.BatchMoeIds[s * routed + pick];
+
+                int position = 0;
+                while (position < unionCount && union[position] < expertIndex)
+                {
+                    position++;
+                }
+
+                if (position == unionCount || union[position] != expertIndex)
+                {
+                    for (int shift = unionCount; shift > position; shift--)
+                    {
+                        union[shift] = union[shift - 1];
+                        counts[shift] = counts[shift - 1];
+                    }
+
+                    union[position] = expertIndex;
+                    counts[position] = 0;
+                    unionCount++;
+                }
+
+                counts[position]++;
+            }
         }
 
+        return unionCount;
+    }
+
+    // One gathered expert's chain over every sequence that selected it this step: its members are collected from the
+    // per-sequence selections in sequence order, their normalized rows packed into the subset buffer, and gate/up/down
+    // run as batched passes through the slabs the gather kernel just prefetched — bit-identical per row to the token
+    // path, with each member's down result accumulated into that sequence's projection stream under its routing weight
+    // as soon as the group completes. The family this route writes through carries the packed subset buffer and gate/up
+    // intermediates — the default family's arrays for decode-side steps, the lane's own when a dedicated window runs them.
+    private void ExecuteGatheredExpertBatch(
+        int expertIndex,
+        int selectionSlots,
+        QuantFormat gateFormat,
+        ReadOnlySpan<byte> gateSlab,
+        QuantFormat upFormat,
+        ReadOnlySpan<byte> upSlab,
+        QuantFormat downFormat,
+        ReadOnlySpan<byte> downSlab,
+        ActivationFamily act,
+        IBackend engine)
+    {
         int hidden = Plan.HiddenSize;
         int inter = Plan.IntermediateSize;
-        Span<float> subsetIn = act.SubsetIn.AsSpan(0, count * hidden);
 
-        for (int m = 0; m < count; m++)
+        int count = 0;
+        for (int s = 0; s < selectionSlots; s++)
         {
-            act.BatchNormed.AsSpan(act.ExpertMembers[m] * hidden, hidden).CopyTo(subsetIn.Slice(m * hidden, hidden));
+            if (act.BatchMoeIds[s] != expertIndex)
+            {
+                continue;
+            }
+
+            int sequence = s / act.MoeIds.Length;
+            act.BatchNormed.AsSpan(sequence * hidden, hidden).CopyTo(act.SubsetIn.AsSpan(count * hidden, hidden));
+            act.MoeMembersFlat[count] = sequence;
+            act.MoeMemberWeights[count] = act.BatchMoeWeights[s];
+            count++;
         }
 
-        LogicalTensor gate = _moeExpertGate[layer];
-        ReadOnlySpan<byte> payload = _weights.Resolve(gate);
-        engine.GemvBatch(subsetIn, count, ExpertWeightRef(payload, _moeExpertGateBytes[layer], expertIndex, _moeExpertGateShape, gate.Format), act.BatchGateUp.AsSpan(0, count * inter));
+        Span<float> subsetIn = act.SubsetIn.AsSpan(0, count * hidden);
 
-        LogicalTensor up = _moeExpertUp[layer];
-        payload = _weights.Resolve(up);
-        engine.GemvBatch(subsetIn, count, ExpertWeightRef(payload, _moeExpertUpBytes[layer], expertIndex, _moeExpertUpShape, up.Format), act.BatchUp.AsSpan(0, count * inter));
+        engine.GemvBatch(subsetIn, count, new WeightRef(gateSlab, _moeExpertGateShape, gateFormat), act.BatchGateUp.AsSpan(0, count * inter));
+        engine.GemvBatch(subsetIn, count, new WeightRef(upSlab, _moeExpertUpShape, upFormat), act.BatchUp.AsSpan(0, count * inter));
 
         for (int m = 0; m < count; m++)
         {
             ApplyActivation(act.BatchGateUp.AsSpan(m * inter, inter), act.BatchUp.AsSpan(m * inter, inter));
         }
 
-        LogicalTensor down = _moeExpertDown[layer];
-        payload = _weights.Resolve(down);
-        engine.GemvBatch(act.BatchGateUp.AsSpan(0, count * inter), count, ExpertWeightRef(payload, _moeExpertDownBytes[layer], expertIndex, _moeExpertDownShape, down.Format), subsetIn);
+        engine.GemvBatch(act.BatchGateUp.AsSpan(0, count * inter), count, new WeightRef(downSlab, _moeExpertDownShape, downFormat), subsetIn);
 
         for (int m = 0; m < count; m++)
         {
-            int s = act.ExpertMembers[m];
-            AccumulateScaled(act.BatchProj.AsSpan(s * hidden, hidden), subsetIn.Slice(m * hidden, hidden), act.BatchMoeWeights[s * routed + slot]);
+            AccumulateScaled(act.BatchProj.AsSpan(act.MoeMembersFlat[m] * hidden, hidden), subsetIn.Slice(m * hidden, hidden), act.MoeMemberWeights[m]);
         }
     }
+
+    private void GatherRoutedChain(ExpertSlabRole gate, ExpertSlabRole up, ExpertSlabRole down, ReadOnlySpan<int> expertIndexes, GatheredExpertChain handle) =>
+        _gatherKernel!.Gather(_expertSlabs!, gate, up, down, expertIndexes, handle);
 
     // The shared expert's dense-shaped triplet over every sequence in one batched pass: the same gate/up/down
     // GemvBatch traversal the dense block runs, accumulating each sequence's output into its projection stream under
@@ -4339,13 +4415,16 @@ public sealed class TransformerModel : IDisposable
         public required float[] TiledRowMax;
         public required float[] TiledRowSumExp;
 
-        // Routing scratch for sparse feed-forward blocks: one selection at a time plus per-sequence copies across a batched step. Empty arrays when the model runs no expert routing at all — nothing reads them then.
+        // Routing scratch for sparse feed-forward blocks: one selection at a time plus per-sequence copies across a batched step, and the step's union active-expert set with its grouped member rows and weights — every selected expert once, members of each expert in sequence order. Empty arrays when the model runs no expert routing at all — nothing reads them then.
         public required float[] MoeScores;
         public required int[] MoeIds;
         public required float[] MoeWeights;
         public required int[] BatchMoeIds;
         public required float[] BatchMoeWeights;
-        public required int[] ExpertMembers;
+        public required int[] MoeUnion;
+        public required int[] MoeUnionCounts;
+        public required int[] MoeMembersFlat;
+        public required float[] MoeMemberWeights;
 
         /// <summary>Packed expert-group activations and down results, held in place across one group.</summary>
         public required float[] SubsetIn;
@@ -4357,8 +4436,8 @@ public sealed class TransformerModel : IDisposable
         /// <summary>Total bytes of mutable activation storage this family holds.</summary>
         public long ActivationBytes =>
             (long)(BatchCur.Length + BatchNormed.Length + BatchQ.Length + BatchK.Length + BatchV.Length + BatchAttnOut.Length + BatchProj.Length + BatchGateUp.Length + BatchUp.Length
-                + TiledRowMax.Length + TiledRowSumExp.Length + MoeScores.Length + MoeWeights.Length + BatchMoeWeights.Length + SubsetIn.Length + FinalNormed.Length + FinalLogits.Length) * sizeof(float)
-            + (long)(MoeIds.Length + BatchMoeIds.Length + ExpertMembers.Length) * sizeof(int);
+                + TiledRowMax.Length + TiledRowSumExp.Length + MoeScores.Length + MoeWeights.Length + BatchMoeWeights.Length + MoeMemberWeights.Length + SubsetIn.Length + FinalNormed.Length + FinalLogits.Length) * sizeof(float)
+            + (long)(MoeIds.Length + BatchMoeIds.Length + MoeUnion.Length + MoeUnionCounts.Length + MoeMembersFlat.Length) * sizeof(int);
     }
 
     private static void RequireSingle(LogicalTensor tensor, int rows, long cols)

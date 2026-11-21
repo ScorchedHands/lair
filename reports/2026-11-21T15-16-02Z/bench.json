@@ -1,0 +1,112 @@
+{
+  "schemaVersion": 1,
+  "reportId": "moe-gather-2026-11-21T15-16-02Z",
+  "arms": [
+    {
+      "id": "gather-merged-decode",
+      "harness": "LAIR engine DecodeBatch union gather (CpuGatherKernel over ExpertSlabWeightSource views)",
+      "metrics": [
+        {
+          "test": "decode tok/s",
+          "tokensPerSecond": 380.0688
+        }
+      ],
+      "medianSeconds": 1.3471,
+      "minSeconds": 1.3381,
+      "maxSeconds": 1.3988
+    },
+    {
+      "id": "dense-equivalent-solo",
+      "harness": "LAIR engine DecodeNext per-sequence stepping (same token streams, fresh KV)",
+      "metrics": [
+        {
+          "test": "decode tok/s",
+          "tokensPerSecond": 138.6816
+        }
+      ],
+      "medianSeconds": 3.6919,
+      "minSeconds": 3.6795,
+      "maxSeconds": 3.7218
+    }
+  ],
+  "parity": {
+    "bitExact": true,
+    "comparedFloats": 131072,
+    "mismatchedFloats": 0,
+    "maxAbsDiff": 0
+  },
+  "unionStats": {
+    "selectionSlotsPerLayerStep": 64,
+    "averageDistinctExpertsGatheredPerLayerStep": 21.4062,
+    "amortizationPercent": 66.5527,
+    "gatheredBytesPerLayerStep": 67338240,
+    "denseEquivalentBytesPerLayerStep": 201326592,
+    "distinctExpertsAcrossRun": 32,
+    "unionGateResolutionsPerDecodeStep": [
+      43,
+      40,
+      44,
+      41,
+      42,
+      37,
+      35,
+      41,
+      41,
+      44,
+      43,
+      42,
+      46,
+      46,
+      43,
+      45,
+      47,
+      39,
+      37,
+      38,
+      46,
+      44,
+      44,
+      45,
+      47,
+      44,
+      43,
+      43,
+      47,
+      47,
+      46,
+      45,
+      45,
+      38,
+      42,
+      43,
+      44,
+      37,
+      39,
+      47,
+      45,
+      43,
+      43,
+      45,
+      42,
+      35,
+      45,
+      43,
+      45,
+      44,
+      43,
+      47,
+      38,
+      33,
+      37,
+      46,
+      46,
+      47,
+      42,
+      44,
+      45,
+      46,
+      43,
+      43
+    ]
+  }
+}
