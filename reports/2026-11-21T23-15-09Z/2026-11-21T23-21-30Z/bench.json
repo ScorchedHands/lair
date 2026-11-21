@@ -1,0 +1,119 @@
+{
+  "schemaVersion": 1,
+  "reportId": "moe-gather-2026-11-21T23-21-30Z",
+  "substrate": "stream",
+  "coldReads": {
+    "substrateId": "stream",
+    "gatherStackRoleReadsTimedReps": 5184,
+    "gatherStreamedBytesTimedReps": 32614907904,
+    "gatherPageFaultDeltaTimedReps": 4414609,
+    "soloStackRoleReadsTimedReps": 27648,
+    "soloStreamedBytesTimedReps": 173946175488,
+    "soloPageFaultDeltaTimedReps": 22446736,
+    "hotArmRan": true,
+    "hotStackRoleReadsTimedReps": 2808,
+    "hotStreamedBytesTimedReps": 17666408448,
+    "hotPageFaultDeltaTimedReps": 1726998
+  },
+  "arms": [
+    {
+      "id": "gather-merged-decode",
+      "harness": "LAIR engine DecodeBatch union gather (CpuGatherKernel over ExpertSlabWeightSource views)",
+      "metrics": [
+        {
+          "test": "decode tok/s",
+          "tokensPerSecond": 16.3177
+        }
+      ],
+      "medianSeconds": 11.7663,
+      "minSeconds": 11.6221,
+      "maxSeconds": 14.4127
+    },
+    {
+      "id": "dense-equivalent-solo",
+      "harness": "LAIR engine DecodeNext per-sequence stepping (same token streams, fresh KV)",
+      "metrics": [
+        {
+          "test": "decode tok/s",
+          "tokensPerSecond": 3.2124
+        }
+      ],
+      "medianSeconds": 59.7689,
+      "minSeconds": 53.3925,
+      "maxSeconds": 63.762
+    },
+    {
+      "id": "gather-ram-hot-tier",
+      "harness": "LAIR engine DecodeBatch union gather over RamHotExpertTier (capacity/cost hot expert copies \u002B cold slab views)",
+      "metrics": [
+        {
+          "test": "decode tok/s",
+          "tokensPerSecond": 28.0844
+        }
+      ],
+      "medianSeconds": 6.8365,
+      "minSeconds": 6.7537,
+      "maxSeconds": 7.4852
+    }
+  ],
+  "parity": {
+    "bitExact": true,
+    "comparedFloats": 49152,
+    "mismatchedFloats": 0,
+    "maxAbsDiff": 0
+  },
+  "tierVsGatherParity": {
+    "bitExact": true,
+    "comparedFloats": 49152,
+    "mismatchedFloats": 0,
+    "maxAbsDiff": 0
+  },
+  "residency": {
+    "tierKind": "ram_hot_experts",
+    "budgetBytes": 18612224,
+    "residentBytes": 17301504,
+    "hotUnits": 11,
+    "swapPeriodLayerSteps": 16,
+    "hitsTotal": 792,
+    "missesTotal": 936,
+    "hitRatePercent": 45.8333,
+    "savedBytesEstimateTotal": 415236096,
+    "promotionsTotal": 0,
+    "demotionsTotal": 0,
+    "tokensPerSecondDeltaVsPrefetchOnlyPercent": 72.1099
+  },
+  "unionStats": {
+    "selectionSlotsPerLayerStep": 64,
+    "averageDistinctExpertsGatheredPerLayerStep": 12,
+    "amortizationPercent": 81.25,
+    "gatheredBytesPerLayerStep": 18874368,
+    "denseEquivalentBytesPerLayerStep": 100663296,
+    "distinctExpertsAcrossRun": 12,
+    "unionGateResolutionsPerDecodeStep": [
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24
+    ]
+  }
+}

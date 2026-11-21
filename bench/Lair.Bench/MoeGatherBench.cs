@@ -36,6 +36,7 @@ public static class MoeGatherBench
         int inter = 512;
         int vocab = 256;
         string outRoot = "reports";
+        string substrate = "mmap"; // mmap keeps the historical OS-cached mapping; stream answers each cold stacked-expert resolution from an unbuffered (FILE_FLAG_NO_BUFFERING) whole-tensor read while dense weights stay cached — a real expensive-read baseline for the residency arm to save against
         double hotBudgetMb = 0.0; // zero disables the residency arm entirely: default runs stay exactly the prefetch-only gather-vs-solo comparison they were before this seam existed
         double hotReserveMb = -1.0; // negative means reserve the KV working-set estimate from pool geometry, honoring budget = quota − reserve as the tier contract states
         int hotSwapPeriod = 16; // layer-step notes per aging/rebalance round: small enough for a short synthetic stream to ramp its hot set during warmup
@@ -60,6 +61,7 @@ public static class MoeGatherBench
                 case "--inter": inter = ParseInt(args[++i], inter); break;
                 case "--vocab": vocab = ParseInt(args[++i], vocab); break;
                 case "--out": outRoot = args[++i]; break;
+                case "--substrate": substrate = args[++i].ToLowerInvariant(); break;
                 case "--hot-budget-mb": hotBudgetMb = ParseDouble(args[++i], 0.0); break;
                 case "--hot-reserve-mb": hotReserveMb = ParseDouble(args[++i], -1.0); break;
                 case "--hot-swap-period": hotSwapPeriod = Math.Max(1, ParseInt(args[++i], 16)); break;
@@ -78,6 +80,19 @@ public static class MoeGatherBench
         if (routed < 1 || routed > experts)
         {
             Console.WriteLine("gather: --routed must be between 1 and --experts");
+            return 1;
+        }
+
+        // The streaming substrate is a Windows measurement seam (FILE_FLAG_NO_BUFFERING reads); a non-Windows host keeps the historical mmap posture.
+        if (substrate == "stream" && !OperatingSystem.IsWindows())
+        {
+            Console.WriteLine("gather: --substrate stream is a Windows measurement seam; this host runs --substrate mmap");
+            return 1;
+        }
+
+        if (substrate != "mmap" && substrate != "stream")
+        {
+            Console.WriteLine("gather: --substrate must be mmap or stream");
             return 1;
         }
 
@@ -102,7 +117,7 @@ public static class MoeGatherBench
         string reportId = $"moe-gather-{stamp}";
 
         Console.WriteLine($"gather fixture: qwen2moe synthetic layers={layers} hidden={hidden} heads={heads} headDim={headDim} kvHeads={kvHeads} inter={inter} experts={experts} routed={routed} vocab={vocab} sharedExpert=yes weights=F32");
-        Console.WriteLine($"gather posture: seqs={seqs} tokensPerSequence={tokens} reps={reps} outRoot={outRoot} engineThreads=auto avx2={Avx2.IsSupported} physicalCores={CpuBackend.DetectedPhysicalCoreCount} logicalProcessors={Environment.ProcessorCount}");
+        Console.WriteLine($"gather posture: seqs={seqs} tokensPerSequence={tokens} reps={reps} outRoot={outRoot} substrate={substrate} engineThreads=auto avx2={Avx2.IsSupported} physicalCores={CpuBackend.DetectedPhysicalCoreCount} logicalProcessors={Environment.ProcessorCount}");
         Console.WriteLine(hotBudgetBytes > 0
             ? $"gather residency arm: enabled budgetMb={hotBudgetMb:F1} reserveMb={(hotReserveMb >= 0.0 ? hotReserveMb.ToString("F1") : "from pool geometry")} swapPeriodLayerSteps={hotSwapPeriod}"
             : "gather residency arm: disabled (pass --hot-budget-mb to add the RAM-hot-tier gather arm)");
@@ -115,7 +130,7 @@ public static class MoeGatherBench
         try
         {
             return Measure(
-                reportId, stamp, startedUtc, outRoot, fixturePath, args, seqs, tokens, reps, layers, hidden, heads, kvHeads, headDim, inter, experts, routed, vocab, hotBudgetBytes, hotReserveMb, hotSwapPeriod);
+                reportId, stamp, startedUtc, outRoot, fixturePath, args, seqs, tokens, reps, layers, hidden, heads, kvHeads, headDim, inter, experts, routed, vocab, substrate, hotBudgetBytes, hotReserveMb, hotSwapPeriod);
         }
         finally
         {
@@ -142,6 +157,7 @@ public static class MoeGatherBench
         int experts,
         int routed,
         int vocab,
+        string substrate,
         long hotBudgetBytes,
         double hotReserveMbOverride,
         int hotSwapPeriod)
@@ -150,7 +166,7 @@ public static class MoeGatherBench
         using CpuBackend backend = new(allowAvx2: true);
 
         using GgufFile gatherGguf = GgufFile.Open(fixturePath);
-        using GgufMmapWeightSource gatherBacking = new(gatherGguf);
+        using IBenchColdBacking gatherBacking = OpenSubstrateBacking(substrate, fixturePath, gatherGguf);
         CountingSlabSource counting = new(gatherBacking);
         using TransformerModel gatherModel = TransformerModel.Open(gatherGguf, counting, backend, maxContextTokens: tokens + 4);
 
@@ -162,7 +178,8 @@ public static class MoeGatherBench
         }
 
         using GgufFile soloGguf = GgufFile.Open(fixturePath);
-        using TransformerModel soloModel = TransformerModel.Open(soloGguf, backend, maxContextTokens: tokens + 4);
+        using IBenchColdBacking soloBacking = OpenSubstrateBacking(substrate, fixturePath, soloGguf);
+        using TransformerModel soloModel = TransformerModel.Open(soloGguf, soloBacking, backend, maxContextTokens: tokens + 4);
 
         int capacityBlocks = ((tokens + 16) / 16 + 1) * seqs + 2; // every sequence holds its own blocks in the shared pool simultaneously
         using BlockPool gatherPool = NewPool(gatherModel, backend, capacityBlocks);
@@ -171,6 +188,10 @@ public static class MoeGatherBench
         // Warm both engines once outside the timed reps so thread pools and page residency settle before measurement.
         RunGatherStream(gatherModel, gatherPool, seqs, tokens, vocab);
         RunSoloStream(soloModel, soloPool, seqs, tokens, vocab);
+
+        long faultsBeforeGather = CurrentPageFaultCount();
+        long stackReadsBeforeGather = gatherBacking.StackResolutionsTotal;
+        long streamedBytesBeforeGather = gatherBacking.BytesStreamedTotal;
 
         double[] gatherSeconds = new double[reps];
         for (int rep = 0; rep < reps; rep++)
@@ -181,6 +202,14 @@ public static class MoeGatherBench
             gatherSeconds[rep] = sw.Elapsed.TotalSeconds;
         }
 
+        long faultsAfterGather = CurrentPageFaultCount();
+        long gatherStackReadsTimed = gatherBacking.StackResolutionsTotal - stackReadsBeforeGather;
+        long gatherStreamedBytesTimed = gatherBacking.BytesStreamedTotal - streamedBytesBeforeGather;
+
+        long faultsBeforeSolo = CurrentPageFaultCount();
+        long stackReadsBeforeSolo = soloBacking.StackResolutionsTotal;
+        long streamedBytesBeforeSolo = soloBacking.BytesStreamedTotal;
+
         double[] soloSeconds = new double[reps];
         for (int rep = 0; rep < reps; rep++)
         {
@@ -190,6 +219,10 @@ public static class MoeGatherBench
             soloSeconds[rep] = sw.Elapsed.TotalSeconds;
         }
 
+        long faultsAfterSolo = CurrentPageFaultCount();
+        long soloStackReadsTimed = soloBacking.StackResolutionsTotal - stackReadsBeforeSolo;
+        long soloStreamedBytesTimed = soloBacking.BytesStreamedTotal - streamedBytesBeforeSolo;
+
         double gatherMedian = Median(gatherSeconds);
         double soloMedian = Median(soloSeconds);
         long sequenceTokens = (long)seqs * tokens;
@@ -198,6 +231,13 @@ public static class MoeGatherBench
 
         Console.WriteLine($"gather arm: merged-decode median={gatherMedian:F4}s min={Min(gatherSeconds):F4} max={Max(gatherSeconds):F4} tok/s={gatherTps:F2}");
         Console.WriteLine($"dense-equivalent arm: solo-stepping median={soloMedian:F4}s min={Min(soloSeconds):F4} max={Max(soloSeconds):F4} tok/s={soloTps:F2}");
+
+        if (substrate != "mmap")
+        {
+            Console.WriteLine(
+                $"cold-read evidence substrate={substrate}: gather arm stackRoleReads={gatherStackReadsTimed} streamedMiB={gatherStreamedBytesTimed / (1024.0 * 1024.0):F1} pageFaults={faultsAfterGather - faultsBeforeGather} " +
+                $"| solo arm stackRoleReads={soloStackReadsTimed} streamedMiB={soloStreamedBytesTimed / (1024.0 * 1024.0):F1} pageFaults={faultsAfterSolo - faultsBeforeSolo}");
+        }
 
         // Parity pass: same token streams through both arms, every step's logits captured and compared bit-for-bit.
         float[] gatherLogits = new float[seqs * tokens * vocab];
@@ -260,6 +300,7 @@ public static class MoeGatherBench
         ArmResult? hotArm = null;
         ResidencyResult? residency = null;
         ParityResult? tierParity = null;
+        long hotFaultDelta = 0, hotStackReadsTimed = 0, hotStreamedBytesTimed = 0; // cold-read evidence for the hot arm's timed reps, when that arm ran
 
         if (hotBudgetBytes > 0)
         {
@@ -267,13 +308,17 @@ public static class MoeGatherBench
             long hotReserveBytes = hotReserveMbOverride >= 0.0 ? (long)Math.Round(hotReserveMbOverride * 1024.0 * 1024.0) : kvWorkingSetEstimateBytes;
 
             using GgufFile hotGguf = GgufFile.Open(fixturePath);
-            using GgufMmapWeightSource hotBacking = new(hotGguf);
+            using IBenchColdBacking hotBacking = OpenSubstrateBacking(substrate, fixturePath, hotGguf);
             using RamHotExpertTier tier = new(hotBacking, hotBudgetBytes, hotReserveBytes, hotSwapPeriod);
 
             using TransformerModel hotModel = TransformerModel.Open(hotGguf, tier, backend, maxContextTokens: tokens + 4);
             using BlockPool hotPool = NewPool(hotModel, backend, capacityBlocks);
 
             RunGatherStream(hotModel, hotPool, seqs, tokens, vocab); // warm pass: thread pools settle and the tier's aging rounds ramp its hot set before measurement reps run
+
+            long faultsBeforeHot = CurrentPageFaultCount();
+            long stackReadsBeforeHot = hotBacking.StackResolutionsTotal;
+            long streamedBytesBeforeHot = hotBacking.BytesStreamedTotal;
 
             double[] hotSeconds = new double[reps];
             for (int rep = 0; rep < reps; rep++)
@@ -283,6 +328,11 @@ public static class MoeGatherBench
                 sw.Stop();
                 hotSeconds[rep] = sw.Elapsed.TotalSeconds;
             }
+
+            long faultsAfterHot = CurrentPageFaultCount();
+            hotStackReadsTimed = hotBacking.StackResolutionsTotal - stackReadsBeforeHot;
+            hotStreamedBytesTimed = hotBacking.BytesStreamedTotal - streamedBytesBeforeHot;
+            hotFaultDelta = faultsAfterHot - faultsBeforeHot;
 
             double hotMedian = Median(hotSeconds);
             double hotTps = sequenceTokens / hotMedian;
@@ -307,6 +357,13 @@ public static class MoeGatherBench
                 $"residency: tier={tier.Kind} budgetBytes={tier.BudgetBytes} residentBytes={tier.ResidentBytes} hotUnits={tier.HotUnits}/{experts * layers} " +
                 $"swapPeriodLayerSteps={hotSwapPeriod} hits={hits} misses={misses} hitRate={hitRatePercent:F1}% savedEstimateMiB={tier.SavedBytesEstimateTotal / (1024.0 * 1024.0):F1} " +
                 $"promotions={tier.PromotionsTotal} demotions={tier.DemotionsTotal} tok/s-vs-prefetch-only={(hotDeltaPercent >= 0 ? "+" : string.Empty)}{hotDeltaPercent:F2}%");
+
+            if (substrate != "mmap")
+            {
+                Console.WriteLine(
+                    $"cold-read evidence substrate={substrate}: hot arm stackRoleReads={hotStackReadsTimed} streamedMiB={hotStreamedBytesTimed / (1024.0 * 1024.0):F1} pageFaults={hotFaultDelta} " +
+                    $"(resident hits avoided {tier.SavedBytesEstimateTotal / (1024.0 * 1024.0):F1} MiB of role reads in the untimed tally pass)");
+            }
 
             hotArm = new ArmResult
             {
@@ -387,10 +444,32 @@ public static class MoeGatherBench
             comparisonNotes.Add("The ram-hot-tier arm runs the same merged-decode gather with its weight source wrapped in the RAM residency tier: experts resident by capacity/cost answer slab reads from private byte-identical copies, everything else resolves through cold contiguous views. Its tallies come from one untimed replay pass after ResetAnswerTallies — hit rate and saved-byte estimate describe that clean stream; parity proves its logits bit-identical to the prefetch-only gather arm's.");
         }
 
+        if (substrate == "stream")
+        {
+            comparisonNotes.Add("Substrate stream: expert role tensors resolve through unbuffered FILE_FLAG_NO_BUFFERING whole-role reads into fresh buffers, while dense weights stay on the ordinary cached mapping so only expert traffic pays storage cost. Both arms pay this for their cold resolutions — the prefetch-only gather arm streams every union expert's roles, and a tier miss streams that expert chain's role tensors through the same slab-view route (the loader has no per-slab staging today); resident experts answer from private copies with zero streamed bytes.");
+        }
+
+        ColdReadResult? coldReads = substrate == "mmap" ? null : new ColdReadResult
+        {
+            SubstrateId = substrate,
+            GatherStackRoleReadsTimedReps = gatherStackReadsTimed,
+            GatherStreamedBytesTimedReps = gatherStreamedBytesTimed,
+            GatherPageFaultDeltaTimedReps = faultsAfterGather - faultsBeforeGather,
+            SoloStackRoleReadsTimedReps = soloStackReadsTimed,
+            SoloStreamedBytesTimedReps = soloStreamedBytesTimed,
+            SoloPageFaultDeltaTimedReps = faultsAfterSolo - faultsBeforeSolo,
+            HotArmRan = residency is not null,
+            HotStackRoleReadsTimedReps = hotStackReadsTimed,
+            HotStreamedBytesTimedReps = hotStreamedBytesTimed,
+            HotPageFaultDeltaTimedReps = hotFaultDelta,
+        };
+
         BenchReport bench = new()
         {
             SchemaVersion = 1,
             ReportId = reportId,
+            Substrate = substrate,
+            ColdReads = coldReads,
             Arms = arms,
             Parity = new ParityResult
             {
@@ -573,6 +652,7 @@ public static class MoeGatherBench
     private static byte[] BuildFixtureImage(int layers, int hidden, int heads, int headDim, int kvHeads, int inter, int experts, int routed, int vocab)
     {
         const float Eps = 1e-5f;
+        const int SectorPad = 4096; // fixture files pad to this boundary so streaming substrates can read every payload window with sector-aligned unbuffered reads
         Random rng = new(20261121);
 
         List<(string Key, object Value)> metadata =
@@ -741,6 +821,13 @@ public static class MoeGatherBench
         foreach (TensorImage tensor in tensors)
         {
             writer.Write(tensor.Bytes);
+        }
+
+        // Pad the file tail to a 4 KiB multiple: unbuffered sector-aligned reads then cover every byte of every payload window without straddling EOF. The loader reads declared tensors only, so trailing zero bytes are inert for every substrate.
+        long paddedLength = (stream.Position + SectorPad - 1) / SectorPad * SectorPad;
+        for (long padOffset = stream.Position; padOffset < paddedLength; padOffset++)
+        {
+            writer.Write((byte)0);
         }
 
         writer.Flush();
@@ -933,6 +1020,11 @@ public static class MoeGatherBench
     {
         [JsonPropertyName("schemaVersion")] public int SchemaVersion { get; init; }
         [JsonPropertyName("reportId")] public string ReportId { get; init; } = "";
+
+        [JsonPropertyName("substrate")] public string Substrate { get; init; } = "mmap";
+
+        /// <summary>Per-arm cold-read tallies for the timed reps, present only when a streaming substrate ran.</summary>
+        [JsonPropertyName("coldReads")] public ColdReadResult? ColdReads { get; init; }
         [JsonPropertyName("arms")] public List<ArmResult> Arms { get; init; } = [];
         [JsonPropertyName("parity")] public ParityResult Parity { get; init; } = new();
 
@@ -977,6 +1069,22 @@ public static class MoeGatherBench
         [JsonPropertyName("denseEquivalentBytesPerLayerStep")] public long DenseEquivalentBytesPerLayerStep { get; init; }
         [JsonPropertyName("distinctExpertsAcrossRun")] public int DistinctExpertsAcrossRun { get; init; }
         [JsonPropertyName("unionGateResolutionsPerDecodeStep")] public List<int> GateResolutionsPerDecodeStep { get; init; } = []; // gate-role slab resolutions per decode step summed over the fixture's layers: every sequence contributes its top-k selections, and each distinct expert of the step's union resolves exactly one slab per role
+    }
+
+    /// <summary>Per-arm cold-read tallies captured around each arm's timed reps on a streaming substrate: whole-role expert resolutions, bytes attributed to storage reads, and the process page-fault delta.</summary>
+    private sealed class ColdReadResult
+    {
+        [JsonPropertyName("substrateId")] public string SubstrateId { get; init; } = "";
+        [JsonPropertyName("gatherStackRoleReadsTimedReps")] public long GatherStackRoleReadsTimedReps { get; init; }
+        [JsonPropertyName("gatherStreamedBytesTimedReps")] public long GatherStreamedBytesTimedReps { get; init; }
+        [JsonPropertyName("gatherPageFaultDeltaTimedReps")] public long GatherPageFaultDeltaTimedReps { get; init; }
+        [JsonPropertyName("soloStackRoleReadsTimedReps")] public long SoloStackRoleReadsTimedReps { get; init; }
+        [JsonPropertyName("soloStreamedBytesTimedReps")] public long SoloStreamedBytesTimedReps { get; init; }
+        [JsonPropertyName("soloPageFaultDeltaTimedReps")] public long SoloPageFaultDeltaTimedReps { get; init; }
+        [JsonPropertyName("hotArmRan")] public bool HotArmRan { get; init; }
+        [JsonPropertyName("hotStackRoleReadsTimedReps")] public long HotStackRoleReadsTimedReps { get; init; }
+        [JsonPropertyName("hotStreamedBytesTimedReps")] public long HotStreamedBytesTimedReps { get; init; }
+        [JsonPropertyName("hotPageFaultDeltaTimedReps")] public long HotPageFaultDeltaTimedReps { get; init; }
     }
 
     private sealed class ResidencyResult
@@ -1136,6 +1244,15 @@ new Chart(document.getElementById('arms'), {
 """;
     }
 
+    private static IBenchColdBacking OpenSubstrateBacking(string substrate, string fixturePath, GgufFile gguf) => substrate switch
+    {
+        "stream" => new UnbufferedStackReadWeightSource(fixturePath, gguf),
+        _ => new MappedArenaWeightSource(gguf),
+    };
+
+    // Windows page-fault counter via psapi: every fault that must fetch a page from storage counts here, so per-arm deltas beside the streamed-byte tallies are the cold-read evidence this lane can publish without perf counters. Non-Windows hosts report 0 (the streaming substrates refuse them anyway).
+    private static long CurrentPageFaultCount() => OperatingSystem.IsWindows() ? WinColdReadInterop.PageFaultCountOfCurrentProcess() : 0L;
+
     private static string Esc(string value) => System.Net.WebUtility.HtmlEncode(value);
 }
 
@@ -1164,4 +1281,271 @@ internal sealed class CountingSlabSource : IWeightSource, IExpertSlabSource
     public void Dispose()
     {
     }
+}
+
+/// <summary>The cold-read accounting seam every gather arm on this lane reads through: whole-tensor resolution plus per-arm tallies of expert-role resolutions and the bytes attributed to storage for them.</summary>
+internal interface IBenchColdBacking : IWeightSource
+{
+    /// <summary>The substrate id these tallies describe ("mmap", "nocache", or "stream").</summary>
+    string SubstrateId { get; }
+
+    /// <summary>Cumulative resolutions of stacked expert-role tensors (whole role tensor per resolution).</summary>
+    long StackResolutionsTotal { get; }
+
+    /// <summary>Cumulative payload bytes attributed to storage reads by those resolutions.</summary>
+    long BytesStreamedTotal { get; }
+}
+
+/// <summary>The historical OS-cached mapping posture, wrapped so every arm reports the same tally interface (its counters stay zero: cached pages are not attributable per resolution).</summary>
+internal sealed class MappedArenaWeightSource : IBenchColdBacking
+{
+    private readonly GgufMmapWeightSource _backing;
+
+    public MappedArenaWeightSource(GgufFile gguf) => _backing = new GgufMmapWeightSource(gguf);
+
+    public string SubstrateId => "mmap";
+    public long StackResolutionsTotal => 0L;
+    public long BytesStreamedTotal => 0L;
+
+    public ReadOnlySpan<byte> Resolve(LogicalTensor tensor) => _backing.Resolve(tensor);
+
+    public void Dispose() => _backing.Dispose();
+}
+
+/// <summary>Bench-side streaming substrate: stacked expert-role tensors answer whole-tensor resolutions from unbuffered FILE_FLAG_NO_BUFFERING reads into fresh buffers, while dense weights answer from ordinary buffered (OS-cached) reads so only expert traffic pays storage cost. No cached mapping of the fixture is held while unbuffered reads run — a cached section over the same bytes is what makes no-buffering reads refuse service. The loader has no per-slab staging today, so a slab view over these sources materializes its role tensor — exactly what both gather arms pay for cold experts here.</summary>
+internal unsafe sealed class UnbufferedStackReadWeightSource : IBenchColdBacking
+{
+    private const int SectorWindow = 4096; // windows align to 4 KiB: valid on 512e and 4Kn volumes alike
+    private const int ReadChunkBytes = 1 << 17; // unbuffered reads prefer 128 KiB sector-aligned chunks, shrinking when a storage filter refuses the request size
+
+    private readonly FileStream _dense; // buffered, OS-cached reads for the non-expert tensors — the resident-dense posture a serving engine keeps
+    private readonly IntPtr _noBufferHandle;
+    private readonly long _fileSize;
+    private readonly long _dataStart;
+    private byte* _scratch; // aligned read window, grown as needed and freed on dispose
+    private int _scratchCapacity;
+    private long _stackResolutions;
+    private long _bytesStreamed;
+
+    public UnbufferedStackReadWeightSource(string path, GgufFile gguf)
+    {
+        ArgumentNullException.ThrowIfNull(gguf);
+        if (!OperatingSystem.IsWindows())
+        {
+            throw new PlatformNotSupportedException("FILE_FLAG_NO_BUFFERING streaming reads are a Windows measurement seam");
+        }
+
+        _dense = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1 << 16, FileOptions.SequentialScan);
+        _fileSize = gguf.FileSize;
+        _dataStart = gguf.DataStart;
+
+        _noBufferHandle = WinColdReadInterop.CreateFileW(path, WinColdReadInterop.GenericRead, WinColdReadInterop.FileShareAll, IntPtr.Zero, WinColdReadInterop.OpenExisting, 0x80 | WinColdReadInterop.NoBuffering, IntPtr.Zero);
+        if (_noBufferHandle == WinColdReadInterop.InvalidHandle)
+        {
+            _dense.Dispose();
+            throw new IOException($"stream substrate: CreateFileW('{path}', FILE_FLAG_NO_BUFFERING) failed (win32={Marshal.GetLastWin32Error()})");
+        }
+    }
+
+    public string SubstrateId => "stream";
+    public long StackResolutionsTotal => Volatile.Read(ref _stackResolutions);
+    public long BytesStreamedTotal => Volatile.Read(ref _bytesStreamed);
+
+    public ReadOnlySpan<byte> Resolve(LogicalTensor tensor)
+    {
+        ArgumentNullException.ThrowIfNull(tensor);
+
+        if (!ExpertRoleNames.IsStackedExpertTensor(tensor.Name))
+        {
+            byte[] dense = new byte[tensor.SizeBytes]; // dense weights stay cached through buffered reads: the measurement isolates expert traffic, like a serving posture that keeps them hot
+            _dense.Seek(_dataStart + tensor.Offset, SeekOrigin.Begin);
+            _dense.ReadExactly(dense);
+            return new ReadOnlySpan<byte>(dense);
+        }
+
+        byte[] payload = ReadUnbuffered(_dataStart + tensor.Offset, tensor.SizeBytes);
+        Interlocked.Add(ref _stackResolutions, 1);
+        Interlocked.Add(ref _bytesStreamed, tensor.SizeBytes);
+        return new ReadOnlySpan<byte>(payload); // one fresh buffer per resolution: spans stay readable for their consumer's lifetime, and the streamed cost is exactly what a staging-less disk provider pays
+    }
+
+    private byte[] ReadUnbuffered(long offset, long length)
+    {
+        if (offset < 0 || length < 0 || offset > _fileSize || length > _fileSize - offset)
+        {
+            throw new InvalidOperationException($"unbuffered read [{offset}..{offset + length}) does not fit the {_fileSize}-byte fixture");
+        }
+
+        byte[] payload = new byte[length];
+
+        long alignedStart = offset & ~(long)(SectorWindow - 1);
+        long windowEnd = Math.Min(_fileSize, (offset + length + SectorWindow - 1) & ~(long)(SectorWindow - 1));
+        int written = 0; // payload bytes copied out of successive sector-aligned chunks
+
+        for (long chunkOffset = alignedStart; chunkOffset < windowEnd;)
+        {
+            int chunkLength = (int)Math.Min(ReadChunkBytes, windowEnd - chunkOffset); // every chunk is a whole number of sectors: both ends stay 4 KiB-aligned inside the padded fixture
+            EnsureScratch(chunkLength);
+
+            // NO_BUFFERING transfers can return short reads in sector-sized pieces, and some storage filters refuse requests above their own transfer cap outright: fill the chunk with successive aligned sub-reads, halving the request size when a filter rejects one.
+            int filled = 0;
+            int attemptLength = Math.Min(chunkLength, ReadChunkBytes);
+            int shrinkAttemptsAtFloor = 0;
+
+            while (filled < chunkLength)
+            {
+                int requestLength = Math.Min(attemptLength, chunkLength - filled);
+                if (!WinColdReadInterop.SetFilePointerEx(_noBufferHandle, chunkOffset + filled, out _, 0))
+                {
+                    throw new IOException($"stream substrate: SetFilePointerEx to 0x{chunkOffset + filled:X16} failed (win32={Marshal.GetLastWin32Error()})");
+                }
+
+                if (!WinColdReadInterop.ReadFile(_noBufferHandle, (nint)(_scratch + filled), (uint)requestLength, out uint read, IntPtr.Zero) || read == 0)
+                {
+                    if (attemptLength > SectorWindow)
+                    {
+                        attemptLength = Math.Max(SectorWindow, attemptLength / 2);
+                        continue; // retry the same offset with a smaller aligned request before giving up on this chunk
+                    }
+
+                    if (++shrinkAttemptsAtFloor > 4)
+                    {
+                        throw new IOException($"stream substrate: unbuffered ReadFile of {requestLength} bytes at 0x{chunkOffset + filled:X16} returned {read} (win32={Marshal.GetLastWin32Error()})");
+                    }
+
+                    continue; // one more try at the sector floor before failing this chunk
+                }
+
+                if ((filled + read) % SectorWindow != 0 && chunkLength - filled > read) // partial transfers must keep the remaining region sector-aligned, or a later aligned sub-read would fault the no-buffering contract
+                {
+                    throw new IOException($"stream substrate: unbuffered ReadFile returned an unaligned partial transfer of {read} bytes at 0x{chunkOffset + filled:X16}");
+                }
+
+                filled += (int)read;
+                attemptLength = Math.Min(chunkLength - filled, ReadChunkBytes); // a successful read re-arms the preferred request size
+            }
+
+            long copyStart = Math.Max(chunkOffset, offset); // head/tail outside the chunk belong to neighbouring sectors: only this tensor's own bytes are kept — same content a slab view would slice from mmap bytes either way
+            long copyEnd = Math.Min(chunkOffset + chunkLength, offset + length);
+            if (copyEnd > copyStart)
+            {
+                fixed (byte* destination = payload)
+                {
+                    Buffer.MemoryCopy((byte*)_scratch + (copyStart - chunkOffset), destination + written, copyEnd - copyStart, copyEnd - copyStart);
+                }
+
+                written += (int)(copyEnd - copyStart);
+            }
+
+            chunkOffset += chunkLength;
+        }
+
+        if (written != length)
+        {
+            throw new IOException($"stream substrate: assembled {written} of {length} requested payload bytes");
+        }
+
+        return payload;
+    }
+
+    private void EnsureScratch(int bytesNeeded)
+    {
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(_scratchCapacity, 1 << 27); // a growable aligned window stays bounded well under any fixture this lane sizes
+
+        if (_scratchCapacity >= bytesNeeded)
+        {
+            return;
+        }
+
+        int capacity = Math.Max(SectorWindow, _scratchCapacity == 0 ? SectorWindow : _scratchCapacity * 2);
+        while (capacity < bytesNeeded && capacity < (1 << 30))
+        {
+            capacity *= 2;
+        }
+
+        if (_scratch != null)
+        {
+            NativeMemory.AlignedFree(_scratch);
+        }
+
+        _scratch = (byte*)NativeMemory.AlignedAlloc((nuint)capacity, SectorWindow);
+        _scratchCapacity = capacity;
+    }
+
+    public void Dispose()
+    {
+        if (_scratch != null)
+        {
+            NativeMemory.AlignedFree(_scratch);
+            _scratch = null;
+        }
+
+        if (_noBufferHandle != WinColdReadInterop.InvalidHandle && _noBufferHandle != IntPtr.Zero)
+        {
+            WinColdReadInterop.CloseHandle(_noBufferHandle);
+        }
+
+        _dense.Dispose();
+    }
+}
+
+internal static class ExpertRoleNames
+{
+    /// <summary>The fixture's stacked MoE expert roles — the tensors a gather reads per-expert slabs from, and the only ones this lane streams on the streaming substrates.</summary>
+    public static bool IsStackedExpertTensor(string tensorName) =>
+        tensorName.Contains("ffn_gate_exps", StringComparison.Ordinal) || tensorName.Contains("ffn_up_exps", StringComparison.Ordinal) || tensorName.Contains("ffn_down_exps", StringComparison.Ordinal);
+}
+
+internal static class WinColdReadInterop
+{
+    public const uint GenericRead = 0x8000_0000;
+    public const uint GenericWrite = 0x4000_0000;
+    public const uint FileShareAll = 0x1 | 0x2 | 0x4; // READ | WRITE | DELETE
+    public const uint OpenExisting = 3;
+    public const uint NoBuffering = 0x2000_0000; // FILE_FLAG_NO_BUFFERING: reads bypass the system file cache entirely
+    public static readonly IntPtr InvalidHandle = new(-1);
+
+    [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    [DllImport("kernel32", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("kernel32", SetLastError = true)]
+    public static extern bool SetFilePointerEx(IntPtr hFile, long distanceToMove, out long newOffset, int moveMethod);
+
+    [DllImport("kernel32", SetLastError = true)]
+    public static extern bool ReadFile(IntPtr hFile, nint lpBuffer, uint nNumberOfBytesToRead, out uint lpNumberOfBytesRead, IntPtr lpOverlapped);
+
+    /// <summary>PROCESS_MEMORY_COUNTERS.PageFaultCount for the current process — every fault that must fetch a page counts here (soft and hard alike; streamed-byte tallies separate storage reads).</summary>
+    public static long PageFaultCountOfCurrentProcess()
+    {
+        ProcessMemoryCounter counters = new();
+        counters.Cb = (uint)Marshal.SizeOf<ProcessMemoryCounter>();
+
+        if (!GetProcessMemoryInfo(new IntPtr(-1), ref counters, counters.Cb)) // -1: the current-process pseudo-handle psapi accepts
+        {
+            throw new InvalidOperationException($"psapi GetProcessMemoryInfo failed (win32={Marshal.GetLastWin32Error()})");
+        }
+
+        return counters.PageFaultCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ProcessMemoryCounter
+    {
+        public uint Cb;
+        public uint PageFaultCount;
+        public nuint PeakWorkingSetSize;
+        public nuint WorkingSetSize;
+        public nuint QuotaPeakPagedPoolUsage;
+        public nuint QuotaPagedPoolUsage;
+        public nuint QuotaPeakNonPagedPoolUsage;
+        public nuint QuotaNonPagedPoolUsage;
+        public nuint PagefileUsage;
+        public nuint PeakPagefileUsage;
+    }
+
+    [DllImport("psapi", SetLastError = true)]
+    private static extern bool GetProcessMemoryInfo(IntPtr processHandle, ref ProcessMemoryCounter counters, uint cb);
 }

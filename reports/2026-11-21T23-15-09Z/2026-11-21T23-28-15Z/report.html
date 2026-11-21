@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>moe-gather-2026-11-21T23-28-15Z</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem; color: #1c1c1c; }
+h1 { font-size: 1.35rem; } h2 { font-size: 1.1rem; margin-top: 1.6rem; }
+table { border-collapse: collapse; margin-top: .5rem; }
+th, td { border: 1px solid #bbb; padding: .4rem .7rem; text-align: left; font-size: .92rem; }
+th { background: #f0f0f0; } .ok { color: #0a7d32; font-weight: 600; } .bad { color: #b00020; font-weight: 600; }
+canvas { max-width: 720px; margin-top: 1rem; }
+.note { color: #555; font-size: .88rem; }
+</style>
+</head>
+<body>
+<h1>moe-gather-2026-11-21T23-28-15Z</h1>
+<p class="note">Local CPU gather/dense-equivalent comparison (synthetic qwen2moe fixture) · 2026-11-21T23:28:15Z · branch phase/mvp6.1</p>
+
+<h2>Arms — merged-decode gather vs dense-equivalent solo stepping</h2>
+<table>
+<tr><th>Arm</th><th>Harness</th><th>Tok/s (median)</th><th>Median s</th><th>Min s</th><th>Max s</th></tr>
+<tr><td>gather-merged-decode</td><td>LAIR engine DecodeBatch union gather (CpuGatherKernel over ExpertSlabWeightSource views)</td><td>6.46</td><td>29.6990</td><td>12.8156</td><td>30.5677</td></tr>
+<tr><td>dense-equivalent-solo</td><td>LAIR engine DecodeNext per-sequence stepping (same token streams, fresh KV)</td><td>1.68</td><td>114.5079</td><td>70.1256</td><td>143.8144</td></tr>
+<tr><td>gather-ram-hot-tier</td><td>LAIR engine DecodeBatch union gather over RamHotExpertTier (capacity/cost hot expert copies + cold slab views)</td><td>344.90</td><td>0.5567</td><td>0.4672</td><td>0.8099</td></tr>
+</table>
+<p class="note">gather vs dense-equivalent delta = 285.57% (positive means the gather arm is faster)</p>
+
+<h2>Parity — gathered logits vs dense-equivalent, bit-for-bit</h2>
+<table>
+<tr><th>Pairing</th><th>Compared floats</th><th>Mismatched</th><th>Exact</th></tr>
+<tr><td>gather vs dense-equivalent</td><td>49152</td><td>0</td><td class="ok">bit-exact</td></tr>
+<tr><td>gather vs ram-hot-tier</td><td>49152</td><td>0</td><td class="ok">bit-exact</td></tr>
+</table>
+
+<h2>Union active-expert amortization (instrumentation pass)</h2>
+<table>
+<tr><th>Selection slots / layer step</th><th>Avg distinct experts gathered</th><th>Amortized</th><th>Gathered MiB / layer step</th><th>Dense-equivalent MiB / layer step</th></tr>
+<tr><td>64</td><td>12.00</td><td>81.2%</td><td>18.0</td><td>96.0</td></tr>
+</table>
+
+
+<h2>RAM hot tier — capacity/cost residency behind the gather</h2>
+<table>
+<tr><th>Tier</th><td>ram_hot_experts</td></tr>
+<tr><th>Budget bytes (quota − reserve)</th><td>40632320</td></tr>
+<tr><th>Resident bytes / hot units</th><td>37748736 · 24</td></tr>
+<tr><th>Swap period (layer steps per aging round)</th><td>16</td></tr>
+<tr><th>Hits · misses · hit rate</th><td>1728 · 0 · <span class="ok">100.0%</span></td></tr>
+<tr><th>Saved cold-read estimate</th><td>864.0 MiB</td></tr>
+<tr><th>Promotions · demotions</th><td>0 · 0</td></tr>
+<tr><th>Tok/s delta vs prefetch-only gather</th><td>+5235.00%</td></tr>
+</table>
+<h2>Decode throughput comparison</h2>
+<canvas id="arms" width="720" height="360"></canvas>
+<script>
+new Chart(document.getElementById('arms'), {
+  type: 'bar',
+  data: {
+    labels: ['gather-merged-decode', 'dense-equivalent-solo', 'gather-ram-hot-tier'],
+    datasets: [{ label: 'decode tok/s (median)', data: [6.46, 1.68, 344.90] }]
+  },
+  options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, title: { display: true, text: 'tokens/s' } } } }
+});
+</script>
+
+<h2>Host</h2>
+<table>
+<tr><th>Hostname</th><td>FRODO</td></tr>
+<tr><th>OS</th><td>Microsoft Windows 10.0.26200</td></tr>
+<tr><th>Logical processors / physical cores / backend workers</th><td>32 / 24 / 24</td></tr>
+<tr><th>CPU flags matched</th><td>avx, avx2, fma, ssse3</td></tr>
+</table>
+
+<h2>Notes</h2>
+<ul>
+<li>The fixture is synthetic deterministic F32 qwen2moe material: it measures the gather mechanism (union walks, slab views, prefetch staging), not a quantized production model.</li>
+<li>Both arms run identical sequences and token streams over identical file bytes; parity compares every step&#39;s logits bit-for-bit between the merged-decode arm and solo stepping.</li>
+<li>Union stats come from an instrumentation pass that counts slab resolutions through the gather kernel: unionGateResolutionsPerDecodeStep lists gate-role resolutions per decode step summed over the fixture&#39;s layers, while averages and byte tallies are reported per layer step — each distinct expert of a step&#39;s union resolves exactly one slab per role.</li>
+<li>The ram-hot-tier arm runs the same merged-decode gather with its weight source wrapped in the RAM residency tier: experts resident by capacity/cost answer slab reads from private byte-identical copies, everything else resolves through cold contiguous views. Its tallies come from one untimed replay pass after ResetAnswerTallies — hit rate and saved-byte estimate describe that clean stream; parity proves its logits bit-identical to the prefetch-only gather arm&#39;s.</li>
+<li>Substrate stream: expert role tensors resolve through unbuffered FILE_FLAG_NO_BUFFERING whole-role reads into fresh buffers, while dense weights stay on the ordinary cached mapping so only expert traffic pays storage cost. Both arms pay this for their cold resolutions — the prefetch-only gather arm streams every union expert&#39;s roles, and a tier miss streams that expert chain&#39;s role tensors through the same slab-view route (the loader has no per-slab staging today); resident experts answer from private copies with zero streamed bytes.</li>
+</ul>
+</body>
+</html>

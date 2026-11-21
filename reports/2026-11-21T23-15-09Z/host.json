@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "laneNote": "All four arms ran on this Windows CPU lane (host FRODO) with the bench fixture under %TEMP% on local NVMe scratch. Streaming-substrate numbers carry storage-read behavior but not Xeon NUMA/LLC fidelity; see manifest.json blockers for why the Xeon lane could not host a faithful streaming substrate.",
+  "host": {
+    "hostname": "FRODO",
+    "os": "Microsoft Windows 10.0.26200",
+    "framework": ".NET 10.0.14",
+    "logicalProcessors": 32,
+    "physicalCores": 24,
+    "backendWorkers": 24,
+    "memoryTotalBytes": 68423139328,
+    "cpuFlagsMatched": ["avx", "avx2", "fma", "ssse3"],
+    "cpuFlagsAbsent": ["vnni", "bf16"],
+    "lane": "CPU-only"
+  },
+  "probeHostXeon": {
+    "profile": "lair-lab (root@192.168.33.53)",
+    "uname": "Linux lair 6.8.12-43-pve #1 SMP PREEMPT_DYNAMIC PMX 6.8.12-43 x86_64",
+    "memoryGbTotal": 251,
+    "memoryGbAvailable": 179,
+    "tmpFilesystem": "tmpfs (128 GiB volume; /tmp/lair-models pinned models ~71 GiB live in RAM)",
+    "rootFilesystem": "zfs zvol subvol-33053-disk-0 (disk-backed, outside the sanctioned /tmp-only scratch rule for this measurement)",
+    "dotnetOnPath": false,
+    "dotnetRuntimePresentAt": "/usr/local/dotnet (Microsoft.NETCore.App 10.0.15)",
+    "perfInstalled": false,
+    "perfEventParanoid": 4
+  }
+}

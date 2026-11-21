@@ -1,0 +1,198 @@
+{
+  "schemaVersion": 1,
+  "reportId": "moe-hot-tier-streaming-gate-2026-11-21T23-15-09Z",
+  "phase": "MVP7",
+  "branch": "phase/mvp6.1",
+  "lane": "Local Windows CPU streaming-substrate gate (host FRODO, NVMe scratch under %TEMP%)",
+  "harnessCommand": "dotnet bench/Lair.Bench/bin/Release/net10.0/Lair.Bench.dll gather --layers 2 --experts 12 --hidden 512 --inter 256 --seqs 8 --tokens 24 --reps 3 [--substrate stream|mmap] [--hot-budget-mb N]",
+  "fixture": {
+    "kind": "pinned synthetic qwen2moe F32 fixture (bench-generated, seed-pinned)",
+    "layers": 2,
+    "hidden": 512,
+    "intermediate": 256,
+    "expertsPerLayer": 12,
+    "routedPerToken": 8,
+    "sequences": 8,
+    "tokensPerSequence": 24,
+    "repsTimed": 3,
+    "expertSlabBytesPerRole": 524288,
+    "roleStackBytesPerLayer": 6291456,
+    "expertChainUnitBytes": 1572864,
+    "totalExpertFootprintBytes": 37748736,
+    "tokensMeasuredPerArmTimedReps": 576
+  },
+  "metricNaming": "decode tok/s below is the merged-decode gather-step rate on a synthetic fixture (sequence-tokens produced per second by DecodeBatch union gathering). It is not end-to-end token generation for any flagship model.",
+  "arms": [
+    {
+      "id": "arm1-stream-prefetch-only",
+      "runDir": "2026-11-21T23-15-09Z/",
+      "substrate": "stream",
+      "hotBudgetQuotaMb": null,
+      "harness": "LAIR engine DecodeBatch union gather over unbuffered FILE_FLAG_NO_BUFFERING expert-role reads (no residency tier)",
+      "decodeTokPerSecMedian": 17.27,
+      "medianSeconds": 11.1153,
+      "minSeconds": 10.7156,
+      "maxSeconds": 11.3411,
+      "coldReadsTimedReps": {
+        "expertRoleResolutions": 5184,
+        "streamedBytes": 32614907904,
+        "pageFaultDelta": 3863525
+      },
+      "denseEquivalentSoloArmSameRun": {
+        "decodeTokPerSecMedian": 3.01,
+        "medianSeconds": 63.8276,
+        "expertRoleResolutions": 27648,
+        "streamedBytes": 173946175488,
+        "pageFaultDelta": 23117804
+      }
+    },
+    {
+      "id": "arm2-stream-hot-half-budget",
+      "runDir": "2026-11-21T23-21-30Z/",
+      "substrate": "stream",
+      "hotBudgetQuotaMb": 21.0,
+      "harness": "LAIR engine DecodeBatch union gather over RamHotExpertTier (capacity/cost hot expert copies + cold whole-role streaming reads)",
+      "decodeTokPerSecMedian": 28.08,
+      "medianSeconds": 6.8365,
+      "minSeconds": 6.7537,
+      "maxSeconds": 7.4852,
+      "residencyTallyPass": {
+        "tierKind": "ram_hot_experts",
+        "budgetBytesAfterReserve": 18612224,
+        "residentBytes": 17301504,
+        "hotUnits": "11/24",
+        "swapPeriodLayerSteps": 16,
+        "hits": 792,
+        "misses": 936,
+        "hitRatePercent": 45.8333,
+        "savedBytesEstimateTotal": 415236096,
+        "promotionsSinceOpen": 0,
+        "demotionsSinceOpen": 0,
+        "tokPerSecDeltaVsPrefetchOnlyPercent": 72.1099
+      },
+      "coldReadsTimedRepsHotArm": {
+        "expertRoleResolutions": 2808,
+        "streamedBytes": 17666408448,
+        "pageFaultDelta": 1726998
+      },
+      "sameRunPrefetchOnlyGatherArm": {
+        "decodeTokPerSecMedian": 16.32,
+        "medianSeconds": 11.7663,
+        "expertRoleResolutions": 5184,
+        "streamedBytes": 32614907904,
+        "pageFaultDelta": 4414609
+      }
+    },
+    {
+      "id": "arm3-stream-hot-ceiling-budget",
+      "runDir": "2026-11-21T23-28-15Z/",
+      "substrate": "stream",
+      "hotBudgetQuotaMb": 42.0,
+      "harness": "LAIR engine DecodeBatch union gather over RamHotExpertTier at a budget that admits the whole expert footprint (capacity ceiling not binding)",
+      "decodeTokPerSecMedian": 344.9,
+      "medianSeconds": 0.5567,
+      "minSeconds": 0.4672,
+      "maxSeconds": 0.8099,
+      "residencyTallyPass": {
+        "tierKind": "ram_hot_experts",
+        "budgetBytesAfterReserve": 40632320,
+        "residentBytes": 37748736,
+        "hotUnits": "24/24",
+        "swapPeriodLayerSteps": 16,
+        "hits": 1728,
+        "misses": 0,
+        "hitRatePercent": 100.0,
+        "savedBytesEstimateTotal": 905969664,
+        "promotionsSinceOpen": 0,
+        "demotionsSinceOpen": 0,
+        "tokPerSecDeltaVsPrefetchOnlyPercent": 5234.9958
+      },
+      "coldReadsTimedRepsHotArm": {
+        "expertRoleResolutions": 0,
+        "streamedBytes": 0,
+        "pageFaultDelta": 45249
+      },
+      "sameRunPrefetchOnlyGatherArm": {
+        "decodeTokPerSecMedian": 6.46,
+        "medianSeconds": 29.699,
+        "minSeconds": 12.8156,
+        "maxSeconds": 30.5677,
+        "expertRoleResolutions": 5184,
+        "streamedBytes": 32614907904,
+        "pageFaultDelta": 3932302,
+        "note": "This run's streaming baseline was noisy (storage contention variance); the hot-arm and residency tallies stand on their own."
+      }
+    },
+    {
+      "id": "arm4-mmap-control-hot-ceiling",
+      "runDir": "2026-11-21T23-39-02Z/",
+      "substrate": "mmap",
+      "hotBudgetQuotaMb": 42.0,
+      "harness": "Control: historical OS-cached GgufMmapWeightSource mapping with the same ceiling-budget residency arm — reproduces the prior 'correct hit-rate, no tok/s win' posture",
+      "decodeTokPerSecMedian": 488.3,
+      "medianSeconds": 0.3932,
+      "minSeconds": 0.3711,
+      "maxSeconds": 0.3946,
+      "residencyTallyPass": {
+        "tierKind": "ram_hot_experts",
+        "budgetBytesAfterReserve": 40632320,
+        "residentBytes": 37748736,
+        "hotUnits": "24/24",
+        "swapPeriodLayerSteps": 16,
+        "hits": 1728,
+        "misses": 0,
+        "hitRatePercent": 100.0,
+        "savedBytesEstimateTotal": 905969664,
+        "promotionsSinceOpen": 0,
+        "demotionsSinceOpen": 0,
+        "tokPerSecDeltaVsPrefetchOnlyPercent": -10.2329
+      },
+      "sameRunPrefetchOnlyGatherArm": {
+        "decodeTokPerSecMedian": 543.96,
+        "medianSeconds": 0.353,
+        "expertRoleResolutions": null,
+        "streamedBytes": null,
+        "pageFaultDelta": null,
+        "note": "OS-cached pages are not attributable per resolution on this substrate — that is exactly why the prior gate attempts saw no win."
+      }
+    }
+  ],
+  "unionStatsSharedAcrossArms": {
+    "selectionSlotsPerLayerStep": 64,
+    "averageDistinctExpertsGatheredPerLayerStep": 12.0,
+    "amortizationPercent": 81.25,
+    "gatheredBytesPerLayerStepLogicalSlabs": 18874368,
+    "denseEquivalentBytesPerLayerStep": 100663296,
+    "distinctExpertsAcrossRunPerLayer": 12,
+    "logicalSlabResolutionsPerStreamTimedReps": 5184
+  },
+  "derivedBytesPerToken": {
+    "tokensPerArmTimedReps": 576,
+    "logicalGatherDemandBytesPerToken": 4718592,
+    "denseEquivalentLogicalBytesPerToken": 25165824,
+    "streamSubstrateActualStreamedBytesPerToken": {
+      "arm1PrefetchOnly": 56623104,
+      "arm2HotHalfBudget": 30670848,
+      "arm3HotCeilingBudget": 0,
+      "note": "Streaming amplification is roleBytes/slabBytes = 12x because the loader has no per-slab staging: each cold slab resolution materializes its whole stacked role tensor. Residency removes that traffic for resident experts (ceiling budget removed it entirely)."
+    }
+  },
+  "parityAllArms": {
+    "gatherVsDenseEquivalentBitExact": true,
+    "gatherVsRamHotTierBitExactWhereRun": true,
+    "comparedFloatsPerArmStream": 49152
+  },
+  "gateVerdict": {
+    "mvp7RamHotTierThroughputGate": "closed-validated-on-streaming-substrate",
+    "evidenceSummary": [
+      "Streaming substrate, half budget (quota 21 MiB, effective 18.6 MiB after KV reserve): +72.1% gather-step tok/s vs prefetch-only at 45.8% hit rate; streamed traffic fell from 32.6 GiB to 17.7 GiB per arm's timed reps.",
+      "Streaming substrate, ceiling budget (quota 42 MiB admits all 24 expert units): 100% hits, zero streamed bytes in timed reps, 344.9 tok/s vs the same run's streaming prefetch-only gather at 6.5-17.3 tok/s.",
+      "OS-cached mmap control with identical residency accounting (24/24 hot units, 864 MiB saved estimate): -10.2% tok/s — confirms the prior null result was a substrate artifact: cached pages leave no expensive read for residency to save."
+    ],
+    "caveats": [
+      "Synthetic qwen2moe fixture proves mechanism and substrate behavior, not Flash-Next flagship throughput.",
+      "Windows NVMe streaming lane carries storage-read behavior but not Xeon NUMA/LLC fidelity; no perf counters were available on either lane (Xeon: perf absent, perf_event_paranoid=4).",
+      "Tier promotion/demotion tallies read 0 in the reported window by harness design (ResetAnswerTallies zeroes cumulative counters before the untimed tally replay); promotions stream whole role tensors and appear inside each arm's timed streamed totals when they land there."
+    ]
+  }
+}

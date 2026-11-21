@@ -1,0 +1,12 @@
+gather fixture: qwen2moe synthetic layers=2 hidden=512 heads=4 headDim=128 kvHeads=4 inter=256 experts=12 routed=8 vocab=256 sharedExpert=yes weights=F32
+gather posture: seqs=8 tokensPerSequence=24 reps=3 outRoot=reports/2026-11-21T23-15-09Z substrate=mmap engineThreads=auto avx2=True physicalCores=24 logicalProcessors=32
+gather residency arm: enabled budgetMb=42.0 reserveMb=from pool geometry swapPeriodLayerSteps=16
+gather fixture file=C:\Users\Chuck\AppData\Local\Temp\lair-moe-gather-c12197cba657404294294acda15e04a0.gguf bytes=49872896 (47.6 MiB)
+gather arm: merged-decode median=0.3530s min=0.3318 max=0.3538 tok/s=543.96
+dense-equivalent arm: solo-stepping median=1.2573s min=1.1970 max=1.4413 tok/s=152.71
+parity: gathered-vs-dense-equivalent logits floats=49152 exact=yes mismatches=0
+union: avgDistinctExpertsGatheredPerLayerStep=12.00 of selectionSlots=64 amortized=81.2% gatheredBytes/layerStep=18.0 MiB denseEquivalentBytes/layerStep=96.0 MiB distinctExpertsAcrossRun=12/12
+ram-hot-tier gather arm: merged-decode median=0.3932s min=0.3711 max=0.3946 tok/s=488.30
+parity: gathered-vs-ram-hot-tier logits floats=49152 exact=yes mismatches=0
+residency: tier=ram_hot_experts budgetBytes=40632320 residentBytes=37748736 hotUnits=24/24 swapPeriodLayerSteps=16 hits=1728 misses=0 hitRate=100.0% savedEstimateMiB=864.0 promotions=0 demotions=0 tok/s-vs-prefetch-only=-10.23%
+gather report dir=C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp6-1\reports\2026-11-21T23-15-09Z\2026-11-21T23-39-02Z

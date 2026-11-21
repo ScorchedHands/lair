@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>moe-hot-tier-streaming-gate-2026-11-21T23-15-09Z</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem; color: #1c1c1c; max-width: 980px; }
+h1 { font-size: 1.35rem; } h2 { font-size: 1.1rem; margin-top: 1.6rem; }
+table { border-collapse: collapse; margin-top: .5rem; width: 100%; }
+th, td { border: 1px solid #bbb; padding: .4rem .7rem; text-align: left; font-size: .92rem; vertical-align: top; }
+th { background: #f0f0f0; } .ok { color: #0a7d32; font-weight: 600; } .bad { color: #b00020; font-weight: 600; }
+canvas { max-width: 860px; margin-top: 1rem; }
+.note { color: #555; font-size: .9rem; }
+code { background: #f4f4f4; padding: 0 .3rem; }
+</style>
+</head>
+<body>
+<h1>MVP7 RAM hot-tier throughput gate — streaming substrate vs OS-cached control</h1>
+<p class="note">moe-hot-tier-streaming-gate-2026-11-21T23-15-09Z · Local Windows CPU lane (FRODO, NVMe scratch) · branch phase/mvp6.1 · generated 2026-11-21T23:15:09Z</p>
+
+<p class="note"><strong>Metric naming:</strong> “gather-step tok/s” is the merged-decode DecodeBatch union-gather rate on a pinned synthetic qwen2moe F32 fixture (8 sequences × 24 tokens × 3 timed reps = 576 sequence-tokens per arm). It is <em>not</em> end-to-end token generation for Flash-Next or any flagship model.</p>
+
+<h2>Fixture and substrates</h2>
+<table>
+<tr><th>Fixture</th><td>qwen2moe synthetic F32: layers=2, hidden=512, inter=256, experts/layer=12, routed/token=8; expert slab 0.5 MiB per role, stacked role tensor 6 MiB, expert chain unit 1.5 MiB, total expert footprint 37,748,736 B (36 MiB)</td></tr>
+<tr><th>substrate = stream</th><td>Cold expert traffic answers through unbuffered <code>FILE_FLAG_NO_BUFFERING</code> whole-role reads into fresh buffers; dense weights stay on ordinary buffered OS-cached reads. No cached mapping is held while unbuffered reads run (a competing cached section makes no-buffering reads refuse service). The loader has no per-slab staging, so every cold slab resolution streams its whole 6 MiB role tensor — a 12× amplification of logical slab demand.</td></tr>
+<tr><th>substrate = mmap</th><td>The historical posture: <code>GgufMmapWeightSource</code> OS-cached mapping retained across reps. Kept as the control that explains the prior null result.</td></tr>
+</table>
+
+<h2>Arms — gather-step tok/s (median of 3 timed reps)</h2>
+<table>
+<tr><th>Arm</th><th>Substrate</th><th>Hot budget quota</th><th>Gather-step tok/s</th><th>Median s</th><th>Prefetch-only same-run gather</th></tr>
+<tr><td>arm1 stream prefetch-only (no tier)</td><td>stream</td><td>—</td><td>17.27</td><td>11.1153</td><td>(this arm is the baseline)</td></tr>
+<tr><td>arm2 stream + hot-tier half budget</td><td>stream</td><td>21 MiB (18.6 MiB effective after KV reserve)</td><td class="ok">28.08 (+72.1%)</td><td>6.8365</td><td>16.32 tok/s (median 11.7663 s)</td></tr>
+<tr><td>arm3 stream + hot-tier ceiling budget</td><td>stream</td><td>42 MiB (40.6 MiB effective — admits all 24 expert units)</td><td class="ok">344.90 (+5235%)</td><td>0.5567</td><td>6.46 tok/s median (min 12.8 s / max 30.6 s — noisy streaming baseline on this run)</td></tr>
+<tr><td>arm4 mmap control + hot-tier ceiling budget</td><td>mmap</td><td>42 MiB (same accounting as arm3)</td><td class="bad">488.30 (-10.2%)</td><td>0.3932</td><td>543.96 tok/s (median 0.353 s)</td></tr>
+<tr><td>Dense-equivalent solo stepping (context, per run)</td><td>stream arms: 1.68–3.21 · mmap arm: 152.71</td><td colspan="4">solo-stepping tok/s on the same token streams; streaming solo arms read 173.9 GiB of role tensors per timed-reps set</td></tr>
+</table>
+
+<h2>Residency accounting (untimed tally replay after ResetAnswerTallies)</h2>
+<table>
+<tr><th>Arm / budget</th><th>Budget bytes</th><th>Resident · hot units</th><th>Hits · misses · hit rate</th><th>Saved cold-read estimate</th><th>Tok/s Δ vs prefetch-only</th></tr>
+<tr><td>arm2 half (quota 21 MiB)</td><td>18,612,224</td><td>17,301,504 · 11/24</td><td class="ok">792 · 936 · 45.8%</td><td>415,236,096 B (396 MiB)</td><td class="ok">+72.11%</td></tr>
+<tr><td>arm3 ceiling (quota 42 MiB), stream</td><td>40,632,320</td><td>37,748,736 · 24/24</td><td class="ok">1728 · 0 · 100.0%</td><td>905,969,664 B (864 MiB)</td><td class="ok">+5235.00%</td></tr>
+<tr><td>arm4 ceiling (quota 42 MiB), mmap control</td><td>40,632,320</td><td>37,748,736 · 24/24</td><td class="ok">1728 · 0 · 100.0%</td><td>905,969,664 B (864 MiB)</td><td class="bad">-10.23%</td></tr>
+</table>
+<p class="note">Promotions/demotions report 0 in the tally window by harness design: <code>ResetAnswerTallies()</code> zeroes cumulative counters before the replay pass; promotions themselves stream whole role tensors and land inside each arm’s timed streamed totals when they occur during measured reps.</p>
+
+<h2>Cold-read evidence per arm (timed reps)</h2>
+<table>
+<tr><th>Arm</th><th>Expert-role resolutions</th><th>Streamed bytes</th><th>Page-fault delta (psapi PageFaultCount, soft+hard)</th></tr>
+<tr><td>arm1 stream prefetch-only gather</td><td>5,184</td><td>32,614,907,904 B (30.4 GiB)</td><td>3,863,525</td></tr>
+<tr><td>arm1 dense-equivalent solo</td><td>27,648</td><td>173,946,175,488 B (162 GiB)</td><td>23,117,804</td></tr>
+<tr><td>arm2 stream prefetch-only gather</td><td>5,184</td><td>32,614,907,904 B (30.4 GiB)</td><td>4,414,609</td></tr>
+<tr><td class="ok">arm2 stream hot-tier half budget</td><td>2,808</td><td>17,666,408,448 B (16.5 GiB)</td><td>1,726,998</td></tr>
+<tr><td class="ok">arm3 stream hot-tier ceiling budget</td><td>0</td><td>0 B — resident experts answered every timed-rep slab from private copies</td><td>45,249 (dense/working-set faults only)</td></tr>
+<tr><td>arm4 mmap control</td><td colspan="3">OS-cached pages are not attributable per resolution on this substrate — the very reason prior gate attempts showed hit rates with no throughput win.</td></tr>
+</table>
+
+<h2>Bytes/token (derived, 576 sequence-tokens per arm)</h2>
+<table>
+<tr><th>Measure</th><th>arm1 stream prefetch-only</th><th>arm2 stream hot half</th><th>arm3 stream hot ceiling</th></tr>
+<tr><td>Logical gather demand (union slabs)</td><td colspan="3">4,718,592 B/token (dense-equivalent: 25,165,824 B/token; union amortization 81.2% — all 12 experts of each layer enter every step’s union with 8 sequences × routed 8)</td></tr>
+<tr><td>Actual streamed bytes on the streaming substrate</td><td class="bad">56,623,104 B/token (12× amplification: whole 6 MiB role tensor per cold slab resolution — no per-slab staging exists in today’s loader)</td><td>30,670,848 B/token</td><td class="ok">0 B/token streamed during timed reps</td></tr>
+<tr><td>Distinct experts touched across the run (per layer)</td><td colspan="3">12/12 gathered per step union; 5,184 slab resolutions = logical demand per arm’s timed-reps set</td></tr>
+</table>
+
+<h2>Gather-step tok/s comparison</h2>
+<canvas id="arms" width="860" height="380"></canvas>
+<script>
+new Chart(document.getElementById('arms'), {
+  type: 'bar',
+  data: {
+    labels: ['stream prefetch-only (arm1)', 'stream hot half-budget (arm2 gather baseline)', 'stream hot half-budget tier (arm2)', 'stream ceiling-budget gather (arm3 baseline)', 'stream ceiling-budget tier (arm3)', 'mmap control gather (arm4)', 'mmap control hot-tier (arm4)'],
+    datasets: [{ label: 'gather-step tok/s (median, synthetic fixture)', data: [17.27, 16.32, 28.08, 6.46, 344.90, 543.96, 488.30] }]
+  },
+  options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, title: { display: true, text: 'tokens/s (synthetic gather-step rate)' } } } }
+});
+</script>
+
+<h2>Parity</h2>
+<p class="note">All four runs: gathered-vs-dense-equivalent logits bit-exact (49,152 floats compared per arm), and gather-vs-ram-hot-tier bit-exact in arms 2–4. Residency changed where slab bytes come from, never the arithmetic over them.</p>
+
+<h2>Gate verdict</h2>
+<ul class="note">
+<li><strong>Closed — validated on a streaming substrate:</strong> with real expensive reads available to save against, <code>RamHotExpertTier</code> as built delivers +72.1% gather-step rate at half budget (45.8% hits) and converts the entire timed-rep expert stream into zero storage reads at ceiling budget (344.9 tok/s vs 6.5–17.3 for streaming prefetch-only).</li>
+<li><strong>The earlier null result is explained, not contradicted:</strong> the mmap control reproduces it exactly — identical residency accounting with −10.2% tok/s because OS-cached pages leave no expensive read for residency to save.</li>
+</ul>
+
+<h2>Lane caveats and blockers (see manifest.json / host.json for full diagnostics)</h2>
+<ul class="note">
+<li>Synthetic qwen2moe fixture: proves substrate behavior of the residency seam, not flagship-model throughput. Pinned Flash-Next tensors were <em>not</em> measured because on the Xeon lane they live in tmpfs (RAM), where eviction cannot create an expensive-read baseline.</li>
+<li>Xeon CPU-only lane blocked for this measurement: <code>/tmp</code> is tmpfs (128 GiB; pinned models ~71 GiB RAM-resident); disk-backed ZFS root sits outside the sanctioned /tmp-only scratch rule. <code>dotnet</code> not on PATH (runtime 10.0.15 present at /usr/local/dotnet, SDK path unestablished). No <code>perf</code> binary and <code>perf_event_paranoid=4</code>, so LLC-load-miss/stall counters were unavailable without privileged host changes.</li>
+<li>Windows SEC_NOCACHE mapping variant rejected by the OS (<code>CreateFileMapping(PAGE_READWRITE|SEC_NOCACHE)</code> → win32 193, ERROR_BAD_EXE_FORMAT from the SEC_IMAGE alias) and was dropped; FILE_FLAG_NO_BUFFERING works only when no cached mapping competes for the same bytes.</li>
+<li>No Xeon NUMA/LLC fidelity in these numbers: this is a local NVMe streaming substrate with honest page-fault tallies, not flagship-model flagship hardware evidence. Flagship/Xeon confirmation of the gate remains open until either a disk-backed scratch decision or an SDK+perf setup on that host is authorized.</li>
+</ul>
+
+<h2>Host (measurement lane)</h2>
+<table>
+<tr><th>Hostname / OS / framework</th><td>FRODO · Microsoft Windows 10.0.26200 · .NET 10.0.14</td></tr>
+<tr><th>Logical processors / physical cores / backend workers</th><td>32 / 24 / 24</td></tr>
+<tr><th>CPU flags matched</th><td>avx, avx2, fma, ssse3 (absent: vnni, bf16)</td></tr>
+</table>
+
+<h2>Raw data locations</h2>
+<p class="note">Per-arm raw reports (manifest.json / host.json / bench.json / cli.json / report.html) live in the four timestamped subdirectories <code>2026-11-21T23-15-09Z/ 2026-11-21T23-21-30Z/ 2026-11-21T23-28-15Z/ 2026-11-21T23-39-02Z/</code>, with console transcripts as <code>arm1..arm4 *.stdout.log</code>. This directory’s own manifest.json, host.json and bench.json carry the merged gate view.</p>
+</body>
+</html>

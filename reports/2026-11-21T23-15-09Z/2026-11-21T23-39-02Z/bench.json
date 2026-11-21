@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "reportId": "moe-gather-2026-11-21T23-39-02Z",
+  "substrate": "mmap",
+  "coldReads": null,
+  "arms": [
+    {
+      "id": "gather-merged-decode",
+      "harness": "LAIR engine DecodeBatch union gather (CpuGatherKernel over ExpertSlabWeightSource views)",
+      "metrics": [
+        {
+          "test": "decode tok/s",
+          "tokensPerSecond": 543.9587
+        }
+      ],
+      "medianSeconds": 0.353,
+      "minSeconds": 0.3318,
+      "maxSeconds": 0.3538
+    },
+    {
+      "id": "dense-equivalent-solo",
+      "harness": "LAIR engine DecodeNext per-sequence stepping (same token streams, fresh KV)",
+      "metrics": [
+        {
+          "test": "decode tok/s",
+          "tokensPerSecond": 152.7108
+        }
+      ],
+      "medianSeconds": 1.2573,
+      "minSeconds": 1.197,
+      "maxSeconds": 1.4413
+    },
+    {
+      "id": "gather-ram-hot-tier",
+      "harness": "LAIR engine DecodeBatch union gather over RamHotExpertTier (capacity/cost hot expert copies \u002B cold slab views)",
+      "metrics": [
+        {
+          "test": "decode tok/s",
+          "tokensPerSecond": 488.2962
+        }
+      ],
+      "medianSeconds": 0.3932,
+      "minSeconds": 0.3711,
+      "maxSeconds": 0.3946
+    }
+  ],
+  "parity": {
+    "bitExact": true,
+    "comparedFloats": 49152,
+    "mismatchedFloats": 0,
+    "maxAbsDiff": 0
+  },
+  "tierVsGatherParity": {
+    "bitExact": true,
+    "comparedFloats": 49152,
+    "mismatchedFloats": 0,
+    "maxAbsDiff": 0
+  },
+  "residency": {
+    "tierKind": "ram_hot_experts",
+    "budgetBytes": 40632320,
+    "residentBytes": 37748736,
+    "hotUnits": 24,
+    "swapPeriodLayerSteps": 16,
+    "hitsTotal": 1728,
+    "missesTotal": 0,
+    "hitRatePercent": 100,
+    "savedBytesEstimateTotal": 905969664,
+    "promotionsTotal": 0,
+    "demotionsTotal": 0,
+    "tokensPerSecondDeltaVsPrefetchOnlyPercent": -10.2329
+  },
+  "unionStats": {
+    "selectionSlotsPerLayerStep": 64,
+    "averageDistinctExpertsGatheredPerLayerStep": 12,
+    "amortizationPercent": 81.25,
+    "gatheredBytesPerLayerStep": 18874368,
+    "denseEquivalentBytesPerLayerStep": 100663296,
+    "distinctExpertsAcrossRun": 12,
+    "unionGateResolutionsPerDecodeStep": [
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24
+    ]
+  }
+}

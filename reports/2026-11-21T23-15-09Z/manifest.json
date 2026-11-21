@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "reportId": "moe-hot-tier-streaming-gate-2026-11-21T23-15-09Z",
+  "generatedAtUtc": "2026-11-21T23:15:09Z",
+  "phase": "MVP7",
+  "branch": "phase/mvp6.1",
+  "lane": "Local Windows CPU streaming-substrate gate (host FRODO, NVMe scratch under %TEMP%). The Xeon CPU lane was probed and could not host a faithful streaming substrate — exact diagnostics in blockers.",
+  "goal": "Close the MVP7 RAM hot-tier throughput gate honestly: measure prefetch-only gather versus RamHotExpertTier residency under an expensive-read (streaming) substrate, at half-budget and ceiling-bound capacity, with cold-read evidence per arm; reproduce the OS-cached mmap posture as a control so the earlier null result is explained rather than re-litigated.",
+  "fixture": {
+    "kind": "pinned synthetic qwen2moe F32 fixture (bench-generated, seed-pinned)",
+    "layers": 2,
+    "hidden": 512,
+    "intermediate": 256,
+    "expertsPerLayer": 12,
+    "routedPerToken": 8,
+    "sequences": 8,
+    "tokensPerSequence": 24,
+    "reps": 3,
+    "expertSlabBytesPerRole": 524288,
+    "roleStackBytesPerLayer": 6291456,
+    "expertChainUnitBytes": 1572864,
+    "totalExpertFootprintBytes": 37748736,
+    "note": "Synthetic gather-step rate: this measures the union-gather + residency mechanism over a streaming substrate. It is not end-to-end token generation for a Flash-Next/flagship model."
+  },
+  "substrates": {
+    "stream": "Stacked expert-role tensors resolve through unbuffered FILE_FLAG_NO_BUFFERING whole-tensor reads into fresh buffers (dense weights stay on ordinary buffered OS-cached reads). No cached mapping of the fixture is held while unbuffered reads run. Both gather and tier-miss paths pay these role reads because the loader has no per-slab staging today: a slab view materializes its whole role tensor, amplifying storage traffic by roleBytes/slabBytes = 12x relative to logical slab demand.",
+    "mmap": "Historical posture: GgufMmapWeightSource OS-cached mapping retained across reps — the substrate behind the prior 'correct hit-rate, no tok/s win' arms; kept here as a control."
+  },
+  "files": [
+    "manifest.json",
+    "host.json",
+    "bench.json",
+    "report.html",
+    "arm1-stream-prefetch-only.stdout.log",
+    "arm2-stream-hot-half.stdout.log",
+    "arm3-stream-hot-ceiling.stdout.log",
+    "arm4-mmap-control-hot-ceiling.stdout.log",
+    "2026-11-21T23-15-09Z/ (raw arm 1: manifest/host/bench/cli/report)",
+    "2026-11-21T23-21-30Z/ (raw arm 2: manifest/host/bench/cli/report)",
+    "2026-11-21T23-28-15Z/ (raw arm 3: manifest/host/bench/cli/report)",
+    "2026-11-21T23-39-02Z/ (raw arm 4 control: manifest/host/bench/cli/report)"
+  ],
+  "comparisonNotes": [
+    "Every arm ran identical sequences and token streams over an identically generated fixture; gather-vs-solo and gather-vs-tier parity passed bit-for-bit in all four runs.",
+    "The tok/s numbers are merged-decode gather-step rates on a synthetic F32 qwen2moe fixture: they prove substrate behavior for the residency seam, not flagship-model throughput.",
+    "Streaming-substrate arms (1-3) show the hot tier saving real storage reads: half budget (+72.1% tok/s vs prefetch-only at 45.8% hit rate, 29.25 streamed MiB/token vs 54.0), ceiling budget (100% hit rate, zero streamed bytes in timed reps, +5235% vs its own prefetch-only gather arm).",
+    "The mmap control (arm 4) reproduces the prior null result exactly: identical residency accounting (24/24 units, 100% hits, 864 MiB saved-estimate) with -10.23% tok/s — on OS-cached pages there is no expensive read to save, and private hot copies cost a little.",
+    "Tier promotion/demotion tallies show 0/0 in the reported window by design: ResetAnswerTallies zeroes cumulative counters before the untimed tally replay pass; promotions themselves stream whole role tensors (counted inside each arm's timed streamed totals when they land there).",
+    "Arm 3's prefetch-only gather baseline was noisy on this run (median 29.7s vs ~11-12s in arms 1/2, min 12.8 max 30.6) from storage contention variance; the hot-arm and residency numbers stand on their own tallies."
+  ],
+  "gateVerdict": {
+    "mvp7RamHotTierThroughputGate": "closed-validated-on-streaming-substrate",
+    "summary": "On an expensive-read substrate, RamHotExpertTier as built delivers a large gather-rate win over prefetch-only (half budget +72.1%, full coverage 345 tok/s with zero streamed reads vs 6.5-17.3 for streaming prefetch-only), while the OS-cached control reproduces the earlier no-win result (-10.2%). The residency mechanism is validated; flagship-model/Xeon confirmation remains open (see blockers).",
+    "openItems": [
+      "Xeon CPU-only confirmation open: /tmp on 192.168.33.53 is tmpfs, so no disk-backed streaming substrate exists under the sanctioned temp-artifact rule.",
+      "Flash-Next pinned tensors (/tmp/lair-models) are tmpfs-resident for the same reason; measuring them there would re-measure RAM speed, not expensive reads."
+    ]
+  },
+  "blockers": [
+    {
+      "lane": "Xeon CPU-only (SSH profile lair-lab, root@192.168.33.53)",
+      "diagnostics": [
+        "uname: Linux lair 6.8.12-43-pve x86_64; free -g: total 251 GB, available 179 GB.",
+        "df -T: /tmp is tmpfs (128 GiB volume, ~71 GiB used by pinned models at /tmp/lair-models); the ZFS root (/) is disk-backed but outside the sanctioned /tmp-only scratch rule for this measurement.",
+        "Cold-read forcing on tmpfs cannot create an expensive baseline: evicted pages re-fault from RAM-resident tmpfs storage, not a block device.",
+        "dotnet is not on PATH (command not found); a runtime exists at /usr/local/dotnet (Microsoft.NETCore.App 10.0.15) but the SDK/restore path for this solution was not established there; publishing linux-x64 from this worktree would still hit the tmpfs substrate problem.",
+        "perf is not installed and /proc/sys/kernel/perf_event_paranoid = 4: LLC-load-miss/stall-cycle counters unavailable unprivileged, and installing perf or changing kernel settings exceeds safe temp artifacts under /tmp."
+      ]
+    },
+    {
+      "lane": "Local Windows",
+      "diagnostics": [
+        "SEC_NOCACHE mapping variant rejected by the OS: CreateFileMapping(PAGE_READWRITE | SEC_NOCACHE) failed with win32=193 (ERROR_BAD_EXE_FORMAT — SEC_NOCACHE shares SEC_IMAGE's numeric value and a file-backed section is not an image), so that substrate was dropped from the bench.",
+        "FILE_FLAG_NO_BUFFERING works only without a competing cached mapping over the same bytes: reads returned 0-byte successes while a whole-file MemoryMappedFile view existed; dense weights therefore serve through buffered FileStream reads on this lane.",
+        "Substrate honesty: local NVMe streaming proves storage-read behavior (page-fault tallies in the millions, streamed MiB tallies per arm); it does not carry Xeon NUMA/LLC fidelity."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+gather fixture: qwen2moe synthetic layers=2 hidden=512 heads=4 headDim=128 kvHeads=4 inter=256 experts=12 routed=8 vocab=256 sharedExpert=yes weights=F32
+gather posture: seqs=8 tokensPerSequence=24 reps=3 outRoot=reports/2026-11-21T23-15-09Z substrate=stream engineThreads=auto avx2=True physicalCores=24 logicalProcessors=32
+gather residency arm: disabled (pass --hot-budget-mb to add the RAM-hot-tier gather arm)
+gather fixture file=C:\Users\Chuck\AppData\Local\Temp\lair-moe-gather-0496a9916c2c4d12b191fa57bb91f3dd.gguf bytes=49872896 (47.6 MiB)
+gather arm: merged-decode median=11.1153s min=10.7156 max=11.3411 tok/s=17.27
+dense-equivalent arm: solo-stepping median=63.8276s min=59.6071 max=65.8281 tok/s=3.01
+cold-read evidence substrate=stream: gather arm stackRoleReads=5184 streamedMiB=31104.0 pageFaults=3863525 | solo arm stackRoleReads=27648 streamedMiB=165888.0 pageFaults=23117804
+parity: gathered-vs-dense-equivalent logits floats=49152 exact=yes mismatches=0
+union: avgDistinctExpertsGatheredPerLayerStep=12.00 of selectionSlots=64 amortized=81.2% gatheredBytes/layerStep=18.0 MiB denseEquivalentBytes/layerStep=96.0 MiB distinctExpertsAcrossRun=12/12
+gather report dir=C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp6-1\reports\2026-11-21T23-15-09Z\2026-11-21T23-15-09Z
