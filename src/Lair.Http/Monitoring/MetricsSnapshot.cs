@@ -244,7 +244,28 @@ public sealed record MetricsSnapshot(
     [property: JsonPropertyName("metrics_encoder_tokens_forwarded_total")] long EncoderTokensForwardedTotal = 0,
 
     /// <summary>Windowed encoder throughput: positions forwarded in this snapshot's window per second. Zero on a decode-side engine because nothing there forwards through an encoder pass.</summary>
-    [property: JsonPropertyName("metrics_encoder_tok_s")] double EncoderTokensPerSecWindowed = 0)
+    [property: JsonPropertyName("metrics_encoder_tok_s")] double EncoderTokensPerSecWindowed = 0,
+
+    // Additive expert-residency facts (earlier shapes untouched): the posture name rides the attached model facts like every other configuration-backed field; the tallies read live from an opened engine's residency tier at each publish. A serve with no residency-backed model reports all seven null — nothing rather than zeros an operator could mistake for an idle hot set, exactly how accelerator slots stay quiet on a host holding no accelerator backend.
+    [property: JsonPropertyName("metrics_residency_tier")] string? ResidencyTier = null,
+
+    /// <summary>Expert units (per layer) the attached tier holds resident right now; null when this engine answers against plain cold slab views.</summary>
+    [property: JsonPropertyName("metrics_residency_hot_units")] int? ResidencyHotUnits = null,
+
+    /// <summary>The residency admission ceiling — RAM quota less the working-set reserve stated at open; null with no attached tier.</summary>
+    [property: JsonPropertyName("metrics_residency_budget_bytes")] long? ResidencyBudgetBytes = null,
+
+    /// <summary>Bytes currently held in hot residency across every admitted expert chain; null with no attached tier.</summary>
+    [property: JsonPropertyName("metrics_residency_resident_bytes")] long? ResidencyResidentBytes = null,
+
+    /// <summary>Cumulative slab resolutions the tier answered from residency since open; null with no attached tier.</summary>
+    [property: JsonPropertyName("metrics_residency_hits_total")] long? ResidencyHitsTotal = null,
+
+    /// <summary>Cumulative slab resolutions that fell through to the cold backing store since open; null with no attached tier.</summary>
+    [property: JsonPropertyName("metrics_residency_misses_total")] long? ResidencyMissesTotal = null,
+
+    /// <summary>Estimated bytes resident answers kept out of the cold gather path — slab bytes summed per hot resolution; null with no attached tier.</summary>
+    [property: JsonPropertyName("metrics_residency_saved_bytes_estimate_total")] long? ResidencySavedBytesEstimateTotal = null)
 {
     /// <summary>The snapshot as one compact JSON document — the SSE payload and the structured log line's body.</summary>
     public string ToJson() => JsonSerializer.Serialize(this);

@@ -167,6 +167,9 @@ public sealed class TransformerModel : IDisposable
     private IGatherKernel? _gatherKernel;
     private IExpertSlabSource? _expertSlabs;
 
+    // The residency tier behind the slab path when an opened weight source answers as one: it folds each step's union active-expert set into its capacity/cost model before that step gathers, so hot experts resolve from resident copies and everything else stays a cold view. Null on every default posture — a plain slab source is not a tier, and nothing here pays for the check per token beyond one null test per sparse layer step.
+    private IResidencyTier? _residencyTier;
+
     // Routing scratch, sized at Open for descriptor-bearing models only. The token path consumes one
     // routing at a time; the batch path stores every sequence's selection flat, sequence by sequence, and folds it
     // into the step's union active-expert set — each selected expert exactly once with its member rows grouped in
@@ -1432,6 +1435,9 @@ public sealed class TransformerModel : IDisposable
             _expertSlabs = _weights as IExpertSlabSource ?? new ExpertSlabWeightSource(_weights);
             _gatherKernel = new CpuGatherKernel();
 
+            // A slab source that is itself a residency tier answers this model's expert reads from its hot set: the forward folds every layer step's union into the tier before gathering, so capacity/cost-selected experts resolve resident and everything else falls through cold. Any other source keeps today's prefetch-only posture untouched — no tier runs without one being opened here.
+            _residencyTier = _expertSlabs as IResidencyTier;
+
             // A declared shared expert is one dense-shaped matrix triplet the routing adds to every token's output,
             // plus — for a family whose reference gates it — one selector vector per layer. An undeclared shared
             // block loads and reads nothing here at all.
@@ -2379,6 +2385,13 @@ public sealed class TransformerModel : IDisposable
 
     /// <summary>The working set stated in the megabyte unit prefill-buffer claims and ceilings count in, rounded up so a claim never under-reports what it holds against a ceiling.</summary>
     public long PrefillWorkingSetMegabytes => (PrefillWorkingSetBytes + PrefillBufferClamp.Megabytes - 1) / PrefillBufferClamp.Megabytes;
+
+    /// <summary>
+    /// The residency tier attached to this engine's expert slab path when the opened weight source answers as one: hot-set size, hits/misses,
+    /// and saved-bytes tallies read from here for monitor facts. Null is today's prefetch-only posture — a model whose slabs resolve only through
+    /// cold views reports nothing residency-side. Public diagnostics; hosts attach what open resolved rather than re-deriving it.
+    /// </summary>
+    public IResidencyTier? AttachedResidencyTier => _residencyTier;
 
     /// <summary>
     /// The mutable activation bytes one prompt-window sub-batch row costs on this engine's route: the per-row streams every batched forward
@@ -4082,6 +4095,9 @@ public sealed class TransformerModel : IDisposable
         ExpertSlabRole up = new(_moeExpertUp[layer], _moeExpertUpShape, _moeExpertUpBytes[layer]);
         ExpertSlabRole down = new(_moeExpertDown[layer], _moeExpertDownShape, _moeExpertDownBytes[layer]);
 
+        // The token path feeds the tier one selection per routed slot — its own union of one sequence, every count 1.
+        _residencyTier?.NoteActiveExperts(gate, up, down, _moeIds.AsSpan(0, sparse.RoutedExpertsPerToken), ReadOnlySpan<int>.Empty);
+
         GatherRoutedChain(gate, up, down, _moeIds.AsSpan(0, sparse.RoutedExpertsPerToken), (int expertIndex, ReadOnlySpan<byte> gateSlab, ReadOnlySpan<byte> upSlab, ReadOnlySpan<byte> downSlab) =>
         {
             engine.Gemv(_normed.AsSpan(0, Plan.HiddenSize), new WeightRef(gateSlab, _moeExpertGateShape, gate.Stack.Format), _gateUp);
@@ -4164,6 +4180,9 @@ public sealed class TransformerModel : IDisposable
         ExpertSlabRole gate = new(_moeExpertGate[layer], _moeExpertGateShape, _moeExpertGateBytes[layer]);
         ExpertSlabRole up = new(_moeExpertUp[layer], _moeExpertUpShape, _moeExpertUpBytes[layer]);
         ExpertSlabRole down = new(_moeExpertDown[layer], _moeExpertDownShape, _moeExpertDownBytes[layer]);
+
+        // The tier sees this step's union before the gather walks it — selections with their member counts (DN-M7-3: the union set is the unit of residency work), and any swap round lands here, ahead of the reads its decisions steer. Gather arithmetic stays untouched either way.
+        _residencyTier?.NoteActiveExperts(gate, up, down, act.MoeUnion.AsSpan(0, unionCount), act.MoeUnionCounts.AsSpan(0, unionCount));
 
         int selectionSlots = n * routed; // only this step's selections are live in the per-sequence arrays
         GatherRoutedChain(gate, up, down, act.MoeUnion.AsSpan(0, unionCount), (int expertIndex, ReadOnlySpan<byte> gateSlab, ReadOnlySpan<byte> upSlab, ReadOnlySpan<byte> downSlab) =>

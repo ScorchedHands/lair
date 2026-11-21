@@ -107,4 +107,7 @@ public sealed record ModelFacts(
     int? MaxQueuedRequests = null,
 
     /// <summary>The bounded wait configured for submissions waiting on that queue, in milliseconds: what a declared ceiling states or the documented default where the model queues without naming one; zero while nothing queues. Additive: reads as nothing until the owning service attaches queue facts.</summary>
-    int QueueTimeoutMs = 0);
+    int QueueTimeoutMs = 0,
+
+    /// <summary>The expert residency tier posture this engine opened with (<c>ram_hot_experts</c>) — what its slab path actually answers against — or null while gathers run through plain cold slab views, which is every default posture today. Additive: a snapshot of a model with no attached tier reads exactly as it did before this fact existed.</summary>
+    string? ResidencyTier = null);

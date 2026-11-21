@@ -329,6 +329,9 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
         // right now. Their configured posture rides the model facts below, so snapshots report both halves of the queue without either side polling.
         bus.AttachQueueDepthProvider(() => Volatile.Read(ref _queuedSubmissions));
 
+        // The monitor's expert-residency tallies ride whatever residency tier this engine's opened model attached — hot-set size and answers since open, read from the tier itself at each publish. A model gathering through plain cold slab views (every default posture today) attaches a provider that reports null, so its snapshots carry nothing in those slots rather than an idle-tier reading.
+        bus.AttachResidencyProvider(BuildResidencyAccounting);
+
         _metrics = bus;
         return bus;
     }
@@ -385,10 +388,28 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
         CpuIsa: _backend.ResolvedSelection.ResolvedIsa,
         CpuGather: _backend.ResolvedSelection.GatherMode,
 
+        // The expert residency posture this engine actually answers against — null on every default cold-slab gather today.
+        ResidencyTier: _model.AttachedResidencyTier?.Kind,
+
         // The request-queue posture in force for submissions admitted now — this engine's own resolved values (a live edit retargets them alongside
         // every other new-request-only fact), so snapshots name the cap and bounded wait a submission actually gets instead of re-deriving either.
         MaxQueuedRequests: MaxQueuedRequests,
         QueueTimeoutMs: Volatile.Read(ref _queueTimeoutMs));
+
+    // Sums what each compute backend this open owns answers about its own device work: cumulative kernel busy time and
+    // runtime copy tallies since that instance opened, plus the weight residency it holds in persistent device memory now.
+    // Both instances are fixed at construction, so a sampling tick reads two fields and one small record — no re-derivation.
+    // What this engine's expert slab path answers against: the opened model's attached residency tier reports its own hot-set size, byte accounting, and answer tallies; a default cold-slab posture has nothing to report at all.
+    private ResidencyTierAccounting? BuildResidencyAccounting() =>
+        _model.AttachedResidencyTier is IResidencyTier tier
+            ? new ResidencyTierAccounting(
+                tier.HotUnits,
+                tier.BudgetBytes,
+                tier.ResidentBytes,
+                tier.HitsTotal,
+                tier.MissesTotal,
+                tier.SavedBytesEstimateTotal)
+            : null;
 
     // Sums what each compute backend this open owns answers about its own device work: cumulative kernel busy time and
     // runtime copy tallies since that instance opened, plus the weight residency it holds in persistent device memory now.

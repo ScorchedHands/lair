@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "reportId": "moe-gather-2026-11-21T15-55-44Z",
+  "commandLine": "C:\\source\\gitlab.scorchedhands.com\\personal\\LAIR\\.agent-worktrees\\mvp6-1\\bench\\Lair.Bench\\bin\\Release\\net10.0\\Lair.Bench.dll gather --hot-budget-mb 48 gather --hot-budget-mb 48",
+  "workingDirectory": "C:\\source\\gitlab.scorchedhands.com\\personal\\LAIR\\.agent-worktrees\\mvp6-1"
+}

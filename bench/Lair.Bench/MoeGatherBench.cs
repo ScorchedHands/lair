@@ -36,6 +36,9 @@ public static class MoeGatherBench
         int inter = 512;
         int vocab = 256;
         string outRoot = "reports";
+        double hotBudgetMb = 0.0; // zero disables the residency arm entirely: default runs stay exactly the prefetch-only gather-vs-solo comparison they were before this seam existed
+        double hotReserveMb = -1.0; // negative means reserve the KV working-set estimate from pool geometry, honoring budget = quota − reserve as the tier contract states
+        int hotSwapPeriod = 16; // layer-step notes per aging/rebalance round: small enough for a short synthetic stream to ramp its hot set during warmup
 
         for (int i = 1; i < args.Length; i++)
         {
@@ -57,6 +60,9 @@ public static class MoeGatherBench
                 case "--inter": inter = ParseInt(args[++i], inter); break;
                 case "--vocab": vocab = ParseInt(args[++i], vocab); break;
                 case "--out": outRoot = args[++i]; break;
+                case "--hot-budget-mb": hotBudgetMb = ParseDouble(args[++i], 0.0); break;
+                case "--hot-reserve-mb": hotReserveMb = ParseDouble(args[++i], -1.0); break;
+                case "--hot-swap-period": hotSwapPeriod = Math.Max(1, ParseInt(args[++i], 16)); break;
                 default:
                     Console.WriteLine($"gather: unknown option '{args[i]}'");
                     return 1;
@@ -75,6 +81,13 @@ public static class MoeGatherBench
             return 1;
         }
 
+        long hotBudgetBytes = (long)Math.Round(hotBudgetMb * 1024.0 * 1024.0); // zero when the arm is disabled
+        if (hotBudgetMb < 0.0)
+        {
+            Console.WriteLine("gather: --hot-budget-mb must be at least 0 (0 disables the residency arm)");
+            return 1;
+        }
+
         int heads = 4;
         int headDim = hidden / heads;
         int kvHeads = heads;
@@ -90,6 +103,9 @@ public static class MoeGatherBench
 
         Console.WriteLine($"gather fixture: qwen2moe synthetic layers={layers} hidden={hidden} heads={heads} headDim={headDim} kvHeads={kvHeads} inter={inter} experts={experts} routed={routed} vocab={vocab} sharedExpert=yes weights=F32");
         Console.WriteLine($"gather posture: seqs={seqs} tokensPerSequence={tokens} reps={reps} outRoot={outRoot} engineThreads=auto avx2={Avx2.IsSupported} physicalCores={CpuBackend.DetectedPhysicalCoreCount} logicalProcessors={Environment.ProcessorCount}");
+        Console.WriteLine(hotBudgetBytes > 0
+            ? $"gather residency arm: enabled budgetMb={hotBudgetMb:F1} reserveMb={(hotReserveMb >= 0.0 ? hotReserveMb.ToString("F1") : "from pool geometry")} swapPeriodLayerSteps={hotSwapPeriod}"
+            : "gather residency arm: disabled (pass --hot-budget-mb to add the RAM-hot-tier gather arm)");
 
         string fixturePath = Path.Combine(Path.GetTempPath(), $"lair-moe-gather-{Guid.NewGuid():N}.gguf");
         byte[] image = BuildFixtureImage(layers, hidden, heads, headDim, kvHeads, inter, experts, routed, vocab);
@@ -99,7 +115,7 @@ public static class MoeGatherBench
         try
         {
             return Measure(
-                reportId, stamp, startedUtc, outRoot, fixturePath, args, seqs, tokens, reps, layers, hidden, heads, kvHeads, headDim, inter, experts, routed, vocab);
+                reportId, stamp, startedUtc, outRoot, fixturePath, args, seqs, tokens, reps, layers, hidden, heads, kvHeads, headDim, inter, experts, routed, vocab, hotBudgetBytes, hotReserveMb, hotSwapPeriod);
         }
         finally
         {
@@ -125,7 +141,10 @@ public static class MoeGatherBench
         int inter,
         int experts,
         int routed,
-        int vocab)
+        int vocab,
+        long hotBudgetBytes,
+        double hotReserveMbOverride,
+        int hotSwapPeriod)
     {
         long expertBytes = (long)inter * hidden * 4; // F32 rows: one expert slab inside each stacked role
         using CpuBackend backend = new(allowAvx2: true);
@@ -186,16 +205,7 @@ public static class MoeGatherBench
         float[] soloLogits = new float[seqs * tokens * vocab];
         RunSoloStream(soloModel, soloPool, seqs, tokens, vocab, soloLogits);
 
-        int mismatchedFloats = 0;
-        double maxAbsDiff = 0.0;
-        for (int i = 0; i < gatherLogits.Length; i++)
-        {
-            if (BitConverter.SingleToInt32Bits(gatherLogits[i]) != BitConverter.SingleToInt32Bits(soloLogits[i]))
-            {
-                mismatchedFloats++;
-                maxAbsDiff = Math.Max(maxAbsDiff, Math.Abs((double)gatherLogits[i] - soloLogits[i]));
-            }
-        }
+        (int mismatchedFloats, double maxAbsDiff) = CompareLogitsBitForBit(gatherLogits, soloLogits); // every step's logits compared bit-for-bit between the merged-decode arm and solo stepping
 
         bool bitExact = mismatchedFloats == 0;
         Console.WriteLine($"parity: gathered-vs-dense-equivalent logits floats={gatherLogits.Length} exact={(bitExact ? "yes" : "no")} mismatches={mismatchedFloats}{(bitExact ? string.Empty : $" maxAbsDiff={maxAbsDiff:G9}")}");
@@ -243,15 +253,102 @@ public static class MoeGatherBench
             $"amortized={(amortizationPercent >= 0 ? amortizationPercent : 0):F1}% gatheredBytes/layerStep={averageUnion * expertBytes * 3 / (1024.0 * 1024.0):F1} MiB " +
             $"denseEquivalentBytes/layerStep={(selectionSlotsPerStep * expertBytes * 3) / (1024.0 * 1024.0):F1} MiB distinctExpertsAcrossRun={distinctExpertsGlobal.Count}/{experts}");
 
+        // Optional third arm: the same merged-decode gather answering through a RAM residency tier — hot experts held as
+        // private copies chosen by capacity/cost, cold ones falling back to contiguous slab views. Identical streams and
+        // file bytes; parity compares its logits bit-for-bit against the prefetch-only gather arm, and one untimed tally
+        // pass after ResetAnswerTallies measures hit rate and saved-byte estimates for a clean replay of the stream.
+        ArmResult? hotArm = null;
+        ResidencyResult? residency = null;
+        ParityResult? tierParity = null;
+
+        if (hotBudgetBytes > 0)
+        {
+            long kvWorkingSetEstimateBytes = capacityBlocks * 16L * kvHeads * headDim * 2 * 4 * layers; // what the pool's blocks hold for every sequence's K/V at full occupancy — the reserve the tier contract subtracts from quota unless --hot-reserve-mb states one
+            long hotReserveBytes = hotReserveMbOverride >= 0.0 ? (long)Math.Round(hotReserveMbOverride * 1024.0 * 1024.0) : kvWorkingSetEstimateBytes;
+
+            using GgufFile hotGguf = GgufFile.Open(fixturePath);
+            using GgufMmapWeightSource hotBacking = new(hotGguf);
+            using RamHotExpertTier tier = new(hotBacking, hotBudgetBytes, hotReserveBytes, hotSwapPeriod);
+
+            using TransformerModel hotModel = TransformerModel.Open(hotGguf, tier, backend, maxContextTokens: tokens + 4);
+            using BlockPool hotPool = NewPool(hotModel, backend, capacityBlocks);
+
+            RunGatherStream(hotModel, hotPool, seqs, tokens, vocab); // warm pass: thread pools settle and the tier's aging rounds ramp its hot set before measurement reps run
+
+            double[] hotSeconds = new double[reps];
+            for (int rep = 0; rep < reps; rep++)
+            {
+                Stopwatch sw = Stopwatch.StartNew();
+                RunGatherStream(hotModel, hotPool, seqs, tokens, vocab);
+                sw.Stop();
+                hotSeconds[rep] = sw.Elapsed.TotalSeconds;
+            }
+
+            double hotMedian = Median(hotSeconds);
+            double hotTps = sequenceTokens / hotMedian;
+            Console.WriteLine($"ram-hot-tier gather arm: merged-decode median={hotMedian:F4}s min={Min(hotSeconds):F4} max={Max(hotSeconds):F4} tok/s={hotTps:F2}");
+
+            float[] tierLogits = new float[seqs * tokens * vocab];
+            RunGatherStream(hotModel, hotPool, seqs, tokens, vocab, tierLogits);
+            (int tierMismatches, double tierMaxDiff) = CompareLogitsBitForBit(gatherLogits, tierLogits);
+
+            bool tierExact = tierMismatches == 0;
+            Console.WriteLine($"parity: gathered-vs-ram-hot-tier logits floats={tierLogits.Length} exact={(tierExact ? "yes" : "no")} mismatches={tierMismatches}{(tierExact ? string.Empty : $" maxAbsDiff={tierMaxDiff:G9}")}");
+
+            tier.ResetAnswerTallies(); // harness-facing reset, then one untimed replay pass so the reported tallies describe a clean measurement stream rather than warmup+reps cumulative counters
+            RunGatherStream(hotModel, hotPool, seqs, tokens, vocab);
+
+            long hits = tier.HitsTotal;
+            long misses = tier.MissesTotal;
+            double hitRatePercent = hits + misses > 0 ? 100.0 * hits / (hits + misses) : 0.0;
+            double hotDeltaPercent = gatherTps > 0 ? (hotTps - gatherTps) / gatherTps * 100.0 : 0.0;
+
+            Console.WriteLine(
+                $"residency: tier={tier.Kind} budgetBytes={tier.BudgetBytes} residentBytes={tier.ResidentBytes} hotUnits={tier.HotUnits}/{experts * layers} " +
+                $"swapPeriodLayerSteps={hotSwapPeriod} hits={hits} misses={misses} hitRate={hitRatePercent:F1}% savedEstimateMiB={tier.SavedBytesEstimateTotal / (1024.0 * 1024.0):F1} " +
+                $"promotions={tier.PromotionsTotal} demotions={tier.DemotionsTotal} tok/s-vs-prefetch-only={(hotDeltaPercent >= 0 ? "+" : string.Empty)}{hotDeltaPercent:F2}%");
+
+            hotArm = new ArmResult
+            {
+                Id = "gather-ram-hot-tier",
+                Harness = "LAIR engine DecodeBatch union gather over RamHotExpertTier (capacity/cost hot expert copies + cold slab views)",
+                Metrics = [new Metric { Test = "decode tok/s", TokensPerSecond = Round(hotTps) }],
+                MedianSeconds = Round(hotMedian),
+                MinSeconds = Round(Min(hotSeconds)),
+                MaxSeconds = Round(Max(hotSeconds)),
+            };
+
+            tierParity = new ParityResult
+            {
+                BitExact = tierExact,
+                ComparedFloats = tierLogits.Length,
+                MismatchedFloats = tierMismatches,
+                MaxAbsDiff = tierExact ? 0.0 : Round(tierMaxDiff),
+            };
+
+            residency = new ResidencyResult
+            {
+                TierKind = tier.Kind,
+                BudgetBytes = tier.BudgetBytes,
+                ResidentBytes = tier.ResidentBytes,
+                HotUnits = tier.HotUnits,
+                SwapPeriodLayerSteps = hotSwapPeriod,
+                HitsTotal = hits,
+                MissesTotal = misses,
+                HitRatePercent = Round(hitRatePercent),
+                SavedBytesEstimateTotal = tier.SavedBytesEstimateTotal,
+                PromotionsTotal = tier.PromotionsTotal,
+                DemotionsTotal = tier.DemotionsTotal,
+                TokensPerSecondDeltaVsPrefetchOnlyPercent = Round(hotDeltaPercent),
+            };
+        }
+
         string reportDir = Path.Combine(outRoot, stamp);
         Directory.CreateDirectory(reportDir);
 
         HostReport host = CaptureHost(backend, seqs, tokens, reps);
-        BenchReport bench = new()
-        {
-            SchemaVersion = 1,
-            ReportId = reportId,
-            Arms =
+
+        List<ArmResult> arms =
             [
                 new ArmResult
                 {
@@ -271,7 +368,30 @@ public static class MoeGatherBench
                     MinSeconds = Round(Min(soloSeconds)),
                     MaxSeconds = Round(Max(soloSeconds)),
                 },
-            ],
+            ];
+
+        if (hotArm is not null)
+        {
+            arms.Add(hotArm); // the RAM-hot-tier gather arm joins the comparison only when --hot-budget-mb enables it; default runs publish exactly the two-arm report they always have
+        }
+
+        List<string> comparisonNotes =
+            [
+                "The fixture is synthetic deterministic F32 qwen2moe material: it measures the gather mechanism (union walks, slab views, prefetch staging), not a quantized production model.",
+                "Both arms run identical sequences and token streams over identical file bytes; parity compares every step's logits bit-for-bit between the merged-decode arm and solo stepping.",
+                "Union stats come from an instrumentation pass that counts slab resolutions through the gather kernel: unionGateResolutionsPerDecodeStep lists gate-role resolutions per decode step summed over the fixture's layers, while averages and byte tallies are reported per layer step — each distinct expert of a step's union resolves exactly one slab per role.",
+            ];
+
+        if (residency is not null)
+        {
+            comparisonNotes.Add("The ram-hot-tier arm runs the same merged-decode gather with its weight source wrapped in the RAM residency tier: experts resident by capacity/cost answer slab reads from private byte-identical copies, everything else resolves through cold contiguous views. Its tallies come from one untimed replay pass after ResetAnswerTallies — hit rate and saved-byte estimate describe that clean stream; parity proves its logits bit-identical to the prefetch-only gather arm's.");
+        }
+
+        BenchReport bench = new()
+        {
+            SchemaVersion = 1,
+            ReportId = reportId,
+            Arms = arms,
             Parity = new ParityResult
             {
                 BitExact = bitExact,
@@ -279,6 +399,8 @@ public static class MoeGatherBench
                 MismatchedFloats = mismatchedFloats,
                 MaxAbsDiff = bitExact ? 0.0 : Round(maxAbsDiff),
             },
+            TierVsGatherParity = tierParity, // null when the residency arm did not run — default reports keep their exact earlier shape
+            Residency = residency,
             UnionStats = new UnionResult
             {
                 SelectionSlotsPerLayerStep = selectionSlotsPerStep,
@@ -301,12 +423,7 @@ public static class MoeGatherBench
             Lane = "Local CPU gather/dense-equivalent comparison (synthetic qwen2moe fixture)",
             Goal = "Measure the merged-decode union gather against dense-equivalent solo stepping on identical sequences and token streams, prove bit-identical parity, and record the step's union active-expert amortization.",
             Files = ["manifest.json", "host.json", "bench.json", "cli.json", "report.html"],
-            ComparisonNotes =
-            [
-                "The fixture is synthetic deterministic F32 qwen2moe material: it measures the gather mechanism (union walks, slab views, prefetch staging), not a quantized production model.",
-                "Both arms run identical sequences and token streams over identical file bytes; parity compares every step's logits bit-for-bit between the merged-decode arm and solo stepping.",
-                "Union stats come from an instrumentation pass that counts slab resolutions through the gather kernel: unionGateResolutionsPerDecodeStep lists gate-role resolutions per decode step summed over the fixture's layers, while averages and byte tallies are reported per layer step — each distinct expert of a step's union resolves exactly one slab per role.",
-            ],
+            ComparisonNotes = comparisonNotes,
         };
 
         WriteJson(Path.Combine(reportDir, "manifest.json"), manifest);
@@ -319,7 +436,9 @@ public static class MoeGatherBench
         File.WriteAllText(Path.Combine(reportDir, "report.html"), BuildHtml(manifest, host, bench));
 
         Console.WriteLine($"gather report dir={Path.GetFullPath(reportDir)}");
-        return bitExact ? 0 : 1;
+
+        bool tierParityOk = tierParity is null || tierParity.BitExact; // the residency arm must also prove bit-identical output whenever it runs: residency changes where slab bytes come from, never the arithmetic over them
+        return bitExact && tierParityOk ? 0 : 1;
     }
 
     private static void RunGatherStream(TransformerModel model, BlockPool pool, int seqs, int tokens, int vocab, float[]? captureLogits = null)
@@ -735,10 +854,34 @@ public static class MoeGatherBench
     }
 
     private static double Min(double[] values) => values.Min();
+
+    // Bit-for-bit logit comparison shared by every parity pairing in this lane: differing float bits are counted, and the widest absolute gap is kept for reporting when a pairing diverges.
+    private static (int MismatchedFloats, double MaxAbsDiff) CompareLogitsBitForBit(float[] expected, float[] actual)
+    {
+        if (expected.Length != actual.Length)
+        {
+            throw new ArgumentException($"logit capture length mismatch ({expected.Length} vs {actual.Length})");
+        }
+
+        int mismatches = 0;
+        double maxDiff = 0.0;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            if (BitConverter.SingleToInt32Bits(expected[i]) != BitConverter.SingleToInt32Bits(actual[i]))
+            {
+                mismatches++;
+                maxDiff = Math.Max(maxDiff, Math.Abs((double)expected[i] - actual[i]));
+            }
+        }
+
+        return (mismatches, maxDiff);
+    }
     private static double Max(double[] values) => values.Max();
     private static double Round(double value) => Math.Round(value, 4);
 
     private static int ParseInt(string raw, int fallback) => int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out int v) ? v : fallback;
+
+    private static double ParseDouble(string raw, double fallback) => double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out double v) ? v : fallback;
 
     private static void TryDelete(string path)
     {
@@ -792,6 +935,12 @@ public static class MoeGatherBench
         [JsonPropertyName("reportId")] public string ReportId { get; init; } = "";
         [JsonPropertyName("arms")] public List<ArmResult> Arms { get; init; } = [];
         [JsonPropertyName("parity")] public ParityResult Parity { get; init; } = new();
+
+        /// <summary>Gather arm vs RAM-hot-tier parity, present only when the residency arm ran.</summary>
+        [JsonPropertyName("tierVsGatherParity")] public ParityResult? TierVsGatherParity { get; init; }
+
+        /// <summary>The RAM tier's own accounting after its clean tally pass, present only when the residency arm ran.</summary>
+        [JsonPropertyName("residency")] public ResidencyResult? Residency { get; init; }
         [JsonPropertyName("unionStats")] public UnionResult UnionStats { get; init; } = new();
     }
 
@@ -830,6 +979,44 @@ public static class MoeGatherBench
         [JsonPropertyName("unionGateResolutionsPerDecodeStep")] public List<int> GateResolutionsPerDecodeStep { get; init; } = []; // gate-role slab resolutions per decode step summed over the fixture's layers: every sequence contributes its top-k selections, and each distinct expert of the step's union resolves exactly one slab per role
     }
 
+    private sealed class ResidencyResult
+    {
+        [JsonPropertyName("tierKind")] public string TierKind { get; init; } = "";
+
+        /// <summary>The tier's admission ceiling — RAM quota less the stated working-set reserve.</summary>
+        [JsonPropertyName("budgetBytes")] public long BudgetBytes { get; init; }
+
+        /// <summary>Expert chains resident at the end of the tally pass, in bytes.</summary>
+        [JsonPropertyName("residentBytes")] public long ResidentBytes { get; init; }
+
+        /// <summary>Hot expert-chain units held across the fixture's layers when the tallies were read.</summary>
+        [JsonPropertyName("hotUnits")] public int HotUnits { get; init; }
+
+        /// <summary>Layer-step notes per aging/rebalance round for this run.</summary>
+        [JsonPropertyName("swapPeriodLayerSteps")] public int SwapPeriodLayerSteps { get; init; }
+
+        /// <summary>Slab resolutions answered from residency during the untimed tally pass.</summary>
+        [JsonPropertyName("hitsTotal")] public long HitsTotal { get; init; }
+
+        /// <summary>Known-expert slab resolutions that fell through to cold views in the same pass.</summary>
+        [JsonPropertyName("missesTotal")] public long MissesTotal { get; init; }
+
+        /// <summary>Hits over all tallied slab resolutions, as a percent of the clean replay pass.</summary>
+        [JsonPropertyName("hitRatePercent")] public double HitRatePercent { get; init; }
+
+        /// <summary>Cumulative bytes those hit resolutions avoided reading cold.</summary>
+        [JsonPropertyName("savedBytesEstimateTotal")] public long SavedBytesEstimateTotal { get; init; }
+
+        /// <summary>Promotions the capacity/cost model made across this arm's streams (warmup included — cumulative since open).</summary>
+        [JsonPropertyName("promotionsTotal")] public long PromotionsTotal { get; init; }
+
+        /// <summary>Margin-gated demotions out of residency in the same window.</summary>
+        [JsonPropertyName("demotionsTotal")] public long DemotionsTotal { get; init; }
+
+        /// <summary>The hot-tier arm's decode tok/s delta against the prefetch-only gather arm, as a percent.</summary>
+        [JsonPropertyName("tokensPerSecondDeltaVsPrefetchOnlyPercent")] public double TokensPerSecondDeltaVsPrefetchOnlyPercent { get; init; }
+    }
+
     private static void WriteJson(string path, object value) =>
         File.WriteAllText(path, System.Text.Json.JsonSerializer.Serialize(value, new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
 
@@ -844,8 +1031,36 @@ public static class MoeGatherBench
         string armsRows = string.Join(
             "\n",
             bench.Arms.Select(a => $"<tr><td>{Esc(a.Id)}</td><td>{Esc(a.Harness)}</td><td>{a.Metrics[0].TokensPerSecond:F2}</td><td>{a.MedianSeconds:F4}</td><td>{a.MinSeconds:F4}</td><td>{a.MaxSeconds:F4}</td></tr>"));
-        string parityRow = $"<tr><td>{bench.Parity.ComparedFloats}</td><td>{bench.Parity.MismatchedFloats}</td><td class=\"{(bench.Parity.BitExact ? "ok" : "bad")}\">{(bench.Parity.BitExact ? "bit-exact" : "diverged")}</td></tr>";
+
+        List<string> parityRows = [
+            $"<tr><td>gather vs dense-equivalent</td><td>{bench.Parity.ComparedFloats}</td><td>{bench.Parity.MismatchedFloats}</td><td class=\"{(bench.Parity.BitExact ? "ok" : "bad")}\">{(bench.Parity.BitExact ? "bit-exact" : "diverged")}</td></tr>",
+        ];
+
+        if (bench.TierVsGatherParity is ParityResult tierPairing) // the residency pairing only shows up when that arm ran — default reports render exactly as they did before this seam existed
+        {
+            parityRows.Add(
+                $"<tr><td>gather vs ram-hot-tier</td><td>{tierPairing.ComparedFloats}</td><td>{tierPairing.MismatchedFloats}</td><td class=\"{(tierPairing.BitExact ? "ok" : "bad")}\">{(tierPairing.BitExact ? "bit-exact" : "diverged")}</td></tr>");
+        }
+
+        string parityRowsHtml = string.Join("\n", parityRows);
         string unionRow = $"<tr><td>{bench.UnionStats.SelectionSlotsPerLayerStep}</td><td>{bench.UnionStats.AverageDistinctExpertsGatheredPerLayerStep:F2}</td><td>{bench.UnionStats.AmortizationPercent:F1}%</td><td>{bench.UnionStats.GatheredBytesPerLayerStep / (1024.0 * 1024.0):F1}</td><td>{bench.UnionStats.DenseEquivalentBytesPerLayerStep / (1024.0 * 1024.0):F1}</td></tr>";
+
+        string residencySection = bench.Residency is ResidencyResult res
+            ? $$"""
+
+<h2>RAM hot tier — capacity/cost residency behind the gather</h2>
+<table>
+<tr><th>Tier</th><td>{{Esc(res.TierKind)}}</td></tr>
+<tr><th>Budget bytes (quota − reserve)</th><td>{{res.BudgetBytes}}</td></tr>
+<tr><th>Resident bytes / hot units</th><td>{{res.ResidentBytes}} · {{res.HotUnits}}</td></tr>
+<tr><th>Swap period (layer steps per aging round)</th><td>{{res.SwapPeriodLayerSteps}}</td></tr>
+<tr><th>Hits · misses · hit rate</th><td>{{res.HitsTotal}} · {{res.MissesTotal}} · <span class="{{(res.HitRatePercent > 0.0 ? "ok" : "bad")}}">{{res.HitRatePercent:F1}}%</span></td></tr>
+<tr><th>Saved cold-read estimate</th><td>{{res.SavedBytesEstimateTotal / (1024.0 * 1024.0):F1}} MiB</td></tr>
+<tr><th>Promotions · demotions</th><td>{{res.PromotionsTotal}} · {{res.DemotionsTotal}}</td></tr>
+<tr><th>Tok/s delta vs prefetch-only gather</th><td>{{(res.TokensPerSecondDeltaVsPrefetchOnlyPercent >= 0.0 ? "+" : string.Empty)}}{{res.TokensPerSecondDeltaVsPrefetchOnlyPercent:F2}}%</td></tr>
+</table>
+"""
+            : string.Empty; // no residency arm ran: the HTML renders exactly as it did before this seam existed
         string notesLi = string.Join("\n", manifest.ComparisonNotes.Select(n => $"<li>{Esc(n)}</li>"));
         string labelsJson = string.Join(", ", bench.Arms.Select(a => "'" + Esc(a.Id) + "'"));
         string dataJson = string.Join(", ", bench.Arms.Select(a => a.Metrics[0].TokensPerSecond.ToString("F2", CultureInfo.InvariantCulture)));
@@ -880,8 +1095,8 @@ canvas { max-width: 720px; margin-top: 1rem; }
 
 <h2>Parity — gathered logits vs dense-equivalent, bit-for-bit</h2>
 <table>
-<tr><th>Compared floats</th><th>Mismatched</th><th>Exact</th></tr>
-{{parityRow}}
+<tr><th>Pairing</th><th>Compared floats</th><th>Mismatched</th><th>Exact</th></tr>
+{{parityRowsHtml}}
 </table>
 
 <h2>Union active-expert amortization (instrumentation pass)</h2>
@@ -890,6 +1105,7 @@ canvas { max-width: 720px; margin-top: 1rem; }
 {{unionRow}}
 </table>
 
+{{residencySection}}
 <h2>Decode throughput comparison</h2>
 <canvas id="arms" width="720" height="360"></canvas>
 <script>

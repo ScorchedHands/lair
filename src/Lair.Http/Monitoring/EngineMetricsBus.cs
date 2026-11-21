@@ -120,6 +120,9 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     // snapshot shape they had before this seam existed, with these slots reading as nothing rather than zero-filled.
     private Func<AcceleratorAccounting?>? _acceleratorProvider;
 
+    // The owning engine's expert residency accounting: read once per publish, and only ever answers null for a serve whose model opened over plain cold slab views — every default posture today. A host that attaches no provider never asks, so its snapshots keep the shape they had before this seam existed with these slots reading as nothing rather than zero-filled.
+    private Func<ResidencyTierAccounting?>? _residencyProvider;
+
     // The owning facade's request-queue depth: submissions blocked on a held concurrency slot right now, read once per publish. A host that
     // queues nothing attaches no provider, so the depth field keeps its inert zero default exactly as it read before this seam existed.
     private Func<int>? _queueDepthProvider;
@@ -395,6 +398,18 @@ public sealed class EngineMetricsBus : IAsyncDisposable
     }
 
     /// <summary>
+    /// Wires the expert residency accounting seam an opened engine answers from its attached residency tier. One volatile delegate swap read at each
+    /// publish: with no provider attached — every host whose models gather through plain cold slab views, which is today's default posture — snapshots
+    /// keep reading exactly as they did before this seam existed. A serve holding no residency-backed model attaches a provider that reports null,
+    /// which publishes the same nothing.
+    /// </summary>
+    public void AttachResidencyProvider(Func<ResidencyTierAccounting?> provider)
+    {
+        ArgumentNullException.ThrowIfNull(provider);
+        Volatile.Write(ref _residencyProvider, provider);
+    }
+
+    /// <summary>
     /// Wires the request-queue depth an owning facade holds: how many of its submissions are blocked waiting for a concurrency slot right now.
     /// One volatile delegate swap read at each publish; with no provider attached — every host that queues nothing — snapshots keep reading this
     /// field as zero exactly as they did before this seam existed. The configured queue posture rides the attached model facts instead, because
@@ -621,6 +636,11 @@ public sealed class EngineMetricsBus : IAsyncDisposable
         long? transferCallsTotal = null;
         long? persistentVramBytes = null;
 
+        // Additive expert-residency tallies (earlier shapes untouched): read live from the attached tier at this publish — hot-set size and byte
+        // residency as they stand now, hits/misses/saved-estimate cumulative since open. No provider or a null answer leaves every slot null: an
+        // engine answering against plain cold slab views publishes exactly what it published before this seam existed.
+        ResidencyTierAccounting? residency = Volatile.Read(ref _residencyProvider) is Func<ResidencyTierAccounting?> residencyProvider ? residencyProvider() : null;
+
         if (currentAccelerator is AcceleratorAccounting accelerator)
         {
             long busyDeltaMicroseconds = Math.Max(0, accelerator.KernelBusyMicrosecondsTotal - (_previous.Accelerator?.KernelBusyMicrosecondsTotal ?? 0));
@@ -747,7 +767,16 @@ public sealed class EngineMetricsBus : IAsyncDisposable
                 ActiveEncoderRequests: (int)Math.Max(0, encoderActive),
                 EncoderRequestsTotal: encoderRequestsCompleted,
                 EncoderTokensForwardedTotal: encoderTokensForwarded,
-                EncoderTokensPerSecWindowed: Math.Round(encodeDelta * 1000.0 / windowMs, 2));
+                EncoderTokensPerSecWindowed: Math.Round(encodeDelta * 1000.0 / windowMs, 2),
+
+                // Additive expert-residency facts (earlier shapes untouched): the posture name rides the attached model facts; the tallies come from this publish's own residency read above. A serve with no attached tier publishes every slot null — nothing at all rather than an idle-tier inference.
+                ResidencyTier: facts?.ResidencyTier,
+                ResidencyHotUnits: residency?.HotUnits,
+                ResidencyBudgetBytes: residency?.BudgetBytes,
+                ResidencyResidentBytes: residency?.ResidentBytes,
+                ResidencyHitsTotal: residency?.HitsTotal,
+                ResidencyMissesTotal: residency?.MissesTotal,
+                ResidencySavedBytesEstimateTotal: residency?.SavedBytesEstimateTotal);
 
             long id = TakeEventId();
             frame = new MonitorFrame(id, MonitorEventNames.Snapshot, snapshot.ToJson());
