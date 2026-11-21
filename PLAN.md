@@ -1842,7 +1842,7 @@ Qwen3.8-Flash-Next runs: sparse MoE with residency management.
 
 #### Implementation Items
 
-- [→] Scripted resource gates — committed runner scripts and report commands for the CPU-only Xeon lane, synthetic loader/gather/PLE/MTP checks, real-file Flash-Next reality-check runs where the host can hold the pinned shards, and dedicated idle-GPU CUDA measurements that refuse to run while another accelerator workload is active (see DN-M7-13).
+- [✓] Scripted resource gates — committed runner scripts and report commands for the CPU-only Xeon lane, synthetic loader/gather/PLE/MTP checks, real-file Flash-Next reality-check runs where the host can hold the pinned shards, and dedicated idle-GPU CUDA measurements that refuse to run while another accelerator workload is active (see DN-M7-13); validated on the Xeon CPU lane with `Category=Scripts` 14/14 and Synthetic gates green.
   - Verify: script dry-runs name each lane's required resources; CPU-only commands succeed on the Xeon without a CUDA device, real-file commands fail naming missing RAM/disk/working-set headroom rather than silently substituting synthetic fixtures, and GPU-gated commands require an explicit idle-accelerator confirmation before launching Flash-Next or two-model monitor measurements.
 - [_] Reality check — llama.cpp/ik_llama.cpp harness on target Flash-Next GGUF (see DN-M7-1)
   - Verify: committed bench report with tok/s, bytes/token, and expert-gather observations first on the Xeon CPU-only lane where the pinned shards fit their measured working set; CUDA observations are added only from a scripted idle-accelerator run. *(bench gate active under the standing bench-deferral decision — the report is requested explicitly before kernel items start)*
