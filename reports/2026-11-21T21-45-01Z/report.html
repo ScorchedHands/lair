@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>lowrank-svd-2026-11-21T21-45-01Z</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem; color: #1c1c1c; }
+h1 { font-size: 1.35rem; } h2 { font-size: 1.1rem; margin-top: 1.6rem; }
+table { border-collapse: collapse; margin-top: .5rem; }
+th, td { border: 1px solid #bbb; padding: .4rem .7rem; text-align: left; font-size: .92rem; }
+th { background: #f0f0f0; } .ok { color: #0a7d32; font-weight: 600; } .bad { color: #b00020; font-weight: 600; }
+canvas { max-width: 720px; margin-top: 1rem; } .note { color: #555; font-size: .88rem; }
+</style>
+</head>
+<body>
+<h1>lowrank-svd-2026-11-21T21-45-01Z</h1>
+<p class="note">Local CPU analytical spike (exact numpy singular spectra over dequantized Flash-Next expert slabs) · 2026-11-21T21:45:01Z · branch phase/mvp6.1</p>
+
+<h2>Sample config</h2>
+<table>
+<tr><th>Model</th><td>C:\source\github.com\Strata-data\models\IQ3_XXS\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf</td></tr>
+<tr><th>Arch / blocks / experts (used)</th><td>qwen4exp · 48 · 512 (10 routed/token)</td></tr>
+<tr><th>Hidden / expert feed-forward</th><td>2560 · 640</td></tr>
+<tr><th>Sampling</th><td>layers [0, 16, 32] experts [0, 7] roles [gate, up, down]</td></tr>
+<tr><th>Dequant route · spectrum tool</th><td>CpuBackend.DequantRow over contiguous per-expert slab views (ExpertSlabWeightSource on GgufMmapWeightSource) · numpy 2.5.4 python 3.12.10</td></tr>
+<tr><th>Spectra cross-check (sum σ² vs ‖A‖F²)</th><td class="ok">passed for every matrix</td></tr>
+</table>
+
+<h2>Viability recommendation — analytical evidence, not a kernel benchmark</h2>
+<p><span class="bad" style="font-size:1.05rem">no_knee</span></p>
+<p class="note">down-role median 90%-energy rank 472.0 (rule wants &lt;=64) and median 95% rank 540 (rule wants &lt;=128); gate/up aggregate median 90% rank 469.0 for context · down matrices sampled 6 · gate/up sampled 12</p>
+
+<h2>Per-matrix spectra summary (full descending spectra live in bench.json)</h2>
+<table>
+<tr><th>Matrix</th><th>L/E/role</th><th>Format</th><th>Dims</th><th>Top σ</th><th>Cumulative energy @8 / @128</th><th>Rank to reach 90% · 95%</th></tr>
+<tr><td>blk.0.ffn_gate_exps.weight#e0</td><td>0/0/gate</td><td>IQ2_XS</td><td>640x2560</td><td>1.43539, 1.40352, 1.3782</td><td>@8: 0.0394 · @128: 0.4032</td><td>90%→466 · 95%→536</td></tr>
+<tr><td>blk.0.ffn_gate_exps.weight#e7</td><td>0/7/gate</td><td>IQ2_XS</td><td>640x2560</td><td>1.47016, 1.3997, 1.38297</td><td>@8: 0.0415 · @128: 0.4038</td><td>90%→468 · 95%→537</td></tr>
+<tr><td>blk.0.ffn_up_exps.weight#e0</td><td>0/0/up</td><td>IQ2_XS</td><td>640x2560</td><td>1.19957, 1.13473, 1.11057</td><td>@8: 0.0356 · @128: 0.3973</td><td>90%→468 · 95%→538</td></tr>
+<tr><td>blk.0.ffn_up_exps.weight#e7</td><td>0/7/up</td><td>IQ2_XS</td><td>640x2560</td><td>1.26412, 1.18789, 1.17627</td><td>@8: 0.0401 · @128: 0.4003</td><td>90%→470 · 95%→539</td></tr>
+<tr><td>blk.0.ffn_down_exps.weight#e0</td><td>0/0/down</td><td>IQ4_NL</td><td>2560x640</td><td>1.20501, 1.15396, 1.10486</td><td>@8: 0.0374 · @128: 0.3962</td><td>90%→470 · 95%→539</td></tr>
+<tr><td>blk.0.ffn_down_exps.weight#e7</td><td>0/7/down</td><td>IQ4_NL</td><td>2560x640</td><td>1.38211, 1.28443, 1.13165</td><td>@8: 0.0415 · @128: 0.3917</td><td>90%→475 · 95%→542</td></tr>
+<tr><td>blk.16.ffn_gate_exps.weight#e0</td><td>16/0/gate</td><td>IQ2_XXS</td><td>640x2560</td><td>1.28065, 1.21469, 1.20049</td><td>@8: 0.0424 · @128: 0.4097</td><td>90%→469 · 95%→539</td></tr>
+<tr><td>blk.16.ffn_gate_exps.weight#e7</td><td>16/7/gate</td><td>IQ2_XXS</td><td>640x2560</td><td>1.25448, 1.18932, 1.0733</td><td>@8: 0.0352 · @128: 0.3792</td><td>90%→479 · 95%→545</td></tr>
+<tr><td>blk.16.ffn_up_exps.weight#e0</td><td>16/0/up</td><td>IQ2_XXS</td><td>640x2560</td><td>1.15244, 1.11042, 1.09659</td><td>@8: 0.0370 · @128: 0.4012</td><td>90%→469 · 95%→538</td></tr>
+<tr><td>blk.16.ffn_up_exps.weight#e7</td><td>16/7/up</td><td>IQ2_XXS</td><td>640x2560</td><td>1.00452, 0.998811, 0.985008</td><td>@8: 0.0295 · @128: 0.3702</td><td>90%→481 · 95%→547</td></tr>
+<tr><td>blk.16.ffn_down_exps.weight#e0</td><td>16/0/down</td><td>Q2_0</td><td>2560x640</td><td>1.31871, 1.21855, 1.17454</td><td>@8: 0.0471 · @128: 0.4180</td><td>90%→466 · 95%→537</td></tr>
+<tr><td>blk.16.ffn_down_exps.weight#e7</td><td>16/7/down</td><td>Q2_0</td><td>2560x640</td><td>1.20973, 1.0928, 1.02238</td><td>@8: 0.0342 · @128: 0.3792</td><td>90%→478 · 95%→545</td></tr>
+<tr><td>blk.32.ffn_gate_exps.weight#e0</td><td>32/0/gate</td><td>IQ3_S</td><td>640x2560</td><td>1.45009, 1.33925, 1.27332</td><td>@8: 0.0497 · @128: 0.4226</td><td>90%→465 · 95%→536</td></tr>
+<tr><td>blk.32.ffn_gate_exps.weight#e7</td><td>32/7/gate</td><td>IQ3_S</td><td>640x2560</td><td>1.4733, 1.26299, 1.08967</td><td>@8: 0.0371 · @128: 0.3762</td><td>90%→480 · 95%→546</td></tr>
+<tr><td>blk.32.ffn_up_exps.weight#e0</td><td>32/0/up</td><td>IQ3_S</td><td>640x2560</td><td>1.25654, 1.23692, 1.20935</td><td>@8: 0.0410 · @128: 0.4096</td><td>90%→465 · 95%→535</td></tr>
+<tr><td>blk.32.ffn_up_exps.weight#e7</td><td>32/7/up</td><td>IQ3_S</td><td>640x2560</td><td>1.15522, 1.11447, 1.09396</td><td>@8: 0.0301 · @128: 0.3688</td><td>90%→481 · 95%→547</td></tr>
+<tr><td>blk.32.ffn_down_exps.weight#e0</td><td>32/0/down</td><td>IQ4_NL</td><td>2560x640</td><td>1.57076, 1.39039, 1.33454</td><td>@8: 0.0553 · @128: 0.4371</td><td>90%→455 · 95%→528</td></tr>
+<tr><td>blk.32.ffn_down_exps.weight#e7</td><td>32/7/down</td><td>IQ4_NL</td><td>2560x640</td><td>1.17422, 1.08347, 1.01417</td><td>@8: 0.0309 · @128: 0.3642</td><td>90%→484 · 95%→548</td></tr>
+</table>
+
+<h2>Median rank needed per role (sampled matrices)</h2>
+<table>
+<tr><th>Role</th><th>Matrices</th><th>50% energy</th><th>75% energy</th><th>90% energy</th><th>95% energy</th><th>99% energy</th></tr>
+<tr><td>down</td><td>6</td><td>178</td><td>330</td><td>472</td><td>540</td><td>614</td></tr>
+<tr><td>gate</td><td>6</td><td>172</td><td>325</td><td>468</td><td>538</td><td>614</td></tr>
+<tr><td>up</td><td>6</td><td>174</td><td>326</td><td>470</td><td>538</td><td>614</td></tr>
+</table>
+
+<h2>Median cumulative-energy ladder per role</h2>
+<table>
+<tr><th>Role</th><th>Rank</th><th>Cumulative energy fraction</th></tr>
+<tr><td>down</td><td>8</td><td>0.03945</td></tr>
+<tr><td>down</td><td>16</td><td>0.07081</td></tr>
+<tr><td>down</td><td>32</td><td>0.12743</td></tr>
+<tr><td>down</td><td>64</td><td>0.22708</td></tr>
+<tr><td>down</td><td>96</td><td>0.31501</td></tr>
+<tr><td>down</td><td>128</td><td>0.39393</td></tr>
+<tr><td>down</td><td>192</td><td>0.53039</td></tr>
+<tr><td>down</td><td>256</td><td>0.64330</td></tr>
+<tr><td>gate</td><td>8</td><td>0.04043</td></tr>
+<tr><td>gate</td><td>16</td><td>0.07301</td></tr>
+<tr><td>gate</td><td>32</td><td>0.13153</td></tr>
+<tr><td>gate</td><td>64</td><td>0.23395</td></tr>
+<tr><td>gate</td><td>96</td><td>0.32360</td></tr>
+<tr><td>gate</td><td>128</td><td>0.40350</td></tr>
+<tr><td>gate</td><td>192</td><td>0.54040</td></tr>
+<tr><td>gate</td><td>256</td><td>0.65272</td></tr>
+<tr><td>up</td><td>8</td><td>0.03630</td></tr>
+<tr><td>up</td><td>16</td><td>0.06819</td></tr>
+<tr><td>up</td><td>32</td><td>0.12618</td></tr>
+<tr><td>up</td><td>64</td><td>0.22864</td></tr>
+<tr><td>up</td><td>96</td><td>0.31874</td></tr>
+<tr><td>up</td><td>128</td><td>0.39880</td></tr>
+<tr><td>up</td><td>192</td><td>0.53609</td></tr>
+<tr><td>up</td><td>256</td><td>0.64917</td></tr>
+</table>
+
+<h2>Active routed-expert bytes/token baseline (assembled tensor table)</h2>
+<p class="note">Total stacked expert packed bytes 42,912,972,800 · active ratio used/experts = 10/512 ≈ 0.019531 · current active packed bytes/token <b>838,144,000</b> · dequantized-fp32 reference bytes/token 9,437,184,000</p>
+<table>
+<tr><th>Role</th><th>Total stacked packed bytes</th><th>Layers carrying role</th><th>Avg per layer</th></tr>
+<tr><td>down</td><td>15,571,353,600</td><td>48</td><td>324403200</td></tr>
+<tr><td>gate</td><td>13,670,809,600</td><td>48</td><td>284808533</td></tr>
+<tr><td>up</td><td>13,670,809,600</td><td>48</td><td>284808533</td></tr>
+</table>
+
+<h2>Conservative fp32 low-rank storage estimates (min(m·n, m·r + n·r) elements)</h2>
+<table>
+<tr><th>Candidate rank</th><th>Estimated active bytes/token (fp32 sidecar)</th><th>Reduction vs current quantized packed baseline</th><th>Reduction vs dequantized-fp32 reference</th></tr>
+<tr><td>r=8</td><td>147,456,000</td><td class="ok">82.41%</td><td>98.44%</td></tr>
+<tr><td>r=16</td><td>294,912,000</td><td class="ok">64.81%</td><td>96.88%</td></tr>
+<tr><td>r=32</td><td>589,824,000</td><td class="ok">29.63%</td><td>93.75%</td></tr>
+<tr><td>r=64</td><td>1,179,648,000</td><td class="bad">-40.75%</td><td>87.50%</td></tr>
+<tr><td>r=96</td><td>1,769,472,000</td><td class="bad">-111.12%</td><td>81.25%</td></tr>
+<tr><td>r=128</td><td>2,359,296,000</td><td class="bad">-181.49%</td><td>75.00%</td></tr>
+</table>
+
+<h2>Cumulative energy — role median spectra (element-wise medians over sampled matrices)</h2>
+<canvas id="energy" width="720" height="360"></canvas>
+<script>
+new Chart(document.getElementById('energy'), {
+  type: 'line',
+  data: { labels: ['r8', 'r16', 'r32', 'r64', 'r96', 'r128', 'r192', 'r256'], datasets: [{ label: 'down median cumulative energy', data: [0.03945, 0.07081, 0.12743, 0.22708, 0.31501, 0.39393, 0.53039, 0.64330] }, { label: 'gate median cumulative energy', data: [0.04043, 0.07301, 0.13153, 0.23395, 0.32360, 0.40350, 0.54040, 0.65272] }, { label: 'up median cumulative energy', data: [0.03630, 0.06819, 0.12618, 0.22864, 0.31874, 0.39880, 0.53609, 0.64917] }] },
+  options: { plugins: { title: { display: true, text: 'median cumulative energy fraction vs rank' } }, scales: { y: { min: 0.5, max: 1.0, title: { display: true, text: 'fraction of total matrix energy' } } } }
+});
+</script>
+
+<h2>Rank needed for each energy threshold — role medians</h2>
+<canvas id="ranks" width="720" height="360"></canvas>
+<script>
+new Chart(document.getElementById('ranks'), {
+  type: 'bar',
+  data: { labels: ['50%', '75%', '90%', '95%', '99%'], datasets: [{ label: 'down median rank needed', data: [178, 330, 472, 540, 614] }, { label: 'gate median rank needed', data: [172, 325, 468, 538, 614] }, { label: 'up median rank needed', data: [174, 326, 470, 538, 614] }] },
+  options: { scales: { y: { beginAtZero: true, title: { display: true, text: 'median leading-rank count' } } } }
+});
+</script>
+
+<h2>Host</h2>
+<table>
+<tr><th>Hostname</th><td>FRODO</td></tr>
+<tr><th>OS</th><td>Microsoft Windows 10.0.26200</td></tr>
+<tr><th>Logical processors / physical cores / backend workers</th><td>32 / 24 / 24</td></tr>
+<tr><th>CPU flags matched</th><td>avx, avx2, fma</td></tr>
+</table>
+
+<h2>Notes</h2>
+<ul>
+<li>Analytical viability evidence only: this measures how much of each dequantized expert matrix&#39;s energy its leading singular directions hold. It is not a low-rank kernel throughput benchmark and changes no posture or config.</li>
+<li>Matrices come from the checkpoint as stored: gate/up/down slabs are already sub-4-bit quantizations, so their spectra include quantization-error energy spread across every mode; a rank-k collapse measured here is an upper bound on what a low-rank sidecar could retain before accuracy costs bite.</li>
+<li>Storage estimates assume fp32 factor coefficients/bases (min(m*n, m*r + n*r) elements per expert). The current baseline they compare against is the checkpoint&#39;s own packed quantized bytes, so positive reduction percentages mean the fp32 sidecar beats today&#39;s storage and negative ones say it does not yet.</li>
+<li>Sampling is deterministic and bounded: a fixed layer/expert subset of every stacked role tensor; spectra are exact numpy.linalg.svd results over full dequantized matrices, one expert resident at a time (peak matrix residency reported in bench.json).</li>
+</ul>
+</body>
+</html>

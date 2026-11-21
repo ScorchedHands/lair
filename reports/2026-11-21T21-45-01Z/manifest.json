@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "reportId": "lowrank-svd-2026-11-21T21-45-01Z",
+  "generatedAtUtc": "2026-11-21T21:45:01Z",
+  "phase": "MVP7",
+  "branch": "phase/mvp6.1",
+  "lane": "Local CPU analytical spike (exact numpy singular spectra over dequantized Flash-Next expert slabs)",
+  "goal": "Measure whether the stacked MoE expert matrices of this checkpoint carry a low-rank knee worth a factorization experiment, against an exact active-bytes-per-token baseline from the assembled tensor table.",
+  "files": [
+    "manifest.json",
+    "host.json",
+    "bench.json",
+    "cli.json",
+    "report.html"
+  ],
+  "comparisonNotes": [
+    "Analytical viability evidence only: this measures how much of each dequantized expert matrix\u0027s energy its leading singular directions hold. It is not a low-rank kernel throughput benchmark and changes no posture or config.",
+    "Matrices come from the checkpoint as stored: gate/up/down slabs are already sub-4-bit quantizations, so their spectra include quantization-error energy spread across every mode; a rank-k collapse measured here is an upper bound on what a low-rank sidecar could retain before accuracy costs bite.",
+    "Storage estimates assume fp32 factor coefficients/bases (min(m*n, m*r \u002B n*r) elements per expert). The current baseline they compare against is the checkpoint\u0027s own packed quantized bytes, so positive reduction percentages mean the fp32 sidecar beats today\u0027s storage and negative ones say it does not yet.",
+    "Sampling is deterministic and bounded: a fixed layer/expert subset of every stacked role tensor; spectra are exact numpy.linalg.svd results over full dequantized matrices, one expert resident at a time (peak matrix residency reported in bench.json)."
+  ]
+}

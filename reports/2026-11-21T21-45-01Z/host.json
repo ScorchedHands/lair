@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "host": {
+    "hostname": "FRODO",
+    "os": "Microsoft Windows 10.0.26200",
+    "framework": ".NET 10.0.14",
+    "logicalProcessors": 32,
+    "physicalCores": 24,
+    "backendWorkers": 24,
+    "memoryTotalBytes": 68423139328,
+    "cpuFlagsMatched": [
+      "avx",
+      "avx2",
+      "fma"
+    ],
+    "lane": "CPU-only analytical spike"
+  }
+}

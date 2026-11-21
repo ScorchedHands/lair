@@ -10,6 +10,11 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The low-rank spike's spectrum script ships beside the bench binary: exact numpy singular values come from here, not from a managed approximation. -->
+    <Content Include="spikes\lowrank-svd.py" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Lair.Contracts\Lair.Contracts.csproj" />
     <ProjectReference Include="..\..\src\Lair.Loader\Lair.Loader.csproj" />
     <ProjectReference Include="..\..\src\Lair.Backends.Cpu\Lair.Backends.Cpu.csproj" />

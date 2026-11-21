@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "reportId": "lowrank-svd-2026-11-21T21-45-01Z",
+  "commandLine": "C:\\source\\gitlab.scorchedhands.com\\personal\\LAIR\\.agent-worktrees\\mvp6-1\\bench\\Lair.Bench\\bin\\Release\\net10.0\\Lair.Bench.dll lowrank-svd C:\\source\\github.com\\Strata-data\\models\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf lowrank-svd C:\\source\\github.com\\Strata-data\\models\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+  "workingDirectory": "C:\\source\\gitlab.scorchedhands.com\\personal\\LAIR\\.agent-worktrees\\mvp6-1",
+  "elapsedSeconds": 4.526
+}
