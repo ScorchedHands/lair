@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "reportId": "flash-next-reality-check-2026-11-21T07-04-13Z",
+  "generatedAtUtc": "2026-11-21T07:04:13Z",
+  "phase": "MVP7",
+  "branch": "phase/mvp6.1",
+  "lane": "Xeon CPU-only Flash-Next reality-check",
+  "goal": "Record llama.cpp and official ik_llama.cpp baselines for the pinned Flash-Next GGUF before LAIR MoE kernel work starts.",
+  "modelFile": "host.json#model",
+  "hostFile": "host.json#host",
+  "benchFile": "bench.json",
+  "cliFile": "cli.json",
+  "htmlReport": "report.html",
+  "markdownReport": "../../bench/reports/flash-next-reality-check-2026-11-21.md",
+  "comparisonNotes": [
+    "JSON files are machine-readable baselines for future LAIR engine comparisons.",
+    "HTML report embeds summary tables and Chart.js charts for quick visual comparison.",
+    "Official pinned ik_llama.cpp commit failed on the target model; official main ik_llama.cpp llama-bench is the usable ik evidence."
+  ]
+}

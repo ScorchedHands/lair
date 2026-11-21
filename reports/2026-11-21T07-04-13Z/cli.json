@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 1,
+  "reportId": "flash-next-reality-check-2026-11-21T07-04-13Z",
+  "cli": [
+    {
+      "id": "mainline-cli",
+      "harness": "llama.cpp b12032 llama-cli",
+      "binary": "/tmp/lair-tools/llama.cpp/b12032/llama-b12032/llama-cli",
+      "version": "b12032",
+      "command": "/tmp/lair-tools/llama.cpp/b12032/llama-b12032/llama-cli -m /tmp/lair-models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf --verbose -ngl 0 -t 8 -tb 8 -c 2048 -b 512 -ub 512 -fa off -f /tmp/reality_prompt.txt -n 256 --temp 0 --seed 1",
+      "status": 0,
+      "metrics": [
+        {
+          "test": "prompt_eval",
+          "tokens": 100,
+          "tokensPerSecond": 10.554813786697768
+        },
+        {
+          "test": "generation",
+          "tokens": 256,
+          "tokensPerSecond": 3.259493367103559
+        }
+      ],
+      "artifactPaths": {
+        "stdout": "/tmp/lair-reality-check/llama-b12032-cli.cli.stdout.txt",
+        "stderr": "/tmp/lair-reality-check/llama-b12032-cli.cli.stderr.txt"
+      }
+    },
+    {
+      "id": "official-ik-main-cli-raw-fa-off",
+      "harness": "official ik_llama.cpp main llama-cli",
+      "binary": "/tmp/lair-tools/ik_official_main_src/build/bin/llama-cli",
+      "version": "7c00f8788e303bfba2886138e288effb0fd5fbbf",
+      "command": "/tmp/lair-tools/ik_official_main_src/build/bin/llama-cli -m /tmp/lair-models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf --verbose -ngl 0 -t 8 -tb 8 -c 2048 -b 512 -ub 512 -fa off -f /tmp/reality_prompt.txt -n 256 --temp 0 --seed 1",
+      "status": 0,
+      "metrics": [
+        {
+          "test": "prompt_eval",
+          "tokens": 48,
+          "tokensPerSecond": 16.98
+        },
+        {
+          "test": "generation",
+          "tokens": 1,
+          "tokensPerSecond": 1000000.00,
+          "note": "EOS-only; not usable as generation throughput."
+        }
+      ],
+      "artifactPaths": {
+        "stdout": "/tmp/lair-reality-check/ik-official-main-cli.cli.stdout.txt",
+        "stderr": "/tmp/lair-reality-check/ik-official-main-cli.cli.stderr.txt"
+      }
+    },
+    {
+      "id": "official-ik-main-cli-raw-fa-auto",
+      "harness": "official ik_llama.cpp main llama-cli",
+      "binary": "/tmp/lair-tools/ik_official_main_src/build/bin/llama-cli",
+      "version": "7c00f8788e303bfba2886138e288effb0fd5fbbf",
+      "command": "/tmp/lair-tools/ik_official_main_src/build/bin/llama-cli -m /tmp/lair-models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf --verbose -ngl 0 -t 8 -tb 8 -c 2048 -b 512 -ub 512 -fa auto -f /tmp/reality_prompt.txt -n 256 --temp 0 --seed 1",
+      "status": 0,
+      "metrics": [
+        {
+          "test": "prompt_eval",
+          "tokens": 48,
+          "tokensPerSecond": 16.73
+        },
+        {
+          "test": "generation",
+          "tokens": 1,
+          "tokensPerSecond": 1000000.00,
+          "note": "EOS-only; not usable as generation throughput."
+        }
+      ],
+      "artifactPaths": {
+        "stdout": "/tmp/lair-reality-check/ik-official-main-cli-fa-auto.cli.stdout.txt",
+        "stderr": "/tmp/lair-reality-check/ik-official-main-cli-fa-auto.cli.stderr.txt"
+      }
+    },
+    {
+      "id": "official-ik-main-cli-chat-fa-off",
+      "harness": "official ik_llama.cpp main llama-cli",
+      "binary": "/tmp/lair-tools/ik_official_main_src/build/bin/llama-cli",
+      "version": "7c00f8788e303bfba2886138e288effb0fd5fbbf",
+      "command": "/tmp/lair-tools/ik_official_main_src/build/bin/llama-cli -m /tmp/lair-models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf --verbose -ngl 0 -t 8 -tb 8 -c 2048 -b 512 -ub 512 -fa off -f /tmp/reality_prompt.txt -n 256 --temp 0 --seed 1 --jinja --reasoning on --reasoning-format deepseek",
+      "status": 0,
+      "metrics": [
+        {
+          "test": "prompt_eval",
+          "tokens": 48,
+          "tokensPerSecond": 16.76
+        },
+        {
+          "test": "generation",
+          "tokens": 1,
+          "tokensPerSecond": 1000000.00,
+          "note": "EOS-only; not usable as generation throughput."
+        }
+      ],
+      "artifactPaths": {
+        "stdout": "/tmp/lair-reality-check/ik-official-main-chat-fa-off.cli.stdout.txt",
+        "stderr": "/tmp/lair-reality-check/ik-official-main-chat-fa-off.cli.stderr.txt"
+      }
+    },
+    {
+      "id": "official-ik-main-cli-chat-fa-auto",
+      "harness": "official ik_llama.cpp main llama-cli",
+      "binary": "/tmp/lair-tools/ik_official_main_src/build/bin/llama-cli",
+      "version": "7c00f8788e303bfba2886138e288effb0fd5fbbf",
+      "command": "/tmp/lair-tools/ik_official_main_src/build/bin/llama-cli -m /tmp/lair-models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf --verbose -ngl 0 -t 8 -tb 8 -c 2048 -b 512 -ub 512 -fa off -f /tmp/reality_prompt.txt -n 256 --temp 0 --seed 1 --jinja --reasoning on --reasoning-format deepseek -fa auto",
+      "status": 0,
+      "metrics": [
+        {
+          "test": "prompt_eval",
+          "tokens": 48,
+          "tokensPerSecond": 17.61
+        },
+        {
+          "test": "generation",
+          "tokens": 1,
+          "tokensPerSecond": 1000000.00,
+          "note": "EOS-only; not usable as generation throughput."
+        }
+      ],
+      "artifactPaths": {
+        "stdout": "/tmp/lair-reality-check/ik-official-main-chat-fa-auto.cli.stdout.txt",
+        "stderr": "/tmp/lair-reality-check/ik-official-main-chat-fa-auto.cli.stderr.txt"
+      }
+    }
+  ],
+  "failedHarnesses": [
+    {
+      "id": "official-ik-pinned-cli",
+      "harness": "official ik_llama.cpp pinned commit 4e87a0e7fe75f906e2fcfa4d7671494d43a46ed5",
+      "binary": "/tmp/lair-tools/ik_official_src/build/bin/llama-cli",
+      "buildStatus": 0,
+      "failures": [
+        {
+          "status": 139,
+          "signal": "SIGSEGV",
+          "note": "Segfault while running target model."
+        },
+        {
+          "variant": "fa-auto",
+          "status": 136,
+          "signal": "SIGFPE",
+          "note": "Floating point exception."
+        },
+        {
+          "variant": "fa-auto-no-mmap",
+          "status": 1,
+          "note": "Unknown argument -no-mmap in this pinned build."
+        }
+      ]
+    },
+    {
+      "id": "unofficial-ik-prebuilt-pinned",
+      "harness": "Thireus ik_llama.cpp prebuilt releases main-b5431-4e87a0e and main-b5574-45acbfc",
+      "failure": "symbol lookup error: undefined symbol: llama_get_dflash_draft_lattice_top_k",
+      "note": "Failed during actual generation on the target model."
+    }
+  ]
+}

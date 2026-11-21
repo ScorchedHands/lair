@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flash-Next Reality Check — 2026-11-21T07:04:13Z</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.45; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.2rem; }
+  h2 { font-size: 1.15rem; margin-top: 1.8rem; border-bottom: 1px solid #8884; padding-bottom: 0.25rem; }
+  .meta { color: #666; font-size: 0.9rem; margin-bottom: 1.2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 0.6rem 0 1.2rem; font-size: 0.88rem; }
+  th, td { border: 1px solid #8884; padding: 0.4rem 0.55rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .chart-wrap { margin: 1rem 0 1.5rem; }
+  canvas { max-height: 420px; }
+  code { font-family: ui-monospace, monospace; font-size: 0.85em; }
+  .note { background: #8881; border-left: 3px solid #8886; padding: 0.5rem 0.8rem; margin: 0.8rem 0; font-size: 0.9rem; }
+  ul { margin: 0.3rem 0 0.8rem; }
+</style>
+</head>
+<body>
+<h1>Flash-Next Reality Check</h1>
+<div class="meta">
+  reportId: <code>flash-next-reality-check-2026-11-21T07-04-13Z</code> ·
+  generated 2026-11-21T07:04:13Z ·
+  lane: Xeon CPU-only ·
+  phase: MVP7 ·
+  branch: <code>phase/mvp6.1</code>
+</div>
+
+<h2>Host</h2>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>Hostname</td><td>lair</td></tr>
+  <tr><td>OS</td><td>Linux 6.8.12-43-pve (Debian trixie)</td></tr>
+  <tr><td>CPU</td><td>Intel Xeon E5-2683 v4 @ 2.10GHz · 64 logical cores</td></tr>
+  <tr><td>Memory</td><td>270,313,869,312 bytes (~252 GiB)</td></tr>
+  <tr><td>CPU features</td><td>AVX, AVX2 (no AVX-512 / VNNI / VBMI / BF16)</td></tr>
+  <tr><td>tmpfs (/tmp)</td><td>126G total · 72G used at capture · 55G available</td></tr>
+</table>
+
+<h2>Model geometry</h2>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>Model</td><td>Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS (qwen4exp)</td></tr>
+  <tr><td>Quant</td><td>IQ3_XXS · 3.0625 bpw</td></tr>
+  <tr><td>Size / params</td><td>70.62 GiB · 176.94 B</td></tr>
+  <tr><td>Shards</td><td>2 (47,039,860,096 + 28,800,138,432 bytes)</td></tr>
+  <tr><td>Layers</td><td>48</td></tr>
+  <tr><td>Hidden size</td><td>2560</td></tr>
+  <tr><td>Experts</td><td>512 total · 10 active per token</td></tr>
+  <tr><td>Expert FF / shared FF</td><td>640 / 640</td></tr>
+  <tr><td>Active MoE FFN params/token</td><td>2,595,225,600</td></tr>
+  <tr><td>Active MoE FFN bytes/token</td><td>993,484,800 (~947 MiB)</td></tr>
+</table>
+
+<h2>Benchmark results</h2>
+<table>
+  <tr><th>Harness</th><th>Config</th><th class="num">pp128 tok/s</th><th class="num">tg256 tok/s</th></tr>
+  <tr><td>llama.cpp b12032 batched-bench</td><td>-fa off -ngl 0 -t 8</td><td class="num">13.40</td><td class="num">3.18</td></tr>
+  <tr><td>llama.cpp b12032 llama-bench</td><td>default</td><td class="num">13.86</td><td class="num">3.33</td></tr>
+  <tr><td>llama.cpp b12032 llama-bench</td><td>-ncmoe 999</td><td class="num">14.85</td><td class="num">3.27</td></tr>
+  <tr><td>official ik_llama.cpp main llama-bench</td><td>-fa off</td><td class="num">24.07</td><td class="num">4.31</td></tr>
+  <tr><td>official ik_llama.cpp main llama-bench</td><td>-fa auto</td><td class="num">23.50</td><td class="num">4.33</td></tr>
+</table>
+
+<div class="chart-wrap">
+  <canvas id="benchChart"></canvas>
+</div>
+
+<h2>CLI generation runs</h2>
+<table>
+  <tr><th>Harness</th><th>Config</th><th class="num">prompt tok/s</th><th class="num">gen tok/s</th><th>Notes</th></tr>
+  <tr><td>llama.cpp b12032 llama-cli</td><td>-fa off -n 256 greedy</td><td class="num">10.55</td><td class="num">3.26</td><td>256 tokens generated</td></tr>
+  <tr><td>official ik main llama-cli</td><td>raw + chat variants</td><td class="num">16.7–17.6</td><td class="num">EOS-only</td><td>1 token generated; not usable for throughput</td></tr>
+</table>
+
+<h2>Failed harnesses</h2>
+<table>
+  <tr><th>Harness</th><th>Failure</th></tr>
+  <tr><td>official ik_llama.cpp pinned 4e87a0e</td><td>SIGSEGV (139) on target model; SIGFPE (136) under -fa auto</td></tr>
+  <tr><td>Thireus ik prebuilt b5431 / b5574</td><td>undefined symbol: llama_get_dflash_draft_lattice_top_k</td></tr>
+</table>
+
+<h2>Derived decode bandwidth</h2>
+<table>
+  <tr><th>Run</th><th class="num">tg256 tok/s</th><th class="num">est. GB/s active MoE FFN</th></tr>
+  <tr><td>mainline batched-bench</td><td class="num">3.18</td><td class="num">3.16</td></tr>
+  <tr><td>mainline llama-bench default</td><td class="num">3.33</td><td class="num">3.31</td></tr>
+  <tr><td>mainline llama-bench -ncmoe 999</td><td class="num">3.27</td><td class="num">3.25</td></tr>
+  <tr><td>official ik main -fa off</td><td class="num">4.31</td><td class="num">4.28</td></tr>
+  <tr><td>official ik main -fa auto</td><td class="num">4.33</td><td class="num">4.30</td></tr>
+</table>
+<div class="note">Bytes/token estimate = active routed experts (10 × 3 × 2560 × 640 × 48) + shared expert (3 × 2560 × 640 × 48) × 3.0625 bpw. It is an active-FFN weight-traffic estimate, not a measured DRAM byte counter.</div>
+
+<h2>Expert-gather observations</h2>
+<ul>
+  <li>Mainline b12032: n_expert=512, n_expert_used=10, n_expert_groups=0.</li>
+  <li>Official ik main: fused_moe=1, graph nodes=4750, graph splits=1, "enabling only_active_experts scheduling".</li>
+  <li>Neither harness logged per-layer selected expert ids; LAIR gather design will rely on the recorded geometry (512 total / 10 active) rather than harness expert traces.</li>
+</ul>
+
+<h2>Gate verdict</h2>
+<ul>
+  <li>Official pinned ik_llama.cpp cannot run the target model (segfault/FPE) — rejected as a baseline harness.</li>
+  <li>Official main ik_llama.cpp llama-bench is the usable ik baseline: pp128 ≈ 24 tok/s, tg256 ≈ 4.3 tok/s.</li>
+  <li>Mainline llama.cpp b12032 baseline: pp128 ≈ 13.9–14.9 tok/s, tg256 ≈ 3.2–3.3 tok/s.</li>
+  <li>ik_llama.cpp main is ~1.7× mainline on prefill and ~1.3× on decode on this Xeon — the MoE-specific optimizations (only_active_experts scheduling, fused MoE) are the visible source of the gap.</li>
+  <li>CUDA observations remain deferred to a scripted idle-accelerator run per DN-M7-13.</li>
+</ul>
+
+<script>
+const labels = [
+  "mainline batched-bench",
+  "mainline llama-bench",
+  "mainline llama-bench -ncmoe",
+  "ik main llama-bench -fa off",
+  "ik main llama-bench -fa auto"
+];
+const pp = [13.40, 13.86, 14.85, 24.07, 23.50];
+const tg = [3.18, 3.33, 3.27, 4.31, 4.33];
+new Chart(document.getElementById("benchChart"), {
+  type: "bar",
+  data: {
+    labels,
+    datasets: [
+      { label: "pp128 tok/s", data: pp, backgroundColor: "#4c78a8" },
+      { label: "tg256 tok/s", data: tg, backgroundColor: "#f58518" }
+    ]
+  },
+  options: {
+    responsive: true,
+    plugins: { title: { display: true, text: "Flash-Next CPU bench — pp128 vs tg256 (Xeon E5-2683 v4, 8 threads)" } },
+    scales: { y: { beginAtZero: true, title: { display: true, text: "tokens / second" } } }
+  }
+});
+</script>
+</body>
+</html>

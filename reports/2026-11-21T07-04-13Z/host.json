@@ -1,0 +1,70 @@
+{
+  "schemaVersion": 1,
+  "reportId": "flash-next-reality-check-2026-11-21T07-04-13Z",
+  "host": {
+    "hostname": "lair",
+    "os": "Linux 6.8.12-43-pve",
+    "distribution": "Debian GNU/Linux 13 (trixie)",
+    "cpuCount": 64,
+    "cpuModel": "Intel(R) Xeon(R) CPU E5-2683 v4 @ 2.10GHz",
+    "memoryTotalBytes": 270313869312,
+    "tmpfsMount": "/tmp",
+    "tmpfsSizeDisplay": "126G",
+    "tmpfsUsedDisplayAtCapture": "72G",
+    "tmpfsAvailableDisplayAtCapture": "55G",
+    "cpuFlagsMatched": [
+      "avx",
+      "avx2"
+    ],
+    "cpuFlagsAbsent": [
+      "avx512",
+      "vnni",
+      "vbmi",
+      "bf16"
+    ],
+    "lane": "CPU-only",
+    "notes": [
+      "SSH profile lair-lab maps to 192.168.33.53.",
+      "Pinned Flash-Next shards were transferred to /tmp/lair-models using a local Range-capable HTTP server.",
+      "The Xeon root filesystem had been increased before the model transfer; exact root size was not rechecked in this capture."
+    ]
+  },
+  "model": {
+    "name": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS",
+    "architecture": "qwen4exp",
+    "quant": "IQ3_XXS",
+    "bitsPerWeight": 3.0625,
+    "reportedModelSize": "70.62 GiB",
+    "reportedParams": "176.94 B",
+    "shards": [
+      {
+        "name": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+        "expectedBytes": 47039860096,
+        "remotePath": "/tmp/lair-models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf"
+      },
+      {
+        "name": "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+        "expectedBytes": 28800138432,
+        "remotePath": "/tmp/lair-models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf"
+      }
+    ],
+    "expertGeometry": {
+      "layers": 48,
+      "hiddenSize": 2560,
+      "expertCount": 512,
+      "expertUsedCount": 10,
+      "expertFeedForwardLength": 640,
+      "sharedExpertFeedForwardLength": 640,
+      "routedExpertParamsPerToken": 2359296000,
+      "sharedExpertParamsPerToken": 235929600,
+      "activeMoEFfnParamsPerToken": 2595225600,
+      "activeMoEFfnBytesPerToken": 993484800,
+      "activeMoEFfnMiBPerToken": 947.45
+    },
+    "expertGatherObservations": [
+      "Mainline b12032 reports n_expert=512 and n_expert_used=10.",
+      "Official main ik_llama.cpp reports n_expert=512, n_expert_used=10, fused_moe=1, graph nodes=4750, graph splits=1, and enabling only_active_experts scheduling.",
+      "Mainline CLI reasoning output explicitly discussed expert gather behavior, but the harness logs did not print per-layer selected expert ids."
+    ]
+  }
+}

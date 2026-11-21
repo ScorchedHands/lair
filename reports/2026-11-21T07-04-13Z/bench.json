@@ -1,0 +1,157 @@
+{
+  "schemaVersion": 1,
+  "reportId": "flash-next-reality-check-2026-11-21T07-04-13Z",
+  "bench": [
+    {
+      "id": "mainline-batched-bench",
+      "harness": "llama.cpp b12032 llama-batched-bench",
+      "binary": "/tmp/lair-tools/llama.cpp/b12032/llama-b12032/llama-batched-bench",
+      "version": "b12032",
+      "command": "/tmp/lair-tools/llama.cpp/b12032/llama-b12032/llama-batched-bench -m /tmp/lair-models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf --verbose -ngl 0 -t 8 -tb 8 -c 2048 -b 512 -ub 512 -npp 128 -ntg 256 -npl 1 -fa off",
+      "status": 0,
+      "metrics": [
+        {
+          "test": "pp128",
+          "tokensPerSecond": 13.40
+        },
+        {
+          "test": "tg256",
+          "tokensPerSecond": 3.18
+        },
+        {
+          "test": "total",
+          "tokensPerSecond": 4.27
+        }
+      ],
+      "stdoutTable": "|    PP |     TG |    B |   N_KV |   T_PP s | S_PP t/s |   T_TG s | S_TG t/s |      T s |    S t/s |\n|-------|--------|------|--------|----------|----------|----------|----------|----------|----------|\n|   128 |    256 |    1 |    384 |    9.554 |    13.40 |   80.479 |     3.18 |   90.033 |     4.27 |",
+      "artifactPaths": {
+        "stdout": "/tmp/lair-reality-check/llama-b12032.batched.stdout.txt",
+        "stderr": "/tmp/lair-reality-check/llama-b12032.batched.stderr.txt"
+      }
+    },
+    {
+      "id": "mainline-llama-bench-default",
+      "harness": "llama.cpp b12032 llama-bench",
+      "binary": "/tmp/lair-tools/llama.cpp/b12032/llama-b12032/llama-bench",
+      "version": "dde879bc4 (12032)",
+      "command": "/tmp/lair-tools/llama.cpp/b12032/llama-b12032/llama-bench -m /tmp/lair-models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf -t 8 -b 512 -ub 512 -ngl 0 -p 128 -n 256 -r 1 -o md --verbose",
+      "status": 0,
+      "metrics": [
+        {
+          "test": "pp128",
+          "tokensPerSecond": 13.86
+        },
+        {
+          "test": "tg256",
+          "tokensPerSecond": 3.33
+        }
+      ],
+      "stdoutTable": "| model                          |       size |     params | backend    | threads | n_batch |            test |                  t/s |\n| ------------------------------ | ---------: | ---------: | ---------- | ------: | ------: | --------------: | -------------------: |\n| qwen4exp A3B IQ3_XXS - 3.0625 bpw |  70.62 GiB |   176.94 B | CPU        |       8 |     512 |           pp128 |         13.86 ± 0.00 |\n| qwen4exp A3B IQ3_XXS - 3.0625 bpw |  70.62 GiB |   176.94 B | CPU        |       8 |     512 |           tg256 |          3.33 ± 0.00 |",
+      "artifactPaths": {
+        "stdout": "/tmp/lair-reality-check/llama-b12032-bench-default.bench.stdout.txt",
+        "stderr": "/tmp/lair-reality-check/llama-b12032-bench-default.bench.stderr.txt"
+      }
+    },
+    {
+      "id": "mainline-llama-bench-ncmoe999",
+      "harness": "llama.cpp b12032 llama-bench",
+      "binary": "/tmp/lair-tools/llama.cpp/b12032/llama-b12032/llama-bench",
+      "version": "dde879bc4 (12032)",
+      "command": "/tmp/lair-tools/llama.cpp/b12032/llama-b12032/llama-bench -m /tmp/lair-models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf -t 8 -b 512 -ub 512 -ngl 0 -p 128 -n 256 -r 1 -o md --verbose -ncmoe 999",
+      "status": 0,
+      "metrics": [
+        {
+          "test": "pp128",
+          "tokensPerSecond": 14.85
+        },
+        {
+          "test": "tg256",
+          "tokensPerSecond": 3.27
+        }
+      ],
+      "stdoutTable": "| model                          |       size |     params | backend    |  n_cpu_moe | threads | n_batch |            test |                  t/s |\n| ------------------------------ | ---------: | ---------: | ---------- | ---------: | ------: | ------: | --------------: | -------------------: |\n| qwen4exp A3B IQ3_XXS - 3.0625 bpw |  70.62 GiB |   176.94 B | CPU        |        999 |       8 |     512 |           pp128 |         14.85 ± 0.00 |\n| qwen4exp A3B IQ3_XXS - 3.0625 bpw |  70.62 GiB |   176.94 B | CPU        |        999 |       8 |     512 |           tg256 |          3.27 ± 0.00 |",
+      "artifactPaths": {
+        "stdout": "/tmp/lair-reality-check/llama-b12032-bench-ncmoe999.bench.stdout.txt",
+        "stderr": "/tmp/lair-reality-check/llama-b12032-bench-ncmoe999.bench.stderr.txt"
+      }
+    },
+    {
+      "id": "official-ik-main-bench-fa-off",
+      "harness": "official ik_llama.cpp main llama-bench",
+      "binary": "/tmp/lair-tools/ik_official_main_src/build/bin/llama-bench",
+      "version": "7c00f8788e303bfba2886138e288effb0fd5fbbf",
+      "command": "/tmp/lair-tools/ik_official_main_src/build/bin/llama-bench -m /tmp/lair-models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf -t 8 -tb 8 -b 512 -ub 512 -ngl 0 -p 128 -n 256 -r 1 -o md --verbose -fa off",
+      "status": 0,
+      "metrics": [
+        {
+          "test": "pp128",
+          "tokensPerSecond": 24.07
+        },
+        {
+          "test": "tg256",
+          "tokensPerSecond": 4.31
+        }
+      ],
+      "stdoutTable": "| model                          |       size |     params | backend    | threads | n_batch | fa |          test |              t/s |\n| ------------------------------ | ---------: | ---------: | ---------- | ------: | ------: | -: | ------------: | ---------------: |\n| qwen4exp 125B.A6B IQ3_XXS - 3.0625 bpw |  70.62 GiB |   176.94 B | CPU        |       8 |     512 |  0 |         pp128 |     24.07 ± 0.00 |\n| qwen4exp 125B.A6B IQ3_XXS - 3.0625 bpw |  70.62 GiB |   176.94 B | CPU        |       8 |     512 |  0 |         tg256 |      4.31 ± 0.00 |",
+      "artifactPaths": {
+        "stdout": "/tmp/lair-reality-check/ik-official-main-bench-fa-off.bench.stdout.txt",
+        "stderr": "/tmp/lair-reality-check/ik-official-main-bench-fa-off.bench.stderr.txt"
+      }
+    },
+    {
+      "id": "official-ik-main-bench-fa-auto",
+      "harness": "official ik_llama.cpp main llama-bench",
+      "binary": "/tmp/lair-tools/ik_official_main_src/build/bin/llama-bench",
+      "version": "7c00f8788e303bfba2886138e288effb0fd5fbbf",
+      "command": "/tmp/lair-tools/ik_official_main_src/build/bin/llama-bench -m /tmp/lair-models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf -t 8 -tb 8 -b 512 -ub 512 -ngl 0 -p 128 -n 256 -r 1 -o md --verbose -fa auto",
+      "status": 0,
+      "metrics": [
+        {
+          "test": "pp128",
+          "tokensPerSecond": 23.50
+        },
+        {
+          "test": "tg256",
+          "tokensPerSecond": 4.33
+        }
+      ],
+      "stdoutTable": "| model                          |       size |     params | backend    | threads | n_batch |          test |              t/s |\n| ------------------------------ | ---------: | ---------: | ---------- | ------: | ------: | ------------: | ---------------: |\n| qwen4exp 125B.A6B IQ3_XXS - 3.0625 bpw |  70.62 GiB |   176.94 B | CPU        |       8 |     512 |         pp128 |     23.50 ± 0.00 |\n| qwen4exp 125B.A6B IQ3_XXS - 3.0625 bpw |  70.62 GiB |   176.94 B | CPU        |       8 |     512 |         tg256 |      4.33 ± 0.00 |",
+      "artifactPaths": {
+        "stdout": "/tmp/lair-reality-check/ik-official-main-bench-fa-auto.bench.stdout.txt",
+        "stderr": "/tmp/lair-reality-check/ik-official-main-bench-fa-auto.bench.stderr.txt"
+      }
+    }
+  ],
+  "bytesPerTokenEstimate": {
+    "method": "Active MoE FFN weight bytes per token from GGUF geometry and IQ3_XXS bits/weight.",
+    "activeMoEFfnBytesPerToken": 993484800,
+    "derivedDecodeBandwidthBytesPerSecond": [
+      {
+        "benchId": "mainline-batched-bench",
+        "tokensPerSecond": 3.18,
+        "bytesPerSecond": 3159281664
+      },
+      {
+        "benchId": "mainline-llama-bench-default",
+        "tokensPerSecond": 3.33,
+        "bytesPerSecond": 3308304384
+      },
+      {
+        "benchId": "mainline-llama-bench-ncmoe999",
+        "tokensPerSecond": 3.27,
+        "bytesPerSecond": 3248695296
+      },
+      {
+        "benchId": "official-ik-main-bench-fa-off",
+        "tokensPerSecond": 4.31,
+        "bytesPerSecond": 4281919488
+      },
+      {
+        "benchId": "official-ik-main-bench-fa-auto",
+        "tokensPerSecond": 4.33,
+        "bytesPerSecond": 4301789184
+      }
+    ],
+    "caveat": "This is an active-FFN weight-traffic estimate, not a measured DRAM byte counter."
+  }
+}
