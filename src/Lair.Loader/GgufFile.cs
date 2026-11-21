@@ -9,6 +9,17 @@ namespace Lair.Loader;
 /// offsets and payload sizes. Tensor payload bytes are not read here; an
 /// <see cref="IWeightSource"/> such as <see cref="GgufMmapWeightSource"/> maps
 /// them on demand.
+///
+/// A model whose file name carries the llama.cpp split shape
+/// `<prefix>-NNNNN-of-NNNNN.<ext>` is opened as a whole: its sibling shards in
+/// the same directory are discovered, validated as one internally consistent
+/// set, and assembled into one logical tensor table with merged metadata. In an
+/// assembled model every <see cref="LogicalTensor.Offset"/> stays relative to
+/// the data region of **its own shard's** physical file (as the GGUF spec
+/// defines it), so only a weight source that consults <see cref="Shards"/> —
+/// such as <see cref="GgufMmapWeightSource"/> — can map tensor spans. An
+/// ordinary single-file model keeps today's meaning: offsets relative to this
+/// file's own data region, and <see cref="Shards"/> is null.
 /// </summary>
 public sealed class GgufFile : IDisposable
 {
@@ -16,6 +27,7 @@ public sealed class GgufFile : IDisposable
     private const int DefaultAlignment = 32;
 
     private FileStream? _stream;
+    private readonly IReadOnlyList<GgufFile>? _shards;
 
     private GgufFile(
         string path,
@@ -25,7 +37,8 @@ public sealed class GgufFile : IDisposable
         LogicalTensorTable tensors,
         long dataStart,
         long fileSize,
-        FileStream stream)
+        FileStream? stream,
+        IReadOnlyList<GgufFile>? shards = null)
     {
         Path = path;
         Version = version;
@@ -35,26 +48,58 @@ public sealed class GgufFile : IDisposable
         DataStart = dataStart;
         FileSize = fileSize;
         _stream = stream;
+        _shards = shards;
     }
 
     public string Path { get; }
 
+    /// <summary>GGUF version of the primary (lowest-numbered) physical shard.</summary>
     public int Version { get; }
 
+    /// <summary><c>general.alignment</c> in effect for the primary (lowest-numbered) physical shard.</summary>
     public int Alignment { get; }
 
     public GgufMetadata Metadata { get; }
 
     public LogicalTensorTable Tensors { get; }
 
+    /// <summary>Data-region start of the primary (lowest-numbered) physical shard. Each shard in 
+    /// <see cref="Shards"/> carries its own data region.</summary>
     public long DataStart { get; }
 
+    /// <summary>Total length of the primary (lowest-numbered) physical shard.</summary>
     public long FileSize { get; }
 
-    public static GgufFile Open(string path)
-    {
-        ArgumentNullException.ThrowIfNull(path);
+    /// <summary>The physical files backing this model in ascending shard order when a split was assembled, 
+    /// each parsed from its own file with its own data region and tensor table; null for an ordinary 
+    /// single-file model. The entry point that opened the split is one of these shards — any member of a 
+    /// complete set opens the same logical model.</summary>
+    public IReadOnlyList<GgufFile>? Shards => _shards;
 
+    /// <summary>Opens a GGUF model. A file named `<prefix>-NNNNN-of-NNNNN.<ext>` is treated as one member of 
+    /// a split: its sibling shards are discovered in the same directory, validated as one set, and assembled 
+    /// into this single view (see the type summary). Any other name opens exactly one container.</summary>
+    public static GgufFile Open(string modelPath) => OpenCore(modelPath, assemblyAllowed: true);
+
+    /// <summary>Opens exactly one physical GGUF container with no split discovery — every sibling member of a 
+    /// split set is inspected per-file through this entry point rather than assembled.</summary>
+    public static GgufFile OpenSingle(string path) => OpenCore(path, assemblyAllowed: false);
+
+    private static GgufFile OpenCore(string modelPath, bool assemblyAllowed)
+    {
+        ArgumentNullException.ThrowIfNull(modelPath);
+
+        if (assemblyAllowed &&
+            GgufShardNaming.TryParse(System.IO.Path.GetFileName(modelPath), out string prefix, out string extension, out int index, out int total))
+        {
+            return OpenSplitModel(modelPath, prefix, extension, index, total);
+        }
+
+        return OpenSingleFile(modelPath);
+    }
+
+    private static GgufFile OpenSingleFile(string path)
+    {
         FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
         try
         {
@@ -68,11 +113,253 @@ public sealed class GgufFile : IDisposable
         }
     }
 
+    private static GgufFile OpenSplitModel(string modelPath, string prefix, string extension, int index, int total)
+    {
+        if (index < 1 || total < 1 || index > total)
+        {
+            throw new GgufException(
+                $"'{modelPath}' names shard {index:D5} of a split whose name declares {total:D5} shards — the numbering is inconsistent");
+        }
+
+        string directory = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(modelPath))!;
+        List<string> shardPaths = [];
+        foreach (string fileName in GgufShardNaming.ShardFileNames(prefix, extension, total))
+        {
+            string candidate = System.IO.Path.Combine(directory, fileName);
+            if (!File.Exists(candidate))
+            {
+                throw new GgufException(
+                    $"'{modelPath}' is shard {index:D5} of a split named with {total:D5} shards but the sibling " +
+                    $"'{candidate}' was not found in '{directory}'");
+            }
+
+            shardPaths.Add(candidate);
+        }
+
+        List<GgufFile> shards = [];
+        try
+        {
+            foreach (string shardPath in shardPaths)
+            {
+                shards.Add(OpenSingleFile(shardPath)); // a broken sibling refuses naming that file.
+            }
+        }
+        catch
+        {
+            foreach (GgufFile opened in shards)
+            {
+                opened.Dispose();
+            }
+
+            throw;
+        }
+
+        return AssembleSplit(modelPath, [.. shards]);
+    }
+
+    private static GgufFile AssembleSplit(string modelPath, IReadOnlyList<GgufFile> shards)
+    {
+        int total = shards.Count;
+        GgufFile primary = shards[0];
+
+        foreach (GgufFile shard in shards)
+        {
+            if (shard.Version != primary.Version)
+            {
+                throw new GgufException(
+                    $"'{modelPath}' is not internally consistent: '{primary.Path}' has GGUF version {primary.Version} " +
+                    $"but '{shard.Path}' has GGUF version {shard.Version}");
+            }
+        }
+
+        // The split identity keys every llama.cpp shard declares. Each key must appear in all shards or none, and 
+        // each declared value must agree with the position its own file name claims — a shard whose metadata 
+        // disagrees with its place in the set cannot silently map to the wrong bytes.
+        string[] splitKeys = [GgufSplitKeys.No, GgufSplitKeys.Count, GgufSplitKeys.TensorsCount];
+        foreach (string key in splitKeys)
+        {
+            List<GgufFile> declaring = shards.Where(shard => shard.Metadata.Has(key)).ToList();
+            if (declaring.Count == 0)
+            {
+                continue; // no split identity declared: the file-name shape alone assembles the set.
+            }
+
+            foreach (GgufFile shard in shards)
+            {
+                if (!shard.Metadata.Has(key))
+                {
+                    throw new GgufException(
+                        $"'{modelPath}' is not internally consistent: '{declaring[0].Path}' declares '{key}' " +
+                        $"but sibling '{shard.Path}' carries no such key");
+                }
+            }
+
+            if (key == GgufSplitKeys.No)
+            {
+                for (int i = 0; i < total; i++)
+                {
+                    long declared = shards[i].Metadata.Get(key).AsLong();
+                    if (declared != i) // split.no is zero-based in every llama.cpp writer.
+                    {
+                        throw new GgufException(
+                            $"'{modelPath}' is not internally consistent: '{shards[i].Path}' declares " +
+                            $"{GgufSplitKeys.No} = {declared} but its name places it at shard position {i + 1:D5} of the split");
+                    }
+                }
+
+                continue;
+            }
+
+            long firstValue = declaring[0].Metadata.Get(key).AsLong();
+            foreach (GgufFile shard in declaring)
+            {
+                long value = shard.Metadata.Get(key).AsLong();
+                if (value != firstValue)
+                {
+                    throw new GgufException(
+                        $"'{modelPath}' is not internally consistent: '{declaring[0].Path}' declares " +
+                        $"'{key}' = {firstValue} but sibling '{shard.Path}' declares {value}");
+                }
+
+                if (key == GgufSplitKeys.Count && value != total)
+                {
+                    throw new GgufException(
+                        $"'{modelPath}' is not internally consistent: '{shard.Path}' declares " +
+                        $"{GgufSplitKeys.Count} = {value} but the file-name shape names a split of {total:D5} shards");
+                }
+            }
+
+            if (key == GgufSplitKeys.TensorsCount)
+            {
+                long declaredTensors = firstValue;
+                long assembledTensors = 0;
+                foreach (GgufFile shard in shards)
+                {
+                    assembledTensors += shard.Tensors.Tensors.Count;
+                }
+
+                if (declaredTensors < 0 || declaredTensors != assembledTensors)
+                {
+                    throw new GgufException(
+                        $"'{modelPath}' is not internally consistent: the split headers declare " +
+                        $"{GgufSplitKeys.TensorsCount} = {firstValue} tensors but the shard tensor tables assemble {assembledTensors}");
+                }
+            }
+        }
+
+        // Tensor names must be disjoint across shards, and every name maps to exactly one physical file. A 
+        // repeated declaration is a broken set: resolving it could read either payload.
+        Dictionary<string, GgufFile> tensorShardIndex = new(StringComparer.Ordinal);
+        List<LogicalTensor> tensors = [];
+        foreach (GgufFile shard in shards)
+        {
+            foreach (LogicalTensor tensor in shard.Tensors.Tensors)
+            {
+                if (!tensorShardIndex.TryAdd(tensor.Name, shard))
+                {
+                    throw new GgufException(
+                        $"'{modelPath}' is not internally consistent: tensor '{tensor.Name}' is declared by both " +
+                        $"'{tensorShardIndex[tensor.Name].Path}' and sibling '{shard.Path}'; split shards must carry disjoint tensor tables");
+                }
+
+                tensors.Add(tensor); // offsets stay relative to this shard's own data region.
+            }
+        }
+
+        // Metadata merges with the primary (lowest-numbered) shard winning every collision — it carries the 
+        // architecture and tokenizer keys while continuation shards add nothing new. Only `split.no` is allowed 
+        // to differ across files, because that key records each file's own position; any other shared key with a 
+        // different value is two headers disagreeing about one model.
+        Dictionary<string, GgufValue> merged = new(StringComparer.Ordinal);
+        List<GgufFile> sources = [];
+        foreach (GgufFile shard in shards)
+        {
+            foreach (string key in shard.Metadata.Keys)
+            {
+                if (!merged.TryGetValue(key, out GgufValue? existing))
+                {
+                    merged[key] = shard.Metadata.Get(key);
+                    sources.Add(shard);
+                    continue;
+                }
+
+                if (key != GgufSplitKeys.No && !ValuesEqual(existing, shard.Metadata.Get(key)))
+                {
+                    int ownerIndex = 0;
+                    while (!sources[ownerIndex].Metadata.Has(key))
+                    {
+                        ownerIndex++;
+                    }
+
+                    throw new GgufException(
+                        $"'{modelPath}' is not internally consistent: metadata key '{key}' carries different values " +
+                        $"in '{sources[ownerIndex].Path}' and sibling '{shard.Path}'");
+                }
+            }
+        }
+
+        GgufMetadata mergedMetadata = new(merged);
+        LogicalTensorTable table = new(tensors);
+        return new GgufFile(
+            modelPath,
+            primary.Version,
+            primary.Alignment,
+            mergedMetadata,
+            table,
+            primary.DataStart,
+            primary.FileSize,
+            stream: null,
+            shards);
+    }
+
+    private static bool ValuesEqual(GgufValue left, GgufValue right)
+    {
+        if (left.Type != right.Type)
+        {
+            return false;
+        }
+
+        switch (left.Type)
+        {
+            case GgufValueType.String:
+                return string.Equals(left.AsString(), right.AsString(), StringComparison.Ordinal);
+            case GgufValueType.Array:
+                IReadOnlyList<GgufValue> leftElements = left.AsArray();
+                IReadOnlyList<GgufValue> rightElements = right.AsArray();
+                if (leftElements.Count != rightElements.Count)
+                {
+                    return false;
+                }
+
+                for (int i = 0; i < leftElements.Count; i++)
+                {
+                    if (!ValuesEqual(leftElements[i], rightElements[i]))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            case GgufValueType.Float32 or GgufValueType.Float64:
+                return left.AsDouble() == right.AsDouble();
+            default: // integer and bool kinds compare through their stored value.
+                return left.AsLong() == right.AsLong();
+        }
+    }
+
     public void Dispose()
     {
         FileStream? stream = _stream;
         _stream = null;
         stream?.Dispose();
+
+        if (_shards is not null)
+        {
+            foreach (GgufFile shard in _shards)
+            {
+                shard.Dispose(); // idempotent: each physical shard releases its own container handle.
+            }
+        }
     }
 
     private static GgufFile Parse(string path, BinaryReader reader, FileStream stream)

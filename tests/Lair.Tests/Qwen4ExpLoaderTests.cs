@@ -4,15 +4,17 @@ using Lair.Loader;
 namespace Lair.Tests;
 
 /// <summary>
- /// Loader gate for the owner's target model, Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS (architecture qwen4exp), shipped as
- /// two GGUF shards on disk (skip-if-absent against those absolute paths): LAIR parses each shard container-to-the-end,
- /// every tensor declared across both shards resolves through the <see cref="GgmlTypeRegistry"/> acceptance path with its
- /// block geometry intact, and each header's offsets/sizes are internally consistent within its own file. Measured from
- /// the shipped files: a split GGUF carries only its own tensors in its header — shard 1 declares 1223 tensor infos plus
- /// the full model metadata, shard 2 (the 28.8 GB PLE table) declares just one tensor and three split.* keys; the global
- /// count lives in general-independent metadata as split.tensors.count = 1224 — so LAIR resolving both files per-shard is
- /// what covers the whole model, not a single-file open. No test here mmaps or reads tensor payload bytes: only LAIR's own
- /// header/tensor-table parse path runs.
+/// Loader gate for the owner's target model, Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS (architecture qwen4exp), shipped as
+/// two GGUF shards on disk (skip-if-absent against those absolute paths): opening either shard assembles the whole
+/// split as one logical model — the two shard headers resolve as a single 1224-tensor table carrying shard 2's
+/// `per_layer_token_embd.weight`, the merged metadata carries shard 1's architecture, and each physical shard keeps
+/// its own data region and disjoint tensor table behind <see cref="GgufFile.Shards"/>. Every tensor declared across
+/// both shards resolves through the <see cref="GgmlTypeRegistry"/> acceptance path with its block geometry intact, and
+/// each header's offsets/sizes are internally consistent within its own file. Measured from the shipped files: a split
+/// GGUF carries only its own tensors in its header — shard 1 declares 1223 tensor infos plus the full model metadata,
+/// shard 2 (the 28.8 GB PLE table) declares just one tensor and three split.* keys; the global count lives in
+/// general-independent metadata as split.tensors.count = 1224. No test here mmaps or reads tensor payload bytes: only
+/// LAIR's own header/tensor-table parse and assembly path runs.
 /// </summary>
 [Trait("Category", "Loader")]
 public sealed class Qwen4ExpLoaderTests
@@ -66,10 +68,10 @@ public sealed class Qwen4ExpLoaderTests
         new(GgmlType.BF16, "BF16", QuantFormat.BF16, 1, 2),
     ];
 
-    // ---------------------------------------------------------------- container parse of both shards
+    // ---------------------------------------------------------------- assembled parse of both shards
 
     [Fact]
-    public void Open_Qwen4ExpShards_ParseWithSanityHeaderValues()
+    public void Open_Qwen4ExpShards_AssemblesOneModelWithSanityHeaderValues()
     {
         string? first = ResolveShardPath(FirstShardName);
         string? second = ResolveShardPath(SecondShardName);
@@ -78,43 +80,59 @@ public sealed class Qwen4ExpLoaderTests
             return; // real-model tests skip when the fixture is absent (xunit 2.9 has no dynamic Assert.Skip)
         }
 
-        using GgufFile shard1 = GgufFile.Open(first);
-        using GgufFile shard2 = GgufFile.Open(second);
+        using GgufFile model = GgufFile.Open(first);
+        Assert.NotNull(model.Shards);
+        IReadOnlyList<GgufFile> shards = model.Shards!;
+        Assert.Equal(2, shards.Count);
+        Assert.Equal(first, Path.GetFullPath(shards[0].Path));
+        Assert.Equal(second, Path.GetFullPath(shards[1].Path)); // discovered in ascending shard order from either member.
 
-        foreach (GgufFile shard in new[] { shard1, shard2 })
+        foreach (GgufFile shard in shards)
         {
             Assert.Equal(3, shard.Version); // GGUF v3: 64-bit tensor and KV counts
             Assert.True(shard.Alignment > 0 && shard.DataStart % shard.Alignment == 0, $"data start {shard.DataStart} must be aligned to {shard.Alignment}");
             Assert.True(shard.DataStart < shard.FileSize);
-            Assert.Equal(new FileInfo(shard.Path).Length, shard.FileSize); // the parser reports the real file length for these multi-GB files
+            Assert.Equal(new FileInfo(shard.Path).Length, shard.FileSize); // each shard view reports the real file length for these multi-GB files
         }
 
-        // Header values read sanely on shard 1: full model metadata under qwen4exp plus the split identity.
-        Assert.Equal("qwen4exp", shard1.Metadata.GetString("general.architecture", ""));
-        Assert.Equal(0, shard1.Metadata.GetInt("split.no", -1));
-        Assert.Equal(2, shard1.Metadata.GetInt("split.count", -1));
-        Assert.Equal(DeclaredAcrossShards, shard1.Metadata.GetInt("split.tensors.count", -1));
+        // The merged model metadata carries shard 1's identity: full model metadata under qwen4exp plus the split identity.
+        Assert.Equal("qwen4exp", model.Metadata.GetString("general.architecture", ""));
+        Assert.Equal(0, model.Metadata.GetInt("split.no", -1)); // the primary shard's position wins the merge.
+        Assert.Equal(2, model.Metadata.GetInt("split.count", -1));
+        Assert.Equal(DeclaredAcrossShards, model.Metadata.GetInt("split.tensors.count", -1));
 
         // Shard 2 carries only the split identity: no general.architecture and no model metadata. It is a tensor-data continuation, not a standalone model header.
-        Assert.False(shard2.Metadata.Has("general.architecture"));
-        Assert.Equal(1, shard2.Metadata.GetInt("split.no", -1));
-        Assert.Equal(2, shard2.Metadata.GetInt("split.count", -1));
-        Assert.Equal(DeclaredAcrossShards, shard2.Metadata.GetInt("split.tensors.count", -1));
+        Assert.False(shards[1].Metadata.Has("general.architecture"));
+        Assert.Equal(1, shards[1].Metadata.GetInt("split.no", -1));
+        Assert.Equal(2, shards[1].Metadata.GetInt("split.count", -1));
+        Assert.Equal(DeclaredAcrossShards, shards[1].Metadata.GetInt("split.tensors.count", -1));
 
-        // Each header declares only its own tensors — the phase's "full tensor-info table in every shard" claim does not hold for these files. The global 1224 lives only in split.tensors.count; opening both shards per-shard is what covers the model.
-        Assert.Equal(FirstShardTensors, shard1.Tensors.Tensors.Count);
+        // Each header declares only its own tensors — the phase's "full tensor-info table in every shard" claim does not hold for these files. The global 1224 lives in split.tensors.count and in the assembled table; the assembly is what covers the model.
+        Assert.Equal(FirstShardTensors, shards[0].Tensors.Tensors.Count);
 
         // Shard 2 declares exactly one tensor: the PLE table. GGUF stores it fastest-varying first as [160, 320001536]; LAIR's row-major logical dims reverse that to [320001536, 160].
-        LogicalTensor ple = Assert.Single(shard2.Tensors.Tensors);
+        LogicalTensor ple = Assert.Single(shards[1].Tensors.Tensors);
         Assert.Equal("per_layer_token_embd.weight", ple.Name);
         Assert.Equal(QuantFormat.IQ4_NL, ple.Format);
         Assert.Equal([320001536, 160], ple.Shape.Dims);
 
-        HashSet<string> names1 = new(shard1.Tensors.Tensors.Select(t => t.Name), StringComparer.Ordinal);
-        HashSet<string> names2 = new(shard2.Tensors.Tensors.Select(t => t.Name), StringComparer.Ordinal);
-        Assert.True(names1.Count == FirstShardTensors, "tensor names must be distinct within shard 1");
+        // The assembled table is the disjoint union of both shard tables, and the second shard's tensor is present in it.
+        Assert.Equal(DeclaredAcrossShards, model.Tensors.Tensors.Count);
+        Assert.NotNull(model.Tensors.Find("per_layer_token_embd.weight"));
+
+        HashSet<string> names1 = new(shards[0].Tensors.Tensors.Select(t => t.Name), StringComparer.Ordinal);
+        HashSet<string> names2 = new(shards[1].Tensors.Tensors.Select(t => t.Name), StringComparer.Ordinal);
+        Assert.Equal(FirstShardTensors, names1.Count); // distinct within shard 1
         Assert.Single(names2); // distinct within shard 2
         Assert.True(names2.All(n => !names1.Contains(n)), "the shards must declare disjoint tensor sets");
+
+        // Any member of the set is a valid entry point: opening the last shard assembles the same model.
+        using GgufFile fromLast = GgufFile.Open(second);
+        Assert.NotNull(fromLast.Shards);
+        Assert.Equal(2, fromLast.Shards!.Count);
+        Assert.Equal(DeclaredAcrossShards, fromLast.Tensors.Tensors.Count);
+        Assert.Equal("qwen4exp", fromLast.Metadata.GetString("general.architecture", ""));
+        Assert.NotNull(fromLast.Tensors.Find("per_layer_token_embd.weight"));
     }
 
     // ---------------------------------------------------------------- registry acceptance + geometry for every declared tensor
@@ -131,13 +149,13 @@ public sealed class Qwen4ExpLoaderTests
 
         Dictionary<QuantFormat, QuantDescriptor> pinnedByFormat = AcceptedRows.ToDictionary(d => d.Format);
 
-        using GgufFile shard1 = GgufFile.Open(first); // Open itself runs the registry acceptance path per tensor: any rejection aborts here with a verbatim message.
-        using GgufFile shard2 = GgufFile.Open(second);
+        using GgufFile model = GgufFile.Open(first); // Open itself runs the registry acceptance path per tensor across the assembled set: any rejection aborts here with a verbatim message.
+        Assert.NotNull(model.Shards);
 
         Dictionary<QuantFormat, int> combinedCounts = new();
         int examined = 0;
 
-        foreach ((GgufFile shard, string label) in new[] { (shard1, "shard 1"), (shard2, "shard 2") })
+        foreach ((GgufFile shard, string label) in model.Shards!.Select((s, i) => (s, $"shard {i + 1}")))
         {
             long dataAvailable = shard.FileSize - shard.DataStart;
 
@@ -166,10 +184,14 @@ public sealed class Qwen4ExpLoaderTests
                     tensor.SizeBytes == viaRowStride && tensor.SizeBytes == descriptor.TypeSize * (shape.ElementCount / descriptor.BlockSize),
                     $"{label}: tensor '{tensor.Name}' ({descriptor.Name}) declares {tensor.SizeBytes} bytes, geometry says row stride {shape.RowStrideBytes(tensor.Format)} x rows and {descriptor.TypeSize} bytes per {descriptor.BlockSize}-element block");
 
-                // Offsets/sizes are internally consistent inside this shard header: every payload sits fully in the file's data region.
+                // Offsets/sizes are internally consistent inside this shard header: every payload sits fully in the shard's own data region.
                 Assert.True(
                     tensor.Offset >= 0 && tensor.SizeBytes > 0 && tensor.Offset + tensor.SizeBytes <= dataAvailable,
                     $"{label}: tensor '{tensor.Name}' payload [{tensor.Offset}..{tensor.Offset + tensor.SizeBytes}) does not fit in {dataAvailable} data bytes");
+
+                // The assembled table carries the same tensor record the shard header declared.
+                LogicalTensor assembled = model.Tensors.Find(tensor.Name)!;
+                Assert.Same(tensor, assembled);
 
                 combinedCounts[tensor.Format] = combinedCounts.GetValueOrDefault(tensor.Format) + 1;
                 examined++;
@@ -177,6 +199,7 @@ public sealed class Qwen4ExpLoaderTests
         }
 
         Assert.Equal(DeclaredAcrossShards, examined); // every declared tensor across both shards was examined with zero rejections
+        Assert.Equal(DeclaredAcrossShards, model.Tensors.Tensors.Count); // the assembled table is exactly the union examined here
         Assert.Equal(ExpectedCombinedInventory, combinedCounts);
 
         Console.WriteLine(
@@ -200,8 +223,8 @@ public sealed class Qwen4ExpLoaderTests
         {
             try
             {
-                using GgufFile shard = GgufFile.Open(path); // acceptance-path parse: zero rejections means this completes.
-                Console.WriteLine($"{label}: parsed clean, {shard.Tensors.Tensors.Count} declared tensors accepted");
+                using GgufFile model = GgufFile.Open(path); // assembled acceptance-path parse: zero rejections means this completes from either entry point.
+                Console.WriteLine($"{label}: assembled clean, {model.Tensors.Tensors.Count} tensors across {model.Shards!.Count} shards accepted");
             }
             catch (GgufException ex)
             {

@@ -228,7 +228,7 @@ public sealed class ModelFetcher
     {
         try
         {
-            using GgufFile gguf = GgufFile.Open(path);
+            using GgufFile gguf = GgufFile.OpenSingle(path); // per-file header inspection: a shard set is validated member by member at fetch time, never assembled.
             return gguf.Metadata.Has("split.tensors.count") ? gguf.Metadata.Get("split.tensors.count").AsLong() : null;
         }
         catch (Exception ex) when (ex is GgufException or IOException or UnauthorizedAccessException)
