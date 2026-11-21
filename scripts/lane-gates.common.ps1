@@ -79,6 +79,27 @@ function Get-LaneVolumeFreeMB {
 
     $root = [System.IO.Path]::GetFullPath($Path)
 
+    if ($IsLinux -or $IsMacOS) {
+        try {
+            $dfOutput = & df -Pk "$root" 2>&1 | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ -ne '' }
+            $candidates = @()
+
+            foreach ($line in @($dfOutput)) {
+                if ($line -match '^(\S+)\s+(\d+)\s+\d+\s+(\d+)\s+([0-9]+%)\s+(.+)$') {
+                    $candidates += [pscustomobject]@{ Mount = $Matches[5]; AvailableBlocks = [long]$Matches[3] }
+                }
+            }
+
+            foreach ($candidate in @($candidates | Sort-Object -Property @{Expression={$_.Mount.Length}} -Descending)) {
+                if ($root.StartsWith($candidate.Mount, [StringComparison]::Ordinal)) {
+                    return [pscustomobject]@{ Volume = $candidate.Mount; FreeMB = [int][math]::Floor(($candidate.AvailableBlocks * 1KB) / 1MB); Ready = $true }
+                }
+            }
+        } catch {
+            # Fall through to the runtime DriveInfo posture below.
+        }
+    }
+
     try {
         # DriveInfo resolves the drive that contains any absolute path, file or directory.
         $drive = New-Object System.IO.DriveInfo($root)

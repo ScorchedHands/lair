@@ -130,8 +130,8 @@ function New-LaneGateList {
         })
     }
 
-    Add-Gate 'build' 'dotnet' @('build', '-c', 'Release', '--nologo') `
-        'none (no CUDA device, no model files)'
+    Add-Gate 'build' 'dotnet' @('build', '-c', 'Release', '--nologo', '-p:SkipWebUi=true') `
+        'none (no CUDA device, no model files, no web UI toolchain dependency)'
 
     # CPU-only synthetic gates: these run with no target file at all.
     Add-Gate 'loader-plan-gates-synthetic' 'dotnet' @(
