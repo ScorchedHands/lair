@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "ple-latency",
+    "C:\\source\\github.com\\Strata-data\\models\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+    "--tokens",
+    "2048",
+    "--reps",
+    "3",
+    "--substrate",
+    "compare",
+    "--ple-cap-mb",
+    "256"
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "table_facts": {
+    "tensor_name": "per_layer_token_embd.weight",
+    "format": "IQ4_NL",
+    "logical_dims": [
+      320001536,
+      160
+    ],
+    "payload_bytes": 28800138240,
+    "ngram_size": 3,
+    "heads_per_ngram": 8,
+    "head_count": 16,
+    "table_rows": 320001536,
+    "row_elements": 160,
+    "row_stride_bytes": 90,
+    "eos_token_id": 248044
+  },
+  "run_shape": {
+    "tokens": 2048,
+    "reps": 3,
+    "substrate": "compare"
+  },
+  "history_traffic": {
+    "windows_containing_eos": 22,
+    "windows_with_missing_predecessors": 32
+  },
+  "index_latency_ns_per_token": {
+    "p50": 200,
+    "p90": 300,
+    "p99": 300,
+    "min": 100,
+    "max": 542400
+  },
+  "mapped_row_latency_ns_first_touch": {
+    "p50": 174100,
+    "p90": 227000,
+    "p99": 360900,
+    "min": 200,
+    "max": 35639500
+  },
+  "mapped_row_latency_ns_warm": {
+    "p50": 500,
+    "p90": 1800,
+    "p99": 2600,
+    "min": 100,
+    "max": 166800
+  },
+  "unbuffered_row_read_ns_cold": {
+    "p50": 82100,
+    "p90": 103100,
+    "p99": 185700,
+    "min": 54500,
+    "max": 1730400
+  },
+  "reach": {
+    "distinct_rows_touched": 32652,
+    "requested_resident_rows": 32652,
+    "packed_bytes_of_requested_rows": 2938680,
+    "unbuffered_streamed_bytes": 136581120,
+    "page_fault_delta_during_unbuffered_arm": 21477
+  },
+  "mapped_vs_file_parity": {
+    "substrate": "mmap",
+    "rows_compared": 96,
+    "bytes_compared_per_row": 90,
+    "byte_for_byte_equal": true
+  },
+  "residency_gate": "no clamp: declared ceiling already fits the requested rows",
+  "notes": [
+    {
+      "note": "Storage and governance measurement only: hash/normalization cost, row addressing through the shard that holds the table, and residency accounting against a declared PLE ceiling. No forward pass runs and no model execution is attempted."
+    },
+    {
+      "note": "Substrate compare: mapped rows are byte-for-byte checked against independent sector-aligned file reads of the same offsets, and the unbuffered arm streams those rows\u0027 containing 4 KiB windows with no cached mapping held over them."
+    }
+  ]
+}

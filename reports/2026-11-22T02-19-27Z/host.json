@@ -1,0 +1,7 @@
+{
+  "machine": "FRODO",
+  "os_description": "Microsoft Windows 10.0.26200",
+  "os_architecture": "X64",
+  "processor_count": 32,
+  "total_memory_bytes_available_to_gc": 68423139328
+}

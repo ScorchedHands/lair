@@ -166,7 +166,7 @@ public sealed class ModelBudgetConfigTests : IDisposable
 
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
         Assert.Contains("Unknown key 'layers' under models[0].budgets", error.Message);
-        Assert.Contains("weights, kv, prefill_buffers", error.Message);
+        Assert.Contains("weights, kv, prefill_buffers, ple", error.Message);
     }
 
     [Fact]
@@ -354,6 +354,63 @@ public sealed class ModelBudgetConfigTests : IDisposable
         ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
         Assert.Contains("models[0].budgets.weights.caps.disk_mb", error.Message);
         Assert.Contains("no model-level ceiling describes that position", error.Message); // the byte resource already sits whole on its origin store.
+    }
+
+    [Fact]
+    public void Load_PleChainParsesItsOwnOrderAndCeilings()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  weights:
+                    order: [dram, disk]
+                    caps:
+                      dram_mb: 2048
+                  ple:
+                    order: [dram, vram, disk]
+                    caps:
+                      dram_mb: 4096
+                      vram_mb: 512
+
+            """;
+
+        LairConfig config = YamlConfigLoader.Load(WriteConfig(yaml));
+        ModelConfig model = Assert.Single(config.Models);
+
+        Assert.NotNull(model.Budgets);
+
+        BudgetChain ple = ChainOf(model.Budgets, BudgetResource.Ple);
+        Assert.Equal([BudgetTier.Dram, BudgetTier.Vram, BudgetTier.Disk], ple.Order);
+        Assert.Equal(512L, ple.Caps[BudgetTier.Vram]);
+        Assert.Equal(4096L, ple.Caps[BudgetTier.Dram]);
+        Assert.False(ple.Caps.ContainsKey(BudgetTier.Disk)); // the model file already holds the whole table there, so only working-copy tiers carry a ceiling of ours.
+
+        // The PLE chain declares itself beside the weight chain rather than riding on it: each resource keeps its own order and ceilings.
+        BudgetChain weights = ChainOf(model.Budgets, BudgetResource.Weights);
+        Assert.Equal([BudgetTier.Dram, BudgetTier.Disk], weights.Order);
+        Assert.Equal(2048L, weights.Caps[BudgetTier.Dram]);
+    }
+
+    [Fact]
+    public void Load_PleDiskCap_FailsNamingQualifiedKeyAndModel()
+    {
+        string yaml = $"""
+            models:
+              - name: qwen-test
+                path: '{TempModelFile()}'
+                budgets:
+                  ple:
+                    order: [dram, disk]
+                    caps:
+                        disk_mb: 2048
+
+            """;
+
+        ConfigException error = Assert.Throws<ConfigException>(() => YamlConfigLoader.Load(WriteConfig(yaml)));
+        Assert.Contains("models[0].budgets.ple.caps.disk_mb", error.Message);
+        Assert.Contains("no model-level ceiling describes that position", error.Message); // the gathered rows read their complete table from disk storage already, exactly as weights do.
     }
 
     [Fact]

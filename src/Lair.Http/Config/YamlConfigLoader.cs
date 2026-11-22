@@ -46,7 +46,7 @@ public static class YamlConfigLoader
     private static readonly IReadOnlyList<string> NodeOverrideKeys = ["index", "mb", "cores"];
 
     /// <summary>The resource keys a model's budgets block may declare, in the order a refusal reports them.</summary>
-    private static readonly IReadOnlyList<string> BudgetResourceKeys = [BudgetResourceNames.Weights, BudgetResourceNames.Kv, BudgetResourceNames.PrefillBuffers];
+    private static readonly IReadOnlyList<string> BudgetResourceKeys = [BudgetResourceNames.Weights, BudgetResourceNames.Kv, BudgetResourceNames.PrefillBuffers, BudgetResourceNames.Ple];
 
     /// <summary>Loads and validates <paramref name="filePath"/>; no file watching.</summary>
     public static LairConfig Load(string filePath)
@@ -1234,10 +1234,10 @@ public static class YamlConfigLoader
                 $"{capsWhere}.{capKey} is invalid for model '{modelName}': a ceiling binds only tiers its own 'order' names — declare '{BudgetTierNames.Of(tier)}' there to cap it.");
         }
 
-        if (resource == BudgetResource.Weights && tier == BudgetTier.Disk)
+        if (resource is BudgetResource.Weights or BudgetResource.Ple && tier == BudgetTier.Disk)
         {
             throw new ConfigException(
-                $"{capsWhere}.{capKey} is invalid for model '{modelName}': weights read their complete set from disk storage already, so no model-level ceiling describes that position.");
+                $"{capsWhere}.{capKey} is invalid for model '{modelName}': '{BudgetResourceNames.Of(resource)}' reads its complete set from disk storage already, so no model-level ceiling describes that position.");
         }
 
         if (resource == BudgetResource.Kv && tier == BudgetTier.Dram)

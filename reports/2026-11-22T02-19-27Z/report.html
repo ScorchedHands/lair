@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ple-latency 2026-11-22T02-19-27Z</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem; color: #1c1c1c; max-width: 980px; }
+h1 { font-size: 1.35rem; } h2 { font-size: 1.1rem; margin-top: 1.6rem; }
+table { border-collapse: collapse; margin-top: .5rem; width: 100%; }
+th, td { border: 1px solid #bbb; padding: .4rem .7rem; text-align: left; font-size: .92rem; vertical-align: top; }
+th { background: #f0f0f0; } .ok { color: #0a7d32; font-weight: 600; } .bad { color: #b00020; font-weight: 600; }
+canvas { max-width: 860px; margin-top: 1rem; }
+.note { color: #555; font-size: .9rem; }
+code { background: #f4f4f4; padding: 0 .3rem; }
+</style>
+</head>
+<body>
+<h1>PLE n-gram gather latency</h1>
+<p class="note">3-gram x 8 heads = 16 rows/token over a 320,001,536-row <code>per_layer_token_embd.weight</code> table (90 packed bytes/row, IQ4_NL).</p>
+
+<h2>Table facts</h2>
+<table>
+<tr><th>Tensor</th><td>per_layer_token_embd.weight</td></tr>
+<tr><th>Format / row width</th><td>IQ4_NL · 160 elements · 90 packed bytes/row</td></tr>
+<tr><th>Logical dims</th><td>320001536 x 160</td></tr>
+<tr><th>Payload bytes</th><td>28,800,138,240</td></tr>
+<tr><th>N-gram geometry</th><td>3-gram x 8 heads = 16 rows/token · EOS id 248044</td></tr>
+</table>
+
+<h2>Run shape and history traffic</h2>
+<table>
+<tr><th>Tokens / reps / substrate</th><td>2,048 · 3 · compare</td></tr>
+<tr><th>Windows containing EOS</th><td>22</td></tr>
+<tr><th>Windows with missing predecessors</th><td>32</td></tr>
+</table>
+
+<h2>Latency percentiles</h2>
+<table>
+<tr><th>Arm</th><th>p50</th><th>p90</th><th>p99</th><th>min</th><th>max</th></tr>
+<tr><td>index ns/token</td><td>200</td><td>300</td><td>300</td><td>100</td><td>542400</td></tr>
+<tr><td>mapped first-touch ns/row</td><td>174100</td><td>227000</td><td>360900</td><td>200</td><td>35639500</td></tr>
+<tr><td>mapped warm ns/row</td><td>500</td><td>1800</td><td>2600</td><td>100</td><td>166800</td></tr>
+<tr><td>unbuffered cold ns/row</td><td>82100</td><td>103100</td><td>185700</td><td>54500</td><td>1730400</td></tr>
+</table>
+
+<canvas id="pleLatency" width="860" height="380"></canvas>
+<script>
+new Chart(document.getElementById('pleLatency'), {"type":"bar","data":{"labels":["p50","p90","p99"],"datasets":[{"label":"index ns/token","data":[200,300,300]},{"label":"mapped first-touch ns/row","data":[174100,227000,360900]},{"label":"mapped warm ns/row","data":[500,1800,2600]},{"label":"unbuffered cold ns/row","data":[82100,103100,185700]}]},"options":{"plugins":{"legend":{"display":true}},"scales":{"y":{"beginAtZero":true,"title":{"display":true,"text":"nanoseconds"}}}}});
+</script>
+
+<h2>Reach and residency</h2>
+<table>
+<tr><th>Distinct rows touched</th><td>32,652</td></tr>
+<tr><th>Requested resident rows</th><td>32,652</td></tr>
+<tr><th>Packed bytes requested</th><td>2,938,680</td></tr>
+<tr><th>Unbuffered streamed bytes</th><td>136,581,120</td></tr>
+<tr><th>Page-fault delta during unbuffered arm</th><td>21,477</td></tr>
+<tr><th>Residency gate</th><td>declared ceiling already fits the requested rows</td></tr>
+</table>
+
+<h2>Parity</h2>
+<p class="note">96 rows x 90 bytes/row — byte-for-byte equal: True</p>
+
+<h2>Host</h2>
+<table>
+<tr><th>Machine / OS / arch</th><td>FRODO · Microsoft Windows 10.0.26200 · X64</td></tr>
+<tr><th>Processors / GC memory bytes</th><td>32 · 68,423,139,328</td></tr>
+</table>
+
+<h2>Notes</h2>
+<ul class="note"><li>Storage and governance measurement only: hash/normalization cost, row addressing through the shard that holds the table, and residency accounting against a declared PLE ceiling. No forward pass runs and no model execution is attempted.</li><li>Substrate compare: mapped rows are byte-for-byte checked against independent sector-aligned file reads of the same offsets, and the unbuffered arm streams those rows&#39; containing 4 KiB windows with no cached mapping held over them.</li></ul>
+</body></html>

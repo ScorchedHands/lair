@@ -342,6 +342,9 @@ public sealed class GgufFile : IDisposable
                 return true;
             case GgufValueType.Float32 or GgufValueType.Float64:
                 return left.AsDouble() == right.AsDouble();
+            case GgufValueType.UInt64:
+                return left.AsULong() == right.AsULong(); // unsigned values carry 64-bit patterns past the Int64 range, so comparing one through AsLong would refuse a shard that declares it exactly as written.
+
             default: // integer and bool kinds compare through their stored value.
                 return left.AsLong() == right.AsLong();
         }

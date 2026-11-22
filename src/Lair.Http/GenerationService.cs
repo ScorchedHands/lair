@@ -924,6 +924,11 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
                             $"{change.Field} refused for model '{effective.Models[0].Name}' (restart-only): a weight ceiling binds what every forward reads, and retargeting it means re-reading slabs from the model file — that migration is not implemented in this build. Change it by restarting lair."));
                         break;
 
+                    case "models[0].budgets.ple.caps.dram_mb" or "models[0].budgets.ple.caps.vram_mb":
+                        results.Add(new FieldResult(change, ConfigApplyOutcome.Refused,
+                            $"{change.Field} refused for model '{effective.Models[0].Name}' (restart-only): a PLE ceiling bounds which gathered rows residency admits, and that admission is established when the table gather opens — re-establishing it against a new ceiling is not implemented in this build. Change it by restarting lair."));
+                        break;
+
                     case "models[0].budgets.prefill_buffers.caps.dram_mb" or "models[0].budgets.prefill_buffers.caps.vram_mb":
                         results.Add(new FieldResult(change, ConfigApplyOutcome.Refused,
                             $"{change.Field} refused for model '{effective.Models[0].Name}' (new-requests): a ceiling on prefill working buffers classifies for later requests only — the physical clamp is where this value lands, when the engine opens its row window, and a live edit cannot re-size the window or activation buffers already established. Nothing in force changed."));

@@ -2,10 +2,11 @@ namespace Lair.Models;
 
 /// <summary>
 /// One model-side resource whose working copies carry their own ceilings: the weight bytes a forward reads, the KV blocks
-/// sequences write, and the activation buffers a prompt window works in. Each resource answers for itself — an exceeded
-/// ceiling moves that one resource down its own chain rather than relocating the whole model — because movement costs are
-/// not comparable across them: KV blocks move cheaply, weight slabs are re-read by every token, and prefill working sets
-/// are transient work no tier wants on disk.
+/// sequences write, the activation buffers a prompt window works in, and the PLE n-gram table rows a gather admits into
+/// residency. Each resource answers for itself — an exceeded ceiling moves that one resource down its own chain rather than
+/// relocating the whole model — because movement costs are not comparable across them: KV blocks move cheaply, weight slabs
+/// are re-read by every token, prefill working sets are transient work no tier wants on disk, and a PLE table is whole on
+/// its origin store so only its resident rows cost anything to bound.
 /// </summary>
 public enum BudgetResource
 {
@@ -17,6 +18,9 @@ public enum BudgetResource
 
     /// <summary>The activation buffers a batched prompt window works inside: transient working-set bytes, never disk material today.</summary>
     PrefillBuffers,
+
+    /// <summary>The PLE n-gram embedding table a forward gathers rows from: read-side material whose complete table already exists in the model file, so only the rows admitted into working copies are bounded here.</summary>
+    Ple,
 }
 
 /// <summary>The config key name of each budget resource, and the reverse read that decides which resources are public vocabulary.</summary>
@@ -25,14 +29,16 @@ public static class BudgetResourceNames
     public const string Weights = "weights";
     public const string Kv = "kv";
     public const string PrefillBuffers = "prefill_buffers";
+    public const string Ple = "ple";
 
     /// <summary>The resource keys a configuration may declare, in the order a refusal reports them.</summary>
-    public static IReadOnlyList<string> DeclaredKeys { get; } = [Weights, Kv, PrefillBuffers];
+    public static IReadOnlyList<string> DeclaredKeys { get; } = [Weights, Kv, PrefillBuffers, Ple];
 
     public static string Of(BudgetResource resource) => resource switch
     {
         BudgetResource.Kv => Kv,
         BudgetResource.PrefillBuffers => PrefillBuffers,
+        BudgetResource.Ple => Ple,
         _ => Weights,
     };
 
@@ -51,6 +57,10 @@ public static class BudgetResourceNames
 
             case PrefillBuffers:
                 resource = BudgetResource.PrefillBuffers;
+                return true;
+
+            case Ple:
+                resource = BudgetResource.Ple;
                 return true;
 
             default:
@@ -430,7 +440,7 @@ public static class ModelBudgets
 
             // A read-side origin store already holds this resource's complete set outside LAIR's working copies, so a ceiling
             // of ours there can only misrepresent it. Skipping that check here would let a config carry a number nothing could honor.
-            if (chain.Resource == BudgetResource.Weights && cap.Key == BudgetTier.Disk)
+            if (IsReadSide(chain.Resource) && cap.Key == BudgetTier.Disk)
             {
                 throw new ModelException(
                     $"model '{model}', budgets for resource '{resource}': a ceiling at tier '{BudgetTierNames.Of(BudgetTier.Disk)}' is not meaningful — " +
@@ -501,6 +511,10 @@ public static class ModelBudgets
             $"'{resource}' resident in accelerator memory needs a compute backend opened with device-resident weight copies in " +
             $"'{ModelRoute.CudaBackendSeam}', which this open has none",
 
+        BudgetTier.Vram when resource == BudgetResourceNames.Ple =>
+            $"'{resource}' resident in accelerator memory needs a gather holding the PLE rows it admits device-side in " +
+            $"'{ModelRoute.CudaBackendSeam}', which this open has none",
+
         BudgetTier.Vram =>
             $"'{resource}' has no device-backed pool opened for it — accelerator memory holds weight copies today, and device-backed pools " +
             $"for '{resource}' run in '{ModelRoute.CudaBackendSeam}' once they are opened",
@@ -518,7 +532,7 @@ public static class ModelBudgets
         : throw new ModelException("budget resolution declares no model name: every refusal this reports names the model its budgets belong to");
 
     /// <summary>Whether this resource's complete set already exists on its origin store rather than only in LAIR's working copies.</summary>
-    private static bool IsReadSide(BudgetResource resource) => resource == BudgetResource.Weights;
+    private static bool IsReadSide(BudgetResource resource) => resource is BudgetResource.Weights or BudgetResource.Ple;
 
     private static int PriorityOf(BudgetTier tier) => Array.IndexOf(PriorityOrder, tier);
 

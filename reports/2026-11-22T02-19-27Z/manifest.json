@@ -1,0 +1,19 @@
+{
+  "command": "ple-latency",
+  "started_utc": "2026-11-22T02-19-27Z",
+  "argv": [
+    "ple-latency",
+    "C:\\source\\github.com\\Strata-data\\models\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+    "--tokens",
+    "2048",
+    "--reps",
+    "3",
+    "--substrate",
+    "compare",
+    "--ple-cap-mb",
+    "256"
+  ],
+  "model_path": "C:\\source\\github.com\\Strata-data\\models\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+  "split_shard_count": 2,
+  "gathered_from": "C:\\source\\github.com\\Strata-data\\models\\IQ3_XXS\\Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf"
+}

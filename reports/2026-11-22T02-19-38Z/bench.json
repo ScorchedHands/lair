@@ -1,0 +1,68 @@
+{
+  "table_facts": {
+    "tensor_name": "per_layer_token_embd.weight",
+    "format": "IQ4_NL",
+    "logical_dims": [
+      320001536,
+      160
+    ],
+    "payload_bytes": 28800138240,
+    "ngram_size": 3,
+    "heads_per_ngram": 8,
+    "head_count": 16,
+    "table_rows": 320001536,
+    "row_elements": 160,
+    "row_stride_bytes": 90,
+    "eos_token_id": 248044
+  },
+  "run_shape": {
+    "tokens": 512,
+    "reps": 1,
+    "substrate": "mmap"
+  },
+  "history_traffic": {
+    "windows_containing_eos": 6,
+    "windows_with_missing_predecessors": 8
+  },
+  "index_latency_ns_per_token": {
+    "p50": 300,
+    "p90": 300,
+    "p99": 400,
+    "min": 200,
+    "max": 599900
+  },
+  "mapped_row_latency_ns_first_touch": {
+    "p50": 174500,
+    "p90": 225000,
+    "p99": 355100,
+    "min": 200,
+    "max": 1412100
+  },
+  "mapped_row_latency_ns_warm": null,
+  "unbuffered_row_read_ns_cold": null,
+  "reach": {
+    "distinct_rows_touched": 8160,
+    "requested_resident_rows": 6000000,
+    "packed_bytes_of_requested_rows": 540000000,
+    "unbuffered_streamed_bytes": 0,
+    "page_fault_delta_during_unbuffered_arm": 0
+  },
+  "mapped_vs_file_parity": {
+    "substrate": "mmap",
+    "rows_compared": 96,
+    "bytes_compared_per_row": 90,
+    "byte_for_byte_equal": true
+  },
+  "residency_gate": {
+    "binding_tier": "dram",
+    "cap_megabytes": 256,
+    "row_bytes": 90,
+    "requested_rows": 6000000,
+    "allowed_rows": 2982616
+  },
+  "notes": [
+    {
+      "note": "Storage and governance measurement only: hash/normalization cost, row addressing through the shard that holds the table, and residency accounting against a declared PLE ceiling. No forward pass runs and no model execution is attempted."
+    }
+  ]
+}
