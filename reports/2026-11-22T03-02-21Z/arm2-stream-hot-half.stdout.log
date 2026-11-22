@@ -1,0 +1,17 @@
+gather fixture: qwen2moe synthetic layers=2 hidden=512 heads=4 headDim=128 kvHeads=4 inter=256 experts=12 routed=8 vocab=256 sharedExpert=yes weights=F32
+gather posture: seqs=8 tokensPerSequence=24 reps=3 outRoot=/root/lair-measurements/xeon-hotsweep/reports substrate=stream engineThreads=auto avx2=True physicalCores=0 logicalProcessors=64
+gather residency arm: enabled budgetMb=21.0 reserveMb=from pool geometry swapPeriodLayerSteps=16
+gather fixture file=/root/lair-measurements/xeon-hotsweep/fixtures/lair-moe-gather-894c63f506774514a561f9f940a4bfd0.gguf bytes=49872896 (47.6 MiB)
+gather cold-read backing: linux o_direct+discard
+gather arm: merged-decode median=15.4337s min=15.4001 max=15.5185 tok/s=12.44
+dense-equivalent arm: solo-stepping median=82.4275s min=82.0683 max=83.7747 tok/s=2.33
+cold-read evidence substrate=stream: gather arm stackRoleReads=5184 streamedMiB=31104.0 pageFaults=7755530 | solo arm stackRoleReads=27648 streamedMiB=165888.0 pageFaults=42039296
+parity: gathered-vs-dense-equivalent logits floats=49152 exact=yes mismatches=0
+union: avgDistinctExpertsGatheredPerLayerStep=12.00 of selectionSlots=64 amortized=81.2% gatheredBytes/layerStep=18.0 MiB denseEquivalentBytes/layerStep=96.0 MiB distinctExpertsAcrossRun=12/12
+ram-hot-tier gather arm: merged-decode median=9.2677s min=8.8273 max=9.3817 tok/s=20.72
+parity: gathered-vs-ram-hot-tier logits floats=49152 exact=yes mismatches=0
+residency: tier=ram_hot_experts budgetBytes=18612224 residentBytes=17301504 hotUnits=11/24 swapPeriodLayerSteps=16 hits=792 misses=936 hitRate=45.8% savedEstimateMiB=396.0 promotions=0 demotions=0 tok/s-vs-prefetch-only=+66.53%
+cold-read evidence substrate=stream: hot arm stackRoleReads=2808 streamedMiB=16848.0 pageFaults=4172378 (resident hits avoided 396.0 MiB of role reads in the untimed tally pass)
+fatal: not a git repository (or any of the parent directories): .git
+gather report dir=/root/lair-measurements/xeon-hotsweep/reports/2026-11-22T03-02-21Z
+wall=565

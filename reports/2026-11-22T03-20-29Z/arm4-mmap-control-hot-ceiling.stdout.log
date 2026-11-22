@@ -1,0 +1,14 @@
+gather fixture: qwen2moe synthetic layers=2 hidden=512 heads=4 headDim=128 kvHeads=4 inter=256 experts=12 routed=8 vocab=256 sharedExpert=yes weights=F32
+gather posture: seqs=8 tokensPerSequence=24 reps=3 outRoot=/root/lair-measurements/xeon-hotsweep/reports substrate=mmap engineThreads=auto avx2=True physicalCores=0 logicalProcessors=64
+gather residency arm: enabled budgetMb=42.0 reserveMb=from pool geometry swapPeriodLayerSteps=16
+gather fixture file=/root/lair-measurements/xeon-hotsweep/fixtures/lair-moe-gather-252db64e08f84d47a3438651ecf7c3b5.gguf bytes=49872896 (47.6 MiB)
+gather arm: merged-decode median=0.5420s min=0.5155 max=0.5807 tok/s=354.23
+dense-equivalent arm: solo-stepping median=0.6434s min=0.6415 max=0.6443 tok/s=298.41
+parity: gathered-vs-dense-equivalent logits floats=49152 exact=yes mismatches=0
+union: avgDistinctExpertsGatheredPerLayerStep=12.00 of selectionSlots=64 amortized=81.2% gatheredBytes/layerStep=18.0 MiB denseEquivalentBytes/layerStep=96.0 MiB distinctExpertsAcrossRun=12/12
+ram-hot-tier gather arm: merged-decode median=0.5674s min=0.5666 max=0.5685 tok/s=338.36
+parity: gathered-vs-ram-hot-tier logits floats=49152 exact=yes mismatches=0
+residency: tier=ram_hot_experts budgetBytes=40632320 residentBytes=37748736 hotUnits=24/24 swapPeriodLayerSteps=16 hits=1728 misses=0 hitRate=100.0% savedEstimateMiB=864.0 promotions=0 demotions=0 tok/s-vs-prefetch-only=-4.48%
+fatal: not a git repository (or any of the parent directories): .git
+gather report dir=/root/lair-measurements/xeon-hotsweep/reports/2026-11-22T03-20-29Z
+wall=11

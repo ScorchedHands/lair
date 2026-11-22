@@ -36,7 +36,8 @@ public static class MoeGatherBench
         int inter = 512;
         int vocab = 256;
         string outRoot = "reports";
-        string substrate = "mmap"; // mmap keeps the historical OS-cached mapping; stream answers each cold stacked-expert resolution from an unbuffered (FILE_FLAG_NO_BUFFERING) whole-tensor read while dense weights stay cached — a real expensive-read baseline for the residency arm to save against
+        string fixtureDir = Path.GetTempPath(); // where the synthetic fixture is written: point it at disk-backed scratch on hosts whose temp dir is RAM (tmpfs) so streaming arms really read from storage
+        string substrate = "mmap"; // mmap keeps the historical OS-cached mapping; stream answers each cold stacked-expert resolution from an unbuffered whole-tensor read while dense weights stay cached — a real expensive-read baseline for the residency arm to save against (Windows: FILE_FLAG_NO_BUFFERING, Linux: O_DIRECT with a fadvise-DONTNEED fallback)
         double hotBudgetMb = 0.0; // zero disables the residency arm entirely: default runs stay exactly the prefetch-only gather-vs-solo comparison they were before this seam existed
         double hotReserveMb = -1.0; // negative means reserve the KV working-set estimate from pool geometry, honoring budget = quota − reserve as the tier contract states
         int hotSwapPeriod = 16; // layer-step notes per aging/rebalance round: small enough for a short synthetic stream to ramp its hot set during warmup
@@ -61,6 +62,7 @@ public static class MoeGatherBench
                 case "--inter": inter = ParseInt(args[++i], inter); break;
                 case "--vocab": vocab = ParseInt(args[++i], vocab); break;
                 case "--out": outRoot = args[++i]; break;
+                case "--fixture-dir": fixtureDir = args[++i]; break;
                 case "--substrate": substrate = args[++i].ToLowerInvariant(); break;
                 case "--hot-budget-mb": hotBudgetMb = ParseDouble(args[++i], 0.0); break;
                 case "--hot-reserve-mb": hotReserveMb = ParseDouble(args[++i], -1.0); break;
@@ -83,10 +85,10 @@ public static class MoeGatherBench
             return 1;
         }
 
-        // The streaming substrate is a Windows measurement seam (FILE_FLAG_NO_BUFFERING reads); a non-Windows host keeps the historical mmap posture.
-        if (substrate == "stream" && !OperatingSystem.IsWindows())
+        // The streaming substrate is a cold-read measurement seam on both supported hosts (Windows FILE_FLAG_NO_BUFFERING, Linux O_DIRECT with a fadvise-DONTNEED fallback); other platforms keep the historical mmap posture.
+        if (substrate == "stream" && !OperatingSystem.IsWindows() && !OperatingSystem.IsLinux())
         {
-            Console.WriteLine("gather: --substrate stream is a Windows measurement seam; this host runs --substrate mmap");
+            Console.WriteLine("gather: --substrate stream is implemented for Windows and Linux hosts; this host runs --substrate mmap");
             return 1;
         }
 
@@ -122,7 +124,7 @@ public static class MoeGatherBench
             ? $"gather residency arm: enabled budgetMb={hotBudgetMb:F1} reserveMb={(hotReserveMb >= 0.0 ? hotReserveMb.ToString("F1") : "from pool geometry")} swapPeriodLayerSteps={hotSwapPeriod}"
             : "gather residency arm: disabled (pass --hot-budget-mb to add the RAM-hot-tier gather arm)");
 
-        string fixturePath = Path.Combine(Path.GetTempPath(), $"lair-moe-gather-{Guid.NewGuid():N}.gguf");
+        string fixturePath = Path.Combine(fixtureDir, $"lair-moe-gather-{Guid.NewGuid():N}.gguf");
         byte[] image = BuildFixtureImage(layers, hidden, heads, headDim, kvHeads, inter, experts, routed, vocab);
         File.WriteAllBytes(fixturePath, image);
         Console.WriteLine($"gather fixture file={fixturePath} bytes={image.Length} ({image.Length / (1024.0 * 1024.0):F1} MiB)");
@@ -180,6 +182,11 @@ public static class MoeGatherBench
         using GgufFile soloGguf = GgufFile.Open(fixturePath);
         using IBenchColdBacking soloBacking = OpenSubstrateBacking(substrate, fixturePath, soloGguf);
         using TransformerModel soloModel = TransformerModel.Open(soloGguf, soloBacking, backend, maxContextTokens: tokens + 4);
+
+        if (substrate != "mmap")
+        {
+            Console.WriteLine($"gather cold-read backing: {gatherBacking.BackingMode}"); // names the host-specific route these arms actually read through
+        }
 
         int capacityBlocks = ((tokens + 16) / 16 + 1) * seqs + 2; // every sequence holds its own blocks in the shared pool simultaneously
         using BlockPool gatherPool = NewPool(gatherModel, backend, capacityBlocks);
@@ -446,8 +453,9 @@ public static class MoeGatherBench
 
         if (substrate == "stream")
         {
-            comparisonNotes.Add("Substrate stream: expert role tensors resolve through unbuffered FILE_FLAG_NO_BUFFERING whole-role reads into fresh buffers, while dense weights stay on the ordinary cached mapping so only expert traffic pays storage cost. Both arms pay this for their cold resolutions — the prefetch-only gather arm streams every union expert's roles, and a tier miss streams that expert chain's role tensors through the same slab-view route (the loader has no per-slab staging today); resident experts answer from private copies with zero streamed bytes.");
+            comparisonNotes.Add($"Substrate stream ({gatherBacking.BackingMode}): expert role tensors resolve through cold whole-role reads into fresh buffers — unbuffered FILE_FLAG_NO_BUFFERING transfers on Windows, sector-aligned O_DIRECT preads whose read range is released with posix_fadvise(POSIX_FADV_DONTNEED) on Linux (a buffered+discard descriptor when the filesystem refuses direct I/O) — while dense weights answer from ordinary buffered (OS-cached) reads so only expert traffic pays storage cost. Both arms pay this for their cold resolutions — the prefetch-only gather arm streams every union expert's roles, and a tier miss streams that expert chain's role tensors through the same slab-view route (the loader has no per-slab staging today); resident experts answer from private copies with zero streamed bytes.");
         }
+
 
         ColdReadResult? coldReads = substrate == "mmap" ? null : new ColdReadResult
         {
@@ -1246,12 +1254,13 @@ new Chart(document.getElementById('arms'), {
 
     private static IBenchColdBacking OpenSubstrateBacking(string substrate, string fixturePath, GgufFile gguf) => substrate switch
     {
-        "stream" => new UnbufferedStackReadWeightSource(fixturePath, gguf),
+        "stream" when OperatingSystem.IsWindows() => new UnbufferedStackReadWeightSource(fixturePath, gguf),
+        "stream" => new LinuxColdReadWeightSource(fixturePath, gguf),
         _ => new MappedArenaWeightSource(gguf),
     };
 
-    // Windows page-fault counter via psapi: every fault that must fetch a page from storage counts here, so per-arm deltas beside the streamed-byte tallies are the cold-read evidence this lane can publish without perf counters. Non-Windows hosts report 0 (the streaming substrates refuse them anyway).
-    private static long CurrentPageFaultCount() => OperatingSystem.IsWindows() ? WinColdReadInterop.PageFaultCountOfCurrentProcess() : 0L;
+    // Page-fault tallies per arm: Windows counts through psapi, Linux sums /proc/self/stat minor+major faults. Per-arm deltas beside the streamed-byte tallies are the cold-read evidence this lane publishes without perf counters; a host where neither is readable reports 0 and leans on the byte tallies alone.
+    private static long CurrentPageFaultCount() => OperatingSystem.IsWindows() ? WinColdReadInterop.PageFaultCountOfCurrentProcess() : LinuxColdReadInterop.PageFaultsOfCurrentProcess();
 
     private static string Esc(string value) => System.Net.WebUtility.HtmlEncode(value);
 }
@@ -1289,6 +1298,9 @@ internal interface IBenchColdBacking : IWeightSource
     /// <summary>The substrate id these tallies describe ("mmap", "nocache", or "stream").</summary>
     string SubstrateId { get; }
 
+    /// <summary>How this backing actually serves cold reads on the current host (e.g. windows no-buffering, linux o_direct+discard, linux discard).</summary>
+    string BackingMode { get; }
+
     /// <summary>Cumulative resolutions of stacked expert-role tensors (whole role tensor per resolution).</summary>
     long StackResolutionsTotal { get; }
 
@@ -1304,6 +1316,7 @@ internal sealed class MappedArenaWeightSource : IBenchColdBacking
     public MappedArenaWeightSource(GgufFile gguf) => _backing = new GgufMmapWeightSource(gguf);
 
     public string SubstrateId => "mmap";
+    public string BackingMode => "mapped-os-cache";
     public long StackResolutionsTotal => 0L;
     public long BytesStreamedTotal => 0L;
 
@@ -1332,7 +1345,7 @@ internal unsafe sealed class UnbufferedStackReadWeightSource : IBenchColdBacking
         ArgumentNullException.ThrowIfNull(gguf);
         if (!OperatingSystem.IsWindows())
         {
-            throw new PlatformNotSupportedException("FILE_FLAG_NO_BUFFERING streaming reads are a Windows measurement seam");
+            throw new PlatformNotSupportedException("FILE_FLAG_NO_BUFFERING streaming reads are the Windows cold-read backing; Linux hosts use the O_DIRECT/discard backing");
         }
 
         _dense = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1 << 16, FileOptions.SequentialScan);
@@ -1348,6 +1361,7 @@ internal unsafe sealed class UnbufferedStackReadWeightSource : IBenchColdBacking
     }
 
     public string SubstrateId => "stream";
+    public string BackingMode => "windows no-buffering";
     public long StackResolutionsTotal => Volatile.Read(ref _stackResolutions);
     public long BytesStreamedTotal => Volatile.Read(ref _bytesStreamed);
 
@@ -1489,6 +1503,192 @@ internal unsafe sealed class UnbufferedStackReadWeightSource : IBenchColdBacking
     }
 }
 
+/// <summary>Linux cold-read backing for the streaming substrate: stacked expert-role tensors answer whole-tensor resolutions through sector-aligned pread calls on an O_DIRECT descriptor — or, when the filesystem refuses direct I/O, on a buffered descriptor whose read range is released afterwards with posix_fadvise(POSIX_FADV_DONTNEED) so every later resolution pays storage again instead of reusing pages this process already fetched. Dense weights answer from ordinary buffered reads, mirroring the Windows backing's resident-dense posture.</summary>
+internal unsafe sealed class LinuxColdReadWeightSource : IBenchColdBacking
+{
+    private const int SectorWindow = 4096; // windows align to 4 KiB: valid on 512e and 4Kn volumes alike
+    private const int ReadChunkBytes = 1 << 17; // sector-aligned chunks keep pread requests bounded
+
+    private readonly int _denseFd; // buffered, OS-cached reads for the non-expert tensors — the resident-dense posture a serving engine keeps
+    private readonly int _expertFd;
+    private readonly bool _direct; // true when the filesystem accepted O_DIRECT on this descriptor
+    private readonly long _fileSize;
+    private readonly long _dataStart;
+    private byte* _scratch; // aligned read window for direct transfers, grown as needed and freed on dispose
+    private int _scratchCapacity;
+    private long _stackResolutions;
+    private long _bytesStreamed;
+
+    public LinuxColdReadWeightSource(string path, GgufFile gguf)
+    {
+        ArgumentNullException.ThrowIfNull(gguf);
+        if (!OperatingSystem.IsLinux())
+        {
+            throw new PlatformNotSupportedException("the O_DIRECT/discard cold-read backing is the Linux streaming substrate");
+        }
+
+        _denseFd = LinuxColdReadInterop.Open(path, 0 /*O_RDONLY*/, 0u);
+        if (_denseFd < 0)
+        {
+            throw new IOException($"stream substrate: open('{path}') failed (errno={Marshal.GetLastPInvokeError()})");
+        }
+
+        _expertFd = LinuxColdReadInterop.Open(path, LinuxColdReadInterop.DirectReadFlags, 0u);
+        if (_expertFd >= 0)
+        {
+            _direct = true; // O_DIRECT honored: reads bypass the page cache outright
+        }
+        else
+        {
+            _expertFd = LinuxColdReadInterop.Open(path, 0 /*O_RDONLY*/, 0u); // buffered fallback: coldness comes from discarding each read range afterwards
+            if (_expertFd < 0)
+            {
+                int errno = Marshal.GetLastPInvokeError();
+                LinuxColdReadInterop.Close(_denseFd);
+                throw new IOException($"stream substrate: open('{path}') for expert reads failed (errno={errno})");
+            }
+
+            _direct = false;
+        }
+
+        _fileSize = gguf.FileSize;
+        _dataStart = gguf.DataStart;
+    }
+
+    public string SubstrateId => "stream";
+    public string BackingMode => _direct ? "linux o_direct+discard" : "linux buffered+discard";
+    public long StackResolutionsTotal => Volatile.Read(ref _stackResolutions);
+    public long BytesStreamedTotal => Volatile.Read(ref _bytesStreamed);
+
+    public ReadOnlySpan<byte> Resolve(LogicalTensor tensor)
+    {
+        ArgumentNullException.ThrowIfNull(tensor);
+
+        if (!ExpertRoleNames.IsStackedExpertTensor(tensor.Name))
+        {
+            byte[] dense = new byte[tensor.SizeBytes]; // dense weights stay cached through buffered reads: the measurement isolates expert traffic, like a serving posture that keeps them hot
+            fixed (byte* buffer = dense)
+            {
+                ReadExactly(_denseFd, _dataStart + tensor.Offset, buffer, checked((int)tensor.SizeBytes));
+            }
+
+            return new ReadOnlySpan<byte>(dense);
+        }
+
+        byte[] payload = ReadCold(_dataStart + tensor.Offset, tensor.SizeBytes);
+        Interlocked.Add(ref _stackResolutions, 1);
+        Interlocked.Add(ref _bytesStreamed, tensor.SizeBytes);
+        return new ReadOnlySpan<byte>(payload); // one fresh buffer per resolution: spans stay readable for their consumer's lifetime, and the streamed cost is exactly what a staging-less disk provider pays
+    }
+
+    private byte[] ReadCold(long offset, long length)
+    {
+        if (offset < 0 || length < 0 || offset > _fileSize || length > _fileSize - offset)
+        {
+            throw new InvalidOperationException($"cold read [{offset}..{offset + length}) does not fit the {_fileSize}-byte fixture");
+        }
+
+        byte[] payload = new byte[length];
+
+        if (!_direct)
+        {
+            fixed (byte* buffer = payload)
+            {
+                ReadExactly(_expertFd, offset, buffer, checked((int)length));
+            }
+
+            LinuxColdReadInterop.DiscardRange(_expertFd, offset, length); // release the pages this resolution just fetched: the next resolution of the same bytes pays storage again
+            return payload;
+        }
+
+        long alignedStart = offset & ~(long)(SectorWindow - 1);
+        long windowEnd = Math.Min(_fileSize, (offset + length + SectorWindow - 1) & ~(long)(SectorWindow - 1));
+        int written = 0; // payload bytes copied out of successive sector-aligned chunks
+
+        for (long chunkOffset = alignedStart; chunkOffset < windowEnd;)
+        {
+            int chunkLength = (int)Math.Min(ReadChunkBytes, windowEnd - chunkOffset); // every chunk is a whole number of sectors: both ends stay 4 KiB-aligned inside the padded fixture
+            EnsureScratch(chunkLength);
+
+            ReadExactly(_expertFd, chunkOffset, _scratch, chunkLength); // whole-sector aligned transfer: pread's own short-read loop fills the chunk
+
+            long copyStart = Math.Max(chunkOffset, offset); // head/tail outside the chunk belong to neighbouring sectors: only this tensor's own bytes are kept — same content a slab view would slice from mmap bytes either way
+            long copyEnd = Math.Min(chunkOffset + chunkLength, offset + length);
+            if (copyEnd > copyStart)
+            {
+                fixed (byte* destination = payload)
+                {
+                    Buffer.MemoryCopy(_scratch + (copyStart - chunkOffset), destination + written, copyEnd - copyStart, copyEnd - copyStart);
+                }
+
+                written += (int)(copyEnd - copyStart);
+            }
+
+            chunkOffset += chunkLength;
+        }
+
+        if (written != length)
+        {
+            throw new IOException($"stream substrate: assembled {written} of {length} requested payload bytes");
+        }
+
+        LinuxColdReadInterop.DiscardRange(_expertFd, alignedStart, windowEnd - alignedStart); // harmless when O_DIRECT bypassed the cache, and it keeps filesystems that silently buffer direct reads honest too
+
+        return payload;
+    }
+
+    private void ReadExactly(int fd, long offset, byte* destination, int length)
+    {
+        int filled = 0;
+        while (filled < length)
+        {
+            long read = LinuxColdReadInterop.Pread(fd, (nint)(destination + filled), (nuint)(length - filled), offset + filled);
+            if (read <= 0)
+            {
+                throw new IOException($"stream substrate: pread at 0x{offset + filled:X16} returned {read} (errno={Marshal.GetLastPInvokeError()})");
+            }
+
+            filled += (int)read; // short reads are legal on Linux descriptors: keep filling the same window
+        }
+    }
+
+    private void EnsureScratch(int bytesNeeded)
+    {
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(_scratchCapacity, 1 << 27); // a growable aligned window stays bounded well under any fixture this lane sizes
+
+        if (_scratchCapacity >= bytesNeeded)
+        {
+            return;
+        }
+
+        int capacity = Math.Max(SectorWindow, _scratchCapacity == 0 ? SectorWindow : _scratchCapacity * 2);
+        while (capacity < bytesNeeded && capacity < (1 << 30))
+        {
+            capacity *= 2;
+        }
+
+        if (_scratch != null)
+        {
+            NativeMemory.AlignedFree(_scratch);
+        }
+
+        _scratch = (byte*)NativeMemory.AlignedAlloc((nuint)capacity, SectorWindow);
+        _scratchCapacity = capacity;
+    }
+
+    public void Dispose()
+    {
+        if (_scratch != null)
+        {
+            NativeMemory.AlignedFree(_scratch);
+            _scratch = null;
+        }
+
+        LinuxColdReadInterop.Close(_expertFd);
+        LinuxColdReadInterop.Close(_denseFd);
+    }
+}
+
 internal static class ExpertRoleNames
 {
     /// <summary>The fixture's stacked MoE expert roles — the tensors a gather reads per-expert slabs from, and the only ones this lane streams on the streaming substrates.</summary>
@@ -1548,4 +1748,54 @@ internal static class WinColdReadInterop
 
     [DllImport("psapi", SetLastError = true)]
     private static extern bool GetProcessMemoryInfo(IntPtr processHandle, ref ProcessMemoryCounter counters, uint cb);
+}
+
+internal static class LinuxColdReadInterop
+{
+    public const int DirectReadFlags = 0 | 0x4000; // O_RDONLY | O_DIRECT (asm-generic value on x86-64): reads bypass the page cache outright
+
+    private const int PosixFadvDontNeed = 4;
+
+    [DllImport("libc", EntryPoint = "open", SetLastError = true)]
+    public static extern int Open(string path, int flags, uint mode);
+
+    [DllImport("libc", EntryPoint = "pread", SetLastError = true)]
+    public static extern long Pread(int fd, nint buffer, nuint count, long offset);
+
+    [DllImport("libc", EntryPoint = "close", SetLastError = true)]
+    public static extern int Close(int fd);
+
+    // posix_fadvise reports its failure as a returned errno instead of the -1/errno pairing other syscalls use.
+    [DllImport("libc", EntryPoint = "posix_fadvise", SetLastError = true)]
+    private static extern int PosixFadvise(int fd, long offset, long length, int advice);
+
+    /// <summary>POSIX_FADV_DONTNEED over a read range: pages this process fetched for that window are released so the next resolution of the same bytes pays storage again.</summary>
+    public static void DiscardRange(int fd, long offset, long length) => _ = PosixFadvise(fd, offset, length, PosixFadvDontNeed);
+
+    /// <summary>Minor + major fault counters for this process from /proc/self/stat (fields after the command paren: index 7 minor faults, index 9 major faults).</summary>
+    public static long PageFaultsOfCurrentProcess()
+    {
+        try
+        {
+            string stat = File.ReadAllText("/proc/self/stat");
+            int closeParen = stat.LastIndexOf(')');
+            if (closeParen < 0 || closeParen + 1 >= stat.Length)
+            {
+                return 0L;
+            }
+
+            // Fields are single-space separated after the parenthesized command, so a comm containing spaces cannot shift the indices.
+            string[] fields = stat.Substring(closeParen + 1).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (fields.Length < 10 || !long.TryParse(fields[7], NumberStyles.Integer, CultureInfo.InvariantCulture, out long minor) || !long.TryParse(fields[9], NumberStyles.Integer, CultureInfo.InvariantCulture, out long major))
+            {
+                return 0L;
+            }
+
+            return minor + major;
+        }
+        catch (IOException)
+        {
+            return 0L; // a host without a readable /proc falls back to the streamed-byte tallies alone
+        }
+    }
 }

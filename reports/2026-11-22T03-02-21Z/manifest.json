@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "reportId": "moe-gather-2026-11-22T03-02-21Z",
+  "generatedAtUtc": "2026-11-22T03:02:21Z",
+  "phase": "MVP7",
+  "branch": "unknown",
+  "lane": "Local CPU gather/dense-equivalent comparison (synthetic qwen2moe fixture)",
+  "goal": "Measure the merged-decode union gather against dense-equivalent solo stepping on identical sequences and token streams, prove bit-identical parity, and record the step\u0027s union active-expert amortization.",
+  "files": [
+    "manifest.json",
+    "host.json",
+    "bench.json",
+    "cli.json",
+    "report.html"
+  ],
+  "comparisonNotes": [
+    "The fixture is synthetic deterministic F32 qwen2moe material: it measures the gather mechanism (union walks, slab views, prefetch staging), not a quantized production model.",
+    "Both arms run identical sequences and token streams over identical file bytes; parity compares every step\u0027s logits bit-for-bit between the merged-decode arm and solo stepping.",
+    "Union stats come from an instrumentation pass that counts slab resolutions through the gather kernel: unionGateResolutionsPerDecodeStep lists gate-role resolutions per decode step summed over the fixture\u0027s layers, while averages and byte tallies are reported per layer step \u2014 each distinct expert of a step\u0027s union resolves exactly one slab per role.",
+    "The ram-hot-tier arm runs the same merged-decode gather with its weight source wrapped in the RAM residency tier: experts resident by capacity/cost answer slab reads from private byte-identical copies, everything else resolves through cold contiguous views. Its tallies come from one untimed replay pass after ResetAnswerTallies \u2014 hit rate and saved-byte estimate describe that clean stream; parity proves its logits bit-identical to the prefetch-only gather arm\u0027s.",
+    "Substrate stream (linux o_direct\u002Bdiscard): expert role tensors resolve through cold whole-role reads into fresh buffers \u2014 unbuffered FILE_FLAG_NO_BUFFERING transfers on Windows, sector-aligned O_DIRECT preads whose read range is released with posix_fadvise(POSIX_FADV_DONTNEED) on Linux (a buffered\u002Bdiscard descriptor when the filesystem refuses direct I/O) \u2014 while dense weights answer from ordinary buffered (OS-cached) reads so only expert traffic pays storage cost. Both arms pay this for their cold resolutions \u2014 the prefetch-only gather arm streams every union expert\u0027s roles, and a tier miss streams that expert chain\u0027s role tensors through the same slab-view route (the loader has no per-slab staging today); resident experts answer from private copies with zero streamed bytes."
+  ]
+}

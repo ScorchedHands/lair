@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "reportId": "moe-gather-2026-11-22T03-02-21Z",
+  "commandLine": "/root/lair-measurements/xeon-hotsweep/app/Lair.Bench gather --seqs 8 --tokens 24 --reps 3 --inter 256 --experts 12 --substrate stream --hot-budget-mb 21 --fixture-dir /root/lair-measurements/xeon-hotsweep/fixtures --out /root/lair-measurements/xeon-hotsweep/reports gather --seqs 8 --tokens 24 --reps 3 --inter 256 --experts 12 --substrate stream --hot-budget-mb 21 --fixture-dir /root/lair-measurements/xeon-hotsweep/fixtures --out /root/lair-measurements/xeon-hotsweep/reports",
+  "workingDirectory": "/root/lair-measurements/xeon-hotsweep"
+}

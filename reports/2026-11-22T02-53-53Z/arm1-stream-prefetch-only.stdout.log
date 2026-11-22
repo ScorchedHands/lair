@@ -1,0 +1,13 @@
+gather fixture: qwen2moe synthetic layers=2 hidden=512 heads=4 headDim=128 kvHeads=4 inter=256 experts=12 routed=8 vocab=256 sharedExpert=yes weights=F32
+gather posture: seqs=8 tokensPerSequence=24 reps=3 outRoot=/root/lair-measurements/xeon-hotsweep/reports substrate=stream engineThreads=auto avx2=True physicalCores=0 logicalProcessors=64
+gather residency arm: disabled (pass --hot-budget-mb to add the RAM-hot-tier gather arm)
+gather fixture file=/root/lair-measurements/xeon-hotsweep/fixtures/lair-moe-gather-cedfe293b697464caecbcac2f41d7d10.gguf bytes=49872896 (47.6 MiB)
+gather cold-read backing: linux o_direct+discard
+gather arm: merged-decode median=15.6379s min=15.6058 max=15.7419 tok/s=12.28
+dense-equivalent arm: solo-stepping median=82.5488s min=81.7066 max=83.8094 tok/s=2.33
+cold-read evidence substrate=stream: gather arm stackRoleReads=5184 streamedMiB=31104.0 pageFaults=7734267 | solo arm stackRoleReads=27648 streamedMiB=165888.0 pageFaults=42040898
+parity: gathered-vs-dense-equivalent logits floats=49152 exact=yes mismatches=0
+union: avgDistinctExpertsGatheredPerLayerStep=12.00 of selectionSlots=64 amortized=81.2% gatheredBytes/layerStep=18.0 MiB denseEquivalentBytes/layerStep=96.0 MiB distinctExpertsAcrossRun=12/12
+fatal: not a git repository (or any of the parent directories): .git
+gather report dir=/root/lair-measurements/xeon-hotsweep/reports/2026-11-22T02-53-53Z
+wall=508

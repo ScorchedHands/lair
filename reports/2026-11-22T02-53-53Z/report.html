@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>moe-gather-2026-11-22T02-53-53Z</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem; color: #1c1c1c; }
+h1 { font-size: 1.35rem; } h2 { font-size: 1.1rem; margin-top: 1.6rem; }
+table { border-collapse: collapse; margin-top: .5rem; }
+th, td { border: 1px solid #bbb; padding: .4rem .7rem; text-align: left; font-size: .92rem; }
+th { background: #f0f0f0; } .ok { color: #0a7d32; font-weight: 600; } .bad { color: #b00020; font-weight: 600; }
+canvas { max-width: 720px; margin-top: 1rem; }
+.note { color: #555; font-size: .88rem; }
+</style>
+</head>
+<body>
+<h1>moe-gather-2026-11-22T02-53-53Z</h1>
+<p class="note">Local CPU gather/dense-equivalent comparison (synthetic qwen2moe fixture) · 2026-11-22T02:53:53Z · branch unknown</p>
+
+<h2>Arms — merged-decode gather vs dense-equivalent solo stepping</h2>
+<table>
+<tr><th>Arm</th><th>Harness</th><th>Tok/s (median)</th><th>Median s</th><th>Min s</th><th>Max s</th></tr>
+<tr><td>gather-merged-decode</td><td>LAIR engine DecodeBatch union gather (CpuGatherKernel over ExpertSlabWeightSource views)</td><td>12.28</td><td>15.6379</td><td>15.6058</td><td>15.7419</td></tr>
+<tr><td>dense-equivalent-solo</td><td>LAIR engine DecodeNext per-sequence stepping (same token streams, fresh KV)</td><td>2.33</td><td>82.5488</td><td>81.7066</td><td>83.8094</td></tr>
+</table>
+<p class="note">gather vs dense-equivalent delta = 427.88% (positive means the gather arm is faster)</p>
+
+<h2>Parity — gathered logits vs dense-equivalent, bit-for-bit</h2>
+<table>
+<tr><th>Pairing</th><th>Compared floats</th><th>Mismatched</th><th>Exact</th></tr>
+<tr><td>gather vs dense-equivalent</td><td>49152</td><td>0</td><td class="ok">bit-exact</td></tr>
+</table>
+
+<h2>Union active-expert amortization (instrumentation pass)</h2>
+<table>
+<tr><th>Selection slots / layer step</th><th>Avg distinct experts gathered</th><th>Amortized</th><th>Gathered MiB / layer step</th><th>Dense-equivalent MiB / layer step</th></tr>
+<tr><td>64</td><td>12.00</td><td>81.2%</td><td>18.0</td><td>96.0</td></tr>
+</table>
+
+
+<h2>Decode throughput comparison</h2>
+<canvas id="arms" width="720" height="360"></canvas>
+<script>
+new Chart(document.getElementById('arms'), {
+  type: 'bar',
+  data: {
+    labels: ['gather-merged-decode', 'dense-equivalent-solo'],
+    datasets: [{ label: 'decode tok/s (median)', data: [12.28, 2.33] }]
+  },
+  options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true, title: { display: true, text: 'tokens/s' } } } }
+});
+</script>
+
+<h2>Host</h2>
+<table>
+<tr><th>Hostname</th><td>lair</td></tr>
+<tr><th>OS</th><td>Debian GNU/Linux 13 (trixie)</td></tr>
+<tr><th>Logical processors / physical cores / backend workers</th><td>64 / 0 / 1</td></tr>
+<tr><th>CPU flags matched</th><td>avx, avx2, fma, ssse3</td></tr>
+</table>
+
+<h2>Notes</h2>
+<ul>
+<li>The fixture is synthetic deterministic F32 qwen2moe material: it measures the gather mechanism (union walks, slab views, prefetch staging), not a quantized production model.</li>
+<li>Both arms run identical sequences and token streams over identical file bytes; parity compares every step&#39;s logits bit-for-bit between the merged-decode arm and solo stepping.</li>
+<li>Union stats come from an instrumentation pass that counts slab resolutions through the gather kernel: unionGateResolutionsPerDecodeStep lists gate-role resolutions per decode step summed over the fixture&#39;s layers, while averages and byte tallies are reported per layer step — each distinct expert of a step&#39;s union resolves exactly one slab per role.</li>
+<li>Substrate stream (linux o_direct+discard): expert role tensors resolve through cold whole-role reads into fresh buffers — unbuffered FILE_FLAG_NO_BUFFERING transfers on Windows, sector-aligned O_DIRECT preads whose read range is released with posix_fadvise(POSIX_FADV_DONTNEED) on Linux (a buffered+discard descriptor when the filesystem refuses direct I/O) — while dense weights answer from ordinary buffered (OS-cached) reads so only expert traffic pays storage cost. Both arms pay this for their cold resolutions — the prefetch-only gather arm streams every union expert&#39;s roles, and a tier miss streams that expert chain&#39;s role tensors through the same slab-view route (the loader has no per-slab staging today); resident experts answer from private copies with zero streamed bytes.</li>
+</ul>
+</body>
+</html>

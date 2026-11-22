@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "host": {
+    "hostname": "lair",
+    "os": "Debian GNU/Linux 13 (trixie)",
+    "framework": ".NET 10.0.14",
+    "logicalProcessors": 64,
+    "physicalCores": 0,
+    "backendWorkers": 1,
+    "memoryTotalBytes": 270313869312,
+    "cpuFlagsMatched": [
+      "avx",
+      "avx2",
+      "fma",
+      "ssse3"
+    ],
+    "cpuFlagsAbsent": [
+      "vnni",
+      "bf16"
+    ],
+    "lane": "CPU-only"
+  }
+}

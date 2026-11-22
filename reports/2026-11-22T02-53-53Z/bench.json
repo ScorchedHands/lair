@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "reportId": "moe-gather-2026-11-22T02-53-53Z",
+  "substrate": "stream",
+  "coldReads": {
+    "substrateId": "stream",
+    "gatherStackRoleReadsTimedReps": 5184,
+    "gatherStreamedBytesTimedReps": 32614907904,
+    "gatherPageFaultDeltaTimedReps": 7734267,
+    "soloStackRoleReadsTimedReps": 27648,
+    "soloStreamedBytesTimedReps": 173946175488,
+    "soloPageFaultDeltaTimedReps": 42040898,
+    "hotArmRan": false,
+    "hotStackRoleReadsTimedReps": 0,
+    "hotStreamedBytesTimedReps": 0,
+    "hotPageFaultDeltaTimedReps": 0
+  },
+  "arms": [
+    {
+      "id": "gather-merged-decode",
+      "harness": "LAIR engine DecodeBatch union gather (CpuGatherKernel over ExpertSlabWeightSource views)",
+      "metrics": [
+        {
+          "test": "decode tok/s",
+          "tokensPerSecond": 12.2779
+        }
+      ],
+      "medianSeconds": 15.6379,
+      "minSeconds": 15.6058,
+      "maxSeconds": 15.7419
+    },
+    {
+      "id": "dense-equivalent-solo",
+      "harness": "LAIR engine DecodeNext per-sequence stepping (same token streams, fresh KV)",
+      "metrics": [
+        {
+          "test": "decode tok/s",
+          "tokensPerSecond": 2.3259
+        }
+      ],
+      "medianSeconds": 82.5488,
+      "minSeconds": 81.7066,
+      "maxSeconds": 83.8094
+    }
+  ],
+  "parity": {
+    "bitExact": true,
+    "comparedFloats": 49152,
+    "mismatchedFloats": 0,
+    "maxAbsDiff": 0
+  },
+  "tierVsGatherParity": null,
+  "residency": null,
+  "unionStats": {
+    "selectionSlotsPerLayerStep": 64,
+    "averageDistinctExpertsGatheredPerLayerStep": 12,
+    "amortizationPercent": 81.25,
+    "gatheredBytesPerLayerStep": 18874368,
+    "denseEquivalentBytesPerLayerStep": 100663296,
+    "distinctExpertsAcrossRun": 12,
+    "unionGateResolutionsPerDecodeStep": [
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24,
+      24
+    ]
+  }
+}
