@@ -280,6 +280,38 @@ public static class ModelProfiles
             NormPlacement = NormPlacement.PreOnly,
             Tensors = MoeTensors(),
         },
+        new ModelProfile
+        {
+            Architecture = "qwen4exp",
+            Prefix = "qwen4exp.",
+            // The qwen4exp plan resolves its family geometry from the file's own declarations and validates the tensor
+            // table against that resolved interleave — no other profile carries this flag, so nothing else pays for it.
+            DeclaresQwen4ExpSemantics = true,
+            // The reference block routes every token through a per-layer router over its experts and adds one shared
+            // expert with a hidden-sized selector vector: the same shape qwen2moe names, under the same names this
+            // conversion writes (its FFN material arrives entirely as *_exps/*_shexp stacks plus that selector). The
+            // counts land from the file's declared metadata like every other sparse shape.
+            SparseFfn = Qwen2MoeSparseFfn,
+            Norm = NormStrategy.RmsNorm,
+            Activation = ActivationStrategy.SwiGLU,
+            Bias = BiasPolicy.Declared,
+            // The conversion is qwen3-lineage and its rotary rows sit in rotate-half order like the qwen3 checkpoints'
+            // do, so pairing each head's halves is the layout a file declaring no rope pairing key should read at. Its
+            // partial rotary arrives as <prefix>rope.dimension_count — carried by the plan's existing rotary-dimensions
+            // machinery rather than a factor key this conversion does not write; the declared dimension_sections array
+            // stays unconsumed until execution composes these blocks.
+            Rope = RopeStrategy.RotateHalfFullHead,
+            // The full-attention layers ship per-head q/k norm vectors while linear layers carry their own head norms
+            // instead, so no single mode fits every layer of this family: the plan default stays off and each kind's
+            // norms are judged where that block composes them.
+            DefaultQkNorm = QkNormMode.Off,
+            // The full-attention layers project q/k/v through separate tensors — what their split roles name — while a
+            // linear layer's fused buffer is named by its own role rather than reached through this layout switch; the
+            // resolved per-layer kind in the plan says which side each block takes.
+            AttentionWeights = QkvLayout.SeparateTensors,
+            NormPlacement = NormPlacement.PreOnly,
+            Tensors = Qwen4ExpTensors(),
+        },
     ];
 
     private static readonly Dictionary<string, ModelProfile> ByArchitecture =
@@ -408,6 +440,12 @@ public static class ModelProfiles
                 descriptor.Role is TensorRole.FeedForwardGate or TensorRole.FeedForwardUp or TensorRole.FeedForwardDown
                     ? descriptor with { Required = false }
                     : descriptor),
+            .. SparseFfnNames(),
+        ]);
+
+    // The sparse-FFN role names shared by every MoE-shaped map here: the router matrix, the stacked per-expert gate/up/down triplets, the shared expert's gate/up/down triplets, and the hidden-sized vector that selects the shared expert for a token. Every sparse role is optional: the map names a MoE file's table so the load can report the file instead of rejecting its material, and only the families whose reference ships each tensor name it — the shared selector vector is a separate tensor from the shared gate matrix, with a shape of its own, so it carries no alias onto that name. Dense profiles carry no sparse roles at all: their forward consumes none, and the generic llama-shaped fallback treats a tensor under a sparse name as material its map cannot match.
+    private static TensorDescriptor[] SparseFfnNames() =>
+        [
             new TensorDescriptor(TensorRole.MoeRouter, TensorScope.PerLayer, "blk.{layer}.ffn_gate_inp.weight", Required: false, []),
             new TensorDescriptor(TensorRole.MoeExpertGate, TensorScope.PerLayer, "blk.{layer}.ffn_gate_exps.weight", Required: false, []),
             new TensorDescriptor(TensorRole.MoeExpertUp, TensorScope.PerLayer, "blk.{layer}.ffn_up_exps.weight", Required: false, []),
@@ -444,5 +482,70 @@ public static class ModelProfiles
                 "blk.{layer}.ffn_exps_basis_out.weight",
                 Required: false,
                 ["blk.{layer}.ffn_experts_basis_out.weight"]),
+        ];
+
+    // The qwen4exp tensor map: the canonical names with this family's substitutions. A routed-only block ships no dense
+    // gate/up/down triplet — its FFN material is entirely the *_exps/*_shexp stacks and selector the sparse roles name —
+    // so those three relax exactly as they do in a MoE map, and the split q/k/v/output quartet plus the plain per-sublayer
+    // norm vectors relax too: which layers carry them is decided by that layer's resolved attention kind (only full
+    // sparse layers project through separate tensors; only linear layers run without hyper-connection stream norms), so a
+    // flat required flag would reject one half of this family's own blocks. The plan gate over the resolved interleave —
+    // not these flags — is what makes each layer's material required where its kind needs it, and reports it missing by
+    // concrete name when it does not arrive; every role here therefore names a table entry whose necessity follows the
+    // per-layer decision. The family roles spell this conversion's own names as they appear in the shipped target file:
+    // `ssm_a` without a `.weight` suffix (the decay weight is spelled that way and nothing invents an alias onto one),
+    // alpha/beta under their separate names because the file ships them separately, dt bias with its bare `.bias`, the
+    // indexer quartet under `indexer.`, each block's hyper-connection trio on both sublayer sides under `hc_attn_`/
+    // `hc_ffn_`, and one global output-side trio under `output_hc_`. The PLE names follow the same target file — a causal
+    // convolution kernel, key/value projections of the mixing attention and three norm vectors — all optional because only
+    // layers the declared ple.layers list selects ship them, and today's gather seam resolves that table by name rather
+    // than through this map.
+    private static TensorMap Qwen4ExpTensors() =>
+        new(
+        [
+            .. CanonicalDescriptors().Select(descriptor =>
+                descriptor.Role is TensorRole.FeedForwardGate or TensorRole.FeedForwardUp or TensorRole.FeedForwardDown
+                    or TensorRole.AttentionQuery or TensorRole.AttentionKey or TensorRole.AttentionValue or TensorRole.AttentionOutput
+                    or TensorRole.AttentionNorm or TensorRole.FeedForwardNorm or TensorRole.OutputNorm
+                    ? descriptor with { Required = false }
+                    : descriptor),
+            .. SparseFfnNames(),
+
+            new TensorDescriptor(TensorRole.AttentionQkv, TensorScope.PerLayer, "blk.{layer}.attn_qkv.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.LinearAttentionGate, TensorScope.PerLayer, "blk.{layer}.attn_gate.weight", Required: false, []),
+
+            new TensorDescriptor(TensorRole.SsmDecayWeight, TensorScope.PerLayer, "blk.{layer}.ssm_a", Required: false, []),
+            new TensorDescriptor(TensorRole.SsmAlphaProjection, TensorScope.PerLayer, "blk.{layer}.ssm_alpha.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.SsmBetaProjection, TensorScope.PerLayer, "blk.{layer}.ssm_beta.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.SsmConvolutionKernel, TensorScope.PerLayer, "blk.{layer}.ssm_conv1d.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.SsmTimeStepBias, TensorScope.PerLayer, "blk.{layer}.ssm_dt.bias", Required: false, []),
+            new TensorDescriptor(TensorRole.SsmHeadNorm, TensorScope.PerLayer, "blk.{layer}.ssm_norm.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.SsmOutputProjection, TensorScope.PerLayer, "blk.{layer}.ssm_out.weight", Required: false, []),
+
+            new TensorDescriptor(TensorRole.IndexerQueryProjection, TensorScope.PerLayer, "blk.{layer}.indexer.q_proj.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.IndexerKeyProjection, TensorScope.PerLayer, "blk.{layer}.indexer.k_proj.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.IndexerQueryNorm, TensorScope.PerLayer, "blk.{layer}.indexer.q_norm.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.IndexerKeyNorm, TensorScope.PerLayer, "blk.{layer}.indexer.k_norm.weight", Required: false, []),
+
+            new TensorDescriptor(TensorRole.AttentionStreamInject, TensorScope.PerLayer, "blk.{layer}.hc_attn_inject.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.AttentionStreamDown, TensorScope.PerLayer, "blk.{layer}.hc_attn_down.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.AttentionStreamUp, TensorScope.PerLayer, "blk.{layer}.hc_attn_up.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.AttentionStreamNorm, TensorScope.PerLayer, "blk.{layer}.hc_attn_norm.weight", Required: false, []),
+
+            new TensorDescriptor(TensorRole.FeedForwardStreamInject, TensorScope.PerLayer, "blk.{layer}.hc_ffn_inject.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.FeedForwardStreamDown, TensorScope.PerLayer, "blk.{layer}.hc_ffn_down.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.FeedForwardStreamUp, TensorScope.PerLayer, "blk.{layer}.hc_ffn_up.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.FeedForwardStreamNorm, TensorScope.PerLayer, "blk.{layer}.hc_ffn_norm.weight", Required: false, []),
+
+            new TensorDescriptor(TensorRole.OutputStreamDown, TensorScope.Global, "output_hc_down.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.OutputStreamNorm, TensorScope.Global, "output_hc_norm.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.OutputStreamUp, TensorScope.Global, "output_hc_up.weight", Required: false, []),
+
+            new TensorDescriptor(TensorRole.PleConvolutionKernel, TensorScope.PerLayer, "blk.{layer}.ple_conv1d.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.PleKeyProjection, TensorScope.PerLayer, "blk.{layer}.ple_key.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.PleValueProjection, TensorScope.PerLayer, "blk.{layer}.ple_value.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.PleConvolutionNorm, TensorScope.PerLayer, "blk.{layer}.ple_norm_conv.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.PleKeyNorm, TensorScope.PerLayer, "blk.{layer}.ple_norm_key.weight", Required: false, []),
+            new TensorDescriptor(TensorRole.PleQueryNorm, TensorScope.PerLayer, "blk.{layer}.ple_norm_query.weight", Required: false, []),
         ]);
 }

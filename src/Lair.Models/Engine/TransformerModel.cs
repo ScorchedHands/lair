@@ -1121,6 +1121,21 @@ public sealed class TransformerModel : IDisposable
         MaxContextTokens = maxContextTokens;
         _modelDisplay = ModelDisplayName(file); // every capability refusal this engine raises — at open and on a re-point alike — calls this model by the same name the structured load lines report.
 
+        // A qwen4exp plan resolves its per-layer interleave, recurrent-state geometry, indexer budgets and hyper-connection
+        // mixing from the file's own declarations — that resolution is what residency accounting sizes against today. What
+        // does not exist yet is the composition: a gated-delta-net step over the fused buffer and stored state, an
+        // indexer-restricted full-attention pass over selected cache cells, and hyper-connection residual mixing around
+        // each sublayer are layer-level operands (the GDN/QSA operand kernels take exactly these shapes) that no block
+        // forward here sequences yet. The plan stays resolved and reported instead of the engine silently running some
+        // other composition against this family's tensors, so open refuses naming what was decided but cannot run — like
+        // every unimplemented capability before it — rather than half-forwarding a model whose logits would be wrong.
+        if (Plan.Qwen4Exp is { } qwen4exp)
+        {
+            throw new ModelException(
+                $"model '{_modelDisplay}' architecture 'qwen4exp' resolves its execution geometry " +
+                $"(gated-delta-net layers: {qwen4exp.LinearLayerCount}, sparse full-attention layers: {qwen4exp.FullLayerCount}, hyper connections: {Plan.Qwen4Exp.HyperConnections.StreamCount} streams at rank {Plan.Qwen4Exp.HyperConnections.LowRank}) but the forward engine cannot run it yet: composing a gated-delta-net step, an indexer-restricted attention pass and hyper-connection residual mixing into this block forward is not implemented in this build — only standard dense/attention families execute today");
+        }
+
         // The formats this file's dense weight matrices carry, read from the plan's tensor map before any payload is
         // touched: it decides whether a selection that multiplies a whole sub-batch against one matrix can run here at
         // all, and it names the formats a refusal reports.

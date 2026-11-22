@@ -96,9 +96,16 @@ public sealed record ModelProfile
     /// <see cref="Lair.Models.WindowInterleave.AlternatingLocalFirst"/> narrows the mask to the even-indexed layers
     /// and leaves the odd-indexed ones unbounded, which is how the gemma2 reference graph applies its window, and
     /// <see cref="Lair.Models.WindowInterleave.SixLayerGroupsLocalFirst"/> leaves the last layer of each group of six
-    /// unbounded and masks the rest, which is how the reference applies this family's window. No
-    /// metadata key selects it: the profile decides, and a declared window of <c>0</c> is unbounded whatever the
-    /// pattern.
+    /// unbounded and masks the rest, which is how the reference applies this family's window. No metadata key selects
+    /// it: the profile decides, and a declared window of <c>0</c> is unbounded whatever the pattern.
     /// </summary>
     public WindowInterleave WindowInterleave { get; init; } = WindowInterleave.AllLayers;
+
+    /// <summary>
+    /// Whether this family's blocks carry gated-delta-net linear attention, a sparse indexer on its full-attention
+    /// layers, and widened hyper-connected residual streams: the profile whose map names those roles sets it true, and
+    /// only such a profile resolves the per-layer geometry slot from the file's declared groups. A profile defaults to
+    /// <c>false</c>; no metadata key selects it — which tensors a family ships is the profile's fact, not the file's.
+    /// </summary>
+    public bool DeclaresQwen4ExpSemantics { get; init; }
 }

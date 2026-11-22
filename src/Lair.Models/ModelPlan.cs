@@ -240,6 +240,17 @@ public sealed record ModelPlan
     public SparseFfnStrategy? SparseFfnStrategy { get; init; }
 
     /// <summary>
+    /// The qwen4exp attention/state geometry resolved from the file's declared interleave and state metadata, or
+    /// <c>null</c> for every other family. It records what the declarations add up to — per-layer gated-delta-net vs
+    /// sparse-full kinds with their pooling ratios, the recurrent-state widths each linear layer's tensors must cover,
+    /// the indexer selection budget a full layer caches against, and the hyper-connection stream mixing across the
+    /// residual width — so residency accounting can size what those layers hold without executing them. Like the
+    /// sparse-FFN descriptor above it names what the load decided, not what proved runnable: composing these operands
+    /// into an actual forward is a later step, and this family reports at engine open instead of computing something else.
+    /// </summary>
+    public Qwen4ExpGeometry? Qwen4Exp { get; init; }
+
+    /// <summary>
     /// The row count a prefill sub-batch carries: the number of prompt positions one batched weight pass advances at
     /// once, resolved per engine and independent of <see cref="Engine.TransformerModel.MaxBatchSequences"/>, which is
     /// the ceiling on sequences a decode batch may advance — widening one family's rows does not widen the other's.

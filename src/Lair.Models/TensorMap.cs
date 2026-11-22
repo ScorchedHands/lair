@@ -78,6 +78,116 @@ public enum TensorRole
     /// application instead of one down-projection per expert.
     /// </summary>
     MoeExpertOutputBasis,
+
+    /// <summary>
+    /// One linear-attention block's z gate: its own projection rows (one value-head slice wide) whose sigmoid gates the
+    /// normalized head outputs at this token. Only a family with gated-delta-net blocks names it; the fused qkv buffer
+    /// of such a block stays named by <see cref="AttentionQkv"/> because that tensor carries exactly its conv channels.
+    /// </summary>
+    LinearAttentionGate,
+
+    // The recurrent-state operands one gated-delta-net block reads: each value head's stored decay weight (the name
+    // this family spells without a .weight suffix), the merged beta and alpha projections' rows split into two named
+    // tensors here because the file ships them as two, the depthwise convolution kernel over every fused channel row,
+    // each head's dt bias added before softplus, the shared per-head output norm vector, and the block output matrix.
+
+    /// <summary>Per value head stored decay weight of a gated-delta-net block.</summary>
+    SsmDecayWeight,
+
+    /// <summary>The alpha projection rows feeding one linear block's decay gate (softplus over these plus each head's dt bias).</summary>
+    SsmAlphaProjection,
+
+    /// <summary>The beta projection rows selecting how much of the value a token writes into its recurrent state.</summary>
+    SsmBetaProjection,
+
+    /// <summary>The causal depthwise convolution kernel: one row per fused qkv channel carrying that channel's taps contiguously.</summary>
+    SsmConvolutionKernel,
+
+    /// <summary>Per value head dt bias added to the raw alpha before softplus.</summary>
+    SsmTimeStepBias,
+
+    /// <summary>The shared norm vector each linear block normalizes its per-head outputs with (head-dimension wide).</summary>
+    SsmHeadNorm,
+
+    /// <summary>A gated-delta-net block's output projection over the concatenated value-head widths.</summary>
+    SsmOutputProjection,
+
+    // The sparse indexer every full-attention block of this family scores its selection through: one query region per
+    // scoring head, the shared single key projection, and their component-width norm vectors. Attention itself stays
+    // named by the ordinary q/k/v/output roles — selection restricts which cache cells those read, not what they are.
+
+    /// <summary>The indexer's stacked query projections: one component region per scoring head.</summary>
+    IndexerQueryProjection,
+
+    /// <summary>The indexer's single key projection every cached cell passes through before pooling.</summary>
+    IndexerKeyProjection,
+
+    /// <summary>The norm vector the indexer queries are RMS-normalized with (component-width).</summary>
+    IndexerQueryNorm,
+
+    /// <summary>The norm vector pooled keys are RMS-normalized with (component-width).</summary>
+    IndexerKeyNorm,
+
+    // Hyper-connections: each block mixes a widened residual stream around both its sublayers. The inject scores pick
+    // which streams feed the sublayer, the down/up pair compresses the flattened stream through the declared low rank,
+    // and the norm vector normalizes every element of that flattened width before mixing. Both sides carry the same
+    // four tensors under their own names; a final output-side trio mixes the streams into the logits' hidden side.
+
+    /// <summary>Per-stream inject scores selecting which residual streams feed this block's attention.</summary>
+    AttentionStreamInject,
+
+    /// <summary>The low-rank expansion adding this block's attention output back across the flattened stream width.</summary>
+    AttentionStreamUp,
+
+    /// <summary>The projection compressing the flattened stream to the declared rank before the attention sublayer.</summary>
+    AttentionStreamDown,
+
+    /// <summary>The norm vector covering the whole flattened residual feeding this block's attention (flattened-width).</summary>
+    AttentionStreamNorm,
+
+    /// <summary>Per-stream inject scores selecting which residual streams feed this block's feed-forward.</summary>
+    FeedForwardStreamInject,
+
+    /// <summary>The low-rank expansion adding this block's feed-forward output back across the flattened stream width.</summary>
+    FeedForwardStreamUp,
+
+    /// <summary>The projection compressing the flattened stream to the declared rank before the feed-forward sublayer.</summary>
+    FeedForwardStreamDown,
+
+    /// <summary>The norm vector covering the whole flattened residual feeding this block's feed-forward (flattened-width).</summary>
+    FeedForwardStreamNorm,
+
+    /// <summary>The global output-side projection compressing the final flattened stream to the declared rank before mixing.</summary>
+    OutputStreamDown,
+
+    /// <summary>The global norm vector covering the final flattened residual stream (flattened-width).</summary>
+    OutputStreamNorm,
+
+    /// <summary>The global low-rank expansion that mixes the final streams into each token's hidden row.</summary>
+    OutputStreamUp,
+
+    // The per-layer ngram input-embedding tensors this family ships on its declared PLE layers: a causal convolution
+    // kernel over the gathered table rows, the key/value projections of the small attention mixing them with the
+    // residual, and their three norm vectors. All are optional in every map — only files declaring PLE carry them, and
+    // nothing resident reads them through this map yet (the gather seam resolves that tensor by name).
+
+    /// <summary>A PLE block's causal convolution kernel over its gathered table rows.</summary>
+    PleConvolutionKernel,
+
+    /// <summary>The key projection of a PLE block's small mixing attention.</summary>
+    PleKeyProjection,
+
+    /// <summary>The value projection returning the mixed per-layer input embedding to the hidden stream.</summary>
+    PleValueProjection,
+
+    /// <summary>The norm vector covering this PLE block's convolved table rows before mixing.</summary>
+    PleConvolutionNorm,
+
+    /// <summary>The norm vector covering a PLE block's projected keys (hidden-width).</summary>
+    PleKeyNorm,
+
+    /// <summary>The norm vector covering the hidden row a PLE block queries against (hidden-width).</summary>
+    PleQueryNorm,
 }
 
 /// <summary>Whether a tensor name is a single global name or a per-block name carrying a <c>{layer}</c> placeholder.</summary>
@@ -209,11 +319,50 @@ public sealed class TensorMap
             or TensorRole.MoeExpertOutputBasis;
 
     /// <summary>
+    /// Whether a role belongs to an architecture family other than the dense and MoE shapes — this build's gated-delta-net
+    /// linear-attention, sparse-indexer, hyper-connection, and per-layer-input-embedding roles. No existing profile names
+    /// them; only a family that runs those blocks declares them in its map. Like the sparse roles, they stay out of the
+    /// llama-shaped fallback's nameable set: a tensor under one of these names is material a dense-shaped file cannot run.
+    /// </summary>
+    public static bool IsFamilySpecificRole(TensorRole role) =>
+        IsSparseRole(role)
+            || role is TensorRole.LinearAttentionGate
+            or TensorRole.SsmDecayWeight
+            or TensorRole.SsmAlphaProjection
+            or TensorRole.SsmBetaProjection
+            or TensorRole.SsmConvolutionKernel
+            or TensorRole.SsmTimeStepBias
+            or TensorRole.SsmHeadNorm
+            or TensorRole.SsmOutputProjection
+            or TensorRole.IndexerQueryProjection
+            or TensorRole.IndexerKeyProjection
+            or TensorRole.IndexerQueryNorm
+            or TensorRole.IndexerKeyNorm
+            or TensorRole.AttentionStreamInject
+            or TensorRole.AttentionStreamUp
+            or TensorRole.AttentionStreamDown
+            or TensorRole.AttentionStreamNorm
+            or TensorRole.FeedForwardStreamInject
+            or TensorRole.FeedForwardStreamUp
+            or TensorRole.FeedForwardStreamDown
+            or TensorRole.FeedForwardStreamNorm
+            or TensorRole.OutputStreamDown
+            or TensorRole.OutputStreamNorm
+            or TensorRole.OutputStreamUp
+            or TensorRole.PleConvolutionKernel
+            or TensorRole.PleKeyProjection
+            or TensorRole.PleValueProjection
+            or TensorRole.PleConvolutionNorm
+            or TensorRole.PleKeyNorm
+            or TensorRole.PleQueryNorm;
+
+    /// <summary>
     /// Whether a profile's map may leave this role out entirely: the sparse-FFN roles above, which no dense block ships,
-    /// and <see cref="TensorRole.AttentionQkv"/>, which only a family whose conversion fuses q/k/v into one tensor names.
+    /// every other family-specific role named by <see cref="IsFamilySpecificRole"/>, and
+    /// <see cref="TensorRole.AttentionQkv"/>, which only a family whose conversion fuses q/k/v into one tensor names.
     /// A map that omits such a role has no name to resolve for it, so nothing may ask the indexer for its descriptor;
     /// every profile today either consumes the fused layout or leaves the role undeclared.
     /// </summary>
     public static bool IsProfileOptionalRole(TensorRole role) =>
-        IsSparseRole(role) || role == TensorRole.AttentionQkv;
+        IsFamilySpecificRole(role) || role == TensorRole.AttentionQkv;
 }

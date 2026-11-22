@@ -121,7 +121,7 @@ public static class ModelPlans
         int layers = RequireInt(metadata, prefix + "block_count");
         int heads = RequireInt(metadata, prefix + "attention.head_count");
         int kvHeads = RequireInt(metadata, prefix + "attention.head_count_kv");
-        int ffn = RequireInt(metadata, prefix + "feed_forward_length");
+        int ffn = ResolveFeedForwardLength(metadata, prefix, gguf, logLine);
 
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(layers);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(hidden);
@@ -261,6 +261,24 @@ public static class ModelPlans
         // not downgraded, when it selects a variant the declared storage cannot back.
         SparseFfnDescriptor? sparseFfn = ResolveSparseFfn(metadata, prefix, profile.SparseFfn);
 
+        // The qwen4exp execution geometry resolves only under a profile that declares this family's semantics: its per-layer
+        // attention interleave from the declared compress-ratio array (checked against <prefix>full_attention_interval when
+        // that key is also present), the shared gated-delta-net geometry from the <prefix>ssm.* group, the indexer budget
+        // from the <prefix>attention.indexer.* group, and the hyper-connection shape from <prefix>hyper_connection.*. The
+        // file's tensor table is then validated against that resolved interleave — every linear layer must carry its fused
+        // qkv buffer, gate matrix and recurrent-state tensors where a full layer instead carries split projections and an
+        // indexer set — so a plan for this family never resolves past a table whose per-layer material contradicts what the
+        // declared groups say those layers run. A profile that declares no such semantics resolves null and validates nothing:
+        // every other family keeps today's posture, where tensor-table enforcement lands at engine open instead.
+        Qwen4ExpGeometry? qwen4exp = profile.DeclaresQwen4ExpSemantics
+            ? ResolveQwen4Exp(metadata, prefix, layers)
+            : null;
+
+        if (qwen4exp is not null)
+        {
+            ValidateQwen4ExpTable(profile.Tensors, architecture, gguf.Tensors, qwen4exp, hidden);
+        }
+
         return new ModelPlan
         {
             Architecture = architecture,
@@ -294,13 +312,18 @@ public static class ModelPlans
             Rope = profile.Rope,
             // The q/k/v projection layout and the feed-forward gate side come straight from the resolved profile like
             // the norm placement and the window interleave do: no metadata key selects either, and each decides which
-            // tensors this block's forward reads.
+            // tensors this block's forward reads. For a family that mixes both layouts across its layers, the per-layer
+            // kind in <see cref="ModelPlan.Qwen4Exp"/> is what says which side each layer takes; this profile-level value
+            // stays at the layout every other family runs on.
             AttentionWeights = profile.AttentionWeights,
             GateSource = profile.GateSource,
             RopeScaling = ropeScaling,
             RopeRotaryDimensions = ropeRotaryDimensions,
             SparseFfn = sparseFfn,
             SparseFfnStrategy = ResolveSparseFfnStrategy(metadata, prefix, profile.DefaultSparseFfnStrategy, sparseFfn),
+
+            // The family geometry resolved above lands unchanged: null for every file whose profile declares no such semantics.
+            Qwen4Exp = qwen4exp,
             // The execution path a file declares nothing about runs on: one CPU segment over DRAM-resident weights. A host
             // that knows its own placement resolves the segments it declares onto this value when it opens the engine; no
             // metadata key selects any part of a route here.
@@ -313,10 +336,10 @@ public static class ModelPlans
     // alias name (the optional ones included). A tensor no descriptor can name is unexpected; the rejection
     // carries the registry wording with its supported-profile list, names both sides of the mismatch, and
     // states that the llama-shaped fallback was attempted. The block extent is derived from the table itself,
-    // so this gate needs no metadata: it runs before any metadata read. Sparse-FFN roles stay out of the
-    // nameable set even though the map declares them: a dense-shaped fallback cannot consume an expert-routed
-    // block, so a tensor under a sparse name is unexpected material and the file is rejected with the names
-    // it carries rather than accepted as a dense model with extra tensors.
+    // so this gate needs no metadata: it runs before any metadata read. Family-specific roles — sparse-FFN, gated-delta-net,
+    // indexer, hyper-connection and PLE names — stay out of the nameable set even though some maps declare them: a dense-shaped
+    // fallback cannot consume an expert-routed or linear-attention block, so a tensor under one of those names is unexpected
+    // material and the file is rejected with the names it carries rather than accepted as a dense model with extra tensors.
     private static void ValidateLlamaShapedTable(TensorMap map, string architecture, LogicalTensorTable tensors)
     {
         int layers = 1;
@@ -330,7 +353,7 @@ public static class ModelPlans
 
         foreach (TensorDescriptor descriptor in map.Descriptors)
         {
-            if (TensorMap.IsSparseRole(descriptor.Role))
+            if (TensorMap.IsFamilySpecificRole(descriptor.Role))
             {
                 continue;
             }
@@ -1065,4 +1088,334 @@ public static class ModelPlans
 
         return scale;
     }
+
+    // Shared feed-forward width resolution: the declared <prefix>feed_forward_length wins when present, exactly as every
+    // family today reads it. A file that names no dense intermediate size but declares an expert one under
+    // <prefix>expert_feed_forward_length takes its sparse-FFN width instead — which is what a routed-only conversion whose
+    // shared and routed blocks share one intermediate size spells (the qwen4exp target ships all of its FFN material as
+    // *_exps/*_shexp stacks with no dense key at all), so reading the expert declaration records the block's actual width
+    // rather than failing on a name this family never writes. The substitution reports itself once in the style of the
+    // vocabulary-fallback line; it lands only when the dense key is absent and an expert one present, and every other file
+    // resolves exactly what it declares — including today's rejection naming the missing dense key when neither exists.
+    private static int ResolveFeedForwardLength(GgufMetadata metadata, string prefix, GgufFile gguf, Action<string>? logLine)
+    {
+        if (metadata.Has(prefix + "feed_forward_length"))
+        {
+            return RequireInt(metadata, prefix + "feed_forward_length");
+        }
+
+        if (!metadata.Has(prefix + "expert_feed_forward_length"))
+        {
+            throw new ModelException($"GGUF metadata key '{prefix}feed_forward_length' is not present");
+        }
+
+        int expertWidth = RequireInt(metadata, prefix + "expert_feed_forward_length");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(expertWidth);
+
+        if (logLine is not null)
+        {
+            logLine(
+                $"ffn_fallback model='{ModelName(metadata, gguf)}' source={prefix}expert_feed_forward_length " +
+                $"value={expertWidth.ToString(CultureInfo.InvariantCulture)}");
+        }
+
+        return expertWidth;
+    }
+
+    // Shared qwen4exp geometry resolution — the exact key names pinned by the target file's own header (the loader gate over both shipped shards reads them unchanged): <prefix>ssm.group_count/state_size/inner_size/time_step_rank/conv_kernel for the gated-delta-net side, <prefix>attention.indexer.head_count/key_length/top_k for selection budgeting, and <prefix>hyper_connection.count/low_rank for stream mixing. The value-head count derives as inner size divided by head dimension — a declaration whose division leaves a remainder fails naming both keys with their values. The declared gate-row count (time_step_rank) must cover exactly those heads: decay weights, dt biases and gate rows each carry one entry per value head, so a mismatch names key + value against the derived count rather than silently padding or truncating gates. <prefix>attention.compress_ratios is an int32 array with exactly block_count non-negative entries — zero means linear attention, positive declares that full layer's pooling ratio for sparse selection (a ratio below 2 groups no cells and runs dense at the layer level: a legal declaration). An absent key fails naming it; wrong length or out-of-range entries name what was declared. When <prefix>full_attention_interval is also declared, its group ends must match the array exactly — every positive-ratio position lands on one and every group end carries one; either side failing names both sides with the layer index. Absent interval leaves the array sole authority (documented choice for synthetic fixtures). Indexer counts and hyper-connection count/rank are required positives.
+    private static Qwen4ExpGeometry ResolveQwen4Exp(GgufMetadata metadata, string prefix, int layers)
+    {
+        int groupCount = RequireInt(metadata, prefix + "ssm.group_count");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(groupCount);
+
+        int stateSize = RequireInt(metadata, prefix + "ssm.state_size");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(stateSize);
+
+        int innerSize = RequireInt(metadata, prefix + "ssm.inner_size");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(innerSize);
+
+        if (innerSize % stateSize != 0)
+        {
+            throw new ModelException(
+                $"{prefix}ssm.inner_size ({innerSize}) is not a whole number of value heads at {prefix}ssm.state_size ({stateSize}); " +
+                "the concatenated value width must divide exactly by the shared head dimension");
+        }
+
+        int valueHeads = innerSize / stateSize;
+
+        int timeStepRank = RequireInt(metadata, prefix + "ssm.time_step_rank");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(timeStepRank);
+
+        if (timeStepRank != valueHeads)
+        {
+            throw new ModelException(
+                $"{prefix}ssm.time_step_rank ({timeStepRank}) does not cover the derived value heads of " +
+                $"{prefix}ssm.inner_size / {prefix}ssm.state_size = {valueHeads}; decay weights, dt biases and gate rows each carry one entry per value head");
+        }
+
+        int convKernel = RequireInt(metadata, prefix + "ssm.conv_kernel");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(convKernel);
+
+        string ratiosKey = prefix + "attention.compress_ratios";
+        if (!metadata.Has(ratiosKey))
+        {
+            throw new ModelException($"GGUF metadata key '{ratiosKey}' is not present: the per-layer attention interleave must be declared");
+        }
+
+        int[] ratios;
+        try
+        {
+            ratios = metadata.GetInt32Array(ratiosKey);
+        }
+        catch (GgufException ex)
+        {
+            throw new ModelException($"GGUF metadata key '{ratiosKey}' must be an array of integers", ex);
+        }
+
+        if (ratios.Length != layers)
+        {
+            throw new ModelException(
+                $"GGUF metadata key '{ratiosKey}' declares {ratios.Length} entries but {prefix}block_count is {layers}; " +
+                "the compress-ratio array must cover every layer exactly once");
+        }
+
+        AttentionKind[] kinds = new AttentionKind[layers];
+        for (int layer = 0; layer < layers; layer++)
+        {
+            if (ratios[layer] < 0)
+            {
+                throw new ModelException(
+                    $"GGUF metadata key '{ratiosKey}'[{layer}] declares {ratios[layer].ToString(CultureInfo.InvariantCulture)}; " +
+                    "compress ratios must be non-negative integers");
+            }
+
+            kinds[layer] = ratios[layer] > 0 ? AttentionKind.FullQuerySparseAttention : AttentionKind.LinearGatedDeltaNet;
+        }
+
+        if (metadata.Has(prefix + "full_attention_interval"))
+        {
+            int interval = RequireInt(metadata, prefix + "full_attention_interval");
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(interval);
+
+            for (int layer = 0; layer < layers; layer++)
+            {
+                bool groupEnd = (layer + 1) % interval == 0;
+
+                if (ratios[layer] > 0 && !groupEnd)
+                {
+                    throw new ModelException(
+                        $"GGUF metadata key '{prefix}full_attention_interval' ({interval}) contradicts '{ratiosKey}'[{layer}] = " +
+                        $"{ratios[layer].ToString(CultureInfo.InvariantCulture)}: a positive compress ratio may only land on the last position of an interval group");
+                }
+
+                if (groupEnd && ratios[layer] == 0)
+                {
+                    throw new ModelException(
+                        $"GGUF metadata key '{prefix}full_attention_interval' ({interval}) contradicts '{ratiosKey}'[{layer}] = 0: " +
+                        "every last position of an interval group must declare a positive compress ratio");
+                }
+            }
+        }
+
+        int indexerHeads = RequireInt(metadata, prefix + "attention.indexer.head_count");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(indexerHeads);
+
+        int indexerKeyLength = RequireInt(metadata, prefix + "attention.indexer.key_length");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(indexerKeyLength);
+
+        int topKCells = RequireInt(metadata, prefix + "attention.indexer.top_k");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(topKCells);
+
+        int streamCount = RequireInt(metadata, prefix + "hyper_connection.count");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(streamCount);
+
+        int lowRank = RequireInt(metadata, prefix + "hyper_connection.low_rank");
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(lowRank);
+
+        return new Qwen4ExpGeometry(
+            AttentionKinds: kinds,
+            CompressRatios: ratios,
+            LinearAttention: new GdnDescriptor(
+                KeyHeadCount: groupCount,
+                ValueHeadCount: valueHeads,
+                StateDim: stateSize,
+                InnerSize: innerSize,
+                TimeStepRank: timeStepRank,
+                ConvKernelSize: convKernel),
+            SparseAttention: new QsaDescriptor(IndexerHeadCount: indexerHeads, IndexerKeyLength: indexerKeyLength, TopKCells: topKCells),
+            HyperConnections: new HyperConnectionDescriptor(StreamCount: streamCount, LowRank: lowRank));
+    }
+
+    // The qwen4exp table gate runs against the resolved interleave rather than a flat required-role sweep. Every linear layer must carry its fused qkv buffer (whose row count is exactly the conv channels), its z-gate matrix and all seven recurrent-state tensors; in place of those, a full sparse layer carries split projections plus the indexer quartet; both sides share the block's hyper-connection trio on each sublayer side. A required name missing from the kind that needs it fails naming every such tensor with its concrete layer index — the same "tensor '<name>' is missing" identity the engine raises at open, raised here so a plan for this family never resolves past material its declared groups contradict. Where a family tensor lands on a layer whose ratio says the other attention runs, the file names which layers carry misplaced material: ssm_* or attn_gate under a positive ratio, split q/k/v or indexer.* under zero. Present hyper-connection and recurrent tensors are shape-checked against what the metadata declares (inject rows = stream count; down/up cross the flattened streams through the low rank in each direction; norms cover the whole flattened width; conv rows = 2·key-heads·state + inner over kernel columns; gate/out transpose across inner size), so a synthetic fixture proves its layouts match its own declarations without inventing names this family does not ship. Roles whose payload geometry only execution can judge (head-split widths inside fused buffers, rope pairing) stay checked where they run.
+    private static void ValidateQwen4ExpTable(TensorMap map, string architecture, LogicalTensorTable tensors, Qwen4ExpGeometry geometry, int hiddenSize)
+    {
+        List<string> missing = [];
+        List<string> misplaced = [];
+
+        for (int layer = 0; layer < geometry.LayerCount; layer++)
+        {
+            AttentionKind kind = geometry.AttentionKinds[layer];
+            TensorRole[] requiredHere = kind == AttentionKind.LinearGatedDeltaNet ? LinearAttentionRoles : FullSparseRoles;
+            TensorRole[] forbiddenHere = kind == AttentionKind.LinearGatedDeltaNet ? FullSparseRoles : LinearAttentionRoles;
+
+            foreach (TensorRole role in requiredHere)
+            {
+                if (map[role].Resolve(tensors, layer) is null)
+                {
+                    missing.Add(map[role].NameFor(layer));
+                }
+            }
+
+            foreach (TensorRole role in forbiddenHere)
+            {
+                LogicalTensor? present = map[role].Resolve(tensors, layer);
+                if (present is not null)
+                {
+                    misplaced.Add(present.Name);
+                }
+            }
+
+            int flattened = geometry.HyperConnections.FlattenedStreamFloats(hiddenSize);
+            foreach ((TensorRole role, int[] expectedShape) in HyperConnectionMixing(geometry.HyperConnections, hiddenSize))
+            {
+                TensorDescriptor descriptor = map[role];
+                LogicalTensor? tensor = descriptor.Resolve(tensors, layer);
+
+                if (tensor is null)
+                {
+                    missing.Add(descriptor.NameFor(layer));
+                    continue;
+                }
+
+                bool ok = role == TensorRole.AttentionStreamNorm || role == TensorRole.FeedForwardStreamNorm
+                    ? VectorMatches(tensor.Shape, flattened)
+                    : ShapeMatches(tensor.Shape, expectedShape);
+
+                if (!ok)
+                {
+                    throw new ModelException(
+                        $"tensor '{descriptor.NameFor(layer)}' declares shape [{string.Join(", ", tensor.Shape.Dims)}] but the declared " +
+                        $"{architecture} hyper-connection geometry (count x hidden = {flattened}, rank {geometry.HyperConnections.LowRank}) needs " +
+                        $"[{string.Join(", ", expectedShape)}]: inject rows are stream count, down/up cross the flattened streams through the low rank in each direction, norms cover the whole flattened width");
+                }
+            }
+
+            if (kind == AttentionKind.LinearGatedDeltaNet)
+            {
+                ValidateLinearBlockShapes(map, tensors, geometry.LinearAttention, architecture, layer, hiddenSize);
+            }
+        }
+
+        foreach ((TensorRole role, int[] expectedShape) in OutputHyperConnectionMixing(geometry.HyperConnections, hiddenSize))
+        {
+            TensorDescriptor descriptor = map[role];
+            LogicalTensor? tensor = descriptor.Resolve(tensors); // global scope: the layer argument is ignored entirely.
+
+            if (tensor is null)
+            {
+                missing.Add(descriptor.NameFor(-1));
+                continue;
+            }
+
+            bool ok = role == TensorRole.OutputStreamNorm ? VectorMatches(tensor.Shape, expectedShape[0]) : ShapeMatches(tensor.Shape, expectedShape);
+            if (!ok)
+            {
+                throw new ModelException(
+                    $"tensor '{descriptor.Name}' declares shape [{string.Join(", ", tensor.Shape.Dims)}] but the declared " +
+                    $"{architecture} output hyper-connection geometry needs [{string.Join(", ", expectedShape)}]: one final down/up pair across the flattened streams through the low rank, with a norm over their whole width");
+            }
+        }
+
+        if (map[TensorRole.TokenEmbedding].Resolve(tensors) is null)
+        {
+            missing.Add(map[TensorRole.TokenEmbedding].NameFor(-1));
+        }
+
+        if (missing.Count > 0 || misplaced.Count > 0)
+        {
+            throw new ModelException(
+                $"model architecture '{architecture}' tensor table does not match its resolved per-layer attention interleave " +
+                $"({geometry.LinearLayerCount} gated-delta-net layers, {geometry.FullLayerCount} sparse full-attention layers): " +
+                $"missing tensors: {string.Join(", ", missing)}; misplaced tensors: {string.Join(", ", misplaced)}");
+        }
+    }
+
+    private static void ValidateLinearBlockShapes(TensorMap map, LogicalTensorTable tensors, GdnDescriptor gdn, string architecture, int layer, int hiddenSize)
+    {
+        foreach ((TensorRole role, int[] expectedShape) in new (TensorRole, int[])[]
+        {
+            (TensorRole.AttentionQkv, [gdn.ConvChannels, hiddenSize]),
+            (TensorRole.LinearAttentionGate, [gdn.InnerSize, hiddenSize]),
+            (TensorRole.SsmOutputProjection, [hiddenSize, gdn.InnerSize]),
+            (TensorRole.SsmConvolutionKernel, [gdn.ConvChannels, gdn.ConvKernelSize]),
+            (TensorRole.SsmAlphaProjection, [gdn.TimeStepRank, hiddenSize]),
+            (TensorRole.SsmBetaProjection, [gdn.TimeStepRank, hiddenSize]),
+        })
+        {
+            TensorDescriptor descriptor = map[role];
+            LogicalTensor? tensor = descriptor.Resolve(tensors, layer);
+
+            // Presence belongs to the aggregate sweep — a required linear-block name that never arrives lands in its missing list naming the tensor; this pass judges only what did arrive.
+            if (tensor is null)
+            {
+                continue;
+            }
+
+            if (!ShapeMatches(tensor.Shape, expectedShape))
+            {
+                throw new ModelException(
+                    $"tensor '{descriptor.NameFor(layer)}' declares shape [{string.Join(", ", tensor.Shape.Dims)}] but the declared {architecture} gated-delta-net geometry needs " +
+                    $"[{string.Join(", ", expectedShape)}]: conv rows are 2 key heads x state dim plus inner size over kernel columns, gate and out transpose across inner size, alpha/beta carry one row per value head");
+            }
+        }
+
+        foreach ((TensorRole role, int length) in new (TensorRole, int)[] { (TensorRole.SsmDecayWeight, gdn.TimeStepRank), (TensorRole.SsmTimeStepBias, gdn.TimeStepRank), (TensorRole.SsmHeadNorm, gdn.StateDim) })
+        {
+            TensorDescriptor descriptor = map[role];
+            LogicalTensor? tensor = descriptor.Resolve(tensors, layer);
+
+            if (tensor is null)
+            {
+                continue; // same posture: the sweep above already names it missing.
+            }
+
+            if (!VectorMatches(tensor.Shape, length))
+            {
+                throw new ModelException(
+                    $"tensor '{descriptor.NameFor(layer)}' declares shape [{string.Join(", ", tensor.Shape.Dims)}] but the declared {architecture} gated-delta-net geometry needs a single vector of length {length}: one entry per value head for decay and dt bias, one per state dimension for the head norm");
+            }
+        }
+    }
+
+    private static readonly TensorRole[] LinearAttentionRoles = [TensorRole.AttentionQkv, TensorRole.LinearAttentionGate, TensorRole.SsmDecayWeight, TensorRole.SsmAlphaProjection, TensorRole.SsmBetaProjection, TensorRole.SsmConvolutionKernel, TensorRole.SsmTimeStepBias, TensorRole.SsmHeadNorm, TensorRole.SsmOutputProjection];
+
+    private static readonly TensorRole[] FullSparseRoles = [TensorRole.AttentionQuery, TensorRole.AttentionKey, TensorRole.AttentionValue, TensorRole.AttentionOutput, TensorRole.IndexerQueryProjection, TensorRole.IndexerKeyProjection, TensorRole.IndexerQueryNorm, TensorRole.IndexerKeyNorm];
+
+    private static (TensorRole, int[])[] HyperConnectionMixing(HyperConnectionDescriptor hc, int hiddenSize)
+    {
+        int flattened = hc.FlattenedStreamFloats(hiddenSize);
+        return
+        [
+            (TensorRole.AttentionStreamInject, [hc.StreamCount, flattened]),
+            (TensorRole.AttentionStreamDown, [hc.LowRank, flattened]),
+            (TensorRole.AttentionStreamUp, [flattened, hc.LowRank]),
+            (TensorRole.AttentionStreamNorm, [flattened]),
+            (TensorRole.FeedForwardStreamInject, [hc.StreamCount, flattened]),
+            (TensorRole.FeedForwardStreamDown, [hc.LowRank, flattened]),
+            (TensorRole.FeedForwardStreamUp, [flattened, hc.LowRank]),
+            (TensorRole.FeedForwardStreamNorm, [flattened]),
+        ];
+    }
+
+    private static (TensorRole, int[])[] OutputHyperConnectionMixing(HyperConnectionDescriptor hc, int hiddenSize)
+    {
+        int flattened = hc.FlattenedStreamFloats(hiddenSize);
+        return [(TensorRole.OutputStreamDown, [hc.LowRank, flattened]), (TensorRole.OutputStreamUp, [flattened, hc.LowRank]), (TensorRole.OutputStreamNorm, [flattened])];
+    }
+
+    private static bool ShapeMatches(TensorShape? shape, int[] expected) =>
+        shape is not null && shape.Dims.Length == expected.Length && shape.Dims.AsSpan().SequenceEqual(expected);
+
+    private static bool VectorMatches(TensorShape? shape, int length) =>
+        shape is not null && (shape.Dims.Length == 1 ? shape.Dims[0] : -1) == length;
 }
