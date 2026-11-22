@@ -1,0 +1,27 @@
+{
+  "argv": [
+    "ple-policy",
+    "/root/lair-models-disk/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+    "--tokens",
+    "65536",
+    "--reps",
+    "2",
+    "--caps",
+    "2,8,32",
+    "--inflight-rows",
+    "256",
+    "--overlap-depth",
+    "2",
+    "--token-dist",
+    "zipf",
+    "--vocab-window",
+    "262144",
+    "--ple-cap-mb",
+    "256",
+    "--numa",
+    "--substrate-label",
+    "disk-backed",
+    "--out",
+    "reports"
+  ]
+}

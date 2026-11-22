@@ -21,6 +21,7 @@ public sealed unsafe class PleRowSource : IDisposable
     // The view and its acquired pointer exist only after mapping succeeds, so the release paths must tolerate a failure made before either.
     private MemoryMappedViewAccessor? _view;
     private byte* _base;
+    private long _viewLength;
 
     // Row addressing state: the owning shard's data region plus this tensor's payload start within it.
     private readonly long _dataStart;
@@ -115,6 +116,7 @@ public sealed unsafe class PleRowSource : IDisposable
             MemoryMappedViewAccessor view = mapped.CreateViewAccessor(0, fileSize, MemoryMappedFileAccess.Read);
             _view = view;
             view.SafeMemoryMappedViewHandle.AcquirePointer(ref _base);
+            _viewLength = fileSize; // the mapping's own extent: prefetch hints and placement accounting name ranges inside exactly this view.
 
             long rowsEnd = checked(_tensorOffset + Rows * RowStrideBytes); // the last row must land inside this tensor's declared payload, which was already file-bounds-checked.
             if (rowsEnd > table.Tensor.SizeBytes)
@@ -165,6 +167,25 @@ public sealed unsafe class PleRowSource : IDisposable
 
     /// <summary>Whether one resolved row lies inside the mapped view — the layout check gather callers take before trusting a computed index.</summary>
     public bool ContainsRow(long rowIndex) => rowIndex >= 0 && rowIndex < Rows;
+
+    /// <summary>The base address of the mapped view rows are addressed through, and its length: placement arms report prefetch coverage over these ranges rather than inventing addresses.</summary>
+    public (nint BaseAddress, long Length) MappingExtent => ((nint)_base, _viewLength);
+
+    /// <summary>The absolute address one row's first byte lives at inside this mapping — the exact computed-address form a bounded-in-flight prefetch hint needs. A row outside this table's declared row space reports false instead of naming an address no head range owns.</summary>
+    public bool TryMappedAddressOf(long rowIndex, out nint address)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (!ContainsRow(rowIndex))
+        {
+            address = nint.Zero;
+            return false;
+        }
+
+        long byteOffset = checked(_tensorOffset + rowIndex * RowStrideBytes); // the same addressing ResolveRow uses: a hint and its demand read can never disagree about where a row lives.
+        address = (nint)(_base + _dataStart + byteOffset);
+        return true;
+    }
 
     public void Dispose()
     {

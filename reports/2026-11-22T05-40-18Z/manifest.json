@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "reportId": "ple-policy-2026-11-22T05-40-18Z",
+  "generatedAtUtc": "2026-11-22T05:40:18Z",
+  "phase": "MVP7",
+  "lane": "CPU-only PLE access-scheduling/placement measurement (huge-page hot-row provider \u002B NUMA arms)",
+  "goal": "Compare demand-only gather against computed-address prefetch overlap and frequency-sketch hot-slot residency with/without prefetch under declared PLE caps; measure huge-page backing and NUMA-local versus remote placement where the platform offers them.",
+  "command_line": "ple-policy /root/lair-models-disk/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf --tokens 65536 --reps 2 --caps 2,8,32 --inflight-rows 256 --overlap-depth 2 --token-dist uniform --vocab-window 4096 --ple-cap-mb 256 --numa --substrate-label disk-backed --out reports",
+  "working_directory": "/root/lair-measurements/ple-hugepage-sweep",
+  "model_path": "/root/lair-models-disk/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf",
+  "gathered_from_shard": "/root/lair-models-disk/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00002-of-00002.gguf",
+  "substrate_label": "disk-backed",
+  "files": [
+    "manifest.json",
+    "host.json",
+    "bench.json",
+    "cli.json",
+    "report.html"
+  ]
+}

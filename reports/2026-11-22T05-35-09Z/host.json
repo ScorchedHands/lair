@@ -1,0 +1,32 @@
+{
+  "machine": "lair",
+  "os_description": "Debian GNU/Linux 13 (trixie)",
+  "os_architecture": "X64",
+  "processor_count": 64,
+  "total_memory_bytes_available_to_gc": 270313869312,
+  "hugepage_facts": {
+    "supported_on_host_family": true,
+    "thp_enabled_posture": "always [madvise] never",
+    "hugetlb_pool_total_pages": 0,
+    "hugetlb_pool_free_pages": 0,
+    "hugetlb_per_node_dirs": {
+      "node0": {
+        "nr_hugepages": 0,
+        "free_hugepages": 0
+      },
+      "node1": {
+        "nr_hugepages": 0,
+        "free_hugepages": 0
+      }
+    }
+  },
+  "hardware_counter_facts": {
+    "perf_binary_present": false,
+    "perf_event_paranoid": "4",
+    "numa_maps_readable": true
+  },
+  "numa_nodes_from_sysfs": {
+    "node0": "0-15,32-47",
+    "node1": "16-31,48-63"
+  }
+}

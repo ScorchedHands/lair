@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>ple-policy 2026-11-22T05-40-18Z</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem; color: #1c1c1c; max-width: 980px; }
+h1 { font-size: 1.35rem; } h2 { font-size: 1.1rem; margin-top: 1.6rem; }
+table { border-collapse: collapse; margin-top: .5rem; width: 100%; }
+th, td { border: 1px solid #bbb; padding: .4rem .7rem; text-align: left; font-size: .92rem; vertical-align: top; }
+th { background: #f0f0f0; } canvas { max-width: 860px; margin-top: 1rem; }
+.note { color: #555; font-size: .9rem; } code { background: #f4f4f4; padding: 0 .3rem; }
+</style>
+</head>
+<body>
+<h1>PLE access-scheduling and placement measurement</h1>
+<p class="note">3-gram x 8 heads = 16 rows/token over a 320,001,536-row <code>per_layer_token_embd.weight</code> table (90 packed bytes/row, IQ4_NL); substrate label: disk-backed.</p>
+
+<h2>Arms</h2>
+<table>
+<tr><th>Arm</th><th>Cap</th><th>warm p50 ns/token</th><th>first-touch p50 ns/token</th><th>residency tallies</th><th>clamp/admission</th><th>prefetch</th></tr>
+<tr><td>demand-only</td><td>2 MiB</td><td>5705</td><td>19646</td><td>no residency</td><td>n/a</td><td>no prefetch</td></tr><tr><td>prefetch-overlap</td><td>2 MiB</td><td>10288</td><td>40317</td><td>no residency</td><td>n/a</td><td>8190 windows · 2096638 rows touched · madvise 8190/8190 accepted</td></tr><tr><td>hot-resident-prefetch</td><td>2 MiB</td><td>14911</td><td>40761</td><td>65494 hits / 2031658 misses · resident 2,097,090 B</td><td>allowed 23,301 / admitted 23,301 (refused 1,015,829)</td><td>8190 windows · 2031156 rows touched · madvise 8190/8190 accepted</td></tr><tr><td>hot-resident-no-prefetch</td><td>2 MiB</td><td>7584</td><td>21051</td><td>65494 hits / 2031658 misses · resident 2,097,090 B</td><td>allowed 23,301 / admitted 23,301 (refused 1,015,829)</td><td>no prefetch</td></tr><tr><td>demand-only</td><td>8 MiB</td><td>5698</td><td>19484</td><td>no residency</td><td>n/a</td><td>no prefetch</td></tr><tr><td>prefetch-overlap</td><td>8 MiB</td><td>10502</td><td>39773</td><td>no residency</td><td>n/a</td><td>8190 windows · 2096638 rows touched · madvise 8190/8190 accepted</td></tr><tr><td>hot-resident-prefetch</td><td>8 MiB</td><td>14740</td><td>38458</td><td>205304 hits / 1891848 misses · resident 8,388,540 B</td><td>allowed 93,206 / admitted 93,206 (refused 945,924)</td><td>8190 windows · 1891380 rows touched · madvise 8190/8190 accepted</td></tr><tr><td>hot-resident-no-prefetch</td><td>8 MiB</td><td>7391</td><td>19878</td><td>205304 hits / 1891848 misses · resident 8,388,540 B</td><td>allowed 93,206 / admitted 93,206 (refused 945,924)</td><td>no prefetch</td></tr><tr><td>demand-only</td><td>32 MiB</td><td>5609</td><td>19413</td><td>no residency</td><td>n/a</td><td>no prefetch</td></tr><tr><td>prefetch-overlap</td><td>32 MiB</td><td>10205</td><td>39973</td><td>no residency</td><td>n/a</td><td>8190 windows · 2096638 rows touched · madvise 8190/8190 accepted</td></tr><tr><td>hot-resident-prefetch</td><td>32 MiB</td><td>15822</td><td>34510</td><td>764546 hits / 1332606 misses · resident 33,554,430 B</td><td>allowed 372,827 / admitted 372,827 (refused 666,303)</td><td>8190 windows · 1332280 rows touched · madvise 8190/8190 accepted</td></tr><tr><td>hot-resident-no-prefetch</td><td>32 MiB</td><td>7017</td><td>15944</td><td>764546 hits / 1332606 misses · resident 33,554,430 B</td><td>allowed 372,827 / admitted 372,827 (refused 666,303)</td><td>no prefetch</td></tr>
+</table>
+
+<canvas id="plePolicy" width="860" height="380"></canvas>
+<script>
+new Chart(document.getElementById('plePolicy'), {"type":"bar","data":{"labels":["p50","p90","p99"],"datasets":[{"label":"demand-only @ 2 MiB","data":[5705,6137,6633]},{"label":"prefetch-overlap @ 2 MiB","data":[10288,11320,22616]},{"label":"hot-resident-prefetch @ 2 MiB","data":[14911,15999,29357]},{"label":"hot-resident-no-prefetch @ 2 MiB","data":[7584,8116,8814]},{"label":"demand-only @ 8 MiB","data":[5698,6131,6631]},{"label":"prefetch-overlap @ 8 MiB","data":[10502,11594,22626]},{"label":"hot-resident-prefetch @ 8 MiB","data":[14740,15725,28957]},{"label":"hot-resident-no-prefetch @ 8 MiB","data":[7391,7904,8608]},{"label":"demand-only @ 32 MiB","data":[5609,6050,6548]},{"label":"prefetch-overlap @ 32 MiB","data":[10205,11203,23024]},{"label":"hot-resident-prefetch @ 32 MiB","data":[15822,17113,33746]},{"label":"hot-resident-no-prefetch @ 32 MiB","data":[7017,7539,8208]}]},"options":{"plugins":{"legend":{"display":true}},"scales":{"y":{"beginAtZero":true,"title":{"display":true,"text":"nanoseconds per token gather step (warm passes)"}}}}});
+</script>
+
+<h2>NUMA placement variants</h2><table><tr><th>Variant</th><th>warm p50 ns/token</th><th>arena binding attempt</th><th>gather cpu list after bind</th></tr><tr><td>placement:unbound</td><td>16606</td><td>unbound control (set_mempolicy(MPOL_DEFAULT) failed: errno=22)</td><td>0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63</td></tr><tr><td>placement:local-node0</td><td>13723</td><td>calling thread bound to node 0 cpulist &#39;0-15,32-47&#39;</td><td>0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47</td></tr><tr><td>placement:arena-on-node1-gather-on-node0</td><td>14444</td><td>calling thread bound to node 1 cpulist &#39;16-31,48-63&#39;</td><td>0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47</td></tr></table>
+
+<h2>Notes</h2>
+<ul class="note"><li>Arms simulate layer-2 access scheduling over the real table&#39;s row addressing with a synthetic token stream; production qwen4exp forward integration is not implemented and no claim here covers it.</li><li>The stream uses uniform token ids (uniform ids across 1e6..2e6, the no-skew control) with EOS cut and missing-predecessor windows mixed in; policy comparisons hold this stream identical across arms.</li><li>hot-resident-prefetch versus hot-resident-no-prefetch isolates what staying resident buys from what prefetch overlap buys; demand-only is the floor of both.</li></ul>
+</body></html>

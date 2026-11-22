@@ -1,0 +1,905 @@
+{
+  "table_facts": {
+    "tensor_name": "per_layer_token_embd.weight",
+    "format": "IQ4_NL",
+    "logical_dims": [
+      320001536,
+      160
+    ],
+    "payload_bytes": 28800138240,
+    "ngram_size": 3,
+    "heads_per_ngram": 8,
+    "head_count": 16,
+    "table_rows": 320001536,
+    "row_elements": 160,
+    "row_stride_bytes": 90,
+    "eos_token_id": 248044
+  },
+  "run_shape": {
+    "tokens": 65536,
+    "reps": 2,
+    "caps_megabytes": [
+      2,
+      8,
+      32
+    ]
+  },
+  "stream_facts": {
+    "token_distribution": "zipf",
+    "vocab_window": 262144,
+    "distinct_rows_touched_by_stream": 976875,
+    "windows_containing_eos": 676,
+    "windows_with_missing_predecessors": 1025
+  },
+  "declared_budget_gate": {
+    "clamp": "none",
+    "text": "the declared PLE ceiling already fits every row this stream reached"
+  },
+  "policy_knobs": {
+    "inflight_rows_cap_per_window": 256,
+    "overlap_depth_windows": 2,
+    "ple_declared_cap_megabytes": 256
+  },
+  "arms": [
+    {
+      "arm": "demand-only",
+      "gather_latency_ns_per_token_first_touch": {
+        "p50": 656480,
+        "p90": 805622,
+        "p99": 991882,
+        "min": 1238,
+        "max": 31199619
+      },
+      "gather_latency_ns_per_token_warm": {
+        "p50": 4148,
+        "p90": 4615,
+        "p99": 5668,
+        "min": 1027,
+        "max": 462098
+      },
+      "warm_tokens_per_second_aggregate": 234375.89,
+      "row_resolutions_total_all_passes": 2097152,
+      "cold_row_bytes_estimated_streamed": 0,
+      "passes": [
+        {
+          "pass": "first_touch",
+          "wall_seconds": 40.964588,
+          "minor_fault_delta": 68231,
+          "major_fault_delta": 774995
+        },
+        {
+          "pass": "warm_1",
+          "wall_seconds": 0.279619,
+          "minor_fault_delta": 328,
+          "major_fault_delta": 0
+        }
+      ],
+      "cap_megabytes": 2
+    },
+    {
+      "arm": "prefetch-overlap",
+      "gather_latency_ns_per_token_first_touch": {
+        "p50": 33082,
+        "p90": 73158,
+        "p99": 93402,
+        "min": 1991,
+        "max": 545062
+      },
+      "gather_latency_ns_per_token_warm": {
+        "p50": 7365,
+        "p90": 8380,
+        "p99": 18591,
+        "min": 2529,
+        "max": 467683
+      },
+      "warm_tokens_per_second_aggregate": 13160.79,
+      "row_resolutions_total_all_passes": 2097152,
+      "cold_row_bytes_estimated_streamed": 377415000,
+      "passes": [
+        {
+          "pass": "first_touch",
+          "wall_seconds": 6.546878,
+          "minor_fault_delta": 406857,
+          "major_fault_delta": 136
+        },
+        {
+          "pass": "warm_1",
+          "wall_seconds": 4.979638,
+          "minor_fault_delta": 11559,
+          "major_fault_delta": 0
+        }
+      ],
+      "prefetch_facts": {
+        "inflight_rows_cap_per_window": 256,
+        "overlap_depth_windows": 2,
+        "lookahead_tokens_per_window": 16,
+        "windows_issued": 8190,
+        "rows_touched_by_prefetchers": 2096348,
+        "madvise_willneed_attempts": 8190,
+        "madvise_willneed_accepted_ranges": 8190
+      },
+      "cap_megabytes": 2
+    },
+    {
+      "arm": "hot-resident-prefetch",
+      "gather_latency_ns_per_token_first_touch": {
+        "p50": 37858,
+        "p90": 75371,
+        "p99": 96235,
+        "min": 5644,
+        "max": 1183029
+      },
+      "gather_latency_ns_per_token_warm": {
+        "p50": 12775,
+        "p90": 14250,
+        "p99": 27555,
+        "min": 5599,
+        "max": 552584
+      },
+      "warm_tokens_per_second_aggregate": 12080.55,
+      "row_resolutions_total_all_passes": 2097152,
+      "cold_row_bytes_estimated_streamed": 346524300,
+      "passes": [
+        {
+          "pass": "first_touch",
+          "wall_seconds": 5.816991,
+          "minor_fault_delta": 370386,
+          "major_fault_delta": 19
+        },
+        {
+          "pass": "warm_1",
+          "wall_seconds": 5.42492,
+          "minor_fault_delta": 860,
+          "major_fault_delta": 1
+        }
+      ],
+      "prefetch_facts": {
+        "inflight_rows_cap_per_window": 256,
+        "overlap_depth_windows": 2,
+        "lookahead_tokens_per_window": 16,
+        "windows_issued": 8190,
+        "rows_touched_by_prefetchers": 1924876,
+        "madvise_willneed_attempts": 8190,
+        "madvise_willneed_accepted_ranges": 8190
+      },
+      "residency_tallies": {
+        "hits_total_all_passes": 171758,
+        "misses_total_all_passes": 1925394,
+        "hit_rate": 0.0819,
+        "resident_bytes_held": 2097090
+      },
+      "admission": {
+        "requested_rows": 976875,
+        "allowed_rows": 23301,
+        "admitted_rows": 23301,
+        "refused_by_clamp_rows": 953574,
+        "resident_bytes": 2097090
+      },
+      "arena_backing_facts": {
+        "requested_back_mode": "TransparentHugePage",
+        "host_family": "linux",
+        "anonymous_mmap_applied": true,
+        "madvise_hugepage_requested": true,
+        "madvise_hugepage_succeeded": true,
+        "explicit_hugetlb_used": false,
+        "arena_capacity_bytes": 2097152,
+        "arena_base_hex": "000073d3c1200000",
+        "smaps_anon_hugepages_bytes_over_arena": 2097152,
+        "smaps_rss_bytes_over_arena": 2097152,
+        "numa_maps_entries_over_arena": 1,
+        "numa_pages_by_node": {
+          "N0": 512
+        }
+      },
+      "cap_megabytes": 2
+    },
+    {
+      "arm": "hot-resident-no-prefetch",
+      "gather_latency_ns_per_token_first_touch": {
+        "p50": 16947,
+        "p90": 37171,
+        "p99": 53675,
+        "min": 2284,
+        "max": 501034
+      },
+      "gather_latency_ns_per_token_warm": {
+        "p50": 6179,
+        "p90": 6669,
+        "p99": 7268,
+        "min": 2230,
+        "max": 481361
+      },
+      "warm_tokens_per_second_aggregate": 163183.55,
+      "row_resolutions_total_all_passes": 2097152,
+      "cold_row_bytes_estimated_streamed": 0,
+      "passes": [
+        {
+          "pass": "first_touch",
+          "wall_seconds": 1.313246,
+          "minor_fault_delta": 370126,
+          "major_fault_delta": 1
+        },
+        {
+          "pass": "warm_1",
+          "wall_seconds": 0.401609,
+          "minor_fault_delta": 102,
+          "major_fault_delta": 1
+        }
+      ],
+      "residency_tallies": {
+        "hits_total_all_passes": 171758,
+        "misses_total_all_passes": 1925394,
+        "hit_rate": 0.0819,
+        "resident_bytes_held": 2097090
+      },
+      "admission": {
+        "requested_rows": 976875,
+        "allowed_rows": 23301,
+        "admitted_rows": 23301,
+        "refused_by_clamp_rows": 953574,
+        "resident_bytes": 2097090
+      },
+      "arena_backing_facts": {
+        "requested_back_mode": "TransparentHugePage",
+        "host_family": "linux",
+        "anonymous_mmap_applied": true,
+        "madvise_hugepage_requested": true,
+        "madvise_hugepage_succeeded": true,
+        "explicit_hugetlb_used": false,
+        "arena_capacity_bytes": 2097152,
+        "arena_base_hex": "000073d3c1200000",
+        "smaps_anon_hugepages_bytes_over_arena": 2097152,
+        "smaps_rss_bytes_over_arena": 2097152,
+        "numa_maps_entries_over_arena": 1,
+        "numa_pages_by_node": {
+          "N0": 512
+        }
+      },
+      "cap_megabytes": 2
+    },
+    {
+      "arm": "demand-only",
+      "gather_latency_ns_per_token_first_touch": {
+        "p50": 15358,
+        "p90": 34651,
+        "p99": 51257,
+        "min": 1067,
+        "max": 497306
+      },
+      "gather_latency_ns_per_token_warm": {
+        "p50": 4105,
+        "p90": 4543,
+        "p99": 5054,
+        "min": 1024,
+        "max": 467308
+      },
+      "warm_tokens_per_second_aggregate": 240989.64,
+      "row_resolutions_total_all_passes": 2097152,
+      "cold_row_bytes_estimated_streamed": 0,
+      "passes": [
+        {
+          "pass": "first_touch",
+          "wall_seconds": 1.196926,
+          "minor_fault_delta": 392488,
+          "major_fault_delta": 5
+        },
+        {
+          "pass": "warm_1",
+          "wall_seconds": 0.271945,
+          "minor_fault_delta": 224,
+          "major_fault_delta": 1
+        }
+      ],
+      "cap_megabytes": 8
+    },
+    {
+      "arm": "prefetch-overlap",
+      "gather_latency_ns_per_token_first_touch": {
+        "p50": 33839,
+        "p90": 70502,
+        "p99": 90178,
+        "min": 2151,
+        "max": 541040
+      },
+      "gather_latency_ns_per_token_warm": {
+        "p50": 7983,
+        "p90": 9184,
+        "p99": 20190,
+        "min": 2536,
+        "max": 481755
+      },
+      "warm_tokens_per_second_aggregate": 13148.87,
+      "row_resolutions_total_all_passes": 2097152,
+      "cold_row_bytes_estimated_streamed": 377415000,
+      "passes": [
+        {
+          "pass": "first_touch",
+          "wall_seconds": 5.467403,
+          "minor_fault_delta": 393911,
+          "major_fault_delta": 5
+        },
+        {
+          "pass": "warm_1",
+          "wall_seconds": 4.984153,
+          "minor_fault_delta": 417,
+          "major_fault_delta": 1
+        }
+      ],
+      "prefetch_facts": {
+        "inflight_rows_cap_per_window": 256,
+        "overlap_depth_windows": 2,
+        "lookahead_tokens_per_window": 16,
+        "windows_issued": 8190,
+        "rows_touched_by_prefetchers": 2096348,
+        "madvise_willneed_attempts": 8190,
+        "madvise_willneed_accepted_ranges": 8190
+      },
+      "cap_megabytes": 8
+    },
+    {
+      "arm": "hot-resident-prefetch",
+      "gather_latency_ns_per_token_first_touch": {
+        "p50": 39509,
+        "p90": 71153,
+        "p99": 91913,
+        "min": 3752,
+        "max": 668879
+      },
+      "gather_latency_ns_per_token_warm": {
+        "p50": 15121,
+        "p90": 17330,
+        "p99": 31553,
+        "min": 5409,
+        "max": 462299
+      },
+      "warm_tokens_per_second_aggregate": 18969.48,
+      "row_resolutions_total_all_passes": 2097152,
+      "cold_row_bytes_estimated_streamed": 318080880,
+      "passes": [
+        {
+          "pass": "first_touch",
+          "wall_seconds": 4.91689,
+          "minor_fault_delta": 338729,
+          "major_fault_delta": 4
+        },
+        {
+          "pass": "warm_1",
+          "wall_seconds": 3.454812,
+          "minor_fault_delta": 346,
+          "major_fault_delta": 1
+        }
+      ],
+      "prefetch_facts": {
+        "inflight_rows_cap_per_window": 256,
+        "overlap_depth_windows": 2,
+        "lookahead_tokens_per_window": 16,
+        "windows_issued": 8190,
+        "rows_touched_by_prefetchers": 1766894,
+        "madvise_willneed_attempts": 8190,
+        "madvise_willneed_accepted_ranges": 8190
+      },
+      "residency_tallies": {
+        "hits_total_all_passes": 329814,
+        "misses_total_all_passes": 1767338,
+        "hit_rate": 0.1573,
+        "resident_bytes_held": 8388540
+      },
+      "admission": {
+        "requested_rows": 976875,
+        "allowed_rows": 93206,
+        "admitted_rows": 93206,
+        "refused_by_clamp_rows": 883669,
+        "resident_bytes": 8388540
+      },
+      "arena_backing_facts": {
+        "requested_back_mode": "TransparentHugePage",
+        "host_family": "linux",
+        "anonymous_mmap_applied": true,
+        "madvise_hugepage_requested": true,
+        "madvise_hugepage_succeeded": true,
+        "explicit_hugetlb_used": false,
+        "arena_capacity_bytes": 8388608,
+        "arena_base_hex": "0000734c58800000",
+        "smaps_anon_hugepages_bytes_over_arena": 8388608,
+        "smaps_rss_bytes_over_arena": 8388608,
+        "numa_maps_entries_over_arena": 1,
+        "numa_pages_by_node": {
+          "N0": 2048
+        }
+      },
+      "cap_megabytes": 8
+    },
+    {
+      "arm": "hot-resident-no-prefetch",
+      "gather_latency_ns_per_token_first_touch": {
+        "p50": 16780,
+        "p90": 35216,
+        "p99": 46716,
+        "min": 2491,
+        "max": 501771
+      },
+      "gather_latency_ns_per_token_warm": {
+        "p50": 6602,
+        "p90": 7102,
+        "p99": 7990,
+        "min": 2372,
+        "max": 472132
+      },
+      "warm_tokens_per_second_aggregate": 152788.57,
+      "row_resolutions_total_all_passes": 2097152,
+      "cold_row_bytes_estimated_streamed": 0,
+      "passes": [
+        {
+          "pass": "first_touch",
+          "wall_seconds": 1.268783,
+          "minor_fault_delta": 338082,
+          "major_fault_delta": 6
+        },
+        {
+          "pass": "warm_1",
+          "wall_seconds": 0.428933,
+          "minor_fault_delta": 248,
+          "major_fault_delta": 3
+        }
+      ],
+      "residency_tallies": {
+        "hits_total_all_passes": 329814,
+        "misses_total_all_passes": 1767338,
+        "hit_rate": 0.1573,
+        "resident_bytes_held": 8388540
+      },
+      "admission": {
+        "requested_rows": 976875,
+        "allowed_rows": 93206,
+        "admitted_rows": 93206,
+        "refused_by_clamp_rows": 883669,
+        "resident_bytes": 8388540
+      },
+      "arena_backing_facts": {
+        "requested_back_mode": "TransparentHugePage",
+        "host_family": "linux",
+        "anonymous_mmap_applied": true,
+        "madvise_hugepage_requested": true,
+        "madvise_hugepage_succeeded": true,
+        "explicit_hugetlb_used": false,
+        "arena_capacity_bytes": 8388608,
+        "arena_base_hex": "0000734c58800000",
+        "smaps_anon_hugepages_bytes_over_arena": 8388608,
+        "smaps_rss_bytes_over_arena": 8388608,
+        "numa_maps_entries_over_arena": 1,
+        "numa_pages_by_node": {
+          "N0": 2048
+        }
+      },
+      "cap_megabytes": 8
+    },
+    {
+      "arm": "demand-only",
+      "gather_latency_ns_per_token_first_touch": {
+        "p50": 15722,
+        "p90": 35528,
+        "p99": 57751,
+        "min": 1048,
+        "max": 608672
+      },
+      "gather_latency_ns_per_token_warm": {
+        "p50": 4585,
+        "p90": 6801,
+        "p99": 18720,
+        "min": 1022,
+        "max": 471645
+      },
+      "warm_tokens_per_second_aggregate": 189188.08,
+      "row_resolutions_total_all_passes": 2097152,
+      "cold_row_bytes_estimated_streamed": 0,
+      "passes": [
+        {
+          "pass": "first_touch",
+          "wall_seconds": 1.237555,
+          "minor_fault_delta": 392715,
+          "major_fault_delta": 0
+        },
+        {
+          "pass": "warm_1",
+          "wall_seconds": 0.346407,
+          "minor_fault_delta": 194,
+          "major_fault_delta": 0
+        }
+      ],
+      "cap_megabytes": 32
+    },
+    {
+      "arm": "prefetch-overlap",
+      "gather_latency_ns_per_token_first_touch": {
+        "p50": 34613,
+        "p90": 71049,
+        "p99": 90625,
+        "min": 2173,
+        "max": 551856
+      },
+      "gather_latency_ns_per_token_warm": {
+        "p50": 8006,
+        "p90": 9171,
+        "p99": 19510,
+        "min": 2586,
+        "max": 1801965
+      },
+      "warm_tokens_per_second_aggregate": 12904.91,
+      "row_resolutions_total_all_passes": 2097152,
+      "cold_row_bytes_estimated_streamed": 377415000,
+      "passes": [
+        {
+          "pass": "first_touch",
+          "wall_seconds": 5.524529,
+          "minor_fault_delta": 393106,
+          "major_fault_delta": 0
+        },
+        {
+          "pass": "warm_1",
+          "wall_seconds": 5.078376,
+          "minor_fault_delta": 157,
+          "major_fault_delta": 0
+        }
+      ],
+      "prefetch_facts": {
+        "inflight_rows_cap_per_window": 256,
+        "overlap_depth_windows": 2,
+        "lookahead_tokens_per_window": 16,
+        "windows_issued": 8190,
+        "rows_touched_by_prefetchers": 2096348,
+        "madvise_willneed_attempts": 8190,
+        "madvise_willneed_accepted_ranges": 8190
+      },
+      "cap_megabytes": 32
+    },
+    {
+      "arm": "hot-resident-prefetch",
+      "gather_latency_ns_per_token_first_touch": {
+        "p50": 32181,
+        "p90": 57053,
+        "p99": 75678,
+        "min": 4459,
+        "max": 570662
+      },
+      "gather_latency_ns_per_token_warm": {
+        "p50": 15468,
+        "p90": 16763,
+        "p99": 33041,
+        "min": 6093,
+        "max": 493495
+      },
+      "warm_tokens_per_second_aggregate": 16252.97,
+      "row_resolutions_total_all_passes": 2097152,
+      "cold_row_bytes_estimated_streamed": 217429740,
+      "passes": [
+        {
+          "pass": "first_touch",
+          "wall_seconds": 5.438266,
+          "minor_fault_delta": 231048,
+          "major_fault_delta": 0
+        },
+        {
+          "pass": "warm_1",
+          "wall_seconds": 4.032248,
+          "minor_fault_delta": 24,
+          "major_fault_delta": 0
+        }
+      ],
+      "prefetch_facts": {
+        "inflight_rows_cap_per_window": 256,
+        "overlap_depth_windows": 2,
+        "lookahead_tokens_per_window": 16,
+        "windows_issued": 8190,
+        "rows_touched_by_prefetchers": 1207790,
+        "madvise_willneed_attempts": 8190,
+        "madvise_willneed_accepted_ranges": 8190
+      },
+      "residency_tallies": {
+        "hits_total_all_passes": 889056,
+        "misses_total_all_passes": 1208096,
+        "hit_rate": 0.4239,
+        "resident_bytes_held": 33554430
+      },
+      "admission": {
+        "requested_rows": 976875,
+        "allowed_rows": 372827,
+        "admitted_rows": 372827,
+        "refused_by_clamp_rows": 604048,
+        "resident_bytes": 33554430
+      },
+      "arena_backing_facts": {
+        "requested_back_mode": "TransparentHugePage",
+        "host_family": "linux",
+        "anonymous_mmap_applied": true,
+        "madvise_hugepage_requested": true,
+        "madvise_hugepage_succeeded": true,
+        "explicit_hugetlb_used": false,
+        "arena_capacity_bytes": 33554432,
+        "arena_base_hex": "0000734c3a000000",
+        "smaps_anon_hugepages_bytes_over_arena": 33554432,
+        "smaps_rss_bytes_over_arena": 33554432,
+        "numa_maps_entries_over_arena": 1,
+        "numa_pages_by_node": {
+          "N0": 8192
+        }
+      },
+      "cap_megabytes": 32
+    },
+    {
+      "arm": "hot-resident-no-prefetch",
+      "gather_latency_ns_per_token_first_touch": {
+        "p50": 14129,
+        "p90": 25948,
+        "p99": 35176,
+        "min": 2680,
+        "max": 501808
+      },
+      "gather_latency_ns_per_token_warm": {
+        "p50": 6667,
+        "p90": 7225,
+        "p99": 13005,
+        "min": 2385,
+        "max": 467807
+      },
+      "warm_tokens_per_second_aggregate": 147250.67,
+      "row_resolutions_total_all_passes": 2097152,
+      "cold_row_bytes_estimated_streamed": 0,
+      "passes": [
+        {
+          "pass": "first_touch",
+          "wall_seconds": 1.021362,
+          "minor_fault_delta": 231099,
+          "major_fault_delta": 0
+        },
+        {
+          "pass": "warm_1",
+          "wall_seconds": 0.445064,
+          "minor_fault_delta": 64,
+          "major_fault_delta": 0
+        }
+      ],
+      "residency_tallies": {
+        "hits_total_all_passes": 889056,
+        "misses_total_all_passes": 1208096,
+        "hit_rate": 0.4239,
+        "resident_bytes_held": 33554430
+      },
+      "admission": {
+        "requested_rows": 976875,
+        "allowed_rows": 372827,
+        "admitted_rows": 372827,
+        "refused_by_clamp_rows": 604048,
+        "resident_bytes": 33554430
+      },
+      "arena_backing_facts": {
+        "requested_back_mode": "TransparentHugePage",
+        "host_family": "linux",
+        "anonymous_mmap_applied": true,
+        "madvise_hugepage_requested": true,
+        "madvise_hugepage_succeeded": true,
+        "explicit_hugetlb_used": false,
+        "arena_capacity_bytes": 33554432,
+        "arena_base_hex": "0000734c3a000000",
+        "smaps_anon_hugepages_bytes_over_arena": 33554432,
+        "smaps_rss_bytes_over_arena": 33554432,
+        "numa_maps_entries_over_arena": 1,
+        "numa_pages_by_node": {
+          "N0": 8192
+        }
+      },
+      "cap_megabytes": 32
+    }
+  ],
+  "numa_placement": {
+    "nodes_detected": {
+      "node0": "0-15,32-47",
+      "node1": "16-31,48-63"
+    },
+    "variants": [
+      {
+        "arm": "placement:unbound",
+        "gather_latency_ns_per_token_first_touch": {
+          "p50": 32548,
+          "p90": 55371,
+          "p99": 77356,
+          "min": 4624,
+          "max": 541992
+        },
+        "gather_latency_ns_per_token_warm": {
+          "p50": 15644,
+          "p90": 19259,
+          "p99": 34737,
+          "min": 6017,
+          "max": 475488
+        },
+        "warm_tokens_per_second_aggregate": 16146.54,
+        "row_resolutions_total_all_passes": 2097152,
+        "cold_row_bytes_estimated_streamed": 217429740,
+        "passes": [
+          {
+            "pass": "first_touch",
+            "wall_seconds": 4.393063,
+            "minor_fault_delta": 230912,
+            "major_fault_delta": 0
+          },
+          {
+            "pass": "warm_1",
+            "wall_seconds": 4.058826,
+            "minor_fault_delta": 131,
+            "major_fault_delta": 0
+          }
+        ],
+        "prefetch_facts": {
+          "inflight_rows_cap_per_window": 256,
+          "overlap_depth_windows": 2,
+          "lookahead_tokens_per_window": 16,
+          "windows_issued": 8190,
+          "rows_touched_by_prefetchers": 1207790,
+          "madvise_willneed_attempts": 8190,
+          "madvise_willneed_accepted_ranges": 8190
+        },
+        "residency_tallies": {
+          "hits_total_all_passes": 889056,
+          "misses_total_all_passes": 1208096,
+          "hit_rate": 0.4239,
+          "resident_bytes_held": 33554430
+        },
+        "numa_placement_facts": {
+          "arena_thread_bind": "unbound control (set_mempolicy(MPOL_DEFAULT) failed: errno=22)",
+          "gather_thread_cpu_list_after_binding": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63",
+          "arena_coverage_after_admission": {
+            "arena_base_hex": "0000734c3a000000",
+            "arena_capacity_bytes": 33554432,
+            "smaps_anon_hugepages_bytes_over_arena": 33554432,
+            "smaps_rss_bytes_over_arena": 33554432,
+            "numa_maps_entries_over_arena": 1,
+            "numa_pages_by_node": {
+              "N0": 8192
+            }
+          }
+        }
+      },
+      {
+        "arm": "placement:local-node0",
+        "gather_latency_ns_per_token_first_touch": {
+          "p50": 31504,
+          "p90": 55661,
+          "p99": 71439,
+          "min": 4823,
+          "max": 527868
+        },
+        "gather_latency_ns_per_token_warm": {
+          "p50": 15001,
+          "p90": 16469,
+          "p99": 31957,
+          "min": 5937,
+          "max": 478411
+        },
+        "warm_tokens_per_second_aggregate": 18168.83,
+        "row_resolutions_total_all_passes": 2097152,
+        "cold_row_bytes_estimated_streamed": 217429740,
+        "passes": [
+          {
+            "pass": "first_touch",
+            "wall_seconds": 3.845407,
+            "minor_fault_delta": 231096,
+            "major_fault_delta": 1
+          },
+          {
+            "pass": "warm_1",
+            "wall_seconds": 3.607056,
+            "minor_fault_delta": 416,
+            "major_fault_delta": 0
+          }
+        ],
+        "prefetch_facts": {
+          "inflight_rows_cap_per_window": 256,
+          "overlap_depth_windows": 2,
+          "lookahead_tokens_per_window": 16,
+          "windows_issued": 8190,
+          "rows_touched_by_prefetchers": 1207790,
+          "madvise_willneed_attempts": 8190,
+          "madvise_willneed_accepted_ranges": 8190
+        },
+        "residency_tallies": {
+          "hits_total_all_passes": 889056,
+          "misses_total_all_passes": 1208096,
+          "hit_rate": 0.4239,
+          "resident_bytes_held": 33554430
+        },
+        "numa_placement_facts": {
+          "arena_thread_bind": "calling thread bound to node 0 cpulist \u00270-15,32-47\u0027",
+          "arena_memory_policy": "set_mempolicy(MPOL_BIND) to node 0 failed: errno=22",
+          "gather_thread_bind": "calling thread bound to node 0 cpulist \u00270-15,32-47\u0027",
+          "gather_thread_cpu_list_after_binding": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47",
+          "arena_coverage_after_admission": {
+            "arena_base_hex": "0000734c3a000000",
+            "arena_capacity_bytes": 33554432,
+            "smaps_anon_hugepages_bytes_over_arena": 33554432,
+            "smaps_rss_bytes_over_arena": 33554432,
+            "numa_maps_entries_over_arena": 1,
+            "numa_pages_by_node": {
+              "N0": 8192
+            }
+          }
+        }
+      },
+      {
+        "arm": "placement:arena-on-node1-gather-on-node0",
+        "gather_latency_ns_per_token_first_touch": {
+          "p50": 33702,
+          "p90": 55775,
+          "p99": 72981,
+          "min": 4705,
+          "max": 557973
+        },
+        "gather_latency_ns_per_token_warm": {
+          "p50": 16950,
+          "p90": 18328,
+          "p99": 34170,
+          "min": 6081,
+          "max": 567815
+        },
+        "warm_tokens_per_second_aggregate": 17685.18,
+        "row_resolutions_total_all_passes": 2097152,
+        "cold_row_bytes_estimated_streamed": 217429740,
+        "passes": [
+          {
+            "pass": "first_touch",
+            "wall_seconds": 4.138623,
+            "minor_fault_delta": 231305,
+            "major_fault_delta": 0
+          },
+          {
+            "pass": "warm_1",
+            "wall_seconds": 3.705702,
+            "minor_fault_delta": 314,
+            "major_fault_delta": 0
+          }
+        ],
+        "prefetch_facts": {
+          "inflight_rows_cap_per_window": 256,
+          "overlap_depth_windows": 2,
+          "lookahead_tokens_per_window": 16,
+          "windows_issued": 8190,
+          "rows_touched_by_prefetchers": 1207790,
+          "madvise_willneed_attempts": 8190,
+          "madvise_willneed_accepted_ranges": 8190
+        },
+        "residency_tallies": {
+          "hits_total_all_passes": 889056,
+          "misses_total_all_passes": 1208096,
+          "hit_rate": 0.4239,
+          "resident_bytes_held": 33554430
+        },
+        "numa_placement_facts": {
+          "arena_thread_bind": "calling thread bound to node 1 cpulist \u002716-31,48-63\u0027",
+          "arena_memory_policy": "set_mempolicy(MPOL_BIND) to node 1 failed: errno=22",
+          "gather_thread_bind": "calling thread bound to node 0 cpulist \u00270-15,32-47\u0027",
+          "gather_thread_cpu_list_after_binding": "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47",
+          "arena_coverage_after_admission": {
+            "arena_base_hex": "0000734c3a000000",
+            "arena_capacity_bytes": 33554432,
+            "smaps_anon_hugepages_bytes_over_arena": 33554432,
+            "smaps_rss_bytes_over_arena": 33554432,
+            "numa_maps_entries_over_arena": 1,
+            "numa_pages_by_node": {
+              "N1": 8192
+            }
+          }
+        }
+      }
+    ]
+  },
+  "notes": [
+    {
+      "note": "Arms simulate layer-2 access scheduling over the real table\u0027s row addressing with a synthetic token stream; production qwen4exp forward integration is not implemented and no claim here covers it."
+    },
+    {
+      "note": "The stream uses zipf token ids (a cubed-uniform skew over a 262144-id vocabulary window concentrates row frequencies so hot-slot selection has something to select) with EOS cut and missing-predecessor windows mixed in; policy comparisons hold this stream identical across arms."
+    },
+    {
+      "note": "hot-resident-prefetch versus hot-resident-no-prefetch isolates what staying resident buys from what prefetch overlap buys; demand-only is the floor of both."
+    }
+  ]
+}

@@ -352,6 +352,122 @@ public sealed class PleNGramTests : IDisposable
         Assert.Contains("'weights' is not 'ple'", wrongChain.Message); // the PLE ceiling bounds gathered rows, nothing else's residency.
     }
 
+    [Fact]
+    public void FrequencySketch_RanksByObservedCountWithDeterministicTieBreak()
+    {
+        PleFrequencySketch sketch = new();
+
+        sketch.Observe(7);
+        sketch.Observe(9);
+        sketch.Observe(7);
+        sketch.Observe(7);
+        sketch.Observe(9);
+
+        Assert.Equal(2, sketch.DistinctRows);
+        Assert.Equal(5L, sketch.TotalObservations);
+        Assert.Equal(3L, sketch.CountOf(7));
+        Assert.Equal(2L, sketch.CountOf(9));
+        Assert.Equal(0L, sketch.CountOf(11));
+
+        Assert.Equal([7L, 9L], sketch.RankedByFrequency()); // higher observed frequency first: hot-slot selection sees the row this stream gathered more often before the rarer one.
+
+        PleFrequencySketch ties = new();
+        ties.Observe(2);
+        ties.Observe(1);
+        ties.Observe(1);
+        ties.Observe(2);
+
+        Assert.Equal([1L, 2L], ties.RankedByFrequency()); // equal counts break on ascending row index, so two identical streams rank identically without a learned predictor.
+    }
+
+    [Fact]
+    public void HotRowProvider_AdmitsPriorityOrderUnderClampAndResolvesCopiesParity()
+    {
+        using GgufFile model = GgufFile.Open(WriteTemp(BuildPleGguf(PleMetadata(ngramSize: 2, headsPerNgram: 1) with { HeadOffsets = [0], HeadVocabSizes = [64] }, tableRows: 64)));
+        using PleRowSource rows = new(model, PleNgramTable.FromGguf(model, Tensor(model)));
+        using PleHotRowProvider provider = new(rows, maxResidentBytes: 500, PleHotRowBackMode.PlainCommitted);
+
+        PleHotRowAdmission admission = provider.AdmitHotSet([5L, 10L, 1L, 20L, 30L, 40L, 50L, 60L, 63L]);
+
+        Assert.Equal(500L, admission.CapBytes);
+        Assert.Equal(RowBytes, admission.RowStrideBytes);
+        Assert.Equal(9L, admission.RequestedRows);
+        Assert.Equal(5L, admission.AllowedRows); // 500 bytes at a 90-byte packed row admits five whole rows, no more.
+        Assert.Equal(5L, admission.AdmittedRows);
+        Assert.Equal(4L, admission.RefusedByClampRows); // the selection's tail stays out of residency and is reported, not silently dropped.
+        Assert.Equal(450L, admission.ResidentBytes);
+        Assert.Equal(450L, provider.ResidentBytes);
+
+        Assert.True(provider.IsResident(1));
+        Assert.True(provider.IsResident(5));
+        Assert.True(provider.IsResident(10));
+        Assert.True(provider.IsResident(20));
+        Assert.True(provider.IsResident(30));
+        Assert.False(provider.IsResident(40));
+        Assert.False(provider.IsResident(63));
+
+        ReadOnlySpan<byte> resident = provider.ResolveRow(5);
+        Assert.Equal(RowBytes, resident.Length);
+
+        for (int byteIndex = 0; byteIndex < RowBytes; byteIndex++)
+        {
+            Assert.Equal(ExpectedRowByte(5, byteIndex), resident[byteIndex]); // admission copied the exact packed bytes the cold gather would have resolved.
+        }
+
+        ReadOnlySpan<byte> cold = provider.ResolveRow(63);
+
+        for (int byteIndex = 0; byteIndex < RowBytes; byteIndex++)
+        {
+            Assert.Equal(ExpectedRowByte(63, byteIndex), cold[byteIndex]); // a miss falls straight through to the shard mapping, refusal and all.
+        }
+
+        Assert.Equal(1L, provider.HitsTotal);
+        Assert.Equal(1L, provider.MissesTotal);
+        Assert.Equal(450L, provider.CopiedBytesTotal);
+        Assert.Equal(5L, provider.ParityCheckedRows);
+        Assert.False((bool)provider.BackingFacts["madvise_hugepage_requested"]!); // PlainCommitted asks for no transparent backing, and the facts say so rather than pretending.
+    }
+
+    [Fact]
+    public void HotRowProvider_RefusesRowsOutsideTable()
+    {
+        using GgufFile model = GgufFile.Open(WriteTemp(BuildPleGguf(PleMetadata(ngramSize: 2, headsPerNgram: 1) with { HeadOffsets = [0], HeadVocabSizes = [64] }, tableRows: 64)));
+        using PleRowSource rows = new(model, PleNgramTable.FromGguf(model, Tensor(model)));
+        using PleHotRowProvider provider = new(rows, maxResidentBytes: 1024, PleHotRowBackMode.PlainCommitted);
+
+        ArgumentOutOfRangeException outside = Assert.Throws<ArgumentOutOfRangeException>(() => provider.AdmitHotSet([64L]));
+        Assert.Contains(PleTensorName, outside.Message);
+        Assert.Contains("64-row PLE table", outside.Message); // residency cannot invent a row no head range declared.
+    }
+
+    [Fact]
+    public void RowSource_ExposesMappingExtentAndComputedAddresses()
+    {
+        using GgufFile model = GgufFile.Open(WriteTemp(BuildPleGguf(PleMetadata(ngramSize: 2, headsPerNgram: 1) with { HeadOffsets = [0], HeadVocabSizes = [64] }, tableRows: 64)));
+        using PleRowSource rows = new(model, PleNgramTable.FromGguf(model, Tensor(model)));
+
+        Assert.True(rows.MappingExtent.Length >= rows.Rows * rows.RowStrideBytes); // the mapping reports the exact extent its row gather addresses through.
+
+        Assert.True(rows.TryMappedAddressOf(0, out nint firstAddress));
+        Assert.True(rows.TryMappedAddressOf(rows.Rows - 1, out nint lastAddress));
+        Assert.True(lastAddress > firstAddress);
+        Assert.False(rows.TryMappedAddressOf(rows.Rows, out _)); // a computed address for a row outside the declared row space is refused rather than guessed.
+    }
+
+    [Fact]
+    public void LinuxPlacementInterop_ParsesKernelCpuLists()
+    {
+        Assert.True(LinuxPlacementInterop.TryParseCpuList("0-1,3", out int[] cpus, out string parseError));
+        Assert.Equal([0, 1, 3], cpus);
+        Assert.Equal(string.Empty, parseError);
+
+        Assert.False(LinuxPlacementInterop.TryParseCpuList("3-1", out _, out string badRange));
+        Assert.Contains("bounded", badRange);
+
+        Assert.False(LinuxPlacementInterop.TryParseCpuList("abc", out _, out string badId));
+        Assert.Contains("processor id", badId);
+    }
+
     private static LogicalTensor Tensor(GgufFile model) =>
         model.Tensors.Find(PleTensorName) ?? throw new InvalidOperationException($"fixture declares no '{PleTensorName}' tensor");
 
