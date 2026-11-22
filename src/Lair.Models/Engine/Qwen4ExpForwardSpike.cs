@@ -34,6 +34,21 @@ internal sealed class Qwen4ExpForwardSpike : IDisposable
         FeedForward,
     }
 
+    /// <summary>
+    /// Declared sparse-FFN shape the spike sequences for a qwen4exp block: the expert count the router scores and the
+    /// routing count each token selects, whether the block adds one shared expert with its own hidden-sized selector
+    /// vector, and the two routing-weight knobs <c>build_moe_ffn</c> carries. These mirror the reference descriptor's
+    /// <c>n_expert</c>/<c>n_expert_used</c>, the shared-expert declaration and the declared
+    /// <c>expert_weights_scale</c>/<c>expert_weights_norm</c>; qwen4exp always routes through a softmax gate with the
+    /// selected weights renormalized, so <see cref="NormalizeExpertWeights"/> defaults to true.
+    /// </summary>
+    internal sealed record SparseMoEConfig(
+        int ExpertCount,
+        int RoutedExpertsPerToken,
+        bool HasSharedExpert = true,
+        float ExpertWeightsScale = 0f,
+        bool NormalizeExpertWeights = true);
+
     private readonly Qwen4ExpGeometry _geometry;
     private readonly int _hiddenSize;
     private readonly int _headCount;
@@ -82,6 +97,16 @@ internal sealed class Qwen4ExpForwardSpike : IDisposable
     private readonly float[] _midStreams;     // maxChunk * flattened: streams after the attention combine, before the ffn mix
     private readonly float[] _ffnScratch;     // intermediateSize: SwiGLU gate/up accumulator
 
+    // Sparse-FFN scratch and declared shape. Present only when the spike is built with a <see cref="SparseMoEConfig"/>;
+    // a dense stand-in fixture carries none and never touches these arrays. The router scores one row per expert, then top-k
+    // selection lands into ids/weights in ascending expert-index order exactly as the production route does, and the routed
+    // chain reuses _ffnScratch for each selected expert's SwiGLU activation while _expertOut holds that expert's down result.
+    private readonly SparseMoEConfig? _sparseMoE;
+    private float[] _routerScores = [];   // ExpertCount: softmax probabilities over every declared expert, poisoned as picked
+    private int[] _selectedIds = [];      // RoutedExpertsPerToken: chosen experts in ascending index order
+    private float[] _selectedWeights = []; // RoutedExpertsPerToken: each chosen expert's routing weight beside its id
+    private float[] _expertOut = [];      // hiddenSize: one selected expert's down output before it folds into the feed-forward sum
+
     public Qwen4ExpForwardSpike(
         Qwen4ExpGeometry geometry,
         int hiddenSize,
@@ -93,7 +118,8 @@ internal sealed class Qwen4ExpForwardSpike : IDisposable
         IBackend backend,
         int maxChunk = 8,
         int maxPositions = 32,
-        double ropeBase = 10000.0)
+        double ropeBase = 10000.0,
+        SparseMoEConfig? sparseMoE = null)
     {
         ArgumentNullException.ThrowIfNull(geometry);
         ArgumentNullException.ThrowIfNull(backend);
@@ -123,6 +149,19 @@ internal sealed class Qwen4ExpForwardSpike : IDisposable
         _maxChunk = maxChunk;
         _maxPositions = maxPositions;
         _backend = backend;
+        _sparseMoE = sparseMoE;
+
+        if (sparseMoE is not null)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(sparseMoE.ExpertCount);
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(sparseMoE.RoutedExpertsPerToken);
+            if (sparseMoE.RoutedExpertsPerToken > sparseMoE.ExpertCount)
+            {
+                throw new ArgumentException(
+                    $"a token cannot route to more experts than the block declares: {sparseMoE.RoutedExpertsPerToken} routed out of {sparseMoE.ExpertCount} experts.",
+                    nameof(sparseMoE));
+            }
+        }
 
         _streamCount = geometry.HyperConnections.StreamCount;
         _lowRank = geometry.HyperConnections.LowRank;
@@ -180,6 +219,14 @@ internal sealed class Qwen4ExpForwardSpike : IDisposable
         _sublayerRows = new float[maxChunk * hiddenSize];
         _midStreams = new float[maxChunk * _flattened];
         _ffnScratch = new float[intermediateSize];
+
+        if (_sparseMoE is not null)
+        {
+            _routerScores = new float[_sparseMoE.ExpertCount];
+            _selectedIds = new int[_sparseMoE.RoutedExpertsPerToken];
+            _selectedWeights = new float[_sparseMoE.RoutedExpertsPerToken];
+            _expertOut = new float[hiddenSize];
+        }
     }
 
     /// <summary>The resolved geometry this spike sequences against.</summary>
@@ -209,6 +256,9 @@ internal sealed class Qwen4ExpForwardSpike : IDisposable
     internal HyperConnectionTensors AttentionHyperOperands(int layer) => _layers[layer].AttnHyper;
 
     internal HyperConnectionTensors FeedForwardHyperOperands(int layer) => _layers[layer].FfnHyper;
+
+    /// <summary>The sparse-FFN operands a sparse-configured spike built for this layer (router, stacked experts, shared block and selector), or an empty set for a dense stand-in fixture.</summary>
+    internal SparseFfnOperands SparseMoEOperands(int layer) => _layers[layer].MoE;
 
     /// <summary>Clear every block's carried state so a fresh sequence starts from a clean slate exactly as the engine would. The residual streams themselves are supplied to each <see cref="ForwardBlockChunk"/> call — the reference's <c>hc_init</c> repeats the embedding across every stream, and a spike test feeds that repeated stream set directly; this method only validates the seed width and zeroes the recurrent, convolution-history and synthetic caches.</summary>
     public void StartSequence(ReadOnlySpan<float> embeddingRow)
@@ -291,11 +341,21 @@ internal sealed class Qwen4ExpForwardSpike : IDisposable
             CombineStreams(streamsIn.Slice(t * streamsPerToken, streamsPerToken), _sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize), _injectScratch.AsSpan(t * _streamCount, _streamCount), _midStreams.AsSpan(t * streamsPerToken, streamsPerToken));
         }
 
-        // Feed-forward-side hyper-connection mix, the dense SwiGLU stand-in for the routed experts, and the final combine.
+        // Feed-forward-side hyper-connection mix, then either the sparse router/gather/expert chain (when the spike was
+        // built with a SparseMoEConfig) or the dense SwiGLU stand-in (for a linear-only fixture), then the final combine.
         for (int t = 0; t < tokenCount; t++)
         {
             MixStreams(layer, SublayerSide.FeedForward, _midStreams.AsSpan(t * streamsPerToken, streamsPerToken), _mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), _injectScratch.AsSpan(t * _streamCount, _streamCount));
-            ForwardDenseFfnStandIn(layer, _mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), _sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize));
+
+            if (_sparseMoE is not null)
+            {
+                ForwardSparseMoE(layer, _mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), _sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize));
+            }
+            else
+            {
+                ForwardDenseFfnStandIn(layer, _mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), _sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize));
+            }
+
             CombineStreams(_midStreams.AsSpan(t * streamsPerToken, streamsPerToken), _sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize), _injectScratch.AsSpan(t * _streamCount, _streamCount), streamsOut.Slice(t * streamsPerToken, streamsPerToken));
         }
     }
@@ -414,6 +474,190 @@ internal sealed class Qwen4ExpForwardSpike : IDisposable
         for (int h = 0; h < _hiddenSize; h++)
         {
             ffnOut[h] = DotRow(ffn.Down, h, _intermediateSize, _ffnScratch);
+        }
+    }
+
+    /// <summary>
+    /// The reference <c>build_moe_ffn</c> routing for one hidden row, mirroring the production <c>RouteSparseExperts</c>
+    /// exactly so a spike selection is bit-identical to the engine's: the router emits one score per declared expert, every
+    /// score is softmaxed together (qwen4exp routes through a softmax gate), then <c>RoutedExpertsPerToken</c> picks run as
+    /// ascending-index scans under strict greater-than so equal scores resolve to the lower expert index; a picked slot is
+    /// poisoned so a later pass cannot re-pick it. The chosen slots are insertion-sorted into ascending expert-index order
+    /// beside their weights, then — because qwen4exp renormalizes (norm = true) — divided by the selected probability sum,
+    /// and finally scaled by <c>ExpertWeightsScale</c> when nonzero. Selection carries no cross-token state, so routing the
+    /// same row twice, or across a chunk split, lands on the same experts in the same order.
+    /// </summary>
+    internal void RouteSparseMoE(int layer, ReadOnlySpan<float> mixed, Span<int> ids, Span<float> weights)
+    {
+        SparseMoEConfig cfg = _sparseMoE!;
+        SparseFfnOperands moe = _layers[layer].MoE;
+        int expertCount = cfg.ExpertCount;
+        int routed = cfg.RoutedExpertsPerToken;
+
+        if (mixed.Length < _hiddenSize || ids.Length < routed || weights.Length < routed)
+        {
+            throw new ArgumentException("Sparse routing needs one hidden row and room for every routed expert and weight.", nameof(mixed));
+        }
+
+        // Router scores over every declared expert, then an all-expert softmax in place with a max-subtraction guard.
+        for (int e = 0; e < expertCount; e++)
+        {
+            _routerScores[e] = DotRow(moe.Router, e, _hiddenSize, mixed);
+        }
+
+        float maxScore = float.NegativeInfinity;
+        for (int e = 0; e < expertCount; e++)
+        {
+            if (_routerScores[e] > maxScore)
+            {
+                maxScore = _routerScores[e];
+            }
+        }
+
+        float allSum = 0f;
+        for (int e = 0; e < expertCount; e++)
+        {
+            _routerScores[e] = MathF.Exp(_routerScores[e] - maxScore);
+            allSum += _routerScores[e];
+        }
+
+        for (int e = 0; e < expertCount; e++)
+        {
+            _routerScores[e] /= allSum;
+        }
+
+        // Ascending-index strict-greater picks: a tie keeps the earlier expert regardless of buffer reuse.
+        float selectedSum = 0f;
+        for (int pick = 0; pick < routed; pick++)
+        {
+            int best = -1;
+            float bestScore = float.NegativeInfinity;
+            for (int e = 0; e < expertCount; e++)
+            {
+                if (_routerScores[e] > bestScore)
+                {
+                    best = e;
+                    bestScore = _routerScores[e];
+                }
+            }
+
+            ids[pick] = best;
+            weights[pick] = bestScore;
+            selectedSum += bestScore;
+            _routerScores[best] = float.NegativeInfinity; // consumed: later passes cannot re-pick this expert
+        }
+
+        // Sort the chosen slots into ascending expert-index execution order beside their weights.
+        for (int i = 1; i < routed; i++)
+        {
+            int id = ids[i];
+            float weight = weights[i];
+            int j = i - 1;
+            while (j >= 0 && ids[j] > id)
+            {
+                ids[j + 1] = ids[j];
+                weights[j + 1] = weights[j];
+                j--;
+            }
+
+            ids[j + 1] = id;
+            weights[j + 1] = weight;
+        }
+
+        if (cfg.NormalizeExpertWeights && selectedSum > 0f)
+        {
+            for (int i = 0; i < routed; i++)
+            {
+                weights[i] /= selectedSum;
+            }
+        }
+
+        if (cfg.ExpertWeightsScale != 0f)
+        {
+            for (int i = 0; i < routed; i++)
+            {
+                weights[i] *= cfg.ExpertWeightsScale;
+            }
+        }
+    }
+
+    /// <summary>
+    /// One block's sparse feed-forward for a single hidden row: route, then run each selected expert's gate/up/down chain
+    /// in ascending expert-index order — a spike-local gather that mirrors <see cref="CpuGatherKernel"/>'s contract (visit
+    /// the selection once, ascending, each expert's slab read as a contiguous view of its stacked role) over synthetic
+    /// operands instead of GGUF byte slabs — accumulating each expert's down output into <paramref name="ffnOut"/> scaled by
+    /// its routing weight. A declared shared expert then runs its own dense-shaped SwiGLU block once, gated by
+    /// <c>sigmoid(dot(ffn_gate_inp_shexp, mixed))</c> — the plain sigmoid the qwen4exp reference applies, not qwen2moe's
+    /// <c>silu(score) / score</c> — and folds into the same sum. The result is the hidden row the hyper-connection combine
+    /// consumes. This path carries no cross-token state, so splitting a chunk across calls reproduces the unsplit run.
+    /// </summary>
+    internal void ForwardSparseMoE(int layer, ReadOnlySpan<float> mixed, Span<float> ffnOut)
+    {
+        SparseMoEConfig cfg = _sparseMoE!;
+        SparseFfnOperands moe = _layers[layer].MoE;
+        int routed = cfg.RoutedExpertsPerToken;
+
+        if (mixed.Length < _hiddenSize || ffnOut.Length < _hiddenSize)
+        {
+            throw new ArgumentException("The sparse feed-forward needs one hidden row in and out.", nameof(mixed));
+        }
+
+        RouteSparseMoE(layer, mixed, _selectedIds.AsSpan(0, routed), _selectedWeights.AsSpan(0, routed));
+
+        // Clear only this row's feed-forward region before accumulating: the caller may alias a shared scratch buffer whose
+        // other rows belong to neighbouring tokens and must stay untouched. The routed and shared contributions build from zero.
+        for (int h = 0; h < _hiddenSize; h++)
+        {
+            ffnOut[h] = 0f;
+        }
+
+        // Routed experts, ascending: each selected expert's SwiGLU chain reads its slab as a contiguous view of the stacked role.
+        for (int slot = 0; slot < routed; slot++)
+        {
+            int expert = _selectedIds[slot];
+            float weight = _selectedWeights[slot];
+
+            for (int i = 0; i < _intermediateSize; i++)
+            {
+                int row = expert * _intermediateSize + i;
+                float gate = DotRow(moe.ExpertGate, row, _hiddenSize, mixed);
+                float up = DotRow(moe.ExpertUp, row, _hiddenSize, mixed);
+                _ffnScratch[i] = LayerOps.Silu(gate) * up;
+            }
+
+            for (int h = 0; h < _hiddenSize; h++)
+            {
+                _expertOut[h] = DotRow(moe.ExpertDown, expert * _hiddenSize + h, _intermediateSize, _ffnScratch);
+            }
+
+            for (int h = 0; h < _hiddenSize; h++)
+            {
+                ffnOut[h] += weight * _expertOut[h];
+            }
+        }
+
+        // Shared expert once, under its own sigmoid gate over the hidden-sized selector vector (ffn_gate_inp_shexp).
+        if (cfg.HasSharedExpert)
+        {
+            float score = 0f;
+            for (int c = 0; c < _hiddenSize; c++)
+            {
+                score += moe.SharedGateVector[c] * mixed[c];
+            }
+
+            float sharedWeight = GdnOps.Sigmoid(score);
+
+            for (int i = 0; i < _intermediateSize; i++)
+            {
+                float gate = DotRow(moe.SharedGate, i, _hiddenSize, mixed);
+                float up = DotRow(moe.SharedUp, i, _hiddenSize, mixed);
+                _ffnScratch[i] = LayerOps.Silu(gate) * up;
+            }
+
+            for (int h = 0; h < _hiddenSize; h++)
+            {
+                ffnOut[h] += sharedWeight * DotRow(moe.SharedDown, h, _intermediateSize, _ffnScratch);
+            }
         }
     }
 
@@ -563,6 +807,11 @@ internal sealed class Qwen4ExpForwardSpike : IDisposable
             },
         };
 
+        if (_sparseMoE is not null)
+        {
+            operands.MoE = BuildSparseMoEOperands();
+        }
+
         if (_geometry.KindForLayer(layer) == AttentionKind.LinearGatedDeltaNet)
         {
             GdnDescriptor gdn = _geometry.LinearAttention;
@@ -623,6 +872,29 @@ internal sealed class Qwen4ExpForwardSpike : IDisposable
         Inject = SyntheticMatrix(_streamCount, _flattened),
     };
 
+    // Synthetic sparse-FFN operands sized straight from the declared shape and the block's hidden/intermediate widths: a
+    // router matrix over the experts, the stacked per-expert gate/up/down triplets (gate/up are intermediate x hidden and
+    // down is hidden x intermediate, exactly the reference's *_exps stacks), and the shared expert's own gate/up/down plus
+    // its hidden-sized selector vector. Every fill is the same deterministic pattern the rest of the spike uses, so a
+    // sparse run is reproducible with no model file.
+    private SparseFfnOperands BuildSparseMoEOperands()
+    {
+        SparseMoEConfig cfg = _sparseMoE!;
+        int experts = cfg.ExpertCount;
+
+        return new SparseFfnOperands
+        {
+            Router = SyntheticMatrix(experts, _hiddenSize),
+            ExpertGate = SyntheticMatrix(experts * _intermediateSize, _hiddenSize),
+            ExpertUp = SyntheticMatrix(experts * _intermediateSize, _hiddenSize),
+            ExpertDown = SyntheticMatrix(experts * _hiddenSize, _intermediateSize),
+            SharedGate = SyntheticMatrix(_intermediateSize, _hiddenSize),
+            SharedUp = SyntheticMatrix(_intermediateSize, _hiddenSize),
+            SharedDown = SyntheticMatrix(_hiddenSize, _intermediateSize),
+            SharedGateVector = SyntheticVector(_hiddenSize, 0.5), // clearly nonzero selector so the shared gate is a real score
+        };
+    }
+
     private static float DotRow(float[] matrix, int row, int width, ReadOnlySpan<float> vector)
     {
         double sum = 0.0;
@@ -673,6 +945,10 @@ internal sealed class Qwen4ExpForwardSpike : IDisposable
         public HyperConnectionTensors FfnHyper = new();
         public DenseFfnTensors Ffn = new();
 
+        // Sparse-FFN operands, present only when the spike was built with a SparseMoEConfig; a dense stand-in fixture leaves
+        // this at its empty default and never reads it. The forward chooses sparse or dense from whether the config is set.
+        public SparseFfnOperands MoE = new();
+
         // Exactly one of these attention operand sets is filled, chosen by the layer's resolved kind; a linear block leaves
         // Sparse at its empty default and a sparse-full block leaves Linear empty. A forward reads only the side its kind selects.
         public GdnOps.GdnBlockTensors Linear;
@@ -694,6 +970,18 @@ internal sealed class Qwen4ExpForwardSpike : IDisposable
         public float[] Gate = []; // intermediateSize rows x hidden
         public float[] Up = []; // intermediateSize rows x hidden
         public float[] Down = []; // hidden rows x intermediateSize
+    }
+
+    internal sealed class SparseFfnOperands
+    {
+        public float[] Router = []; // ExpertCount rows x hidden — the ffn_gate_inp router matrix
+        public float[] ExpertGate = []; // (ExpertCount * intermediate) rows x hidden — stacked ffn_gate_exps slab views
+        public float[] ExpertUp = []; // (ExpertCount * intermediate) rows x hidden — stacked ffn_up_exps slab views
+        public float[] ExpertDown = []; // (ExpertCount * hidden) rows x intermediate — stacked ffn_down_exps slab views
+        public float[] SharedGate = []; // intermediateSize rows x hidden — the shared expert's gate matrix
+        public float[] SharedUp = []; // intermediateSize rows x hidden — the shared expert's up matrix
+        public float[] SharedDown = []; // hiddenSize rows x intermediateSize — the shared expert's down matrix
+        public float[] SharedGateVector = []; // hiddenSize: the ffn_gate_inp_shexp selector row whose score gates the shared block
     }
 
     private sealed class GdnState
