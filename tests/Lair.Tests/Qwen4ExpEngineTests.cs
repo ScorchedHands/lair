@@ -15,9 +15,11 @@ namespace Lair.Tests;
 /// in the reference order over the file's own tensors, the gated-delta-net recurrent state and convolution history carry
 /// across chunk splits, the sparse block's whole-sequence caches and indexer selection carry unchanged, a ratio-2 layer
 /// runs the pooling selection deterministically, and a declared shared expert gates under the qwen4exp reference's plain
-/// sigmoid — finite at a zero score where qwen2moe's silu(score)/score divides 0 by 0. The serving routes (Prefill,
-/// DecodeNext, DecodeBatch, LastLogits) refuse against the seam because persistent production caches for this family do
-/// not exist yet, and a fixture whose material is not F32 is refused naming the format.
+    /// sigmoid — finite at a zero score where qwen2moe's silu(score)/score divides 0 by 0. A quantized fixture runs through
+    /// the backend's packed weight views, the serving routes (Prefill, DecodeNext, DecodeBatch, LastLogits) refuse because
+    /// persistent production caches for this family do not exist yet, and declared PLE tensors are refused naming the missing
+    /// forward feature.
+
 /// </summary>
 [Trait("Category", "Engine")]
 public sealed class Qwen4ExpEngineTests : IDisposable
@@ -197,20 +199,53 @@ public sealed class Qwen4ExpEngineTests : IDisposable
     // ---------------------------------------------------------------- the seam refuses what it cannot read or compose
 
     [Fact]
-    public void TransformerModel_Qwen4ExpSeam_RefusesNonF32FixtureMaterialNamingTheFormat()
+    public void TransformerModel_Qwen4ExpSeam_RunsQuantizedFixtureMaterialThroughPackedWeightViews()
     {
-        // The bounded engine reads F32 fixture rows through the backend's row dequantization; a quantized posture needs the
-        // production weight views and kernels this synthetic path does not carry, so it is refused naming the tensor and format.
+        // The bounded engine now reads the file's own packed weight views through the backend kernels. An F16 matrix in the
+        // first GDN block proves that non-F32 material is consumed rather than refused: the forward stays finite and repeats
+        // bit-for-bit on a fresh sequence.
         List<TensorDef> tensors = [.. FixtureTensors()];
-        int normIndex = tensors.FindIndex(t => t.Name == "blk.0.ssm_norm.weight");
-        tensors[normIndex] = new TensorDef("blk.0.ssm_norm.weight", [StateDim], GgmlTypeF16);
+        int qkvIndex = tensors.FindIndex(t => t.Name == "blk.0.attn_qkv.weight");
+        tensors[qkvIndex] = new TensorDef(
+            "blk.0.attn_qkv.weight",
+            [2 * GroupCount * StateDim + InnerSize, Hidden],
+            GgmlTypeF16);
+
+        using GgufFile file = OpenFixture(BuildGguf(MetadataPairs(), tensors));
+        using CpuBackend backend = new();
+
+        using TransformerModel model = TransformerModel.Open(file, backend, maxContextTokens: 8);
+
+        Assert.True(model.HasQwen4ExpForward);
+
+        Qwen4ExpSequence sequence = model.NewQwen4ExpSequence();
+        Span<float> logits = model.ForwardQwen4ExpChunk(sequence, [0, 1, 2]);
+
+        Assert.Equal(3 * VocabSize, logits.Length);
+        foreach (float value in logits)
+        {
+            Assert.True(float.IsFinite(value), "a quantized qwen4exp fixture must land finite logits through the packed weight views");
+        }
+
+        Qwen4ExpSequence repeat = model.NewQwen4ExpSequence();
+        Span<float> again = model.ForwardQwen4ExpChunk(repeat, [0, 1, 2]);
+        Assert.True(again.SequenceEqual(logits));
+    }
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpSeam_RefusesPleTensorsBecausePleForwardIsNotWiredYet()
+    {
+        // A PLE tensor is a declared forward feature this bounded CPU seam does not compose. The refusal names the tensor and
+        // the missing module instead of silently ignoring it.
+        List<TensorDef> tensors = [.. FixtureTensors()];
+        tensors.Add(new TensorDef("blk.0.ple_key.weight", [Hidden, Hidden]));
 
         using GgufFile file = OpenFixture(BuildGguf(MetadataPairs(), tensors));
         using CpuBackend backend = new();
 
         ModelException ex = Assert.Throws<ModelException>(() => TransformerModel.Open(file, backend, maxContextTokens: 8));
-        Assert.Contains("blk.0.ssm_norm.weight", ex.Message);
-        Assert.Contains("f16", ex.Message);
+        Assert.Contains("blk.0.ple_key.weight", ex.Message);
+        Assert.Contains("PLE n-gram module", ex.Message);
     }
 
     [Fact]

@@ -1147,7 +1147,7 @@ public sealed class TransformerModel : IDisposable
     // behind the selection that happens to work.
     private ModelException Qwen4ExpPostureRefusal(string posture) => new(
         $"model '{_modelDisplay}' architecture 'qwen4exp' opens its forward on the bounded synthetic qwen4exp engine seam, " +
-        $"which runs CPU-only dense reads over F32 fixtures with per-sequence state sized at the opened context ceiling: " +
+        $"which runs CPU-only GEMV and slab kernels over the file's own packed weight views with per-sequence state sized at the opened context ceiling: " +
         $"{posture} has no composition over that seam — omit it to run the fixture through the assembly-internal qwen4exp " +
         $"chunk forwards, or resolve placement onto a standard family");
 
@@ -1232,7 +1232,7 @@ public sealed class TransformerModel : IDisposable
             _weights = weights ?? new GgufMmapWeightSource(file);
             _fileTensors = file.Tensors;
 
-            _qwen4Exp = new Qwen4ExpEngine(Plan, file.Tensors, _weights, backend, maxContextTokens);
+            _qwen4Exp = new Qwen4ExpEngine(Plan, file.Tensors, _weights, backend, maxContextTokens, _modelDisplay);
 
             if (logLine is not null)
             {

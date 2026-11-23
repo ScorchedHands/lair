@@ -17,7 +17,7 @@ namespace Lair.Models.Engine;
 /// collapse of gated streams, 2·sigmoid scatter on the combine side, all-expert router softmax with ascending strict-greater
 /// top-k and lower-index tie resolution, SwiGLU expert chains accumulated in ascending expert-index order — against real GGUF rows
 /// instead of synthetic fills. State is explicit per sequence: each linear block's delta-rule slot arrays plus raw convolution
-/// history advance across chunk splits through <see cref="GdnOps.ForwardChunk"/>, and each sparse-full block's whole-sequence KV
+/// history advance across chunk splits through <see cref="GdnOps.ForwardChunkKernel"/>, and each sparse-full block's whole-sequence KV
 /// rows, raw indexer-key cache and pooled selection run through the existing <see cref="QsaOps"/> semantics unchanged, so a
 /// sequence forwarded as consecutive chunks lands bit-for-bit on one unsplit pass. The shared expert uses the qwen4exp reference
 /// gate — plain <c>sigmoid(dot(ffn_gate_inp_shexp, mixed))</c>, finite at a zero score where qwen2moe's
@@ -41,18 +41,56 @@ internal sealed class Qwen4ExpEngine : IDisposable
     private readonly int _lowRank;
     private readonly int _flattened;
     private readonly int _maxPositions;
+    private readonly string _modelDisplay = "";
 
-    // Per-block operands loaded once from the file: one hyper-connection trio per sublayer side, either a gated-delta-net operand
-    // set (linear layers) or sparse-full attention operands plus the indexer quartet (full layers), and the block's routed expert
-    // stacks with their router row — every role read as contiguous float rows because this bounded path runs F32 fixtures only.
+    // Per-block operands captured once at open: one hyper-connection trio per sublayer side, either a gated-delta-net weight-view
+    // set (linear layers) or sparse-full attention views plus the indexer quartet (full layers), and the block's routed expert
+    // stacks with their router row and per-expert slab geometry. A forward resolves each matrix role's bytes from the weight
+    // source and dots them through the backend kernels; only operands with no dense-GEMV shape — norms, biases, decay weights,
+    // conv taps, the shared selector vector — stay materialized as small float rows the way production materializes its own.
     private readonly LayerOperands[] _layers;
 
     // The global output hyper-connection trio: one flattened norm vector plus a final down/up pair, no inject row at this scope.
     private readonly OutputHyperConnectionTensors _outputHc;
 
     // Logit head rows and the embedding table — untied <c>output.weight</c> when the file ships it, tied token-embedding rows otherwise.
-    private readonly float[] _embeddingRows; // vocabSize x hidden
-    private readonly float[] _logitHead;     // vocabSize x hidden (untied), or the same rows when tied
+    private readonly LogicalTensor _tokenEmbedding = null!;   // vocabSize x hidden, read through DequantRow per lookup
+    private readonly LogicalTensor _logitHead = null!;        // vocabSize x hidden (untied), or the embedding tensor itself when tied
+
+    // The slab seam every routed expert chain runs through: the weight source's own slab views when it answers slab resolutions,
+    // a contiguous-slab view of it otherwise — the same posture the production sparse path takes.
+    private readonly IExpertSlabSource _expertSlabs = null!;
+    private readonly IGatherKernel _gatherKernel = new CpuGatherKernel();
+
+    // Per-token feed-forward scratch sized once from the plan's own widths: the activation row a gathered chain reads, the
+    // gate/up/down intermediates, the router scores, and this token's selection.
+    private float[] _ffnInput = [];
+    private float[] _ffnScratch = [];
+    private float[] _ffnGateOut = [];
+    private float[] _ffnUpOut = [];
+    private float[] _ffnDownOut = [];
+    private float[] _routerScores = [];
+    private int[] _moeIds = [];
+    private float[] _moeWeights = [];
+    private float[] _selectedExpertWeights = []; // routing weight by expert index for the current token's gathered chain; only selected entries are read
+
+    // The two-dimensional shape a GEMV over one expert slice carries, shared by every layer of a role the way the production
+    // sparse path shares it: gate and up emit intermediate values from hidden inputs, down emits hidden values from intermediates.
+    private TensorShape _expertGateShape = new([]);
+    private TensorShape _expertUpShape = new([]);
+    private TensorShape _expertDownShape = new([]);
+
+    // Reused scratch for the hyper-connection mix and the sparse attention projections: sized once from plan widths so a forward
+    // does not allocate per token. The accumulator span borrows whichever output row the current gathered chain writes into; it is
+    // assigned immediately before each synchronous gather call, never stored across calls.
+    private float[] _hcNormed = [];
+    private float[] _hcLowRank = [];
+    private float[] _hcGated = [];
+    private float[] _queryGateRows = [];
+    private float[] _keyProjectionRows = [];
+    private float[] _valueProjectionRows = [];
+    private float[] _indexerQueryRows = [];
+    private float[] _ffnOutputScratch = []; // sparse routed/shared contributions accumulate here, then copy to the caller's output row — a class cannot hold a caller-owned Span field.
 
     // Rotary tables shared across every block: one position-major cos/sin run for the q/k head dimension and one for the indexer
     // component width, built once at open so no forward rebuilds either.
@@ -63,7 +101,7 @@ internal sealed class Qwen4ExpEngine : IDisposable
     private readonly int _ropeHalfHead;
     private readonly int _ropeHalfIndexer;
 
-    public Qwen4ExpEngine(ModelPlan plan, LogicalTensorTable tensors, IWeightSource weights, IBackend backend, int maxPositions)
+    public Qwen4ExpEngine(ModelPlan plan, LogicalTensorTable tensors, IWeightSource weights, IBackend backend, int maxPositions, string modelDisplay)
     {
         ArgumentNullException.ThrowIfNull(plan);
         ArgumentNullException.ThrowIfNull(tensors);
@@ -77,6 +115,8 @@ internal sealed class Qwen4ExpEngine : IDisposable
             throw new ArgumentException("A qwen4exp engine needs a plan whose family geometry resolved.", nameof(plan));
         }
 
+        _modelDisplay = modelDisplay;
+        ValidateForwardPosture(plan, tensors);
         _plan = plan;
         _geometry = geometry;
         _backend = backend;
@@ -110,6 +150,53 @@ internal sealed class Qwen4ExpEngine : IDisposable
             throw new ModelException($"qwen4exp hyper_connection.count is {_streamCount}; mixing needs at least two residual streams");
         }
 
+        _expertSlabs = weights as IExpertSlabSource ?? new ExpertSlabWeightSource(weights);
+
+        _ffnInput = new float[_hiddenSize];
+        _ffnScratch = new float[_intermediateSize];
+        _ffnGateOut = new float[_intermediateSize];
+        _ffnUpOut = new float[_intermediateSize];
+        _ffnDownOut = new float[_hiddenSize];
+        _ffnOutputScratch = new float[_hiddenSize];
+
+        _hcNormed = new float[_flattened];
+        _hcLowRank = new float[_lowRank];
+        _hcGated = new float[_flattened];
+
+        if (geometry.FullLayerCount > 0)
+        {
+            int qRegion = _headCount * _headDim;
+            int kvRegion = _kvHeadCount * _headDim;
+            int indexerWidth = geometry.SparseAttention.IndexerHeadCount * geometry.SparseAttention.IndexerKeyLength;
+
+            _queryGateRows = new float[2 * qRegion];
+            _keyProjectionRows = new float[kvRegion];
+            _valueProjectionRows = new float[kvRegion];
+            _indexerQueryRows = new float[indexerWidth];
+        }
+
+        if (plan.SparseFfn is { } sparseDeclared)
+        {
+            int expertCount = sparseDeclared.ExpertCount;
+            int routed = sparseDeclared.RoutedExpertsPerToken;
+
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(expertCount);
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(routed);
+            if (routed > expertCount)
+            {
+                throw new ModelException($"qwen4exp declares {expertCount} experts but routes each token through {routed}; the router cannot select more than it ships");
+            }
+
+            _routerScores = new float[expertCount];
+            _moeIds = new int[routed];
+            _moeWeights = new float[routed];
+            _selectedExpertWeights = new float[expertCount];
+
+            _expertGateShape = new TensorShape([_intermediateSize, _hiddenSize]);
+            _expertUpShape = new TensorShape([_intermediateSize, _hiddenSize]);
+            _expertDownShape = new TensorShape([_hiddenSize, _intermediateSize]);
+        }
+
         TensorMap map = plan.Tensors;
 
         _layers = new LayerOperands[geometry.LayerCount];
@@ -121,17 +208,20 @@ internal sealed class Qwen4ExpEngine : IDisposable
         _outputHc = new OutputHyperConnectionTensors
         {
             Norm = LoadVector(RequireTensor(map[TensorRole.OutputStreamNorm], tensors), "output hyper-connection norm", _flattened),
-            Down = LoadMatrix(RequireTensor(map[TensorRole.OutputStreamDown], tensors), "output hyper-connection down", [_lowRank, _flattened]),
-            Up = LoadMatrix(RequireTensor(map[TensorRole.OutputStreamUp], tensors), "output hyper-connection up", [_flattened, _lowRank]),
+            Down = MatrixRole(RequireTensor(map[TensorRole.OutputStreamDown], tensors), "output hyper-connection down", [_lowRank, _flattened]),
+            Up = MatrixRole(RequireTensor(map[TensorRole.OutputStreamUp], tensors), "output hyper-connection up", [_flattened, _lowRank]),
         };
 
-        LogicalTensor tokenEmbedding = RequireTensor(map[TensorRole.TokenEmbedding], tensors);
-        _embeddingRows = LoadMatrix(tokenEmbedding, "token embedding", [plan.VocabSize, _hiddenSize]);
+        _tokenEmbedding = RequireTensor(map[TensorRole.TokenEmbedding], tensors);
+        ValidateMatrixShape(_tokenEmbedding, "token embedding", [plan.VocabSize, _hiddenSize]);
 
         LogicalTensor? outputHead = map[TensorRole.OutputHead].Resolve(tensors);
-        _logitHead = outputHead is not null
-            ? LoadMatrix(outputHead, "output head", [plan.VocabSize, _hiddenSize])
-            : _embeddingRows; // tied posture: the logits read the same rows the embeddings do
+        if (outputHead is not null)
+        {
+            ValidateMatrixShape(outputHead, "output head", [plan.VocabSize, _hiddenSize]);
+        }
+
+        _logitHead = outputHead ?? _tokenEmbedding; // tied posture: the logits read the same rows the embeddings do
 
         _ropeHalfHead = _headDim / 2;
         _ropeHalfIndexer = geometry.SparseAttention.IndexerKeyLength / 2;
@@ -197,7 +287,6 @@ internal sealed class Qwen4ExpEngine : IDisposable
         // scores must survive until that token's own combine — one row per token, exactly as the spike carries them.
         float[] attnInject = new float[tokenCount * _streamCount];
         float[] injectScratch = new float[_streamCount];
-        float[] ffnScratch = new float[_intermediateSize];
 
         for (int layer = 0; layer < _geometry.LayerCount; layer++)
         {
@@ -211,11 +300,13 @@ internal sealed class Qwen4ExpEngine : IDisposable
 
             if (kind == AttentionKind.LinearGatedDeltaNet)
             {
-                GdnOps.ForwardChunk(
-                    mixedRows.AsSpan(0, tokenCount * _hiddenSize),
-                    w.Linear,
+                GdnOps.ForwardChunkKernel(
+                    _backend,
+                    _weights,
+                    w.KernelLinear,
                     _eps,
                     tokenCount,
+                    mixedRows.AsSpan(0, tokenCount * _hiddenSize),
                     sequence.ConvHistory(layer),
                     sequence.NextConvHistory(layer),
                     sequence.RecurrentState(layer),
@@ -227,7 +318,7 @@ internal sealed class Qwen4ExpEngine : IDisposable
             }
             else
             {
-                QsaOps.QsaBlockTensors sparseTensors = w.SparseFull ?? throw new InvalidOperationException($"qwen4exp layer {layer} resolved as a sparse-full block but its attention operands were never loaded.");
+                QsaKernelTensors sparseTensors = w.SparseFull ?? throw new InvalidOperationException($"qwen4exp layer {layer} resolved as a sparse-full block but its attention operands were never loaded.");
 
                 for (int t = 0; t < tokenCount; t++)
                 {
@@ -241,7 +332,7 @@ internal sealed class Qwen4ExpEngine : IDisposable
 
                 MixStreams(w.FfnHyper, midStreams.AsSpan(t * streamsPerToken, streamsPerToken), mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), injectScratch);
 
-                ForwardFeedForward(w, mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize), ffnScratch);
+                ForwardFeedForward(w, mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize));
 
                 CombineStreams(midStreams.AsSpan(t * streamsPerToken, streamsPerToken), sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize), injectScratch, streams.AsSpan(t * streamsPerToken, streamsPerToken));
             }
@@ -253,18 +344,15 @@ internal sealed class Qwen4ExpEngine : IDisposable
         for (int t = 0; t < tokenCount; t++)
         {
             MixOutputStreams(streams.AsSpan(t * streamsPerToken, streamsPerToken), mixedRows.AsSpan(t * _hiddenSize, _hiddenSize));
+        }
 
-            for (int v = 0; v < _plan.VocabSize; v++)
-            {
-                logits[t * _plan.VocabSize + v] = DotRow(_logitHead, v, _hiddenSize, mixedRows.AsSpan(t * _hiddenSize, _hiddenSize));
-            }
+        _backend.GemvBatch(mixedRows.AsSpan(0, tokenCount * _hiddenSize), tokenCount, Ref(_logitHead), logits);
 
-            if (_plan.FinalLogitSoftcap > 0f)
+        if (_plan.FinalLogitSoftcap > 0f)
+        {
+            for (int i = 0; i < logits.Length; i++)
             {
-                for (int v = 0; v < _plan.VocabSize; v++)
-                {
-                    logits[t * _plan.VocabSize + v] = LayerOps.Softcap(logits[t * _plan.VocabSize + v], _plan.FinalLogitSoftcap);
-                }
+                logits[i] = LayerOps.Softcap(logits[i], _plan.FinalLogitSoftcap);
             }
         }
 
@@ -290,74 +378,76 @@ internal sealed class Qwen4ExpEngine : IDisposable
     // attention restricted to that selection — then gate each attended head by sigmoid of its gate slice and project. The
     // query-and-gate layout alternates a query slice and its gate slice per head exactly as the reference's interleaved rows carry
     // them.
-    private void SparseAttention(QsaOps.QsaBlockTensors w, Qwen4ExpSequence.SequenceQsaState state, ReadOnlySpan<float> mixed, Span<float> attnOut)
+    private void SparseAttention(QsaKernelTensors w, Qwen4ExpSequence.SequenceQsaState state, ReadOnlySpan<float> mixed, Span<float> attnOut)
     {
+        QsaOps.QsaBlockTensors geometry = w.Geometry;
         int position = state.CacheCells;
         if (position >= _maxPositions)
         {
             throw new InvalidOperationException($"a qwen4exp sparse block reached cache cell {position}, past this engine's opened context ceiling of {_maxPositions}.");
         }
 
-        int qRegion = _headCount * _headDim;
         int kvRegion = _kvHeadCount * _headDim;
-        int idxDim = w.IndexerDim;
+        int idxDim = geometry.IndexerDim;
+
+        // The whole query-and-gate matrix lands in one GEMV pass, exactly as the production dense projections read it: row 2h is head h's
+        // query slice and row 2h + 1 its gate slice. Each head then normalizes/rotates only its own query half while its gate stays raw.
+        _backend.Gemv(mixed, Ref(w.QueryGate), _queryGateRows);
 
         for (int h = 0; h < _headCount; h++)
         {
             int qRow = (2 * h) * _headDim;
             int gateRow = (2 * h + 1) * _headDim;
 
-            for (int j = 0; j < _headDim; j++)
-            {
-                state.QueryHead[j] = DotRow(w.QueryGate, qRow + j, _hiddenSize, mixed);
-                state.GateHead[j] = DotRow(w.QueryGate, gateRow + j, _hiddenSize, mixed);
-            }
+            _queryGateRows.AsSpan(qRow, _headDim).CopyTo(state.QueryHead);
+            _queryGateRows.AsSpan(gateRow, _headDim).CopyTo(state.GateHead);
 
-            LayerOps.RmsNormWeightedHeads(state.QueryHead.AsSpan(0, _headDim), w.QueryHeadNorm, _headDim, _eps, state.QueryHead.AsSpan(0, _headDim));
+            LayerOps.RmsNormWeightedHeads(state.QueryHead.AsSpan(0, _headDim), geometry.QueryHeadNorm, _headDim, _eps, state.QueryHead.AsSpan(0, _headDim));
             QsaOps.RotateAtPosition(state.QueryHead.AsSpan(0, _headDim), _ropeHalfHead, _cosHead, _sinHead, position);
             state.QueryHead.AsSpan(0, _headDim).CopyTo(state.RotatedQuery.AsSpan(h * _headDim, _headDim));
         }
 
+        _backend.Gemv(mixed, Ref(w.Key), _keyProjectionRows);
+        _backend.Gemv(mixed, Ref(w.Value), _valueProjectionRows);
+
         for (int h = 0; h < _kvHeadCount; h++)
         {
-            for (int j = 0; j < _headDim; j++)
-            {
-                state.KHead[j] = DotRow(w.Key, h * _headDim + j, _hiddenSize, mixed);
-                state.VHead[j] = DotRow(w.Value, h * _headDim + j, _hiddenSize, mixed);
-            }
+            int rowOffset = h * _headDim;
 
-            LayerOps.RmsNormWeightedHeads(state.KHead.AsSpan(0, _headDim), w.KeyHeadNorm, _headDim, _eps, state.KHead.AsSpan(0, _headDim));
+            _keyProjectionRows.AsSpan(rowOffset, _headDim).CopyTo(state.KHead);
+            _valueProjectionRows.AsSpan(rowOffset, _headDim).CopyTo(state.VHead);
+
+            LayerOps.RmsNormWeightedHeads(state.KHead.AsSpan(0, _headDim), geometry.KeyHeadNorm, _headDim, _eps, state.KHead.AsSpan(0, _headDim));
             QsaOps.RotateAtPosition(state.KHead.AsSpan(0, _headDim), _ropeHalfHead, _cosHead, _sinHead, position);
 
-            state.KHead.AsSpan(0, _headDim).CopyTo(state.KeyCache.AsSpan(position * kvRegion + h * _headDim, _headDim));
-            state.VHead.AsSpan(0, _headDim).CopyTo(state.ValueCache.AsSpan(position * kvRegion + h * _headDim, _headDim));
+            state.KHead.AsSpan(0, _headDim).CopyTo(state.KeyCache.AsSpan(position * kvRegion + rowOffset, _headDim));
+            state.VHead.AsSpan(0, _headDim).CopyTo(state.ValueCache.AsSpan(position * kvRegion + rowOffset, _headDim));
         }
 
-        for (int h = 0; h < w.IndexerHeads; h++)
+        int indexerWidth = geometry.IndexerHeads * idxDim;
+        if (indexerWidth > 0)
         {
-            for (int j = 0; j < idxDim; j++)
+            _backend.Gemv(mixed, Ref(w.IndexerQueryProj), _indexerQueryRows);
+            _indexerQueryRows.AsSpan(0, indexerWidth).CopyTo(state.IndexerQuery.AsSpan(0, indexerWidth));
+
+            LayerOps.RmsNormWeightedHeads(state.IndexerQuery.AsSpan(0, indexerWidth), geometry.IndexerQueryNorm, idxDim, _eps, state.IndexerQuery.AsSpan(0, indexerWidth));
+
+            for (int h = 0; h < geometry.IndexerHeads; h++)
             {
-                state.IndexerQuery[h * idxDim + j] = DotRow(w.IndexerQueryProj, h * idxDim + j, _hiddenSize, mixed);
+                QsaOps.RotateAtPosition(state.IndexerQuery.AsSpan(h * idxDim, idxDim), _ropeHalfIndexer, _cosIndexer, _sinIndexer, position);
             }
         }
 
-        LayerOps.RmsNormWeightedHeads(state.IndexerQuery.AsSpan(0, w.IndexerHeads * idxDim), w.IndexerQueryNorm, idxDim, _eps, state.IndexerQuery.AsSpan(0, w.IndexerHeads * idxDim));
-
-        for (int h = 0; h < w.IndexerHeads; h++)
+        if (idxDim > 0)
         {
-            QsaOps.RotateAtPosition(state.IndexerQuery.AsSpan(h * idxDim, idxDim), _ropeHalfIndexer, _cosIndexer, _sinIndexer, position);
-        }
-
-        for (int j = 0; j < idxDim; j++)
-        {
-            state.RawIndexerKeys[position * idxDim + j] = DotRow(w.IndexerKeyProj, j, _hiddenSize, mixed);
+            _backend.Gemv(mixed, Ref(w.IndexerKeyProj), state.RawIndexerKeys.AsSpan(position * idxDim, idxDim));
         }
 
         state.CacheCells = position + 1;
         int cacheCells = state.CacheCells;
         float attnScale = 1f / MathF.Sqrt((float)_headDim);
 
-        if (w.CompressRatio < 2 || cacheCells / w.CompressRatio == 0)
+        if (geometry.CompressRatio < 2 || cacheCells / geometry.CompressRatio == 0)
         {
             // A ratio that groups fewer than two cells runs dense and never reaches selection; a cache shorter than one complete pool has nothing to rank. Either way every cached cell stays visible.
             List<int> visible = [];
@@ -366,21 +456,21 @@ internal sealed class Qwen4ExpEngine : IDisposable
                 visible.Add(cell);
             }
 
-            QsaOps.RestrictedAttention(_backend, state.RotatedQuery, state.KeyCache, state.ValueCache, visible, cacheCells, w, attnScale, state.AttentionConcat);
+            QsaOps.RestrictedAttention(_backend, state.RotatedQuery, state.KeyCache, state.ValueCache, visible, cacheCells, geometry, attnScale, state.AttentionConcat);
         }
         else
         {
-            int fullPools = cacheCells / w.CompressRatio;
-            QsaOps.PoolKeys(state.RawIndexerKeys.AsSpan(0, cacheCells * idxDim), cacheCells, w, _eps, state.PooledKeys.AsSpan(0, fullPools * idxDim));
+            int fullPools = cacheCells / geometry.CompressRatio;
+            QsaOps.PoolKeys(state.RawIndexerKeys.AsSpan(0, cacheCells * idxDim), cacheCells, geometry, _eps, state.PooledKeys.AsSpan(0, fullPools * idxDim));
 
             for (int p = 0; p < fullPools; p++)
             {
-                QsaOps.RotateAtPosition(state.PooledKeys.AsSpan(p * idxDim, idxDim), _ropeHalfIndexer, _cosIndexer, _sinIndexer, p * w.CompressRatio);
+                QsaOps.RotateAtPosition(state.PooledKeys.AsSpan(p * idxDim, idxDim), _ropeHalfIndexer, _cosIndexer, _sinIndexer, p * geometry.CompressRatio);
             }
 
-            QsaOps.IndexerScores(state.IndexerQuery.AsSpan(0, w.IndexerHeads * idxDim), state.PooledKeys.AsSpan(0, fullPools * idxDim), w.IndexerHeads, idxDim, fullPools, state.Scores.AsSpan(0, fullPools));
-            List<int> selected = QsaOps.SelectCells(state.Scores.AsSpan(0, fullPools), cacheCells, w);
-            QsaOps.RestrictedAttention(_backend, state.RotatedQuery, state.KeyCache, state.ValueCache, selected, cacheCells, w, attnScale, state.AttentionConcat);
+            QsaOps.IndexerScores(state.IndexerQuery.AsSpan(0, indexerWidth), state.PooledKeys.AsSpan(0, fullPools * idxDim), geometry.IndexerHeads, idxDim, fullPools, state.Scores.AsSpan(0, fullPools));
+            List<int> selected = QsaOps.SelectCells(state.Scores.AsSpan(0, fullPools), cacheCells, geometry);
+            QsaOps.RestrictedAttention(_backend, state.RotatedQuery, state.KeyCache, state.ValueCache, selected, cacheCells, geometry, attnScale, state.AttentionConcat);
         }
 
         for (int h = 0; h < _headCount; h++)
@@ -391,10 +481,7 @@ internal sealed class Qwen4ExpEngine : IDisposable
             }
         }
 
-        for (int o = 0; o < _hiddenSize; o++)
-        {
-            attnOut[o] = DotRow(w.Output, o, qRegion, state.AttentionConcat);
-        }
+        _backend.Gemv(state.AttentionConcat, Ref(w.Output), attnOut);
     }
 
     // The reference build_hc_mix: grouped RMS normalization per stream scaled by that stream's slice of the flattened norm vector,
@@ -403,26 +490,25 @@ internal sealed class Qwen4ExpEngine : IDisposable
     // sublayer consumes. The same normalized streams feed the inject projection the combine weights the residual scatter with.
     private void MixStreams(HyperConnectionTensors hc, ReadOnlySpan<float> streams, Span<float> mixed, Span<float> inject)
     {
-        float[] normed = new float[_flattened];
         for (int s = 0; s < _streamCount; s++)
         {
             int baseOffset = s * _hiddenSize;
-            LayerOps.RmsNormWeighted(streams.Slice(baseOffset, _hiddenSize), hc.Norm.AsSpan(baseOffset, _hiddenSize), _eps, normed.AsSpan(baseOffset, _hiddenSize));
+            LayerOps.RmsNormWeighted(streams.Slice(baseOffset, _hiddenSize), hc.Norm.AsSpan(baseOffset, _hiddenSize), _eps, _hcNormed.AsSpan(baseOffset, _hiddenSize));
         }
 
         float invStreams = 1f / _streamCount;
 
-        float[] lo = new float[_lowRank];
+        _backend.Gemv(_hcNormed, Ref(hc.Down), _hcLowRank);
         for (int r = 0; r < _lowRank; r++)
         {
-            lo[r] = LayerOps.Silu(DotRow(hc.Down, r, _flattened, normed) * invStreams);
+            _hcLowRank[r] = LayerOps.Silu(_hcLowRank[r] * invStreams);
         }
 
-        float[] gated = new float[_flattened];
+        _backend.Gemv(_hcLowRank, Ref(hc.Up), _hcGated);
         for (int f = 0; f < _flattened; f++)
         {
-            float gate = DotRow(hc.Up, f, _lowRank, lo);
-            gated[f] = normed[f] * GdnOps.Sigmoid(gate);
+            float gate = _hcGated[f];
+            _hcGated[f] = _hcNormed[f] * GdnOps.Sigmoid(gate);
         }
 
         for (int h = 0; h < _hiddenSize; h++)
@@ -430,15 +516,16 @@ internal sealed class Qwen4ExpEngine : IDisposable
             double sum = 0.0;
             for (int s = 0; s < _streamCount; s++)
             {
-                sum += gated[s * _hiddenSize + h];
+                sum += _hcGated[s * _hiddenSize + h];
             }
 
             mixed[h] = (float)(sum * invStreams);
         }
 
+        _backend.Gemv(_hcNormed, Ref(hc.Inject), inject);
         for (int s = 0; s < _streamCount; s++)
         {
-            inject[s] = DotRow(hc.Inject, s, _flattened, normed) * invStreams;
+            inject[s] *= invStreams; // the reference scales each stream's low-rank expansion by 1/streams before its combine scatter weights it with 2·sigmoid
         }
     }
 
@@ -446,20 +533,21 @@ internal sealed class Qwen4ExpEngine : IDisposable
     // over the output_hc_* trio and with no inject row — the conversion ships only that trio globally.
     private void MixOutputStreams(ReadOnlySpan<float> streams, Span<float> mixed)
     {
-        float[] normed = new float[_flattened];
         for (int s = 0; s < _streamCount; s++)
         {
             int baseOffset = s * _hiddenSize;
-            LayerOps.RmsNormWeighted(streams.Slice(baseOffset, _hiddenSize), _outputHc.Norm.AsSpan(baseOffset, _hiddenSize), _eps, normed.AsSpan(baseOffset, _hiddenSize));
+            LayerOps.RmsNormWeighted(streams.Slice(baseOffset, _hiddenSize), _outputHc.Norm.AsSpan(baseOffset, _hiddenSize), _eps, _hcNormed.AsSpan(baseOffset, _hiddenSize));
         }
 
         float invStreams = 1f / _streamCount;
 
-        float[] lo = new float[_lowRank];
+        _backend.Gemv(_hcNormed, Ref(_outputHc.Down), _hcLowRank);
         for (int r = 0; r < _lowRank; r++)
         {
-            lo[r] = LayerOps.Silu(DotRow(_outputHc.Down, r, _flattened, normed) * invStreams);
+            _hcLowRank[r] = LayerOps.Silu(_hcLowRank[r] * invStreams);
         }
+
+        _backend.Gemv(_hcLowRank, Ref(_outputHc.Up), _hcGated);
 
         for (int h = 0; h < _hiddenSize; h++)
         {
@@ -467,8 +555,8 @@ internal sealed class Qwen4ExpEngine : IDisposable
             for (int s = 0; s < _streamCount; s++)
             {
                 int f = s * _hiddenSize + h;
-                float gate = DotRow(_outputHc.Up, f, _lowRank, lo);
-                sum += normed[f] * GdnOps.Sigmoid(gate);
+                float gate = _hcGated[f];
+                sum += _hcNormed[f] * GdnOps.Sigmoid(gate);
             }
 
             mixed[h] = (float)(sum * invStreams);
@@ -497,57 +585,50 @@ internal sealed class Qwen4ExpEngine : IDisposable
     // once under the plain sigmoid gate over its hidden-sized selector vector — the qwen4exp reference gate, finite at a zero score
     // where qwen2moe's silu(score)/score divides 0 by 0. A file declaring no experts keeps the dense gate/up/down triplet.
     // Selection carries no cross-token state, so splitting a chunk across calls reproduces the unsplit run exactly.
-    private void ForwardFeedForward(LayerOperands w, ReadOnlySpan<float> mixed, Span<float> ffnOut, float[] scratch)
+    private void ForwardFeedForward(LayerOperands w, ReadOnlySpan<float> mixed, Span<float> ffnOut)
     {
         if (w.Sparse is not { } sparse)
         {
+            _backend.Gemv(mixed, Ref(w.DenseGate!), _ffnGateOut);
+            _backend.Gemv(mixed, Ref(w.DenseUp!), _ffnUpOut);
+
             for (int i = 0; i < _intermediateSize; i++)
             {
-                float gate = DotRow(w.DenseGate!, i, _hiddenSize, mixed);
-                float up = DotRow(w.DenseUp!, i, _hiddenSize, mixed);
-                scratch[i] = LayerOps.Silu(gate) * up;
+                _ffnScratch[i] = LayerOps.Silu(_ffnGateOut[i]) * _ffnUpOut[i];
             }
 
-            for (int h = 0; h < _hiddenSize; h++)
-            {
-                ffnOut[h] = DotRow(w.DenseDown!, h, _intermediateSize, scratch);
-            }
-
+            _backend.Gemv(_ffnScratch, Ref(w.DenseDown!), ffnOut);
             return;
         }
 
         int expertCount = sparse.ExpertCount;
         int routed = sparse.RoutedExpertsPerToken;
 
-        float[] scores = new float[expertCount];
-        for (int e = 0; e < expertCount; e++)
-        {
-            scores[e] = DotRow(w.Router!, e, _hiddenSize, mixed);
-        }
+        mixed.CopyTo(_ffnInput); // the gathered chain cannot capture a caller-owned span across its callback boundary: this token's row is copied into reusable engine scratch first.
+
+        _backend.Gemv(_ffnInput, Ref(w.Router!), _routerScores.AsSpan(0, expertCount));
 
         float maxScore = float.NegativeInfinity;
         for (int e = 0; e < expertCount; e++)
         {
-            if (scores[e] > maxScore)
+            if (_routerScores[e] > maxScore)
             {
-                maxScore = scores[e];
+                maxScore = _routerScores[e];
             }
         }
 
         float allSum = 0f;
         for (int e = 0; e < expertCount; e++)
         {
-            scores[e] = MathF.Exp(scores[e] - maxScore);
-            allSum += scores[e];
+            _routerScores[e] = MathF.Exp(_routerScores[e] - maxScore);
+            allSum += _routerScores[e];
         }
 
         for (int e = 0; e < expertCount; e++)
         {
-            scores[e] /= allSum;
+            _routerScores[e] /= allSum;
         }
 
-        int[] ids = new int[routed];
-        float[] weights = new float[routed];
         float selectedSum = 0f;
         for (int pick = 0; pick < routed; pick++)
         {
@@ -555,40 +636,40 @@ internal sealed class Qwen4ExpEngine : IDisposable
             float bestScore = float.NegativeInfinity;
             for (int e = 0; e < expertCount; e++)
             {
-                if (scores[e] > bestScore) // strict '>' over ascending indexes: a tie keeps the earlier expert
+                if (_routerScores[e] > bestScore) // strict '>' over ascending indexes: a tie keeps the earlier expert
                 {
                     best = e;
-                    bestScore = scores[e];
+                    bestScore = _routerScores[e];
                 }
             }
 
-            ids[pick] = best;
-            weights[pick] = bestScore;
+            _moeIds[pick] = best;
+            _moeWeights[pick] = bestScore;
             selectedSum += bestScore;
-            scores[best] = float.NegativeInfinity; // consumed: later passes cannot re-pick this expert
+            _routerScores[best] = float.NegativeInfinity; // consumed: later passes cannot re-pick this expert
         }
 
         for (int i = 1; i < routed; i++)
         {
-            int id = ids[i];
-            float weight = weights[i];
+            int id = _moeIds[i];
+            float weight = _moeWeights[i];
             int j = i - 1;
-            while (j >= 0 && ids[j] > id)
+            while (j >= 0 && _moeIds[j] > id)
             {
-                ids[j + 1] = ids[j];
-                weights[j + 1] = weights[j];
+                _moeIds[j + 1] = _moeIds[j];
+                _moeWeights[j + 1] = _moeWeights[j];
                 j--;
             }
 
-            ids[j + 1] = id;
-            weights[j + 1] = weight;
+            _moeIds[j + 1] = id;
+            _moeWeights[j + 1] = weight;
         }
 
         if (sparse.NormalizeExpertWeights && selectedSum > 0f)
         {
             for (int i = 0; i < routed; i++)
             {
-                weights[i] /= selectedSum;
+                _moeWeights[i] /= selectedSum;
             }
         }
 
@@ -596,30 +677,46 @@ internal sealed class Qwen4ExpEngine : IDisposable
         {
             for (int i = 0; i < routed; i++)
             {
-                weights[i] *= sparse.ExpertWeightsScale;
+                _moeWeights[i] *= sparse.ExpertWeightsScale;
             }
         }
 
-        ffnOut.Clear(); // the routed and shared contributions accumulate from zero, mirroring the production sparse posture
+        ExpertSlabRole gate = w.GateRole;
+        ExpertSlabRole up = w.UpRole;
+        ExpertSlabRole down = w.DownRole;
 
-        for (int slot = 0; slot < routed; slot++)
+        for (int i = 0; i < routed; i++)
         {
-            int expert = ids[slot];
-            float weight = weights[slot];
-
-            for (int i = 0; i < _intermediateSize; i++)
-            {
-                int row = expert * _intermediateSize + i;
-                float gate = DotRow(w.ExpertGate!, row, _hiddenSize, mixed);
-                float up = DotRow(w.ExpertUp!, row, _hiddenSize, mixed);
-                scratch[i] = LayerOps.Silu(gate) * up;
-            }
-
-            for (int h = 0; h < _hiddenSize; h++)
-            {
-                ffnOut[h] += weight * DotRow(w.ExpertDown!, expert * _hiddenSize + h, _intermediateSize, scratch);
-            }
+            _selectedExpertWeights[_moeIds[i]] = _moeWeights[i]; // the gather callback visits expert indexes, not selection slots: this maps each selected slab back to its routing weight.
         }
+
+        _ffnOutputScratch.AsSpan().Clear(); // the routed and shared contributions accumulate from zero, mirroring the production sparse posture
+
+        _gatherKernel.Gather(
+            _expertSlabs,
+            gate,
+            up,
+            down,
+            _moeIds.AsSpan(0, routed),
+            (int expertIndex, ReadOnlySpan<byte> gateSlab, ReadOnlySpan<byte> upSlab, ReadOnlySpan<byte> downSlab) =>
+            {
+                float weight = _selectedExpertWeights[expertIndex];
+
+                _backend.Gemv(_ffnInput, new WeightRef(gateSlab, gate.ExpertShape, gate.Stack.Format), _ffnGateOut);
+                _backend.Gemv(_ffnInput, new WeightRef(upSlab, up.ExpertShape, up.Stack.Format), _ffnUpOut);
+
+                for (int i = 0; i < _intermediateSize; i++)
+                {
+                    _ffnScratch[i] = LayerOps.Silu(_ffnGateOut[i]) * _ffnUpOut[i];
+                }
+
+                _backend.Gemv(_ffnScratch, new WeightRef(downSlab, down.ExpertShape, down.Stack.Format), _ffnDownOut);
+
+                for (int h = 0; h < _hiddenSize; h++)
+                {
+                    _ffnOutputScratch[h] += weight * _ffnDownOut[h]; // ascending expert-index order: the gather kernel's supplied selection is this token's sorted routing set.
+                }
+            });
 
         if (sparse.HasSharedExpert)
         {
@@ -631,18 +728,23 @@ internal sealed class Qwen4ExpEngine : IDisposable
 
             float sharedWeight = GdnOps.Sigmoid(score);
 
+            _backend.Gemv(mixed, Ref(w.SharedGate!), _ffnGateOut);
+            _backend.Gemv(mixed, Ref(w.SharedUp!), _ffnUpOut);
+
             for (int i = 0; i < _intermediateSize; i++)
             {
-                float gate = DotRow(w.SharedGate!, i, _hiddenSize, mixed);
-                float up = DotRow(w.SharedUp!, i, _hiddenSize, mixed);
-                scratch[i] = LayerOps.Silu(gate) * up;
+                _ffnScratch[i] = LayerOps.Silu(_ffnGateOut[i]) * _ffnUpOut[i];
             }
+
+            _backend.Gemv(_ffnScratch, Ref(w.SharedDown!), _ffnDownOut);
 
             for (int h = 0; h < _hiddenSize; h++)
             {
-                ffnOut[h] += sharedWeight * DotRow(w.SharedDown!, h, _intermediateSize, scratch);
+                _ffnOutputScratch[h] += sharedWeight * _ffnDownOut[h];
             }
         }
+
+        _ffnOutputScratch.AsSpan(0, _hiddenSize).CopyTo(ffnOut); // the caller's sublayer row receives the accumulated sparse contribution once the gather callback is done with its scratch.
     }
 
     private void SeedStreams(int tokenId, Span<float> streams)
@@ -652,7 +754,7 @@ internal sealed class Qwen4ExpEngine : IDisposable
             throw new ArgumentOutOfRangeException(nameof(tokenId), $"token id {tokenId} is outside the vocabulary of {_plan.VocabSize}.");
         }
 
-        _embeddingRows.AsSpan(tokenId * _hiddenSize, _hiddenSize).CopyTo(streams[.._hiddenSize]);
+        _backend.DequantRow(Ref(_tokenEmbedding), tokenId, streams[.._hiddenSize]); // the embedding row is one packed table row read through the backend's own dequantization, not a resident F32 copy of the whole table.
         for (int s = 1; s < _streamCount; s++)
         {
             streams[.._hiddenSize].CopyTo(streams.Slice(s * _hiddenSize, _hiddenSize)); // hc_init repeats the embedding row across every stream
@@ -681,60 +783,84 @@ internal sealed class Qwen4ExpEngine : IDisposable
         if (kind == AttentionKind.LinearGatedDeltaNet)
         {
             GdnDescriptor gdn = _geometry.LinearAttention;
-            operands.Linear = new GdnOps.GdnBlockTensors
+            LogicalTensor qkv = MatrixRole(RequireTensor(map[TensorRole.AttentionQkv], tensors, layer), "fused qkv buffer", [gdn.ConvChannels, _hiddenSize]);
+            LogicalTensor gate = MatrixRole(RequireTensor(map[TensorRole.LinearAttentionGate], tensors, layer), "linear attention gate", [gdn.InnerSize, _hiddenSize]);
+            LogicalTensor beta = MatrixRole(RequireTensor(map[TensorRole.SsmBetaProjection], tensors, layer), "ssm beta projection", [gdn.TimeStepRank, _hiddenSize]);
+            LogicalTensor alpha = MatrixRole(RequireTensor(map[TensorRole.SsmAlphaProjection], tensors, layer), "ssm alpha projection", [gdn.TimeStepRank, _hiddenSize]);
+            LogicalTensor output = MatrixRole(RequireTensor(map[TensorRole.SsmOutputProjection], tensors, layer), "ssm output projection", [_hiddenSize, gdn.InnerSize]);
+
+            operands.KernelLinear = new GdnOps.GdnKernelTensors
             {
                 HiddenSize = _hiddenSize,
                 KeyHeads = gdn.KeyHeadCount,
                 ValueHeads = gdn.ValueHeadCount,
                 StateDim = gdn.StateDim,
                 ConvKernel = gdn.ConvKernelSize,
-                Qkv = LoadMatrix(RequireTensor(map[TensorRole.AttentionQkv], tensors, layer), "fused qkv buffer", [gdn.ConvChannels, _hiddenSize]),
-                Gate = LoadMatrix(RequireTensor(map[TensorRole.LinearAttentionGate], tensors, layer), "linear attention gate", [gdn.InnerSize, _hiddenSize]),
-                BetaAlphaCat = ConcatRows(
-                    LoadMatrix(RequireTensor(map[TensorRole.SsmBetaProjection], tensors, layer), "ssm beta projection", [gdn.TimeStepRank, _hiddenSize]),
-                    LoadMatrix(RequireTensor(map[TensorRole.SsmAlphaProjection], tensors, layer), "ssm alpha projection", [gdn.TimeStepRank, _hiddenSize])),
+                Qkv = qkv,
+                Gate = gate,
+                Beta = beta,
+                Alpha = alpha,
+                Output = output,
+                Conv1d = LoadMatrixValues(RequireTensor(map[TensorRole.SsmConvolutionKernel], tensors, layer), "conv kernel", [gdn.ConvChannels, gdn.ConvKernelSize]),
                 SsmA = LoadVector(RequireTensor(map[TensorRole.SsmDecayWeight], tensors, layer), "decay weights", gdn.ValueHeadCount),
                 DtBias = LoadVector(RequireTensor(map[TensorRole.SsmTimeStepBias], tensors, layer), "dt bias", gdn.ValueHeadCount),
-                Conv1d = LoadMatrix(RequireTensor(map[TensorRole.SsmConvolutionKernel], tensors, layer), "conv kernel", [gdn.ConvChannels, gdn.ConvKernelSize]),
                 NormWeight = LoadVector(RequireTensor(map[TensorRole.SsmHeadNorm], tensors, layer), "ssm head norm", gdn.StateDim),
-                Output = LoadMatrix(RequireTensor(map[TensorRole.SsmOutputProjection], tensors, layer), "ssm output projection", [_hiddenSize, gdn.InnerSize]),
             };
         }
         else
         {
             QsaDescriptor qsa = _geometry.SparseAttention;
-            operands.SparseFull = new QsaOps.QsaBlockTensors
+            LogicalTensor queryGate = MatrixRole(RequireTensor(map[TensorRole.AttentionQuery], tensors, layer), "query-and-gate rows", [2 * _headCount * _headDim, _hiddenSize]);
+            LogicalTensor key = MatrixRole(RequireTensor(map[TensorRole.AttentionKey], tensors, layer), "key projections", [_kvHeadCount * _headDim, _hiddenSize]);
+            LogicalTensor value = MatrixRole(RequireTensor(map[TensorRole.AttentionValue], tensors, layer), "value projections", [_kvHeadCount * _headDim, _hiddenSize]);
+            LogicalTensor attnOutput = MatrixRole(RequireTensor(map[TensorRole.AttentionOutput], tensors, layer), "attention output projection", [_hiddenSize, _headCount * _headDim]);
+            LogicalTensor indexerQuery = MatrixRole(RequireTensor(map[TensorRole.IndexerQueryProjection], tensors, layer), "indexer query projections", [qsa.IndexerHeadCount * qsa.IndexerKeyLength, _hiddenSize]);
+            LogicalTensor indexerKey = MatrixRole(RequireTensor(map[TensorRole.IndexerKeyProjection], tensors, layer), "indexer key projection", [qsa.IndexerKeyLength, _hiddenSize]);
+
+            operands.SparseFull = new QsaKernelTensors
             {
-                HiddenSize = _hiddenSize,
-                HeadCount = _headCount,
-                KvHeadCount = _kvHeadCount,
-                HeadDim = _headDim,
-                IndexerHeads = qsa.IndexerHeadCount,
-                IndexerDim = qsa.IndexerKeyLength,
-                TopKCells = qsa.TopKCells,
-                CompressRatio = _geometry.CompressRatioForLayer(layer),
-                QueryGate = LoadMatrix(RequireTensor(map[TensorRole.AttentionQuery], tensors, layer), "query-and-gate rows", [2 * _headCount * _headDim, _hiddenSize]),
-                Key = LoadMatrix(RequireTensor(map[TensorRole.AttentionKey], tensors, layer), "key projections", [_kvHeadCount * _headDim, _hiddenSize]),
-                Value = LoadMatrix(RequireTensor(map[TensorRole.AttentionValue], tensors, layer), "value projections", [_kvHeadCount * _headDim, _hiddenSize]),
-                Output = LoadMatrix(RequireTensor(map[TensorRole.AttentionOutput], tensors, layer), "attention output projection", [_hiddenSize, _headCount * _headDim]),
-                IndexerQueryProj = LoadMatrix(RequireTensor(map[TensorRole.IndexerQueryProjection], tensors, layer), "indexer query projections", [qsa.IndexerHeadCount * qsa.IndexerKeyLength, _hiddenSize]),
-                IndexerKeyProj = LoadMatrix(RequireTensor(map[TensorRole.IndexerKeyProjection], tensors, layer), "indexer key projection", [qsa.IndexerKeyLength, _hiddenSize]),
-                IndexerQueryNorm = LoadVector(RequireTensor(map[TensorRole.IndexerQueryNorm], tensors, layer), "indexer query norm", qsa.IndexerKeyLength),
-                IndexerKeyNorm = LoadVector(RequireTensor(map[TensorRole.IndexerKeyNorm], tensors, layer), "indexer key norm", qsa.IndexerKeyLength),
-                // The target ships no per-head block norm tensors for this family's split layers, and the plan gate names none: a
-                // uniform weight of ones reads as identity, matching what the spike carries when no norm tensor is declared.
-                QueryHeadNorm = Ones(_headDim),
-                KeyHeadNorm = Ones(_headDim),
+                Geometry = new QsaOps.QsaBlockTensors
+                {
+                    HiddenSize = _hiddenSize,
+                    HeadCount = _headCount,
+                    KvHeadCount = _kvHeadCount,
+                    HeadDim = _headDim,
+                    IndexerHeads = qsa.IndexerHeadCount,
+                    IndexerDim = qsa.IndexerKeyLength,
+                    TopKCells = qsa.TopKCells,
+                    CompressRatio = _geometry.CompressRatioForLayer(layer),
+                    IndexerQueryNorm = LoadVector(RequireTensor(map[TensorRole.IndexerQueryNorm], tensors, layer), "indexer query norm", qsa.IndexerKeyLength),
+                    IndexerKeyNorm = LoadVector(RequireTensor(map[TensorRole.IndexerKeyNorm], tensors, layer), "indexer key norm", qsa.IndexerKeyLength),
+                    // The target ships no per-head block norm tensors for this family's split layers, and the plan gate names none: a
+                    // uniform weight of ones reads as identity, matching what the spike carries when no norm tensor is declared.
+                    QueryHeadNorm = Ones(_headDim),
+                    KeyHeadNorm = Ones(_headDim),
+                },
+                QueryGate = queryGate,
+                Key = key,
+                Value = value,
+                Output = attnOutput,
+                IndexerQueryProj = indexerQuery,
+                IndexerKeyProj = indexerKey,
             };
         }
 
         if (_plan.SparseFfn is { } declared)
         {
             int experts = declared.ExpertCount;
-            operands.Router = LoadMatrix(RequireTensor(map[declared.RouterRole], tensors, layer), "router matrix", [experts, _hiddenSize]);
-            operands.ExpertGate = LoadStack(RequireTensor(map[declared.ExpertGateRole], tensors, layer), "expert gate stack", experts);
-            operands.ExpertUp = LoadStack(RequireTensor(map[declared.ExpertUpRole], tensors, layer), "expert up stack", experts);
-            operands.ExpertDown = LoadStack(RequireTensor(map[declared.ExpertDownRole], tensors, layer), "expert down stack", experts);
+            operands.Router = MatrixRole(RequireTensor(map[declared.RouterRole], tensors, layer), "router matrix", [experts, _hiddenSize]);
+
+            LogicalTensor gateStack = RequireTensor(map[declared.ExpertGateRole], tensors, layer);
+            LogicalTensor upStack = RequireTensor(map[declared.ExpertUpRole], tensors, layer);
+            LogicalTensor downStack = RequireTensor(map[declared.ExpertDownRole], tensors, layer);
+
+            ValidateStackShape(gateStack, "expert gate stack", experts, _intermediateSize, _hiddenSize);
+            ValidateStackShape(upStack, "expert up stack", experts, _intermediateSize, _hiddenSize);
+            ValidateStackShape(downStack, "expert down stack", experts, _hiddenSize, _intermediateSize);
+
+            operands.GateRole = new ExpertSlabRole(gateStack, _expertGateShape, ExpertSlabBytes(gateStack, _intermediateSize, experts));
+            operands.UpRole = new ExpertSlabRole(upStack, _expertUpShape, ExpertSlabBytes(upStack, _intermediateSize, experts));
+            operands.DownRole = new ExpertSlabRole(downStack, _expertDownShape, ExpertSlabBytes(downStack, _hiddenSize, experts));
 
             if (declared.HasSharedExpert)
             {
@@ -742,9 +868,9 @@ internal sealed class Qwen4ExpEngine : IDisposable
                 TensorDescriptor upDesc = map[RequiredSparseRole(declared.SharedUpRole, "up")];
                 TensorDescriptor downDesc = map[RequiredSparseRole(declared.SharedDownRole, "down")];
 
-                operands.SharedGate = LoadMatrix(RequireTensor(gateDesc, tensors, layer), "shared expert gate", [_intermediateSize, _hiddenSize]);
-                operands.SharedUp = LoadMatrix(RequireTensor(upDesc, tensors, layer), "shared expert up", [_intermediateSize, _hiddenSize]);
-                operands.SharedDown = LoadMatrix(RequireTensor(downDesc, tensors, layer), "shared expert down", [_hiddenSize, _intermediateSize]);
+                operands.SharedGate = MatrixRole(RequireTensor(gateDesc, tensors, layer), "shared expert gate", [_intermediateSize, _hiddenSize]);
+                operands.SharedUp = MatrixRole(RequireTensor(upDesc, tensors, layer), "shared expert up", [_intermediateSize, _hiddenSize]);
+                operands.SharedDown = MatrixRole(RequireTensor(downDesc, tensors, layer), "shared expert down", [_hiddenSize, _intermediateSize]);
 
                 LogicalTensor? selector = declared.SharedInputGateRole is { } gateRole ? map[gateRole].Resolve(tensors, layer) : null;
                 operands.SharedGateVector = selector is not null
@@ -756,9 +882,9 @@ internal sealed class Qwen4ExpEngine : IDisposable
         }
         else
         {
-            operands.DenseGate = LoadMatrix(RequireTensor(map[TensorRole.FeedForwardGate], tensors, layer), "feed-forward gate", [_intermediateSize, _hiddenSize]);
-            operands.DenseUp = LoadMatrix(RequireTensor(map[TensorRole.FeedForwardUp], tensors, layer), "feed-forward up", [_intermediateSize, _hiddenSize]);
-            operands.DenseDown = LoadMatrix(RequireTensor(map[TensorRole.FeedForwardDown], tensors, layer), "feed-forward down", [_hiddenSize, _intermediateSize]);
+            operands.DenseGate = MatrixRole(RequireTensor(map[TensorRole.FeedForwardGate], tensors, layer), "feed-forward gate", [_intermediateSize, _hiddenSize]);
+            operands.DenseUp = MatrixRole(RequireTensor(map[TensorRole.FeedForwardUp], tensors, layer), "feed-forward up", [_intermediateSize, _hiddenSize]);
+            operands.DenseDown = MatrixRole(RequireTensor(map[TensorRole.FeedForwardDown], tensors, layer), "feed-forward down", [_hiddenSize, _intermediateSize]);
         }
 
         return operands;
@@ -767,9 +893,9 @@ internal sealed class Qwen4ExpEngine : IDisposable
     private HyperConnectionTensors LoadHyper(TensorDescriptor inject, TensorDescriptor down, TensorDescriptor up, TensorDescriptor norm, LogicalTensorTable tensors, int layer) => new()
     {
         Norm = LoadVector(RequireTensor(norm, tensors, layer), "hyper-connection norm", _flattened),
-        Down = LoadMatrix(RequireTensor(down, tensors, layer), "hyper-connection down", [_lowRank, _flattened]),
-        Up = LoadMatrix(RequireTensor(up, tensors, layer), "hyper-connection up", [_flattened, _lowRank]),
-        Inject = LoadMatrix(RequireTensor(inject, tensors, layer), "hyper-connection inject", [_streamCount, _flattened]),
+        Down = MatrixRole(RequireTensor(down, tensors, layer), "hyper-connection down", [_lowRank, _flattened]),
+        Up = MatrixRole(RequireTensor(up, tensors, layer), "hyper-connection up", [_flattened, _lowRank]),
+        Inject = MatrixRole(RequireTensor(inject, tensors, layer), "hyper-connection inject", [_streamCount, _flattened]),
     };
 
     private static LogicalTensor RequireTensor(TensorDescriptor descriptor, LogicalTensorTable tensors, int layer = -1) =>
@@ -778,13 +904,118 @@ internal sealed class Qwen4ExpEngine : IDisposable
     private static TensorRole RequiredSparseRole(TensorRole? role, string side) =>
         role ?? throw new ModelException($"the sparse-FFN descriptor declares a shared expert without naming its {side} matrix");
 
-    private static float[] ConcatRows(float[] first, float[] second)
+    private void ValidateForwardPosture(ModelPlan plan, LogicalTensorTable tensors)
     {
-        float[] joined = new float[first.Length + second.Length];
-        first.CopyTo(joined, 0);
-        second.CopyTo(joined, first.Length);
-        return joined;
+        if (plan.RopeScaling is { } scaling)
+        {
+            throw PostureRefusal($"rope scaling variant '{scaling.Variant}' with multiplier {scaling.Multiplier} and attention factor {scaling.AttentionFactor}");
+        }
+
+        if (plan.RopeRotaryDimensions != 0)
+        {
+            throw PostureRefusal($"partial rotary dimensions {plan.RopeRotaryDimensions}; this seam rotates each head in full");
+        }
+
+        if (plan.AttentionWindow > 0)
+        {
+            throw PostureRefusal($"attention window {plan.AttentionWindow} under interleave '{plan.WindowInterleave}'");
+        }
+
+        if (plan.AttentionSoftcap > 0f)
+        {
+            throw PostureRefusal($"attention softcap {plan.AttentionSoftcap}");
+        }
+
+        if (plan.UseAttentionBias)
+        {
+            throw PostureRefusal("attention projection biases");
+        }
+
+        if (plan.UseNormBias)
+        {
+            throw PostureRefusal("norm bias vectors");
+        }
+
+        if (plan.QkNorm is QkNormMode.PerHeadWeighted or QkNormMode.StreamWeighted)
+        {
+            throw PostureRefusal($"weighted QK norm mode '{plan.QkNorm}'; this seam carries only unweighted head norms");
+        }
+
+        if (plan.SparseFfn is { } sparse)
+        {
+            if (sparse.Layout != SparseFfnLayout.StackedExperts)
+            {
+                throw PostureRefusal($"sparse-FFN expert layout '{sparse.Layout}'");
+            }
+
+            if (plan.SparseFfnStrategy is { } strategy && strategy != SparseFfnStrategy.DenseResident)
+            {
+                throw PostureRefusal($"sparse-FFN strategy '{strategy}'");
+            }
+        }
+
+        TensorRole[] pleRoles = new TensorRole[]
+        {
+            TensorRole.PleConvolutionKernel,
+            TensorRole.PleKeyProjection,
+            TensorRole.PleValueProjection,
+            TensorRole.PleConvolutionNorm,
+            TensorRole.PleKeyNorm,
+            TensorRole.PleQueryNorm,
+        };
+
+        TensorRole[] attentionBiasRoles = new TensorRole[]
+        {
+            TensorRole.AttentionQueryBias,
+            TensorRole.AttentionKeyBias,
+            TensorRole.AttentionValueBias,
+            TensorRole.AttentionOutputBias,
+        };
+
+        TensorRole[] normBiasRoles = new TensorRole[]
+        {
+            TensorRole.AttentionNormBias,
+            TensorRole.FeedForwardNormBias,
+        };
+
+        for (int layer = 0; layer < plan.LayerCount; layer++)
+        {
+            foreach (TensorRole role in pleRoles)
+            {
+                if (HasRole(plan.Tensors, tensors, role, layer))
+                {
+                    throw PostureRefusal($"PLE n-gram module tensor '{plan.Tensors[role].NameFor(layer)}'");
+                }
+            }
+
+            foreach (TensorRole role in attentionBiasRoles)
+            {
+                if (HasRole(plan.Tensors, tensors, role, layer))
+                {
+                    throw PostureRefusal($"attention bias tensor '{plan.Tensors[role].NameFor(layer)}'");
+                }
+            }
+
+            foreach (TensorRole role in normBiasRoles)
+            {
+                if (HasRole(plan.Tensors, tensors, role, layer))
+                {
+                    throw PostureRefusal($"norm bias tensor '{plan.Tensors[role].NameFor(layer)}'");
+                }
+            }
+        }
+
+        if (HasRole(plan.Tensors, tensors, TensorRole.OutputNormBias, -1))
+        {
+            throw PostureRefusal($"output norm bias tensor '{plan.Tensors[TensorRole.OutputNormBias].NameFor(-1)}'");
+        }
     }
+
+    private ModelException PostureRefusal(string posture) => new(
+        $"model '{_modelDisplay}' architecture 'qwen4exp' bounded forward has no composition over {posture}: run a fixture that omits it, or resolve a family whose forward composes that posture");
+
+    private static bool HasRole(TensorMap map, LogicalTensorTable tensors, TensorRole role, int layer) =>
+        map[role].Resolve(tensors, layer) is not null;
 
     private static float[] Ones(int length)
     {
@@ -797,22 +1028,46 @@ internal sealed class Qwen4ExpEngine : IDisposable
         return values;
     }
 
-    // Reads one F32 tensor's rows as contiguous floats through the backend's row dequantization — this bounded path refuses any other format by name.
-    private void RequireF32(LogicalTensor tensor)
+    private ReadOnlySpan<byte> ResolveBytes(LogicalTensor tensor) => _weights.Resolve(tensor);
+
+    private WeightRef Ref(LogicalTensor tensor) => new(ResolveBytes(tensor), tensor.Shape, tensor.Format);
+
+    private LogicalTensor MatrixRole(LogicalTensor tensor, string what, int[] logicalRowsCols)
     {
-        if (tensor.Format != QuantFormat.F32)
+        ValidateMatrixShape(tensor, what, logicalRowsCols);
+        return tensor;
+    }
+
+    private static void ValidateMatrixShape(LogicalTensor tensor, string what, int[] logicalRowsCols)
+    {
+        if (tensor.Shape.Dims.Length != 2 || tensor.Shape.Dims[0] != logicalRowsCols[0] || tensor.Shape.Dims[^1] != logicalRowsCols[1])
         {
-            throw new ModelException(
-                $"the bounded qwen4exp engine runs F32 fixtures only: tensor '{tensor.Name}' carries format " +
-                $"'{tensor.Format.ToString().ToLowerInvariant()}' — a quantized posture needs the production weight views and kernels this synthetic path does not carry.");
+            throw new ModelException($"tensor '{tensor.Name}' ({what}) declares shape [{string.Join(", ", tensor.Shape.Dims)}] but the qwen4exp geometry needs [{logicalRowsCols[0]}, {logicalRowsCols[1]}]");
         }
     }
 
-    private ReadOnlySpan<byte> ResolveBytes(LogicalTensor tensor) => _weights.Resolve(tensor);
+    private static void ValidateStackShape(LogicalTensor tensor, string what, int experts, int rows, int cols)
+    {
+        if (tensor.Shape.Dims.Length != 3 || tensor.Shape.Dims[0] != experts || tensor.Shape.Dims[1] != rows || tensor.Shape.Dims[2] != cols)
+        {
+            throw new ModelException($"tensor '{tensor.Name}' ({what}) must be a three-dimensional expert stack of {experts} experts shaped [{experts}, {rows}, {cols}], got [{string.Join(", ", tensor.Shape.Dims)}]");
+        }
+    }
+
+    private static long ExpertSlabBytes(LogicalTensor tensor, int rows, int experts)
+    {
+        long expertBytes = checked((long)rows * tensor.Shape.RowStrideBytes(tensor.Format));
+        long stackBytes = checked((long)experts * expertBytes);
+        if (expertBytes <= 0 || tensor.SizeBytes != stackBytes)
+        {
+            throw new ModelException($"tensor '{tensor.Name}' declares {tensor.SizeBytes} bytes for {experts} expert slabs of {expertBytes} bytes each; the bounded qwen4exp slab seam needs contiguous stacked experts");
+        }
+
+        return expertBytes;
+    }
 
     private float[] LoadVector(LogicalTensor tensor, string what, int expectedLength)
     {
-        RequireF32(tensor);
         if (tensor.Shape.Dims.Length != 1 || tensor.Shape.Dims[0] != expectedLength)
         {
             throw new ModelException($"tensor '{tensor.Name}' ({what}) declares shape [{string.Join(", ", tensor.Shape.Dims)}] but the qwen4exp geometry needs a vector of length {expectedLength}");
@@ -824,13 +1079,9 @@ internal sealed class Qwen4ExpEngine : IDisposable
         return values;
     }
 
-    private float[] LoadMatrix(LogicalTensor tensor, string what, int[] logicalRowsCols)
+    private float[] LoadMatrixValues(LogicalTensor tensor, string what, int[] logicalRowsCols)
     {
-        RequireF32(tensor);
-        if (tensor.Shape.Dims.Length != 2 || tensor.Shape.Dims[0] != logicalRowsCols[0] || tensor.Shape.Dims[^1] != logicalRowsCols[1])
-        {
-            throw new ModelException($"tensor '{tensor.Name}' ({what}) declares shape [{string.Join(", ", tensor.Shape.Dims)}] but the qwen4exp geometry needs [{logicalRowsCols[0]}, {logicalRowsCols[1]}]");
-        }
+        ValidateMatrixShape(tensor, what, logicalRowsCols);
 
         int rows = logicalRowsCols[0];
         int cols = logicalRowsCols[1];
@@ -845,38 +1096,6 @@ internal sealed class Qwen4ExpEngine : IDisposable
         return values;
     }
 
-    private float[] LoadStack(LogicalTensor tensor, string what, int experts)
-    {
-        RequireF32(tensor);
-        if (tensor.Shape.Dims.Length != 3 || tensor.Shape.Dims[0] != experts)
-        {
-            throw new ModelException($"tensor '{tensor.Name}' ({what}) must be a three-dimensional expert stack of {experts} experts, got [{string.Join(", ", tensor.Shape.Dims)}]");
-        }
-
-        int totalRows = checked(tensor.Shape.Dims[0] * tensor.Shape.Dims[1]);
-        int cols = tensor.Shape.Dims[^1];
-        ReadOnlySpan<byte> bytes = ResolveBytes(tensor);
-        float[] values = new float[checked(totalRows * (long)cols)];
-        TensorShape shape2D = new([totalRows, cols]);
-        for (int r = 0; r < totalRows; r++)
-        {
-            _backend.DequantRow(new WeightRef(bytes, shape2D, tensor.Format), r, values.AsSpan(r * cols, cols));
-        }
-
-        return values;
-    }
-
-    private static float DotRow(float[] matrix, int row, int width, ReadOnlySpan<float> vector)
-    {
-        double sum = 0.0;
-        for (int i = 0; i < width; i++)
-        {
-            sum += (double)matrix[row * width + i] * vector[i];
-        }
-
-        return (float)sum;
-    }
-
     public void Dispose()
     {
         // No unmanaged resources: weight views were read at open and the backend is caller-owned.
@@ -887,39 +1106,56 @@ internal sealed class Qwen4ExpEngine : IDisposable
         public HyperConnectionTensors AttnHyper = new();
         public HyperConnectionTensors FfnHyper = new();
 
-        // Exactly one of these attention operand sets is filled, chosen by the layer's resolved kind; a linear block leaves SparseFull
-        // empty and a sparse-full block leaves Linear empty. A forward reads only the side its kind selects.
-        public GdnOps.GdnBlockTensors Linear;
-        public QsaOps.QsaBlockTensors? SparseFull;
+        // Exactly one of these attention operand sets is filled, chosen by the layer's resolved kind; a linear block carries its GDN
+        // weight views and a sparse-full block carries its QSA weight views plus the geometry/norms QsaOps consumes. A forward reads
+        // only the side its kind selects.
+        public GdnOps.GdnKernelTensors KernelLinear;
+        public QsaKernelTensors? SparseFull;
 
-        public float[]? Router;
-        public float[]? ExpertGate;
-        public float[]? ExpertUp;
-        public float[]? ExpertDown;
-        public float[]? SharedGate;
-        public float[]? SharedUp;
-        public float[]? SharedDown;
+        public LogicalTensor? Router;
+        public ExpertSlabRole GateRole;
+        public ExpertSlabRole UpRole;
+        public ExpertSlabRole DownRole;
+        public LogicalTensor? SharedGate;
+        public LogicalTensor? SharedUp;
+        public LogicalTensor? SharedDown;
         public float[]? SharedGateVector;
         public SparseFfnDescriptor? Sparse;
 
-        public float[]? DenseGate;
-        public float[]? DenseUp;
-        public float[]? DenseDown;
+        public LogicalTensor? DenseGate;
+        public LogicalTensor? DenseUp;
+        public LogicalTensor? DenseDown;
+    }
+
+    private struct QsaKernelTensors
+    {
+        public QsaKernelTensors()
+        {
+        }
+
+        public QsaOps.QsaBlockTensors Geometry; // the scalar/norm side QsaOps consumes; its projection arrays stay empty because this engine projects through the backend instead
+
+        public LogicalTensor QueryGate = null!; // 2 * HeadCount * HeadDim rows x HiddenSize: every head's query slice then its gate slice, alternating per head
+        public LogicalTensor Key = null!; // KvHeadCount * HeadDim rows x HiddenSize
+        public LogicalTensor Value = null!; // same shape as Key
+        public LogicalTensor Output = null!; // HiddenSize rows x (HeadCount * HeadDim)
+        public LogicalTensor IndexerQueryProj = null!; // IndexerHeads * IndexerDim rows x HiddenSize
+        public LogicalTensor IndexerKeyProj = null!; // IndexerDim rows x HiddenSize
     }
 
     private sealed class HyperConnectionTensors
     {
-        public float[] Norm = []; // flattened: each stream's gamma slice
-        public float[] Down = []; // lowRank rows x flattened
-        public float[] Up = []; // flattened rows x lowRank
-        public float[] Inject = []; // streamCount rows x flattened
+        public float[] Norm = []; // flattened: each stream's gamma slice, materialized because RMS scaling has no dense-GEMV shape
+        public LogicalTensor Down = null!; // lowRank rows x flattened
+        public LogicalTensor Up = null!; // flattened rows x lowRank
+        public LogicalTensor Inject = null!; // streamCount rows x flattened
     }
 
     private sealed class OutputHyperConnectionTensors
     {
         public float[] Norm = []; // flattened: the final norm vector over the whole flattened width
-        public float[] Down = []; // lowRank rows x flattened
-        public float[] Up = []; // flattened rows x lowRank
+        public LogicalTensor Down = null!; // lowRank rows x flattened
+        public LogicalTensor Up = null!; // flattened rows x lowRank
     }
 }
 
