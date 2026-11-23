@@ -45,7 +45,7 @@
     like a second copy of the model. Default 16384.
 
 .PARAMETER Threads
-    Bench thread quota (0 keeps the backend's auto sizing).
+    Bench thread quota (0 uses the bench command's default thread quota).
 
 .PARAMETER ReportPath
     Write a plain-text lane log here. Only valid on Synthetic or RealFile after validation passes; DryRun refuses it so
@@ -176,15 +176,13 @@ function New-LaneGateList {
         }
 
         foreach ($shard in @($Shards | Where-Object { -not $_.Streamed })) {
-            Add-Gate "reality-check-gemv-file[$([System.IO.Path]::GetFileName($shard.Path))]" 'dotnet' @(
-                'run', '--project', 'bench/Lair.Bench', '-c', 'Release', '--no-build', '--', 'gemv-file', $shard.Path,
-                '--threads', ([string]$Threads)
-            ) "resident working set within the declared RAM headroom: kernels read zero-copy mmap spans"
+            $gemvArgs = @('run', '--project', 'bench/Lair.Bench', '-c', 'Release', '--no-build', '--', 'gemv-file', $shard.Path)
+            if ($Threads -gt 0) { $gemvArgs += @('--threads', ([string]$Threads)) }
+            Add-Gate "reality-check-gemv-file[$([System.IO.Path]::GetFileName($shard.Path))]" 'dotnet' $gemvArgs "resident working set within the declared RAM headroom: kernels read zero-copy mmap spans"
 
-            Add-Gate "reality-check-prefill-profile[$([System.IO.Path]::GetFileName($shard.Path))]" 'dotnet' @(
-                'run', '--project', 'bench/Lair.Bench', '-c', 'Release', '--no-build', '--', 'prefill-profile', $shard.Path,
-                '--threads', ([string]$Threads)
-            ) "resident weight tier plus prefill activation buffers within the declared RAM headroom"
+            $prefillArgs = @('run', '--project', 'bench/Lair.Bench', '-c', 'Release', '--no-build', '--', 'prefill-profile', $shard.Path)
+            if ($Threads -gt 0) { $prefillArgs += @('--threads', ([string]$Threads)) }
+            Add-Gate "reality-check-prefill-profile[$([System.IO.Path]::GetFileName($shard.Path))]" 'dotnet' $prefillArgs "resident weight tier plus prefill activation buffers within the declared RAM headroom"
         }
 
         foreach ($shard in @($Shards | Where-Object { $_.Streamed })) {
