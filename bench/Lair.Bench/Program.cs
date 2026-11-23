@@ -310,6 +310,11 @@ static int BenchFileGemv(string[] args)
             continue;
         }
 
+        if (tensor.SizeBytes > int.MaxValue)
+        {
+            continue; // this bench measures one full mapped tensor span at a time; oversized tensors need a bounded streaming source instead
+        }
+
         // A GGUF payload is one packed row after another over its innermost dimension, so a rank-3 slab reads as rows x cols too.
         long flatRows = tensor.Shape.ElementCount / cols;
         if (flatRows * stride != tensor.SizeBytes)
@@ -573,6 +578,11 @@ static List<RowView> BuildRowViews(GgufFile gguf)
         if (stride <= 0 || stride > int.MaxValue)
         {
             continue;
+        }
+
+        if (tensor.SizeBytes > int.MaxValue)
+        {
+            continue; // this bench measures one full mapped tensor span at a time; oversized tensors need a bounded streaming source instead
         }
 
         // A GGUF payload is one packed row after another over its innermost dimension, so a rank-3 slab reads as rows x cols too.
@@ -1063,8 +1073,7 @@ static int BenchPrefillProfile(string[] args)
         }
     }
 
-    GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
-    int[] prompt = BuildPrefillPrompt(tokenizer, maxLength);
+    int[] prompt = BuildSyntheticPrefillPrompt(geometry.VocabSize, maxLength);
 
     int blockTokens = 16; // the same block granularity the tests and the engine's KV side use
     int capacityBlocks = (maxLength + blockTokens - 1) / blockTokens + 8; // slack past the longest window so no measurement trips the pool
@@ -1334,19 +1343,18 @@ static int BenchPrefillProfile(string[] args)
     return 0;
 }
 
-// A prompt of exactly the requested token count from the repeated sentence the prefill tests use, trimmed to length:
-// token values only drive embedding lookups, so any in-vocabulary ids exercise the same weight and attention work.
-static int[] BuildPrefillPrompt(GgufTokenizer tokenizer, int tokens)
+// A prompt of exactly the requested token count using deterministic in-vocabulary ids: token values only drive
+// embedding lookups, so synthetic ids exercise the same weight and attention work without depending on tokenizer metadata.
+static int[] BuildSyntheticPrefillPrompt(int vocabSize, int tokens)
 {
-    const string line = "The quick brown fox jumps over the lazy dog while the patient cat watches the rain. ";
-
-    List<int> ids = [];
-    while (ids.Count < tokens)
+    int safeVocab = Math.Max(2, vocabSize);
+    int[] prompt = new int[tokens];
+    for (int i = 0; i < tokens; i++)
     {
-        ids.AddRange(tokenizer.Encode(line));
+        prompt[i] = 1 + (int)((long)i * 1_000_003L % (safeVocab - 1));
     }
 
-    return [.. ids.Take(tokens)];
+    return prompt;
 }
 
 // Activation bytes one full sub-batch carries at a given row count, computed from the plan's geometry as FP32 stream

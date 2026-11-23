@@ -109,6 +109,12 @@ public sealed unsafe class GgufMmapWeightSource : IWeightSource
         ArgumentNullException.ThrowIfNull(tensor);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
+        if (tensor.SizeBytes > int.MaxValue)
+        {
+            throw new GgufException(
+                $"tensor '{tensor.Name}' payload size {tensor.SizeBytes} exceeds the largest span this source can return ({int.MaxValue} bytes)");
+        }
+
         if (_shards is null)
         {
             long capacity = _view!.Capacity;
