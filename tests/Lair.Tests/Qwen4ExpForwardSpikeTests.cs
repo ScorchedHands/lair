@@ -10,8 +10,9 @@ namespace Lair.Tests;
 /// The linear block runs gated-delta-net composition and its recurrent state plus convolution history carry across chunk splits;
 /// a sparse-full block composes indexer selection and restricted attention through the existing QsaOps semantics; the
 /// hyper-connection mix/combine math is checked against hand-derived reference order and shapes, and re-sequencing every stage
-/// in the graph's own order reproduces the spike's block forward bit-for-bit. The production TransformerModel refusal stays a
-/// capability boundary: adding this spike did not wire qwen4exp into engine open.
+/// in the graph's own order reproduces the spike's block forward bit-for-bit. The spike stays a synthetic composition harness:
+/// engine open wires this family through its own bounded engine seam over real GGUF tensors, and no Open overload ever accepts
+/// the spike's synthetic operands.
 /// </summary>
 [Trait("Category", "Engine")]
 public sealed class Qwen4ExpForwardSpikeTests
@@ -591,23 +592,23 @@ public sealed class Qwen4ExpForwardSpikeTests
         Assert.True(outFirst.AsSpan().SequenceEqual(outSplit.AsSpan()), "a sparse MoE block forward must not change across a chunk boundary");
     }
 
-    // ---------------------------------------------------------------- the production engine refusal is unchanged by adding this spike
+    // ---------------------------------------------------------------- the spike never becomes a public engine open surface
 
     [Fact]
-    public void TransformerModel_StillRefusesQwen4Exp_OpenBecauseForwardExecutionIsIncomplete()
+    public void TransformerModel_OpenNeverExposesSyntheticQwen4ExpSpikeOperands()
     {
         using CpuBackend backend = new(threads: 1, allowAvx2: true);
         Qwen4ExpGeometry geometry = LinearOnlyGeometry(linearLayers: 1);
 
         // The spike is a synthetic composition harness only — it never opens a model. Asserting the resolved geometry drives it
-        // while TransformerModel.Open still refuses this family proves the boundary between "the plan resolves" and "the engine runs".
+        // while no Open overload takes its operand types proves the boundary between the spike and the engine seam.
         using Qwen4ExpForwardSpike spike = new(geometry, Hidden, HeadCount, KvHeadCount, HeadDim, IntermediateSize, Eps, backend);
 
         Assert.Equal(AttentionKind.LinearGatedDeltaNet, spike.KindForLayer(0));
         Assert.NotNull(spike.Geometry.HyperConnections); // the same resolved geometry a plan carries feeds this spike without any file access.
 
-        // No TransformerModel.Open overload accepts synthetic spike operands or the sparse-FFN config: composing qwen4exp into
-        // engine open is still unimplemented, sparse MoE included.
+        // No TransformerModel.Open overload accepts synthetic spike operands or the sparse-FFN config: the engine seam wires
+        // real GGUF tensors through its own internal engine, and the spike's operand types stay spike-local.
         bool hasSpikeOpen = typeof(TransformerModel).GetMethods()
             .Any(m => m.Name == "Open" && m.GetParameters().Any(p =>
                 (p.ParameterType.FullName?.Contains("Qwen4ExpForwardSpike") ?? false)

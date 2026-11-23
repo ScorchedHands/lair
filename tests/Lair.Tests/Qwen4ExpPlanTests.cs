@@ -15,9 +15,9 @@ namespace Lair.Tests;
 /// an optional <c>full_attention_interval</c>; the recurrent-state, indexer and hyper-connection groups under their exact
 /// shipped names; a feed-forward width that arrives only as <c>expert_feed_forward_length</c>. The plan then carries the
 /// resolved geometry — kinds, ratios, derived value heads and budget facts residency accounting sizes against — and its
-/// tensor gate refuses tables whose per-layer material contradicts those declarations by concrete name. Nothing here
-/// forwards: composing these operands into a block forward is unimplemented, so engine open refuses naming exactly that,
-/// which this suite pins as the posture between "the plan resolves" and "the model runs".
+/// tensor gate refuses tables whose per-layer material contradicts those declarations by concrete name. A valid fixture no
+/// longer refuses at engine open: it opens on the bounded synthetic qwen4exp forward seam, whose forward coverage lives in
+/// Qwen4ExpEngineTests — this suite pins the resolution and the tensor gate, and the seam-open posture they land on.
 /// </summary>
 [Trait("Category", "Loader")]
 public sealed class Qwen4ExpPlanTests : IDisposable
@@ -47,7 +47,7 @@ public sealed class Qwen4ExpPlanTests : IDisposable
     private const int GroupCount = 1;      // key-head groups → conv channels 2 * (1 x 2) + 4 = 8 == hidden
     private const int ConvKernel = 3;
     private const int IndexerHeads = 2;
-    private const int IndexerKeyLength = 3;
+    private const int IndexerKeyLength = 4; // even component width so the engine seam can rotate indexer heads in pairs
     private const int TopKCells = 6;
     private const int StreamCount = 2;     // flattened residual width: 2 x hidden = 16
     private const int LowRank = 3;
@@ -149,13 +149,13 @@ public sealed class Qwen4ExpPlanTests : IDisposable
         Assert.Equal(24L, gdn.StateSlotsPerSequence);
         Assert.Equal(72L, geometry.RecurrentStateSlotsPerSequence);
 
-        // Indexer budgets: every cached cell carries both scoring heads' component regions (6 values), the window's full
-        // block footprint is cells x per-cell width x one full layer — 4 positions = 24 slots here — and a token keeps at
+        // Indexer budgets: every cached cell carries both scoring heads' component regions (8 values), the window's full
+        // block footprint is cells x per-cell width x one full layer — 4 positions = 32 slots here — and a token keeps at
         // most top_k / ratio complete pools, so this fixture's ratio-1 layer budgets all six while ratio 2 halves it.
         QsaDescriptor qsa = geometry.SparseAttention;
-        Assert.Equal(6L, qsa.IndexerCacheValuesPerCachedCell);
-        Assert.Equal(24L, geometry.IndexerCacheValuesForWindow(4));
-        Assert.Equal(96L, geometry.RecurrentAndIndexerSlotsForWindow(4));
+        Assert.Equal(8L, qsa.IndexerCacheValuesPerCachedCell);
+        Assert.Equal(32L, geometry.IndexerCacheValuesForWindow(4));
+        Assert.Equal(104L, geometry.RecurrentAndIndexerSlotsForWindow(4));
         Assert.Equal(TopKCells, qsa.PoolBudgetForRatio(1));
         Assert.Equal(TopKCells / 2, qsa.PoolBudgetForRatio(2));
 
@@ -390,25 +390,21 @@ public sealed class Qwen4ExpPlanTests : IDisposable
         Assert.Contains("blk.0.ssm_a", decayEx.Message);
     }
 
-    // ---------------------------------------------------------------- the resolved plan reports instead of running what cannot compose yet
+    // ---------------------------------------------------------------- the resolved plan opens the bounded synthetic forward seam
 
     [Fact]
-    public void TransformerModel_Qwen4ExpPlan_ResolvesGeometryThenRefusesNamingWhatCannotRunYet()
+    public void TransformerModel_Qwen4ExpPlan_ResolvesGeometryAndOpensTheBoundedSyntheticForwardSeam()
     {
         using GgufFile file = OpenFixture(BuildGguf(MetadataPairs(), FixtureTensors()));
         using CpuBackend backend = new();
 
-        ModelException ex = Assert.Throws<ModelException>(() => TransformerModel.Open(file, backend, maxContextTokens: 8));
+        using TransformerModel model = TransformerModel.Open(file, backend, maxContextTokens: 8);
 
-        // The refusal names the resolved decision it cannot execute — kinds and counts straight from this fixture's own
-        // declarations — beside what is missing, instead of silently running some other composition against these tensors.
-        Assert.Contains("model '", ex.Message);
-        Assert.Contains("architecture 'qwen4exp' resolves its execution geometry", ex.Message);
-        Assert.Contains("(gated-delta-net layers: 3, sparse full-attention layers: 1, hyper connections: 2 streams at rank 3)", ex.Message);
-        Assert.Contains("cannot run it yet", ex.Message);
+        // The composition exists now: a valid fixture opens on the assembly-internal qwen4exp engine seam instead of the
+        // standard dense loading, and the seam reports itself on the opened model. Forward coverage lives in Qwen4ExpEngineTests.
+        Assert.True(model.HasQwen4ExpForward);
 
-        // The plan itself resolved fully before the refusal — this is a capability boundary, not a load failure: the same
-        // file resolves through ModelPlans with its geometry intact.
+        // The plan itself resolved fully before the seam opened — this is the same file through ModelPlans with its geometry intact.
         ModelPlan plan = ModelPlans.Resolve(file);
         Assert.NotNull(plan.Qwen4Exp);
         Assert.Equal(3, plan.Qwen4Exp.LinearLayerCount);
@@ -525,8 +521,10 @@ public sealed class Qwen4ExpPlanTests : IDisposable
 
     private static List<TensorDef> FullDefs(int layer) =>
         [
-            // Split projections plus the indexer quartet — no ssm_* or attn_gate material on this layer.
-            new($"blk.{layer}.attn_q.weight", [2 * (Hidden / 2), Hidden]),
+            // Split projections plus the indexer quartet — no ssm_* or attn_gate material on this layer. The q projection
+            // carries the reference's interleaved query-and-gate rows (2 * head_count * head_dim), which is what the engine
+            // seam reads when it composes this layer.
+            new($"blk.{layer}.attn_q.weight", [2 * 2 * (Hidden / 2), Hidden]),
             new($"blk.{layer}.attn_k.weight", [Hidden / 2, Hidden]),
             new($"blk.{layer}.attn_v.weight", [Hidden / 2, Hidden]),
             new($"blk.{layer}.attn_output.weight", [Hidden, Hidden]),

@@ -68,15 +68,23 @@ public sealed class TransformerModel : IDisposable
     // backend arrives without a layout — allowed only over the single DRAM-resident span every unsplit route resolves
     // to, because that shape reads host-resident weight bytes directly from whichever device it reports. Decode-side
     // forwards never consult the lane side.
-    private readonly IBackend _prefillsBackend;
+    private readonly IBackend _prefillsBackend = null!;
 
     // The composed attention window this engine's prompt windows run their attention through when a device prefill
     // posture was opened for it: null everywhere else, which is every default path and the whole decode side. Supplied at
     // open by whoever opened the step — like an alternate weight source, its lifetime stays under that caller and model
     // disposal never releases it. Non-null only behind the internal seam no host configuration path reaches.
-    private readonly IDeviceAttentionStep? _devicePrefill;
+    private readonly IDeviceAttentionStep? _devicePrefill = null;
 
     private readonly IWeightSource _weights;
+
+    // The bounded synthetic qwen4exp forward seam this engine opens on for a plan whose family geometry resolved, instead of
+    // the standard dense loading: a dedicated internal engine that loads the file's own tensors through the plan's tensor map
+    // and sequences every block in the reference order with explicit per-sequence state. Null on every other family — which is
+    // every model served today — and never a public type: hosts reach this seam only through the assembly-internal chunk
+    // forwards below, and the serving routes refuse against it because persistent production caches for this family do not
+    // exist yet.
+    private readonly Qwen4ExpEngine? _qwen4Exp = null;
 
     // The resolved prefill kernel selection: pinned at open, re-pointed only through ApplyPrefillKernel, and read
     // fresh at every window boundary so a hot edit lands from the next window — the same re-read discipline the
@@ -87,7 +95,7 @@ public sealed class TransformerModel : IDisposable
     // The quant formats this engine's dense weight matrices carry, resolved once from the plan's tensor map in role
     // order with repeats collapsed. It is what a blocked-matmul selection needs kernels for: every format it lists has
     // to have one before that selection can run this file, and they are the names an unsupported file reports back.
-    private readonly IReadOnlyList<QuantFormat> _matmulFormats;
+    private readonly IReadOnlyList<QuantFormat> _matmulFormats = [];
 
     // The name every load-time and re-point capability refusal this engine raises calls this model by — general.name when the file declares it, its path otherwise. Held so a hot re-point refused over resolved execution spans names the same identity an open refusal did.
     private readonly string _modelDisplay;
@@ -109,7 +117,7 @@ public sealed class TransformerModel : IDisposable
     private LogicalTensor[] _wq = [];
     private LogicalTensor[] _wk = [];
     private LogicalTensor[] _wv = [];
-    private readonly LogicalTensor[] _wo;
+    private readonly LogicalTensor[] _wo = [];
     private LogicalTensor[] _ffnGate = []; // empty when a sparse descriptor replaces the dense block, or when the gate half rides inside the up tensor
     private LogicalTensor[] _ffnUp = []; // empty when a sparse descriptor replaces the dense block
 
@@ -133,7 +141,7 @@ public sealed class TransformerModel : IDisposable
     // the contiguous row range [e * rows .. (e + 1) * rows) and a per-expert GEMV reads it through a slice of that
     // role's payload with the fixed two-dimensional shape below. Every expert stays resident: routing selects among
     // these tensors instead of fetching them.
-    private readonly SparseFfnDescriptor? _sparseFfn;
+    private readonly SparseFfnDescriptor? _sparseFfn = null;
     private LogicalTensor[] _moeRouter = [];
     private LogicalTensor[] _moeExpertGate = [];
     private LogicalTensor[] _moeExpertUp = [];
@@ -190,95 +198,95 @@ public sealed class TransformerModel : IDisposable
 
     // Small FP32 vectors preloaded at Open: per-layer norm weights and any biases present in the file. Null
     // entries mean the tensor is absent (llama files carry no attention bias, qwen2 files may).
-    private readonly float[][] _attnNormWeight;
-    private readonly float[][] _ffnNormWeight;
-    private readonly float[]?[] _biasQ;
-    private readonly float[]?[] _biasK;
-    private readonly float[]?[] _biasV;
-    private readonly float[]?[] _biasO;
+    private readonly float[][] _attnNormWeight = [];
+    private readonly float[][] _ffnNormWeight = [];
+    private readonly float[]?[] _biasQ = [];
+    private readonly float[]?[] _biasK = [];
+    private readonly float[]?[] _biasV = [];
+    private readonly float[]?[] _biasO = [];
 
     // Per-head QK-norm weight vectors (one headDim vector per layer, shared by every head of its side),
     // preloaded only when the plan resolves a weighted mode: every head normalizes its own headDim slice.
-    private readonly float[][] _attnQNorm;
-    private readonly float[][] _attnKNorm;
+    private readonly float[][] _attnQNorm = [];
+    private readonly float[][] _attnKNorm = [];
 
     // Post-sublayer norm weight vectors, preloaded only when the plan places norms on sublayer outputs: each holds one
     // hidden-sized vector per layer and normalizes that sublayer's own output before its residual add. A pre-only
     // placement loads neither and rejects a file carrying either tensor.
-    private readonly float[][] _postAttnNorm;
-    private readonly float[][] _postFfnNorm;
+    private readonly float[][] _postAttnNorm = [];
+    private readonly float[][] _postFfnNorm = [];
 
     // Norm-bias vectors preloaded only when the plan declares them: the LayerNorm path adds them after the
     // weighted normalization. Null entries mean the layer's tensor is absent.
-    private readonly float[]?[] _attnNormBias;
-    private readonly float[]?[] _ffnNormBias;
-    private readonly float[]? _outputNormBias;
+    private readonly float[]?[] _attnNormBias = [];
+    private readonly float[]?[] _ffnNormBias = [];
+    private readonly float[]? _outputNormBias = null;
 
-    private readonly LogicalTensor _tokenEmbd;
-    private readonly LogicalTensor? _output;
-    private readonly float[] _outputNormWeight;
-    private readonly float[]? _outputBias;
+    private readonly LogicalTensor _tokenEmbd = null!;
+    private readonly LogicalTensor? _output = null;
+    private readonly float[] _outputNormWeight = [];
+    private readonly float[]? _outputBias = null;
 
     // FP32 buffers reused across every forward call.
-    private readonly float[] _cur;     // hidden: layer input stream (residual carrier) and FFN output accumulator
-    private readonly float[] _normed;  // hidden: weighted norm before the QKV / FFN GEMVs
-    private readonly float[] _q;       // headCount * headDim
-    private readonly float[] _k;       // kvHeads * headDim (also the KV slot write source)
-    private readonly float[] _v;       // kvHeads * headDim
-    private readonly float[] _attnOut; // headCount * headDim: heads concatenated in order for wo GEMV
-    private readonly float[] _proj;    // hidden: attn_output / ffn_down GEMV target before the residual add
-    private readonly float[] _gateUp;  // intermediateSize: gate result, then activation(gate) * up written back into it
-    private readonly float[] _up;      // intermediateSize: up GEMV result
-    private readonly float[] _logits;  // vocabSize
+    private readonly float[] _cur = [];     // hidden: layer input stream (residual carrier) and FFN output accumulator
+    private readonly float[] _normed = [];  // hidden: weighted norm before the QKV / FFN GEMVs
+    private readonly float[] _q = [];       // headCount * headDim
+    private readonly float[] _k = [];       // kvHeads * headDim (also the KV slot write source)
+    private readonly float[] _v = [];       // kvHeads * headDim
+    private readonly float[] _attnOut = []; // headCount * headDim: heads concatenated in order for wo GEMV
+    private readonly float[] _proj = [];    // hidden: attn_output / ffn_down GEMV target before the residual add
+    private readonly float[] _gateUp = [];  // intermediateSize: gate result, then activation(gate) * up written back into it
+    private readonly float[] _up = [];      // intermediateSize: up GEMV result
+    private readonly float[] _logits = [];  // vocabSize
 
     // Batched decode buffers: sequence-major blocks of _rowCapacity copies of the single-token streams, allocated once
     // at Open so a batched step adds no per-step heap pressure. Each sequence's block mirrors the same-sized buffer in
     // its own single-token forward; a wider prefill window widens these allocations and nothing else.
-    private readonly int _rowCapacity;
+    private readonly int _rowCapacity = 0;
 
     // The row window a resolved prefill-buffer ceiling leaves this engine running: the clamp itself (null when nothing declared bounds it),
     // the width every prompt route splits at after it, the lane family's own capacity beside it, and one sub-batch row's activation cost —
     // what the clamp measures rows against. Resolved once at open like every other forward-shape value; no arithmetic in any forward reads them.
-    private readonly PrefillRowWidthClamp? _prefillClamp;
-    private readonly int _effectivePrefillRowWidth;
-    private readonly int _laneRowCapacity;
-    private readonly long _prefillRowActivationBytes;
+    private readonly PrefillRowWidthClamp? _prefillClamp = null;
+    private readonly int _effectivePrefillRowWidth = 0;
+    private readonly int _laneRowCapacity = 0;
+    private readonly long _prefillRowActivationBytes = 0L;
 
-    private readonly float[] _batchCur;     // _rowCapacity * hidden
-    private readonly float[] _batchNormed;  // _rowCapacity * hidden
-    private readonly float[] _batchQ;       // _rowCapacity * headCount * headDim
-    private readonly float[] _batchK;       // _rowCapacity * kvHeads * headDim
-    private readonly float[] _batchV;       // _rowCapacity * kvHeads * headDim
-    private readonly float[] _batchAttnOut; // _rowCapacity * headCount * headDim
-    private readonly float[] _batchProj;    // _rowCapacity * hidden
-    private readonly float[] _batchGateUp;  // _rowCapacity * intermediateSize
-    private readonly float[] _batchUp;      // _rowCapacity * intermediateSize
-    private readonly float[] _batchLogits;  // _rowCapacity * vocabSize
+    private readonly float[] _batchCur = [];     // _rowCapacity * hidden
+    private readonly float[] _batchNormed = [];  // _rowCapacity * hidden
+    private readonly float[] _batchQ = [];       // _rowCapacity * headCount * headDim
+    private readonly float[] _batchK = [];       // _rowCapacity * kvHeads * headDim
+    private readonly float[] _batchV = [];       // _rowCapacity * kvHeads * headDim
+    private readonly float[] _batchAttnOut = []; // _rowCapacity * headCount * headDim
+    private readonly float[] _batchProj = [];    // _rowCapacity * hidden
+    private readonly float[] _batchGateUp = [];  // _rowCapacity * intermediateSize
+    private readonly float[] _batchUp = [];      // _rowCapacity * intermediateSize
+    private readonly float[] _batchLogits = [];  // _rowCapacity * vocabSize
 
     // Row-tiled prefill attention state: one online-softmax entry per head for every row of a sub-batch — running max,
     // then weight sum — held across the tiled walk so each row advances its own state in exactly the order its per-row
     // kernel would. Sized once at Open for the widest window; the accumulators ride on _batchAttnOut's per-row head
     // regions, so a tiled window allocates nothing per call.
-    private readonly float[] _tiledRowMax;    // _rowCapacity * headCount: every row's per-head online max across the walk
-    private readonly float[] _tiledRowSumExp; // same shape: every row's per-head weight sum across the walk
+    private readonly float[] _tiledRowMax = [];    // _rowCapacity * headCount: every row's per-head online max across the walk
+    private readonly float[] _tiledRowSumExp = []; // same shape: every row's per-head weight sum across the walk
 
     // The dedicated prefill-lane posture this engine forwards under, resolved at open from placement values — null for
     // every shared-posture model. Worker pools, masks, activation buffers, and collision posture are load-time facts of it.
-    private readonly PrefillLaneLayout? _prefillsLane;
+    private readonly PrefillLaneLayout? _prefillsLane = null;
 
     // The execution spans this engine's forwards advance over, resolved once at open from the route and the compute backends opened for it.
     // Every model served today resolves to one span holding every layer on the device its own backend reports — decode-side spans carry the
     // single-token and batched forwards, prompt-window spans carry the prefill routes — and a split route maps each ordered segment onto the
     // backend supplied for its position, so two spans agreeing on device and residency stay distinct ranges of layers. The two lists share one
     // geometry: only the first span's engine differs when placement declares a dedicated lane.
-    private readonly ExecutionSpan[] _mainSpans;
-    private readonly ExecutionSpan[] _prefillSpans;
+    private readonly ExecutionSpan[] _mainSpans = [];
+    private readonly ExecutionSpan[] _prefillSpans = [];
 
     // The staging arenas a split route crosses through, one per resolved span beyond the first: each was allocated at open by that span's own backend and is freed here before this engine hands back. Empty for every single-span route — which leaves today's activation arrays as the only mutable streams any forward touches. A dedicated lane posture over a split route is refused above, so both routes of every crossing this build stages run through one activation family's arenas.
-    private readonly ResidualCarrier?[] _stagedCarriers;
+    private readonly ResidualCarrier?[] _stagedCarriers = [];
 
     // What each crossing staged at open, in segment order: the resolved position it feeds, the layers that span runs there, the device of the backend whose aligned allocator owns its arena, and that arena's byte size. Internal diagnostics — no host reports staging today.
-    private readonly ExecutionCrossing[] _stagedCrossings;
+    private readonly ExecutionCrossing[] _stagedCrossings = [];
 
     // The mutable-activation families each forward route writes into: decode-side paths (single-token forwards, batched
     // decode windows, encoder passes) always use the default family — every buffer this block has always allocated — while
@@ -286,15 +294,15 @@ public sealed class TransformerModel : IDisposable
     // sized and behavior is byte-for-byte what it was before any lane vocabulary existed; for a dedicated posture the lane
     // gets its own buffers at the resolved prefill row width — separate storage per mutable path, while read-only weights,
     // norms, rotation tables, and KV bytes stay shared. ActivationBytes reports what the lane family holds in total.
-    private readonly ActivationFamily _decodeAct;
-    private readonly ActivationFamily _laneAct;
+    private readonly ActivationFamily _decodeAct = null!;
+    private readonly ActivationFamily _laneAct = null!;
 
-    private readonly float[] _cos;          // maxContext * rope pair count
-    private readonly float[] _sin;
-    private readonly float[]? _cosWindowed; // the same shape again at a second base, or null when every layer shares one
-    private readonly float[]? _sinWindowed;
-    private readonly int _ropeHalf;         // pairs the rotation covers: the declared slice, or the full head
-    private readonly float _attnScale;      // head-dimension score gain times the variant's attention factor
+    private readonly float[] _cos = [];          // maxContext * rope pair count
+    private readonly float[] _sin = [];
+    private readonly float[]? _cosWindowed = null; // the same shape again at a second base, or null when every layer shares one
+    private readonly float[]? _sinWindowed = null;
+    private readonly int _ropeHalf = 0;         // pairs the rotation covers: the declared slice, or the full head
+    private readonly float _attnScale = 0f;      // head-dimension score gain times the variant's attention factor
 
     /// <summary>The resolved model plan this engine forwards under: geometry, profile tensor map, and strategy values.</summary>
     public ModelPlan Plan { get; }
@@ -339,10 +347,10 @@ public sealed class TransformerModel : IDisposable
     // instantiation chosen at open — the pinned FP32 causal kernel (and the measurement spike on the single-token path
     // when one is installed) for an FP32 pair, or one closed generic quantized kernel for a quantized pair. No forward
     // branches on a format per token: the pair is decided once here and every forward body runs the route its type names.
-    private readonly KvFormatPair _kvFormats;
-    private readonly FloatAttentionRoute? _floatAttention;
-    private readonly QuantizedAttentionRoute<Q8Block, Q8Block>? _q8q8Attention;
-    private readonly QuantizedAttentionRoute<Q8Block, Q4Block>? _q8q4Attention;
+    private readonly KvFormatPair _kvFormats = default;
+    private readonly FloatAttentionRoute? _floatAttention = null;
+    private readonly QuantizedAttentionRoute<Q8Block, Q8Block>? _q8q8Attention = null;
+    private readonly QuantizedAttentionRoute<Q8Block, Q4Block>? _q8q4Attention = null;
 
     /// <summary>The attention route a forward body runs at each attention call, closed over the sequence type its model opened with.</summary>
     private interface IKvAttentionRoute<TSeq> where TSeq : class
@@ -417,6 +425,32 @@ public sealed class TransformerModel : IDisposable
         _ => "private arena",
     };
 
+    /// <summary>Whether this engine opened on the bounded synthetic qwen4exp forward seam instead of the standard dense loading. Assembly-internal: hosts never reach this family's fixture path.</summary>
+    internal bool HasQwen4ExpForward => _qwen4Exp is not null;
+
+    /// <summary>Fresh per-sequence state on the bounded qwen4exp seam: recurrent delta-rule slots, convolution history and synthetic whole-sequence caches, all sized at the opened context ceiling. Refused on every family that did not open the seam.</summary>
+    internal Qwen4ExpSequence NewQwen4ExpSequence() =>
+        _qwen4Exp is { } engine
+            ? engine.NewSequence()
+            : throw new InvalidOperationException($"model '{_modelDisplay}' did not open the bounded synthetic qwen4exp forward seam");
+
+    /// <summary>
+    /// Forward one chunk of one synthetic qwen4exp sequence through the seam: every block runs in the reference order over the
+    /// sequence's carried state — recurrent slots and convolution history advance through the GDN chunk, whole-sequence KV rows
+    /// and indexer selection advance through the QSA caches — and the returned span carries every token's logits. Splitting the
+    /// same token run at any boundary lands bit-for-bit on the unsplit run. Refused on every family that did not open the seam.
+    /// </summary>
+    internal Span<float> ForwardQwen4ExpChunk(Qwen4ExpSequence sequence, ReadOnlySpan<int> tokens) =>
+        _qwen4Exp is { } engine
+            ? engine.ForwardChunk(sequence, tokens)
+            : throw new InvalidOperationException($"model '{_modelDisplay}' did not open the bounded synthetic qwen4exp forward seam");
+
+    /// <summary>The final-row logits the last chunk this sequence forwarded produced. Refused on every family that did not open the seam.</summary>
+    internal Span<float> LastQwen4ExpLogits(Qwen4ExpSequence sequence) =>
+        _qwen4Exp is { } engine
+            ? engine.LastLogits(sequence)
+            : throw new InvalidOperationException($"model '{_modelDisplay}' did not open the bounded synthetic qwen4exp forward seam");
+
     /// <summary>
     /// Re-points the engine's prefill path selection. The new value is read fresh at the next prefill window
     /// boundary, so sequences already mid-window finish that window on the route they started with — the same
@@ -430,6 +464,14 @@ public sealed class TransformerModel : IDisposable
         if (!KernelExecutes(kernel))
         {
             throw KernelRefusal(kernel);
+        }
+
+        // The bounded synthetic qwen4exp seam forwards its chunks through its own engine and reads no kernel selection, so a
+        // hot re-point to another kernel would run some other route behind the selection — refused naming it exactly as open
+        // did, and the running selection stays in force.
+        if (_qwen4Exp is not null && kernel != PrefillKernel.GemV)
+        {
+            throw Qwen4ExpPostureRefusal($"prefill kernel '{kernel}'");
         }
 
         // A quantized engine forwards prompt windows through the batched-row window only: its attention route is the closed
@@ -1100,6 +1142,23 @@ public sealed class TransformerModel : IDisposable
         $"naming the format and the backend rather than raised mid-decode — resolve placement onto '{ModelRoute.CpuDeviceId}' or re-quantize this file " +
         $"to a format '{engine.DeviceId}' executes");
 
+    // The refusal the bounded synthetic qwen4exp seam raises for a serving posture it has no composition over: the model, the
+    // posture, and what the seam runs instead — named rather than silently dropped, so an open never serves some other route
+    // behind the selection that happens to work.
+    private ModelException Qwen4ExpPostureRefusal(string posture) => new(
+        $"model '{_modelDisplay}' architecture 'qwen4exp' opens its forward on the bounded synthetic qwen4exp engine seam, " +
+        $"which runs CPU-only dense reads over F32 fixtures with per-sequence state sized at the opened context ceiling: " +
+        $"{posture} has no composition over that seam — omit it to run the fixture through the assembly-internal qwen4exp " +
+        $"chunk forwards, or resolve placement onto a standard family");
+
+    // The refusal a serving forward gets when this engine opened on the qwen4exp seam instead of the standard loading: the seam
+    // forwards chunks against its own per-sequence state, and the persistent production caches these routes hand a sequence
+    // object to do not exist for this family yet.
+    private InvalidOperationException Qwen4ExpServingRefusal(string routeName) => new(
+        $"model '{_modelDisplay}' opened the bounded synthetic qwen4exp forward seam: {routeName} runs against persistent " +
+        $"production caches this family does not have yet — forward the fixture through the assembly-internal qwen4exp " +
+        $"chunk seam instead");
+
     // The name every load-time refusal this engine raises calls the model by: general.name when the file declares it, and
     // the file path when it does not, the same identity the structured load lines report.
     private static string ModelDisplayName(GgufFile file)
@@ -1122,18 +1181,71 @@ public sealed class TransformerModel : IDisposable
         _modelDisplay = ModelDisplayName(file); // every capability refusal this engine raises — at open and on a re-point alike — calls this model by the same name the structured load lines report.
 
         // A qwen4exp plan resolves its per-layer interleave, recurrent-state geometry, indexer budgets and hyper-connection
-        // mixing from the file's own declarations — that resolution is what residency accounting sizes against today. What
-        // does not exist yet is the composition: a gated-delta-net step over the fused buffer and stored state, an
-        // indexer-restricted full-attention pass over selected cache cells, and hyper-connection residual mixing around
-        // each sublayer are layer-level operands (the GDN/QSA operand kernels take exactly these shapes) that no block
-        // forward here sequences yet. The plan stays resolved and reported instead of the engine silently running some
-        // other composition against this family's tensors, so open refuses naming what was decided but cannot run — like
-        // every unimplemented capability before it — rather than half-forwarding a model whose logits would be wrong.
-        if (Plan.Qwen4Exp is { } qwen4exp)
+        // mixing from the file's own declarations — that resolution is what residency accounting sizes against today, and it
+        // also decides this engine's forward seam: a valid synthetic fixture opens on the bounded CPU-only qwen4exp engine
+        // instead of the standard dense loading. This family's linear layers carry no dense q/k/v triplet and its blocks carry
+        // none of the standard norms the dense loader requires, so running that loader against it would refuse material the
+        // family legitimately does not ship; the dedicated engine reads the file's own tensors through the plan's tensor map,
+        // sequences every block in the reference order — hyper-connection mix, gated-delta-net chunk or indexer-selected
+        // restricted attention, combine, mix, feed-forward, combine, then the global output mix before the head — with explicit
+        // per-sequence state advanced across chunk splits, and sizes every cache at the opened context ceiling. That is a
+        // bounded synthetic path, not target serving: the postures that compose against the standard machinery (quantized KV,
+        // dedicated prefill lanes, offloaded or crossing backends, device prefill steps, split routes, non-GemV kernels) have
+        // no composition over this seam and refuse naming it — like every unimplemented capability before it — rather than
+        // half-forwarding a model whose logits would be wrong.
+        if (Plan.Qwen4Exp is { } qwen4expGeometry)
         {
-            throw new ModelException(
-                $"model '{_modelDisplay}' architecture 'qwen4exp' resolves its execution geometry " +
-                $"(gated-delta-net layers: {qwen4exp.LinearLayerCount}, sparse full-attention layers: {qwen4exp.FullLayerCount}, hyper connections: {Plan.Qwen4Exp.HyperConnections.StreamCount} streams at rank {Plan.Qwen4Exp.HyperConnections.LowRank}) but the forward engine cannot run it yet: composing a gated-delta-net step, an indexer-restricted attention pass and hyper-connection residual mixing into this block forward is not implemented in this build — only standard dense/attention families execute today");
+            if (!string.Equals(backend.DeviceId, ModelRoute.CpuDeviceId, StringComparison.Ordinal))
+            {
+                throw Qwen4ExpPostureRefusal($"compute backend '{backend.DeviceId}'");
+            }
+
+            if (route is not null && route.Segments.Count > 1)
+            {
+                throw Qwen4ExpPostureRefusal($"a route of {route.Segments.Count} segments");
+            }
+
+            if (kvFormats is { } declaredPair && !declaredPair.IsFloatStorage)
+            {
+                throw Qwen4ExpPostureRefusal($"quantized KV storage k='{KvSideFormatNames.Of(declaredPair.K)}' v='{KvSideFormatNames.Of(declaredPair.V)}'");
+            }
+
+            if (prefillsLane is not null || prefillsBackend is not null || crossingBackends is not null || devicePrefill is not null)
+            {
+                throw Qwen4ExpPostureRefusal("a dedicated prefill lane, an offloaded prefill backend, crossing backends or a device prefill step");
+            }
+
+            if (prefillKernel != PrefillKernel.GemV)
+            {
+                throw Qwen4ExpPostureRefusal($"prefill kernel '{prefillKernel}'");
+            }
+
+            Plan = route is null ? Plan : Plan with { Route = route };
+            Plan = budgets is null ? Plan : Plan with { Budgets = budgets };
+
+            _prefillKernel = prefillKernel;
+            _kvFormats = kvFormats ?? KvFormatPair.Default;
+
+            // The weight view lands here rather than further down the standard path: this seam reads nothing but the file's
+            // own tensors, and a posture refused above never spends one.
+            _ownsWeights = weights is null;
+            _weights = weights ?? new GgufMmapWeightSource(file);
+            _fileTensors = file.Tensors;
+
+            _qwen4Exp = new Qwen4ExpEngine(Plan, file.Tensors, _weights, backend, maxContextTokens);
+
+            if (logLine is not null)
+            {
+                GgufMetadata metadata = file.Metadata;
+                string modelName = metadata.Has("general.name") ? metadata.Get("general.name").AsString() : "";
+                logLine(
+                    $"qwen4exp_engine model='{(modelName.Length > 0 ? modelName : file.Path)}' " +
+                    $"architecture='{Plan.Architecture}' linear_layers={qwen4expGeometry.LinearLayerCount} " +
+                    $"sparse_full_layers={qwen4expGeometry.FullLayerCount} hyper_streams={qwen4expGeometry.HyperConnections.StreamCount} " +
+                    $"hyper_rank={qwen4expGeometry.HyperConnections.LowRank} context_ceiling={maxContextTokens}");
+            }
+
+            return;
         }
 
         // The formats this file's dense weight matrices carry, read from the plan's tensor map before any payload is
@@ -1839,6 +1951,11 @@ public sealed class TransformerModel : IDisposable
         ArgumentNullException.ThrowIfNull(tokens);
         ArgumentNullException.ThrowIfNull(kv);
 
+        if (_qwen4Exp is not null)
+        {
+            throw Qwen4ExpServingRefusal(nameof(Prefill));
+        }
+
         int n = tokens.Count;
         if (n == 0)
         {
@@ -2354,6 +2471,11 @@ public sealed class TransformerModel : IDisposable
     {
         ArgumentNullException.ThrowIfNull(kv);
 
+        if (_qwen4Exp is not null)
+        {
+            throw Qwen4ExpServingRefusal(nameof(DecodeNext));
+        }
+
         if (_q8q8Attention is { } q8q8)
         {
             ForwardToken(tokenId, kv.Length, ServeSequence<SequenceKv<Q8Block, Q8Block>>(kv), q8q8);
@@ -2374,7 +2496,15 @@ public sealed class TransformerModel : IDisposable
     /// Logits from the most recent forward: after a prefill these are already the next-token distribution for the
     /// sequence's final token — sampling them avoids re-forwarding (and double-appending) that token.
     /// </summary>
-    public Span<float> LastLogits() => _logits.AsSpan();
+    public Span<float> LastLogits()
+    {
+        if (_qwen4Exp is not null)
+        {
+            throw Qwen4ExpServingRefusal(nameof(LastLogits));
+        }
+
+        return _logits.AsSpan();
+    }
 
     /// <summary>
     /// The logits left by this engine's most recent prompt window, read through the prefill route's activation family:
@@ -2451,6 +2581,11 @@ public sealed class TransformerModel : IDisposable
     {
         ArgumentNullException.ThrowIfNull(tokenIds);
         ArgumentNullException.ThrowIfNull(kvs);
+
+        if (_qwen4Exp is not null)
+        {
+            throw Qwen4ExpServingRefusal(nameof(DecodeBatch));
+        }
 
         int n = tokenIds.Count;
         if (n != kvs.Count)
@@ -3280,6 +3415,10 @@ public sealed class TransformerModel : IDisposable
 
     public void Dispose()
     {
+        // The bounded synthetic qwen4exp seam releases nothing it did not allocate as arrays, but it holds the family's operand
+        // reads, so it lands before the weight view it resolved against.
+        _qwen4Exp?.Dispose();
+
         // Model-owned staging arenas return before anything else: each was allocated through a compute backend this host disposes after the model, so every handle lands while its allocator is still live. Repeated disposal never frees one twice.
         foreach (ResidualCarrier? carrier in _stagedCarriers)
         {
