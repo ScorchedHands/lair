@@ -1891,8 +1891,11 @@ Qwen3.8-Flash-Next runs: sparse MoE with residency management.
 - [x] Reduce linear GDN attention hotspot — profile and optimize the bounded `qwen4exp` linear attention path (`GdnOps` projections/convolution/recurrent/delta-rule kernels) without changing full target semantics.
   - Verify: targeted non-CUDA tests prove bounded qwen4exp forward remains deterministic/bit-identical where feasible, Xeon profile shows reduced `attention_linear_ms` or total forward time, and decode does not regress.
   - Measured Xeon confirmation: GDN projection batching reduced prefill `attention_linear_ms` from `86402` to `49013` and prefill throughput to `0.72 t/s`; decode stayed `0.38 t/s`. MoE remains the largest stage (`prefill moe_ffn_ms=86310`, `decode moe_ffn_ms=38743`).
-- [→] Tune chunk size after batching — rerun the profiled pinned-shard harness at chunk 16/32/64/128 to find the best bounded prefill window after GDN/MoE/hyper batching; decode single-token posture should remain solo.
+- [x] Tune chunk size after batching — rerun the profiled pinned-shard harness at chunk 16/32/64/128 to find the best bounded prefill window after GDN/MoE/hyper batching; decode single-token posture should remain solo.
   - Verify: Xeon evidence shows the best chunk window and no decode regression, and the result is recorded in `/tmp/lair-transfer` or equivalent evidence file.
+  - Measured Xeon confirmation: `chunk=32` was best (`prefill_tps=0.76`, `decode_tps=0.38`, `prefill attention_linear_ms=47294`, `prefill moe_ffn_ms=80092`) versus the prior `chunk=16` baseline (`prefill_tps=0.72`, `decode_tps=0.38`, `prefill attention_linear_ms=49013`, `prefill moe_ffn_ms=86310`). `chunk=64` regressed prefill (`prefill_tps=0.67`, `decode_tps=0.39`) while `chunk=128` was refused by the bounded harness cap (`count <= 64`).
+- [→] Profile and reduce MoE substage — add gate/up/down/shared-expert/router substage timing to the bounded `qwen4exp` MoE profile and optimize the dominant substage without changing full target semantics.
+  - Verify: targeted non-CUDA tests prove bounded qwen4exp forward remains deterministic/bit-identical where feasible, profiling shows reduced dominant MoE substage time or identifies the dominant substage, and throughput improves without regressing decode.
 
 #### Tests
 
