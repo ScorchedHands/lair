@@ -1,0 +1,12 @@
+load_backend: loaded RPC backend from C:\Users\Chuck\AppData\Local\Temp\kilo\optimize-small-cpu\tools\llama-b12359-bin-win-cpu-x64\ggml-rpc.dll
+load_backend: loaded CPU backend from C:\Users\Chuck\AppData\Local\Temp\kilo\optimize-small-cpu\tools\llama-b12359-bin-win-cpu-x64\ggml-cpu-alderlake.dll
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen2 3B Q4_K - Medium         |   1.95 GiB |     3.40 B | CPU        |       8 |           pp128 |        185.31 ± 6.84 |
+| qwen2 3B Q4_K - Medium         |   1.95 GiB |     3.40 B | CPU        |       8 |            tg32 |         21.08 ± 0.31 |
+| qwen2 3B Q4_K - Medium         |   1.95 GiB |     3.40 B | CPU        |      16 |           pp128 |        252.71 ± 9.36 |
+| qwen2 3B Q4_K - Medium         |   1.95 GiB |     3.40 B | CPU        |      16 |            tg32 |         22.72 ± 0.15 |
+| qwen2 3B Q4_K - Medium         |   1.95 GiB |     3.40 B | CPU        |      32 |           pp128 |        279.94 ± 2.69 |
+| qwen2 3B Q4_K - Medium         |   1.95 GiB |     3.40 B | CPU        |      32 |            tg32 |         19.27 ± 0.10 |
+
+build: b1b770d90 (12359)

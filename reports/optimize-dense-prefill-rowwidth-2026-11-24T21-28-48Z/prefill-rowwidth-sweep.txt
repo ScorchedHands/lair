@@ -1,0 +1,67 @@
+prefill-profile file=C:\Users\Chuck\AppData\Local\Temp\kilo\optimize-small-cpu\models\qwen2.5-3b-instruct-q4_k_m.gguf bytes=2104932768 threads=8 maxBatchSequences=16
+  arch=qwen2 layers=36 hidden=2048 heads=16 kvHeads=2 headDim=128 vocab=151936 windowedLayers=0 avx2=True
+  traversalBytes=1668685824 outputHeadBytes=255252480 kvBlocks=24 blockTokens=16 reps=3 perToken=off lengths=128,256 rowWidths=16,32,64 kernels=gemv,tiled,gemm
+
+prefill-profile kernel=gemv
+
+prefill-profile rowWidth=16 subBatchActivationBytes=2097152
+  weightFit=1023.82 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=1.63
+  attentionFit=48.053 us per position pair
+  crossover: not reached within 4x the longest measured length (256 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             8        8587.3         14.91        8190.6         396.7           0.0          1.63
+         256            16       17961.9         14.25       16381.1        1580.8           0.0          1.63
+
+prefill-profile rowWidth=32 subBatchActivationBytes=4194304
+  weightFit=2013.11 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.83
+  attentionFit=73.017 us per position pair
+  crossover: not reached within 4x the longest measured length (256 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             4        8655.3         14.79        8052.4         602.8          -0.0          0.83
+         256             8       18506.9         13.83       16104.9        2402.0          -0.0          0.83
+
+prefill-profile rowWidth=64 subBatchActivationBytes=8388608
+  weightFit=3791.54 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.44
+  attentionFit=33.768 us per position pair
+  crossover: not reached within 4x the longest measured length (256 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             2        7861.9         16.28        7583.1         278.8           0.0          0.44
+         256             4       16277.0         15.73       15166.2        1110.8           0.0          0.44
+
+prefill-profile kernel=tiled
+
+prefill-profile rowWidth=16 subBatchActivationBytes=2097152
+  weightFit=768.91 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=2.17
+  attentionFit=63.303 us per position pair
+  crossover: not reached within 4x the longest measured length (256 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             8        6673.9         19.18        6151.3         522.6          -0.0          2.17
+         256            16       14385.0         17.80       12302.6        2082.4          -0.0          2.17
+
+prefill-profile rowWidth=32 subBatchActivationBytes=4194304
+  weightFit=1890.24 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.88
+  attentionFit=89.994 us per position pair
+  crossover: not reached within 4x the longest measured length (256 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             4        8304.0         15.41        7561.0         743.0           0.0          0.88
+         256             8       18082.4         14.16       15121.9        2960.4           0.0          0.88
+
+prefill-profile rowWidth=64 subBatchActivationBytes=8388608
+  weightFit=4379.97 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.38
+  attentionFit=107.276 us per position pair
+  crossover: not reached within 4x the longest measured length (256 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             2        9645.6         13.27        8759.9         885.7          -0.0          0.38
+         256             4       21048.8         12.16       17519.9        3528.9          -0.0          0.38
+
+prefill-profile kernel=gemm
+  kernel=gemm status=refused reason=prefill kernel 'gemm' is not implemented by the forward engine: architecture 'qwen2' carries dense weight matrices of format(s) Q6_K and no gemm attention/weight path exists in this build for them on the compute backend 'cpu' — the window shape that multiplies a whole sub-batch against one matrix runs only where every dense weight matrix has a blocked matmul kernel there, while every other family forwards its prompt windows through batched row passes — set engine.prefill_kernel to 'gemv' or 'tiled' (or omit it) to run this file
+  kernel=gemm status=refused reason=prefill kernel 'gemm' is not implemented by the forward engine: architecture 'qwen2' carries dense weight matrices of format(s) Q6_K and no gemm attention/weight path exists in this build for them on the compute backend 'cpu' — the window shape that multiplies a whole sub-batch against one matrix runs only where every dense weight matrix has a blocked matmul kernel there, while every other family forwards its prompt windows through batched row passes — set engine.prefill_kernel to 'gemv' or 'tiled' (or omit it) to run this file
+  kernel=gemm status=refused reason=prefill kernel 'gemm' is not implemented by the forward engine: architecture 'qwen2' carries dense weight matrices of format(s) Q6_K and no gemm attention/weight path exists in this build for them on the compute backend 'cpu' — the window shape that multiplies a whole sub-batch against one matrix runs only where every dense weight matrix has a blocked matmul kernel there, while every other family forwards its prompt windows through batched row passes — set engine.prefill_kernel to 'gemv' or 'tiled' (or omit it) to run this file
+  peakWorkingSetMb=1981.8 cumulative across this process run: measure per-kernel peaks in separate processes

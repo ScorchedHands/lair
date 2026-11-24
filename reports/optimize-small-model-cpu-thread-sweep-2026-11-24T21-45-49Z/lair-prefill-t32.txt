@@ -1,0 +1,56 @@
+prefill-profile file=C:\Users\Chuck\AppData\Local\Temp\kilo\optimize-small-cpu\models\qwen2.5-3b-instruct-q4_k_m.gguf bytes=2104932768 threads=32 maxBatchSequences=16
+  arch=qwen2 layers=36 hidden=2048 heads=16 kvHeads=2 headDim=128 vocab=151936 windowedLayers=0 avx2=True
+  traversalBytes=1668685824 outputHeadBytes=255252480 kvBlocks=16 blockTokens=16 reps=3 perToken=off lengths=128 rowWidths=16,32,64 kernels=gemv,tiled
+
+prefill-profile kernel=gemv
+
+prefill-profile rowWidth=16 subBatchActivationBytes=2097152
+  weightFit=678.92 ms/traversal (UNRELIABLE: measured costs are not separable into the two terms on this run) impliedWeightGB/s=2.46
+  attentionFit=0.000 us per position pair
+  crossover: not reached within 4x the longest measured length (128 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             8        5431.4         23.57        5431.4           0.0           0.0          2.46
+
+prefill-profile rowWidth=32 subBatchActivationBytes=4194304
+  weightFit=1254.75 ms/traversal (UNRELIABLE: measured costs are not separable into the two terms on this run) impliedWeightGB/s=1.33
+  attentionFit=0.000 us per position pair
+  crossover: not reached within 4x the longest measured length (128 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             4        5019.0         25.50        5019.0           0.0           0.0          1.33
+
+prefill-profile rowWidth=64 subBatchActivationBytes=8388608
+  weightFit=2201.93 ms/traversal (UNRELIABLE: measured costs are not separable into the two terms on this run) impliedWeightGB/s=0.76
+  attentionFit=0.000 us per position pair
+  crossover: not reached within 4x the longest measured length (128 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             2        4403.9         29.07        4403.9           0.0           0.0          0.76
+
+prefill-profile kernel=tiled
+
+prefill-profile rowWidth=16 subBatchActivationBytes=2097152
+  weightFit=679.87 ms/traversal (UNRELIABLE: measured costs are not separable into the two terms on this run) impliedWeightGB/s=2.45
+  attentionFit=0.000 us per position pair
+  crossover: not reached within 4x the longest measured length (128 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             8        5439.0         23.53        5439.0           0.0           0.0          2.45
+
+prefill-profile rowWidth=32 subBatchActivationBytes=4194304
+  weightFit=1210.54 ms/traversal (UNRELIABLE: measured costs are not separable into the two terms on this run) impliedWeightGB/s=1.38
+  attentionFit=0.000 us per position pair
+  crossover: not reached within 4x the longest measured length (128 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             4        4842.2         26.43        4842.2           0.0           0.0          1.38
+
+prefill-profile rowWidth=64 subBatchActivationBytes=8388608
+  weightFit=2579.60 ms/traversal (UNRELIABLE: measured costs are not separable into the two terms on this run) impliedWeightGB/s=0.65
+  attentionFit=0.000 us per position pair
+  crossover: not reached within 4x the longest measured length (128 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             2        5159.2         24.81        5159.2           0.0           0.0          0.65
+  peakWorkingSetMb=1969.1 cumulative across this process run: measure per-kernel peaks in separate processes

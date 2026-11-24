@@ -1,0 +1,15 @@
+START=llama-bench-thread-sweep
+llama-bench-thread-sweep EXIT=0 OUTPUT=reports\optimize-small-model-cpu-thread-sweep-2026-11-24T21-45-49Z\llama-thread-sweep.txt
+START=lair-prefill-t8
+lair-prefill-t8 EXIT=0 OUTPUT=reports\optimize-small-model-cpu-thread-sweep-2026-11-24T21-45-49Z\lair-prefill-t8.txt
+START=lair-kv-quant-baseline-t8
+lair-kv-quant-baseline-t8 EXIT=0 OUTPUT=reports\optimize-small-model-cpu-thread-sweep-2026-11-24T21-45-49Z\lair-kv-quant-baseline-t8.txt
+START=lair-prefill-t16
+lair-prefill-t16 EXIT=0 OUTPUT=reports\optimize-small-model-cpu-thread-sweep-2026-11-24T21-45-49Z\lair-prefill-t16.txt
+START=lair-kv-quant-baseline-t16
+lair-kv-quant-baseline-t16 EXIT=0 OUTPUT=reports\optimize-small-model-cpu-thread-sweep-2026-11-24T21-45-49Z\lair-kv-quant-baseline-t16.txt
+START=lair-prefill-t32
+lair-prefill-t32 EXIT=0 OUTPUT=reports\optimize-small-model-cpu-thread-sweep-2026-11-24T21-45-49Z\lair-prefill-t32.txt
+START=lair-kv-quant-baseline-t32
+lair-kv-quant-baseline-t32 EXIT=0 OUTPUT=reports\optimize-small-model-cpu-thread-sweep-2026-11-24T21-45-49Z\lair-kv-quant-baseline-t32.txt
+DONE=reports/optimize-small-model-cpu-thread-sweep-2026-11-24T21-45-49Z
