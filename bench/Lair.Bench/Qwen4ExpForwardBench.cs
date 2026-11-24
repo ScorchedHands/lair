@@ -55,6 +55,7 @@ internal static class Qwen4ExpForwardBench
         int reps = 1;
         int context = 0; // 0 resolves to this run's windows plus slack so no forward trips the opened ceiling
         bool skipPle = false;
+        bool profileLayers = false;
 
         for (int i = 2; i < args.Length; i++)
         {
@@ -106,6 +107,9 @@ internal static class Qwen4ExpForwardBench
                 case "--skip-ple":
                     skipPle = true;
                     break;
+                case "--profile-layers":
+                    profileLayers = true;
+                    break;
                 default:
                     Console.WriteLine($"qwen4exp-forward-file: unknown option '{args[i]}'");
                     return Usage();
@@ -127,7 +131,7 @@ internal static class Qwen4ExpForwardBench
         try
         {
             gguf = GgufFile.Open(path);
-            return RunOpened(gguf, promptTokens, genTokens, chunk, reps, openedContext, threads, skipPle);
+            return RunOpened(gguf, promptTokens, genTokens, chunk, reps, openedContext, threads, skipPle, profileLayers);
         }
         catch (Exception failure) when (failure is GgufException or ModelException or IOException or UnauthorizedAccessException)
         {
@@ -143,7 +147,7 @@ internal static class Qwen4ExpForwardBench
         }
     }
 
-    static int RunOpened(GgufFile gguf, int promptTokens, int genTokens, int chunk, int reps, int openedContext, int threads, bool skipPle)
+    static int RunOpened(GgufFile gguf, int promptTokens, int genTokens, int chunk, int reps, int openedContext, int threads, bool skipPle, bool profileLayers)
     {
         string declaredArchitecture = gguf.Metadata.GetString("general.architecture", "general");
 
@@ -214,10 +218,18 @@ internal static class Qwen4ExpForwardBench
             bool pleTensorsPresent = CarriesPleTensors(gguf);
             string parityField = skipPle && pleTensorsPresent ? "not_full_target_parity" : "bounded_seam";
 
+            if (profileLayers)
+            {
+                model.EnableQwen4ExpLayerProfiling();
+            }
+
             try
             {
-                (double bestPrefillSeconds, double meanPrefillSeconds) = MeasurePrefill(model, prompt, chunk, reps);
-                (double decodeSeconds, double argmaxSeconds, bool finiteDecode) = MeasureDecode(model, prompt, genTokens, chunk);
+                (double bestPrefillSeconds, double meanPrefillSeconds) = MeasurePrefill(model, prompt, chunk, reps, profileLayers);
+                Qwen4ExpLayerProfile? prefillProfile = profileLayers ? model.Qwen4ExpLayerProfileSummary() : null;
+
+                (double decodeSeconds, double argmaxSeconds, bool finiteDecode) = MeasureDecode(model, prompt, genTokens, chunk, profileLayers);
+                Qwen4ExpLayerProfile? decodeProfile = profileLayers ? model.Qwen4ExpLayerProfileSummary() : null;
 
                 string ropeNote = model.Qwen4ExpRotaryCoverage is { } coverage ? $" ropeHeadRegions={coverage.HeadRegions} ropeIndexerRegions={coverage.IndexerRegions}" : string.Empty;
 
@@ -228,6 +240,12 @@ internal static class Qwen4ExpForwardBench
                     $" prefill_best_ms={bestPrefillSeconds * 1000.0:F3} prefill_mean_ms={meanPrefillSeconds * 1000.0:F3} decode_ms={decodeSeconds * 1000.0:F3} argmax_ms={argmaxSeconds * 1000.0:F3}" +
                     $" parity={parityField} ple_tensors_present={(pleTensorsPresent ? "true" : "false")}" +
                     $" finite_logits={(finiteDecode ? "true" : "false")}{ropeNote} status=ok");
+
+                if (prefillProfile is { } prefill && decodeProfile is { } decode)
+                {
+                    Console.WriteLine(ProfileLine("prefill", prefill));
+                    Console.WriteLine(ProfileLine("decode", decode));
+                }
 
                 PrintPeakWorkingSet();
             }
@@ -248,8 +266,9 @@ internal static class Qwen4ExpForwardBench
     // Prefill windows: every rep runs the whole prompt through chunk forwards on a fresh sequence (the seam's carried state is
     // per-sequence, so reusing one would score later reps against positions an earlier rep already wrote), and only the timed
     // reps count. The first pass over mapped weights pays page residency rather than kernel cost, which is why best and mean
-    // land beside the tokens/sec figure a comparison reads off.
-    static (double BestSeconds, double MeanSeconds) MeasurePrefill(TransformerModel model, int[] prompt, int chunk, int reps)
+    // land beside the tokens/sec figure a comparison reads off. With --profile-layers the warmup rep's contribution is reset
+    // away so the reported stage/layer times describe the measured reps only.
+    static (double BestSeconds, double MeanSeconds) MeasurePrefill(TransformerModel model, int[] prompt, int chunk, int reps, bool profile)
     {
         double best = double.PositiveInfinity;
         double total = 0.0;
@@ -266,6 +285,11 @@ internal static class Qwen4ExpForwardBench
 
             sw.Stop();
 
+            if (rep == 0 && profile)
+            {
+                model.ResetQwen4ExpLayerProfile(); // the untimed warmup pass must not land in the measured profile
+            }
+
             if (rep > 0)
             {
                 best = Math.Min(best, sw.Elapsed.TotalSeconds);
@@ -280,13 +304,20 @@ internal static class Qwen4ExpForwardBench
     // token alone against that carried state — exactly the shape a decode loop takes — and its next token is the argmax of the
     // logits row that forward produced. Timing covers all requested steps at once so tokens/sec describes the steady-state
     // path rather than one step with an allocation tax attached. The vocab-sized argmax scan is timed apart from the loop so a
-    // reader can split a decode step into its forward cost (decode_ms minus argmax_ms) and its selection cost.
-    static (double Seconds, double ArgMaxSeconds, bool Finite) MeasureDecode(TransformerModel model, int[] prompt, int genTokens, int chunk)
+    // reader can split a decode step into its forward cost (decode_ms minus argmax_ms) and its selection cost. With
+    // --profile-layers the profile is reset after the untimed prompt warm start so the reported stage/layer times describe
+    // the measured generation steps only.
+    static (double Seconds, double ArgMaxSeconds, bool Finite) MeasureDecode(TransformerModel model, int[] prompt, int genTokens, int chunk, bool profile)
     {
         Qwen4ExpSequence sequence = model.NewQwen4ExpSequence();
         foreach ((int offset, int length) in Windows(prompt.Length, chunk))
         {
             model.ForwardQwen4ExpChunk(sequence, prompt.AsSpan(offset, length));
+        }
+
+        if (profile)
+        {
+            model.ResetQwen4ExpLayerProfile(); // the warm-start prompt forwards are not part of the measured decode profile
         }
 
         bool finite = true;
@@ -408,6 +439,25 @@ internal static class Qwen4ExpForwardBench
         $" promptTokens={promptTokens} genTokens={genTokens} chunk={chunk} reps={reps} context={context} threads={threads}" +
         (skipPle ? " skipPle=true" : string.Empty);
 
+    // One machine-readable profile line per measured window: the stage partition of the engine's bounded forward plus the top
+    // layers by whole-block time, compact enough to parse without swallowing the output. A layer entry is
+    // layer:kind:total_ms with kind in {linear, sparse}.
+    static string ProfileLine(string stage, Qwen4ExpLayerProfile profile)
+    {
+        List<Qwen4ExpLayerTiming> ranked = [.. profile.Layers];
+        ranked.Sort((a, b) => b.TotalMs.CompareTo(a.TotalMs));
+
+        string topLayers = string.Join(',', ranked.Take(8).Select(entry =>
+            $"{entry.Layer}:{(entry.Kind == AttentionKind.LinearGatedDeltaNet ? "linear" : "sparse")}:{entry.TotalMs:F3}"));
+
+        return $"qwen4exp-forward-file profile stage={stage}" +
+            $" seed_ms={profile.SeedMs:F3} hyper_mix_ms={profile.HyperMixMs:F3}" +
+            $" attention_linear_ms={profile.LinearAttentionMs:F3} attention_sparse_ms={profile.SparseAttentionMs:F3}" +
+            $" moe_ffn_ms={profile.MoeFeedForwardMs:F3} dense_ffn_ms={profile.DenseFeedForwardMs:F3}" +
+            $" combine_ms={profile.CombineMs:F3} logits_ms={profile.LogitsMs:F3}" +
+            $" total_ms={profile.TotalMs:F3} top_layers={topLayers}";
+    }
+
     // Stage timings that separate model preparation from the measured forwards: plan_ms covers ModelPlans.Resolve, open_ms
     // covers TransformerModel.Open. open_ms is omitted where the open never completed (a plan-stage refusal), so every line
     // reports exactly the stages that actually ran.
@@ -440,7 +490,7 @@ internal static class Qwen4ExpForwardBench
 
     private static int Usage()
     {
-        Console.WriteLine("qwen4exp-forward-file <gguf path> [--prompt-tokens N] [--gen-tokens M] [--context C] [--chunk K] [--threads T] [--reps R] [--skip-ple]" +
+        Console.WriteLine("qwen4exp-forward-file <gguf path> [--prompt-tokens N] [--gen-tokens M] [--context C] [--chunk K] [--threads T] [--reps R] [--skip-ple] [--profile-layers]" +
             " (CPU-only bounded qwen4exp forward measurement: synthetic in-vocabulary prompt ids and argmax-driven generation steps run through the engine's" +
             " assembly-internal chunk seam over a plain CPU backend, publishing prefill/decode tokens-per-second plus peak working-set facts beside the" +
             " plan-resolved geometry; --threads T sets the backend's global worker request so the reported threads= matches the effective worker count," +
@@ -449,6 +499,9 @@ internal static class Qwen4ExpForwardBench
             " argmax_ms so load/open cost separates from forward cost;" +
             " --skip-ple opens a qwen4exp file whose n-gram module tensors this seam has no composition over by pointing those six roles at absent names," +
             " which measures every non-PLE block of that target and marks parity=not_full_target_parity rather than claiming full-target forward parity;" +
+            " --profile-layers turns on the engine's bounded stage/layer profiling for the measured windows only (warmup forwards are reset out) and" +
+            " prints one machine-readable profile line per window: stage=prefill|decode with seed_ms, hyper_mix_ms, attention_linear_ms, attention_sparse_ms," +
+            " moe_ffn_ms, dense_ffn_ms, combine_ms, logits_ms, total_ms and top_layers=layer:kind:ms entries ranked by whole-block time;" +
             " any loader/plan/engine refusal prints one status=refused line naming what this build cannot run against that file, with exit code 2)");
         return 1;
     }

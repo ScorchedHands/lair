@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 using Lair.Contracts;
 using Lair.Loader;
 
@@ -108,6 +110,23 @@ internal sealed class Qwen4ExpEngine : IDisposable
     private readonly int _ropeHalfHead;
     private readonly int _ropeHalfIndexer;
 
+    // Bounded stage/layer profiling for CPU hotspot work, off by default. A disabled forward reads no clock and touches none
+    // of this state: BeginProfile returns 0 without calling Stopwatch.GetTimestamp and Accumulate returns before touching an
+    // accumulator, so the forward path and its logits stay bit-identical unless a host explicitly enables profiling.
+    // Accumulators hold raw Stopwatch ticks; only the summary converts them, and no Stopwatch object is allocated per token
+    // or per layer.
+    private bool _profileEnabled;
+    private long _profileSeedTicks;
+    private long _profileHyperMixTicks;
+    private long _profileLinearTicks;
+    private long _profileSparseTicks;
+    private long _profileCombineTicks;
+    private long _profileMoeTicks;
+    private long _profileDenseTicks;
+    private long _profileLogitsTicks;
+    private long _profileTotalTicks;
+    private long[] _profileLayerTicks = [];
+
     public Qwen4ExpEngine(ModelPlan plan, LogicalTensorTable tensors, IWeightSource weights, IBackend backend, int maxPositions, string modelDisplay)
     {
         ArgumentNullException.ThrowIfNull(plan);
@@ -166,6 +185,10 @@ internal sealed class Qwen4ExpEngine : IDisposable
         {
             throw new ModelException($"qwen4exp hyper_connection.count is {_streamCount}; mixing needs at least two residual streams");
         }
+
+        // The per-layer accumulator table is sized from the geometry at open so a forward's profiling seams can index it
+        // unconditionally; a disabled forward still never writes it (Accumulate returns before touching its target).
+        _profileLayerTicks = new long[geometry.LayerCount];
 
         _expertSlabs = weights as IExpertSlabSource ?? new ExpertSlabWeightSource(weights);
 
@@ -307,9 +330,12 @@ internal sealed class Qwen4ExpEngine : IDisposable
 
         int streamsPerToken = _flattened;
         float[] streams = new float[tokenCount * streamsPerToken];
+        long forwardStart = BeginProfile();
         for (int t = 0; t < tokenCount; t++)
         {
+            long seedStart = BeginProfile();
             SeedStreams(tokens[t], streams.AsSpan(t * streamsPerToken, streamsPerToken));
+            Accumulate(ref _profileSeedTicks, seedStart);
         }
 
         float[] mixedRows = new float[tokenCount * _hiddenSize];
@@ -324,14 +350,18 @@ internal sealed class Qwen4ExpEngine : IDisposable
         {
             LayerOperands w = _layers[layer];
             AttentionKind kind = _geometry.KindForLayer(layer);
+            long layerStart = BeginProfile();
 
             for (int t = 0; t < tokenCount; t++)
             {
+                long mixStart = BeginProfile();
                 MixStreams(w.AttnHyper, streams.AsSpan(t * streamsPerToken, streamsPerToken), mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), attnInject.AsSpan(t * _streamCount, _streamCount));
+                Accumulate(ref _profileHyperMixTicks, mixStart);
             }
 
             if (kind == AttentionKind.LinearGatedDeltaNet)
             {
+                long attnStart = BeginProfile();
                 GdnOps.ForwardChunkKernel(
                     _backend,
                     _weights,
@@ -347,31 +377,53 @@ internal sealed class Qwen4ExpEngine : IDisposable
 
                 // The convolution history update writes the new tail while the previous one is still read; rotate so the next chunk sees exactly what this one left behind.
                 sequence.RotateConvHistory(layer);
+                Accumulate(ref _profileLinearTicks, attnStart);
             }
             else
             {
                 QsaKernelTensors sparseTensors = w.SparseFull ?? throw new InvalidOperationException($"qwen4exp layer {layer} resolved as a sparse-full block but its attention operands were never loaded.");
 
+                long attnStart = BeginProfile();
                 for (int t = 0; t < tokenCount; t++)
                 {
                     SparseAttention(sparseTensors, sequence.Qsa(layer), mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize));
                 }
+
+                Accumulate(ref _profileSparseTicks, attnStart);
             }
 
             for (int t = 0; t < tokenCount; t++)
             {
+                long combineStart = BeginProfile();
                 CombineStreams(streams.AsSpan(t * streamsPerToken, streamsPerToken), sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize), attnInject.AsSpan(t * _streamCount, _streamCount), midStreams.AsSpan(t * streamsPerToken, streamsPerToken));
+                Accumulate(ref _profileCombineTicks, combineStart);
 
+                long mixStart = BeginProfile();
                 MixStreams(w.FfnHyper, midStreams.AsSpan(t * streamsPerToken, streamsPerToken), mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), injectScratch);
+                Accumulate(ref _profileHyperMixTicks, mixStart);
 
+                long ffnStart = BeginProfile();
                 ForwardFeedForward(w, mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize));
+                if (w.Sparse is not null)
+                {
+                    Accumulate(ref _profileMoeTicks, ffnStart);
+                }
+                else
+                {
+                    Accumulate(ref _profileDenseTicks, ffnStart);
+                }
 
+                combineStart = BeginProfile();
                 CombineStreams(midStreams.AsSpan(t * streamsPerToken, streamsPerToken), sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize), injectScratch, streams.AsSpan(t * streamsPerToken, streamsPerToken));
+                Accumulate(ref _profileCombineTicks, combineStart);
             }
+
+            Accumulate(ref _profileLayerTicks[layer], layerStart);
         }
 
         sequence.Positions += tokenCount;
 
+        long logitsStart = BeginProfile();
         float[] logits = new float[tokenCount * _plan.VocabSize];
         for (int t = 0; t < tokenCount; t++)
         {
@@ -388,6 +440,9 @@ internal sealed class Qwen4ExpEngine : IDisposable
             }
         }
 
+        Accumulate(ref _profileLogitsTicks, logitsStart);
+        Accumulate(ref _profileTotalTicks, forwardStart);
+
         if (sequence.FinalLogits.Length != _plan.VocabSize)
         {
             sequence.FinalLogits = new float[_plan.VocabSize]; // the seam's last-logits read is one vocab-sized row, allocated on the first forward
@@ -403,6 +458,82 @@ internal sealed class Qwen4ExpEngine : IDisposable
         ArgumentNullException.ThrowIfNull(sequence);
         return sequence.FinalLogits;
     }
+
+    /// <summary>
+    /// Turn on bounded stage/layer timing for this engine's forwards. Off by default; while off a forward reads no clock and
+    /// touches no profiling state, so the forward and its logits stay bit-identical to the unprofiled seam. Assembly-internal
+    /// diagnostic surface (bench hotspot evidence), never a public serving API.
+    /// </summary>
+    internal void EnableLayerProfiling()
+    {
+        if (_profileLayerTicks.Length != _geometry.LayerCount)
+        {
+            _profileLayerTicks = new long[_geometry.LayerCount];
+        }
+
+        _profileEnabled = true;
+    }
+
+    /// <summary>Turn stage/layer timing back off; accumulators keep their last values until <see cref="ResetLayerProfile"/>.</summary>
+    internal void DisableLayerProfiling() => _profileEnabled = false;
+
+    /// <summary>Zero every stage and per-layer accumulator so the next window measures from zero.</summary>
+    internal void ResetLayerProfile()
+    {
+        _profileSeedTicks = 0;
+        _profileHyperMixTicks = 0;
+        _profileLinearTicks = 0;
+        _profileSparseTicks = 0;
+        _profileCombineTicks = 0;
+        _profileMoeTicks = 0;
+        _profileDenseTicks = 0;
+        _profileLogitsTicks = 0;
+        _profileTotalTicks = 0;
+        Array.Clear(_profileLayerTicks);
+    }
+
+    /// <summary>
+    /// The accumulated stage and per-layer times as milliseconds, converted from raw Stopwatch ticks. Stages cover the whole
+    /// forward: seed/embedding, every hyper-connection mix (attention side and feed-forward side), the linear gated-delta-net
+    /// chunk kernels, the sparse-full attention per token, every hyper-connection combine, the sparse routed feed-forward,
+    /// the dense feed-forward, and the output hyper mix plus the logit head. Per-layer totals cover each block's whole
+    /// mix/attention/combine/feed-forward span with its resolved attention kind.
+    /// </summary>
+    internal Qwen4ExpLayerProfile LayerProfileSummary()
+    {
+        List<Qwen4ExpLayerTiming> layers = new(_geometry.LayerCount);
+        for (int layer = 0; layer < _geometry.LayerCount; layer++)
+        {
+            layers.Add(new Qwen4ExpLayerTiming(layer, _geometry.KindForLayer(layer), TicksToMs(_profileLayerTicks[layer])));
+        }
+
+        return new Qwen4ExpLayerProfile(
+            TicksToMs(_profileSeedTicks),
+            TicksToMs(_profileHyperMixTicks),
+            TicksToMs(_profileLinearTicks),
+            TicksToMs(_profileSparseTicks),
+            TicksToMs(_profileCombineTicks),
+            TicksToMs(_profileMoeTicks),
+            TicksToMs(_profileDenseTicks),
+            TicksToMs(_profileLogitsTicks),
+            TicksToMs(_profileTotalTicks),
+            layers);
+    }
+
+    // The profiling seams every instrumented site shares: a disabled forward gets 0 from BeginProfile without ever reading
+    // the clock, and Accumulate returns before touching its accumulator — so the unprofiled forward path pays nothing beyond
+    // two inlined flag checks and stays bit-identical. No Stopwatch is allocated per token or per layer.
+    private long BeginProfile() => _profileEnabled ? Stopwatch.GetTimestamp() : 0L;
+
+    private void Accumulate(ref long accumulator, long startTicks)
+    {
+        if (_profileEnabled)
+        {
+            accumulator += Stopwatch.GetTimestamp() - startTicks;
+        }
+    }
+
+    private static double TicksToMs(long ticks) => ticks * 1000.0 / Stopwatch.Frequency;
 
     // One sparse-full block's attention for one token against the block's carried caches: project and rotate the block q/k heads,
     // append K/V, project/rotate the indexer query at this position, append the raw indexer key, pool complete blocks of ratio
@@ -1303,3 +1434,24 @@ internal sealed class Qwen4ExpSequence
         public int CacheCells { get; set; }
     }
 }
+
+/// <summary>
+/// One bounded qwen4exp forward window's accumulated stage and per-layer times, in milliseconds. Stage times partition every
+/// instrumented forward into seed/embedding, hyper-connection mixes, linear attention kernels, sparse attention, hyper
+/// combines, sparse feed-forward, dense feed-forward, and the output mix plus logit head; total is the whole forward.
+/// Assembly-internal diagnostic shape behind the engine's profiling seam.
+/// </summary>
+internal readonly record struct Qwen4ExpLayerProfile(
+    double SeedMs,
+    double HyperMixMs,
+    double LinearAttentionMs,
+    double SparseAttentionMs,
+    double CombineMs,
+    double MoeFeedForwardMs,
+    double DenseFeedForwardMs,
+    double LogitsMs,
+    double TotalMs,
+    IReadOnlyList<Qwen4ExpLayerTiming> Layers);
+
+/// <summary>One block's whole mix/attention/combine/feed-forward span with its resolved attention kind, in milliseconds.</summary>
+internal readonly record struct Qwen4ExpLayerTiming(int Layer, AttentionKind Kind, double TotalMs);

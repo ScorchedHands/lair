@@ -455,6 +455,52 @@ public sealed class TransformerModel : IDisposable
             : throw new InvalidOperationException($"model '{_modelDisplay}' did not open the bounded synthetic qwen4exp forward seam");
 
     /// <summary>
+    /// Turn on the bounded seam's stage/layer timing. Assembly-internal bench/diagnostic surface, not a public serving API:
+    /// while off the seam's forwards read no clock and touch no profiling state, so measured logits stay bit-identical.
+    /// Refused on every family that did not open the seam.
+    /// </summary>
+    internal void EnableQwen4ExpLayerProfiling()
+    {
+        if (_qwen4Exp is not { } engine)
+        {
+            throw SeamRefusal();
+        }
+
+        engine.EnableLayerProfiling();
+    }
+
+    /// <summary>Turn the seam's stage/layer timing back off. Refused on every family that did not open the seam.</summary>
+    internal void DisableQwen4ExpLayerProfiling()
+    {
+        if (_qwen4Exp is not { } engine)
+        {
+            throw SeamRefusal();
+        }
+
+        engine.DisableLayerProfiling();
+    }
+
+    /// <summary>Zero the seam's stage and per-layer accumulators so the next measured window starts from zero. Refused on every family that did not open the seam.</summary>
+    internal void ResetQwen4ExpLayerProfile()
+    {
+        if (_qwen4Exp is not { } engine)
+        {
+            throw SeamRefusal();
+        }
+
+        engine.ResetLayerProfile();
+    }
+
+    /// <summary>The seam's accumulated stage and per-layer times as milliseconds. Refused on every family that did not open the seam.</summary>
+    internal Qwen4ExpLayerProfile Qwen4ExpLayerProfileSummary() =>
+        _qwen4Exp is { } engine
+            ? engine.LayerProfileSummary()
+            : throw SeamRefusal();
+
+    private InvalidOperationException SeamRefusal() =>
+        new($"model '{_modelDisplay}' did not open the bounded synthetic qwen4exp forward seam");
+
+    /// <summary>
     /// Re-points the engine's prefill path selection. The new value is read fresh at the next prefill window
     /// boundary, so sequences already mid-window finish that window on the route they started with — the same
     /// boundary discipline a chunk-width edit keeps. A selection this build has no kernel for is refused naming it

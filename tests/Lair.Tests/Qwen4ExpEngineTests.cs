@@ -346,6 +346,85 @@ public sealed class Qwen4ExpEngineTests : IDisposable
         Assert.True(tail.SequenceEqual(unsplit.Slice(2 * VocabSize, VocabSize)), "a sliced rotation must carry its positions across a chunk boundary");
     }
 
+    // ---------------------------------------------------------------- bounded stage/layer profiling
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpLayerProfiling_EnabledSummaryReportsPositiveStageAndLayerTimesWithoutMovingLogits()
+    {
+        using GgufFile file = OpenFixture(BuildGguf(MetadataPairs(), FixtureTensors()));
+        using CpuBackend backend = new();
+
+        using TransformerModel model = TransformerModel.Open(file, backend, maxContextTokens: 8);
+
+        // The unprofiled forward is the baseline the profiled run must match bit-for-bit.
+        Span<float> unprofiled = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2, 3, 4, 0]);
+
+        model.EnableQwen4ExpLayerProfiling();
+        Span<float> profiled = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2, 3, 4, 0]);
+
+        Assert.True(BitsEqual(unprofiled, profiled), "enabling layer profiling must not move a single logit bit");
+
+        Qwen4ExpLayerProfile summary = model.Qwen4ExpLayerProfileSummary();
+
+        Assert.True(summary.TotalMs > 0.0, "the whole forward must carry a positive total");
+        Assert.True(summary.SeedMs > 0.0);
+        Assert.True(summary.HyperMixMs > 0.0);
+        Assert.True(summary.LinearAttentionMs > 0.0);
+        Assert.True(summary.SparseAttentionMs > 0.0);
+        Assert.True(summary.MoeFeedForwardMs > 0.0);
+        Assert.True(summary.CombineMs > 0.0);
+        Assert.True(summary.LogitsMs > 0.0);
+
+        // This fixture declares routed experts and no dense triplet, so the dense stage stays exactly zero.
+        Assert.Equal(0.0, summary.DenseFeedForwardMs);
+
+        Assert.Equal(Layers, summary.Layers.Count);
+        Assert.Equal(AttentionKind.LinearGatedDeltaNet, summary.Layers[0].Kind);
+        Assert.Equal(AttentionKind.FullQuerySparseAttention, summary.Layers[3].Kind);
+        foreach (Qwen4ExpLayerTiming layer in summary.Layers)
+        {
+            Assert.True(layer.TotalMs > 0.0, $"layer {layer.Layer} must carry a positive whole-block time once profiling is on");
+        }
+    }
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpLayerProfiling_DisabledForwardStaysBitIdenticalAndResetClearsTheSummary()
+    {
+        using GgufFile file = OpenFixture(BuildGguf(MetadataPairs(), FixtureTensors()));
+        using CpuBackend backend = new();
+
+        using TransformerModel model = TransformerModel.Open(file, backend, maxContextTokens: 8);
+
+        // Never enabled: the seam reports an empty summary and the forward lands on today's logits.
+        Span<float> defaultRun = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2]);
+        Qwen4ExpLayerProfile untouched = model.Qwen4ExpLayerProfileSummary();
+        Assert.Equal(0.0, untouched.TotalMs);
+        Assert.Equal(0.0, untouched.SeedMs);
+        Assert.Equal(0.0, untouched.LinearAttentionMs);
+        Assert.Equal(0.0, untouched.MoeFeedForwardMs);
+
+        model.EnableQwen4ExpLayerProfiling();
+        Span<float> profiledRun = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2]);
+        Assert.True(model.Qwen4ExpLayerProfileSummary().TotalMs > 0.0);
+
+        model.ResetQwen4ExpLayerProfile();
+        Qwen4ExpLayerProfile cleared = model.Qwen4ExpLayerProfileSummary();
+        Assert.Equal(0.0, cleared.TotalMs);
+        Assert.Equal(0.0, cleared.HyperMixMs);
+        Assert.Equal(0.0, cleared.SparseAttentionMs);
+        Assert.Equal(0.0, cleared.LogitsMs);
+        foreach (Qwen4ExpLayerTiming layer in cleared.Layers)
+        {
+            Assert.Equal(0.0, layer.TotalMs);
+        }
+
+        model.DisableQwen4ExpLayerProfiling();
+        Span<float> disabledRun = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2]);
+
+        Assert.True(BitsEqual(defaultRun, profiledRun), "a profiled forward must land on the unprofiled run bit-for-bit");
+        Assert.True(BitsEqual(defaultRun, disabledRun), "a disabled forward after profiling must land on the unprofiled run bit-for-bit");
+    }
+
     // ---------------------------------------------------------------- the seam refuses what it cannot read or compose
 
     [Fact]
