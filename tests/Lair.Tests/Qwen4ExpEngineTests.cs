@@ -549,6 +549,113 @@ public sealed class Qwen4ExpEngineTests : IDisposable
         Assert.True(BitsEqual(unprofiled, profiled), "a profiled solo forward must land on the unprofiled solo run bit-for-bit");
     }
 
+    // ---------------------------------------------------------------- batched hyper-connection mix
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpBatchedHyperMix_MultiTokenChunk_MatchesPerTokenAndPairRunsBitForBit()
+    {
+        // On the dense-FFN fixture the only batched-vs-solo posture change a multi-token chunk makes is the hyper mix: the
+        // chunk's down/up/inject projections run as batched passes while a single-token chunk keeps the solo mix. Every row of
+        // the three-token run must land bit-for-bit on the same tokens forwarded alone and as split chunks — the batched mix
+        // carries no cross-token state and each batched row is the solo GEMV row it replaces.
+        List<(string Key, object Value)> pairs = [.. MetadataPairs()];
+        int expertCountIndex = pairs.FindIndex(p => p.Key == "qwen4exp.expert_count");
+        int routedIndex = pairs.FindIndex(p => p.Key == "qwen4exp.expert_used_count");
+        pairs.RemoveAt(routedIndex);
+        pairs.RemoveAt(expertCountIndex);
+
+        using GgufFile file = OpenFixture(BuildGguf(pairs, DenseFixtureTensors()));
+        using CpuBackend backend = new();
+
+        using TransformerModel model = TransformerModel.Open(file, backend, maxContextTokens: 8);
+        Assert.Null(model.Plan.SparseFfn);
+
+        Span<float> whole = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2]);
+
+        Qwen4ExpSequence perToken = model.NewQwen4ExpSequence();
+        for (int t = 0; t < 3; t++)
+        {
+            Span<float> row = model.ForwardQwen4ExpChunk(perToken, [t]);
+            Assert.True(BitsEqual(row, whole.Slice(t * VocabSize, VocabSize)), $"token {t} must land on the same logits whether its chunk batched its hyper mix or ran the solo mix");
+        }
+
+        Qwen4ExpSequence split = model.NewQwen4ExpSequence();
+        model.ForwardQwen4ExpChunk(split, [0]);
+        Span<float> tail = model.ForwardQwen4ExpChunk(split, [1, 2]);
+        Assert.True(BitsEqual(tail, whole.Slice(VocabSize, 2 * VocabSize)), "a solo token followed by a batched pair must not move the chunk's later rows");
+
+        Assert.True(BitsEqual(model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2]), whole), "the batched hyper mix must repeat bit-for-bit on a fresh sequence");
+    }
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpBatchedHyperMix_RunsProjectionsBatchedForMultiTokenAndStaysSoloForSingleToken()
+    {
+        // The posture split is observable on the dense-FFN fixture: a single-token chunk reaches the batched seam exactly once
+        // (its one-row logit head) because both hyper mixes and the dense feed-forward run solo GEMVs, while a three-token chunk
+        // answers every hyper-connection down/up/inject projection as a multi-row batched pass — three batched calls per side per
+        // block, twelve per block over four blocks before any feed-forward or logit-head call.
+        List<(string Key, object Value)> pairs = [.. MetadataPairs()];
+        int expertCountIndex = pairs.FindIndex(p => p.Key == "qwen4exp.expert_count");
+        int routedIndex = pairs.FindIndex(p => p.Key == "qwen4exp.expert_used_count");
+        pairs.RemoveAt(routedIndex);
+        pairs.RemoveAt(expertCountIndex);
+
+        using GgufFile file = OpenFixture(BuildGguf(pairs, DenseFixtureTensors()));
+
+        using (CpuBackend inner = new())
+        {
+            CountingBackend solo = new(inner);
+            using TransformerModel soloModel = TransformerModel.Open(file, solo, maxContextTokens: 8);
+            soloModel.ForwardQwen4ExpChunk(soloModel.NewQwen4ExpSequence(), [0]);
+
+            Assert.True(solo.BatchCounts.Count == 1 && solo.BatchCounts[0] == 1, "a single-token chunk must keep both hyper mixes on the solo fast path and reach the batched seam exactly once, for its one-row logit head");
+        }
+
+        using (CpuBackend inner = new())
+        {
+            CountingBackend batched = new(inner);
+            using TransformerModel batchedModel = TransformerModel.Open(file, batched, maxContextTokens: 8);
+            batchedModel.ForwardQwen4ExpChunk(batchedModel.NewQwen4ExpSequence(), [0, 1, 2]);
+
+            Assert.True(
+                batched.BatchCounts.Count(count => count == 3) >= 2 * Layers * 3,
+                "a three-token chunk must run every hyper-connection down/up/inject projection as a three-row batched pass (three calls per side per block)");
+        }
+    }
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpLayerProfiling_SplitsHyperMixIntoAttentionAndFeedForwardSubstages()
+    {
+        // hyper_mix_ms keeps covering all mix work, and the new substage fields split it: each side carries a positive time, the
+        // whole-stage time is their sum, and a disabled or reset summary reports every hyper field exactly zero. The forward's
+        // logits stay bit-identical whether or not the split is reported.
+        using GgufFile file = OpenFixture(BuildGguf(MetadataPairs(), FixtureTensors()));
+        using CpuBackend backend = new();
+
+        using TransformerModel model = TransformerModel.Open(file, backend, maxContextTokens: 8);
+
+        Span<float> unprofiled = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2]);
+        Assert.Equal(0.0, model.Qwen4ExpLayerProfileSummary().HyperMixAttentionMs);
+        Assert.Equal(0.0, model.Qwen4ExpLayerProfileSummary().HyperMixFeedForwardMs);
+
+        model.EnableQwen4ExpLayerProfiling();
+        model.ResetQwen4ExpLayerProfile();
+        Span<float> profiled = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2]);
+        Qwen4ExpLayerProfile summary = model.Qwen4ExpLayerProfileSummary();
+
+        Assert.True(summary.HyperMixAttentionMs > 0.0, "the attention-side mix must carry its own positive substage time");
+        Assert.True(summary.HyperMixFeedForwardMs > 0.0, "the feed-forward-side mix must carry its own positive substage time");
+        Assert.True(summary.HyperMixMs >= summary.HyperMixAttentionMs, "hyper_mix_ms must keep covering the attention side of the mix");
+        Assert.True(summary.HyperMixMs >= summary.HyperMixFeedForwardMs, "hyper_mix_ms must keep covering the feed-forward side of the mix");
+        Assert.True(BitsEqual(unprofiled, profiled), "splitting the hyper mix stage must not move a single logit bit");
+
+        model.ResetQwen4ExpLayerProfile();
+        Qwen4ExpLayerProfile cleared = model.Qwen4ExpLayerProfileSummary();
+        Assert.Equal(0.0, cleared.HyperMixMs);
+        Assert.Equal(0.0, cleared.HyperMixAttentionMs);
+        Assert.Equal(0.0, cleared.HyperMixFeedForwardMs);
+    }
+
     [Fact]
     public void TransformerModel_Qwen4ExpDenseFixture_BatchedDenseFeedForwardStaysFiniteAndReportsTheDenseStage()
     {

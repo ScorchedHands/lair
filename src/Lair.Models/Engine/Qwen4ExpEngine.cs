@@ -71,6 +71,10 @@ internal sealed class Qwen4ExpEngine : IDisposable
     // windows, and every window's rows land on their solo-GEMV results unchanged.
     private const int FeedForwardBatchWindow = 64;
 
+    // The widest token window a batched hyper-connection mix projects in one call, matching the backend's batch ceiling: each
+    // window's down/up/inject rows land on their solo-GEMV results unchanged, so windowing never moves a token's arithmetic.
+    private const int HyperBatchWindow = 64;
+
     // Batched feed-forward scratch, grown on demand to the widest chunk a forward has seen and reused across every layer of that
     // forward: this chunk's router scores, per-token selections, the union active-expert set with member counts, one expert
     // group's packed member rows plus its gate/up intermediates, and the shared-expert weights. Selection carries no cross-token
@@ -113,6 +117,13 @@ internal sealed class Qwen4ExpEngine : IDisposable
     private float[] _hcNormed = [];
     private float[] _hcLowRank = [];
     private float[] _hcGated = [];
+
+    // Batched hyper-connection mix scratch, one window wide (HyperBatchWindow tokens) and allocated once on the first
+    // multi-token mix: the window's flattened normed streams, low-rank rows and gated streams. A single-token mix never
+    // touches these arrays — the solo fast path answers it on the per-token scratch above.
+    private float[] _hcNormedBatch = [];
+    private float[] _hcLowRankBatch = [];
+    private float[] _hcGatedBatch = [];
     private float[] _queryGateRows = [];
     private float[] _keyProjectionRows = [];
     private float[] _valueProjectionRows = [];
@@ -139,6 +150,8 @@ internal sealed class Qwen4ExpEngine : IDisposable
     private bool _profileEnabled;
     private long _profileSeedTicks;
     private long _profileHyperMixTicks;
+    private long _profileHyperMixAttnTicks;
+    private long _profileHyperMixFfnTicks;
     private long _profileLinearTicks;
     private long _profileSparseTicks;
     private long _profileCombineTicks;
@@ -386,12 +399,18 @@ internal sealed class Qwen4ExpEngine : IDisposable
             AttentionKind kind = _geometry.KindForLayer(layer);
             long layerStart = BeginProfile();
 
-            for (int t = 0; t < tokenCount; t++)
+            long attnMixStart = BeginProfile();
+            if (tokenCount == 1)
             {
-                long mixStart = BeginProfile();
-                MixStreams(w.AttnHyper, streams.AsSpan(t * streamsPerToken, streamsPerToken), mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), attnInject.AsSpan(t * _streamCount, _streamCount));
-                Accumulate(ref _profileHyperMixTicks, mixStart);
+                MixStreams(w.AttnHyper, streams, mixedRows, attnInject);
             }
+            else
+            {
+                MixStreamsBatched(w.AttnHyper, streams, tokenCount, mixedRows, attnInject);
+            }
+
+            Accumulate(ref _profileHyperMixTicks, attnMixStart);
+            Accumulate(ref _profileHyperMixAttnTicks, attnMixStart);
 
             if (kind == AttentionKind.LinearGatedDeltaNet)
             {
@@ -433,12 +452,18 @@ internal sealed class Qwen4ExpEngine : IDisposable
                 Accumulate(ref _profileCombineTicks, combineStart);
             }
 
-            for (int t = 0; t < tokenCount; t++)
+            long ffnMixStart = BeginProfile();
+            if (tokenCount == 1)
             {
-                long mixStart = BeginProfile();
-                MixStreams(w.FfnHyper, midStreams.AsSpan(t * streamsPerToken, streamsPerToken), mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), ffnInject.AsSpan(t * _streamCount, _streamCount));
-                Accumulate(ref _profileHyperMixTicks, mixStart);
+                MixStreams(w.FfnHyper, midStreams, mixedRows, ffnInject);
             }
+            else
+            {
+                MixStreamsBatched(w.FfnHyper, midStreams, tokenCount, mixedRows, ffnInject);
+            }
+
+            Accumulate(ref _profileHyperMixTicks, ffnMixStart);
+            Accumulate(ref _profileHyperMixFfnTicks, ffnMixStart);
 
             long ffnStart = BeginProfile();
             if (w.Sparse is not null)
@@ -523,6 +548,8 @@ internal sealed class Qwen4ExpEngine : IDisposable
     {
         _profileSeedTicks = 0;
         _profileHyperMixTicks = 0;
+        _profileHyperMixAttnTicks = 0;
+        _profileHyperMixFfnTicks = 0;
         _profileLinearTicks = 0;
         _profileSparseTicks = 0;
         _profileCombineTicks = 0;
@@ -551,6 +578,8 @@ internal sealed class Qwen4ExpEngine : IDisposable
         return new Qwen4ExpLayerProfile(
             TicksToMs(_profileSeedTicks),
             TicksToMs(_profileHyperMixTicks),
+            TicksToMs(_profileHyperMixAttnTicks),
+            TicksToMs(_profileHyperMixFfnTicks),
             TicksToMs(_profileLinearTicks),
             TicksToMs(_profileSparseTicks),
             TicksToMs(_profileCombineTicks),
@@ -731,6 +760,107 @@ internal sealed class Qwen4ExpEngine : IDisposable
         {
             inject[s] *= invStreams; // the reference scales each stream's low-rank expansion by 1/streams before its combine scatter weights it with 2·sigmoid
         }
+    }
+
+    // The batched side of the same mix for a multi-token chunk: every token's grouped RMS norm feeds one windowed batched down
+    // projection, its SiLU, its batched up projection, the per-element gate, the per-token mean collapse, and one batched inject
+    // projection, in windows of HyperBatchWindow tokens. Each batched row is the solo GEMV row it replaces bit-for-bit — the
+    // backend's batched kernels advance every batch vector through its own accumulator chain, quantizing each vector with the
+    // same rule a solo call uses — and the norm, SiLU, gate, collapse and inject scaling run per token in the same order the
+    // solo mix does, so a chunk split at any boundary lands on the unsplit run exactly. A single-token chunk never reaches
+    // this method: the solo fast path above answers it without a batched seam.
+    private void MixStreamsBatched(HyperConnectionTensors hc, ReadOnlySpan<float> streams, int tokenCount, Span<float> mixed, Span<float> inject)
+    {
+        int hidden = _hiddenSize;
+        int flattened = _flattened;
+        int streamCount = _streamCount;
+        int lowRank = _lowRank;
+        float invStreams = 1f / streamCount;
+
+        EnsureHyperBatchScratch(flattened, lowRank);
+
+        for (int offset = 0; offset < tokenCount; offset += HyperBatchWindow)
+        {
+            int rows = Math.Min(HyperBatchWindow, tokenCount - offset);
+
+            for (int t = 0; t < rows; t++)
+            {
+                ReadOnlySpan<float> tokenStreams = streams.Slice((offset + t) * flattened, flattened);
+                Span<float> tokenNormed = _hcNormedBatch.AsSpan(t * flattened, flattened);
+                for (int s = 0; s < streamCount; s++)
+                {
+                    int baseOffset = s * hidden;
+                    LayerOps.RmsNormWeighted(
+                        tokenStreams.Slice(baseOffset, hidden),
+                        hc.Norm.AsSpan(baseOffset, hidden),
+                        _eps,
+                        tokenNormed.Slice(baseOffset, hidden));
+                }
+            }
+
+            _backend.GemvBatch(
+                _hcNormedBatch.AsSpan(0, rows * flattened),
+                rows,
+                Ref(hc.Down),
+                _hcLowRankBatch.AsSpan(0, rows * lowRank));
+
+            for (int i = 0; i < rows * lowRank; i++)
+            {
+                _hcLowRankBatch[i] = LayerOps.Silu(_hcLowRankBatch[i] * invStreams);
+            }
+
+            _backend.GemvBatch(
+                _hcLowRankBatch.AsSpan(0, rows * lowRank),
+                rows,
+                Ref(hc.Up),
+                _hcGatedBatch.AsSpan(0, rows * flattened));
+
+            for (int i = 0; i < rows * flattened; i++)
+            {
+                _hcGatedBatch[i] = _hcNormedBatch[i] * GdnOps.Sigmoid(_hcGatedBatch[i]);
+            }
+
+            for (int t = 0; t < rows; t++)
+            {
+                ReadOnlySpan<float> gated = _hcGatedBatch.AsSpan(t * flattened, flattened);
+                Span<float> mixedRow = mixed.Slice((offset + t) * hidden, hidden);
+                for (int h = 0; h < hidden; h++)
+                {
+                    double sum = 0.0;
+                    for (int s = 0; s < streamCount; s++)
+                    {
+                        sum += gated[s * hidden + h];
+                    }
+
+                    mixedRow[h] = (float)(sum * invStreams);
+                }
+            }
+
+            _backend.GemvBatch(
+                _hcNormedBatch.AsSpan(0, rows * flattened),
+                rows,
+                Ref(hc.Inject),
+                inject.Slice(offset * streamCount, rows * streamCount));
+
+            for (int i = 0; i < rows * streamCount; i++)
+            {
+                inject[offset * streamCount + i] *= invStreams;
+            }
+        }
+    }
+
+    // Grows the batched hyper-mix scratch once to one window wide; every later multi-token mix reuses it. Sized from the
+    // flattened width and low-rank so a forward never allocates per token or per layer.
+    private void EnsureHyperBatchScratch(int flattened, int lowRank)
+    {
+        if (_hcNormedBatch.Length >= HyperBatchWindow * flattened)
+        {
+            return;
+        }
+
+        _hcNormedBatch = new float[HyperBatchWindow * flattened];
+        _hcLowRankBatch = new float[HyperBatchWindow * lowRank];
+        _hcGatedBatch = new float[HyperBatchWindow * flattened];
     }
 
     // The global output-side mix: the same grouped norm / low-rank SiLU / sigmoid gate / mean collapse as every block-side mix, but
@@ -1798,6 +1928,8 @@ internal sealed class Qwen4ExpSequence
 internal readonly record struct Qwen4ExpLayerProfile(
     double SeedMs,
     double HyperMixMs,
+    double HyperMixAttentionMs,
+    double HyperMixFeedForwardMs,
     double LinearAttentionMs,
     double SparseAttentionMs,
     double CombineMs,

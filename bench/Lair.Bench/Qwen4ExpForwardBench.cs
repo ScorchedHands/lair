@@ -452,6 +452,7 @@ internal static class Qwen4ExpForwardBench
 
         return $"qwen4exp-forward-file profile stage={stage}" +
             $" seed_ms={profile.SeedMs:F3} hyper_mix_ms={profile.HyperMixMs:F3}" +
+            $" hyper_mix_attn_ms={profile.HyperMixAttentionMs:F3} hyper_mix_ffn_ms={profile.HyperMixFeedForwardMs:F3}" +
             $" attention_linear_ms={profile.LinearAttentionMs:F3} attention_sparse_ms={profile.SparseAttentionMs:F3}" +
             $" moe_ffn_ms={profile.MoeFeedForwardMs:F3} dense_ffn_ms={profile.DenseFeedForwardMs:F3}" +
             $" combine_ms={profile.CombineMs:F3} logits_ms={profile.LogitsMs:F3}" +
@@ -500,7 +501,7 @@ internal static class Qwen4ExpForwardBench
             " --skip-ple opens a qwen4exp file whose n-gram module tensors this seam has no composition over by pointing those six roles at absent names," +
             " which measures every non-PLE block of that target and marks parity=not_full_target_parity rather than claiming full-target forward parity;" +
             " --profile-layers turns on the engine's bounded stage/layer profiling for the measured windows only (warmup forwards are reset out) and" +
-            " prints one machine-readable profile line per window: stage=prefill|decode with seed_ms, hyper_mix_ms, attention_linear_ms, attention_sparse_ms," +
+            " prints one machine-readable profile line per window: stage=prefill|decode with seed_ms, hyper_mix_ms, hyper_mix_attn_ms, hyper_mix_ffn_ms, attention_linear_ms, attention_sparse_ms," +
             " moe_ffn_ms, dense_ffn_ms, combine_ms, logits_ms, total_ms and top_layers=layer:kind:ms entries ranked by whole-block time;" +
             " any loader/plan/engine refusal prints one status=refused line naming what this build cannot run against that file, with exit code 2)");
         return 1;
