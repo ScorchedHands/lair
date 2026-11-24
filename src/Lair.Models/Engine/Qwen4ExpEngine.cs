@@ -156,6 +156,20 @@ internal sealed class Qwen4ExpEngine : IDisposable
     private long _profileSparseTicks;
     private long _profileCombineTicks;
     private long _profileMoeTicks;
+
+    // The sparse feed-forward's substage partition, beside its parent stage: router scores, per-token selection, union build
+    // and per-expert member dispatch (router); the routed experts' gate projections (gate), up projections and SwiGLU fold
+    // (up); the routed down projections (down); each routed expert's weighted fold into its token's output row (combine); and
+    // the whole shared-expert contribution — its selector score, its gate/up/down chain and its fold — as one region
+    // (shared). The routed chain's four regions partition the routed side and the shared region covers the shared side, so
+    // the six add up to the parent stage rather than double-counting it.
+    private long _profileMoeRouterTicks;
+    private long _profileMoeGateTicks;
+    private long _profileMoeUpTicks;
+    private long _profileMoeDownTicks;
+    private long _profileMoeSharedTicks;
+    private long _profileMoeCombineTicks;
+
     private long _profileDenseTicks;
     private long _profileLogitsTicks;
     private long _profileTotalTicks;
@@ -554,6 +568,12 @@ internal sealed class Qwen4ExpEngine : IDisposable
         _profileSparseTicks = 0;
         _profileCombineTicks = 0;
         _profileMoeTicks = 0;
+        _profileMoeRouterTicks = 0;
+        _profileMoeGateTicks = 0;
+        _profileMoeUpTicks = 0;
+        _profileMoeDownTicks = 0;
+        _profileMoeSharedTicks = 0;
+        _profileMoeCombineTicks = 0;
         _profileDenseTicks = 0;
         _profileLogitsTicks = 0;
         _profileTotalTicks = 0;
@@ -564,8 +584,10 @@ internal sealed class Qwen4ExpEngine : IDisposable
     /// The accumulated stage and per-layer times as milliseconds, converted from raw Stopwatch ticks. Stages cover the whole
     /// forward: seed/embedding, every hyper-connection mix (attention side and feed-forward side), the linear gated-delta-net
     /// chunk kernels, the sparse-full attention per token, every hyper-connection combine, the sparse routed feed-forward,
-    /// the dense feed-forward, and the output hyper mix plus the logit head. Per-layer totals cover each block's whole
-    /// mix/attention/combine/feed-forward span with its resolved attention kind.
+    /// the dense feed-forward, and the output hyper mix plus the logit head. The sparse feed-forward stage additionally
+    /// reports its substage partition — router scores/selection/dispatch, routed gate, routed up plus SwiGLU fold, routed
+    /// down, routed fold-into-token, and the shared expert as one region — beside the parent stage it partitions. Per-layer
+    /// totals cover each block's whole mix/attention/combine/feed-forward span with its resolved attention kind.
     /// </summary>
     internal Qwen4ExpLayerProfile LayerProfileSummary()
     {
@@ -584,6 +606,12 @@ internal sealed class Qwen4ExpEngine : IDisposable
             TicksToMs(_profileSparseTicks),
             TicksToMs(_profileCombineTicks),
             TicksToMs(_profileMoeTicks),
+            TicksToMs(_profileMoeRouterTicks),
+            TicksToMs(_profileMoeGateTicks),
+            TicksToMs(_profileMoeUpTicks),
+            TicksToMs(_profileMoeDownTicks),
+            TicksToMs(_profileMoeSharedTicks),
+            TicksToMs(_profileMoeCombineTicks),
             TicksToMs(_profileDenseTicks),
             TicksToMs(_profileLogitsTicks),
             TicksToMs(_profileTotalTicks),
@@ -938,6 +966,7 @@ internal sealed class Qwen4ExpEngine : IDisposable
         int routed = sparse.RoutedExpertsPerToken;
         int hidden = _hiddenSize;
 
+        long routerStart = BeginProfile();
         EnsureFeedForwardBatchCapacity(tokenCount);
 
         WeightRef router = Ref(w.Router!);
@@ -963,6 +992,8 @@ internal sealed class Qwen4ExpEngine : IDisposable
         int selectionSlots = tokenCount * routed;
         int unionCount = BuildUnionActiveExperts(selectionSlots);
 
+        Accumulate(ref _profileMoeRouterTicks, routerStart);
+
         ffnOut.AsSpan(0, tokenCount * hidden).Clear(); // the routed and shared contributions accumulate from zero, mirroring the production sparse posture
 
         ExpertSlabRole gate = w.GateRole;
@@ -977,6 +1008,7 @@ internal sealed class Qwen4ExpEngine : IDisposable
             _ffnUnion.AsSpan(0, unionCount),
             (int expertIndex, ReadOnlySpan<byte> gateSlab, ReadOnlySpan<byte> upSlab, ReadOnlySpan<byte> downSlab) =>
             {
+                long packStart = BeginProfile();
                 int count = 0;
                 for (int slot = 0; slot < selectionSlots; slot++)
                 {
@@ -991,6 +1023,8 @@ internal sealed class Qwen4ExpEngine : IDisposable
                     _ffnMemberWeights[count] = _ffnSelectionWeights[slot];
                     count++;
                 }
+
+                Accumulate(ref _profileMoeRouterTicks, packStart); // per-expert member dispatch belongs to the router substage: it selects and packs this expert's members, and runs no expert arithmetic
 
                 // The gather kernel walks the union in ascending expert order, so every token's member contributions land in the
                 // same ascending expert-index order its solo chain accumulated them in. A one-member group has nothing to batch:
@@ -1011,12 +1045,15 @@ internal sealed class Qwen4ExpEngine : IDisposable
                         new WeightRef(gateSlab, gate.ExpertShape, gate.Stack.Format),
                         new WeightRef(upSlab, up.ExpertShape, up.Stack.Format),
                         new WeightRef(downSlab, down.ExpertShape, down.Stack.Format),
-                        ffnOut);
+                        ffnOut,
+                        routedChain: true);
                 }
             });
 
         if (sparse.HasSharedExpert)
         {
+            long sharedStart = BeginProfile();
+
             // A file shipping this block's hidden-sized selector vector gates the shared contribution through the family's own
             // composition — plain sigmoid over its score, finite at every score including exactly zero, where qwen2moe's
             // silu(score)/score divides 0 by 0. A file shipping no selector adds it ungated at exactly one, which is what the
@@ -1043,7 +1080,9 @@ internal sealed class Qwen4ExpEngine : IDisposable
                 _ffnMemberWeights[t] = sharedWeight;
             }
 
-            RunExpertChain(tokenCount, Ref(w.SharedGate!), Ref(w.SharedUp!), Ref(w.SharedDown!), ffnOut);
+            RunExpertChain(tokenCount, Ref(w.SharedGate!), Ref(w.SharedUp!), Ref(w.SharedDown!), ffnOut, routedChain: false);
+
+            Accumulate(ref _profileMoeSharedTicks, sharedStart); // the shared side is timed whole, so its gate/up/down/fold never also lands in the routed substages
         }
     }
 
@@ -1061,6 +1100,7 @@ internal sealed class Qwen4ExpEngine : IDisposable
         int expertCount = sparse.ExpertCount;
         int routed = sparse.RoutedExpertsPerToken;
 
+        long routerStart = BeginProfile();
         mixed.CopyTo(_soloInput);
 
         _backend.Gemv(_soloInput, Ref(w.Router!), _soloRouterScores);
@@ -1077,6 +1117,7 @@ internal sealed class Qwen4ExpEngine : IDisposable
         }
 
         _soloOutputScratch.AsSpan().Clear(); // the routed and shared contributions accumulate from zero, mirroring the production sparse posture
+        Accumulate(ref _profileMoeRouterTicks, routerStart);
 
         ExpertSlabRole gate = w.GateRole;
         ExpertSlabRole up = w.UpRole;
@@ -1092,7 +1133,11 @@ internal sealed class Qwen4ExpEngine : IDisposable
             {
                 float weight = _soloExpertWeights[expertIndex];
 
+                long gateStart = BeginProfile();
                 _backend.Gemv(_soloInput, new WeightRef(gateSlab, gate.ExpertShape, gate.Stack.Format), _soloGateOut);
+                Accumulate(ref _profileMoeGateTicks, gateStart);
+
+                long upStart = BeginProfile();
                 _backend.Gemv(_soloInput, new WeightRef(upSlab, up.ExpertShape, up.Stack.Format), _soloUpOut);
 
                 for (int i = 0; i < _intermediateSize; i++)
@@ -1100,16 +1145,25 @@ internal sealed class Qwen4ExpEngine : IDisposable
                     _soloGateOut[i] = LayerOps.Silu(_soloGateOut[i]) * _soloUpOut[i];
                 }
 
-                _backend.Gemv(_soloGateOut, new WeightRef(downSlab, down.ExpertShape, down.Stack.Format), _soloDownOut);
+                Accumulate(ref _profileMoeUpTicks, upStart);
 
+                long downStart = BeginProfile();
+                _backend.Gemv(_soloGateOut, new WeightRef(downSlab, down.ExpertShape, down.Stack.Format), _soloDownOut);
+                Accumulate(ref _profileMoeDownTicks, downStart);
+
+                long combineStart = BeginProfile();
                 for (int h = 0; h < _hiddenSize; h++)
                 {
                     _soloOutputScratch[h] += weight * _soloDownOut[h]; // ascending expert-index order: the gather kernel's supplied selection is this token's sorted routing set.
                 }
+
+                Accumulate(ref _profileMoeCombineTicks, combineStart);
             });
 
         if (sparse.HasSharedExpert)
         {
+            long sharedStart = BeginProfile();
+
             // A file shipping this block's hidden-sized selector vector gates the shared contribution through the family's own
             // composition — plain sigmoid over its score, finite at every score including exactly zero, where qwen2moe's
             // silu(score)/score divides 0 by 0. A file shipping no selector adds it ungated at exactly one, which is what the
@@ -1141,6 +1195,8 @@ internal sealed class Qwen4ExpEngine : IDisposable
             {
                 _soloOutputScratch[h] += sharedWeight * _soloDownOut[h];
             }
+
+            Accumulate(ref _profileMoeSharedTicks, sharedStart); // the solo shared side is timed whole, exactly as the batched side is
         }
 
         _soloOutputScratch.AsSpan(0, _hiddenSize).CopyTo(ffnOut); // the caller's sublayer row receives the accumulated sparse contribution once the gather callback is done with its scratch.
@@ -1195,8 +1251,10 @@ internal sealed class Qwen4ExpEngine : IDisposable
     // One expert chain over a packed member group: gate and up run as batched passes over the group's rows, the SwiGLU
     // activation folds each member's gate row into its gate buffer in place, down writes each member's hidden row back through
     // the subset buffer, and each result accumulates into its token's output row scaled by that member's routing weight.
-    // Sub-batches stay within the backend's batch ceiling, and every row lands on its solo-GEMV result either way.
-    private void RunExpertChain(int count, WeightRef gate, WeightRef up, WeightRef down, float[] ffnOut)
+    // Sub-batches stay within the backend's batch ceiling, and every row lands on its solo-GEMV result either way. A routed
+    // group times its four regions into the MoE substages; the shared group runs the identical chain but reports through the
+    // shared substage at its call site, so its rows never land in the routed gate/up/down/combine accumulators as well.
+    private void RunExpertChain(int count, WeightRef gate, WeightRef up, WeightRef down, float[] ffnOut, bool routedChain)
     {
         int hidden = _hiddenSize;
         int inter = _intermediateSize;
@@ -1205,25 +1263,50 @@ internal sealed class Qwen4ExpEngine : IDisposable
         {
             int rows = Math.Min(FeedForwardBatchWindow, count - offset);
             Span<float> inRows = _ffnSubsetIn.AsSpan(offset * hidden, rows * hidden);
+
+            long gateStart = routedChain ? BeginProfile() : 0L;
             _backend.GemvBatch(inRows, rows, gate, _ffnGateOut.AsSpan(offset * inter, rows * inter));
+            if (routedChain)
+            {
+                Accumulate(ref _profileMoeGateTicks, gateStart);
+            }
+
+            long upStart = routedChain ? BeginProfile() : 0L;
             _backend.GemvBatch(inRows, rows, up, _ffnUpOut.AsSpan(offset * inter, rows * inter));
+            if (routedChain)
+            {
+                Accumulate(ref _profileMoeUpTicks, upStart);
+            }
         }
 
+        long foldStart = routedChain ? BeginProfile() : 0L;
         for (int i = 0; i < count * inter; i++)
         {
             _ffnGateOut[i] = LayerOps.Silu(_ffnGateOut[i]) * _ffnUpOut[i];
         }
 
+        if (routedChain)
+        {
+            Accumulate(ref _profileMoeUpTicks, foldStart); // the SwiGLU fold consumes both projections and produces what down reads, so it rides the up substage
+        }
+
         for (int offset = 0; offset < count; offset += FeedForwardBatchWindow)
         {
             int rows = Math.Min(FeedForwardBatchWindow, count - offset);
+
+            long downStart = routedChain ? BeginProfile() : 0L;
             _backend.GemvBatch(
                 _ffnGateOut.AsSpan(offset * inter, rows * inter),
                 rows,
                 down,
                 _ffnSubsetIn.AsSpan(offset * hidden, rows * hidden));
+            if (routedChain)
+            {
+                Accumulate(ref _profileMoeDownTicks, downStart);
+            }
         }
 
+        long combineStart = routedChain ? BeginProfile() : 0L;
         for (int m = 0; m < count; m++)
         {
             Span<float> target = ffnOut.AsSpan(_ffnMemberTokens[m] * hidden, hidden);
@@ -1234,18 +1317,28 @@ internal sealed class Qwen4ExpEngine : IDisposable
                 target[h] += weight * source[h];
             }
         }
+
+        if (routedChain)
+        {
+            Accumulate(ref _profileMoeCombineTicks, combineStart);
+        }
     }
 
     // One expert chain for a single member of a multi-token chunk's group: the same gate/up/down the batched chain runs, but
     // through solo GEMVs on the fast-path scratch — a one-member group has nothing to batch, and every solo row is the batched
     // kernel's single-row row bit-for-bit. The member's hidden row accumulates into its token's output row scaled by its
-    // routing weight, exactly as the batched accumulation does.
+    // routing weight, exactly as the batched accumulation does. This chain only ever serves a routed group, so its regions
+    // always report through the routed substages.
     private void RunSoloExpertChain(int member, WeightRef gate, WeightRef up, WeightRef down, float[] ffnOut)
     {
         int hidden = _hiddenSize;
         int inter = _intermediateSize;
 
+        long gateStart = BeginProfile();
         _backend.Gemv(_ffnSubsetIn.AsSpan(0, hidden), gate, _soloGateOut);
+        Accumulate(ref _profileMoeGateTicks, gateStart);
+
+        long upStart = BeginProfile();
         _backend.Gemv(_ffnSubsetIn.AsSpan(0, hidden), up, _soloUpOut);
 
         for (int i = 0; i < inter; i++)
@@ -1253,14 +1346,21 @@ internal sealed class Qwen4ExpEngine : IDisposable
             _soloGateOut[i] = LayerOps.Silu(_soloGateOut[i]) * _soloUpOut[i];
         }
 
-        _backend.Gemv(_soloGateOut, down, _soloDownOut);
+        Accumulate(ref _profileMoeUpTicks, upStart);
 
+        long downStart = BeginProfile();
+        _backend.Gemv(_soloGateOut, down, _soloDownOut);
+        Accumulate(ref _profileMoeDownTicks, downStart);
+
+        long combineStart = BeginProfile();
         Span<float> target = ffnOut.AsSpan(_ffnMemberTokens[member] * hidden, hidden);
         float weight = _ffnMemberWeights[member];
         for (int h = 0; h < hidden; h++)
         {
             target[h] += weight * _soloDownOut[h];
         }
+
+        Accumulate(ref _profileMoeCombineTicks, combineStart);
     }
 
     // One token's routing: the same all-expert softmax, ascending strict-greater top-k with lower-index tie resolution,
@@ -1922,8 +2022,11 @@ internal sealed class Qwen4ExpSequence
 /// <summary>
 /// One bounded qwen4exp forward window's accumulated stage and per-layer times, in milliseconds. Stage times partition every
 /// instrumented forward into seed/embedding, hyper-connection mixes, linear attention kernels, sparse attention, hyper
-/// combines, sparse feed-forward, dense feed-forward, and the output mix plus logit head; total is the whole forward.
-/// Assembly-internal diagnostic shape behind the engine's profiling seam.
+/// combines, sparse feed-forward, dense feed-forward, and the output mix plus logit head; total is the whole forward. The
+/// sparse feed-forward stage carries its own substage partition beside it: router scores/selection/union build/member pack,
+/// the routed gate projections, the routed up projections with their SwiGLU fold, the routed down projections, the routed
+/// weighted fold into each token's output row, and the shared expert's selector score plus its whole gate/up/down/fold chain
+/// as one region. Assembly-internal diagnostic shape behind the engine's profiling seam.
 /// </summary>
 internal readonly record struct Qwen4ExpLayerProfile(
     double SeedMs,
@@ -1934,6 +2037,12 @@ internal readonly record struct Qwen4ExpLayerProfile(
     double SparseAttentionMs,
     double CombineMs,
     double MoeFeedForwardMs,
+    double MoeRouterMs,
+    double MoeGateMs,
+    double MoeUpMs,
+    double MoeDownMs,
+    double MoeSharedMs,
+    double MoeCombineMs,
     double DenseFeedForwardMs,
     double LogitsMs,
     double TotalMs,

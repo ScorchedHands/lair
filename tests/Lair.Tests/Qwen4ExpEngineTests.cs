@@ -549,6 +549,134 @@ public sealed class Qwen4ExpEngineTests : IDisposable
         Assert.True(BitsEqual(unprofiled, profiled), "a profiled solo forward must land on the unprofiled solo run bit-for-bit");
     }
 
+    [Fact]
+    public void TransformerModel_Qwen4ExpLayerProfiling_SplitsSparseFeedForwardIntoRouterGateUpDownCombineSubstages()
+    {
+        // moe_ffn_ms keeps covering the whole sparse feed-forward, and the new substage fields partition it: the batched
+        // chunk's router scores/selection/dispatch, its routed gate, up-plus-SwiGLU-fold and down passes, and its weighted
+        // fold into each token's output row each carry a positive time, every substage stays inside the parent stage, and a
+        // fixture that declares no shared expert reports the shared region exactly zero. The forward's logits stay
+        // bit-identical whether or not the split is reported.
+        using GgufFile file = OpenFixture(BuildGguf(MetadataPairs(), FixtureTensors()));
+        using CpuBackend backend = new();
+
+        using TransformerModel model = TransformerModel.Open(file, backend, maxContextTokens: 8);
+
+        Span<float> unprofiled = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2]);
+        Qwen4ExpLayerProfile untouched = model.Qwen4ExpLayerProfileSummary();
+        Assert.Equal(0.0, untouched.MoeRouterMs);
+        Assert.Equal(0.0, untouched.MoeGateMs);
+        Assert.Equal(0.0, untouched.MoeUpMs);
+        Assert.Equal(0.0, untouched.MoeDownMs);
+        Assert.Equal(0.0, untouched.MoeSharedMs);
+        Assert.Equal(0.0, untouched.MoeCombineMs);
+
+        model.EnableQwen4ExpLayerProfiling();
+        model.ResetQwen4ExpLayerProfile();
+        Span<float> profiled = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2]);
+        Qwen4ExpLayerProfile summary = model.Qwen4ExpLayerProfileSummary();
+
+        Assert.True(summary.MoeRouterMs > 0.0, "the router scores, per-token selection and member dispatch must carry their own positive substage time");
+        Assert.True(summary.MoeGateMs > 0.0, "the routed gate projections must carry their own positive substage time");
+        Assert.True(summary.MoeUpMs > 0.0, "the routed up projections and their SwiGLU fold must carry their own positive substage time");
+        Assert.True(summary.MoeDownMs > 0.0, "the routed down projections must carry their own positive substage time");
+        Assert.True(summary.MoeCombineMs > 0.0, "the routed weighted fold into each token's output row must carry its own positive substage time");
+        Assert.True(summary.MoeSharedMs == 0.0, "a fixture declaring no shared expert must report the shared region exactly zero");
+
+        Assert.True(summary.MoeFeedForwardMs >= summary.MoeRouterMs, "moe_ffn_ms must keep covering the router substage");
+        Assert.True(summary.MoeFeedForwardMs >= summary.MoeGateMs, "moe_ffn_ms must keep covering the gate substage");
+        Assert.True(summary.MoeFeedForwardMs >= summary.MoeUpMs, "moe_ffn_ms must keep covering the up substage");
+        Assert.True(summary.MoeFeedForwardMs >= summary.MoeDownMs, "moe_ffn_ms must keep covering the down substage");
+        Assert.True(summary.MoeFeedForwardMs >= summary.MoeCombineMs, "moe_ffn_ms must keep covering the combine substage");
+
+        double substageSum = summary.MoeRouterMs + summary.MoeGateMs + summary.MoeUpMs + summary.MoeDownMs + summary.MoeSharedMs + summary.MoeCombineMs;
+        Assert.True(substageSum <= summary.MoeFeedForwardMs, "the substages partition the sparse feed-forward stage and never exceed it");
+        Assert.True(substageSum >= 0.5 * summary.MoeFeedForwardMs, "the substages must cover the bulk of the stage: only the output-row clear and scratch copies stay uninstrumented");
+
+        Assert.True(BitsEqual(unprofiled, profiled), "splitting the sparse feed-forward stage must not move a single logit bit");
+
+        model.ResetQwen4ExpLayerProfile();
+        Qwen4ExpLayerProfile cleared = model.Qwen4ExpLayerProfileSummary();
+        Assert.Equal(0.0, cleared.MoeFeedForwardMs);
+        Assert.Equal(0.0, cleared.MoeRouterMs);
+        Assert.Equal(0.0, cleared.MoeGateMs);
+        Assert.Equal(0.0, cleared.MoeUpMs);
+        Assert.Equal(0.0, cleared.MoeDownMs);
+        Assert.Equal(0.0, cleared.MoeSharedMs);
+        Assert.Equal(0.0, cleared.MoeCombineMs);
+    }
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpLayerProfiling_SoloAndBatchedMoEReportSharedExpertAsItsOwnSubstage()
+    {
+        // The shared expert reports as one region covering its selector score, its gate/up/down chain and its fold, in both
+        // postures: a batched chunk over a gated shared-expert fixture and the solo single-token fast path each carry a
+        // positive shared region beside positive router/gate/up/down/combine substages, the shared chain never also lands in
+        // the routed gate/up/down accumulators (the six stay inside the parent stage), and every profiled forward lands
+        // bit-for-bit on its unprofiled run — including the chunk-split parity the solo fast path already guarantees.
+        List<(string Key, object Value)> pairs = MetadataPairs(4, 2);
+        pairs.Add(("qwen4exp.expert_shared_count", 1));
+
+        List<TensorDef> tensors = [.. FixtureTensors(4)];
+        for (int layer = 0; layer < Layers; layer++)
+        {
+            tensors.Add(new TensorDef($"blk.{layer}.ffn_gate_shexp.weight", [IntermediateSize, Hidden]));
+            tensors.Add(new TensorDef($"blk.{layer}.ffn_up_shexp.weight", [IntermediateSize, Hidden]));
+            tensors.Add(new TensorDef($"blk.{layer}.ffn_down_shexp.weight", [Hidden, IntermediateSize]));
+            tensors.Add(new TensorDef($"blk.{layer}.ffn_gate_inp_shexp.weight", [Hidden]));
+        }
+
+        using GgufFile file = OpenFixture(BuildGguf(pairs, tensors));
+        using CpuBackend backend = new();
+
+        using TransformerModel model = TransformerModel.Open(file, backend, maxContextTokens: 8);
+        Assert.True(model.Plan.SparseFfn!.HasSharedExpert);
+
+        Span<float> unprofiledBatched = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2, 3]);
+        Span<float> unprofiledSolo = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [1]);
+
+        model.EnableQwen4ExpLayerProfiling();
+
+        model.ResetQwen4ExpLayerProfile();
+        Span<float> profiledBatched = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2, 3]);
+        Qwen4ExpLayerProfile batched = model.Qwen4ExpLayerProfileSummary();
+
+        Assert.True(batched.MoeSharedMs > 0.0, "the batched shared expert must carry its own positive substage time");
+        Assert.True(batched.MoeRouterMs > 0.0);
+        Assert.True(batched.MoeGateMs > 0.0);
+        Assert.True(batched.MoeUpMs > 0.0);
+        Assert.True(batched.MoeDownMs > 0.0);
+        Assert.True(batched.MoeCombineMs > 0.0);
+
+        double batchedSum = batched.MoeRouterMs + batched.MoeGateMs + batched.MoeUpMs + batched.MoeDownMs + batched.MoeSharedMs + batched.MoeCombineMs;
+        Assert.True(batchedSum <= batched.MoeFeedForwardMs, "the shared chain must report through its own region instead of doubling the routed gate/up/down accumulators");
+        Assert.True(batchedSum >= 0.5 * batched.MoeFeedForwardMs, "the substages must cover the bulk of the stage");
+        Assert.True(BitsEqual(unprofiledBatched, profiledBatched), "a profiled batched MoE forward must land on the unprofiled run bit-for-bit");
+
+        model.ResetQwen4ExpLayerProfile();
+        Span<float> profiledSolo = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [1]);
+        Qwen4ExpLayerProfile solo = model.Qwen4ExpLayerProfileSummary();
+
+        Assert.True(solo.MoeSharedMs > 0.0, "the solo shared expert must carry its own positive substage time");
+        Assert.True(solo.MoeRouterMs > 0.0);
+        Assert.True(solo.MoeGateMs > 0.0);
+        Assert.True(solo.MoeUpMs > 0.0);
+        Assert.True(solo.MoeDownMs > 0.0);
+        Assert.True(solo.MoeCombineMs > 0.0);
+
+        double soloSum = solo.MoeRouterMs + solo.MoeGateMs + solo.MoeUpMs + solo.MoeDownMs + solo.MoeSharedMs + solo.MoeCombineMs;
+        Assert.True(soloSum <= solo.MoeFeedForwardMs, "the solo substages partition the solo sparse feed-forward stage");
+        Assert.True(BitsEqual(unprofiledSolo, profiledSolo), "a profiled solo MoE forward must land on the unprofiled solo run bit-for-bit");
+
+        // The split is reporting-only: the same chunk run still lands bit-for-bit on its per-token solo rows.
+        Qwen4ExpSequence perToken = model.NewQwen4ExpSequence();
+        for (int t = 0; t < 4; t++)
+        {
+            Span<float> row = model.ForwardQwen4ExpChunk(perToken, [t]);
+            Assert.True(BitsEqual(row, unprofiledBatched.Slice(t * VocabSize, VocabSize)), $"token {t} must keep landing on the same logits with the MoE split reported");
+        }
+    }
+
     // ---------------------------------------------------------------- batched hyper-connection mix
 
     [Fact]

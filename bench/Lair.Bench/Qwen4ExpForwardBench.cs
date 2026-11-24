@@ -441,7 +441,9 @@ internal static class Qwen4ExpForwardBench
 
     // One machine-readable profile line per measured window: the stage partition of the engine's bounded forward plus the top
     // layers by whole-block time, compact enough to parse without swallowing the output. A layer entry is
-    // layer:kind:total_ms with kind in {linear, sparse}.
+    // layer:kind:total_ms with kind in {linear, sparse}. The moe_* fields are the sparse feed-forward stage's substage
+    // partition beside moe_ffn_ms: router scores/selection/dispatch, routed gate, routed up plus its SwiGLU fold, routed
+    // down, the routed weighted fold into each token's output row, and the shared expert as one region.
     static string ProfileLine(string stage, Qwen4ExpLayerProfile profile)
     {
         List<Qwen4ExpLayerTiming> ranked = [.. profile.Layers];
@@ -454,7 +456,11 @@ internal static class Qwen4ExpForwardBench
             $" seed_ms={profile.SeedMs:F3} hyper_mix_ms={profile.HyperMixMs:F3}" +
             $" hyper_mix_attn_ms={profile.HyperMixAttentionMs:F3} hyper_mix_ffn_ms={profile.HyperMixFeedForwardMs:F3}" +
             $" attention_linear_ms={profile.LinearAttentionMs:F3} attention_sparse_ms={profile.SparseAttentionMs:F3}" +
-            $" moe_ffn_ms={profile.MoeFeedForwardMs:F3} dense_ffn_ms={profile.DenseFeedForwardMs:F3}" +
+            $" moe_ffn_ms={profile.MoeFeedForwardMs:F3} moe_router_ms={profile.MoeRouterMs:F3}" +
+            $" moe_gate_ms={profile.MoeGateMs:F3} moe_up_ms={profile.MoeUpMs:F3}" +
+            $" moe_down_ms={profile.MoeDownMs:F3} moe_shared_ms={profile.MoeSharedMs:F3}" +
+            $" moe_combine_ms={profile.MoeCombineMs:F3}" +
+            $" dense_ffn_ms={profile.DenseFeedForwardMs:F3}" +
             $" combine_ms={profile.CombineMs:F3} logits_ms={profile.LogitsMs:F3}" +
             $" total_ms={profile.TotalMs:F3} top_layers={topLayers}";
     }
@@ -502,7 +508,8 @@ internal static class Qwen4ExpForwardBench
             " which measures every non-PLE block of that target and marks parity=not_full_target_parity rather than claiming full-target forward parity;" +
             " --profile-layers turns on the engine's bounded stage/layer profiling for the measured windows only (warmup forwards are reset out) and" +
             " prints one machine-readable profile line per window: stage=prefill|decode with seed_ms, hyper_mix_ms, hyper_mix_attn_ms, hyper_mix_ffn_ms, attention_linear_ms, attention_sparse_ms," +
-            " moe_ffn_ms, dense_ffn_ms, combine_ms, logits_ms, total_ms and top_layers=layer:kind:ms entries ranked by whole-block time;" +
+            " moe_ffn_ms beside its substage partition moe_router_ms, moe_gate_ms, moe_up_ms, moe_down_ms, moe_shared_ms and moe_combine_ms, dense_ffn_ms, combine_ms, logits_ms, total_ms and" +
+            " top_layers=layer:kind:ms entries ranked by whole-block time;" +
             " any loader/plan/engine refusal prints one status=refused line naming what this build cannot run against that file, with exit code 2)");
         return 1;
     }
