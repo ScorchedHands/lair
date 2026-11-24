@@ -36,6 +36,7 @@ internal static class KvQuantDecodeBench
         int decodeTokens = ParseInt(rest, "--decode", 32);
         int windows = ParseInt(rest, "--windows", 5);
         List<string> modes = [.. ParseList(rest, "--modes", ["baseline", "q8q8", "k8v4"])];
+        bool stageProfile = rest.Contains("--stage-profile"); // off keeps every report line exactly as this bench has always printed them
 
         if (!File.Exists(modelPath))
         {
@@ -85,7 +86,7 @@ internal static class KvQuantDecodeBench
 
             try
             {
-                float[] probe = RunMode(mode, gguf, geometry, route, backend, maxContext, capacityBlocks, blockTokens, context, decodeTokens, windows);
+                float[] probe = RunMode(mode, gguf, geometry, route, backend, maxContext, capacityBlocks, blockTokens, context, decodeTokens, windows, stageProfile);
 
                 if (mode == "baseline")
                 {
@@ -118,7 +119,7 @@ internal static class KvQuantDecodeBench
     // then timed windows of a fixed token id and a fixed decode count over the same sequence.
     private static float[] RunMode(
         string mode, GgufFile gguf, ModelPlan geometry, ModelRoute route, CpuBackend backend,
-        int maxContext, int capacityBlocks, int blockTokens, int context, int decodeTokens, int windows)
+        int maxContext, int capacityBlocks, int blockTokens, int context, int decodeTokens, int windows, bool stageProfile)
     {
         KvFormatPair pair = mode switch
         {
@@ -143,6 +144,11 @@ internal static class KvQuantDecodeBench
                 pair,
                 backend.ResolvedIntegerDotPath);
 
+        if (stageProfile)
+        {
+            model.EnableDenseForwardProfiling(); // additive clock reads around the engine's existing dense spans only: every forward below still leaves the same logits and KV bytes an unprofiled run does
+        }
+
         using IKvPool pool = pair switch
         {
             { K: KvSideFormat.Q8_0, V: KvSideFormat.Q8_0 } => new BlockPool<Q8Block, Q8Block>(blockTokens, geometry.LayerCount, geometry.KvHeadCount, geometry.HeadDim, capacityBlocks, backend, pair),
@@ -155,9 +161,16 @@ internal static class KvQuantDecodeBench
         GgufTokenizer tokenizer = GgufTokenizer.FromGguf(gguf);
         int[] prompt = BuildPrompt(tokenizer, context);
 
+        if (stageProfile)
+        {
+            model.ResetDenseForwardProfile(); // the setup window's profile is read alone, before any decode forward adds to it
+        }
+
         Stopwatch prefillWatch = Stopwatch.StartNew();
         model.Prefill(prompt, kv); // fills every position the decode windows attend over: setup cost, reported apart from timing
         double prefillMs = prefillWatch.Elapsed.TotalMilliseconds;
+
+        string? setupStageLine = stageProfile ? DenseDecodeStageLine(model, mode, "prefill_setup", prompt.Length, 1) : null;
 
         long reservedBytes = checked(pool.BytesPerBlock * pool.CapacityBlocks);
         Console.WriteLine(
@@ -168,10 +181,15 @@ internal static class KvQuantDecodeBench
             $"reservedKvBytes={reservedBytes} reservedKvMiB={reservedBytes / (1024.0 * 1024.0):F2} " +
             $"descriptorBytesPerBlock={pair.BytesPerBlock(geometry.LayerCount, blockTokens, pool.KvDim)}");
 
-        return RunWindows(model, kv, mode, prompt[0], decodeTokens, windows);
+        if (setupStageLine is not null)
+        {
+            Console.WriteLine(setupStageLine);
+        }
+
+        return RunWindows(model, kv, mode, prompt[0], decodeTokens, windows, stageProfile);
     }
 
-    private static float[] RunWindows(TransformerModel model, IKvSequence kv, string mode, int nextToken, int decodeTokens, int windows)
+    private static float[] RunWindows(TransformerModel model, IKvSequence kv, string mode, int nextToken, int decodeTokens, int windows, bool stageProfile)
     {
         Stopwatch warmWatch = Stopwatch.StartNew();
         for (int i = 0; i < decodeTokens; i++)
@@ -188,6 +206,11 @@ internal static class KvQuantDecodeBench
         for (int w = 0; w < windows; w++)
         {
             int firstPosition = kv.Length;
+
+            if (stageProfile)
+            {
+                model.ResetDenseForwardProfile(); // each window's stage totals describe that window alone: the untimed warm-up forwards and any earlier window are reset out
+            }
 
             Stopwatch windowWatch = Stopwatch.StartNew();
             for (int i = 0; i < decodeTokens; i++)
@@ -206,6 +229,11 @@ internal static class KvQuantDecodeBench
             Console.WriteLine(
                 $"kv-quant mode={mode} window={w + 1} positions={firstPosition}..{kv.Length - 1} decodeMs={ms:F1} " +
                 $"tok/s={(decodeTokens / (ms / 1000.0)):F3}");
+
+            if (stageProfile)
+            {
+                Console.WriteLine(DenseDecodeStageLine(model, mode, "decode", kv.Length - firstPosition, decodeTokens));
+            }
         }
 
         Console.WriteLine(FormatStats(mode, perWindowTokS));
@@ -326,6 +354,28 @@ internal static class KvQuantDecodeBench
         }
 
         return requested; // unresolvable: the caller reports the fixture absence against the requested path
+    }
+
+    // One machine-readable dense stage line for a measured window group in this mode: the engine's own accumulated stage and per-layer totals since
+    // its last reset, with the three heaviest whole-block layers ranked beside them. Parent stages cover their substages — attention weight/kernel/KV-write
+    // times partition the attention stage, feed-forward traversal partitions its parent — so a reader names the dominant substage without double-counting it.
+    // forwardCalls states how many forwards those totals describe: every stage figure is a sum over that group rather than one window's cost.
+    private static string DenseDecodeStageLine(TransformerModel model, string mode, string windowKind, int tokensCovered, int forwardCalls)
+    {
+        DenseForwardProfile profile = model.DenseForwardProfileSummary();
+
+        List<string> topLayers = [.. profile.Layers
+            .OrderByDescending(timing => timing.TotalMs)
+            .Take(3)
+            .Select(timing => $"{timing.Layer}:{timing.TotalMs:F3}")];
+
+        return $"kv-quant mode={mode} stage window={windowKind} tokens={tokensCovered} forwardCalls={forwardCalls}" +
+               $" seed_ms={profile.SeedMs:F3} cache_append_ms={profile.CacheAppendMs:F3}" +
+               $" attention_ms={profile.AttentionMs:F3} attention_weight_ms={profile.AttentionWeightMs:F3}" +
+               $" attention_kernel_ms={profile.AttentionKernelMs:F3} kv_write_ms={profile.KvWriteMs:F3}" +
+               $" feed_forward_ms={profile.FeedForwardMs:F3} feed_forward_weight_ms={profile.FeedForwardWeightMs:F3}" +
+               $" logits_head_ms={profile.LogitsHeadMs:F3} total_ms={profile.TotalMs:F3}" +
+               $" top_layers={string.Join(",", topLayers)}";
     }
 
     private static string CollapseWhitespace(string text) => string.Join(' ', text.Split(" \t\r\n", StringSplitOptions.RemoveEmptyEntries));

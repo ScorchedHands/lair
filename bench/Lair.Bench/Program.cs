@@ -46,7 +46,7 @@ static int Usage()
     Console.WriteLine("ple-latency <gguf path> [--tokens N] [--reps R] [--substrate mmap|nocache|compare] [--resident-rows N] [--ple-cap-mb MB] [--sample K] [--out DIR] (PLE n-gram gather measurement over a real pinned model: the reference hash/history normalization per token, rows addressed out of the owning shard through the loader's row gather with first-touch and warm passes separated, an unbuffered FILE_FLAG_NO_BUFFERING baseline for those same rows, byte-for-byte parity between mapped rows and independent sector-aligned file reads, distinct-row reach tallied against a declared PLE residency ceiling; storage/governance evidence only - no forward pass runs and no posture or config change)");
     Console.WriteLine("ple-policy <gguf path> [--tokens N] [--reps R] [--caps MiB,MiB,...] [--inflight-rows D] [--overlap-depth K] [--token-dist uniform|zipf] [--vocab-window W] [--ple-cap-mb MB] [--numa] [--substrate-label TEXT] [--out DIR] (PLE access-scheduling measurement over a real pinned model: demand-only gather, bounded computed-address prefetch overlap, frequency-sketch hot-row residency with and without prefetch under declared caps, and Linux NUMA/huge-page placement facts where the host offers them; storage/governance evidence only - no forward pass runs and no posture or config change)");
     Console.WriteLine("lowrank-svd <gguf path> [--layers 0,16,32] [--experts 0,7] [--roles gate,up,down] (analytical low-rank viability spike for stacked MoE expert tensors: per-expert slab views dequantized to float32 through the engine CPU route, exact numpy singular spectra, rank-energy aggregates, and an active-bytes-per-token storage comparison; analytical evidence only - no kernel throughput benchmark and no posture or config change), mtp [models/SmolLM-135M-Instruct-F16.gguf] [--threads N] [--context C] [--decode D] [--windows W] [--draft-window K] (CPU speculative-draft seam measurement on a pinned small fixture: scripted draft heads over SpeculativeDecoder's accept-prefix verify put against an undrafted greedy baseline - median/min/max tok/s per window, accept-rate tallies, and drafted-vs-baseline stream equality; multipliers document drafting overhead until single-forward batched verification exists in the engine)");
-    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M] [--grid scalar|gather|compare] [--prefetch on|off|compare], prefill-profile <gguf path> [--threads N] [--lengths L1,L2,...] [--widths W1,W2,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--out <path>], kv-spike [model.gguf] [--modes baseline,f32block,q8k,q4] [--threads N] [--context C] [--decode D] [--windows N], q4-parity <gguf path> [--ref llama-ref.json] [--out measurement.txt] [--prompts p1,p2,p3,p4] [--threads N] [--context C], kv-micro [model.gguf] [--modes baseline,f32block,q8k,q4] [--threads N] [--context P], cuda-concurrency [--rows R] [--cols C] [--batch B] [--reps R] [--sweeps S] [--pairs mixed_gemv_q4k__gemm_f16,two_gemv_q8_0__q6_k,two_gemm_q8_0__bf16] [--out <path>] (MVP6.1 co-scheduling payoff measurement: the same pinned fixtures and seam kernels serialized on the legacy stream versus overlapped across two non-blocking CUstreams in one shared primary context, with single-arm baselines, device-measured busy tallies per arm, a bit-exact equivalence check between arms, and per-sweep payoff ratios; bench-side measurement seam only - independent of the production stream seam and no posture or config change), or kv-quant [models/SmolLM-135M-Instruct-F16.gguf] [--modes baseline,q8q8,k8v4] [--threads N] [--context C] [--decode D] [--windows N] (production CPU quantized KV decode routes - f32/f32, q8_0/q8_0, q8_0/q4_0 - measured against the FP32 baseline: median/min/max tok/s per mode, argmax and max-abs-logit equivalence vs the run's own baseline probe, pool footprint bytesPerBlock/reservedKvBytes), cuda-gemv [--rows R] [--cols C] [--batch B] [--reps R] [--formats F1,F2,...] (Bench Gate measurement over deterministic pinned synthetic fixtures at rows=512 cols=1024 batch=32 reps=7 by default, sweeping every QuantFormat the CUDA seam carries today: per-format CPU wall time on a single-threaded scalar-oracle arm and an auto-threaded engine arm with its worker count reported vs CudaBackend.GemvBatch launch wall after untimed warm-up (activation upload/output download/launch/sync inside each timed call, one-time device weight copy excluded), plus that launch's device-measured kernel-busy microseconds read off KernelBusyMicrosecondsTotal deltas; speed ratios CPU-vs-CUDA total pass and CPU-wall-vs-kernel-busy compute-only labeled as excluding PCIe/runtime transfer overhead; one untimed paired pass per format reports max relative drift between the CPU scalar chain and the CUDA chain over identical inputs without asserting or widening any band; stdout only, no model file required), cuda-gemm [--rows R] [--cols C] [--batch B] [--reps R] [--formats F1,F2,...] (Bench Gate measurement over the same pinned fixtures at rows=512 cols=1024 batch=32 reps=7 by default, sweeping every QuantFormat CudaBackend.HasGemmKernel answers true for: per-format CPU wall time on a single-threaded scalar-oracle arm used for untimed equivalence and an auto-threaded engine arm with its worker count reported, both taking that format's own dense-matrix weight pass (CpuBackend.GemmBatch where SupportsGemm is true - Q8_0/Q4_K/IQ4_XS - otherwise CpuBackend.GemvBatch as the batched-row alternative, printed per format as cpuRoute=gemm|gemv) vs CudaBackend.GemmBatch launch wall after untimed warm-up (activation upload/output download/launch/sync inside each timed call, one-time device copy excluded), plus that launch's device-measured kernel-busy microseconds read off KernelBusyMicrosecondsTotal deltas; speed ratios CPU-vs-CUDA total pass and CPU-wall-vs-kernel-busy compute-only labeled as excluding PCIe/runtime transfer overhead, with GFLOP/s per arm from 2*rows*cols*batch; one untimed paired pass per format reports max relative drift between the scalar CPU chain of that route and the CUDA blocked matmul without asserting or widening any band; stdout only, no model file required)");
+    Console.WriteLine("unknown subcommand; expected gemv, gguf-dump <path>, gemv-file <gguf path> [--threads N] [--reps R] [--max-rows M] [--grid scalar|gather|compare] [--prefetch on|off|compare], prefill-profile <gguf path> [--threads N] [--lengths L1,L2,...] [--widths W1,W2,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--stage-profile] [--out <path>], kv-spike [model.gguf] [--modes baseline,f32block,q8k,q4] [--threads N] [--context C] [--decode D] [--windows N], q4-parity <gguf path> [--ref llama-ref.json] [--out measurement.txt] [--prompts p1,p2,p3,p4] [--threads N] [--context C], kv-micro [model.gguf] [--modes baseline,f32block,q8k,q4] [--threads N] [--context P], cuda-concurrency [--rows R] [--cols C] [--batch B] [--reps R] [--sweeps S] [--pairs mixed_gemv_q4k__gemm_f16,two_gemv_q8_0__q6_k,two_gemm_q8_0__bf16] [--out <path>] (MVP6.1 co-scheduling payoff measurement: the same pinned fixtures and seam kernels serialized on the legacy stream versus overlapped across two non-blocking CUstreams in one shared primary context, with single-arm baselines, device-measured busy tallies per arm, a bit-exact equivalence check between arms, and per-sweep payoff ratios; bench-side measurement seam only - independent of the production stream seam and no posture or config change), or kv-quant [models/SmolLM-135M-Instruct-F16.gguf] [--modes baseline,q8q8,k8v4] [--threads N] [--context C] [--decode D] [--windows N] [--stage-profile] (production CPU quantized KV decode routes - f32/f32, q8_0/q8_0, q8_0/q4_0 - measured against the FP32 baseline: median/min/max tok/s per mode, argmax and max-abs-logit equivalence vs the run's own baseline probe, pool footprint bytesPerBlock/reservedKvBytes), cuda-gemv [--rows R] [--cols C] [--batch B] [--reps R] [--formats F1,F2,...] (Bench Gate measurement over deterministic pinned synthetic fixtures at rows=512 cols=1024 batch=32 reps=7 by default, sweeping every QuantFormat the CUDA seam carries today: per-format CPU wall time on a single-threaded scalar-oracle arm and an auto-threaded engine arm with its worker count reported vs CudaBackend.GemvBatch launch wall after untimed warm-up (activation upload/output download/launch/sync inside each timed call, one-time device weight copy excluded), plus that launch's device-measured kernel-busy microseconds read off KernelBusyMicrosecondsTotal deltas; speed ratios CPU-vs-CUDA total pass and CPU-wall-vs-kernel-busy compute-only labeled as excluding PCIe/runtime transfer overhead; one untimed paired pass per format reports max relative drift between the CPU scalar chain and the CUDA chain over identical inputs without asserting or widening any band; stdout only, no model file required), cuda-gemm [--rows R] [--cols C] [--batch B] [--reps R] [--formats F1,F2,...] (Bench Gate measurement over the same pinned fixtures at rows=512 cols=1024 batch=32 reps=7 by default, sweeping every QuantFormat CudaBackend.HasGemmKernel answers true for: per-format CPU wall time on a single-threaded scalar-oracle arm used for untimed equivalence and an auto-threaded engine arm with its worker count reported, both taking that format's own dense-matrix weight pass (CpuBackend.GemmBatch where SupportsGemm is true - Q8_0/Q4_K/IQ4_XS - otherwise CpuBackend.GemvBatch as the batched-row alternative, printed per format as cpuRoute=gemm|gemv) vs CudaBackend.GemmBatch launch wall after untimed warm-up (activation upload/output download/launch/sync inside each timed call, one-time device copy excluded), plus that launch's device-measured kernel-busy microseconds read off KernelBusyMicrosecondsTotal deltas; speed ratios CPU-vs-CUDA total pass and CPU-wall-vs-kernel-busy compute-only labeled as excluding PCIe/runtime transfer overhead, with GFLOP/s per arm from 2*rows*cols*batch; one untimed paired pass per format reports max relative drift between the scalar CPU chain of that route and the CUDA blocked matmul without asserting or widening any band; stdout only, no model file required)");
     return 1;
 }
 
@@ -888,13 +888,14 @@ static int BenchPrefillProfile(string[] args)
 {
     if (args.Length < 2)
     {
-        Console.WriteLine("usage: prefill-profile <gguf path> [--threads N] [--lengths 16,32,...] [--widths 16,32,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--out <path>]");
+        Console.WriteLine("usage: prefill-profile <gguf path> [--threads N] [--lengths 16,32,...] [--widths 16,32,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--stage-profile] [--out <path>]");
         return 1;
     }
 
     int threads = 0; // 0 = the backend's auto-sizing, same posture as the serve surface with engine.threads unset
     int reps = 3;
     bool perToken = false;
+    bool stageProfile = false; // off keeps every report line exactly as this profile has always printed them
     string? outPath = null;
     List<int> lengths = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048];
     List<int>? rowWidths = null; // the resolved-row-count axis: one candidate engine per listed width; absent keeps the single default engine
@@ -1015,6 +1016,9 @@ static int BenchPrefillProfile(string[] args)
             case "--per-token":
                 perToken = true;
                 break;
+            case "--stage-profile":
+                stageProfile = true; // the engine's dense stage/layer seam reports one machine-readable line per measured window group
+                break;
             case "--out":
                 if (i + 1 >= args.Length)
                 {
@@ -1098,7 +1102,8 @@ static int BenchPrefillProfile(string[] args)
         $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} " +
         $"reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" +
         (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : "") +
-        (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : ""));
+        (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : "") +
+        (stageProfile ? " stageProfile=on" : ""));
 
     // One engine per candidate resolved width per requested kernel; without either axis this is exactly the single default engine the profile has always opened. Each candidate disposes before the next opens, so peak model memory stays one engine wide even as their tables interleave in the report body below. A kernel the engine refuses for this file contributes a refusal line and no table: the selection never falls back to the route that happens to run.
     List<int> candidateWidths = rowWidths ?? [0]; // 0: public open with no explicit resolution — whatever the plan resolves today
@@ -1136,6 +1141,12 @@ static int BenchPrefillProfile(string[] args)
 
         using TransformerModel model = opened;
 
+        if (stageProfile)
+        {
+            // The engine's own dense stage/layer seam: additive clock reads around existing spans only, so every measured window below still lands on the same logits and KV bytes an unprofiled run leaves.
+            model.EnableDenseForwardProfiling();
+        }
+
         int resolvedRows = model.ResolvedPrefillRowWidth; // the engine's own answer to what its prompt windows carry
 
         if (rowWidths is not null)
@@ -1147,6 +1158,8 @@ static int BenchPrefillProfile(string[] args)
         }
 
         List<PrefillRow> rows = [];
+        List<string> stageLines = []; // one dense stage line per measured window group when --stage-profile is set; empty otherwise
+
         foreach (int length in lengths)
         {
             int subBatches = (length + resolvedRows - 1) / resolvedRows;
@@ -1157,6 +1170,12 @@ static int BenchPrefillProfile(string[] args)
             for (int rep = 0; rep < reps + 1; rep++)
             {
                 using SequenceKv kv = new(pool);
+
+                if (rep == 1 && stageProfile)
+                {
+                    model.ResetDenseForwardProfile(); // the untimed warm pass must not land in the measured profile
+                }
+
                 Stopwatch sw = Stopwatch.StartNew();
                 model.Prefill(prompt.AsSpan(0, length).ToArray(), kv);
                 sw.Stop();
@@ -1166,6 +1185,11 @@ static int BenchPrefillProfile(string[] args)
                 }
             }
 
+            if (stageProfile)
+            {
+                stageLines.Add(DenseStageLine(model, kernelName, resolvedRows, length, "window", reps));
+            }
+
             double perTokenMs = double.NaN;
             if (perToken)
             {
@@ -1173,6 +1197,12 @@ static int BenchPrefillProfile(string[] args)
                 for (int rep = 0; rep < reps + 1; rep++)
                 {
                     using SequenceKv kv = new(pool);
+
+                    if (rep == 1 && stageProfile)
+                    {
+                        model.ResetDenseForwardProfile(); // the stepwise profile describes its own timed forwards only
+                    }
+
                     Stopwatch sw = Stopwatch.StartNew();
                     for (int i = 0; i < length; i++)
                     {
@@ -1184,6 +1214,11 @@ static int BenchPrefillProfile(string[] args)
                     {
                         perTokenMs = Math.Min(perTokenMs, sw.Elapsed.TotalMilliseconds);
                     }
+                }
+
+                if (stageProfile)
+                {
+                    stageLines.Add(DenseStageLine(model, kernelName, resolvedRows, length, "stepwise", reps));
                 }
             }
 
@@ -1315,6 +1350,12 @@ static int BenchPrefillProfile(string[] args)
             reportBody.Add(tableLine);
             Console.WriteLine(tableLine);
         }
+
+        foreach (string stageLine in stageLines)
+        {
+            reportBody.Add(stageLine);
+            Console.WriteLine(stageLine);
+        }
     }
 
     // Peak working set of this process at the close of the run — the engine's own mapped weights plus whatever the
@@ -1333,7 +1374,7 @@ static int BenchPrefillProfile(string[] args)
         [
             $"prefill-profile file={gguf.Path} bytes={gguf.FileSize} threads={backend.EffectiveWorkerCount} maxBatchSequences={TransformerModel.MaxBatchSequences}",
             $"  arch={geometry.Architecture} layers={geometry.LayerCount} hidden={geometry.HiddenSize} heads={geometry.HeadCount} kvHeads={geometry.KvHeadCount} headDim={geometry.HeadDim} vocab={geometry.VocabSize} windowedLayers={windowedLayers} avx2={Avx2.IsSupported}",
-            $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" + (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : "") + (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : ""),
+            $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" + (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : "") + (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : "") + (stageProfile ? " stageProfile=on" : ""),
             .. reportBody,
         ];
 
@@ -1366,6 +1407,28 @@ static int[] BuildSyntheticPrefillPrompt(int vocabSize, int tokens)
 // its final row. These are allocation bytes at that row count, not measured process residency.
 static long EstimatedSubBatchActivationBytes(ModelPlan plan, int rows) =>
     4L * rows * (3L * plan.HiddenSize + 2L * plan.HeadCount * plan.HeadDim + 2L * plan.KvHeadCount * plan.HeadDim + 2L * plan.IntermediateSize);
+
+// One machine-readable dense stage line for a measured window group on this candidate engine: the engine's own accumulated stage and per-layer
+// totals since its last reset, with the three heaviest whole-block layers ranked beside them. Parent stages cover their substages — attention
+// weight/kernel/KV-write times partition the attention stage, feed-forward traversal partitions its parent — so a reader names the dominant substage
+// without double-counting it. forwardCalls states how many forwards those totals describe, because every stage figure is a sum over that group rather than one window's cost.
+static string DenseStageLine(TransformerModel model, string kernelName, int rowWidth, int length, string windowKind, int forwardCalls)
+{
+    DenseForwardProfile profile = model.DenseForwardProfileSummary();
+
+    List<string> topLayers = [.. profile.Layers
+        .OrderByDescending(timing => timing.TotalMs)
+        .Take(3)
+        .Select(timing => $"{timing.Layer}:{timing.TotalMs:F3}")];
+
+    return $"  prefill-profile stage window={windowKind} kernel={kernelName} rowWidth={rowWidth} length={length} forwardCalls={forwardCalls}" +
+           $" seed_ms={profile.SeedMs:F3} cache_append_ms={profile.CacheAppendMs:F3}" +
+           $" attention_ms={profile.AttentionMs:F3} attention_weight_ms={profile.AttentionWeightMs:F3}" +
+           $" attention_kernel_ms={profile.AttentionKernelMs:F3} kv_write_ms={profile.KvWriteMs:F3}" +
+           $" feed_forward_ms={profile.FeedForwardMs:F3} feed_forward_weight_ms={profile.FeedForwardWeightMs:F3}" +
+           $" logits_head_ms={profile.LogitsHeadMs:F3} total_ms={profile.TotalMs:F3}" +
+           $" top_layers={string.Join(",", topLayers)}";
+}
 
 // Open one candidate engine on a stated kernel and resolved row width (0 keeps the plan's default row count). A kernel
 // this file cannot run comes back as null with the engine's refusal reason, so the caller reports the refusal instead of

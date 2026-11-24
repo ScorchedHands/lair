@@ -1,0 +1,14 @@
+kv-quant file=C:\Users\Chuck\AppData\Local\Temp\kilo\optimize-small-cpu\models\qwen2.5-3b-instruct-q4_k_m.gguf bytes=2104932768 threads=32 isaResolved=vnni
+  arch=qwen2 layers=36 hidden=2048 heads=16 kvHeads=2 headDim=128 vocab=151936 context=256 decode=32 windows=2 blockTokens=16 poolBlocks=26
+kv-quant mode=baseline storage=f32/f32 attention=production span<float> kernel prefillSetupMs=14806.3 promptTokens=256
+kv-quant mode=baseline footprint bytesPerBlock=1179648 capacityBlocks=26 reservedKvBytes=30670848 reservedKvMiB=29.25 descriptorBytesPerBlock=1179648
+kv-quant mode=baseline stage window=prefill_setup tokens=256 forwardCalls=1 seed_ms=2.410 cache_append_ms=0.724 attention_ms=5133.892 attention_weight_ms=2354.880 attention_kernel_ms=2632.071 kv_write_ms=3.287 feed_forward_ms=9603.343 feed_forward_weight_ms=9186.107 logits_head_ms=62.372 total_ms=14805.696 top_layers=0:479.660,34:435.194,21:429.873
+kv-quant mode=baseline warmWindowTok/s=5.176
+kv-quant mode=baseline window=1 positions=288..319 decodeMs=6169.7 tok/s=5.187
+kv-quant mode=baseline stage window=decode tokens=32 forwardCalls=32 seed_ms=0.142 cache_append_ms=0.011 attention_ms=2449.525 attention_weight_ms=1613.982 attention_kernel_ms=813.480 kv_write_ms=1.877 feed_forward_ms=3314.501 feed_forward_weight_ms=3259.475 logits_head_ms=404.515 total_ms=6169.627 top_layers=31:180.562,2:180.358,17:179.442
+kv-quant mode=baseline window=2 positions=320..351 decodeMs=6246.0 tok/s=5.123
+kv-quant mode=baseline stage window=decode tokens=32 forwardCalls=32 seed_ms=0.119 cache_append_ms=0.015 attention_ms=2535.661 attention_weight_ms=1617.511 attention_kernel_ms=896.783 kv_write_ms=1.980 feed_forward_ms=3300.182 feed_forward_weight_ms=3245.660 logits_head_ms=408.799 total_ms=6245.701 top_layers=21:183.852,0:181.762,27:179.501
+kv-quant mode=baseline tok/s=[5.187, 5.123] median=5.155 min=5.123 max=5.187 spread=1.23%
+kv-quant mode=baseline probeTopId=85047/151936 probeTopLogit=8.0027
+
+  peakWorkingSetMb=1985.7 across this process run
