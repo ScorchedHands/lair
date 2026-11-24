@@ -1894,8 +1894,9 @@ Qwen3.8-Flash-Next runs: sparse MoE with residency management.
 - [x] Tune chunk size after batching — rerun the profiled pinned-shard harness at chunk 16/32/64/128 to find the best bounded prefill window after GDN/MoE/hyper batching; decode single-token posture should remain solo.
   - Verify: Xeon evidence shows the best chunk window and no decode regression, and the result is recorded in `/tmp/lair-transfer` or equivalent evidence file.
   - Measured Xeon confirmation: `chunk=32` was best (`prefill_tps=0.76`, `decode_tps=0.38`, `prefill attention_linear_ms=47294`, `prefill moe_ffn_ms=80092`) versus the prior `chunk=16` baseline (`prefill_tps=0.72`, `decode_tps=0.38`, `prefill attention_linear_ms=49013`, `prefill moe_ffn_ms=86310`). `chunk=64` regressed prefill (`prefill_tps=0.67`, `decode_tps=0.39`) while `chunk=128` was refused by the bounded harness cap (`count <= 64`).
-- [→] Profile and reduce MoE substage — add gate/up/down/shared-expert/router substage timing to the bounded `qwen4exp` MoE profile and optimize the dominant substage without changing full target semantics.
+- [x] Profile and reduce MoE substage — add gate/up/down/shared-expert/router substage timing to the bounded `qwen4exp` MoE profile and optimize the dominant substage without changing full target semantics.
   - Verify: targeted non-CUDA tests prove bounded qwen4exp forward remains deterministic/bit-identical where feasible, profiling shows reduced dominant MoE substage time or identifies the dominant substage, and throughput improves without regressing decode.
+  - Measured Xeon confirmation: profiling landed and identified the dominant MoE substages without applying a further optimization. At `--threads 8 --chunk 32 --skip-ple --profile-layers`, prefill `moe_ffn_ms=80016` split as `moe_gate_ms=30907`, `moe_up_ms=31398`, `moe_down_ms=13639`, `moe_router_ms=989`, `moe_combine_ms=245`, and `moe_shared_ms=0`; decode `moe_ffn_ms=40267` split as `moe_gate_ms=13604`, `moe_up_ms=13691`, `moe_down_ms=7323`, `moe_router_ms=727`, `moe_combine_ms=142`, and `moe_shared_ms=0`. Gate and up are the dominant routed pair, with down next.
 
 #### Tests
 
