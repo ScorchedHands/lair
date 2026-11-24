@@ -55,6 +55,13 @@
     Also run the CPU suites that open a small pinned model from models/ (serve, parity, hybrid posture). Requires those
     files to be present in the repository working tree.
 
+.PARAMETER IncludeQwen4ExpForward
+    Opt-in bounded qwen4exp forward gate: one 'qwen4exp-forward-file' bench command over the declared shards on this lane's
+    thread quota. It is not part of the default RealFile gate table, so a lane that does not ask for it behaves exactly as
+    before. The command reports prefill/decode tokens-per-second or exits non-zero with one status=refused line naming which
+    tensor role/posture this build cannot open against that file - a refusal is recorded as a gate failure rather than being
+    swallowed, because the refusal text is itself the evidence the lane is asked to collect.
+
 .EXAMPLE
     ./scripts/run-cpu-first-lane.ps1 -DryRun
 .EXAMPLE
@@ -79,7 +86,9 @@ param(
 
     [string]$ReportPath = '',
 
-    [switch]$IncludeSmallModelSuites
+    [switch]$IncludeSmallModelSuites,
+
+    [switch]$IncludeQwen4ExpForward
 )
 
 . (Join-Path $PSScriptRoot 'lane-gates.common.ps1')
@@ -189,6 +198,17 @@ function New-LaneGateList {
             Add-Gate "ple-disk-gather-reality-check[$([System.IO.Path]::GetFileName($shard.Path))]" 'dotnet' @(
                 'run', '--project', 'bench/Lair.Bench', '-c', 'Release', '--no-build', '--', 'gguf-dump', $shard.Path
             ) "streamed shard stays on disk: header parse now, indexed row gather once the PLE seam exists"
+        }
+
+        if ($IncludeQwen4ExpForward) {
+            # Any one declared shard is a valid entry point: the loader assembles its -NNNNN-of-NNNNN siblings automatically, and
+            # the bounded qwen4exp seam reads only packed weight views for blocks it composes (never the PLE table span).
+            $entryShard = @($Shards)[0]
+            $forwardArgs = @('run', '--project', 'bench/Lair.Bench', '-c', 'Release', '--no-build', '--', 'qwen4exp-forward-file', $entryShard.Path)
+            if ($Threads -gt 0) { $forwardArgs += @('--threads', ([string]$Threads)) }
+
+            Add-Gate "reality-check-qwen4exp-forward-file[$([System.IO.Path]::GetFileName($entryShard.Path))]" 'dotnet' $forwardArgs `
+                'assembled pinned shards resident within the declared RAM headroom: bounded chunk forwards over short synthetic windows; a seam refusal exits non-zero naming the unsupported role/posture rather than half-running the target'
         }
     }
 
