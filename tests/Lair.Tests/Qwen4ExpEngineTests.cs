@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Text;
 
 using Lair.Backends.Cpu;
@@ -425,6 +426,106 @@ public sealed class Qwen4ExpEngineTests : IDisposable
         Assert.True(BitsEqual(defaultRun, disabledRun), "a disabled forward after profiling must land on the unprofiled run bit-for-bit");
     }
 
+    // ---------------------------------------------------------------- batched sparse feed-forward
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpBatchedMoE_MultiTokenChunk_MatchesPerTokenAndPairRunsBitForBit()
+    {
+        // Four experts with two routed per token over a four-token chunk: eight selections across four experts guarantee at
+        // least one expert serves two tokens, so the batched path groups that expert's members. Grouping must not move a
+        // token's arithmetic: every row of the one-chunk run lands bit-for-bit on the same tokens forwarded as single-token
+        // chunks and as two-token chunks.
+        using GgufFile file = OpenFixture(BuildGguf(MetadataPairs(4, 2), FixtureTensors(4)));
+        using CpuBackend backend = new();
+
+        using TransformerModel model = TransformerModel.Open(file, backend, maxContextTokens: 8);
+
+        Span<float> whole = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2, 3]);
+
+        Qwen4ExpSequence perToken = model.NewQwen4ExpSequence();
+        for (int t = 0; t < 4; t++)
+        {
+            Span<float> row = model.ForwardQwen4ExpChunk(perToken, [t]);
+            Assert.True(BitsEqual(row, whole.Slice(t * VocabSize, VocabSize)), $"token {t} must land on the same logits whether its chunk batched its expert group or ran alone");
+        }
+
+        Qwen4ExpSequence pairs = model.NewQwen4ExpSequence();
+        Span<float> head = model.ForwardQwen4ExpChunk(pairs, [0, 1]);
+        Span<float> tail = model.ForwardQwen4ExpChunk(pairs, [2, 3]);
+        Assert.True(BitsEqual(head, whole.Slice(0, 2 * VocabSize)), "a pair chunk must not move the first two rows");
+        Assert.True(BitsEqual(tail, whole.Slice(2 * VocabSize, 2 * VocabSize)), "a pair chunk must not move the last two rows");
+
+        // A repeat of the batched run reproduces it bit-for-bit: grouping carries no per-run state.
+        Assert.True(BitsEqual(model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2, 3]), whole), "the batched run must repeat bit-for-bit on a fresh sequence");
+    }
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpBatchedMoE_RunsExpertMembersThroughMultiRowBatchedPasses()
+    {
+        // The seam's batched posture is observable: a single-token chunk answers every batched pass with one row, while a
+        // four-token chunk over the same fixture answers at least one pass with more than one row — the chunk's expert
+        // groups and router projection run as multi-row passes through the backend's batched kernel.
+        using GgufFile file = OpenFixture(BuildGguf(MetadataPairs(4, 2), FixtureTensors(4)));
+
+        using (CpuBackend inner = new())
+        {
+            CountingBackend solo = new(inner);
+            using TransformerModel soloModel = TransformerModel.Open(file, solo, maxContextTokens: 8);
+            soloModel.ForwardQwen4ExpChunk(soloModel.NewQwen4ExpSequence(), [0]);
+
+            Assert.True(solo.BatchCounts.Count > 0, "a single-token forward must still reach the batched seam");
+            Assert.True(!solo.BatchCounts.Exists(count => count != 1), "every batched pass of a single-token chunk carries exactly one row");
+        }
+
+        using (CpuBackend inner = new())
+        {
+            CountingBackend batched = new(inner);
+            using TransformerModel batchedModel = TransformerModel.Open(file, batched, maxContextTokens: 8);
+            batchedModel.ForwardQwen4ExpChunk(batchedModel.NewQwen4ExpSequence(), [0, 1, 2, 3]);
+
+            Assert.True(batched.BatchCounts.Exists(count => count > 1), "a multi-token chunk must run at least one batched pass over several rows");
+        }
+    }
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpDenseFixture_BatchedDenseFeedForwardStaysFiniteAndReportsTheDenseStage()
+    {
+        // A file declaring no experts keeps the dense gate/up/down triplet, now batched across the chunk's rows: the forward
+        // stays finite and deterministic, and profiling reports the dense stage positive with the sparse stage exactly zero.
+        List<(string Key, object Value)> pairs = [.. MetadataPairs()];
+        int expertCountIndex = pairs.FindIndex(p => p.Key == "qwen4exp.expert_count");
+        int routedIndex = pairs.FindIndex(p => p.Key == "qwen4exp.expert_used_count");
+        pairs.RemoveAt(routedIndex);
+        pairs.RemoveAt(expertCountIndex); // an expert count a file declares as zero fails the load; the dense posture names no key at all
+
+        List<TensorDef> tensors = [.. DenseFixtureTensors()];
+
+        using GgufFile file = OpenFixture(BuildGguf(pairs, tensors));
+        using CpuBackend backend = new();
+
+        using TransformerModel model = TransformerModel.Open(file, backend, maxContextTokens: 8);
+        Assert.Null(model.Plan.SparseFfn);
+
+        Span<float> logits = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2]);
+        foreach (float value in logits)
+        {
+            Assert.True(float.IsFinite(value), "a batched dense qwen4exp forward must land every logit finite");
+        }
+
+        Assert.True(BitsEqual(model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2]), logits), "the batched dense forward must repeat bit-for-bit");
+
+        Qwen4ExpSequence split = model.NewQwen4ExpSequence();
+        model.ForwardQwen4ExpChunk(split, [0, 1]);
+        Assert.True(BitsEqual(model.ForwardQwen4ExpChunk(split, [2]), logits.Slice(2 * VocabSize, VocabSize)), "a chunk boundary must not move a dense forward row");
+
+        model.EnableQwen4ExpLayerProfiling();
+        model.ResetQwen4ExpLayerProfile();
+        model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2]);
+        Qwen4ExpLayerProfile summary = model.Qwen4ExpLayerProfileSummary();
+        Assert.True(summary.DenseFeedForwardMs > 0.0, "the dense stage must carry a positive time for a dense fixture");
+        Assert.Equal(0.0, summary.MoeFeedForwardMs);
+    }
+
     // ---------------------------------------------------------------- the seam refuses what it cannot read or compose
 
     [Fact]
@@ -502,8 +603,7 @@ public sealed class Qwen4ExpEngineTests : IDisposable
 
     // ---------------------------------------------------------------- fixture builders (synthetic GGUF v3 images; array metadata supported)
 
-    private static List<(string Key, object Value)> MetadataPairs() =>
-        [
+    private static List<(string Key, object Value)> MetadataPairs() =>        [
             ("general.architecture", "qwen4exp"),
             ("qwen4exp.embedding_length", Hidden),
             ("qwen4exp.block_count", Layers),
@@ -528,13 +628,25 @@ public sealed class Qwen4ExpEngineTests : IDisposable
             ("tokenizer.ggml.tokens", new string[] { "a", "b", "c", "d", "e" }),
         ];
 
-    private static List<TensorDef> FixtureTensors()
+    private static List<(string Key, object Value)> MetadataPairs(int expertCount, int routed)
+    {
+        List<(string Key, object Value)> pairs = MetadataPairs();
+        int countIndex = pairs.FindIndex(p => p.Key == "qwen4exp.expert_count");
+        int routedIndex = pairs.FindIndex(p => p.Key == "qwen4exp.expert_used_count");
+        pairs[countIndex] = ("qwen4exp.expert_count", expertCount);
+        pairs[routedIndex] = ("qwen4exp.expert_used_count", routed);
+        return pairs;
+    }
+
+    private static List<TensorDef> FixtureTensors() => FixtureTensors(ExpertCount);
+
+    private static List<TensorDef> FixtureTensors(int expertCount)
     {
         List<TensorDef> tensors = GlobalDefs();
 
         for (int layer = 0; layer < Layers; layer++)
         {
-            tensors.AddRange(LayerCommonDefs(layer));
+            tensors.AddRange(LayerCommonDefs(layer, expertCount));
             tensors.AddRange(ExpectedKinds[layer] == AttentionKind.LinearGatedDeltaNet ? LinearDefs(layer) : FullDefs(layer));
         }
 
@@ -546,10 +658,42 @@ public sealed class Qwen4ExpEngineTests : IDisposable
         return tensors;
     }
 
+    // The dense-FFN shape of the same fixture: every block keeps its hyper-connection and attention material but its feed-forward
+    // is the plain gate/up/down triplet instead of a router plus expert stack.
+    private static List<TensorDef> DenseFixtureTensors()
+    {
+        List<TensorDef> tensors = GlobalDefs();
+
+        for (int layer = 0; layer < Layers; layer++)
+        {
+            int flattened = StreamCount * Hidden;
+            foreach (string side in new[] { "hc_attn", "hc_ffn" })
+            {
+                tensors.Add(new TensorDef($"blk.{layer}.{side}_inject.weight", [StreamCount, flattened]));
+                tensors.Add(new TensorDef($"blk.{layer}.{side}_down.weight", [LowRank, flattened]));
+                tensors.Add(new TensorDef($"blk.{layer}.{side}_up.weight", [flattened, LowRank]));
+                tensors.Add(new TensorDef($"blk.{layer}.{side}_norm.weight", [flattened]));
+            }
+
+            tensors.Add(new TensorDef($"blk.{layer}.ffn_gate.weight", [IntermediateSize, Hidden]));
+            tensors.Add(new TensorDef($"blk.{layer}.ffn_up.weight", [IntermediateSize, Hidden]));
+            tensors.Add(new TensorDef($"blk.{layer}.ffn_down.weight", [Hidden, IntermediateSize]));
+
+            tensors.AddRange(ExpectedKinds[layer] == AttentionKind.LinearGatedDeltaNet ? LinearDefs(layer) : FullDefs(layer));
+        }
+
+        int flattenedWidth = StreamCount * Hidden;
+        tensors.Add(new TensorDef("output_hc_down.weight", [LowRank, flattenedWidth]));
+        tensors.Add(new TensorDef("output_hc_norm.weight", [flattenedWidth]));
+        tensors.Add(new TensorDef("output_hc_up.weight", [flattenedWidth, LowRank]));
+
+        return tensors;
+    }
+
     private static List<TensorDef> GlobalDefs() =>
         [new("token_embd.weight", [VocabSize, Hidden]), new("output.weight", [VocabSize, Hidden])];
 
-    private static List<TensorDef> LayerCommonDefs(int layer)
+    private static List<TensorDef> LayerCommonDefs(int layer, int expertCount)
     {
         int flattened = StreamCount * Hidden;
         List<TensorDef> defs = [];
@@ -562,10 +706,10 @@ public sealed class Qwen4ExpEngineTests : IDisposable
             defs.Add(new TensorDef($"blk.{layer}.{side}_norm.weight", [flattened]));
         }
 
-        defs.Add(new TensorDef($"blk.{layer}.ffn_gate_inp.weight", [ExpertCount, Hidden]));
-        defs.Add(new TensorDef($"blk.{layer}.ffn_gate_exps.weight", [ExpertCount, IntermediateSize, Hidden]));
-        defs.Add(new TensorDef($"blk.{layer}.ffn_up_exps.weight", [ExpertCount, IntermediateSize, Hidden]));
-        defs.Add(new TensorDef($"blk.{layer}.ffn_down_exps.weight", [ExpertCount, Hidden, IntermediateSize]));
+        defs.Add(new TensorDef($"blk.{layer}.ffn_gate_inp.weight", [expertCount, Hidden]));
+        defs.Add(new TensorDef($"blk.{layer}.ffn_gate_exps.weight", [expertCount, IntermediateSize, Hidden]));
+        defs.Add(new TensorDef($"blk.{layer}.ffn_up_exps.weight", [expertCount, IntermediateSize, Hidden]));
+        defs.Add(new TensorDef($"blk.{layer}.ffn_down_exps.weight", [expertCount, Hidden, IntermediateSize]));
 
         return defs;
     }
@@ -771,6 +915,38 @@ public sealed class Qwen4ExpEngineTests : IDisposable
         }
 
         return true;
+    }
+
+    // A pass-through CPU backend that records the row count of every batched kernel call, so a test can see which posture a
+    // forward actually ran its weight passes in. Every call delegates to the inner backend unchanged.
+    private sealed class CountingBackend(CpuBackend inner) : IBackend
+    {
+        public List<int> BatchCounts { get; } = [];
+
+        public string DeviceId => inner.DeviceId;
+        public WeightTier WeightTier => inner.WeightTier;
+
+        public MemoryHandle AllocateAligned(long bytes, int alignment) => inner.AllocateAligned(bytes, alignment);
+        public void FreeAligned(MemoryHandle handle) => inner.FreeAligned(handle);
+        public IKvDeviceMirror OpenKvMirror(KvMirrorRequest request) => inner.OpenKvMirror(request);
+
+        public void Gemv(ReadOnlySpan<float> x, WeightRef w, Span<float> output) => inner.Gemv(x, w, output);
+
+        public void GemvBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs)
+        {
+            BatchCounts.Add(count);
+            inner.GemvBatch(inputs, count, w, outputs);
+        }
+
+        public bool SupportsGemv(QuantFormat format) => inner.SupportsGemv(format);
+        public void GemmBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs) => inner.GemmBatch(inputs, count, w, outputs);
+        public bool SupportsGemm(QuantFormat format) => inner.SupportsGemm(format);
+        public void DequantRow(WeightRef w, int row, Span<float> output) => inner.DequantRow(w, row, output);
+        public float Dot(ReadOnlySpan<float> a, ReadOnlySpan<float> b) => inner.Dot(a, b);
+        public void Axpy(float alpha, ReadOnlySpan<float> x, Span<float> y) => inner.Axpy(alpha, x, y);
+        public void Fill(Span<float> y, float v) => inner.Fill(y, v);
+        public void Scale(Span<float> y, float s) => inner.Scale(y, s);
+        public void Dispose() => inner.Dispose();
     }
 
     private sealed record TensorDef(string Name, int[] Dims, uint GgmlType = GgmlTypeF32); // dims in logical (row-major) order; vectors are one-dimensional

@@ -67,17 +67,24 @@ internal sealed class Qwen4ExpEngine : IDisposable
     private readonly IExpertSlabSource _expertSlabs = null!;
     private readonly IGatherKernel _gatherKernel = new CpuGatherKernel();
 
-    // Per-token feed-forward scratch sized once from the plan's own widths: the activation row a gathered chain reads, the
-    // gate/up/down intermediates, the router scores, and this token's selection.
-    private float[] _ffnInput = [];
-    private float[] _ffnScratch = [];
+    // The widest sub-batch the backend's batched kernels answer in one call; a member group wider than this splits into
+    // windows, and every window's rows land on their solo-GEMV results unchanged.
+    private const int FeedForwardBatchWindow = 64;
+
+    // Batched feed-forward scratch, grown on demand to the widest chunk a forward has seen and reused across every layer of that
+    // forward: this chunk's router scores, per-token selections, the union active-expert set with member counts, one expert
+    // group's packed member rows plus its gate/up intermediates, and the shared-expert weights. Selection carries no cross-token
+    // state, so grouping a chunk's tokens by expert never moves a token's arithmetic.
+    private float[] _ffnRouterScores = [];
+    private int[] _ffnSelectionIds = [];
+    private float[] _ffnSelectionWeights = [];
+    private int[] _ffnUnion = [];
+    private int[] _ffnMemberTokens = [];
+    private float[] _ffnMemberWeights = [];
+    private float[] _ffnSubsetIn = [];
     private float[] _ffnGateOut = [];
     private float[] _ffnUpOut = [];
-    private float[] _ffnDownOut = [];
-    private float[] _routerScores = [];
-    private int[] _moeIds = [];
-    private float[] _moeWeights = [];
-    private float[] _selectedExpertWeights = []; // routing weight by expert index for the current token's gathered chain; only selected entries are read
+    private int _ffnBatchTokens;
 
     // The two-dimensional shape a GEMV over one expert slice carries, shared by every layer of a role the way the production
     // sparse path shares it: gate and up emit intermediate values from hidden inputs, down emits hidden values from intermediates.
@@ -95,7 +102,6 @@ internal sealed class Qwen4ExpEngine : IDisposable
     private float[] _keyProjectionRows = [];
     private float[] _valueProjectionRows = [];
     private float[] _indexerQueryRows = [];
-    private float[] _ffnOutputScratch = []; // sparse routed/shared contributions accumulate here, then copy to the caller's output row — a class cannot hold a caller-owned Span field.
 
     // Rotary tables shared across every block: one position-major cos/sin run for the q/k head dimension and one for the indexer
     // component width, built once at open so no forward rebuilds either. A file declaring a rotary slice narrower than its heads
@@ -192,12 +198,12 @@ internal sealed class Qwen4ExpEngine : IDisposable
 
         _expertSlabs = weights as IExpertSlabSource ?? new ExpertSlabWeightSource(weights);
 
-        _ffnInput = new float[_hiddenSize];
-        _ffnScratch = new float[_intermediateSize];
+        _ffnSubsetIn = new float[_hiddenSize];
         _ffnGateOut = new float[_intermediateSize];
         _ffnUpOut = new float[_intermediateSize];
-        _ffnDownOut = new float[_hiddenSize];
-        _ffnOutputScratch = new float[_hiddenSize];
+        _ffnMemberTokens = [0];
+        _ffnMemberWeights = [0f];
+        _ffnBatchTokens = 1;
 
         _hcNormed = new float[_flattened];
         _hcLowRank = new float[_lowRank];
@@ -227,10 +233,10 @@ internal sealed class Qwen4ExpEngine : IDisposable
                 throw new ModelException($"qwen4exp declares {expertCount} experts but routes each token through {routed}; the router cannot select more than it ships");
             }
 
-            _routerScores = new float[expertCount];
-            _moeIds = new int[routed];
-            _moeWeights = new float[routed];
-            _selectedExpertWeights = new float[expertCount];
+            _ffnRouterScores = new float[_ffnBatchTokens * expertCount];
+            _ffnSelectionIds = new int[_ffnBatchTokens * routed];
+            _ffnSelectionWeights = new float[_ffnBatchTokens * routed];
+            _ffnUnion = new int[_ffnBatchTokens * routed];
 
             _expertGateShape = new TensorShape([_intermediateSize, _hiddenSize]);
             _expertUpShape = new TensorShape([_intermediateSize, _hiddenSize]);
@@ -342,9 +348,11 @@ internal sealed class Qwen4ExpEngine : IDisposable
         float[] sublayerRows = new float[tokenCount * _hiddenSize];
         float[] midStreams = new float[tokenCount * streamsPerToken];
         // The attention side mixes every token's streams before the block runs over the whole chunk, so each token's inject
-        // scores must survive until that token's own combine — one row per token, exactly as the spike carries them.
+        // scores must survive until that token's own combine — one row per token, exactly as the spike carries them. The
+        // feed-forward side carries its own per-token inject rows for the same reason: the batched feed-forward consumes every
+        // token's mixed row at once, so each token's mix must complete before the block's feed-forward runs.
         float[] attnInject = new float[tokenCount * _streamCount];
-        float[] injectScratch = new float[_streamCount];
+        float[] ffnInject = new float[tokenCount * _streamCount];
 
         for (int layer = 0; layer < _geometry.LayerCount; layer++)
         {
@@ -397,24 +405,31 @@ internal sealed class Qwen4ExpEngine : IDisposable
                 long combineStart = BeginProfile();
                 CombineStreams(streams.AsSpan(t * streamsPerToken, streamsPerToken), sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize), attnInject.AsSpan(t * _streamCount, _streamCount), midStreams.AsSpan(t * streamsPerToken, streamsPerToken));
                 Accumulate(ref _profileCombineTicks, combineStart);
+            }
 
+            for (int t = 0; t < tokenCount; t++)
+            {
                 long mixStart = BeginProfile();
-                MixStreams(w.FfnHyper, midStreams.AsSpan(t * streamsPerToken, streamsPerToken), mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), injectScratch);
+                MixStreams(w.FfnHyper, midStreams.AsSpan(t * streamsPerToken, streamsPerToken), mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), ffnInject.AsSpan(t * _streamCount, _streamCount));
                 Accumulate(ref _profileHyperMixTicks, mixStart);
+            }
 
-                long ffnStart = BeginProfile();
-                ForwardFeedForward(w, mixedRows.AsSpan(t * _hiddenSize, _hiddenSize), sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize));
-                if (w.Sparse is not null)
-                {
-                    Accumulate(ref _profileMoeTicks, ffnStart);
-                }
-                else
-                {
-                    Accumulate(ref _profileDenseTicks, ffnStart);
-                }
+            long ffnStart = BeginProfile();
+            if (w.Sparse is not null)
+            {
+                ForwardSparseFeedForward(w, mixedRows, tokenCount, sublayerRows);
+                Accumulate(ref _profileMoeTicks, ffnStart);
+            }
+            else
+            {
+                ForwardDenseFeedForward(w, mixedRows, tokenCount, sublayerRows);
+                Accumulate(ref _profileDenseTicks, ffnStart);
+            }
 
-                combineStart = BeginProfile();
-                CombineStreams(midStreams.AsSpan(t * streamsPerToken, streamsPerToken), sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize), injectScratch, streams.AsSpan(t * streamsPerToken, streamsPerToken));
+            for (int t = 0; t < tokenCount; t++)
+            {
+                long combineStart = BeginProfile();
+                CombineStreams(midStreams.AsSpan(t * streamsPerToken, streamsPerToken), sublayerRows.AsSpan(t * _hiddenSize, _hiddenSize), ffnInject.AsSpan(t * _streamCount, _streamCount), streams.AsSpan(t * streamsPerToken, streamsPerToken));
                 Accumulate(ref _profileCombineTicks, combineStart);
             }
 
@@ -742,55 +757,220 @@ internal sealed class Qwen4ExpEngine : IDisposable
         }
     }
 
-    // The block's feed-forward side. A resolved sparse descriptor routes every token through the same all-expert softmax, ascending
-    // strict-greater top-k (lower index wins ties), renormalization and scale the production route applies, then each selected
-    // expert's SwiGLU chain accumulates in ascending expert-index order scaled by its routing weight; a declared shared expert runs
-    // once under plain sigmoid over its hidden-sized selector vector — the qwen4exp reference gate, finite at a zero score where
-    // qwen2moe's silu(score)/score divides 0 by 0 — or ungated at one when the file ships no such vector. A file declaring no
-    // experts keeps the dense gate/up/down triplet.
-    // Selection carries no cross-token state, so splitting a chunk across calls reproduces the unsplit run exactly.
-    private void ForwardFeedForward(LayerOperands w, ReadOnlySpan<float> mixed, Span<float> ffnOut)
+    // The block's feed-forward side, batched across the chunk's tokens. A resolved sparse descriptor routes every token through
+    // the same all-expert softmax, ascending strict-greater top-k (lower index wins ties), renormalization and scale the
+    // production route applies; the chunk's selections fold into an ascending union active-expert set, each expert slab resolves
+    // once for the whole chunk through the gather kernel, and that expert's gate/up/down run over its member tokens in batched
+    // passes — each batched row bit-identical to the solo GEMV row it replaces. Each token's routed contributions still
+    // accumulate in ascending expert-index order, then its shared expert contributes once under plain sigmoid over its
+    // hidden-sized selector vector — the qwen4exp reference gate, finite at a zero score where qwen2moe's silu(score)/score
+    // divides 0 by 0 — or ungated at one when the file ships no such vector. A file declaring no experts keeps the dense
+    // gate/up/down triplet, batched the same way. Selection carries no cross-token state and every batched row lands on its
+    // solo-GEMV result, so splitting a chunk across calls reproduces the unsplit run exactly.
+    private void ForwardSparseFeedForward(LayerOperands w, float[] mixedRows, int tokenCount, float[] ffnOut)
     {
-        if (w.Sparse is not { } sparse)
-        {
-            _backend.Gemv(mixed, Ref(w.DenseGate!), _ffnGateOut);
-            _backend.Gemv(mixed, Ref(w.DenseUp!), _ffnUpOut);
-
-            for (int i = 0; i < _intermediateSize; i++)
-            {
-                _ffnScratch[i] = LayerOps.Silu(_ffnGateOut[i]) * _ffnUpOut[i];
-            }
-
-            _backend.Gemv(_ffnScratch, Ref(w.DenseDown!), ffnOut);
-            return;
-        }
-
+        SparseFfnDescriptor sparse = w.Sparse!;
         int expertCount = sparse.ExpertCount;
         int routed = sparse.RoutedExpertsPerToken;
+        int hidden = _hiddenSize;
 
-        mixed.CopyTo(_ffnInput); // the gathered chain cannot capture a caller-owned span across its callback boundary: this token's row is copied into reusable engine scratch first.
+        EnsureFeedForwardBatchCapacity(tokenCount);
 
-        _backend.Gemv(_ffnInput, Ref(w.Router!), _routerScores.AsSpan(0, expertCount));
+        WeightRef router = Ref(w.Router!);
+        for (int offset = 0; offset < tokenCount; offset += FeedForwardBatchWindow)
+        {
+            int rows = Math.Min(FeedForwardBatchWindow, tokenCount - offset);
+            _backend.GemvBatch(
+                mixedRows.AsSpan(offset * hidden, rows * hidden),
+                rows,
+                router,
+                _ffnRouterScores.AsSpan(offset * expertCount, rows * expertCount));
+        }
+
+        for (int t = 0; t < tokenCount; t++)
+        {
+            RouteToken(
+                _ffnRouterScores.AsSpan(t * expertCount, expertCount),
+                _ffnSelectionIds.AsSpan(t * routed, routed),
+                _ffnSelectionWeights.AsSpan(t * routed, routed),
+                sparse);
+        }
+
+        int selectionSlots = tokenCount * routed;
+        int unionCount = BuildUnionActiveExperts(selectionSlots);
+
+        ffnOut.AsSpan(0, tokenCount * hidden).Clear(); // the routed and shared contributions accumulate from zero, mirroring the production sparse posture
+
+        ExpertSlabRole gate = w.GateRole;
+        ExpertSlabRole up = w.UpRole;
+        ExpertSlabRole down = w.DownRole;
+
+        _gatherKernel.Gather(
+            _expertSlabs,
+            gate,
+            up,
+            down,
+            _ffnUnion.AsSpan(0, unionCount),
+            (int expertIndex, ReadOnlySpan<byte> gateSlab, ReadOnlySpan<byte> upSlab, ReadOnlySpan<byte> downSlab) =>
+            {
+                int count = 0;
+                for (int slot = 0; slot < selectionSlots; slot++)
+                {
+                    if (_ffnSelectionIds[slot] != expertIndex)
+                    {
+                        continue;
+                    }
+
+                    int token = slot / routed;
+                    mixedRows.AsSpan(token * hidden, hidden).CopyTo(_ffnSubsetIn.AsSpan(count * hidden, hidden));
+                    _ffnMemberTokens[count] = token;
+                    _ffnMemberWeights[count] = _ffnSelectionWeights[slot];
+                    count++;
+                }
+
+                // The gather kernel walks the union in ascending expert order, so every token's member contributions land in the
+                // same ascending expert-index order its solo chain accumulated them in.
+                RunExpertChain(
+                    count,
+                    new WeightRef(gateSlab, gate.ExpertShape, gate.Stack.Format),
+                    new WeightRef(upSlab, up.ExpertShape, up.Stack.Format),
+                    new WeightRef(downSlab, down.ExpertShape, down.Stack.Format),
+                    ffnOut);
+            });
+
+        if (sparse.HasSharedExpert)
+        {
+            // A file shipping this block's hidden-sized selector vector gates the shared contribution through the family's own
+            // composition — plain sigmoid over its score, finite at every score including exactly zero, where qwen2moe's
+            // silu(score)/score divides 0 by 0. A file shipping no selector adds it ungated at exactly one, which is what the
+            // production sparse path reads for that case as well. The whole chunk's shared rows run as one member group the
+            // routed groups ran as, each token weighted by its own shared weight.
+            float[]? gateVector = w.SharedGateVector;
+            for (int t = 0; t < tokenCount; t++)
+            {
+                float sharedWeight = 1f;
+                if (gateVector is not null)
+                {
+                    float score = 0f;
+                    ReadOnlySpan<float> mixed = mixedRows.AsSpan(t * hidden, hidden);
+                    for (int c = 0; c < hidden; c++)
+                    {
+                        score += gateVector[c] * mixed[c];
+                    }
+
+                    sharedWeight = LayerOps.SharedExpertGateWeight(plainSigmoidFamily: true, score);
+                }
+
+                mixedRows.AsSpan(t * hidden, hidden).CopyTo(_ffnSubsetIn.AsSpan(t * hidden, hidden));
+                _ffnMemberTokens[t] = t;
+                _ffnMemberWeights[t] = sharedWeight;
+            }
+
+            RunExpertChain(tokenCount, Ref(w.SharedGate!), Ref(w.SharedUp!), Ref(w.SharedDown!), ffnOut);
+        }
+    }
+
+    // The dense triplet for a file declaring no experts, batched over the chunk's rows the same way the sparse chain batches:
+    // gate/up as batched passes, the SwiGLU activation elementwise per member row, down as a batched pass writing each token's
+    // output row directly.
+    private void ForwardDenseFeedForward(LayerOperands w, float[] mixedRows, int tokenCount, float[] ffnOut)
+    {
+        int hidden = _hiddenSize;
+        int inter = _intermediateSize;
+
+        EnsureFeedForwardBatchCapacity(tokenCount);
+
+        for (int offset = 0; offset < tokenCount; offset += FeedForwardBatchWindow)
+        {
+            int rows = Math.Min(FeedForwardBatchWindow, tokenCount - offset);
+            Span<float> inRows = mixedRows.AsSpan(offset * hidden, rows * hidden);
+            _backend.GemvBatch(inRows, rows, Ref(w.DenseGate!), _ffnGateOut.AsSpan(offset * inter, rows * inter));
+            _backend.GemvBatch(inRows, rows, Ref(w.DenseUp!), _ffnUpOut.AsSpan(offset * inter, rows * inter));
+        }
+
+        for (int i = 0; i < tokenCount * inter; i++)
+        {
+            _ffnGateOut[i] = LayerOps.Silu(_ffnGateOut[i]) * _ffnUpOut[i];
+        }
+
+        for (int offset = 0; offset < tokenCount; offset += FeedForwardBatchWindow)
+        {
+            int rows = Math.Min(FeedForwardBatchWindow, tokenCount - offset);
+            _backend.GemvBatch(_ffnGateOut.AsSpan(offset * inter, rows * inter), rows, Ref(w.DenseDown!), ffnOut.AsSpan(offset * hidden, rows * hidden));
+        }
+    }
+
+    // One expert chain over a packed member group: gate and up run as batched passes over the group's rows, the SwiGLU
+    // activation folds each member's gate row into its gate buffer in place, down writes each member's hidden row back through
+    // the subset buffer, and each result accumulates into its token's output row scaled by that member's routing weight.
+    // Sub-batches stay within the backend's batch ceiling, and every row lands on its solo-GEMV result either way.
+    private void RunExpertChain(int count, WeightRef gate, WeightRef up, WeightRef down, float[] ffnOut)
+    {
+        int hidden = _hiddenSize;
+        int inter = _intermediateSize;
+
+        for (int offset = 0; offset < count; offset += FeedForwardBatchWindow)
+        {
+            int rows = Math.Min(FeedForwardBatchWindow, count - offset);
+            Span<float> inRows = _ffnSubsetIn.AsSpan(offset * hidden, rows * hidden);
+            _backend.GemvBatch(inRows, rows, gate, _ffnGateOut.AsSpan(offset * inter, rows * inter));
+            _backend.GemvBatch(inRows, rows, up, _ffnUpOut.AsSpan(offset * inter, rows * inter));
+        }
+
+        for (int i = 0; i < count * inter; i++)
+        {
+            _ffnGateOut[i] = LayerOps.Silu(_ffnGateOut[i]) * _ffnUpOut[i];
+        }
+
+        for (int offset = 0; offset < count; offset += FeedForwardBatchWindow)
+        {
+            int rows = Math.Min(FeedForwardBatchWindow, count - offset);
+            _backend.GemvBatch(
+                _ffnGateOut.AsSpan(offset * inter, rows * inter),
+                rows,
+                down,
+                _ffnSubsetIn.AsSpan(offset * hidden, rows * hidden));
+        }
+
+        for (int m = 0; m < count; m++)
+        {
+            Span<float> target = ffnOut.AsSpan(_ffnMemberTokens[m] * hidden, hidden);
+            ReadOnlySpan<float> source = _ffnSubsetIn.AsSpan(m * hidden, hidden);
+            float weight = _ffnMemberWeights[m];
+            for (int h = 0; h < hidden; h++)
+            {
+                target[h] += weight * source[h];
+            }
+        }
+    }
+
+    // One token's routing: the same all-expert softmax, ascending strict-greater top-k with lower-index tie resolution,
+    // ascending sort, renormalization and scale the solo path applied — run over this token's slice of the batched router
+    // scores, whose consumed entries no later stage reads.
+    private void RouteToken(Span<float> scores, Span<int> ids, Span<float> weights, SparseFfnDescriptor sparse)
+    {
+        int expertCount = scores.Length;
+        int routed = ids.Length;
 
         float maxScore = float.NegativeInfinity;
         for (int e = 0; e < expertCount; e++)
         {
-            if (_routerScores[e] > maxScore)
+            if (scores[e] > maxScore)
             {
-                maxScore = _routerScores[e];
+                maxScore = scores[e];
             }
         }
 
         float allSum = 0f;
         for (int e = 0; e < expertCount; e++)
         {
-            _routerScores[e] = MathF.Exp(_routerScores[e] - maxScore);
-            allSum += _routerScores[e];
+            scores[e] = MathF.Exp(scores[e] - maxScore);
+            allSum += scores[e];
         }
 
         for (int e = 0; e < expertCount; e++)
         {
-            _routerScores[e] /= allSum;
+            scores[e] /= allSum;
         }
 
         float selectedSum = 0f;
@@ -800,40 +980,40 @@ internal sealed class Qwen4ExpEngine : IDisposable
             float bestScore = float.NegativeInfinity;
             for (int e = 0; e < expertCount; e++)
             {
-                if (_routerScores[e] > bestScore) // strict '>' over ascending indexes: a tie keeps the earlier expert
+                if (scores[e] > bestScore) // strict '>' over ascending indexes: a tie keeps the earlier expert
                 {
                     best = e;
-                    bestScore = _routerScores[e];
+                    bestScore = scores[e];
                 }
             }
 
-            _moeIds[pick] = best;
-            _moeWeights[pick] = bestScore;
+            ids[pick] = best;
+            weights[pick] = bestScore;
             selectedSum += bestScore;
-            _routerScores[best] = float.NegativeInfinity; // consumed: later passes cannot re-pick this expert
+            scores[best] = float.NegativeInfinity; // consumed: later passes cannot re-pick this expert
         }
 
         for (int i = 1; i < routed; i++)
         {
-            int id = _moeIds[i];
-            float weight = _moeWeights[i];
+            int id = ids[i];
+            float weight = weights[i];
             int j = i - 1;
-            while (j >= 0 && _moeIds[j] > id)
+            while (j >= 0 && ids[j] > id)
             {
-                _moeIds[j + 1] = _moeIds[j];
-                _moeWeights[j + 1] = _moeWeights[j];
+                ids[j + 1] = ids[j];
+                weights[j + 1] = weights[j];
                 j--;
             }
 
-            _moeIds[j + 1] = id;
-            _moeWeights[j + 1] = weight;
+            ids[j + 1] = id;
+            weights[j + 1] = weight;
         }
 
         if (sparse.NormalizeExpertWeights && selectedSum > 0f)
         {
             for (int i = 0; i < routed; i++)
             {
-                _moeWeights[i] /= selectedSum;
+                weights[i] /= selectedSum;
             }
         }
 
@@ -841,83 +1021,68 @@ internal sealed class Qwen4ExpEngine : IDisposable
         {
             for (int i = 0; i < routed; i++)
             {
-                _moeWeights[i] *= sparse.ExpertWeightsScale;
+                weights[i] *= sparse.ExpertWeightsScale;
             }
         }
+    }
 
-        ExpertSlabRole gate = w.GateRole;
-        ExpertSlabRole up = w.UpRole;
-        ExpertSlabRole down = w.DownRole;
-
-        for (int i = 0; i < routed; i++)
+    // Folds this chunk's per-token selections into the union active-expert set: ascending distinct expert indexes with each
+    // expert's member count beside it, exactly the posture the production sparse path builds. The gather kernel walks the set
+    // in ascending order, so every token's contributions land in its own ascending expert-index order.
+    private int BuildUnionActiveExperts(int selectionSlots)
+    {
+        int unionCount = 0;
+        for (int slot = 0; slot < selectionSlots; slot++)
         {
-            _selectedExpertWeights[_moeIds[i]] = _moeWeights[i]; // the gather callback visits expert indexes, not selection slots: this maps each selected slab back to its routing weight.
+            int expertIndex = _ffnSelectionIds[slot];
+
+            int position = 0;
+            while (position < unionCount && _ffnUnion[position] < expertIndex)
+            {
+                position++;
+            }
+
+            if (position == unionCount || _ffnUnion[position] != expertIndex)
+            {
+                for (int shift = unionCount; shift > position; shift--)
+                {
+                    _ffnUnion[shift] = _ffnUnion[shift - 1];
+                }
+
+                _ffnUnion[position] = expertIndex;
+                unionCount++;
+            }
         }
 
-        _ffnOutputScratch.AsSpan().Clear(); // the routed and shared contributions accumulate from zero, mirroring the production sparse posture
+        return unionCount;
+    }
 
-        _gatherKernel.Gather(
-            _expertSlabs,
-            gate,
-            up,
-            down,
-            _moeIds.AsSpan(0, routed),
-            (int expertIndex, ReadOnlySpan<byte> gateSlab, ReadOnlySpan<byte> upSlab, ReadOnlySpan<byte> downSlab) =>
-            {
-                float weight = _selectedExpertWeights[expertIndex];
-
-                _backend.Gemv(_ffnInput, new WeightRef(gateSlab, gate.ExpertShape, gate.Stack.Format), _ffnGateOut);
-                _backend.Gemv(_ffnInput, new WeightRef(upSlab, up.ExpertShape, up.Stack.Format), _ffnUpOut);
-
-                for (int i = 0; i < _intermediateSize; i++)
-                {
-                    _ffnScratch[i] = LayerOps.Silu(_ffnGateOut[i]) * _ffnUpOut[i];
-                }
-
-                _backend.Gemv(_ffnScratch, new WeightRef(downSlab, down.ExpertShape, down.Stack.Format), _ffnDownOut);
-
-                for (int h = 0; h < _hiddenSize; h++)
-                {
-                    _ffnOutputScratch[h] += weight * _ffnDownOut[h]; // ascending expert-index order: the gather kernel's supplied selection is this token's sorted routing set.
-                }
-            });
-
-        if (sparse.HasSharedExpert)
+    // Grows the batched feed-forward scratch to the widest chunk seen so far; every later forward reuses it, so a bench loop
+    // pays these allocations once per capacity step rather than per layer.
+    private void EnsureFeedForwardBatchCapacity(int tokenCount)
+    {
+        if (tokenCount <= _ffnBatchTokens)
         {
-            // A file shipping this block's hidden-sized selector vector gates the shared contribution through the family's own
-            // composition — plain sigmoid over its score, finite at every score including exactly zero, where qwen2moe's
-            // silu(score)/score divides 0 by 0. A file shipping no selector adds it ungated at exactly one, which is what the
-            // production sparse path reads for that case as well.
-            float sharedWeight = 1f;
-
-            if (w.SharedGateVector is { } gateVector)
-            {
-                float score = 0f;
-                for (int c = 0; c < _hiddenSize; c++)
-                {
-                    score += gateVector[c] * mixed[c];
-                }
-
-                sharedWeight = LayerOps.SharedExpertGateWeight(plainSigmoidFamily: true, score);
-            }
-
-            _backend.Gemv(mixed, Ref(w.SharedGate!), _ffnGateOut);
-            _backend.Gemv(mixed, Ref(w.SharedUp!), _ffnUpOut);
-
-            for (int i = 0; i < _intermediateSize; i++)
-            {
-                _ffnScratch[i] = LayerOps.Silu(_ffnGateOut[i]) * _ffnUpOut[i];
-            }
-
-            _backend.Gemv(_ffnScratch, Ref(w.SharedDown!), _ffnDownOut);
-
-            for (int h = 0; h < _hiddenSize; h++)
-            {
-                _ffnOutputScratch[h] += sharedWeight * _ffnDownOut[h];
-            }
+            return;
         }
 
-        _ffnOutputScratch.AsSpan(0, _hiddenSize).CopyTo(ffnOut); // the caller's sublayer row receives the accumulated sparse contribution once the gather callback is done with its scratch.
+        _ffnSubsetIn = new float[tokenCount * _hiddenSize];
+        _ffnGateOut = new float[tokenCount * _intermediateSize];
+        _ffnUpOut = new float[tokenCount * _intermediateSize];
+        _ffnMemberTokens = new int[tokenCount];
+        _ffnMemberWeights = new float[tokenCount];
+
+        if (_plan.SparseFfn is { } sparse)
+        {
+            int expertCount = sparse.ExpertCount;
+            int routed = sparse.RoutedExpertsPerToken;
+            _ffnRouterScores = new float[tokenCount * expertCount];
+            _ffnSelectionIds = new int[tokenCount * routed];
+            _ffnSelectionWeights = new float[tokenCount * routed];
+            _ffnUnion = new int[tokenCount * routed];
+        }
+
+        _ffnBatchTokens = tokenCount;
     }
 
     private void SeedStreams(int tokenId, Span<float> streams)
