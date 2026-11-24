@@ -65,7 +65,18 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// <see cref="Environment.ProcessorCount"/>, which can only overestimate and is then capped by it. An explicit
     /// nonzero thread request wins over auto-sizing, and a per-model quota caps either choice.
     /// </summary>
-    public static int AutoWorkerCount => Math.Min(Math.Max(ThreadAffinity.DetectPhysicalCoreCount(), 1), Environment.ProcessorCount);
+    public static int AutoWorkerCount
+    {
+        get
+        {
+            int detected = ThreadAffinity.DetectPhysicalCoreCount();
+
+            // Detection present (Windows topology) sizes by physical cores, capped by the logical ceiling; detection
+            // absent (non-Windows or an unsupported probe shape) sizes by the logical processor count rather than
+            // collapsing to a single worker, which is what the documented fallback promises.
+            return detected > 0 ? Math.Min(detected, Environment.ProcessorCount) : Environment.ProcessorCount;
+        }
+    }
 
     /// <summary>
     /// Opens the CPU backend for one model placement. <paramref name="threads"/> is the global worker request (0 = auto-size by

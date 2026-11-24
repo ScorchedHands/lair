@@ -17,7 +17,10 @@ namespace Lair.Bench;
 /// its weights and attention geometry. Every window stays inside the opened context ceiling: the bounded seam sizes its
 /// sequence caches at open and never grows them. Serving routes (Prefill/DecodeNext/DecodeBatch), KV pools, dedicated lanes,
 /// offloaded or crossing backends, device prefill steps and quantized KV postures are deliberately absent — every one of
-/// them is refused by the seam anyway, so this harness opens none. Bench-only: no posture, config or production change.
+/// them is refused by the seam anyway, so this harness opens none. <c>--threads T</c> is the backend's global worker request
+/// (T &gt; 0) so the reported <c>threads=</c> equals <c>backend.EffectiveWorkerCount</c>, and every line carries stage timings
+/// (plan_ms, open_ms) beside the prefill/decode/argmax timings so model preparation cost separates from forward cost.
+/// Bench-only: no posture, config or production change.
 ///
 /// Exit codes: 0 ran both windows; 1 malformed options (nothing opened); 2 a loader/plan/engine refusal naming what this
 /// build cannot run against that file — reported as one machine-readable line rather than an unhandled crash.
@@ -155,6 +158,7 @@ internal static class Qwen4ExpForwardBench
         ModelProfile? pleSkipped = skipPle ? PleSkippedProfile() : null;
 
         ModelPlan? plan = null;
+        Stopwatch planWatch = Stopwatch.StartNew();
         try
         {
             plan = pleSkipped is null ? ModelPlans.Resolve(gguf) : ModelPlans.Resolve(gguf, pleSkipped);
@@ -162,15 +166,23 @@ internal static class Qwen4ExpForwardBench
         catch (Exception failure) when (failure is GgufException or ModelException)
         {
             // A header that parsed but whose tensor table contradicts the family's declared interleave still reports its own
-            // architecture name beside the plan-level refusal, so a reader sees which side disagreed.
-            Console.WriteLine(HeaderLine(gguf, declaredArchitecture, promptTokens, genTokens, chunk, reps, openedContext, threads, skipPle) + $" status=refused stage=plan reason={CollapseWhitespace(failure.Message)}");
+            // architecture name beside the plan-level refusal, so a reader sees which side disagreed. The plan stage is timed
+            // even on refusal so a slow resolve is visible in the same machine-readable shape a successful run prints.
+            planWatch.Stop();
+            Console.WriteLine(HeaderLine(gguf, declaredArchitecture, promptTokens, genTokens, chunk, reps, openedContext, threads, skipPle) + $" plan_ms={planWatch.Elapsed.TotalMilliseconds:F3} status=refused stage=plan reason={CollapseWhitespace(failure.Message)}");
             PrintPeakWorkingSet();
             return 2;
         }
+        planWatch.Stop();
+        double planMs = planWatch.Elapsed.TotalMilliseconds;
 
-        using CpuBackend backend = threads > 0 ? new(threadQuota: threads, allowAvx2: true) : new(threads: 0, allowAvx2: true);
+        // `--threads T` is the backend's global worker request (T > 0); `--threads 0` keeps the backend's auto posture.
+        // This harness has no separate quota knob, so the request stands uncapped and EffectiveWorkerCount reports
+        // exactly the thread count the run asked for — the posture the stage timings are read against.
+        using CpuBackend backend = new(threads: threads, allowAvx2: true);
 
         TransformerModel? model = null;
+        Stopwatch openWatch = Stopwatch.StartNew();
         try
         {
             model = pleSkipped is null
@@ -179,10 +191,13 @@ internal static class Qwen4ExpForwardBench
         }
         catch (Exception failure) when (failure is ModelException or InvalidOperationException)
         {
-            Console.WriteLine(IdentityLine(plan, gguf, promptTokens, genTokens, chunk, reps, openedContext, backend.EffectiveWorkerCount, skipPle) + $" status=refused stage=open reason={CollapseWhitespace(failure.Message)}");
+            openWatch.Stop();
+            Console.WriteLine(IdentityLine(plan, gguf, promptTokens, genTokens, chunk, reps, openedContext, backend.EffectiveWorkerCount, skipPle) + StageTimings(planMs, openWatch.Elapsed.TotalMilliseconds) + $" status=refused stage=open reason={CollapseWhitespace(failure.Message)}");
             PrintPeakWorkingSet();
             return 2;
         }
+        openWatch.Stop();
+        double openMs = openWatch.Elapsed.TotalMilliseconds;
 
         using (model)
         {
@@ -190,7 +205,7 @@ internal static class Qwen4ExpForwardBench
             {
                 // The seam is chosen by the plan's family geometry: a file whose architecture resolves no qwen4exp geometry
                 // never opens it, and this harness reports that rather than reaching for some other route.
-                Console.WriteLine(IdentityLine(plan, gguf, promptTokens, genTokens, chunk, reps, openedContext, backend.EffectiveWorkerCount, skipPle) + " status=refused stage=open reason='resolved no bounded qwen4exp forward seam (only a plan whose architecture resolves the qwen4exp family geometry opens it)'");
+                Console.WriteLine(IdentityLine(plan, gguf, promptTokens, genTokens, chunk, reps, openedContext, backend.EffectiveWorkerCount, skipPle) + StageTimings(planMs, openMs) + " status=refused stage=open reason='resolved no bounded qwen4exp forward seam (only a plan whose architecture resolves the qwen4exp family geometry opens it)'");
                 PrintPeakWorkingSet();
                 return 2;
             }
@@ -202,14 +217,15 @@ internal static class Qwen4ExpForwardBench
             try
             {
                 (double bestPrefillSeconds, double meanPrefillSeconds) = MeasurePrefill(model, prompt, chunk, reps);
-                (double decodeSeconds, bool finiteDecode) = MeasureDecode(model, prompt, genTokens, chunk);
+                (double decodeSeconds, double argmaxSeconds, bool finiteDecode) = MeasureDecode(model, prompt, genTokens, chunk);
 
                 string ropeNote = model.Qwen4ExpRotaryCoverage is { } coverage ? $" ropeHeadRegions={coverage.HeadRegions} ropeIndexerRegions={coverage.IndexerRegions}" : string.Empty;
 
                 Console.WriteLine(
                     IdentityLine(plan, gguf, promptTokens, genTokens, chunk, reps, openedContext, backend.EffectiveWorkerCount, skipPle) +
+                    StageTimings(planMs, openMs) +
                     $" prefill_tps={promptTokens / bestPrefillSeconds:F2} decode_tps={genTokens / decodeSeconds:F2}" +
-                    $" prefill_best_ms={bestPrefillSeconds * 1000.0:F3} prefill_mean_ms={meanPrefillSeconds * 1000.0:F3} decode_ms={decodeSeconds * 1000.0:F3}" +
+                    $" prefill_best_ms={bestPrefillSeconds * 1000.0:F3} prefill_mean_ms={meanPrefillSeconds * 1000.0:F3} decode_ms={decodeSeconds * 1000.0:F3} argmax_ms={argmaxSeconds * 1000.0:F3}" +
                     $" parity={parityField} ple_tensors_present={(pleTensorsPresent ? "true" : "false")}" +
                     $" finite_logits={(finiteDecode ? "true" : "false")}{ropeNote} status=ok");
 
@@ -220,7 +236,7 @@ internal static class Qwen4ExpForwardBench
                 // A forward that trips the seam — a window past the opened ceiling, an operand its own composition cannot run,
                 // or a payload span wider than this source can hand back — lands on the same refusal shape as open does, so no
                 // measurement path can crash this harness unhandled.
-                Console.WriteLine(IdentityLine(plan, gguf, promptTokens, genTokens, chunk, reps, openedContext, backend.EffectiveWorkerCount, skipPle) + $" status=refused stage=forward reason={CollapseWhitespace(failure.Message)}");
+                Console.WriteLine(IdentityLine(plan, gguf, promptTokens, genTokens, chunk, reps, openedContext, backend.EffectiveWorkerCount, skipPle) + StageTimings(planMs, openMs) + $" status=refused stage=forward reason={CollapseWhitespace(failure.Message)}");
                 PrintPeakWorkingSet();
                 return 2;
             }
@@ -263,8 +279,9 @@ internal static class Qwen4ExpForwardBench
     // Decode steps: the prompt warms the sequence untimed through the same chunk seam, then each generation step forwards one
     // token alone against that carried state — exactly the shape a decode loop takes — and its next token is the argmax of the
     // logits row that forward produced. Timing covers all requested steps at once so tokens/sec describes the steady-state
-    // path rather than one step with an allocation tax attached.
-    static (double Seconds, bool Finite) MeasureDecode(TransformerModel model, int[] prompt, int genTokens, int chunk)
+    // path rather than one step with an allocation tax attached. The vocab-sized argmax scan is timed apart from the loop so a
+    // reader can split a decode step into its forward cost (decode_ms minus argmax_ms) and its selection cost.
+    static (double Seconds, double ArgMaxSeconds, bool Finite) MeasureDecode(TransformerModel model, int[] prompt, int genTokens, int chunk)
     {
         Qwen4ExpSequence sequence = model.NewQwen4ExpSequence();
         foreach ((int offset, int length) in Windows(prompt.Length, chunk))
@@ -276,14 +293,19 @@ internal static class Qwen4ExpForwardBench
         int token = ArgMax(model.LastQwen4ExpLogits(sequence), ref finite);
 
         Stopwatch sw = Stopwatch.StartNew();
+        double argmaxSeconds = 0.0;
         for (int step = 0; step < genTokens; step++)
         {
             model.ForwardQwen4ExpChunk(sequence, [token]);
+
+            Stopwatch argmaxWatch = Stopwatch.StartNew();
             token = ArgMax(model.LastQwen4ExpLogits(sequence), ref finite);
+            argmaxWatch.Stop();
+            argmaxSeconds += argmaxWatch.Elapsed.TotalSeconds;
         }
 
         sw.Stop();
-        return (sw.Elapsed.TotalSeconds, finite);
+        return (sw.Elapsed.TotalSeconds, argmaxSeconds, finite);
     }
 
     static IEnumerable<(int Offset, int Length)> Windows(int tokens, int chunk)
@@ -386,6 +408,12 @@ internal static class Qwen4ExpForwardBench
         $" promptTokens={promptTokens} genTokens={genTokens} chunk={chunk} reps={reps} context={context} threads={threads}" +
         (skipPle ? " skipPle=true" : string.Empty);
 
+    // Stage timings that separate model preparation from the measured forwards: plan_ms covers ModelPlans.Resolve, open_ms
+    // covers TransformerModel.Open. open_ms is omitted where the open never completed (a plan-stage refusal), so every line
+    // reports exactly the stages that actually ran.
+    static string StageTimings(double planMs, double? openMs = null) =>
+        $" plan_ms={planMs:F3}" + (openMs is double open ? $" open_ms={open:F3}" : string.Empty);
+
     static void PrintPeakWorkingSet() =>
         Console.WriteLine($"qwen4exp-forward-file peak_working_set_mb={Process.GetCurrentProcess().PeakWorkingSet64 / (102.0 * 1024.0):F1}");
 
@@ -415,7 +443,10 @@ internal static class Qwen4ExpForwardBench
         Console.WriteLine("qwen4exp-forward-file <gguf path> [--prompt-tokens N] [--gen-tokens M] [--context C] [--chunk K] [--threads T] [--reps R] [--skip-ple]" +
             " (CPU-only bounded qwen4exp forward measurement: synthetic in-vocabulary prompt ids and argmax-driven generation steps run through the engine's" +
             " assembly-internal chunk seam over a plain CPU backend, publishing prefill/decode tokens-per-second plus peak working-set facts beside the" +
-            " plan-resolved geometry; --threads 0 keeps the backend's auto posture, an omitted --context sizes the opened ceiling from the requested windows;" +
+            " plan-resolved geometry; --threads T sets the backend's global worker request so the reported threads= matches the effective worker count," +
+            " --threads 0 keeps the backend's auto posture, an omitted --context sizes the opened ceiling from the requested windows;" +
+            " every line carries stage timings (plan_ms for plan resolution, open_ms for model open) beside prefill_best_ms, prefill_mean_ms, decode_ms and" +
+            " argmax_ms so load/open cost separates from forward cost;" +
             " --skip-ple opens a qwen4exp file whose n-gram module tensors this seam has no composition over by pointing those six roles at absent names," +
             " which measures every non-PLE block of that target and marks parity=not_full_target_parity rather than claiming full-target forward parity;" +
             " any loader/plan/engine refusal prints one status=refused line naming what this build cannot run against that file, with exit code 2)");

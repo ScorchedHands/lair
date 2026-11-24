@@ -137,14 +137,41 @@ public sealed class AffinityTests
             $"detected physical cores ({detected}) cannot exceed the logical processor count ({Environment.ProcessorCount}).");
 
         using CpuBackend auto = new(); // threads: 0 — the documented rule must be what the backend applied
-        int expected = Math.Min(Math.Max(detected, 1), Environment.ProcessorCount);
+        int expected = detected > 0 ? Math.Min(detected, Environment.ProcessorCount) : Environment.ProcessorCount;
         Assert.Equal(expected, auto.EffectiveWorkerCount);
 
         if (!windowsTopology && detected == 0)
         {
-            // Documented fallback: detection unavailable means the logical processor count sizes the pool.
+            // Documented fallback: detection unavailable means the logical processor count sizes the pool, never a single worker.
             Assert.Equal(Environment.ProcessorCount, auto.EffectiveWorkerCount);
         }
+    }
+
+    [Fact]
+    public void ExplicitThreadRequest_IsGlobalWorkerCount_AndQuotaCapsItWithoutExceedingTheRequest()
+    {
+        // An explicit nonzero thread request is the backend's global worker count, uncapped when no quota is supplied:
+        // EffectiveWorkerCount reports exactly the requested posture, which is what the bench's threads= field reads off.
+        using CpuBackend explicitRequest = new(threads: 4);
+        Assert.Equal(4, explicitRequest.EffectiveWorkerCount);
+        Assert.Equal(4, explicitRequest.UncappedThreadChoice);
+
+        // A quota caps participation below the request; the uncapped ceiling still records the engine's own choice.
+        using CpuBackend capped = new(threads: 4, threadQuota: 2);
+        Assert.Equal(2, capped.EffectiveWorkerCount);
+        Assert.Equal(4, capped.UncappedThreadChoice);
+
+        // A quota above the engine request cannot raise participation past it — placement caps, never expands, the worker count.
+        using CpuBackend overQuota = new(threads: 4, threadQuota: 8);
+        Assert.Equal(4, overQuota.EffectiveWorkerCount); // min(global 4, quota 8)
+        Assert.Equal(4, overQuota.UncappedThreadChoice);
+
+        // A live quota edit re-derives participation against the uncapped ceiling: lowering idles workers, raising back to or
+        // above the engine choice restores it but never exceeds that choice.
+        using CpuBackend live = new(threads: 4, threadQuota: 2);
+        Assert.Equal(1, live.ApplyThreadQuota(1));
+        Assert.Equal(4, live.ApplyThreadQuota(8)); // capped at the engine's own 4, not the quota's 8
+        Assert.Equal(4, live.EffectiveWorkerCount);
     }
 
     private static (byte[] Weights, float[] X, float[] Output) Workload()
