@@ -428,6 +428,9 @@ public sealed class TransformerModel : IDisposable
     /// <summary>Whether this engine opened on the bounded synthetic qwen4exp forward seam instead of the standard dense loading. Assembly-internal: hosts never reach this family's fixture path.</summary>
     internal bool HasQwen4ExpForward => _qwen4Exp is not null;
 
+    /// <summary>The leading dimensions the opened qwen4exp seam's positional rotations cover, per region kind — head regions and indexer component regions — or null on every engine that did not open the seam. Assembly-internal diagnostics behind this family's rope gates.</summary>
+    internal (int HeadRegions, int IndexerRegions)? Qwen4ExpRotaryCoverage => _qwen4Exp?.RotaryCoverage;
+
     /// <summary>Fresh per-sequence state on the bounded qwen4exp seam: recurrent delta-rule slots, convolution history and synthetic whole-sequence caches, all sized at the opened context ceiling. Refused on every family that did not open the seam.</summary>
     internal Qwen4ExpSequence NewQwen4ExpSequence() =>
         _qwen4Exp is { } engine
@@ -4208,12 +4211,14 @@ public sealed class TransformerModel : IDisposable
 
     // The weight a declared shared expert contributes with. A block whose profile names no selector role, or whose
     // file ships none of those vectors, gets exactly 1f: the ungated accumulation this path has always used. When the
-    // vectors are present the score is taken from them against this token's normalized stream and applied as
-    // silu(score) / score to the shared output — the pinned qwen2moe graph builds it that way, as
-    // `ggml_div(ggml_silu(cur_gate_inp), cur_gate_inp)` over a GEMV of ffn_gate_inp_shexp, which is sigmoid's value
-    // read through its own silu rather than a separate node. The dot runs in ascending column order and both forward
-    // paths reach it through this method with the same per-token stream, so batched steps stay bit-identical to
-    // single-sequence ones. A score of exactly zero divides 0 by 0 as the reference graph does.
+    // vectors are present the score is taken from them against this token's normalized stream and gated by the family
+    // the plan resolved: a qwen4exp plan composes plain sigmoid(score) — the reference gate its own bounded forward
+    // reads, finite at every score including exactly zero — while every other routed family keeps silu(score) / score,
+    // how the pinned qwen2moe graph builds it as `ggml_div(ggml_silu(cur_gate_inp), cur_gate_inp)` over a GEMV of
+    // ffn_gate_inp_shexp, sigmoid's value read through its own silu rather than a separate node. The dot runs in
+    // ascending column order and both forward paths reach it through this method with the same per-token stream, so
+    // batched steps stay bit-identical to single-sequence ones. A qwen2moe score of exactly zero divides 0 by 0 as its
+    // reference graph does; a qwen4exp one reads 0.5.
     private float SharedExpertWeight(int layer, ReadOnlySpan<float> normed)
     {
         if (_sharedInputGate.Length == 0)
@@ -4228,7 +4233,9 @@ public sealed class TransformerModel : IDisposable
             score += selector[c] * normed[c];
         }
 
-        return LayerOps.Silu(score) / score;
+        // The gate arm is chosen by the family the plan resolved, never probed from the score: qwen2moe-shaped plans keep
+        // their pinned composition unchanged, and a qwen4exp plan reads the plain sigmoid its reference composes.
+        return LayerOps.SharedExpertGateWeight(plainSigmoidFamily: Plan.Qwen4Exp is not null, score);
     }
 
     // Sparse feed-forward for the current token: routing selects, then every selected expert's gate/up/down chain runs

@@ -19,11 +19,14 @@ namespace Lair.Models.Engine;
 /// instead of synthetic fills. State is explicit per sequence: each linear block's delta-rule slot arrays plus raw convolution
 /// history advance across chunk splits through <see cref="GdnOps.ForwardChunkKernel"/>, and each sparse-full block's whole-sequence KV
 /// rows, raw indexer-key cache and pooled selection run through the existing <see cref="QsaOps"/> semantics unchanged, so a
-/// sequence forwarded as consecutive chunks lands bit-for-bit on one unsplit pass. The shared expert uses the qwen4exp reference
-/// gate — plain <c>sigmoid(dot(ffn_gate_inp_shexp, mixed))</c>, finite at a zero score where qwen2moe's
-/// <c>silu(score) / score</c> divides 0 by 0 — rather than qwen2moe's posture, which stays exactly as production applies it for
-/// that family.
+/// sequence forwarded as consecutive chunks lands bit-for-bit on one unsplit pass. Positional rotation composes the file's declared
+/// rotary slice — <c>&lt;prefix&gt;rope.dimension_count</c>, or every head dimension when the key is absent — at text positions over
+/// the pairs inside that slice, leaving each dimension outside it untouched in both q/k heads and indexer components. The shared
+/// expert uses the qwen4exp reference gate — plain <c>sigmoid(dot(ffn_gate_inp_shexp, mixed))</c>, finite at a zero score where
+/// qwen2moe's <c>silu(score) / score</c> divides 0 by 0, or ungated at one when the file ships no selector vector — rather than
+/// qwen2moe's posture, which stays exactly as production applies it for that family.
 /// </summary>
+
 internal sealed class Qwen4ExpEngine : IDisposable
 {
     private readonly ModelPlan _plan;
@@ -93,7 +96,11 @@ internal sealed class Qwen4ExpEngine : IDisposable
     private float[] _ffnOutputScratch = []; // sparse routed/shared contributions accumulate here, then copy to the caller's output row — a class cannot hold a caller-owned Span field.
 
     // Rotary tables shared across every block: one position-major cos/sin run for the q/k head dimension and one for the indexer
-    // component width, built once at open so no forward rebuilds either.
+    // component width, built once at open so no forward rebuilds either. A file declaring a rotary slice narrower than its heads
+    // (the target's <c>rope.dimension_count</c>) gets tables over that leading slice only: each rotation composes the text position
+    // across the pairs inside the slice and leaves every dimension outside it untouched, in head regions and indexer component
+    // regions alike. The declared <c>rope.sections</c> array stays unconsumed here because a text-only composition gives every pair
+    // of the slice the same position-derived angle whatever axis split those sections describe.
     private readonly float[] _cosHead;
     private readonly float[] _sinHead;
     private readonly float[] _cosIndexer;
@@ -139,6 +146,16 @@ internal sealed class Qwen4ExpEngine : IDisposable
         {
             // The spike's own posture: indexer heads rotate in pairs, so a sparse-full block needs an even component width.
             throw new ModelException($"qwen4exp indexer key length {geometry.SparseAttention.IndexerKeyLength} is odd; RoPE pairs require an even indexer key length on sparse-full blocks");
+        }
+
+        // The declared rotary slice the composition covers: every head dimension when the plan declares none, otherwise the
+        // leading count the file names. A slice that cannot form pairs inside its own heads — odd, zero, or wider than the
+        // head dimension — is a declaration this seam has no composition over, refused naming what was declared.
+        int ropeSliceDimensions = plan.RopeRotaryDimensions > 0 ? plan.RopeRotaryDimensions : _headDim;
+        if (ropeSliceDimensions % 2 != 0 || ropeSliceDimensions > _headDim)
+        {
+            throw new ModelException(
+                $"qwen4exp declares rotary dimensions {plan.RopeRotaryDimensions} that cannot form pairs inside its {_headDim}-wide heads; a slice must be an even count not exceeding the head dimension");
         }
 
         _streamCount = geometry.HyperConnections.StreamCount;
@@ -223,23 +240,38 @@ internal sealed class Qwen4ExpEngine : IDisposable
 
         _logitHead = outputHead ?? _tokenEmbedding; // tied posture: the logits read the same rows the embeddings do
 
-        _ropeHalfHead = _headDim / 2;
-        _ropeHalfIndexer = geometry.SparseAttention.IndexerKeyLength / 2;
+        // Each rotation covers the leading slice: full pairs for a file declaring no slice, and the declared count's pairs
+        // otherwise — in head regions at their own width, and in indexer components narrowed to that same slice only where
+        // the component region is narrower than it. A plan carrying no slice therefore leaves both widths exactly as today.
+        int indexerSliceDimensions = plan.RopeRotaryDimensions > 0
+            ? Math.Min(ropeSliceDimensions, geometry.SparseAttention.IndexerKeyLength)
+            : geometry.SparseAttention.IndexerKeyLength;
+
+        _ropeHalfHead = ropeSliceDimensions / 2;
+        _ropeHalfIndexer = indexerSliceDimensions / 2;
 
         _cosHead = new float[maxPositions * _ropeHalfHead];
         _sinHead = new float[maxPositions * _ropeHalfHead];
-        LayerOps.BuildRopeTables(plan.RopeTheta, _headDim, maxPositions, _cosHead, _sinHead);
+        LayerOps.BuildRopeSliceTables(plan.RopeTheta, _headDim, ropeSliceDimensions, maxPositions, _cosHead, _sinHead);
 
         _cosIndexer = new float[maxPositions * Math.Max(1, _ropeHalfIndexer)];
         _sinIndexer = new float[maxPositions * Math.Max(1, _ropeHalfIndexer)];
         if (_ropeHalfIndexer > 0)
         {
-            LayerOps.BuildRopeTables(plan.RopeTheta, geometry.SparseAttention.IndexerKeyLength, maxPositions, _cosIndexer, _sinIndexer);
+            LayerOps.BuildRopeSliceTables(plan.RopeTheta, geometry.SparseAttention.IndexerKeyLength, indexerSliceDimensions, maxPositions, _cosIndexer, _sinIndexer);
         }
     }
 
     /// <summary>The resolved family geometry this engine sequences against.</summary>
     public Qwen4ExpGeometry Geometry => _geometry;
+
+    /// <summary>
+    /// The leading dimensions every positional rotation of this engine actually covers: the declared rotary slice for q/k head
+    /// regions, and that same slice narrowed to a component region only where the region is wider than it — so an undeclared
+    /// plan reports each region rotated at its own full width. Assembly-internal diagnostics behind the family's rope gates; no
+    /// forward reads them.
+    /// </summary>
+    internal (int HeadRegions, int IndexerRegions) RotaryCoverage => (_ropeHalfHead * 2, _ropeHalfIndexer * 2);
 
     /// <summary>
     /// Fresh per-sequence state: each linear block's delta-rule slot arrays plus convolution history, and each sparse-full block's
@@ -582,8 +614,9 @@ internal sealed class Qwen4ExpEngine : IDisposable
     // The block's feed-forward side. A resolved sparse descriptor routes every token through the same all-expert softmax, ascending
     // strict-greater top-k (lower index wins ties), renormalization and scale the production route applies, then each selected
     // expert's SwiGLU chain accumulates in ascending expert-index order scaled by its routing weight; a declared shared expert runs
-    // once under the plain sigmoid gate over its hidden-sized selector vector — the qwen4exp reference gate, finite at a zero score
-    // where qwen2moe's silu(score)/score divides 0 by 0. A file declaring no experts keeps the dense gate/up/down triplet.
+    // once under plain sigmoid over its hidden-sized selector vector — the qwen4exp reference gate, finite at a zero score where
+    // qwen2moe's silu(score)/score divides 0 by 0 — or ungated at one when the file ships no such vector. A file declaring no
+    // experts keeps the dense gate/up/down triplet.
     // Selection carries no cross-token state, so splitting a chunk across calls reproduces the unsplit run exactly.
     private void ForwardFeedForward(LayerOperands w, ReadOnlySpan<float> mixed, Span<float> ffnOut)
     {
@@ -720,13 +753,22 @@ internal sealed class Qwen4ExpEngine : IDisposable
 
         if (sparse.HasSharedExpert)
         {
-            float score = 0f; // the qwen4exp gate is plain sigmoid(score): finite at a zero score where qwen2moe's silu/score divides 0 by 0
-            for (int c = 0; c < _hiddenSize; c++)
-            {
-                score += w.SharedGateVector![c] * mixed[c];
-            }
+            // A file shipping this block's hidden-sized selector vector gates the shared contribution through the family's own
+            // composition — plain sigmoid over its score, finite at every score including exactly zero, where qwen2moe's
+            // silu(score)/score divides 0 by 0. A file shipping no selector adds it ungated at exactly one, which is what the
+            // production sparse path reads for that case as well.
+            float sharedWeight = 1f;
 
-            float sharedWeight = GdnOps.Sigmoid(score);
+            if (w.SharedGateVector is { } gateVector)
+            {
+                float score = 0f;
+                for (int c = 0; c < _hiddenSize; c++)
+                {
+                    score += gateVector[c] * mixed[c];
+                }
+
+                sharedWeight = LayerOps.SharedExpertGateWeight(plainSigmoidFamily: true, score);
+            }
 
             _backend.Gemv(mixed, Ref(w.SharedGate!), _ffnGateOut);
             _backend.Gemv(mixed, Ref(w.SharedUp!), _ffnUpOut);
@@ -875,7 +917,7 @@ internal sealed class Qwen4ExpEngine : IDisposable
                 LogicalTensor? selector = declared.SharedInputGateRole is { } gateRole ? map[gateRole].Resolve(tensors, layer) : null;
                 operands.SharedGateVector = selector is not null
                     ? LoadVector(selector, "shared expert selector vector", _hiddenSize)
-                    : new float[_hiddenSize]; // no selector shipped for this layer: the shared block adds ungated, exactly as the production posture reads it
+                    : null; // no selector shipped for this layer: the shared block adds ungated, exactly as the production posture reads it
             }
 
             operands.Sparse = declared;
@@ -911,11 +953,9 @@ internal sealed class Qwen4ExpEngine : IDisposable
             throw PostureRefusal($"rope scaling variant '{scaling.Variant}' with multiplier {scaling.Multiplier} and attention factor {scaling.AttentionFactor}");
         }
 
-        if (plan.RopeRotaryDimensions != 0)
-        {
-            throw PostureRefusal($"partial rotary dimensions {plan.RopeRotaryDimensions}; this seam rotates each head in full");
-        }
-
+        // A declared rotary slice is composed, not refused: the rotation covers its leading dimensions across every block's
+        // q/k heads and indexer components and passes the rest through unchanged (see the tables built at open). Only a rope
+        // scaling variant stays out of this seam.
         if (plan.AttentionWindow > 0)
         {
             throw PostureRefusal($"attention window {plan.AttentionWindow} under interleave '{plan.WindowInterleave}'");

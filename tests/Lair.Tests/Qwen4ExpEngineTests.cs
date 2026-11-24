@@ -44,7 +44,8 @@ public sealed class Qwen4ExpEngineTests : IDisposable
     private const int Layers = 4;          // ratios [0,0,0,1]: three linear blocks, one sparse full block per group of four
     private const int Hidden = 8;
     private const int HeadCount = 2;
-    private const int HeadDim = 4;         // hidden / head_count — even, so the engine rotates full heads
+    private const int HeadDim = 4;         // hidden / head_count — even, so the engine rotates full heads by default
+    private const int PartialRopeDimensions = 2; // a declared leading slice narrower than the heads: the target's partial-rotary posture in miniature
     private const int KvHeadCount = 1;
     private const int StateDim = 2;        // ssm.state_size — the shared head dimension every value head carries
     private const int InnerSize = 4;       // ssm.inner_size over state dim: two derived value heads per linear block
@@ -194,6 +195,155 @@ public sealed class Qwen4ExpEngineTests : IDisposable
         {
             Assert.True(float.IsFinite(value), "a zero-score shared expert must gate through sigmoid(0), not a 0/0 division");
         }
+    }
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpSharedExpertWithoutASelectorVector_AddsUngatedRatherThanAtSigmoidOfZero()
+    {
+        // The two postures are different weights, not the same one read twice. A file shipping this block's selector vector at
+        // exactly zeros gates with sigmoid(0) = 0.5; a file shipping no vector at all adds the shared block ungated at exactly
+        // one, which is what the production sparse path reads for that case too. The two forwards must therefore disagree —
+        // folding an absent selector into a zero score and gating it would make them identical. Both fixtures ship every shared
+        // tensor in the same order so only the selector's presence differs anywhere on the path.
+        List<(string Key, object Value)> pairs = MetadataPairs();
+        pairs.Add(("qwen4exp.expert_shared_count", 1));
+
+        List<TensorDef> sharedDefs = [];
+        List<TensorDef> selectorDefs = [];
+        HashSet<string> zeroFilledNames = [];
+        for (int layer = 0; layer < Layers; layer++)
+        {
+            sharedDefs.Add(new TensorDef($"blk.{layer}.ffn_gate_shexp.weight", [IntermediateSize, Hidden]));
+            sharedDefs.Add(new TensorDef($"blk.{layer}.ffn_up_shexp.weight", [IntermediateSize, Hidden]));
+            sharedDefs.Add(new TensorDef($"blk.{layer}.ffn_down_shexp.weight", [Hidden, IntermediateSize]));
+
+            string selectorName = $"blk.{layer}.ffn_gate_inp_shexp.weight";
+            selectorDefs.Add(new TensorDef(selectorName, [Hidden])); // zero-filled by the builder below
+            zeroFilledNames.Add(selectorName);
+        }
+
+        List<TensorDef> ungatedTensors = [.. FixtureTensors(), .. sharedDefs];
+        List<TensorDef> gatedTensors = [.. ungatedTensors, .. selectorDefs];
+
+        using GgufFile gated = OpenFixture(BuildGguf(pairs, gatedTensors, zeroFilledNames: zeroFilledNames));
+        using GgufFile ungated = OpenFixture(BuildGguf(pairs, ungatedTensors));
+        using CpuBackend backend = new();
+
+        using TransformerModel gatedModel = TransformerModel.Open(gated, backend, maxContextTokens: 8);
+        using TransformerModel ungatedModel = TransformerModel.Open(ungated, backend, maxContextTokens: 8);
+
+        Assert.True(gatedModel.Plan.SparseFfn!.HasSharedExpert);
+        Assert.Equal(TensorRole.MoeSharedExpertInputGate, gatedModel.Plan.SparseFfn!.SharedInputGateRole);
+
+        Span<float> gatedLogits = gatedModel.ForwardQwen4ExpChunk(gatedModel.NewQwen4ExpSequence(), [0, 1, 2]);
+        Span<float> ungatedLogits = ungatedModel.ForwardQwen4ExpChunk(ungatedModel.NewQwen4ExpSequence(), [0, 1, 2]);
+
+        float largestDelta = 0f;
+        for (int i = 0; i < ungatedLogits.Length; i++)
+        {
+            Assert.True(float.IsFinite(gatedLogits[i]));
+            Assert.True(float.IsFinite(ungatedLogits[i]));
+            largestDelta = Math.Max(largestDelta, Math.Abs(gatedLogits[i] - ungatedLogits[i]));
+        }
+
+        Assert.True(largestDelta > 1e-4f, $"a zero-score sigmoid gate (0.5) and an absent selector (1.0) must not read as the same weight; largest delta {largestDelta:G9}");
+    }
+
+    // ---------------------------------------------------------------- declared rotary slices
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpFixture_DeclaredPartialRotarySlice_OpensAndNarrowsEveryPositionalRotation()
+    {
+        // The target shape in miniature: heads of four dimensions carrying a two-dimension rotary slice, exactly the posture
+        // this seam used to refuse. It composes now — the plan carries the declaration, the engine opens on it, and both
+        // region kinds report the coverage their rotations actually run at.
+        List<(string Key, object Value)> pairs = [.. MetadataPairs(), ("qwen4exp.rope.dimension_count", PartialRopeDimensions)];
+
+        using GgufFile file = OpenFixture(BuildGguf(pairs, FixtureTensors()));
+        using CpuBackend backend = new();
+
+        using TransformerModel model = TransformerModel.Open(file, backend, maxContextTokens: 8);
+
+        Assert.Equal(PartialRopeDimensions, model.Plan.RopeRotaryDimensions); // the declaration resolved rather than failing or being ignored
+        Assert.True(model.HasQwen4ExpForward);
+
+        (int HeadRegions, int IndexerRegions)? coverage = model.Qwen4ExpRotaryCoverage;
+        Assert.NotNull(coverage);
+        Assert.Equal(PartialRopeDimensions, coverage.Value.HeadRegions); // q/k heads rotate only the declared leading slice
+        Assert.Equal(PartialRopeDimensions, coverage.Value.IndexerRegions); // and so do indexer components of a wider region
+
+        Qwen4ExpSequence sequence = model.NewQwen4ExpSequence();
+        Span<float> logits = model.ForwardQwen4ExpChunk(sequence, [0, 1, 2]);
+
+        foreach (float value in logits)
+        {
+            Assert.True(float.IsFinite(value), "a sliced rotary composition must land every logit finite");
+        }
+
+        Qwen4ExpSequence repeat = model.NewQwen4ExpSequence();
+        Assert.True(model.ForwardQwen4ExpChunk(repeat, [0, 1, 2]).SequenceEqual(logits));
+    }
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpFixture_FullWidthRotarySlice_MatchesTheUndeclaredRunBitForBit()
+    {
+        // A slice declaration that covers every head dimension is today's full-head rotation: same tables, same coverage the
+        // seam reports with no declaration at all, and logits identical bit-for-bit against the fixture that names nothing.
+        List<(string Key, object Value)> pairs = [.. MetadataPairs(), ("qwen4exp.rope.dimension_count", HeadDim)];
+
+        using GgufFile declared = OpenFixture(BuildGguf(pairs, FixtureTensors()));
+        using GgufFile undeclared = OpenFixture(BuildGguf(MetadataPairs(), FixtureTensors()));
+        using CpuBackend backend = new();
+
+        using TransformerModel declaredModel = TransformerModel.Open(declared, backend, maxContextTokens: 8);
+        using TransformerModel plainModel = TransformerModel.Open(undeclared, backend, maxContextTokens: 8);
+
+        Assert.Equal(HeadDim, declaredModel.Plan.RopeRotaryDimensions);
+
+        (int HeadRegions, int IndexerRegions)? declaredCoverage = declaredModel.Qwen4ExpRotaryCoverage;
+        (int HeadRegions, int IndexerRegions)? plainCoverage = plainModel.Qwen4ExpRotaryCoverage;
+        Assert.Equal((HeadDim, IndexerKeyLength), declaredCoverage);
+        Assert.Equal(plainCoverage, declaredCoverage);
+
+        Span<float> declaredLogits = declaredModel.ForwardQwen4ExpChunk(declaredModel.NewQwen4ExpSequence(), [0, 1, 2]);
+        Span<float> plainLogits = plainModel.ForwardQwen4ExpChunk(plainModel.NewQwen4ExpSequence(), [0, 1, 2]);
+
+        Assert.True(BitsEqual(declaredLogits, plainLogits), "a whole-head slice declaration must rotate exactly as an undeclared plan does");
+    }
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpPartialRotarySlice_ChangesTheForwardAndCarriesAcrossChunkSplits()
+    {
+        // The narrowed composition is real rather than decorative: against the same tensors rotated in full, a two-dimension
+        // slice moves logits by more than bit noise while every carried state still lands a chunk split on the unsplit run.
+        List<(string Key, object Value)> pairs = [.. MetadataPairs(), ("qwen4exp.rope.dimension_count", PartialRopeDimensions)];
+
+        using GgufFile sliced = OpenFixture(BuildGguf(pairs, FixtureTensors()));
+        using GgufFile fullHead = OpenFixture(BuildGguf(MetadataPairs(), FixtureTensors()));
+        using CpuBackend backend = new();
+
+        using TransformerModel slicedModel = TransformerModel.Open(sliced, backend, maxContextTokens: 8);
+        using TransformerModel fullModel = TransformerModel.Open(fullHead, backend, maxContextTokens: 8);
+
+        Span<float> slicedLogits = slicedModel.ForwardQwen4ExpChunk(slicedModel.NewQwen4ExpSequence(), [0, 1, 2]);
+        Span<float> fullLogits = fullModel.ForwardQwen4ExpChunk(fullModel.NewQwen4ExpSequence(), [0, 1, 2]);
+
+        float largestDelta = 0f;
+        for (int i = 0; i < slicedLogits.Length; i++)
+        {
+            largestDelta = Math.Max(largestDelta, Math.Abs(slicedLogits[i] - fullLogits[i]));
+        }
+
+        Assert.True(largestDelta > 1e-4f, $"a narrowed slice must change the forward, largest logit delta {largestDelta:G9}");
+
+        Qwen4ExpSequence whole = slicedModel.NewQwen4ExpSequence();
+        Span<float> unsplit = slicedModel.ForwardQwen4ExpChunk(whole, [0, 1, 2]);
+
+        Qwen4ExpSequence split = slicedModel.NewQwen4ExpSequence();
+        slicedModel.ForwardQwen4ExpChunk(split, [0, 1]);
+        Span<float> tail = slicedModel.ForwardQwen4ExpChunk(split, [2]);
+
+        Assert.True(tail.SequenceEqual(unsplit.Slice(2 * VocabSize, VocabSize)), "a sliced rotation must carry its positions across a chunk boundary");
     }
 
     // ---------------------------------------------------------------- the seam refuses what it cannot read or compose
@@ -523,6 +673,25 @@ public sealed class Qwen4ExpEngineTests : IDisposable
         byte[] bytes = Encoding.UTF8.GetBytes(value);
         writer.Write((ulong)bytes.Length);
         writer.Write(bytes);
+    }
+
+    // Bit-for-bit comparison: the seam's full-head posture gates compare against today's behavior exactly, not within a tolerance.
+    private static bool BitsEqual(ReadOnlySpan<float> left, ReadOnlySpan<float> right)
+    {
+        if (left.Length != right.Length)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < left.Length; i++)
+        {
+            if (BitConverter.SingleToInt32Bits(left[i]) != BitConverter.SingleToInt32Bits(right[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private sealed record TensorDef(string Name, int[] Dims, uint GgmlType = GgmlTypeF32); // dims in logical (row-major) order; vectors are one-dimensional

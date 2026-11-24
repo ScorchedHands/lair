@@ -410,6 +410,40 @@ public sealed class Qwen4ExpPlanTests : IDisposable
         Assert.Equal(3, plan.Qwen4Exp.LinearLayerCount);
     }
 
+    // ---------------------------------------------------------------- the target's positional posture resolves under this family's prefix
+
+    [Fact]
+    public void ModelPlan_Qwen4ExpDeclaredHeadWidthAndPartialRotarySlice_ResolveForTheForwardToCompose()
+    {
+        // The pinned target declares its head/key/value width outright and narrows rotation with rope.dimension_count; the
+        // plan must land both values rather than rejecting the partial posture, so the bounded forward composes over them.
+        List<(string Key, object Value)> declared =
+        [
+            .. MetadataPairs(),
+            ("qwen4exp.attention.head_length", 4),
+            ("qwen4exp.rope.dimension_count", 2),
+        ];
+
+        using GgufFile file = OpenFixture(BuildGguf(declared, FixtureTensors()));
+        ModelPlan plan = ModelPlans.Resolve(file);
+
+        Assert.Equal(4, plan.HeadDim); // declared width rather than the hidden / head_count derivation
+        Assert.Equal(2, plan.RopeRotaryDimensions); // a leading slice: the rest of each region passes through unchanged
+
+        // A slice wider than the heads it must pair inside still fails naming the key and the declared value.
+        List<(string Key, object Value)> tooWide =
+        [
+            .. MetadataPairs(),
+            ("qwen4exp.attention.head_length", 4),
+            ("qwen4exp.rope.dimension_count", 6),
+        ];
+
+        using GgufFile oversized = OpenFixture(BuildGguf(tooWide, FixtureTensors()));
+        ModelException ex = Assert.Throws<ModelException>(() => ModelPlans.Resolve(oversized));
+        Assert.Contains("qwen4exp.rope.dimension_count", ex.Message);
+        Assert.Contains("6", ex.Message);
+    }
+
     // ---------------------------------------------------------------- fixture builders (synthetic GGUF v3 images; array metadata supported)
 
     private static List<(string Key, object Value)> MetadataPairs() =>

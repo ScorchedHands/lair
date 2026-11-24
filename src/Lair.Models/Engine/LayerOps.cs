@@ -146,6 +146,18 @@ internal static class LayerOps
     /// <summary>SiLU activation: x / (1 + exp(-x)).</summary>
     internal static float Silu(float x) => x / (1f + MathF.Exp(-x));
 
+    /// <summary>Plain sigmoid: 1 / (1 + exp(-x)) — the gate a qwen4exp shared expert reads over its selector score.</summary>
+    internal static float Sigmoid(float x) => 1f / (1f + MathF.Exp(-x));
+
+    /// <summary>
+    /// The weight one routed family's declared shared expert contributes for its selector score. A family whose reference
+    /// composes the gate as a plain sigmoid gets <c>sigmoid(score)</c>: finite at every score, 0.5 at exactly zero. Every
+    /// other routed family keeps the pinned qwen2moe composition <c>silu(score) / score</c>, which divides 0 by 0 at a zero
+    /// score exactly as that graph does. The arm is selected by the family the plan resolved, never probed from the score.
+    /// </summary>
+    internal static float SharedExpertGateWeight(bool plainSigmoidFamily, float score) =>
+        plainSigmoidFamily ? Sigmoid(score) : Silu(score) / score;
+
     /// <summary>
     /// Logit softcap: cap * tanh(x / cap), evaluated in double and rounded once to float. The result stays
     /// inside [-cap, cap]: the identity for small magnitudes, saturating toward ±cap for large ones. Callers
@@ -243,9 +255,24 @@ internal static class LayerOps
     /// <summary>
     /// Fills position-major cos/sin tables for standard full-head RoPE up to maxPositions. Each position stores
     /// headDim/2 entries: angle(pos, i) = pos * base^(-2i/headDim), the angle of pair i, computed in double and stored
-    /// as float so the same inputs always produce bit-identical rotations.
+    /// as float so the same inputs always produce bit-identical rotations. This is <see cref="BuildRopeSliceTables"/>
+    /// over the whole head dimension, which is why a full-head table reads exactly as it always has.
     /// </summary>
-    internal static void BuildRopeTables(double thetaBase, int headDim, int maxPositions, Span<float> cos, Span<float> sin)
+    internal static void BuildRopeTables(double thetaBase, int headDim, int maxPositions, Span<float> cos, Span<float> sin) =>
+        BuildRopeSliceTables(thetaBase, headDim, ropeDimensions: headDim, maxPositions, cos, sin);
+
+    /// <summary>
+    /// Fills position-major cos/sin tables for the leading <c>ropeDimensions</c> of a <c>headDim</c>-wide head up to
+    /// maxPositions — the unscaled angle table a partial rotary declaration asks for. Each position stores
+    /// <c>ropeDimensions / 2</c> entries, and pair i still carries the angle of the pair occupying head dimensions at
+    /// its own place in the full head: <c>angle(pos, i) = pos * base^(-2i/headDim)</c>, computed over the whole-head
+    /// denominator exactly as a full-head build computes it. Narrowing therefore truncates which pairs exist without
+    /// re-spacing the frequencies of the ones that remain — what the reference reads for <c>n_rot &lt; n_embd_head</c>
+    /// and what <see cref="BuildRopeScalingTables"/> already does under a scaling variant. A slice equal to the head
+    /// dimension produces bit-identical tables to <see cref="BuildRopeTables"/>, and only pairs inside the slice exist,
+    /// so every rotation driven off this table leaves the dimensions outside it untouched.
+    /// </summary>
+    internal static void BuildRopeSliceTables(double thetaBase, int headDim, int ropeDimensions, int maxPositions, Span<float> cos, Span<float> sin)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(headDim);
 
@@ -254,10 +281,18 @@ internal static class LayerOps
             throw new ArgumentException($"RoPE pairs require an even head dimension, got {headDim}.", nameof(headDim));
         }
 
-        int half = headDim / 2;
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(ropeDimensions);
+        if (ropeDimensions > headDim || ropeDimensions % 2 != 0)
+        {
+            throw new ArgumentException(
+                $"the rotary slice must be an even count of head dimensions not exceeding {headDim}, got {ropeDimensions}.",
+                nameof(ropeDimensions));
+        }
+
+        int half = ropeDimensions / 2;
         if (cos.Length < maxPositions * half || sin.Length < maxPositions * half)
         {
-            throw new ArgumentException("Cos/sin tables must cover maxPositions * headDim/2 entries each.", nameof(cos));
+            throw new ArgumentException($"Cos/sin tables must cover maxPositions * {ropeDimensions}/2 entries each.", nameof(cos));
         }
 
         double[] invFreq = new double[half];
