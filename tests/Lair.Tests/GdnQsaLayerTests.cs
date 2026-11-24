@@ -1,4 +1,6 @@
+using System.Buffers;
 using Lair.Backends.Cpu;
+using Lair.Contracts;
 using Lair.Kv;
 using Lair.Models.Engine;
 
@@ -233,6 +235,90 @@ public sealed class GdnQsaLayerTests
     }
 
     [Fact]
+    public void GdnOps_ForwardChunkKernel_BatchedProjectionsMatchPerTokenSoloBitForBit()
+    {
+        GdnOps.GdnKernelTensors w = KernelTensors();
+        float[] hidden = Matrix(4, w.HiddenSize);
+
+        using CpuBackend backend = new(threads: 1, allowAvx2: true);
+        using ArrayGdnWeightSource weights = new(w);
+
+        // Batched multi-token forward: every projection role runs as one batched pass per window.
+        float[] batchOut = new float[4 * w.HiddenSize];
+        float[] batchState = new float[RecurrentValues(w)];
+        float[] batchHistory = new float[ConvHistoryValues(w)];
+        float[] batchNew = new float[ConvHistoryValues(w)];
+        GdnOps.GdnChunkScratch batchScratch = GdnOps.GdnChunkScratch.Create(w.KeyHeads, w.ValueHeads, w.StateDim, w.ConvKernel, maxTokenCount: 4);
+        GdnOps.ForwardChunkKernel(backend, weights, w, eps: 1e-6f, 4, hidden, batchHistory, batchNew, batchState, batchScratch, batchOut);
+
+        // Solo per-token forward over the same operands: the batched projections and the per-row solo dots must land identically,
+        // and the convolution history and recurrent state must advance the same way across the token-by-token carry.
+        float[] soloOut = new float[4 * w.HiddenSize];
+        float[] soloState = new float[RecurrentValues(w)];
+        float[] soloHistory = new float[ConvHistoryValues(w)];
+        float[] soloNew = new float[ConvHistoryValues(w)];
+        GdnOps.GdnChunkScratch soloScratch = GdnOps.GdnChunkScratch.Create(w.KeyHeads, w.ValueHeads, w.StateDim, w.ConvKernel, maxTokenCount: 4);
+        for (int t = 0; t < 4; t++)
+        {
+            GdnOps.ForwardChunkKernel(backend, weights, w, eps: 1e-6f, 1, hidden.AsSpan(t * w.HiddenSize, w.HiddenSize), soloHistory, soloNew, soloState, soloScratch, soloOut.AsSpan(t * w.HiddenSize, w.HiddenSize));
+            (soloHistory, soloNew) = (soloNew, soloHistory);
+        }
+
+        Assert.True(batchOut.AsSpan().SequenceEqual(soloOut.AsSpan()), "a batched multi-token GDN projection must land bit-for-bit on the per-token solo forward");
+        Assert.True(batchState.AsSpan().SequenceEqual(soloState.AsSpan()), "the recurrent state must advance identically under batched projections");
+
+        // After the solo loop's final rotation the produced conv tail sits in the history slot (what the next chunk would read),
+        // which is exactly the tail the single batched call left in its new-history buffer.
+        Assert.True(batchNew.AsSpan().SequenceEqual(soloHistory.AsSpan()), "the convolution history tail must carry identically under batched projections");
+    }
+
+    [Fact]
+    public void GdnOps_ForwardChunkKernel_SingleTokenRunsSolo_MultiTokenRunsBatched()
+    {
+        GdnOps.GdnKernelTensors w = KernelTensors();
+        float[] hidden = Matrix(4, w.HiddenSize);
+
+        using CpuBackend inner = new(threads: 1, allowAvx2: true);
+        using CountingBackend backend = new(inner);
+        using ArrayGdnWeightSource weights = new(w);
+
+        // Single token: the decode posture — every role a solo GEMV, no batched kernel call.
+        float[] soloOut = new float[w.HiddenSize];
+        float[] soloState = new float[RecurrentValues(w)];
+        float[] soloHistory = new float[ConvHistoryValues(w)];
+        float[] soloNew = new float[ConvHistoryValues(w)];
+        GdnOps.GdnChunkScratch soloScratch = GdnOps.GdnChunkScratch.Create(w.KeyHeads, w.ValueHeads, w.StateDim, w.ConvKernel, maxTokenCount: 1);
+        GdnOps.ForwardChunkKernel(backend, weights, w, eps: 1e-6f, 1, hidden.AsSpan(0, w.HiddenSize), soloHistory, soloNew, soloState, soloScratch, soloOut);
+        Assert.Equal(5, backend.GemvCalls); // qkv, gate, beta, alpha, output — each one solo GEMV
+        Assert.Equal(0, backend.GemvBatchCalls);
+
+        // Multi-token: every role one batched pass per window, no solo GEMV left.
+        backend.GemvCalls = 0;
+        backend.GemvBatchCalls = 0;
+        float[] batchOut = new float[4 * w.HiddenSize];
+        float[] batchState = new float[RecurrentValues(w)];
+        float[] batchHistory = new float[ConvHistoryValues(w)];
+        float[] batchNew = new float[ConvHistoryValues(w)];
+        GdnOps.GdnChunkScratch batchScratch = GdnOps.GdnChunkScratch.Create(w.KeyHeads, w.ValueHeads, w.StateDim, w.ConvKernel, maxTokenCount: 4);
+        GdnOps.ForwardChunkKernel(backend, weights, w, eps: 1e-6f, 4, hidden, batchHistory, batchNew, batchState, batchScratch, batchOut);
+        Assert.Equal(0, backend.GemvCalls);
+        Assert.Equal(5, backend.GemvBatchCalls); // qkv, gate, beta, alpha, output — one windowed batched pass each
+
+        // A chunk wider than the batch ceiling still lands on the same per-token results: windowing never moves a token's arithmetic.
+        backend.GemvCalls = 0;
+        backend.GemvBatchCalls = 0;
+        float[] wideHidden = Matrix(70, w.HiddenSize);
+        float[] wideOut = new float[70 * w.HiddenSize];
+        float[] wideState = new float[RecurrentValues(w)];
+        float[] wideHistory = new float[ConvHistoryValues(w)];
+        float[] wideNew = new float[ConvHistoryValues(w)];
+        GdnOps.GdnChunkScratch wideScratch = GdnOps.GdnChunkScratch.Create(w.KeyHeads, w.ValueHeads, w.StateDim, w.ConvKernel, maxTokenCount: 70);
+        GdnOps.ForwardChunkKernel(backend, weights, w, eps: 1e-6f, 70, wideHidden, wideHistory, wideNew, wideState, wideScratch, wideOut);
+        Assert.Equal(0, backend.GemvCalls);
+        Assert.Equal(10, backend.GemvBatchCalls); // five roles split into two windows (64 + 6) each
+    }
+
+    [Fact]
     public void QsaOps_IndexerScores_SumsRectifiedHeadDotsWithOneScale()
     {
         const int Heads = 2;
@@ -434,5 +520,118 @@ public sealed class GdnQsaLayerTests
     {
         double tolerance = 1e-5 * Math.Max(1.0, Math.Abs(expected));
         return Math.Abs((double)actual - expected) <= tolerance;
+    }
+
+    // A kernel-fed block's geometry, mirroring the synthetic dense fixture above: every projection role ships as an F32
+    // LogicalTensor the array weight source answers with deterministic rows, and the conv taps / decay / dt bias / head norm
+    // stay materialized exactly as the kernel seam carries them.
+    private static GdnOps.GdnKernelTensors KernelTensors() => new()
+    {
+        HiddenSize = 3,
+        KeyHeads = 1,
+        ValueHeads = 2,
+        StateDim = 2,
+        ConvKernel = 4,
+        Qkv = new LogicalTensor("gdn.qkv", new TensorShape([8, 3]), QuantFormat.F32, 0, 8 * 3 * 4L),
+        Gate = new LogicalTensor("gdn.gate", new TensorShape([4, 3]), QuantFormat.F32, 0, 4 * 3 * 4L),
+        Beta = new LogicalTensor("gdn.beta", new TensorShape([2, 3]), QuantFormat.F32, 0, 2 * 3 * 4L),
+        Alpha = new LogicalTensor("gdn.alpha", new TensorShape([2, 3]), QuantFormat.F32, 0, 2 * 3 * 4L),
+        Output = new LogicalTensor("gdn.out", new TensorShape([3, 4]), QuantFormat.F32, 0, 3 * 4 * 4L),
+        Conv1d = Matrix(8 * 4, 1),
+        SsmA = [-0.7f, -0.3f],
+        DtBias = [0.15f, -0.25f],
+        NormWeight = [1.25f, -0.75f],
+    };
+
+    private static int RecurrentValues(GdnOps.GdnKernelTensors w) => w.ValueHeads * w.StateDim * w.StateDim;
+
+    private static int ConvHistoryValues(GdnOps.GdnKernelTensors w) => (w.ConvKernel - 1) * w.ConvChannels;
+
+    /// <summary>An array-backed whole-tensor weight source that answers each GDN projection role with deterministic F32 rows,
+    /// so a batched and a solo forward read the very same bytes.</summary>
+    private sealed class ArrayGdnWeightSource : IWeightSource, IDisposable
+    {
+        private readonly Dictionary<string, byte[]> _payloads = new(StringComparer.Ordinal);
+
+        public ArrayGdnWeightSource(GdnOps.GdnKernelTensors w)
+        {
+            Add(w.Qkv);
+            Add(w.Gate);
+            Add(w.Beta);
+            Add(w.Alpha);
+            Add(w.Output);
+        }
+
+        private void Add(LogicalTensor tensor)
+        {
+            int rows = tensor.Shape.Dims[0];
+            int cols = tensor.Shape.Dims[^1];
+            float[] matrix = Matrix(rows, cols);
+            byte[] bytes = new byte[matrix.Length * 4];
+            System.Buffer.BlockCopy(matrix, 0, bytes, 0, bytes.Length);
+            _payloads[tensor.Name] = bytes;
+        }
+
+        public ReadOnlySpan<byte> Resolve(LogicalTensor tensor) =>
+            _payloads.TryGetValue(tensor.Name, out byte[]? bytes)
+                ? bytes
+                : throw new InvalidOperationException($"GDN weight source has no payload for tensor '{tensor.Name}'.");
+
+        public void Dispose()
+        {
+        }
+    }
+
+    /// <summary>Wraps a real CPU backend and tallies which dense kernel each projection took, so a test can assert the solo
+    /// versus batched posture without reaching into the engine. All compute delegates to the wrapped backend unchanged.</summary>
+    private sealed class CountingBackend : IBackend
+    {
+        private readonly CpuBackend _inner;
+
+        public CountingBackend(CpuBackend inner) => _inner = inner;
+
+        public int GemvCalls { get; set; }
+
+        public int GemvBatchCalls { get; set; }
+
+        public string DeviceId => _inner.DeviceId;
+
+        public WeightTier WeightTier => _inner.WeightTier;
+
+        public MemoryHandle AllocateAligned(long bytes, int alignment) => _inner.AllocateAligned(bytes, alignment);
+
+        public void FreeAligned(MemoryHandle handle) => _inner.FreeAligned(handle);
+
+        public IKvDeviceMirror OpenKvMirror(KvMirrorRequest request) => _inner.OpenKvMirror(request);
+
+        public void Gemv(ReadOnlySpan<float> x, WeightRef w, Span<float> output)
+        {
+            GemvCalls++;
+            _inner.Gemv(x, w, output);
+        }
+
+        public void GemvBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs)
+        {
+            GemvBatchCalls++;
+            _inner.GemvBatch(inputs, count, w, outputs);
+        }
+
+        public bool SupportsGemv(QuantFormat format) => _inner.SupportsGemv(format);
+
+        public void GemmBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs) => _inner.GemmBatch(inputs, count, w, outputs);
+
+        public bool SupportsGemm(QuantFormat format) => _inner.SupportsGemm(format);
+
+        public void DequantRow(WeightRef w, int row, Span<float> output) => _inner.DequantRow(w, row, output);
+
+        public float Dot(ReadOnlySpan<float> a, ReadOnlySpan<float> b) => _inner.Dot(a, b);
+
+        public void Axpy(float alpha, ReadOnlySpan<float> x, Span<float> y) => _inner.Axpy(alpha, x, y);
+
+        public void Fill(Span<float> y, float v) => _inner.Fill(y, v);
+
+        public void Scale(Span<float> y, float s) => _inner.Scale(y, s);
+
+        public void Dispose() => _inner.Dispose();
     }
 }

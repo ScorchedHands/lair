@@ -24,6 +24,11 @@ namespace Lair.Models.Engine;
 /// </summary>
 internal static class GdnOps
 {
+    // The widest token window one batched projection pass answers in a single backend call: the ceiling the compute backend's
+    // batched GEMV kernels accept. A chunk wider than this splits into windows, and every window's rows land on their solo-GEMV
+    // results unchanged, so windowing never moves a token's arithmetic.
+    private const int BatchWindow = 64;
+
     /// <summary>Sigmoid used by the beta selection and the output gate.</summary>
     internal static float Sigmoid(float x) => 1f / (1f + MathF.Exp(-x));
 
@@ -382,7 +387,8 @@ internal static class GdnOps
         public float[] LogGate = []; // tokenCount * ValueHeads decay gates per value head
         public float[] Beta = []; // tokenCount * ValueHeads sigmoided betas
         public float[] ValueOut = []; // tokenCount * ValueDim raw delta-rule outputs
-        public float[] GatedValue = []; // ValueDim gated-normalized head rows of one token, reused across tokens
+        public float[] GatedValue = []; // ValueDim gated-normalized head rows of one token, reused across tokens on the solo path
+        public float[] GatedValueBatch = []; // BatchWindow * ValueDim gated-normalized head rows, one window wide: the batched output projection's activation rows
 
         /// <summary>Size every array for a block and chunk width; each covers exactly what the forward reads per step.</summary>
         public static GdnChunkScratch Create(in GdnBlockTensors w, int maxTokenCount) =>
@@ -406,6 +412,7 @@ internal static class GdnOps
                 Beta = new float[maxTokenCount * valueHeads],
                 ValueOut = new float[maxTokenCount * valueDim],
                 GatedValue = new float[valueDim],
+                GatedValueBatch = new float[BatchWindow * valueDim],
             };
         }
     }
@@ -521,11 +528,14 @@ internal static class GdnOps
     /// The same block forward with every projection role read through a compute backend's GEMV kernels over the file's own
     /// packed weight views: the fused qkv rows, the z gate, and the beta and alpha sides each land as one <see
     /// cref="IBackend.Gemv"/> pass over a <see cref="WeightRef"/> resolved from the weight source for this pass, and the
-    /// block output projection runs per token through that same seam. Everything downstream of stage 1 — the causal depthwise
-    /// convolution against the carried history, the head norms, the delta rule, and the gated normalization — runs through
-    /// <see cref="RunRecurrentCore"/> unchanged, so a kernel-fed block and a synthetic block advance identical state for
-    /// identical operands. The conv taps, decay weights, dt biases, and head norm stay materialized because no dense-GEMV
-    /// kernel exists for a depthwise pass or a scalar head vector.
+    /// block output projection runs through that same seam. A single token runs every role as one solo GEMV — the decode
+    /// posture, with no batched scratch touched. A wider chunk runs each role as one <see cref="IBackend.GemvBatch"/> pass per
+    /// window of <see cref="BatchWindow"/> tokens, each window's rows landing bit-for-bit on the dots the solo seam would have
+    /// produced; the beta sigmoid and the alpha softplus/decay fold run per token in the same order the solo seam used.
+    /// Everything downstream of stage 1 — the causal depthwise convolution against the carried history, the head norms, the
+    /// delta rule, and the gated normalization — runs through <see cref="RunRecurrentCore"/> unchanged, so a kernel-fed block
+    /// and a synthetic block advance identical state for identical operands. The conv taps, decay weights, dt biases, and head
+    /// norm stay materialized because no dense-GEMV kernel exists for a depthwise pass or a scalar head vector.
     /// </summary>
     internal static void ForwardChunkKernel(
         IBackend engine,
@@ -561,7 +571,8 @@ internal static class GdnOps
         if (scratch.QkvRaw.Length < tokenCount * channels || scratch.ConvOut.Length < tokenCount * channels
             || scratch.NormQ.Length < tokenCount * qWidth || scratch.NormK.Length < scratch.NormQ.Length
             || scratch.Vraw.Length < tokenCount * valueDim || scratch.GateRows.Length < tokenCount * valueDim
-            || scratch.LogGate.Length < tokenCount * w.ValueHeads || scratch.Beta.Length < tokenCount * w.ValueHeads)
+            || scratch.LogGate.Length < tokenCount * w.ValueHeads || scratch.Beta.Length < tokenCount * w.ValueHeads
+            || scratch.GatedValueBatch.Length < Math.Min(BatchWindow, tokenCount) * valueDim)
         {
             throw new ArgumentException("Scratch buffers must cover the whole chunk.", nameof(scratch));
         }
@@ -572,25 +583,62 @@ internal static class GdnOps
         }
 
         // Stage 1 through the backend: every projection writes its whole row region in one GEMV pass over the tensor's own bytes.
-        for (int t = 0; t < tokenCount; t++)
+        // A single token keeps the solo seam — one GEMV per role, no batched scratch, exactly as decode needs it. A wider chunk
+        // runs each role as one batched pass per window of BatchWindow tokens: each window's rows land on the same per-row dots
+        // the solo seam produced (the backend's batched kernel is bit-identical per row), and the sigmoid/softplus post-pass runs
+        // per token in the same order the solo seam used.
+        if (tokenCount == 1)
         {
-            ReadOnlySpan<float> cur = hiddenIn.Slice(t * w.HiddenSize, w.HiddenSize);
+            ReadOnlySpan<float> cur = hiddenIn.Slice(0, w.HiddenSize);
 
-            engine.Gemv(cur, new WeightRef(weights.Resolve(w.Qkv), w.Qkv.Shape, w.Qkv.Format), scratch.QkvRaw.AsSpan(t * channels, channels));
+            engine.Gemv(cur, new WeightRef(weights.Resolve(w.Qkv), w.Qkv.Shape, w.Qkv.Format), scratch.QkvRaw.AsSpan(0, channels));
 
-            engine.Gemv(cur, new WeightRef(weights.Resolve(w.Gate), w.Gate.Shape, w.Gate.Format), scratch.GateRows.AsSpan(t * valueDim, valueDim));
+            engine.Gemv(cur, new WeightRef(weights.Resolve(w.Gate), w.Gate.Shape, w.Gate.Format), scratch.GateRows.AsSpan(0, valueDim));
 
-            engine.Gemv(cur, new WeightRef(weights.Resolve(w.Beta), w.Beta.Shape, w.Beta.Format), scratch.Beta.AsSpan(t * w.ValueHeads, w.ValueHeads));
+            engine.Gemv(cur, new WeightRef(weights.Resolve(w.Beta), w.Beta.Shape, w.Beta.Format), scratch.Beta.AsSpan(0, w.ValueHeads));
             for (int h = 0; h < w.ValueHeads; h++)
             {
-                scratch.Beta[t * w.ValueHeads + h] = Sigmoid(scratch.Beta[t * w.ValueHeads + h]);
+                scratch.Beta[h] = Sigmoid(scratch.Beta[h]);
             }
 
-            engine.Gemv(cur, new WeightRef(weights.Resolve(w.Alpha), w.Alpha.Shape, w.Alpha.Format), scratch.LogGate.AsSpan(t * w.ValueHeads, w.ValueHeads));
+            engine.Gemv(cur, new WeightRef(weights.Resolve(w.Alpha), w.Alpha.Shape, w.Alpha.Format), scratch.LogGate.AsSpan(0, w.ValueHeads));
             for (int h = 0; h < w.ValueHeads; h++)
             {
-                float alphaBiased = scratch.LogGate[t * w.ValueHeads + h] + w.DtBias[h];
-                scratch.LogGate[t * w.ValueHeads + h] = w.SsmA[h] * Softplus(alphaBiased); // the stored weight is already negative: gate = -exp(A_log) * softplus(...)
+                float alphaBiased = scratch.LogGate[h] + w.DtBias[h];
+                scratch.LogGate[h] = w.SsmA[h] * Softplus(alphaBiased); // the stored weight is already negative: gate = -exp(A_log) * softplus(...)
+            }
+        }
+        else
+        {
+            WeightRef qkvRef = new(weights.Resolve(w.Qkv), w.Qkv.Shape, w.Qkv.Format);
+            WeightRef gateRef = new(weights.Resolve(w.Gate), w.Gate.Shape, w.Gate.Format);
+            WeightRef betaRef = new(weights.Resolve(w.Beta), w.Beta.Shape, w.Beta.Format);
+            WeightRef alphaRef = new(weights.Resolve(w.Alpha), w.Alpha.Shape, w.Alpha.Format);
+
+            for (int offset = 0; offset < tokenCount; offset += BatchWindow)
+            {
+                int rows = Math.Min(BatchWindow, tokenCount - offset);
+                ReadOnlySpan<float> inRows = hiddenIn.Slice(offset * w.HiddenSize, rows * w.HiddenSize);
+
+                engine.GemvBatch(inRows, rows, qkvRef, scratch.QkvRaw.AsSpan(offset * channels, rows * channels));
+
+                engine.GemvBatch(inRows, rows, gateRef, scratch.GateRows.AsSpan(offset * valueDim, rows * valueDim));
+
+                engine.GemvBatch(inRows, rows, betaRef, scratch.Beta.AsSpan(offset * w.ValueHeads, rows * w.ValueHeads));
+
+                engine.GemvBatch(inRows, rows, alphaRef, scratch.LogGate.AsSpan(offset * w.ValueHeads, rows * w.ValueHeads));
+
+                for (int t = 0; t < rows; t++)
+                {
+                    int baseIndex = (offset + t) * w.ValueHeads;
+                    for (int h = 0; h < w.ValueHeads; h++)
+                    {
+                        scratch.Beta[baseIndex + h] = Sigmoid(scratch.Beta[baseIndex + h]);
+
+                        float alphaBiased = scratch.LogGate[baseIndex + h] + w.DtBias[h];
+                        scratch.LogGate[baseIndex + h] = w.SsmA[h] * Softplus(alphaBiased); // the stored weight is already negative: gate = -exp(A_log) * softplus(...)
+                    }
+                }
             }
         }
 
@@ -611,19 +659,44 @@ internal static class GdnOps
             w.NormWeight,
             scratch);
 
-        // Stage 5's projection through the same kernel seam. Each token's gated-normalized head rows rewrite the one-token scratch
-        // before the backend dots them through the output matrix.
+        // Stage 5's projection through the same kernel seam. Each token's gated-normalized head rows are produced by the same
+        // NormGatedHeads call the solo seam used; the solo path dots them one at a time, the batched path fills one window-wide
+        // buffer of gated rows and projects the whole window in one batched pass whose per-row dots match the solo seam's.
         WeightRef outputRef = new(weights.Resolve(w.Output), w.Output.Shape, w.Output.Format);
-        for (int t = 0; t < tokenCount; t++)
+        if (tokenCount == 1)
         {
             NormGatedHeads(
-                scratch.ValueOut.AsSpan(t * valueDim, valueDim),
+                scratch.ValueOut.AsSpan(0, valueDim),
                 w.NormWeight,
-                scratch.GateRows.AsSpan(t * valueDim, valueDim),
+                scratch.GateRows.AsSpan(0, valueDim),
                 eps,
                 scratch.GatedValue);
 
-            engine.Gemv(scratch.GatedValue, outputRef, hiddenOut.Slice(t * w.HiddenSize, w.HiddenSize));
+            engine.Gemv(scratch.GatedValue, outputRef, hiddenOut.Slice(0, w.HiddenSize));
+        }
+        else
+        {
+            for (int offset = 0; offset < tokenCount; offset += BatchWindow)
+            {
+                int rows = Math.Min(BatchWindow, tokenCount - offset);
+
+                for (int t = 0; t < rows; t++)
+                {
+                    int tok = offset + t;
+                    NormGatedHeads(
+                        scratch.ValueOut.AsSpan(tok * valueDim, valueDim),
+                        w.NormWeight,
+                        scratch.GateRows.AsSpan(tok * valueDim, valueDim),
+                        eps,
+                        scratch.GatedValueBatch.AsSpan(t * valueDim, valueDim));
+                }
+
+                engine.GemvBatch(
+                    scratch.GatedValueBatch.AsSpan(0, rows * valueDim),
+                    rows,
+                    outputRef,
+                    hiddenOut.Slice(offset * w.HiddenSize, rows * w.HiddenSize));
+            }
         }
     }
 
