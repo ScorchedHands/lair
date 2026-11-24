@@ -74,7 +74,8 @@ internal sealed class Qwen4ExpEngine : IDisposable
     // Batched feed-forward scratch, grown on demand to the widest chunk a forward has seen and reused across every layer of that
     // forward: this chunk's router scores, per-token selections, the union active-expert set with member counts, one expert
     // group's packed member rows plus its gate/up intermediates, and the shared-expert weights. Selection carries no cross-token
-    // state, so grouping a chunk's tokens by expert never moves a token's arithmetic.
+    // state, so grouping a chunk's tokens by expert never moves a token's arithmetic. A single-token chunk never touches these
+    // arrays: the feed-forward's solo fast path below answers it on the per-token scratch instead.
     private float[] _ffnRouterScores = [];
     private int[] _ffnSelectionIds = [];
     private float[] _ffnSelectionWeights = [];
@@ -85,6 +86,20 @@ internal sealed class Qwen4ExpEngine : IDisposable
     private float[] _ffnGateOut = [];
     private float[] _ffnUpOut = [];
     private int _ffnBatchTokens;
+
+    // Single-token fast-path scratch: the one-token feed-forward runs the solo chain the batching commit replaced, so a decode
+    // step pays no grouping pass, no union set, and no batched seam for its router or expert chains — one input row, one gate/up/
+    // down row, one accumulation row, and the solo router/selection arrays. A singleton expert group inside a multi-token chunk's
+    // gather also runs its chain on this scratch, since a one-member group has nothing to batch.
+    private float[] _soloInput = [];
+    private float[] _soloGateOut = [];
+    private float[] _soloUpOut = [];
+    private float[] _soloDownOut = [];
+    private float[] _soloOutputScratch = [];
+    private float[] _soloRouterScores = [];
+    private int[] _soloSelectionIds = [];
+    private float[] _soloSelectionWeights = [];
+    private float[] _soloExpertWeights = []; // routing weight by expert index for this token's gathered chain; only selected entries are read
 
     // The two-dimensional shape a GEMV over one expert slice carries, shared by every layer of a role the way the production
     // sparse path shares it: gate and up emit intermediate values from hidden inputs, down emits hidden values from intermediates.
@@ -205,6 +220,12 @@ internal sealed class Qwen4ExpEngine : IDisposable
         _ffnMemberWeights = [0f];
         _ffnBatchTokens = 1;
 
+        _soloInput = new float[_hiddenSize];
+        _soloGateOut = new float[_intermediateSize];
+        _soloUpOut = new float[_intermediateSize];
+        _soloDownOut = new float[_hiddenSize];
+        _soloOutputScratch = new float[_hiddenSize];
+
         _hcNormed = new float[_flattened];
         _hcLowRank = new float[_lowRank];
         _hcGated = new float[_flattened];
@@ -237,6 +258,11 @@ internal sealed class Qwen4ExpEngine : IDisposable
             _ffnSelectionIds = new int[_ffnBatchTokens * routed];
             _ffnSelectionWeights = new float[_ffnBatchTokens * routed];
             _ffnUnion = new int[_ffnBatchTokens * routed];
+
+            _soloRouterScores = new float[expertCount];
+            _soloSelectionIds = new int[routed];
+            _soloSelectionWeights = new float[routed];
+            _soloExpertWeights = new float[expertCount];
 
             _expertGateShape = new TensorShape([_intermediateSize, _hiddenSize]);
             _expertUpShape = new TensorShape([_intermediateSize, _hiddenSize]);
@@ -766,9 +792,17 @@ internal sealed class Qwen4ExpEngine : IDisposable
     // hidden-sized selector vector — the qwen4exp reference gate, finite at a zero score where qwen2moe's silu(score)/score
     // divides 0 by 0 — or ungated at one when the file ships no such vector. A file declaring no experts keeps the dense
     // gate/up/down triplet, batched the same way. Selection carries no cross-token state and every batched row lands on its
-    // solo-GEMV result, so splitting a chunk across calls reproduces the unsplit run exactly.
+    // solo-GEMV result, so splitting a chunk across calls reproduces the unsplit run exactly. A single-token chunk takes the
+    // solo fast path instead: same routing, same ascending expert-index accumulation, same shared gate, but no grouping pass,
+    // no union set, and no batched seam — the posture the decode step pays every token.
     private void ForwardSparseFeedForward(LayerOperands w, float[] mixedRows, int tokenCount, float[] ffnOut)
     {
+        if (tokenCount == 1)
+        {
+            ForwardSparseFeedForwardSolo(w, mixedRows.AsSpan(0, _hiddenSize), ffnOut.AsSpan(0, _hiddenSize));
+            return;
+        }
+
         SparseFfnDescriptor sparse = w.Sparse!;
         int expertCount = sparse.ExpertCount;
         int routed = sparse.RoutedExpertsPerToken;
@@ -829,13 +863,26 @@ internal sealed class Qwen4ExpEngine : IDisposable
                 }
 
                 // The gather kernel walks the union in ascending expert order, so every token's member contributions land in the
-                // same ascending expert-index order its solo chain accumulated them in.
-                RunExpertChain(
-                    count,
-                    new WeightRef(gateSlab, gate.ExpertShape, gate.Stack.Format),
-                    new WeightRef(upSlab, up.ExpertShape, up.Stack.Format),
-                    new WeightRef(downSlab, down.ExpertShape, down.Stack.Format),
-                    ffnOut);
+                // same ascending expert-index order its solo chain accumulated them in. A one-member group has nothing to batch:
+                // it runs the solo chain, whose rows are the batched kernel's single-row rows bit-for-bit.
+                if (count == 1)
+                {
+                    RunSoloExpertChain(
+                        0,
+                        new WeightRef(gateSlab, gate.ExpertShape, gate.Stack.Format),
+                        new WeightRef(upSlab, up.ExpertShape, up.Stack.Format),
+                        new WeightRef(downSlab, down.ExpertShape, down.Stack.Format),
+                        ffnOut);
+                }
+                else
+                {
+                    RunExpertChain(
+                        count,
+                        new WeightRef(gateSlab, gate.ExpertShape, gate.Stack.Format),
+                        new WeightRef(upSlab, up.ExpertShape, up.Stack.Format),
+                        new WeightRef(downSlab, down.ExpertShape, down.Stack.Format),
+                        ffnOut);
+                }
             });
 
         if (sparse.HasSharedExpert)
@@ -870,13 +917,128 @@ internal sealed class Qwen4ExpEngine : IDisposable
         }
     }
 
+    // The single-token sparse feed-forward: the exact per-token posture the batching commit carried. The token's row copies into
+    // the solo input scratch (the gather callback cannot capture a caller-owned span across its boundary), the router answers with
+    // one solo GEMV, RouteToken applies the same all-expert softmax, ascending strict-greater top-k with lower-index tie
+    // resolution, ascending sort, renormalization and scale, the gather walks this token's own sorted selection — already
+    // ascending, so the chain accumulates in ascending expert-index order — and the shared expert contributes once under plain
+    // sigmoid over the selector vector, or ungated at one when the file ships none. No grouping pass, no union set, no batched
+    // seam: every row here is the batched path's single-row row bit-for-bit, which is what keeps a chunk split bit-identical to
+    // an unsplit run.
+    private void ForwardSparseFeedForwardSolo(LayerOperands w, ReadOnlySpan<float> mixed, Span<float> ffnOut)
+    {
+        SparseFfnDescriptor sparse = w.Sparse!;
+        int expertCount = sparse.ExpertCount;
+        int routed = sparse.RoutedExpertsPerToken;
+
+        mixed.CopyTo(_soloInput);
+
+        _backend.Gemv(_soloInput, Ref(w.Router!), _soloRouterScores);
+
+        RouteToken(
+            _soloRouterScores,
+            _soloSelectionIds.AsSpan(0, routed),
+            _soloSelectionWeights.AsSpan(0, routed),
+            sparse);
+
+        for (int i = 0; i < routed; i++)
+        {
+            _soloExpertWeights[_soloSelectionIds[i]] = _soloSelectionWeights[i]; // the gather callback visits expert indexes, not selection slots: this maps each selected slab back to its routing weight.
+        }
+
+        _soloOutputScratch.AsSpan().Clear(); // the routed and shared contributions accumulate from zero, mirroring the production sparse posture
+
+        ExpertSlabRole gate = w.GateRole;
+        ExpertSlabRole up = w.UpRole;
+        ExpertSlabRole down = w.DownRole;
+
+        _gatherKernel.Gather(
+            _expertSlabs,
+            gate,
+            up,
+            down,
+            _soloSelectionIds.AsSpan(0, routed),
+            (int expertIndex, ReadOnlySpan<byte> gateSlab, ReadOnlySpan<byte> upSlab, ReadOnlySpan<byte> downSlab) =>
+            {
+                float weight = _soloExpertWeights[expertIndex];
+
+                _backend.Gemv(_soloInput, new WeightRef(gateSlab, gate.ExpertShape, gate.Stack.Format), _soloGateOut);
+                _backend.Gemv(_soloInput, new WeightRef(upSlab, up.ExpertShape, up.Stack.Format), _soloUpOut);
+
+                for (int i = 0; i < _intermediateSize; i++)
+                {
+                    _soloGateOut[i] = LayerOps.Silu(_soloGateOut[i]) * _soloUpOut[i];
+                }
+
+                _backend.Gemv(_soloGateOut, new WeightRef(downSlab, down.ExpertShape, down.Stack.Format), _soloDownOut);
+
+                for (int h = 0; h < _hiddenSize; h++)
+                {
+                    _soloOutputScratch[h] += weight * _soloDownOut[h]; // ascending expert-index order: the gather kernel's supplied selection is this token's sorted routing set.
+                }
+            });
+
+        if (sparse.HasSharedExpert)
+        {
+            // A file shipping this block's hidden-sized selector vector gates the shared contribution through the family's own
+            // composition — plain sigmoid over its score, finite at every score including exactly zero, where qwen2moe's
+            // silu(score)/score divides 0 by 0. A file shipping no selector adds it ungated at exactly one, which is what the
+            // production sparse path reads for that case as well.
+            float sharedWeight = 1f;
+
+            if (w.SharedGateVector is { } gateVector)
+            {
+                float score = 0f;
+                for (int c = 0; c < _hiddenSize; c++)
+                {
+                    score += gateVector[c] * _soloInput[c];
+                }
+
+                sharedWeight = LayerOps.SharedExpertGateWeight(plainSigmoidFamily: true, score);
+            }
+
+            _backend.Gemv(_soloInput, Ref(w.SharedGate!), _soloGateOut);
+            _backend.Gemv(_soloInput, Ref(w.SharedUp!), _soloUpOut);
+
+            for (int i = 0; i < _intermediateSize; i++)
+            {
+                _soloGateOut[i] = LayerOps.Silu(_soloGateOut[i]) * _soloUpOut[i];
+            }
+
+            _backend.Gemv(_soloGateOut, Ref(w.SharedDown!), _soloDownOut);
+
+            for (int h = 0; h < _hiddenSize; h++)
+            {
+                _soloOutputScratch[h] += sharedWeight * _soloDownOut[h];
+            }
+        }
+
+        _soloOutputScratch.AsSpan(0, _hiddenSize).CopyTo(ffnOut); // the caller's sublayer row receives the accumulated sparse contribution once the gather callback is done with its scratch.
+    }
+
     // The dense triplet for a file declaring no experts, batched over the chunk's rows the same way the sparse chain batches:
     // gate/up as batched passes, the SwiGLU activation elementwise per member row, down as a batched pass writing each token's
-    // output row directly.
+    // output row directly. A single-token chunk takes the solo GEMV posture instead — the same three passes on the fast-path
+    // scratch, each row bit-identical to the batched kernel's single-row row.
     private void ForwardDenseFeedForward(LayerOperands w, float[] mixedRows, int tokenCount, float[] ffnOut)
     {
         int hidden = _hiddenSize;
         int inter = _intermediateSize;
+
+        if (tokenCount == 1)
+        {
+            Span<float> mixed = mixedRows.AsSpan(0, hidden);
+            _backend.Gemv(mixed, Ref(w.DenseGate!), _soloGateOut);
+            _backend.Gemv(mixed, Ref(w.DenseUp!), _soloUpOut);
+
+            for (int i = 0; i < inter; i++)
+            {
+                _soloGateOut[i] = LayerOps.Silu(_soloGateOut[i]) * _soloUpOut[i];
+            }
+
+            _backend.Gemv(_soloGateOut, Ref(w.DenseDown!), ffnOut.AsSpan(0, hidden));
+            return;
+        }
 
         EnsureFeedForwardBatchCapacity(tokenCount);
 
@@ -941,6 +1103,33 @@ internal sealed class Qwen4ExpEngine : IDisposable
             {
                 target[h] += weight * source[h];
             }
+        }
+    }
+
+    // One expert chain for a single member of a multi-token chunk's group: the same gate/up/down the batched chain runs, but
+    // through solo GEMVs on the fast-path scratch — a one-member group has nothing to batch, and every solo row is the batched
+    // kernel's single-row row bit-for-bit. The member's hidden row accumulates into its token's output row scaled by its
+    // routing weight, exactly as the batched accumulation does.
+    private void RunSoloExpertChain(int member, WeightRef gate, WeightRef up, WeightRef down, float[] ffnOut)
+    {
+        int hidden = _hiddenSize;
+        int inter = _intermediateSize;
+
+        _backend.Gemv(_ffnSubsetIn.AsSpan(0, hidden), gate, _soloGateOut);
+        _backend.Gemv(_ffnSubsetIn.AsSpan(0, hidden), up, _soloUpOut);
+
+        for (int i = 0; i < inter; i++)
+        {
+            _soloGateOut[i] = LayerOps.Silu(_soloGateOut[i]) * _soloUpOut[i];
+        }
+
+        _backend.Gemv(_soloGateOut, down, _soloDownOut);
+
+        Span<float> target = ffnOut.AsSpan(_ffnMemberTokens[member] * hidden, hidden);
+        float weight = _ffnMemberWeights[member];
+        for (int h = 0; h < hidden; h++)
+        {
+            target[h] += weight * _soloDownOut[h];
         }
     }
 

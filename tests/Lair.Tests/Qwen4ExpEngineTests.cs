@@ -434,7 +434,7 @@ public sealed class Qwen4ExpEngineTests : IDisposable
         // Four experts with two routed per token over a four-token chunk: eight selections across four experts guarantee at
         // least one expert serves two tokens, so the batched path groups that expert's members. Grouping must not move a
         // token's arithmetic: every row of the one-chunk run lands bit-for-bit on the same tokens forwarded as single-token
-        // chunks and as two-token chunks.
+        // chunks — which now run the solo fast path — and as two-token chunks.
         using GgufFile file = OpenFixture(BuildGguf(MetadataPairs(4, 2), FixtureTensors(4)));
         using CpuBackend backend = new();
 
@@ -462,9 +462,10 @@ public sealed class Qwen4ExpEngineTests : IDisposable
     [Fact]
     public void TransformerModel_Qwen4ExpBatchedMoE_RunsExpertMembersThroughMultiRowBatchedPasses()
     {
-        // The seam's batched posture is observable: a single-token chunk answers every batched pass with one row, while a
-        // four-token chunk over the same fixture answers at least one pass with more than one row — the chunk's expert
-        // groups and router projection run as multi-row passes through the backend's batched kernel.
+        // The seam's posture split is observable: a single-token chunk answers its whole feed-forward through solo GEMVs and
+        // reaches the batched seam only for its logit head (the engine's one remaining batched call site for a one-token
+        // chunk), while a four-token chunk over the same fixture answers at least one pass with more than one row — the chunk's
+        // expert groups and router projection run as multi-row passes through the backend's batched kernel.
         using GgufFile file = OpenFixture(BuildGguf(MetadataPairs(4, 2), FixtureTensors(4)));
 
         using (CpuBackend inner = new())
@@ -473,8 +474,8 @@ public sealed class Qwen4ExpEngineTests : IDisposable
             using TransformerModel soloModel = TransformerModel.Open(file, solo, maxContextTokens: 8);
             soloModel.ForwardQwen4ExpChunk(soloModel.NewQwen4ExpSequence(), [0]);
 
-            Assert.True(solo.BatchCounts.Count > 0, "a single-token forward must still reach the batched seam");
-            Assert.True(!solo.BatchCounts.Exists(count => count != 1), "every batched pass of a single-token chunk carries exactly one row");
+            Assert.True(solo.BatchCounts.Count == 1 && solo.BatchCounts[0] == 1, "a single-token chunk must reach the batched seam exactly once, for its one-row logit head: its router and expert chains run the solo fast path");
+            Assert.True(solo.GemvCalls >= 4 * Layers, "the single-token feed-forward must answer its router and expert chains through solo GEMVs (one router plus one gate/up/down triplet per sparse block)");
         }
 
         using (CpuBackend inner = new())
@@ -485,6 +486,67 @@ public sealed class Qwen4ExpEngineTests : IDisposable
 
             Assert.True(batched.BatchCounts.Exists(count => count > 1), "a multi-token chunk must run at least one batched pass over several rows");
         }
+    }
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpSoloMoE_SingleTokenChunk_MatchesBatchedChunkBitForBitWithSharedExpert()
+    {
+        // The solo fast path against the batched path, not batched against batched: a four-expert/two-routed fixture that also
+        // ships a gated shared expert, so the comparison covers the solo router, the solo expert chain, the solo shared-expert
+        // plain-sigmoid gate, and the batched path's singleton-group solo chain (a four-token chunk over four experts with two
+        // routed per token also leaves some expert groups with exactly one member). Every single-token row must land bit-for-bit
+        // on the same token inside the unsplit four-token chunk.
+        List<(string Key, object Value)> pairs = MetadataPairs(4, 2);
+        pairs.Add(("qwen4exp.expert_shared_count", 1));
+
+        List<TensorDef> tensors = [.. FixtureTensors(4)];
+        for (int layer = 0; layer < Layers; layer++)
+        {
+            tensors.Add(new TensorDef($"blk.{layer}.ffn_gate_shexp.weight", [IntermediateSize, Hidden]));
+            tensors.Add(new TensorDef($"blk.{layer}.ffn_up_shexp.weight", [IntermediateSize, Hidden]));
+            tensors.Add(new TensorDef($"blk.{layer}.ffn_down_shexp.weight", [Hidden, IntermediateSize]));
+            tensors.Add(new TensorDef($"blk.{layer}.ffn_gate_inp_shexp.weight", [Hidden]));
+        }
+
+        using GgufFile file = OpenFixture(BuildGguf(pairs, tensors));
+        using CpuBackend backend = new();
+
+        using TransformerModel model = TransformerModel.Open(file, backend, maxContextTokens: 8);
+        Assert.True(model.Plan.SparseFfn!.HasSharedExpert);
+
+        Span<float> whole = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2, 3]);
+
+        Qwen4ExpSequence solo = model.NewQwen4ExpSequence();
+        for (int t = 0; t < 4; t++)
+        {
+            Span<float> row = model.ForwardQwen4ExpChunk(solo, [t]);
+            Assert.True(BitsEqual(row, whole.Slice(t * VocabSize, VocabSize)), $"token {t} must land on the same logits through the solo fast path as through the batched chunk");
+        }
+
+        Assert.True(BitsEqual(model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0, 1, 2, 3]), whole), "the batched run must repeat bit-for-bit on a fresh sequence");
+    }
+
+    [Fact]
+    public void TransformerModel_Qwen4ExpSoloMoE_ProfiledSingleTokenForwardReportsTheSparseStage()
+    {
+        // Profiling covers both feed-forward postures: a single-token chunk on the solo fast path must still carry a positive
+        // sparse feed-forward stage with the dense stage exactly zero, and its logits must land bit-for-bit on the unprofiled
+        // single-token run.
+        using GgufFile file = OpenFixture(BuildGguf(MetadataPairs(), FixtureTensors()));
+        using CpuBackend backend = new();
+
+        using TransformerModel model = TransformerModel.Open(file, backend, maxContextTokens: 8);
+
+        Span<float> unprofiled = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0]);
+
+        model.EnableQwen4ExpLayerProfiling();
+        model.ResetQwen4ExpLayerProfile();
+        Span<float> profiled = model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [0]);
+        Qwen4ExpLayerProfile summary = model.Qwen4ExpLayerProfileSummary();
+
+        Assert.True(summary.MoeFeedForwardMs > 0.0, "the solo sparse fast path must still be timed by the MoE stage");
+        Assert.Equal(0.0, summary.DenseFeedForwardMs);
+        Assert.True(BitsEqual(unprofiled, profiled), "a profiled solo forward must land on the unprofiled solo run bit-for-bit");
     }
 
     [Fact]
@@ -524,6 +586,14 @@ public sealed class Qwen4ExpEngineTests : IDisposable
         Qwen4ExpLayerProfile summary = model.Qwen4ExpLayerProfileSummary();
         Assert.True(summary.DenseFeedForwardMs > 0.0, "the dense stage must carry a positive time for a dense fixture");
         Assert.Equal(0.0, summary.MoeFeedForwardMs);
+
+        // The single-token dense fast path: its row already landed bit-for-bit on the batched run above, and it must still be
+        // timed by the dense stage with the sparse stage exactly zero.
+        model.ResetQwen4ExpLayerProfile();
+        model.ForwardQwen4ExpChunk(model.NewQwen4ExpSequence(), [1]);
+        Qwen4ExpLayerProfile soloSummary = model.Qwen4ExpLayerProfileSummary();
+        Assert.True(soloSummary.DenseFeedForwardMs > 0.0, "the solo dense fast path must still be timed by the dense stage");
+        Assert.Equal(0.0, soloSummary.MoeFeedForwardMs);
     }
 
     // ---------------------------------------------------------------- the seam refuses what it cannot read or compose
@@ -917,20 +987,26 @@ public sealed class Qwen4ExpEngineTests : IDisposable
         return true;
     }
 
-    // A pass-through CPU backend that records the row count of every batched kernel call, so a test can see which posture a
-    // forward actually ran its weight passes in. Every call delegates to the inner backend unchanged.
+    // A pass-through CPU backend that records the row count of every batched kernel call and the number of solo GEMV calls, so a
+    // test can see which posture a forward actually ran its weight passes in. Every call delegates to the inner backend unchanged.
     private sealed class CountingBackend(CpuBackend inner) : IBackend
     {
         public List<int> BatchCounts { get; } = [];
+        public int GemvCalls { get; private set; }
 
         public string DeviceId => inner.DeviceId;
         public WeightTier WeightTier => inner.WeightTier;
 
         public MemoryHandle AllocateAligned(long bytes, int alignment) => inner.AllocateAligned(bytes, alignment);
         public void FreeAligned(MemoryHandle handle) => inner.FreeAligned(handle);
+
         public IKvDeviceMirror OpenKvMirror(KvMirrorRequest request) => inner.OpenKvMirror(request);
 
-        public void Gemv(ReadOnlySpan<float> x, WeightRef w, Span<float> output) => inner.Gemv(x, w, output);
+        public void Gemv(ReadOnlySpan<float> x, WeightRef w, Span<float> output)
+        {
+            GemvCalls++;
+            inner.Gemv(x, w, output);
+        }
 
         public void GemvBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs)
         {
