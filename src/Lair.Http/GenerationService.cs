@@ -1642,17 +1642,29 @@ public sealed class GenerationService : IDisposable, IConfigApplyTarget
                 $"{missingFeature}, and a forced ISA is never answered with some other integer-dot path that happens to be available — declare '{CpuIsaNames.Auto}' to select the highest path this host runs, or run on hardware reporting {missingFeature}.");
         }
 
+        // The CPU kernel tuning pins travel engine-wide exactly like the ISA axis: every backend this open builds (decode side and a dedicated lane's side)
+        // resolves its scheduling/scratch posture from the same stated values against its own effective worker count, so auto knobs scale per backend while
+        // explicit `engine.cpu.tuning` pins reproduce a measured posture deliberately. The loader already validated each span; an out-of-span internal pin
+        // would fail here naming the qualified key rather than clamping quietly.
+        CpuKernelTuningOverrides kernelTuning = new()
+        {
+            RowBlock = config.Engine.Cpu.Tuning.RowBlock,
+            ParallelRowThreshold = config.Engine.Cpu.Tuning.ParallelRowThreshold,
+            ChainGroup = config.Engine.Cpu.Tuning.ChainGroup,
+            MaxScratchCols = config.Engine.Cpu.Tuning.MaxScratchCols,
+        };
+
         if (modelConfig.Placement.PrefillLane == PlacementPrefillLaneValues.Dedicated)
         {
             // A dedicated posture sub-allocates both lane sides from this model's granted share, so a clamped claim narrows the split instead of letting one side reach past what the host seated for it. A node-derived core set splits inside the chosen node: each lane claims its side of that node's reported ids.
             prefillsLane = ModelPrefillLanes.ResolveDedicated(modelConfig.Name, engineThreadsChoice, grantedQuota, backendCoreSet);
 
-            backend = new(engineThreadsChoice, new HashSet<int>(prefillsLane.DecodeCoreIds), prefillsLane.DecodeShareThreads, requestedIsa: requestedIsa, cpuFeatures: resolvedFeatures);
-            prefillsBackend = new(prefillsLane.PrefillShareThreads, new HashSet<int>(prefillsLane.PrefillCoreIds), requestedIsa: requestedIsa, cpuFeatures: resolvedFeatures);
+            backend = new(engineThreadsChoice, new HashSet<int>(prefillsLane.DecodeCoreIds), prefillsLane.DecodeShareThreads, requestedIsa: requestedIsa, cpuFeatures: resolvedFeatures, tuning: kernelTuning);
+            prefillsBackend = new(prefillsLane.PrefillShareThreads, new HashSet<int>(prefillsLane.PrefillCoreIds), requestedIsa: requestedIsa, cpuFeatures: resolvedFeatures, tuning: kernelTuning);
         }
         else
         {
-            backend = new(config.Engine.Threads, backendCoreSet, grantedQuota, requestedIsa: requestedIsa, cpuFeatures: resolvedFeatures);
+            backend = new(config.Engine.Threads, backendCoreSet, grantedQuota, requestedIsa: requestedIsa, cpuFeatures: resolvedFeatures, tuning: kernelTuning);
         }
 
         // The placement's layer split opens the accelerator compute backend beside this service's decode-side CPU backend — and only when a model declares one: an absent or zero key never touches the CUDA seam at all. A declared split with no usable driver or device behind it fails here naming the model, the key as declared, and where accelerator-backed segments run; nothing falls back to some other posture that happens to work.

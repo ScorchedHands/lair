@@ -1,0 +1,26 @@
+prefill-profile file=C:\Users\Chuck\AppData\Local\Temp\kilo\optimize-small-cpu\models\qwen2.5-3b-instruct-q4_k_m.gguf bytes=2104932768 threads=32 maxBatchSequences=16
+  arch=qwen2 layers=36 hidden=2048 heads=16 kvHeads=2 headDim=128 vocab=151936 windowedLayers=0 avx2=True
+  traversalBytes=1668685824 outputHeadBytes=255252480 kvBlocks=24 blockTokens=16 reps=3 perToken=off lengths=128,256 rowWidths=64 kernels=gemv,tiled
+
+prefill-profile kernel=gemv
+
+prefill-profile rowWidth=64 subBatchActivationBytes=8388608
+  weightFit=844.96 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=1.97
+  attentionFit=47.406 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 566
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             2        2081.3         61.50        1689.9         391.4           0.0          1.97
+         256             4        4939.3         51.83        3379.9        1559.5          -0.0          1.97
+
+prefill-profile kernel=tiled
+
+prefill-profile rowWidth=64 subBatchActivationBytes=8388608
+  weightFit=634.85 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=2.63
+  attentionFit=93.239 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 233
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             2        2039.5         62.76        1269.7         769.8          -0.0          2.63
+         256             4        5606.6         45.66        2539.4        3067.2          -0.0          2.63
+  peakWorkingSetMb=1975.0 cumulative across this process run: measure per-kernel peaks in separate processes

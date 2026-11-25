@@ -90,7 +90,10 @@ public sealed unsafe partial class CpuBackend
         fixed (float* pOut = outputs)
         {
             int workers = _effectiveThreads;
-            bool parallel = workers > 1 && rows >= ParallelRowThreshold;
+
+            // One tuning snapshot for the whole call: threshold, block count, and claimed-block width all read the same resolved posture.
+            CpuKernelTuning tuning = _tuning;
+            bool parallel = workers > 1 && rows >= tuning.ParallelRowThreshold;
 
             if (!parallel)
             {
@@ -99,7 +102,7 @@ public sealed unsafe partial class CpuBackend
             }
 
             WorkerPool pool = GetOrCreatePool();
-            pool.Run((rows + RowBlock - 1) / RowBlock, new GemmRowJob(pBytes, pIn, pOut, stride, rows, cols, count, format, _useAvx2));
+            pool.Run((rows + tuning.RowBlock - 1) / tuning.RowBlock, new GemmRowJob(pBytes, pIn, pOut, stride, rows, cols, count, format, _useAvx2, tuning));
         }
     }
 
@@ -152,8 +155,9 @@ public sealed unsafe partial class CpuBackend
         private readonly int _count;
         private readonly QuantFormat _format;
         private readonly bool _avx2;
+        private readonly int _rowBlock; // captured from the dispatch snapshot so every claimed block uses the same width as Run's block count
 
-        public GemmRowJob(byte* bytes, float* inputs, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2)
+        public GemmRowJob(byte* bytes, float* inputs, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2, CpuKernelTuning tuning)
         {
             _bytes = bytes;
             _inputs = inputs;
@@ -164,12 +168,13 @@ public sealed unsafe partial class CpuBackend
             _count = count;
             _format = format;
             _avx2 = avx2;
+            _rowBlock = tuning.RowBlock;
         }
 
         public void ProcessBlock(int block)
         {
-            int firstRow = block * RowBlock;
-            RunGemmRows(_bytes, _inputs, _out, _stride, _rows, _cols, _count, _format, _avx2, firstRow, Math.Min(firstRow + RowBlock, _rows));
+            int firstRow = block * _rowBlock;
+            RunGemmRows(_bytes, _inputs, _out, _stride, _rows, _cols, _count, _format, _avx2, firstRow, Math.Min(firstRow + _rowBlock, _rows));
         }
     }
 

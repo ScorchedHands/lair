@@ -25,16 +25,13 @@ public sealed unsafe partial class CpuBackend : IBackend
     //   byte 8+k    (0..3): low nibble of scale_{4+k},    high nibble of min_{4+k}
     private const int QkK = 256;
 
-    // Output rows per scheduling unit for threaded GEMV.
-    private const int RowBlock = 64;
-
     // Upper bound on activation vectors per batched GEMV call: the stack scratch of every batch kernel is sized for
     // it, and it covers the widest sub-batch a forward engine may resolve — at least what a decode batch advances (16),
-    // widened to 64 so prompt windows resolved past the decode width stream their weights in one pass per matrix.
+    // widened to 64 so prompt windows resolved past the decode width stream their weights in one pass per matrix. This is
+    // a capability ceiling every caller must stay inside rather than a core-count knob: it never re-resolves with posture,
+    // which is why forward callers can never throw unexpectedly across tuning postures. The core-count-dependent scheduling
+    // knobs (row block, dispatch threshold, scratch chain grouping, scratch width) resolve per open — see CpuKernelTuning.
     private const int MaxBatch = 64;
-
-    // Below this row count the threading overhead is not worth paying.
-    private const int ParallelRowThreshold = 256;
 
     // The engine's own thread choice (0 = auto-sized) before any model quota capped it: the ceiling a hot quota edit
     // may restore participation up to — raising a quota beyond this would be an engine-wide change, not a placement one.
@@ -55,6 +52,16 @@ public sealed unsafe partial class CpuBackend : IBackend
     private readonly CpuIsa _requestedIsa;
     private readonly IntegerDotPath _integerDot; // resolved once at open: every i-quant dot this backend runs uses this encoding for its whole lifetime
     private WorkerPool? _pool;
+
+    // This backend's resolved kernel scheduling/scratch posture (row block, dispatch threshold, scratch chain grouping, scratch width):
+    // resolved once at open from the effective worker count and vector posture, re-resolved whenever a quota change moves that count. Read
+    // fresh per kernel call into one local snapshot — and captured whole by each row job — so a concurrent ApplyThreadQuota can never tear
+    // one dispatch between its block count and its jobs' block width. Every resolved value only repartitions independent work, so output
+    // bytes are identical at any posture (see CpuKernelTuning).
+    private volatile CpuKernelTuning _tuning = null!;
+
+    // The pins this backend was opened with (empty for an auto open), kept so a quota re-resolve applies the same stated values.
+    private readonly CpuKernelTuningOverrides _tuningOverrides;
 
     /// <summary>
     /// Default auto-sizing rule: one worker per physical core, SMT siblings excluded. Dense GEMV decode is memory-
@@ -90,8 +97,8 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// encoding for the backend's whole lifetime. A forced ISA this CPU does not report fails the open naming the missing feature;
     /// <see cref="cpuFeatures"/> lets a caller state a posture other than what this process reports.
     /// </summary>
-    public CpuBackend(int threads = 0, IReadOnlySet<int>? coreSet = null, int? threadQuota = null, bool allowAvx2 = true, CpuIsa requestedIsa = CpuIsa.Auto, CpuFeaturePosture? cpuFeatures = null)
-        : this(threads, coreSet, threadQuota, allowAvx2, requestedIsa, cpuFeatures, forcedGrid: null, forcePrefetchWeights: null)
+    public CpuBackend(int threads = 0, IReadOnlySet<int>? coreSet = null, int? threadQuota = null, bool allowAvx2 = true, CpuIsa requestedIsa = CpuIsa.Auto, CpuFeaturePosture? cpuFeatures = null, CpuKernelTuningOverrides? tuning = null)
+        : this(threads, coreSet, threadQuota, allowAvx2, requestedIsa, cpuFeatures, forcedGrid: null, forcePrefetchWeights: null, tuning: tuning)
     {
     }
 
@@ -107,7 +114,8 @@ public sealed unsafe partial class CpuBackend : IBackend
         CpuIsa requestedIsa,
         CpuFeaturePosture? cpuFeatures,
         GridLoadEncoding? forcedGrid,
-        bool? forcePrefetchWeights)
+        bool? forcePrefetchWeights,
+        CpuKernelTuningOverrides? tuning = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(threads);
         if (threadQuota is < 1)
@@ -169,6 +177,11 @@ public sealed unsafe partial class CpuBackend : IBackend
 
         _grid = forcedGrid ?? (vectorPosture ? ResolveAutoGrid(features) : GridLoadEncoding.Scalar);
         _prefetchWeights = forcePrefetchWeights ?? vectorPosture;
+
+        // The scheduling/scratch posture resolves from this open's effective worker count and vector posture, with explicit pins applied
+        // field by field. An override outside its accepted span fails the open naming the qualified key — nothing clamps a stated value quietly.
+        _tuningOverrides = tuning ?? CpuKernelTuningOverrides.Auto;
+        _tuning = CpuKernelTuning.Resolve(_effectiveThreads, vectorPosture, _tuningOverrides);
     }
 
     /// <summary>The engine.cpu.isa selection this backend was opened with, exactly as declared.</summary>
@@ -197,6 +210,9 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// <summary>Worker count this backend actually runs threaded GEMV with (dispatcher plus pool workers), after quota and auto-sizing.</summary>
     public int EffectiveWorkerCount => _effectiveThreads;
 
+    /// <summary>The kernel tuning this backend resolved from its posture — row block, dispatch threshold, scratch chain grouping, and scratch width ceiling. Internal so bench/test seams can read what an open actually applied (host pins arrive through the constructor's tuning overrides).</summary>
+    internal CpuKernelTuning ResolvedTuning => _tuning;
+
     /// <summary>The engine's own thread choice this backend sizes from — the ceiling a live quota edit may restore participation up to. Internal so a host can re-derive lane shares against the same value this backend caps them with.</summary>
     internal int UncappedThreadChoice => _uncappedThreads;
 
@@ -219,6 +235,11 @@ public sealed unsafe partial class CpuBackend : IBackend
         lock (_poolGate)
         {
             _effectiveThreads = Math.Min(_uncappedThreads, threadQuota ?? _uncappedThreads);
+
+            // The posture-resolved knobs track the effective worker count: re-resolve under the same gate so a quota change lands on
+            // one whole snapshot. Explicit overrides stay pinned exactly as stated (Resolve applies them field by field).
+            _tuning = CpuKernelTuning.Resolve(_effectiveThreads, _useAvx2, _tuningOverrides);
+
             return _effectiveThreads;
         }
     }
@@ -350,18 +371,19 @@ public sealed unsafe partial class CpuBackend : IBackend
             // every row, worker, and batch vector, whatever partition claims them.
             Q8KKernelOptions opts = new(_integerDot, _grid, _prefetchWeights);
 
-            // Participation is sampled per call so a quota applied on another thread takes effect from this kernel on.
+            // Participation is sampled per call so a quota applied on another thread takes effect from this kernel on. One tuning snapshot
+            // for the whole call: block count and every claimed block's width come from the same resolved posture.
             int workers = _effectiveThreads;
-            bool parallel = workers > 1 && rows >= ParallelRowThreshold;
+            CpuKernelTuning tuning = _tuning;
+            bool parallel = workers > 1 && rows >= tuning.ParallelRowThreshold;
 
             if (!parallel)
             {
                 for (int row = 0; row < rows; row++)
                 {
-                    if (usesQ8K)
-                    {
-                        PrefetchRowWindow(pBytes, stride, rows, row, opts.Prefetch); // pure hint over this call's own row region: future rows streamed ahead.
-                    }
+                    // Pure hint over this call's own row region: future rows streamed ahead. It runs for every dense format,
+                    // not only the Q8_K ones, because single-token GEMV rows are cold DRAM reads the hint bridges ahead.
+                    PrefetchRowWindow(pBytes, stride, rows, row, opts.Prefetch);
 
                     pOut[row] = usesQ8K
                         ? RowDotQ8K(pBytes + (long)row * stride, qa, da, cols, format, opts)
@@ -371,7 +393,7 @@ public sealed unsafe partial class CpuBackend : IBackend
             else
             {
                 WorkerPool pool = GetOrCreatePool();
-                pool.Run((rows + RowBlock - 1) / RowBlock, new RowBlockJob(pBytes, pX, qa, da, usesQ8K ? 1 : 0, pOut, stride, rows, cols, format, _useAvx2, opts));
+                pool.Run((rows + tuning.RowBlock - 1) / tuning.RowBlock, new RowBlockJob(pBytes, pX, qa, da, usesQ8K ? 1 : 0, pOut, stride, rows, cols, format, _useAvx2, opts, tuning));
             }
         }
 
@@ -459,30 +481,32 @@ public sealed unsafe partial class CpuBackend : IBackend
 
             Q8KKernelOptions opts = new(_integerDot, _grid, _prefetchWeights); // same resolved posture for every row and batch vector of the call
 
-            // Participation is sampled per call so a quota applied on another thread takes effect from this kernel on.
+            // Participation is sampled per call so a quota applied on another thread takes effect from this kernel on. One tuning snapshot
+            // for the whole call: block count, claimed-block width, and scratch grouping all come from the same resolved posture.
             int workers = _effectiveThreads;
-            bool parallel = workers > 1 && rows >= ParallelRowThreshold;
+            CpuKernelTuning tuning = _tuning;
+            bool parallel = workers > 1 && rows >= tuning.ParallelRowThreshold;
 
             if (!parallel)
             {
                 for (int row = 0; row < rows; row++)
                 {
+                    PrefetchRowWindow(pBytes, stride, rows, row, opts.Prefetch); // pure hint over this call's own row region: future rows streamed ahead, for every dense format.
+
                     if (usesQ8K)
                     {
-                        PrefetchRowWindow(pBytes, stride, rows, row, opts.Prefetch); // pure hint over this call's own row region: future rows streamed ahead.
-
                         RowBatchDotQ8K(pBytes + (long)row * stride, qa, da, q8Blocks, count, rows, format, opts, pOut + row);
                     }
                     else
                     {
-                        RowBatchDot(pBytes + (long)row * stride, pIn, count, rows, cols, format, _useAvx2, pOut + row);
+                        RowBatchDot(pBytes + (long)row * stride, pIn, count, rows, cols, format, _useAvx2, tuning.ChainGroup, tuning.MaxScratchCols, pOut + row);
                     }
                 }
             }
             else
             {
                 WorkerPool pool = GetOrCreatePool();
-                pool.Run((rows + RowBlock - 1) / RowBlock, new BatchRowJob(pBytes, pIn, qa, da, usesQ8K ? 1 : 0, q8Blocks, pOut, stride, rows, cols, count, format, _useAvx2, opts));
+                pool.Run((rows + tuning.RowBlock - 1) / tuning.RowBlock, new BatchRowJob(pBytes, pIn, qa, da, usesQ8K ? 1 : 0, q8Blocks, pOut, stride, rows, cols, count, format, _useAvx2, opts, tuning));
             }
         }
 
@@ -1216,8 +1240,9 @@ public sealed unsafe partial class CpuBackend : IBackend
         private readonly QuantFormat _format;
         private readonly bool _avx2;
         private readonly Q8KKernelOptions _opts; // this backend's resolved sub-4-bit posture: identical for every block of the call, whatever partition claims them
+        private readonly int _rowBlock; // captured from the dispatch snapshot so every claimed block uses the same width as Run's block count
 
-        public RowBlockJob(byte* bytes, float* x, byte* qa, float* da, int q8k, float* outPtr, int stride, int rows, int cols, QuantFormat format, bool avx2, Q8KKernelOptions opts)
+        public RowBlockJob(byte* bytes, float* x, byte* qa, float* da, int q8k, float* outPtr, int stride, int rows, int cols, QuantFormat format, bool avx2, Q8KKernelOptions opts, CpuKernelTuning tuning)
         {
             _bytes = bytes;
             _x = x;
@@ -1231,19 +1256,22 @@ public sealed unsafe partial class CpuBackend : IBackend
             _format = format;
             _avx2 = avx2;
                         _opts = opts;
+            _rowBlock = tuning.RowBlock;
         }
 
         public void ProcessBlock(int block)
         {
-            int firstRow = block * RowBlock;
-            int lastRow = Math.Min(firstRow + RowBlock, _rows);
+            int firstRow = block * _rowBlock;
+            int lastRow = Math.Min(firstRow + _rowBlock, _rows);
             for (int row = firstRow; row < lastRow; row++)
             {
                 byte* rowBytes = _bytes + (long)row * _stride;
+
+                // Pure hint over this call's own row region: future rows streamed ahead, for every dense format.
+                PrefetchRowWindow(_bytes, _stride, _rows, row, _opts.Prefetch);
+
                 if (_q8k != 0)
                 {
-                    PrefetchRowWindow(_bytes, _stride, _rows, row, _opts.Prefetch); // pure hint over this call's own row region: future rows streamed ahead.
-
                     _out[row] = RowDotQ8K(rowBytes, _qa, _da, _cols, _format, _opts);
                 }
                 else
@@ -1279,8 +1307,11 @@ public sealed unsafe partial class CpuBackend : IBackend
         private readonly QuantFormat _format;
         private readonly bool _avx2;
         private readonly Q8KKernelOptions _opts; // this backend's resolved sub-4-bit posture: identical for every block and batch vector of the call
+        private readonly int _rowBlock; // captured from the dispatch snapshot so every claimed block uses the same width as Run's block count
+        private readonly int _chainGroup; // scratch batch-dot grouping of the same snapshot, held across every row of this job
+        private readonly int _maxScratchCols;
 
-        public BatchRowJob(byte* bytes, float* inputs, byte* qa, float* da, int q8k, int blocks, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2, Q8KKernelOptions opts)
+        public BatchRowJob(byte* bytes, float* inputs, byte* qa, float* da, int q8k, int blocks, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2, Q8KKernelOptions opts, CpuKernelTuning tuning)
         {
             _bytes = bytes;
             _inputs = inputs;
@@ -1296,24 +1327,29 @@ public sealed unsafe partial class CpuBackend : IBackend
             _format = format;
             _avx2 = avx2;
                         _opts = opts;
+            _rowBlock = tuning.RowBlock;
+            _chainGroup = tuning.ChainGroup;
+            _maxScratchCols = tuning.MaxScratchCols;
         }
 
         public void ProcessBlock(int block)
         {
-            int firstRow = block * RowBlock;
-            int lastRow = Math.Min(firstRow + RowBlock, _rows);
+            int firstRow = block * _rowBlock;
+            int lastRow = Math.Min(firstRow + _rowBlock, _rows);
             for (int row = firstRow; row < lastRow; row++)
             {
                 byte* rowBytes = _bytes + (long)row * _stride;
+
+                // Pure hint over this call's own row region: future rows streamed ahead, for every dense format.
+                PrefetchRowWindow(_bytes, _stride, _rows, row, _opts.Prefetch);
+
                 if (_q8k != 0)
                 {
-                    PrefetchRowWindow(_bytes, _stride, _rows, row, _opts.Prefetch); // pure hint over this call's own row region: future rows streamed ahead.
-
                     RowBatchDotQ8K(rowBytes, _qa, _da, _blocks, _count, _rows, _format, _opts, _out + row);
                 }
                 else
                 {
-                    RowBatchDot(rowBytes, _inputs, _count, _rows, _cols, _format, _avx2, _out + row);
+                    RowBatchDot(rowBytes, _inputs, _count, _rows, _cols, _format, _avx2, _chainGroup, _maxScratchCols, _out + row);
                 }
             }
         }
@@ -1325,8 +1361,10 @@ public sealed unsafe partial class CpuBackend : IBackend
     // is materialized one time into a stack scratch buffer and fed to all count accumulator chains. Each chain
     // advances exactly like the single-vector kernel's - eight-lane FMAs over successive chunks in the same
     // element order, then scalar tail accumulation, then a lane reduction identical to HSum - so every output
-    // is bit-identical to a single-vector GEMV row.
-    private static void RowBatchDot(byte* rowBytes, float* inputs, int count, int rows, int cols, QuantFormat format, bool avx2, float* outBase)
+    // is bit-identical to a single-vector GEMV row. The scratch route's grouping (chainGroup) and width ceiling
+    // (maxScratchCols) arrive from the call's resolved tuning snapshot; they choose which batch vectors share one
+    // materialized-row pass, never how any chain advances, so outputs are identical at every posture.
+    private static void RowBatchDot(byte* rowBytes, float* inputs, int count, int rows, int cols, QuantFormat format, bool avx2, int chainGroup, int maxScratchCols, float* outBase)
     {
         switch (format)
         {
@@ -1375,9 +1413,8 @@ public sealed unsafe partial class CpuBackend : IBackend
             case QuantFormat.Q4_K:
                 if (avx2)
                 {
-                    // Block-aligned Q4_K rows take the scratch route: one dequant pass materializes the row once and eight chains per
-                    // group keep their accumulators in registers across it. Unaligned or oversized postures keep the streaming kernel.
-                    if (!ScratchRowDot(rowBytes, format, cols, inputs, count, rows, outBase))
+                    // Block-aligned Q4_K rows take the scratch route: one dequant pass materializes the row once and each group's chains keep their accumulators in registers across it. Unaligned or oversized postures keep the streaming kernel.
+                    if (!ScratchRowDot(rowBytes, format, cols, inputs, count, rows, chainGroup, maxScratchCols, outBase))
                     {
                         BatchQ4KAvx2(rowBytes, inputs, count, rows, cols, outBase);
                     }
@@ -1423,7 +1460,7 @@ public sealed unsafe partial class CpuBackend : IBackend
                 if (avx2)
                 {
                     // Same scratch route as Q4_K for block-aligned rows; unaligned or oversized postures keep the streaming kernel.
-                    if (!ScratchRowDot(rowBytes, format, cols, inputs, count, rows, outBase))
+                    if (!ScratchRowDot(rowBytes, format, cols, inputs, count, rows, chainGroup, maxScratchCols, outBase))
                     {
                         BatchQ6KAvx2(rowBytes, inputs, count, rows, cols, outBase);
                     }

@@ -14,6 +14,14 @@ engine:
   # prefill_kernel: gemv   # optional; gemv | tiled | gemm — which attention/weight path the engine's prefill route selects. All three run today; gemm serves only a model whose dense weight formats it has kernels for (Q8_0, Q4_K, IQ4_XS), and a file with any other format is refused at model open naming that format rather than falling back.
   # prefill_step_budget_ms: 250  # optional; sizes prompt-window token counts from measured per-row cost, clamped by scheduler floor/ceiling and engine row caps.
 
+  # cpu:                     # optional CPU posture block; every key resolves at model open against detected topology (restart-only).
+  #   isa: auto              # auto | avx2 | avx-vnni — the integer-dot path sub-4-bit kernels run; a forced value this host cannot report refuses.
+  #   tuning:                # optional pins over posture-resolved kernel defaults; omit every key to let them scale with detected cores and worker count.
+  #     row_block: 16        # output rows per threaded scheduling unit (1..64); omitted resolves from effective workers (~512 weight rows' worth each).
+  #     parallel_row_threshold: 256  # rows at which kernels hand blocks to the worker pool; omitted tracks resolved row block x workers.
+  #     chain_group: 8       # scratch batch-dot grouping (1..8): batch vectors sharing one materialized-row pass, bounded by the vector register budget.
+  #     max_scratch_cols: 16384      # scratch route column ceiling (512..65536 floats); wider matrices keep streaming kernels.
+
 # host:
 #   dram_mb: 65536         # optional host DRAM byte total; reported warn-and-accept against OS topology when present
 #   vram_mb: 8192          # optional accelerator/VRAM byte posture; declared ceiling only, not driver-detected capacity

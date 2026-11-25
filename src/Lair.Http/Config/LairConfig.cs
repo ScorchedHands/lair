@@ -122,6 +122,32 @@ public sealed record EngineCpuConfig
     /// can run is decided when its backend opens.
     /// </summary>
     public string Isa { get; init; } = "auto";
+
+    /// <summary>Optional explicit pins for the CPU kernel scheduling/scratch posture an open would otherwise resolve from detected topology and worker count.</summary>
+    public EngineCpuTuningConfig Tuning { get; init; } = new();
+}
+
+/// <summary>
+/// The keys one engine cpu tuning block may declare. Every value is optional: an absent key leaves that knob to the backend's posture-resolved
+/// default (row block scaled by effective worker count, dispatch threshold tracking row block and workers, chain grouping at the vector
+/// posture's register budget, scratch width ceiling sized for cache residency). A stated value pins it exactly as declared — never clamped
+/// quietly; a value outside its accepted span refuses the load naming the qualified key. These knobs partition independent rows between workers
+/// and choose which batch vectors share one materialized-row pass: no resolved or pinned value changes a row's dot order, so forward output
+/// bytes are identical at every posture. They belong to an opened backend exactly like <c>engine.cpu.isa</c>: only a restart re-resolves them.
+/// </summary>
+public sealed record EngineCpuTuningConfig
+{
+    /// <summary>Output rows per scheduling unit for threaded dense kernels (1..64) or absent to resolve from the effective worker count.</summary>
+    public int? RowBlock { get; init; }
+
+    /// <summary>The row count at which a kernel hands its blocks to the worker pool (1 or greater) or absent to resolve from resolved row block and workers.</summary>
+    public int? ParallelRowThreshold { get; init; }
+
+    /// <summary>Scratch batch-dot chain group width: consecutive batch vectors sharing one pass over a materialized row (1..8, bounded by the vector posture's register budget) or absent to resolve.</summary>
+    public int? ChainGroup { get; init; }
+
+    /// <summary>The scratch batch-dot route's column ceiling (512..65_536 floats — wider staging no longer stays cache-resident) or absent to use the default 16,384.</summary>
+    public int? MaxScratchCols { get; init; }
 }
 
 /// <summary>One served model and how it is placed on the machine.</summary>

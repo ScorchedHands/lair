@@ -19,7 +19,11 @@ public static class YamlConfigLoader
     private static readonly string[] TopLevelKeys = ["server", "engine", "models", "ui", "host"];
     private static readonly string[] ServerKeys = ["bind", "port"];
     private static readonly string[] EngineKeys = ["threads", "block_size", "max_batch_tokens", "prefill_step_budget_ms", "prefill_kernel", "cpu"];
-    private static readonly string[] CpuKeys = ["isa"];
+    private static readonly string[] CpuKeys = ["isa", "tuning"];
+
+    // The CPU kernel tuning block: every key is an optional pin over the posture-resolved default. Each accepted span mirrors the
+    // backend's own resolution bounds (CpuKernelTuning), so a value that passes here always pins cleanly there too.
+    private static readonly string[] CpuTuningKeys = ["row_block", "parallel_row_threshold", "max_scratch_cols", "chain_group"];
     private static readonly string[] UiKeys = ["recent_requests"];
     private static readonly string[] ModelKeys = ["name", "path", "type", "max_context_tokens", "kv_blocks", "kv", "placement", "force_fenced_tools", "tool_parser", "reasoning", "max_reasoning_tokens", "max_response_tokens", "max_concurrent_requests", "max_queued_requests", "queue_timeout_ms", "compute_share", "pooling", "normalize", "budgets", "source"];
     private static readonly string[] PlacementKeys = ["device", "kv_residency", "prefill", "core_set", "thread_quota", "prefill_lane", "core_overcommit", "numa_spread", "gpu_layers"];
@@ -357,7 +361,51 @@ public static class YamlConfigLoader
                 $"engine.cpu.isa '{isa}' is invalid for model '{modelName}': 'cpu.isa' accepts {CpuIsaNames.AcceptedVocabulary}.");
         }
 
-        return new EngineCpuConfig { Isa = isa };
+        EngineCpuTuningConfig tuning = ParseEngineCpuTuning(keys);
+
+        return new EngineCpuConfig { Isa = isa, Tuning = tuning };
+    }
+
+    // CPU kernel tuning pins: every key is optional and validated against the same accepted span the backend's own resolution applies.
+    // An out-of-span value fails naming the qualified key and its bounds instead of clamping a stated pin quietly; an absent block or key
+    // declares nothing — that knob stays posture-resolved (row block scaled by effective worker count, threshold tracking row block and
+    // workers, chain grouping at the vector register budget, scratch width sized for cache residency).
+    private static EngineCpuTuningConfig ParseEngineCpuTuning(Dictionary<string, YamlNode> cpuKeys)
+    {
+        const string where = "'engine.cpu.tuning'";
+        if (!cpuKeys.TryGetValue("tuning", out YamlNode? node))
+        {
+            return new EngineCpuTuningConfig();
+        }
+
+        Dictionary<string, YamlNode> keys = KeysOf(AsMapping(node, where), where);
+        RejectUnknownKeys(keys, where, CpuTuningKeys);
+
+        int? rowBlock = TryInteger(keys, "row_block", "engine.cpu.tuning.row_block");
+        if (rowBlock is not null and (< 1 or > 64))
+        {
+            throw new ConfigException($"engine.cpu.tuning.row_block {rowBlock} is invalid: 'cpu.tuning.row_block' must be between 1 and 64.");
+        }
+
+        int? parallelRowThreshold = TryInteger(keys, "parallel_row_threshold", "engine.cpu.tuning.parallel_row_threshold");
+        if (parallelRowThreshold is < 1)
+        {
+            throw new ConfigException($"engine.cpu.tuning.parallel_row_threshold {parallelRowThreshold} is invalid: 'cpu.tuning.parallel_row_threshold' must be 1 or greater.");
+        }
+
+        int? chainGroup = TryInteger(keys, "chain_group", "engine.cpu.tuning.chain_group");
+        if (chainGroup is not null and (< 1 or > 8))
+        {
+            throw new ConfigException($"engine.cpu.tuning.chain_group {chainGroup} is invalid: 'cpu.tuning.chain_group' must be between 1 and 8 — a chain group wider than eight spills accumulators past the vector posture's register budget.");
+        }
+
+        int? maxScratchCols = TryInteger(keys, "max_scratch_cols", "engine.cpu.tuning.max_scratch_cols");
+        if (maxScratchCols is not null and (< 512 or > 65_536))
+        {
+            throw new ConfigException($"engine.cpu.tuning.max_scratch_cols {maxScratchCols} is invalid: 'cpu.tuning.max_scratch_cols' must be between 512 and 65536 — wider staging no longer stays cache-resident beside the packed row it replaces.");
+        }
+
+        return new EngineCpuTuningConfig { RowBlock = rowBlock, ParallelRowThreshold = parallelRowThreshold, ChainGroup = chainGroup, MaxScratchCols = maxScratchCols };
     }
 
     private static IReadOnlyList<ModelConfig> ParseModels(Dictionary<string, YamlNode> top)

@@ -141,11 +141,18 @@ public static class ConfigMutationTable
         }
 
         // The CPU ISA axis is a fact of an opened backend's kernels, not a knob any live path re-reads: the whole engine
-        // restarts to move it.
+        // restarts to move it. The tuning pins beside it belong to the same opened posture — row blocks size stack/scratch
+        // partitions and dispatch grouping for every kernel this backend runs — so each reports its own field with the same
+        // restart-only class, exactly as the plan's convention requires for values that change scratch layout mid-forward.
         if (newEngine.Cpu.Isa != oldEngine.Cpu.Isa)
         {
             changes.Add(new FieldChange("engine.cpu.isa", oldEngine.Cpu.Isa, newEngine.Cpu.Isa, ConfigMutationClass.RestartOnly));
         }
+
+        Add(changes, "engine.cpu.tuning.row_block", TextOrNone(oldEngine.Cpu.Tuning.RowBlock), TextOrNone(newEngine.Cpu.Tuning.RowBlock));
+        Add(changes, "engine.cpu.tuning.parallel_row_threshold", TextOrNone(oldEngine.Cpu.Tuning.ParallelRowThreshold), TextOrNone(newEngine.Cpu.Tuning.ParallelRowThreshold));
+        Add(changes, "engine.cpu.tuning.chain_group", TextOrNone(oldEngine.Cpu.Tuning.ChainGroup), TextOrNone(newEngine.Cpu.Tuning.ChainGroup));
+        Add(changes, "engine.cpu.tuning.max_scratch_cols", TextOrNone(oldEngine.Cpu.Tuning.MaxScratchCols), TextOrNone(newEngine.Cpu.Tuning.MaxScratchCols));
 
         ServerConfig oldServer = current.Server;
         ServerConfig newServer = candidate.Server;
@@ -360,6 +367,9 @@ public static class ConfigMutationTable
         "engine.prefill_step_budget_ms" => ConfigMutationClass.Live,
         "engine.prefill_kernel" => ConfigMutationClass.NewRequestsOnly,
         "engine.cpu.isa" => ConfigMutationClass.RestartOnly, // resolved into the opened backend's kernels at load: only a restart re-resolves it
+        // Tuning pins are part of that same opened posture: row blocks, dispatch thresholds, chain grouping, and scratch width size the
+        // stack/scratch partitions every kernel this backend runs resolves once — hot mutation mid-forward is exactly what the plan refuses.
+        "engine.cpu.tuning.row_block" or "engine.cpu.tuning.parallel_row_threshold" or "engine.cpu.tuning.chain_group" or "engine.cpu.tuning.max_scratch_cols" => ConfigMutationClass.RestartOnly,
         "models[0].kv_blocks" => ConfigMutationClass.Live,
         // KV format pair physical layout and attention execution are resolved when the model opens.
         "models[0].kv.quant.k" or "models[0].kv.quant.v" => ConfigMutationClass.RestartOnly,
@@ -496,6 +506,13 @@ public static class ConfigMutationTable
         yield return ("engine.prefill_kernel", ScalarText(engine, "prefill_kernel"));
         yield return ("engine.cpu.isa", ScalarText(Child(engine, "cpu"), "isa"));
 
+        // The tuning pins are plain scalars beside the ISA they sit next to in the same cpu block: their raw text carries into best-effort classification of a candidate that failed validation.
+        YamlDotNet.RepresentationModel.YamlMappingNode? cpuTuning = Child(Child(engine, "cpu"), "tuning");
+        yield return ("engine.cpu.tuning.row_block", ScalarText(cpuTuning, "row_block"));
+        yield return ("engine.cpu.tuning.parallel_row_threshold", ScalarText(cpuTuning, "parallel_row_threshold"));
+        yield return ("engine.cpu.tuning.chain_group", ScalarText(cpuTuning, "chain_group"));
+        yield return ("engine.cpu.tuning.max_scratch_cols", ScalarText(cpuTuning, "max_scratch_cols"));
+
         YamlDotNet.RepresentationModel.YamlMappingNode? model = FirstModel(root);
         yield return ("models[0].name", ScalarText(model, "name"));
         yield return ("models[0].path", ScalarText(model, "path"));
@@ -580,6 +597,10 @@ public static class ConfigMutationTable
         "engine.prefill_step_budget_ms" => TextOrNone(current.Engine.PrefillStepBudgetMs),
         "engine.prefill_kernel" => current.Engine.PrefillKernel,
         "engine.cpu.isa" => current.Engine.Cpu.Isa,
+        "engine.cpu.tuning.row_block" => TextOrNone(current.Engine.Cpu.Tuning.RowBlock),
+        "engine.cpu.tuning.parallel_row_threshold" => TextOrNone(current.Engine.Cpu.Tuning.ParallelRowThreshold),
+        "engine.cpu.tuning.chain_group" => TextOrNone(current.Engine.Cpu.Tuning.ChainGroup),
+        "engine.cpu.tuning.max_scratch_cols" => TextOrNone(current.Engine.Cpu.Tuning.MaxScratchCols),
         "models[0].name" => current.Models[0].Name,
         "models[0].path" => current.Models[0].Path,
         "models[0].type" => current.Models[0].Type,

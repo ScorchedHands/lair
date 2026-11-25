@@ -49,6 +49,13 @@ Engine-wide knobs shared by the served model.
 
 | `engine.cpu.isa` | `auto` \| `avx2` \| `avx-vnni` | `auto` | CPU integer-dot ISA selection resolved at model open. `auto` picks the highest path reported by the host; an explicit forced value resolves to that path or refuses naming the missing feature. |
 
+| `engine.cpu.tuning.row_block` | integer 1..64, optional | omitted (posture-resolved) | Output rows per scheduling unit for threaded dense kernels. Omitted scales from detected topology and effective worker count: about half a page of weight rows per participating worker — larger blocks when fewer workers run, finer ones when more do. A stated value pins it exactly; out-of-span values refuse naming the key. Row partitioning never changes a row's dot order, so outputs are byte-identical at any posture. |
+| `engine.cpu.tuning.parallel_row_threshold` | integer ≥ 1, optional | omitted (posture-resolved) | The row count at which kernels hand blocks to the worker pool instead of streaming on the calling thread. Omitted tracks the resolved row block and effective worker count together. |
+| `engine.cpu.tuning.chain_group` | integer 1..8, optional | omitted (`8` with a vector posture) | Scratch batch-dot chain grouping: consecutive batch vectors sharing one pass over a materialized row. Eight chains plus a weight chunk fit the AVX2 register budget; wider groups refuse rather than spill accumulators past it. Grouping chooses which vectors share a pass — never a chain's order or reduction. |
+| `engine.cpu.tuning.max_scratch_cols` | integer 512..65536, optional | omitted (`16384`) | Column ceiling for the scratch batch-dot route: matrices wider than this keep their streaming kernels instead of staging a whole row. The default keeps staged rows plus their packed bytes cache-resident on AVX2-class postures; wider ceilings refuse because such staging no longer stays resident beside the row it replaces. |
+
+Tuning pins belong to an opened CPU backend exactly like `engine.cpu.isa`: every value resolves once at engine open against detected topology and the model's effective worker count, and a hot edit is refused — only a restart re-resolves them. An absent key (or an omitted block) declares nothing: that knob stays posture-resolved rather than fixed to one machine class.
+
 `prefill_kernel` accepts all three values at load, but a selection this engine cannot run for the served file is refused **at model open**, naming that file's own weight formats. Today the blocked-matmul path exists only for `Q8_0`, `Q4_K`, and `IQ4_XS`: a file with any other dense format is refused rather than falling back.
 
 Chunk width and row width are separate numbers: `max_batch_tokens` bounds how many prompt tokens a step forwards, while the engine's prompt windows run in sub-batches of a resolved **row** count (measured default 32, engine ceiling 64) that no configuration key sets on this build. A declared `prefill_buffers` cap can narrow that effective row width; see budgets below.
@@ -248,6 +255,7 @@ Taken from the change-application table, not from prose. Anything not listed as 
 | `engine.prefill_kernel` | new-requests | Re-points the prompt-window route from its next window boundary; a selection the served file's formats cannot run is refused naming them. |
 
 | `engine.cpu.isa` | restart-only | Resolved when the CPU backend opens and compiled into its integer-dot dispatch. |
+| `engine.cpu.tuning.row_block`, `engine.cpu.tuning.parallel_row_threshold`, `engine.cpu.tuning.chain_group`, `engine.cpu.tuning.max_scratch_cols` | restart-only | Each pin resolves once against detected topology and effective worker count when the backend opens; they size stack/scratch partitions for every kernel, so a live edit is refused exactly like the ISA beside them. Absent keys resolve from posture — no default is fixed to one machine class. |
 | `models[].max_context_tokens` | new-requests | Admission validates against the new window; in-flight sequences are unaffected. |
 | `models[].force_fenced_tools` | new-requests | Later chat requests re-resolve their tool surface; in-flight sequences keep their resolved limits. |
 | `models[].tool_parser` | new-requests | Later chat requests resolve to the new parser. |

@@ -9,40 +9,45 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
     // Formats whose batch dot runs through a materialized row scratch: the dequant kernel stores exactly the chunk values that
     // kernel's dot chains consume, so a float staging buffer reproduces them bit-for-bit. Q8_K-quantized activation formats (the
     // sub-4-bit i-quants) stay on their integer-dot staging route and are excluded from scratch batching and fusion alike; every
-    // other format keeps its existing streaming batch kernel unchanged.
+    // other format keeps its existing streaming batch kernel unchanged. The scratch posture itself (chain grouping, width ceiling)
+    // resolves per backend — see CpuKernelTuning — never fixed to one machine class here.
     private static readonly QuantFormat[] ScratchBatchDotFormats = [QuantFormat.Q4_K, QuantFormat.Q6_K];
-
-    // Row scratch stays bounded: wider matrices keep their existing streaming batch kernels rather than materializing a row.
-    private const int MaxScratchCols = 16_384;
-
-    // Chains per register group: eight Vector256 accumulators plus the weight chunk fit AVX2's sixteen YMM registers without spills.
-    private const int ChainGroup = 8;
 
     // Per-thread row scratch, grown once to this engine's widest fused matrix and reused across every row of every call after that.
     [ThreadStatic]
     private static float[]? s_rowScratch;
 
-    private static bool ScratchBatchDotEligible(QuantFormat format, int cols, int count) =>
+    // Scratch-route eligibility against the call's resolved tuning snapshot: a full chain group of batch vectors before materializing
+    // (below one group the streaming kernels' in-register chunk feeds too few accumulator chains to pay for a row staging pass, so
+    // small merged-decode batches keep their streaming route), the width ceiling that keeps a staged row cache-resident, and
+    // block-aligned columns only: with a partial final group the streaming kernels split that group's ragged elements into scalar
+    // chain adds at positions the scratch dot would fold into vector lanes, so unaligned widths keep the streaming route.
+    private static bool ScratchBatchDotEligible(QuantFormat format, int cols, int count, int chainGroup, int maxScratchCols) =>
         Array.IndexOf(ScratchBatchDotFormats, format) >= 0
-        && cols <= MaxScratchCols
-        // A full register group of chains before materializing: below one group the streaming kernels' in-register chunk feeds too
-        // few accumulator chains to pay for a row staging pass, so small merged-decode batches keep their streaming route.
-        && count >= ChainGroup
+        && cols <= maxScratchCols
+        && count >= chainGroup
         // Block-aligned columns only: with a partial final group the streaming kernels split that group's ragged elements into
         // scalar chain adds at positions the scratch dot would fold into vector lanes, so unaligned widths keep the streaming route.
         && (format != QuantFormat.Q4_K || cols % 32 == 0)
         && (format != QuantFormat.Q6_K || cols % 16 == 0);
 
-    // Register-blocked batch dot over a materialized row: eight accumulator chains per group keep their Vector256 lanes in
+    // Register-blocked batch dot over a materialized row: `chainGroup` accumulator chains per group keep their Vector256 lanes in
     // registers across the whole row instead of load/store round-trips through stack scratch, and each chain advances its own
     // input vector as one FMA against the weight chunk read from L1-hot scratch. Chunk positions are 8-aligned exactly like the
     // streaming kernels' group windows (eligibility guarantees aligned columns), so every lane holds the same elements in the same
-    // order and each output lands bit-identical to the streaming route's chain, down to the HSum fold an empty scalar tail adds.
-    private static void BatchDotFromScratch(float* w, int cols, float* inputs, int count, int rows, float* outBase)
+    // order and each output lands bit-identical to the streaming route's chain, down to the HSum fold an empty scalar tail adds —
+    // at any resolved group width, because grouping only chooses which batch vectors share one pass over the row and never reorders a chain.
+    private static void BatchDotFromScratch(float* w, int cols, float* inputs, int count, int rows, float* outBase, int chainGroup)
     {
+        if (chainGroup != CpuKernelTuning.ChainGroupMax)
+        {
+            ScratchGroupsOverStackChains(w, cols, inputs, count, rows, outBase, chainGroup); // a pinned narrower group: the same chains in the same order, staged through stack lanes instead of live YMM registers.
+            return;
+        }
+
         int b = 0;
 
-        for (; b + ChainGroup <= count; b += ChainGroup)
+        for (; b + chainGroup <= count; b += chainGroup)
         {
             Vector256<float> a0 = Vector256<float>.Zero;
             Vector256<float> a1 = Vector256<float>.Zero;
@@ -93,11 +98,59 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
         }
     }
 
-    // Materialize one packed row into the thread's scratch with its format's own dequant kernel, then run the blocked dot over it.
-    // Returns false when the format/column posture is outside the scratch route so callers keep their streaming kernels.
-    private static bool ScratchRowDot(byte* rowBytes, QuantFormat format, int cols, float* inputs, int count, int rows, float* outBase)
+    // A pinned group width below the register budget: the same ascending per-chain walks with each chain's eight-lane accumulator staged in
+    // stack scratch (one group's worth, reused for every group and row) instead of live YMM registers. Outputs are bit-identical to the
+    // register route because grouping never changes a chain's element order or its reduction — only which batch vectors share one pass.
+    private static void ScratchGroupsOverStackChains(float* w, int cols, float* inputs, int count, int rows, float* outBase, int chainGroup)
     {
-        if (!ScratchBatchDotEligible(format, cols, count))
+        Span<float> acc = stackalloc float[chainGroup * 8];
+        fixed (float* pAcc = acc)
+        {
+            int b0 = 0;
+            for (; b0 + chainGroup <= count; b0 += chainGroup)
+            {
+                for (int lane = 0; lane < chainGroup * 8; lane++)
+                {
+                    pAcc[lane] = 0f;
+                }
+
+                for (int i = 0; i < cols; i += 8)
+                {
+                    Vector256<float> wv = Avx.LoadVector256(w + i); // one hot-scratch weight read shared by the group's chains, as in the register route.
+                    for (int j = 0; j < chainGroup; j++)
+                    {
+                        float* chain = pAcc + j * 8;
+                        Avx.Store(chain, Fma.MultiplyAdd(Avx.LoadVector256(inputs + (long)(b0 + j) * cols + i), wv, Avx.LoadVector256(chain)));
+                    }
+                }
+
+                for (int j = 0; j < chainGroup; j++)
+                {
+                    outBase[(long)(b0 + j) * rows] = HSum(Avx.LoadVector256(pAcc + j * 8));
+                }
+            }
+
+            // Ragged tail below one group: a single accumulator walking the row exactly as each full-group chain does.
+            for (; b0 < count; b0++)
+            {
+                Vector256<float> chain = Vector256<float>.Zero;
+                float* inB = inputs + (long)b0 * cols;
+                for (int i = 0; i < cols; i += 8)
+                {
+                    chain = Fma.MultiplyAdd(Avx.LoadVector256(inB + i), Avx.LoadVector256(w + i), chain);
+                }
+
+                outBase[(long)b0 * rows] = HSum(chain);
+            }
+        }
+    }
+
+    // Materialize one packed row into the thread's scratch with its format's own dequant kernel, then run the blocked dot over it.
+    // Returns false when the format/column posture is outside the scratch route so callers keep their streaming kernels. The grouping
+    // and width ceiling arrive as plain locals from the call's resolved tuning snapshot — no allocation on this route.
+    private static bool ScratchRowDot(byte* rowBytes, QuantFormat format, int cols, float* inputs, int count, int rows, int chainGroup, int maxScratchCols, float* outBase)
+    {
+        if (!ScratchBatchDotEligible(format, cols, count, chainGroup, maxScratchCols))
         {
             return false;
         }
@@ -121,7 +174,7 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
                     break;
             }
 
-            BatchDotFromScratch(pScratch, cols, inputs, count, rows, outBase);
+            BatchDotFromScratch(pScratch, cols, inputs, count, rows, outBase, chainGroup);
         }
 
         return true;
@@ -146,7 +199,11 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
 
         QuantFormat formatA = weightA.Format;
         QuantFormat formatB = weightB.Format;
-        if (!ScratchBatchDotEligible(formatA, cols, count) || !ScratchBatchDotEligible(formatB, cols, count))
+
+        // One tuning snapshot for the whole call: eligibility, dispatch threshold, block width, and scratch grouping all read the same resolved posture.
+        CpuKernelTuning tuning = _tuning;
+
+        if (!ScratchBatchDotEligible(formatA, cols, count, tuning.ChainGroup, tuning.MaxScratchCols) || !ScratchBatchDotEligible(formatB, cols, count, tuning.ChainGroup, tuning.MaxScratchCols))
         {
             return false; // formats outside the scratch route (Q8_K i-quants included) fall back to independent GemvBatch calls.
         }
@@ -173,20 +230,20 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
 
             // Same per-call participation sample as Gemv/GemvBatch: a quota applied on another thread takes effect from this kernel on.
             int workers = _effectiveThreads;
-            bool parallel = workers > 1 && rows >= ParallelRowThreshold;
+            bool parallel = workers > 1 && rows >= tuning.ParallelRowThreshold;
 
             if (!parallel)
             {
                 for (int row = 0; row < rows; row++)
                 {
-                    RunFusedPairRow(bytesA + (long)row * strideA, bytesB + (long)row * strideB, formatA, formatB, cols, pIn, count, rows, outA + row, outB + row);
+                    RunFusedPairRow(bytesA + (long)row * strideA, bytesB + (long)row * strideB, formatA, formatB, cols, pIn, count, rows, tuning.ChainGroup, outA + row, outB + row);
                 }
 
                 return true;
             }
 
             WorkerPool pool = GetOrCreatePool();
-            pool.Run((rows + RowBlock - 1) / RowBlock, new PairBatchRowJob(bytesA, bytesB, strideA, strideB, formatA, formatB, cols, pIn, count, rows, outA, outB));
+            pool.Run((rows + tuning.RowBlock - 1) / tuning.RowBlock, new PairBatchRowJob(bytesA, bytesB, strideA, strideB, formatA, formatB, cols, pIn, count, rows, outA, outB, tuning));
 
             return true;
         }
@@ -194,8 +251,9 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
 
     // One fused row pair: materialize each matrix's row into the shared thread scratch with its own bit-exact dequant kernel (the
     // stored values are exactly the chunk vectors that kernel feeds its dot chains), then run both blocked chain sets over the hot
-    // activation batch back to back, so the second traversal reads input vectors this call already pulled through cache.
-    private static void RunFusedPairRow(byte* rowA, byte* rowB, QuantFormat formatA, QuantFormat formatB, int cols, float* inputs, int count, int rows, float* outBaseA, float* outBaseB)
+    // activation batch back to back, so the second traversal reads input vectors this call already pulled through cache. The group
+    // width arrives from the call's tuning snapshot and only chooses which batch vectors share one pass — never a chain's order.
+    private static void RunFusedPairRow(byte* rowA, byte* rowB, QuantFormat formatA, QuantFormat formatB, int cols, float* inputs, int count, int rows, int chainGroup, float* outBaseA, float* outBaseB)
     {
         float[]? scratch = s_rowScratch;
         if (scratch is null || scratch.Length < cols)
@@ -207,10 +265,10 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
         fixed (float* pScratch = scratch)
         {
             MaterializeRow(rowA, formatA, pScratch, cols);
-            BatchDotFromScratch(pScratch, cols, inputs, count, rows, outBaseA);
+            BatchDotFromScratch(pScratch, cols, inputs, count, rows, outBaseA, chainGroup);
 
             MaterializeRow(rowB, formatB, pScratch, cols);
-            BatchDotFromScratch(pScratch, cols, inputs, count, rows, outBaseB);
+            BatchDotFromScratch(pScratch, cols, inputs, count, rows, outBaseB, chainGroup);
         }
     }
 
@@ -266,8 +324,10 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
         private readonly int _rows;
         private readonly float* _outA;
         private readonly float* _outB;
+        private readonly int _rowBlock; // captured from the dispatch snapshot so every claimed block uses the same width as Run's block count
+        private readonly int _chainGroup;
 
-        public PairBatchRowJob(byte* bytesA, byte* bytesB, int strideA, int strideB, QuantFormat formatA, QuantFormat formatB, int cols, float* inputs, int count, int rows, float* outA, float* outB)
+        public PairBatchRowJob(byte* bytesA, byte* bytesB, int strideA, int strideB, QuantFormat formatA, QuantFormat formatB, int cols, float* inputs, int count, int rows, float* outA, float* outB, CpuKernelTuning tuning)
         {
             _bytesA = bytesA;
             _bytesB = bytesB;
@@ -281,15 +341,17 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
             _rows = rows;
             _outA = outA;
             _outB = outB;
+            _rowBlock = tuning.RowBlock;
+            _chainGroup = tuning.ChainGroup;
         }
 
         public void ProcessBlock(int block)
         {
-            int firstRow = block * RowBlock;
-            int lastRow = Math.Min(firstRow + RowBlock, _rows);
+            int firstRow = block * _rowBlock;
+            int lastRow = Math.Min(firstRow + _rowBlock, _rows);
             for (int row = firstRow; row < lastRow; row++)
             {
-                RunFusedPairRow(_bytesA + (long)row * _strideA, _bytesB + (long)row * _strideB, _formatA, _formatB, _cols, _inputs, _count, _rows, _outA + row, _outB + row);
+                RunFusedPairRow(_bytesA + (long)row * _strideA, _bytesB + (long)row * _strideB, _formatA, _formatB, _cols, _inputs, _count, _rows, _chainGroup, _outA + row, _outB + row);
             }
         }
     }

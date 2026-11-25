@@ -3818,13 +3818,19 @@ public sealed class TransformerModel : IDisposable
 
                 long projectionStart = BeginDenseProfile();   // the attention side's dense traversals with their bias adds riding inside this span: Q, K, V
 
-                engine.Gemv(_normed.AsSpan(0, hidden), AttentionQueryWeight(l), _q);
+                // Q, K, and V all consume this block's one normed vector. A backend that offers single-vector shared-input
+                // fusion walks the three matrices in one dispatch and keeps that vector hot across all three traversals;
+                // every element lands bit-identical to the three independent calls the fallback runs.
+                if (!(engine is IDenseWeightSharedInputFusion sharedFusion &&
+                      sharedFusion.TryGemvSharedInput(_normed.AsSpan(0, hidden), AttentionQueryWeight(l), _q, AttentionKeyWeight(l), _k, AttentionValueWeight(l), _v)))
+                {
+                    engine.Gemv(_normed.AsSpan(0, hidden), AttentionQueryWeight(l), _q);
+                    engine.Gemv(_normed.AsSpan(0, hidden), AttentionKeyWeight(l), _k);
+                    engine.Gemv(_normed.AsSpan(0, hidden), AttentionValueWeight(l), _v);
+                }
+
                 AddBias(_q, _biasQ[l]);
-
-                engine.Gemv(_normed.AsSpan(0, hidden), AttentionKeyWeight(l), _k);
                 AddBias(_k, _biasK[l]);
-
-                engine.Gemv(_normed.AsSpan(0, hidden), AttentionValueWeight(l), _v);
                 AddBias(_v, _biasV[l]);
 
                 AccumulateDenseProfile(ref _denseAttentionWeightTicks, projectionStart);
@@ -3886,9 +3892,14 @@ public sealed class TransformerModel : IDisposable
                 {
                     long gateUpStart = BeginDenseProfile();   // the dense feed-forward's gate and up traversals
 
-                    engine.Gemv(_normed.AsSpan(0, hidden), FeedForwardGateWeight(l), _gateUp);
-
-                    engine.Gemv(_normed.AsSpan(0, hidden), FeedForwardUpWeight(l), _up);
+                    // Gate and up consume the same normed vector: the same single-vector shared-input fusion seam walks
+                    // them in one dispatch when the backend covers the pair, bit-identical to the two independent calls.
+                    if (!(engine is IDenseWeightSharedInputFusion ffnFusion &&
+                          ffnFusion.TryGemvSharedInput(_normed.AsSpan(0, hidden), FeedForwardGateWeight(l), _gateUp, FeedForwardUpWeight(l), _up)))
+                    {
+                        engine.Gemv(_normed.AsSpan(0, hidden), FeedForwardGateWeight(l), _gateUp);
+                        engine.Gemv(_normed.AsSpan(0, hidden), FeedForwardUpWeight(l), _up);
+                    }
 
                     AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, gateUpStart);
 
