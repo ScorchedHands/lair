@@ -2258,6 +2258,22 @@ public sealed class TransformerModel : IDisposable
     // through the blocked matmul when <paramref name="denseMatmul"/> selects it. The two routes differ only in how a
     // weight tile reaches the arithmetic, so each output element lands byte-identical to the other and to the
     // single-vector reference.
+    // Dense feed-forward gate/up traversal for one batch: both matrices consume the same normed activation batch, so a backend that
+    // offers shared-input pair fusion walks them in one call and keeps those activations hot across both traversals. Fusion is gated
+    // per posture by the backend itself (formats it reproduces bit-identically only), the gemm route never fuses, and every backend
+    // without the capability — CUDA included — runs exactly the two independent calls this seam replaced.
+    private void RunDenseFeedForwardPair(IBackend engine, ReadOnlySpan<float> inputs, int count, WeightRef gate, Span<float> outGate, WeightRef up, Span<float> outUp, bool denseMatmul)
+    {
+        if (!denseMatmul && engine is IDenseWeightPairFusion fusion &&
+            fusion.TryGemvBatchSharedInput(inputs, count, gate, outGate, up, outUp))
+        {
+            return;
+        }
+
+        WeightPass(engine, inputs, count, gate, outGate, denseMatmul);
+        WeightPass(engine, inputs, count, up, outUp, denseMatmul);
+    }
+
     private void PrefillWindow<TSeq, TR>(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, TSeq kv, bool emitLogits, bool denseMatmul, ActivationFamily act, TR attention)
         where TSeq : class, IKvSequence
         where TR : IKvAttentionRoute<TSeq>
@@ -2430,9 +2446,7 @@ public sealed class TransformerModel : IDisposable
                 {
                     long gateUpStart = BeginDenseProfile();   // the dense feed-forward's gate and up traversals for every row at once
 
-                    WeightPass(engine, batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), batchGateUp.AsSpan(0, rows * inter), denseMatmul);
-
-                    WeightPass(engine, batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardUpWeight(l), batchUp.AsSpan(0, rows * inter), denseMatmul);
+                    RunDenseFeedForwardPair(engine, batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), batchGateUp.AsSpan(0, rows * inter), FeedForwardUpWeight(l), batchUp.AsSpan(0, rows * inter), denseMatmul);
 
                     AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, gateUpStart);
 
@@ -2676,9 +2690,7 @@ public sealed class TransformerModel : IDisposable
                 {
                     long gateUpStart = BeginDenseProfile();   // the dense feed-forward's gate and up traversals for every row at once
 
-                    engine.GemvBatch(batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), batchGateUp.AsSpan(0, rows * inter));
-
-                    engine.GemvBatch(batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardUpWeight(l), batchUp.AsSpan(0, rows * inter));
+                RunDenseFeedForwardPair(engine, batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), batchGateUp.AsSpan(0, rows * inter), FeedForwardUpWeight(l), batchUp.AsSpan(0, rows * inter), denseMatmul: false);
 
                     AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, gateUpStart);
 
@@ -3050,9 +3062,7 @@ public sealed class TransformerModel : IDisposable
                 {
                     long gateUpStart = BeginDenseProfile();   // the dense feed-forward's gate and up traversals for every sequence at once
 
-                    engine.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, FeedForwardGateWeight(l), _batchGateUp.AsSpan(0, n * inter));
-
-                    engine.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, FeedForwardUpWeight(l), _batchUp.AsSpan(0, n * inter));
+                RunDenseFeedForwardPair(engine, _batchNormed.AsSpan(0, n * hidden), n, FeedForwardGateWeight(l), _batchGateUp.AsSpan(0, n * inter), FeedForwardUpWeight(l), _batchUp.AsSpan(0, n * inter), denseMatmul: false);
 
                     AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, gateUpStart);
 

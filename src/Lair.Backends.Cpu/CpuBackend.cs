@@ -1375,7 +1375,12 @@ public sealed unsafe partial class CpuBackend : IBackend
             case QuantFormat.Q4_K:
                 if (avx2)
                 {
-                    BatchQ4KAvx2(rowBytes, inputs, count, rows, cols, outBase);
+                    // Block-aligned Q4_K rows take the scratch route: one dequant pass materializes the row once and eight chains per
+                    // group keep their accumulators in registers across it. Unaligned or oversized postures keep the streaming kernel.
+                    if (!ScratchRowDot(rowBytes, format, cols, inputs, count, rows, outBase))
+                    {
+                        BatchQ4KAvx2(rowBytes, inputs, count, rows, cols, outBase);
+                    }
                 }
                 else
                 {
@@ -1417,7 +1422,11 @@ public sealed unsafe partial class CpuBackend : IBackend
             case QuantFormat.Q6_K:
                 if (avx2)
                 {
-                    BatchQ6KAvx2(rowBytes, inputs, count, rows, cols, outBase);
+                    // Same scratch route as Q4_K for block-aligned rows; unaligned or oversized postures keep the streaming kernel.
+                    if (!ScratchRowDot(rowBytes, format, cols, inputs, count, rows, outBase))
+                    {
+                        BatchQ6KAvx2(rowBytes, inputs, count, rows, cols, outBase);
+                    }
                 }
                 else
                 {

@@ -1,0 +1,11 @@
+kv-quant file=C:\Users\Chuck\AppData\Local\Temp\kilo\optimize-small-cpu\models\qwen2.5-3b-instruct-q4_k_m.gguf bytes=2104932768 threads=32 isaResolved=vnni
+  arch=qwen2 layers=36 hidden=2048 heads=16 kvHeads=2 headDim=128 vocab=151936 context=256 decode=32 windows=2 blockTokens=16 poolBlocks=26
+kv-quant mode=baseline storage=f32/f32 attention=production span<float> kernel prefillSetupMs=7474.1 promptTokens=256
+kv-quant mode=baseline footprint bytesPerBlock=1179648 capacityBlocks=26 reservedKvBytes=30670848 reservedKvMiB=29.25 descriptorBytesPerBlock=1179648
+kv-quant mode=baseline warmWindowTok/s=4.952
+kv-quant mode=baseline window=1 positions=288..319 decodeMs=6040.7 tok/s=5.297
+kv-quant mode=baseline window=2 positions=320..351 decodeMs=5299.6 tok/s=6.038
+kv-quant mode=baseline tok/s=[5.297, 6.038] median=5.668 min=5.297 max=6.038 spread=13.07%
+kv-quant mode=baseline probeTopId=85047/151936 probeTopLogit=8.0027
+
+  peakWorkingSetMb=1987.4 across this process run
