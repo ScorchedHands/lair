@@ -560,6 +560,57 @@ public sealed class MoeTests : IDisposable
         AssertBitsEqual(soloLogits, multiSolo, "one-thread and four-thread single-token forwards must match bit-for-bit");
     }
 
+    /// <summary>The dense profiling seam over a sparse-FFN block: the whole routed/shared chain lands in the named sparse_chain_ms substage inside the feed-forward traversal parent, the dense gate/up and down substages a routed block never runs stay exactly zero, the attention traversal parent still equals the sum of its projection/output substages, and every profiled forward — the batched prompt window and the single-token step alike — lands bit-identical to its unprofiled twin.</summary>
+    [Fact]
+    [Trait("Category", "Engine")]
+    public void SparseForward_DenseProfiling_ReportsChainSubstageInsideFeedForwardStage()
+    {
+        const double ConversionToleranceMs = 1e-6; // a traversal parent is the exact tick sum of its substages; each millisecond conversion rounds independently
+
+        MoeSpec spec = new(sharedExpert: true, routerMode: RouterMode.Discriminating);
+        string path = WriteTemp(BuildGguf(spec.MetadataPairs(), [.. spec.Tensors()]));
+
+        using GgufFile gguf = GgufFile.Open(path);
+        using CpuBackend backend = new(threads: 1, allowAvx2: false);
+
+        using TransformerModel unprofiled = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
+        using BlockPool referencePool = NewPool(unprofiled, backend, capacityBlocks: 8);
+
+        int[] prompt = [1, 2, 3];
+        SequenceKv referenceKv = new(referencePool);
+        float[] referenceWindow = [.. unprofiled.Prefill(prompt, referenceKv)];
+        float[] referenceStep = [.. unprofiled.DecodeNext(1, referenceKv)];
+
+        using TransformerModel profiled = TransformerModel.Open(gguf, backend, maxContextTokens: 8);
+        profiled.EnableDenseForwardProfiling();
+        using BlockPool profiledPool = NewPool(profiled, backend, capacityBlocks: 8);
+
+        SequenceKv profiledKv = new(profiledPool);
+        float[] profiledWindow = [.. profiled.Prefill(prompt, profiledKv)];
+        float[] profiledStep = [.. profiled.DecodeNext(1, profiledKv)];
+
+        AssertBitsEqual(referenceWindow, profiledWindow, "a sparse prompt window with dense stage profiling on");
+        AssertBitsEqual(referenceStep, profiledStep, "a sparse decode step with dense stage profiling on");
+
+        DenseForwardProfile summary = profiled.DenseForwardProfileSummary();
+
+        Assert.True(summary.FeedForwardMs > 0.0, "a sparse block's feed-forward stage must carry a positive time");
+        Assert.True(summary.FeedForwardWeightMs > 0.0, "a sparse block's traversal parent must carry a positive time");
+        Assert.True(summary.SparseChainMs > 0.0, "the routed/shared chain must carry its own named substage time");
+        Assert.True(summary.SparseChainMs <= summary.FeedForwardWeightMs + ConversionToleranceMs, "sparse_chain_ms must stay inside feed_forward_weight_ms");
+        Assert.True(summary.SparseChainMs <= summary.FeedForwardMs + ConversionToleranceMs, "sparse_chain_ms must stay inside feed_forward_ms");
+        Assert.True(summary.SparseChainMs <= summary.TotalMs, "sparse_chain_ms must stay inside total_ms");
+
+        // A routed block runs no dense gate/up pair and no dense down traversal: those substages stay exactly zero while the chain substage carries the work.
+        Assert.Equal(0.0, summary.FeedForwardGateUpMs);
+        Assert.Equal(0.0, summary.FeedForwardDownMs);
+
+        Assert.True(summary.AttentionWeightMs > 0.0, "the sparse block's attention traversals must carry their own substage time");
+        Assert.True(summary.AttentionProjectionMs > 0.0, "the sparse block's Q/K/V traversals must carry their own substage time");
+        Assert.True(summary.AttentionOutputMs > 0.0, "the sparse block's output-projection traversal must carry its own substage time");
+        Assert.True(summary.AttentionWeightMs + ConversionToleranceMs >= summary.AttentionProjectionMs + summary.AttentionOutputMs, "the projection/output pair must account for attention_weight_ms");
+    }
+
     // ---------------------------------------------------------------- encoder deferral for sparse models
 
     [Fact]

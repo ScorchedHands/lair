@@ -52,6 +52,51 @@ public sealed class CpuTuningTests
         Assert.Equal(CpuKernelTuning.ChainGroupMin, CpuKernelTuning.Resolve(32, vectorPosture: false, CpuKernelTuningOverrides.Auto).ChainGroup);
     }
 
+    [Theory]
+    [InlineData(true, 8, 4)] // the auto posture pairs at half its single-row group: four A chains plus four B chains plus two weight chunks fit the register budget
+    [InlineData(true, 6, 3)]
+    [InlineData(true, 2, 1)]
+    [InlineData(true, 1, 1)] // a single chain pairs at one: the pair route degrades to per-chain passes rather than refusing
+    [InlineData(false, 1, 1)] // without a vector posture no scratch route runs, and the pair group follows it
+    public void Resolve_PairChainGroupFollowsTheResolvedChainGroupAndPosture(bool vectorPosture, int pinnedChainGroup, int expectedPairGroup)
+    {
+        CpuKernelTuning tuning = CpuKernelTuning.Resolve(32, vectorPosture, new CpuKernelTuningOverrides { ChainGroup = pinnedChainGroup });
+
+        Assert.Equal(expectedPairGroup, tuning.PairChainGroup);
+    }
+
+    [Fact]
+    public void Resolve_AutoPairChainGroupStaysInsideThePairRegisterBudget()
+    {
+        CpuKernelTuning tuning = CpuKernelTuning.Resolve(32, vectorPosture: true, CpuKernelTuningOverrides.Auto);
+
+        Assert.Equal(CpuKernelTuning.PairChainGroupMax, tuning.PairChainGroup);
+        Assert.True(2 * tuning.PairChainGroup + 2 <= CpuKernelTuning.ChainGroupMax * 2); // both matrices' chains plus the pair's two weight chunks fit the vector posture's register budget
+    }
+
+    [Theory]
+    [InlineData(true, 8, 3)] // the auto posture triples at the triple register budget: three chains per matrix plus three weight chunks fit the register budget
+    [InlineData(true, 6, 3)]
+    [InlineData(true, 3, 3)]
+    [InlineData(true, 2, 2)] // a resolved group narrower than the budget caps the triple group to it
+    [InlineData(true, 1, 1)] // a single chain triples at one: the triple route degrades to per-chain passes rather than refusing
+    [InlineData(false, 1, 1)] // without a vector posture no scratch route runs, and the triple group follows it
+    public void Resolve_TripleChainGroupFollowsTheResolvedChainGroupAndPosture(bool vectorPosture, int pinnedChainGroup, int expectedTripleGroup)
+    {
+        CpuKernelTuning tuning = CpuKernelTuning.Resolve(32, vectorPosture, new CpuKernelTuningOverrides { ChainGroup = pinnedChainGroup });
+
+        Assert.Equal(expectedTripleGroup, tuning.TripleChainGroup);
+    }
+
+    [Fact]
+    public void Resolve_AutoTripleChainGroupStaysInsideTheTripleRegisterBudget()
+    {
+        CpuKernelTuning tuning = CpuKernelTuning.Resolve(32, vectorPosture: true, CpuKernelTuningOverrides.Auto);
+
+        Assert.Equal(CpuKernelTuning.TripleChainGroupMax, tuning.TripleChainGroup);
+        Assert.True(3 * tuning.TripleChainGroup + 3 <= CpuKernelTuning.ChainGroupMax * 2); // all three matrices' chains plus the triple's three weight chunks fit the vector posture's register budget
+    }
+
     [Fact]
     public void Resolve_AutoScratchCeilingStaysCacheSafeOnVectorPostures()
     {
@@ -129,6 +174,8 @@ public sealed class CpuTuningTests
         Assert.Equal(16, backend.ResolvedTuning.RowBlock);
         Assert.Equal(256, backend.ResolvedTuning.ParallelRowThreshold);
         Assert.Equal(8, backend.ResolvedTuning.ChainGroup);
+        Assert.Equal(CpuKernelTuning.PairChainGroupMax, backend.ResolvedTuning.PairChainGroup); // the fused pair route pairs at half the resolved chain group
+        Assert.Equal(CpuKernelTuning.TripleChainGroupMax, backend.ResolvedTuning.TripleChainGroup); // the fused triple route triples at the triple register budget
         Assert.Equal(16_384, backend.ResolvedTuning.MaxScratchCols);
     }
 
@@ -138,7 +185,9 @@ public sealed class CpuTuningTests
         using CpuBackend backend = new(threads: 32, cpuFeatures: new CpuFeaturePosture(Avx2Available: false, AvxVnniAvailable: false));
 
         Assert.Equal(CpuKernelTuning.ChainGroupMin, backend.ResolvedTuning.ChainGroup);
-        Assert.Equal(16, backend.ResolvedTuning.RowBlock); // worker-scaled knobs resolve the same way; only the register-budget knob follows the posture
+        Assert.Equal(CpuKernelTuning.ChainGroupMin, backend.ResolvedTuning.PairChainGroup); // no scratch route runs without a vector posture, and the pair group follows it
+        Assert.Equal(CpuKernelTuning.ChainGroupMin, backend.ResolvedTuning.TripleChainGroup); // the triple group follows the posture too
+        Assert.Equal(16, backend.ResolvedTuning.RowBlock); // worker-scaled knobs resolve the same way; only the register-budget knobs follow the posture
     }
 
     [Fact]

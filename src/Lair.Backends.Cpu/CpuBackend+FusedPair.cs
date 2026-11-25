@@ -17,6 +17,11 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
     [ThreadStatic]
     private static float[]? s_rowScratch;
 
+    // Per-thread pair scratch: both rows of one pair staged side by side so the pair dot can read them in the same traversal,
+    // grown once to twice this engine's widest fused pair and reused across every row pair of every call after that.
+    [ThreadStatic]
+    private static float[]? s_pairScratch;
+
     // Scratch-route eligibility against the call's resolved tuning snapshot: a full chain group of batch vectors before materializing
     // (below one group the streaming kernels' in-register chunk feeds too few accumulator chains to pay for a row staging pass, so
     // small merged-decode batches keep their streaming route), the width ceiling that keeps a staged row cache-resident, and
@@ -145,6 +150,145 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
         }
     }
 
+    // Register-blocked pair dot over one pair's two materialized rows: `pairGroup` accumulator chains per matrix keep their
+    // Vector256 lanes in registers across the whole pair, and each chain advances against its own matrix's chunk while the group's
+    // input vector is loaded once and fed to both matrices' FMAs — the activation batch is walked one time per row pair instead of
+    // once per matrix. Chunk positions are 8-aligned exactly like the single-row scratch kernel's group windows (eligibility
+    // guarantees aligned columns), so every lane holds the same elements in the same order and each output lands bit-identical to
+    // that kernel's chain, down to the HSum fold an empty scalar tail adds — at any resolved pair group width, because grouping
+    // only chooses which batch vectors share one pass over the pair and never reorders a chain or its reduction.
+    private static void PairBatchDotFromScratch(float* wA, float* wB, int cols, float* inputs, int count, int rows, float* outA, float* outB, int pairGroup)
+    {
+        if (pairGroup != CpuKernelTuning.PairChainGroupMax)
+        {
+            PairScratchGroupsOverStackChains(wA, wB, cols, inputs, count, rows, outA, outB, pairGroup); // a pinned narrower pair group: the same chains in the same order, staged through stack lanes instead of live YMM registers.
+            return;
+        }
+
+        int b = 0;
+
+        for (; b + pairGroup <= count; b += pairGroup)
+        {
+            Vector256<float> a0 = Vector256<float>.Zero;
+            Vector256<float> a1 = Vector256<float>.Zero;
+            Vector256<float> a2 = Vector256<float>.Zero;
+            Vector256<float> a3 = Vector256<float>.Zero;
+            Vector256<float> b0 = Vector256<float>.Zero;
+            Vector256<float> b1 = Vector256<float>.Zero;
+            Vector256<float> b2 = Vector256<float>.Zero;
+            Vector256<float> b3 = Vector256<float>.Zero;
+
+            float* in0 = inputs + (long)b * cols;
+            for (int i = 0; i < cols; i += 8)
+            {
+                Vector256<float> wvA = Avx.LoadVector256(wA + i);
+                Vector256<float> wvB = Avx.LoadVector256(wB + i);
+
+                Vector256<float> x0 = Avx.LoadVector256(in0); // one input vector load feeds both matrices' chains.
+                a0 = Fma.MultiplyAdd(x0, wvA, a0);
+                b0 = Fma.MultiplyAdd(x0, wvB, b0);
+                Vector256<float> x1 = Avx.LoadVector256(in0 + cols);
+                a1 = Fma.MultiplyAdd(x1, wvA, a1);
+                b1 = Fma.MultiplyAdd(x1, wvB, b1);
+                Vector256<float> x2 = Avx.LoadVector256(in0 + 2L * cols);
+                a2 = Fma.MultiplyAdd(x2, wvA, a2);
+                b2 = Fma.MultiplyAdd(x2, wvB, b2);
+                Vector256<float> x3 = Avx.LoadVector256(in0 + 3L * cols);
+                a3 = Fma.MultiplyAdd(x3, wvA, a3);
+                b3 = Fma.MultiplyAdd(x3, wvB, b3);
+
+                in0 += 8;
+            }
+
+            outA[(long)b * rows] = HSum(a0);
+            outA[(long)(b + 1) * rows] = HSum(a1);
+            outA[(long)(b + 2) * rows] = HSum(a2);
+            outA[(long)(b + 3) * rows] = HSum(a3);
+            outB[(long)b * rows] = HSum(b0);
+            outB[(long)(b + 1) * rows] = HSum(b1);
+            outB[(long)(b + 2) * rows] = HSum(b2);
+            outB[(long)(b + 3) * rows] = HSum(b3);
+        }
+
+        // Ragged pair tail (count not a multiple of the pair group): one accumulator per remaining chain for each matrix, walking
+        // the pair's rows in the same pass with the same chunk order and reduction as the full groups.
+        for (; b < count; b++)
+        {
+            Vector256<float> accA = Vector256<float>.Zero;
+            Vector256<float> accB = Vector256<float>.Zero;
+            float* inB = inputs + (long)b * cols;
+            for (int i = 0; i < cols; i += 8)
+            {
+                Vector256<float> xv = Avx.LoadVector256(inB + i);
+                accA = Fma.MultiplyAdd(xv, Avx.LoadVector256(wA + i), accA);
+                accB = Fma.MultiplyAdd(xv, Avx.LoadVector256(wB + i), accB);
+            }
+
+            outA[(long)b * rows] = HSum(accA);
+            outB[(long)b * rows] = HSum(accB);
+        }
+    }
+
+    // A pinned pair group below the pair register budget: the same ascending per-chain walks for both matrices, with each chain's
+    // eight-lane accumulator staged in stack scratch (one group's worth per matrix, reused for every group and row pair) instead of
+    // live YMM registers. Outputs are bit-identical to the register route and to two independent single-row passes because grouping
+    // never changes a chain's element order or its reduction — only which batch vectors share one pass over the pair.
+    private static void PairScratchGroupsOverStackChains(float* wA, float* wB, int cols, float* inputs, int count, int rows, float* outA, float* outB, int pairGroup)
+    {
+        Span<float> accA = stackalloc float[pairGroup * 8];
+        Span<float> accB = stackalloc float[pairGroup * 8];
+        fixed (float* pA = accA)
+        fixed (float* pB = accB)
+        {
+            int b0 = 0;
+            for (; b0 + pairGroup <= count; b0 += pairGroup)
+            {
+                for (int lane = 0; lane < pairGroup * 8; lane++)
+                {
+                    pA[lane] = 0f;
+                    pB[lane] = 0f;
+                }
+
+                for (int i = 0; i < cols; i += 8)
+                {
+                    Vector256<float> wvA = Avx.LoadVector256(wA + i); // one hot-scratch read per matrix shared by the group's chains, as in the register route.
+                    Vector256<float> wvB = Avx.LoadVector256(wB + i);
+                    for (int j = 0; j < pairGroup; j++)
+                    {
+                        Vector256<float> xv = Avx.LoadVector256(inputs + (long)(b0 + j) * cols + i); // one input vector load feeds both matrices' chains.
+                        float* chainA = pA + j * 8;
+                        Avx.Store(chainA, Fma.MultiplyAdd(xv, wvA, Avx.LoadVector256(chainA)));
+                        float* chainB = pB + j * 8;
+                        Avx.Store(chainB, Fma.MultiplyAdd(xv, wvB, Avx.LoadVector256(chainB)));
+                    }
+                }
+
+                for (int j = 0; j < pairGroup; j++)
+                {
+                    outA[(long)(b0 + j) * rows] = HSum(Avx.LoadVector256(pA + j * 8));
+                    outB[(long)(b0 + j) * rows] = HSum(Avx.LoadVector256(pB + j * 8));
+                }
+            }
+
+            // Ragged tail below one pair group: one accumulator per matrix walking its row exactly as each full-group chain does.
+            for (; b0 < count; b0++)
+            {
+                Vector256<float> chainA = Vector256<float>.Zero;
+                Vector256<float> chainB = Vector256<float>.Zero;
+                float* inB = inputs + (long)b0 * cols;
+                for (int i = 0; i < cols; i += 8)
+                {
+                    Vector256<float> xv = Avx.LoadVector256(inB + i);
+                    chainA = Fma.MultiplyAdd(xv, Avx.LoadVector256(wA + i), chainA);
+                    chainB = Fma.MultiplyAdd(xv, Avx.LoadVector256(wB + i), chainB);
+                }
+
+                outA[(long)b0 * rows] = HSum(chainA);
+                outB[(long)b0 * rows] = HSum(chainB);
+            }
+        }
+    }
+
     // Materialize one packed row into the thread's scratch with its format's own dequant kernel, then run the blocked dot over it.
     // Returns false when the format/column posture is outside the scratch route so callers keep their streaming kernels. The grouping
     // and width ceiling arrive as plain locals from the call's resolved tuning snapshot — no allocation on this route.
@@ -236,7 +380,7 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
             {
                 for (int row = 0; row < rows; row++)
                 {
-                    RunFusedPairRow(bytesA + (long)row * strideA, bytesB + (long)row * strideB, formatA, formatB, cols, pIn, count, rows, tuning.ChainGroup, outA + row, outB + row);
+                    RunFusedPairRow(bytesA + (long)row * strideA, bytesB + (long)row * strideB, formatA, formatB, cols, pIn, count, rows, tuning.ChainGroup, tuning.PairChainGroup, tuning.MaxScratchCols, outA + row, outB + row);
                 }
 
                 return true;
@@ -249,12 +393,21 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
         }
     }
 
-    // One fused row pair: materialize each matrix's row into the shared thread scratch with its own bit-exact dequant kernel (the
-    // stored values are exactly the chunk vectors that kernel feeds its dot chains), then run both blocked chain sets over the hot
-    // activation batch back to back, so the second traversal reads input vectors this call already pulled through cache. The group
-    // width arrives from the call's tuning snapshot and only chooses which batch vectors share one pass — never a chain's order.
-    private static void RunFusedPairRow(byte* rowA, byte* rowB, QuantFormat formatA, QuantFormat formatB, int cols, float* inputs, int count, int rows, int chainGroup, float* outBaseA, float* outBaseB)
+    // One fused row pair. With both rows stageable — the pair scratch ceiling keeps two staged rows cache-resident and the posture
+    // resolved a pair group — materialize each matrix's row into its half of the pair scratch with its own bit-exact dequant kernel
+    // (the stored values are exactly the chunk vectors that kernel feeds its dot chains), then walk the hot activation batch once
+    // through both matrices' chain sets. Without a pair group the existing back-to-back single-row route runs instead: it stages
+    // one row at a time and walks the batch once per matrix, which is the fallback for postures the pair scratch ceiling excludes.
+    // Both routes take their group width from the call's tuning snapshot and only choose which batch vectors share one pass —
+    // never a chain's order or reduction — so every route lands bit-identical to two independent batch calls.
+    private static void RunFusedPairRow(byte* rowA, byte* rowB, QuantFormat formatA, QuantFormat formatB, int cols, float* inputs, int count, int rows, int chainGroup, int pairGroup, int maxScratchCols, float* outBaseA, float* outBaseB)
     {
+        if (pairGroup >= CpuKernelTuning.ChainGroupMin && 2L * cols <= maxScratchCols)
+        {
+            RunFusedPairRowPaired(rowA, rowB, formatA, formatB, cols, inputs, count, rows, pairGroup, outBaseA, outBaseB);
+            return;
+        }
+
         float[]? scratch = s_rowScratch;
         if (scratch is null || scratch.Length < cols)
         {
@@ -269,6 +422,26 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
 
             MaterializeRow(rowB, formatB, pScratch, cols);
             BatchDotFromScratch(pScratch, cols, inputs, count, rows, outBaseB, chainGroup);
+        }
+    }
+
+    // The pair route for one row pair: both rows materialized side by side in the pair scratch, then one shared traversal of the
+    // activation batch updating both matrices' accumulator chains.
+    private static void RunFusedPairRowPaired(byte* rowA, byte* rowB, QuantFormat formatA, QuantFormat formatB, int cols, float* inputs, int count, int rows, int pairGroup, float* outBaseA, float* outBaseB)
+    {
+        float[]? scratch = s_pairScratch;
+        if (scratch is null || scratch.Length < 2L * cols)
+        {
+            scratch = new float[2 * cols];
+            s_pairScratch = scratch;
+        }
+
+        fixed (float* pScratch = scratch)
+        {
+            MaterializeRow(rowA, formatA, pScratch, cols);
+            MaterializeRow(rowB, formatB, pScratch + cols, cols);
+
+            PairBatchDotFromScratch(pScratch, pScratch + cols, cols, inputs, count, rows, outBaseA, outBaseB, pairGroup);
         }
     }
 
@@ -326,6 +499,8 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
         private readonly float* _outB;
         private readonly int _rowBlock; // captured from the dispatch snapshot so every claimed block uses the same width as Run's block count
         private readonly int _chainGroup;
+        private readonly int _pairGroup;
+        private readonly int _maxScratchCols;
 
         public PairBatchRowJob(byte* bytesA, byte* bytesB, int strideA, int strideB, QuantFormat formatA, QuantFormat formatB, int cols, float* inputs, int count, int rows, float* outA, float* outB, CpuKernelTuning tuning)
         {
@@ -343,6 +518,8 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
             _outB = outB;
             _rowBlock = tuning.RowBlock;
             _chainGroup = tuning.ChainGroup;
+            _pairGroup = tuning.PairChainGroup;
+            _maxScratchCols = tuning.MaxScratchCols;
         }
 
         public void ProcessBlock(int block)
@@ -351,7 +528,7 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
             int lastRow = Math.Min(firstRow + _rowBlock, _rows);
             for (int row = firstRow; row < lastRow; row++)
             {
-                RunFusedPairRow(_bytesA + (long)row * _strideA, _bytesB + (long)row * _strideB, _formatA, _formatB, _cols, _inputs, _count, _rows, _chainGroup, _outA + row, _outB + row);
+                RunFusedPairRow(_bytesA + (long)row * _strideA, _bytesB + (long)row * _strideB, _formatA, _formatB, _cols, _inputs, _count, _rows, _chainGroup, _pairGroup, _maxScratchCols, _outA + row, _outB + row);
             }
         }
     }

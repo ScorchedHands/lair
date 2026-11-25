@@ -50,6 +50,18 @@ public sealed record CpuKernelTuning
     // and lose exactly what grouping buys; they refuse rather than substitute.
     public const int ChainGroupMax = 8;
 
+    // The fused pair route keeps both matrices' accumulator chains live beside the two weight chunks it reads, so its register-budget
+    // group is half the single-row group: four chains per matrix plus two weight chunks fit the same sixteen YMM registers. Like the
+    // single-row budget it is a property of the vector posture, not of one CPU model.
+    public const int PairChainGroupMax = ChainGroupMax / 2;
+
+    // The fused triple route keeps all three matrices' accumulator chains live beside the three weight chunks it reads, so its register-budget
+    // group is the widest one whose chains plus three weight chunks stay inside the sixteen YMM registers with headroom for the shared input
+    // vectors the triple feeds: three chains per matrix (nine accumulators) plus three weight chunks is twelve live registers. A wider triple
+    // group would spill the very accumulators grouping exists to keep live, so it caps at three rather than substitute. Like the other budgets
+    // it is a property of the vector posture, not of one CPU model.
+    public const int TripleChainGroupMax = 3;
+
     /// <summary>The narrowest row staging worth materializing: below this the streaming kernels' in-register feeds already cover the matrix.</summary>
     public const int MaxScratchColsMin = 512;
 
@@ -66,6 +78,12 @@ public sealed record CpuKernelTuning
     /// <summary>Scratch batch-dot chain group width: consecutive batch vectors whose accumulator chains share one pass over a materialized row, bounded by the vector posture's register budget.</summary>
     public required int ChainGroup { get; init; }
 
+    /// <summary>Fused pair chain group width: consecutive batch vectors whose accumulator chains for both matrices of a pair share one pass over the pair's two materialized rows, bounded by the register budget for A+B chains plus two weight chunks.</summary>
+    public required int PairChainGroup { get; init; }
+
+    /// <summary>Fused triple chain group width: consecutive batch vectors whose accumulator chains for all three matrices of a triple share one pass over the triple's three materialized rows, bounded by the register budget for A+B+C chains plus three weight chunks.</summary>
+    public required int TripleChainGroup { get; init; }
+
     /// <summary>The scratch batch-dot route's column ceiling: matrices wider than this keep their streaming kernels instead of staging a whole row.</summary>
     public required int MaxScratchCols { get; init; }
 
@@ -79,6 +97,10 @@ public sealed record CpuKernelTuning
     ///   exactly on 256; because the row block itself scales inversely with worker count this stays near that point across postures while
     ///   still tracking both factors and never dispatching below two blocks of work.
     /// - Chain group = <see cref="ChainGroupMax"/> when a vector posture runs (AVX2's register budget) and 1 without one, where the scratch route never executes anyway.
+    /// - Pair chain group = half the resolved chain group, floored at 1 and capped at <see cref="PairChainGroupMax"/>: the fused pair route
+    ///   keeps both matrices' chains live beside two weight chunks, so its register budget is half the single-row group.
+    /// - Triple chain group = the resolved chain group capped at <see cref="TripleChainGroupMax"/>: the fused triple route keeps three
+    ///   matrices' chains live beside three weight chunks, so its register budget is three chains per matrix plus three weight chunks.
     /// - Max scratch columns = 16_384 floats: a staged row plus its packed bytes stay cache-resident at that width on AVX2-class postures; wider matrices keep their streaming kernels.
     /// An override outside its accepted range fails the open naming the qualified key, its value, and the accepted span — never clamped silently.
     /// </summary>
@@ -103,12 +125,23 @@ public sealed record CpuKernelTuning
             ? Validate(pinnedGroup, "engine.cpu.tuning.chain_group", ChainGroupMin, ChainGroupMax, "a chain group wider than eight spills accumulators past the vector posture's register budget")
             : autoChainGroup;
 
+        // The fused pair budget follows the resolved chain group, not a machine class: a pair keeps both matrices' chains live beside
+        // two weight chunks, so its register-budget group is half the single-row group (eight chains pair at four). A narrower pinned
+        // chain group pairs at half that width, and without a vector posture the pair route never runs anyway.
+        int pairChainGroup = vectorPosture ? Math.Clamp(chainGroup / 2, ChainGroupMin, PairChainGroupMax) : ChainGroupMin;
+
+        // The fused triple budget follows the resolved chain group the same way: a triple keeps three matrices' chains live beside three
+        // weight chunks, so its register-budget group caps at TripleChainGroupMax (three chains per matrix plus three weight chunks fit the
+        // vector posture's register budget). A narrower resolved chain group caps the triple group to it, and without a vector posture the
+        // triple route never runs anyway.
+        int tripleChainGroup = vectorPosture ? Math.Min(TripleChainGroupMax, chainGroup) : ChainGroupMin;
+
         const int AutoMaxScratchCols = 16_384; // cache-safe staging ceiling for AVX2-class postures (see MaxScratchColsMax).
         int maxScratchCols = overrides.MaxScratchCols is { } pinnedCols
             ? Validate(pinnedCols, "engine.cpu.tuning.max_scratch_cols", MaxScratchColsMin, MaxScratchColsMax, "wider staging no longer stays cache-resident beside the packed row it replaces")
             : AutoMaxScratchCols;
 
-        return new CpuKernelTuning { RowBlock = rowBlock, ParallelRowThreshold = parallelThreshold, ChainGroup = chainGroup, MaxScratchCols = maxScratchCols };
+        return new CpuKernelTuning { RowBlock = rowBlock, ParallelRowThreshold = parallelThreshold, ChainGroup = chainGroup, PairChainGroup = pairChainGroup, TripleChainGroup = tripleChainGroup, MaxScratchCols = maxScratchCols };
     }
 
     private static int Validate(int value, string key, int min, int max, string rationale) =>

@@ -515,14 +515,23 @@ public sealed class TransformerModel : IDisposable
     // the K/V slot writes it performs; each layer's feed-forward block — partitioned by its gate/up/down traversals (or a sparse block's whole
     // routed/shared chain); the output head each window reaches; and each instrumented forward call as a whole. Parent stages cover their
     // substages, so a substage never adds cost beside its parent rather than inside it, exactly like the bounded seam's feed-forward split.
+    // Each traversal parent is itself split: the attention weight tally partitions into the batched Q/K/V projection passes and the output
+    // projection pass, and the feed-forward weight tally into the gate/up pair and the down pass, with a sparse block's chain reported as
+    // its own named substage instead of a gate/up/down triple. A split site feeds one clock read into both its substage tally and its
+    // parent tally, so a parent is exactly the sum of its traversal substages.
     private long _denseSeedTicks;
     private long _denseCacheAppendTicks;
     private long _denseKvWriteTicks;
     private long _denseAttentionTicks;
     private long _denseAttentionWeightTicks;
+    private long _denseAttentionProjectionTicks;
+    private long _denseAttentionOutputTicks;
     private long _denseKernelTicks;
     private long _denseFeedForwardTicks;
     private long _denseFeedForwardWeightTicks;
+    private long _denseFeedForwardGateUpTicks;
+    private long _denseFeedForwardDownTicks;
+    private long _denseSparseChainTicks;
     private long _denseLogitsTicks;
     private long _denseTotalTicks;
 
@@ -561,9 +570,14 @@ public sealed class TransformerModel : IDisposable
         _denseKvWriteTicks = 0;
         _denseAttentionTicks = 0;
         _denseAttentionWeightTicks = 0;
+        _denseAttentionProjectionTicks = 0;
+        _denseAttentionOutputTicks = 0;
         _denseKernelTicks = 0;
         _denseFeedForwardTicks = 0;
         _denseFeedForwardWeightTicks = 0;
+        _denseFeedForwardGateUpTicks = 0;
+        _denseFeedForwardDownTicks = 0;
+        _denseSparseChainTicks = 0;
         _denseLogitsTicks = 0;
         _denseTotalTicks = 0;
 
@@ -576,11 +590,13 @@ public sealed class TransformerModel : IDisposable
     /// <summary>
     /// The dense forwards' accumulated stage and per-layer times as milliseconds since the last reset, converted from raw Stopwatch ticks.
     /// Stages partition each instrumented window: seed/embedding lookups with their input scale; sequence slot reservations (cache interaction);
-    /// attention blocks — split into their Q/K/V + output-projection weight traversals, their causal read spans including a tiled walk or a composed
-    /// device step, and the K/V slot writes they perform, with norms/bias/RoPE/residual folds riding inside the parent stage beside those substages;
-    /// feed-forward blocks — split into their gate/up/down traversals (a sparse block's whole routed/shared chain); the output head each window reaches;
-    /// and each forward call as a whole. Parent stages cover their substages rather than adding to them, so summing parents stays inside the total while
-    /// substage sums stay inside their own parent. Per-layer totals cover each block's whole attention + feed-forward span.
+    /// attention blocks — split into their Q/K/V projection traversals and their output-projection traversal (which together are the attention
+    /// weight substage), their causal read spans including a tiled walk or a composed device step, and the K/V slot writes they perform, with
+    /// norms/bias/RoPE/residual folds riding inside the parent stage beside those substages; feed-forward blocks — split into their gate/up and
+    /// down traversals (which together are the feed-forward weight substage), or a sparse block's whole routed/shared chain; the output head each
+    /// window reaches; and each forward call as a whole. Parent stages cover their substages rather than adding to them, so summing parents stays
+    /// inside the total while substage sums stay inside their own parent and each traversal parent is exactly the sum of its traversal substages.
+    /// Per-layer totals cover each block's whole attention + feed-forward span.
     /// </summary>
     internal DenseForwardProfile DenseForwardProfileSummary()
     {
@@ -595,10 +611,15 @@ public sealed class TransformerModel : IDisposable
             TicksToMs(_denseCacheAppendTicks),
             TicksToMs(_denseAttentionTicks),
             TicksToMs(_denseAttentionWeightTicks),
+            TicksToMs(_denseAttentionProjectionTicks),
+            TicksToMs(_denseAttentionOutputTicks),
             TicksToMs(_denseKernelTicks),
             TicksToMs(_denseKvWriteTicks),
             TicksToMs(_denseFeedForwardTicks),
             TicksToMs(_denseFeedForwardWeightTicks),
+            TicksToMs(_denseFeedForwardGateUpTicks),
+            TicksToMs(_denseFeedForwardDownTicks),
+            TicksToMs(_denseSparseChainTicks),
             TicksToMs(_denseLogitsTicks),
             TicksToMs(_denseTotalTicks),
             layers);
@@ -614,6 +635,19 @@ public sealed class TransformerModel : IDisposable
         if (_denseProfileEnabled)
         {
             accumulator += Stopwatch.GetTimestamp() - startTicks;
+        }
+    }
+
+    // A traversal span that is both a named substage and part of its parent stage: one clock read lands the elapsed ticks in both tallies,
+    // so the parent is exactly the sum of its traversal substages rather than a second, independently measured pass over the same span.
+    // A disabled forward still returns before touching either accumulator.
+    private void AccumulateDenseSubstage(ref long substage, ref long parent, long startTicks)
+    {
+        if (_denseProfileEnabled)
+        {
+            long elapsed = Stopwatch.GetTimestamp() - startTicks;
+            substage += elapsed;
+            parent += elapsed;
         }
     }
 
@@ -2274,6 +2308,25 @@ public sealed class TransformerModel : IDisposable
         WeightPass(engine, inputs, count, up, outUp, denseMatmul);
     }
 
+    // One batched attention Q/K/V projection pass: the three matrices consume the same normed activation batch and share its column count, so a
+    // backend that offers shared-input triple fusion walks them in one call and keeps those activations hot across all three traversals — the
+    // activation-side win the gate/up pair got, extended to the trio. Fusion is gated per posture by the backend itself (formats it reproduces
+    // bit-identically only), the gemm route never fuses, and every backend without the capability — CUDA included — runs exactly the three
+    // independent calls this seam replaced. Unlike the pair seam the trio may hold different row counts (the query region is wider than the
+    // kv region), and the fused executor walks each matrix's own rows.
+    private void RunAttentionQKVProjection(IBackend engine, ReadOnlySpan<float> inputs, int count, WeightRef query, Span<float> outQ, WeightRef key, Span<float> outK, WeightRef value, Span<float> outV, bool denseMatmul)
+    {
+        if (!denseMatmul && engine is IDenseWeightTripleFusion fusion &&
+            fusion.TryGemvBatchSharedInput(inputs, count, query, outQ, key, outK, value, outV))
+        {
+            return;
+        }
+
+        WeightPass(engine, inputs, count, query, outQ, denseMatmul);
+        WeightPass(engine, inputs, count, key, outK, denseMatmul);
+        WeightPass(engine, inputs, count, value, outV, denseMatmul);
+    }
+
     private void PrefillWindow<TSeq, TR>(IReadOnlyList<int> tokens, int offset, int rows, int basePosition, TSeq kv, bool emitLogits, bool denseMatmul, ActivationFamily act, TR attention)
         where TSeq : class, IKvSequence
         where TR : IKvAttentionRoute<TSeq>
@@ -2359,13 +2412,9 @@ public sealed class TransformerModel : IDisposable
 
                 // One weight pass per matrix for the whole sub-batch; each row's result matches its single-vector GEMV on
                 // either route this selection can take.
-                WeightPass(engine, batchNormed.AsSpan(0, rows * hidden), rows, AttentionQueryWeight(l), batchQ.AsSpan(0, rows * qkvRegion), denseMatmul);
+                RunAttentionQKVProjection(engine, batchNormed.AsSpan(0, rows * hidden), rows, AttentionQueryWeight(l), batchQ.AsSpan(0, rows * qkvRegion), AttentionKeyWeight(l), batchK.AsSpan(0, rows * kvRegion), AttentionValueWeight(l), batchV.AsSpan(0, rows * kvRegion), denseMatmul);
 
-                WeightPass(engine, batchNormed.AsSpan(0, rows * hidden), rows, AttentionKeyWeight(l), batchK.AsSpan(0, rows * kvRegion), denseMatmul);
-
-                WeightPass(engine, batchNormed.AsSpan(0, rows * hidden), rows, AttentionValueWeight(l), batchV.AsSpan(0, rows * kvRegion), denseMatmul);
-
-                AccumulateDenseProfile(ref _denseAttentionWeightTicks, projectionStart);
+                AccumulateDenseSubstage(ref _denseAttentionProjectionTicks, ref _denseAttentionWeightTicks, projectionStart);
 
                 // Bias, QK-norm, RoPE at the row's absolute position, and the K/V writes for every row complete
                 // before any row attends, so each row's causal read sees exactly the prefix it would have alone.
@@ -2412,7 +2461,7 @@ public sealed class TransformerModel : IDisposable
 
                 long outputPassStart = BeginDenseProfile();   // the attention side's remaining dense traversal: the output projection for every row
                 WeightPass(engine, batchAttnOut.AsSpan(0, rows * qkvRegion), rows, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), batchProj.AsSpan(0, rows * hidden), denseMatmul);
-                AccumulateDenseProfile(ref _denseAttentionWeightTicks, outputPassStart);
+                AccumulateDenseSubstage(ref _denseAttentionOutputTicks, ref _denseAttentionWeightTicks, outputPassStart);
 
                 for (int r = 0; r < rows; r++)
                 {
@@ -2440,7 +2489,7 @@ public sealed class TransformerModel : IDisposable
                 {
                     long chainStart = BeginDenseProfile();   // a sparse block reports its whole routed/shared chain as this stage's traversal substage
                     ApplySparseFeedForwardBatch(routing, l, rows, act, engine);
-                    AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, chainStart);
+                    AccumulateDenseSubstage(ref _denseSparseChainTicks, ref _denseFeedForwardWeightTicks, chainStart);
                 }
                 else
                 {
@@ -2448,7 +2497,7 @@ public sealed class TransformerModel : IDisposable
 
                     RunDenseFeedForwardPair(engine, batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), batchGateUp.AsSpan(0, rows * inter), FeedForwardUpWeight(l), batchUp.AsSpan(0, rows * inter), denseMatmul);
 
-                    AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, gateUpStart);
+                    AccumulateDenseSubstage(ref _denseFeedForwardGateUpTicks, ref _denseFeedForwardWeightTicks, gateUpStart);
 
                     // act = activation(gate) * up in place on each row's gate buffer.
                     for (int r = 0; r < rows; r++)
@@ -2460,7 +2509,7 @@ public sealed class TransformerModel : IDisposable
 
                     long downStart = BeginDenseProfile();   // the dense feed-forward's down traversal for every row at once
                     WeightPass(engine, batchGateUp.AsSpan(0, rows * inter), rows, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), batchProj.AsSpan(0, rows * hidden), denseMatmul);
-                    AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, downStart);
+                    AccumulateDenseSubstage(ref _denseFeedForwardDownTicks, ref _denseFeedForwardWeightTicks, downStart);
                 }
 
                 for (int r = 0; r < rows; r++)
@@ -2597,13 +2646,9 @@ public sealed class TransformerModel : IDisposable
                 long projectionStart = BeginDenseProfile();   // the attention side's dense weight traversals: Q, K, V for every row at once
 
                 // One weight pass per matrix for the whole sub-batch; each row's result matches its single-vector GEMV.
-                engine.GemvBatch(batchNormed.AsSpan(0, rows * hidden), rows, AttentionQueryWeight(l), batchQ.AsSpan(0, rows * qkvRegion));
+                RunAttentionQKVProjection(engine, batchNormed.AsSpan(0, rows * hidden), rows, AttentionQueryWeight(l), batchQ.AsSpan(0, rows * qkvRegion), AttentionKeyWeight(l), batchK.AsSpan(0, rows * kvRegion), AttentionValueWeight(l), batchV.AsSpan(0, rows * kvRegion), denseMatmul: false);
 
-                engine.GemvBatch(batchNormed.AsSpan(0, rows * hidden), rows, AttentionKeyWeight(l), batchK.AsSpan(0, rows * kvRegion));
-
-                engine.GemvBatch(batchNormed.AsSpan(0, rows * hidden), rows, AttentionValueWeight(l), batchV.AsSpan(0, rows * kvRegion));
-
-                AccumulateDenseProfile(ref _denseAttentionWeightTicks, projectionStart);
+                AccumulateDenseSubstage(ref _denseAttentionProjectionTicks, ref _denseAttentionWeightTicks, projectionStart);
 
                 // Bias, QK-norm, RoPE at the row's absolute position, and the K/V writes for every row complete
                 // before any row attends, so each row's causal read sees exactly the prefix it would have alone.
@@ -2656,7 +2701,7 @@ public sealed class TransformerModel : IDisposable
 
                 long outputPassStart = BeginDenseProfile();   // the attention side's remaining dense traversal: the output projection for every row
                 engine.GemvBatch(batchAttnOut.AsSpan(0, rows * qkvRegion), rows, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), batchProj.AsSpan(0, rows * hidden));
-                AccumulateDenseProfile(ref _denseAttentionWeightTicks, outputPassStart);
+                AccumulateDenseSubstage(ref _denseAttentionOutputTicks, ref _denseAttentionWeightTicks, outputPassStart);
 
                 for (int r = 0; r < rows; r++)
                 {
@@ -2684,7 +2729,7 @@ public sealed class TransformerModel : IDisposable
                 {
                     long chainStart = BeginDenseProfile();   // a sparse block reports its whole routed/shared chain as this stage's traversal substage
                     ApplySparseFeedForwardBatch(routing, l, rows, act, engine);
-                    AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, chainStart);
+                    AccumulateDenseSubstage(ref _denseSparseChainTicks, ref _denseFeedForwardWeightTicks, chainStart);
                 }
                 else
                 {
@@ -2692,7 +2737,7 @@ public sealed class TransformerModel : IDisposable
 
                 RunDenseFeedForwardPair(engine, batchNormed.AsSpan(0, rows * hidden), rows, FeedForwardGateWeight(l), batchGateUp.AsSpan(0, rows * inter), FeedForwardUpWeight(l), batchUp.AsSpan(0, rows * inter), denseMatmul: false);
 
-                    AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, gateUpStart);
+                    AccumulateDenseSubstage(ref _denseFeedForwardGateUpTicks, ref _denseFeedForwardWeightTicks, gateUpStart);
 
                     // act = activation(gate) * up in place on each row's gate buffer.
                     for (int r = 0; r < rows; r++)
@@ -2704,7 +2749,7 @@ public sealed class TransformerModel : IDisposable
 
                     long downStart = BeginDenseProfile();   // the dense feed-forward's down traversal for every row at once
                     engine.GemvBatch(batchGateUp.AsSpan(0, rows * inter), rows, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), batchProj.AsSpan(0, rows * hidden));
-                    AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, downStart);
+                    AccumulateDenseSubstage(ref _denseFeedForwardDownTicks, ref _denseFeedForwardWeightTicks, downStart);
                 }
 
                 for (int r = 0; r < rows; r++)
@@ -2994,13 +3039,9 @@ public sealed class TransformerModel : IDisposable
                 long projectionStart = BeginDenseProfile();   // the attention side's dense weight traversals: Q, K, V for every sequence at once
 
                 // One weight pass per matrix for the whole batch; each sequence's row result matches its single-vector GEMV.
-                engine.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, AttentionQueryWeight(l), _batchQ.AsSpan(0, n * qkvRegion));
+                RunAttentionQKVProjection(engine, _batchNormed.AsSpan(0, n * hidden), n, AttentionQueryWeight(l), _batchQ.AsSpan(0, n * qkvRegion), AttentionKeyWeight(l), _batchK.AsSpan(0, n * kvRegion), AttentionValueWeight(l), _batchV.AsSpan(0, n * kvRegion), denseMatmul: false);
 
-                engine.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, AttentionKeyWeight(l), _batchK.AsSpan(0, n * kvRegion));
-
-                engine.GemvBatch(_batchNormed.AsSpan(0, n * hidden), n, AttentionValueWeight(l), _batchV.AsSpan(0, n * kvRegion));
-
-                AccumulateDenseProfile(ref _denseAttentionWeightTicks, projectionStart);
+                AccumulateDenseSubstage(ref _denseAttentionProjectionTicks, ref _denseAttentionWeightTicks, projectionStart);
 
                 for (int s = 0; s < n; s++)
                 {
@@ -3028,7 +3069,7 @@ public sealed class TransformerModel : IDisposable
 
                 long outputPassStart = BeginDenseProfile();   // the attention side's remaining dense traversal: the output projection for every sequence
                 engine.GemvBatch(_batchAttnOut.AsSpan(0, n * qkvRegion), n, new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _batchProj.AsSpan(0, n * hidden));
-                AccumulateDenseProfile(ref _denseAttentionWeightTicks, outputPassStart);
+                AccumulateDenseSubstage(ref _denseAttentionOutputTicks, ref _denseAttentionWeightTicks, outputPassStart);
 
                 for (int s = 0; s < n; s++)
                 {
@@ -3056,7 +3097,7 @@ public sealed class TransformerModel : IDisposable
                 {
                     long chainStart = BeginDenseProfile();   // a sparse block reports its whole routed/shared chain as this stage's traversal substage
                     ApplySparseFeedForwardBatch(routing, l, n, _decodeAct, engine);
-                    AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, chainStart);
+                    AccumulateDenseSubstage(ref _denseSparseChainTicks, ref _denseFeedForwardWeightTicks, chainStart);
                 }
                 else
                 {
@@ -3064,7 +3105,7 @@ public sealed class TransformerModel : IDisposable
 
                 RunDenseFeedForwardPair(engine, _batchNormed.AsSpan(0, n * hidden), n, FeedForwardGateWeight(l), _batchGateUp.AsSpan(0, n * inter), FeedForwardUpWeight(l), _batchUp.AsSpan(0, n * inter), denseMatmul: false);
 
-                    AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, gateUpStart);
+                    AccumulateDenseSubstage(ref _denseFeedForwardGateUpTicks, ref _denseFeedForwardWeightTicks, gateUpStart);
 
                     // act = activation(gate) * up in place on each sequence's gate buffer.
                     for (int s = 0; s < n; s++)
@@ -3076,7 +3117,7 @@ public sealed class TransformerModel : IDisposable
 
                     long downStart = BeginDenseProfile();   // the dense feed-forward's down traversal for every sequence at once
                     engine.GemvBatch(_batchGateUp.AsSpan(0, n * inter), n, new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _batchProj.AsSpan(0, n * hidden));
-                    AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, downStart);
+                    AccumulateDenseSubstage(ref _denseFeedForwardDownTicks, ref _denseFeedForwardWeightTicks, downStart);
                 }
 
                 for (int s = 0; s < n; s++)
@@ -3250,11 +3291,7 @@ public sealed class TransformerModel : IDisposable
                         ApplyNorm(cur.AsSpan((c * EncodeChunkTokens + i) * hidden, hidden), _attnNormWeight[l], _attnNormBias[l], chunkNormed.AsSpan(i * hidden, hidden));
                     }
 
-                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, AttentionQueryWeight(l), chunkQ.AsSpan(0, m * qkvRegion));
-
-                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, AttentionKeyWeight(l), chunkK.AsSpan(0, m * kvRegion));
-
-                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, AttentionValueWeight(l), chunkV.AsSpan(0, m * kvRegion));
+                    RunAttentionQKVProjection(_backend, chunkNormed.AsSpan(0, m * hidden), m, AttentionQueryWeight(l), chunkQ.AsSpan(0, m * qkvRegion), AttentionKeyWeight(l), chunkK.AsSpan(0, m * kvRegion), AttentionValueWeight(l), chunkV.AsSpan(0, m * kvRegion), denseMatmul: false);
 
                     for (int i = 0; i < m; i++)
                     {
@@ -3553,11 +3590,7 @@ public sealed class TransformerModel : IDisposable
                         ApplyNorm(cur.AsSpan((firstRow + i) * hidden, hidden), _attnNormWeight[l], _attnNormBias[l], chunkNormed.AsSpan(i * hidden, hidden));
                     }
 
-                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, AttentionQueryWeight(l), chunkQ.AsSpan(0, m * qkvRegion));
-
-                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, AttentionKeyWeight(l), chunkK.AsSpan(0, m * kvRegion));
-
-                    _backend.GemvBatch(chunkNormed.AsSpan(0, m * hidden), m, AttentionValueWeight(l), chunkV.AsSpan(0, m * kvRegion));
+                    RunAttentionQKVProjection(_backend, chunkNormed.AsSpan(0, m * hidden), m, AttentionQueryWeight(l), chunkQ.AsSpan(0, m * qkvRegion), AttentionKeyWeight(l), chunkK.AsSpan(0, m * kvRegion), AttentionValueWeight(l), chunkV.AsSpan(0, m * kvRegion), denseMatmul: false);
 
                     for (int i = 0; i < m; i++)
                     {
@@ -3833,7 +3866,7 @@ public sealed class TransformerModel : IDisposable
                 AddBias(_k, _biasK[l]);
                 AddBias(_v, _biasV[l]);
 
-                AccumulateDenseProfile(ref _denseAttentionWeightTicks, projectionStart);
+                AccumulateDenseSubstage(ref _denseAttentionProjectionTicks, ref _denseAttentionWeightTicks, projectionStart);
 
                 // Resolved QK-norm mode: each side's projected stream is normalized after the projection and bias and
                 // before RoPE, either per head in its own head-dimension slice or across all its heads under one mean.
@@ -3865,7 +3898,7 @@ public sealed class TransformerModel : IDisposable
 
                 long outputPassStart = BeginDenseProfile();   // the attention side's remaining dense traversal: the output projection
                 engine.Gemv(_attnOut.AsSpan(0, Plan.HeadCount * Plan.HeadDim), new WeightRef(bytes, _wo[l].Shape, _wo[l].Format), _proj);
-                AccumulateDenseProfile(ref _denseAttentionWeightTicks, outputPassStart);
+                AccumulateDenseSubstage(ref _denseAttentionOutputTicks, ref _denseAttentionWeightTicks, outputPassStart);
 
                 AddBias(_proj, _biasO[l]);
 
@@ -3886,7 +3919,7 @@ public sealed class TransformerModel : IDisposable
                 {
                     long chainStart = BeginDenseProfile();   // a sparse block reports its whole routed/shared chain as this stage's traversal substage
                     ApplySparseFeedForward(routing, l, engine);
-                    AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, chainStart);
+                    AccumulateDenseSubstage(ref _denseSparseChainTicks, ref _denseFeedForwardWeightTicks, chainStart);
                 }
                 else
                 {
@@ -3901,7 +3934,7 @@ public sealed class TransformerModel : IDisposable
                         engine.Gemv(_normed.AsSpan(0, hidden), FeedForwardUpWeight(l), _up);
                     }
 
-                    AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, gateUpStart);
+                    AccumulateDenseSubstage(ref _denseFeedForwardGateUpTicks, ref _denseFeedForwardWeightTicks, gateUpStart);
 
                     // act = activation(gate) * up with the plan's resolved activation, applied in place on the gate buffer.
                     ApplyActivation(_gateUp.AsSpan(0, Plan.IntermediateSize), _up.AsSpan(0, Plan.IntermediateSize));
@@ -3910,7 +3943,7 @@ public sealed class TransformerModel : IDisposable
 
                     long downStart = BeginDenseProfile();   // the dense feed-forward's down traversal
                     engine.Gemv(_gateUp.AsSpan(0, Plan.IntermediateSize), new WeightRef(bytes, _ffnDown[l].Shape, _ffnDown[l].Format), _proj);
-                    AccumulateDenseProfile(ref _denseFeedForwardWeightTicks, downStart);
+                    AccumulateDenseSubstage(ref _denseFeedForwardDownTicks, ref _denseFeedForwardWeightTicks, downStart);
                 }
 
                 ApplyPostSublayerNorm(_proj, _postFfnNorm[l]);
@@ -5316,22 +5349,29 @@ public sealed class TransformerModel : IDisposable
 /// One measured window's dense stage and per-layer times, in milliseconds. Stages partition every instrumented prefill or decode forward:
 /// seed/embedding lookups with their input-embedding scale; the sequence slot reservations that route makes before its layers write (cache
 /// interaction); each layer's attention block from its norms through its sublayer fold and that block's feed-forward norm — split into its Q/K/V
-/// plus output-projection dense traversals, its causal read spans including a tiled walk or a composed device step, and the K/V slot writes it
-/// performs (bias/QK-norm/RoPE/residual folds ride inside this stage beside those substages); each layer's feed-forward block — split into its
-/// gate/up/down traversals, or a sparse block's whole routed/shared chain; the output head each window reaches; and each instrumented forward call
-/// as a whole. Parent stages cover their substages rather than adding to them: attention weight + kernel + KV write times sum inside the attention
-/// stage, feed-forward traversal time inside the feed-forward stage, and every parent beside seed and cache interaction stays inside the total apart
-/// from cross-span staging copies and per-call argument checks. Assembly-internal diagnostic shape behind the engine's dense profiling seam.
+/// projection traversals and its output-projection traversal (which together are <see cref="AttentionWeightMs"/>), its causal read spans including
+/// a tiled walk or a composed device step, and the K/V slot writes it performs (bias/QK-norm/RoPE/residual folds ride inside this stage beside those
+/// substages); each layer's feed-forward block — split into its gate/up pair traversal and its down traversal (which together are
+/// <see cref="FeedForwardWeightMs"/>), or a sparse block's whole routed/shared chain; the output head each window reaches; and each instrumented
+/// forward call as a whole. Parent stages cover their substages rather than adding to them: attention weight + kernel + KV write times sum inside
+/// the attention stage, feed-forward traversal time inside the feed-forward stage, each traversal parent is exactly the sum of its traversal
+/// substages, and every parent beside seed and cache interaction stays inside the total apart from cross-span staging copies and per-call argument
+/// checks. Assembly-internal diagnostic shape behind the engine's dense profiling seam.
 /// </summary>
 internal readonly record struct DenseForwardProfile(
     double SeedMs,
     double CacheAppendMs,
     double AttentionMs,
     double AttentionWeightMs,
+    double AttentionProjectionMs,
+    double AttentionOutputMs,
     double AttentionKernelMs,
     double KvWriteMs,
     double FeedForwardMs,
     double FeedForwardWeightMs,
+    double FeedForwardGateUpMs,
+    double FeedForwardDownMs,
+    double SparseChainMs,
     double LogitsHeadMs,
     double TotalMs,
     IReadOnlyList<DenseForwardLayerTiming> Layers);

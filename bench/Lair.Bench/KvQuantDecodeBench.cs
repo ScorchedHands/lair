@@ -358,7 +358,8 @@ internal static class KvQuantDecodeBench
 
     // One machine-readable dense stage line for a measured window group in this mode: the engine's own accumulated stage and per-layer totals since
     // its last reset, with the three heaviest whole-block layers ranked beside them. Parent stages cover their substages — attention weight/kernel/KV-write
-    // times partition the attention stage, feed-forward traversal partitions its parent — so a reader names the dominant substage without double-counting it.
+    // times partition the attention stage, feed-forward traversal partitions its parent, and each traversal parent is exactly the sum of its traversal
+    // substages (projection + output, gate/up + down, or a sparse block's named chain) — so a reader names the dominant substage without double-counting it.
     // forwardCalls states how many forwards those totals describe: every stage figure is a sum over that group rather than one window's cost.
     private static string DenseDecodeStageLine(TransformerModel model, string mode, string windowKind, int tokensCovered, int forwardCalls)
     {
@@ -372,8 +373,11 @@ internal static class KvQuantDecodeBench
         return $"kv-quant mode={mode} stage window={windowKind} tokens={tokensCovered} forwardCalls={forwardCalls}" +
                $" seed_ms={profile.SeedMs:F3} cache_append_ms={profile.CacheAppendMs:F3}" +
                $" attention_ms={profile.AttentionMs:F3} attention_weight_ms={profile.AttentionWeightMs:F3}" +
+               $" attention_projection_ms={profile.AttentionProjectionMs:F3} attention_output_ms={profile.AttentionOutputMs:F3}" +
                $" attention_kernel_ms={profile.AttentionKernelMs:F3} kv_write_ms={profile.KvWriteMs:F3}" +
                $" feed_forward_ms={profile.FeedForwardMs:F3} feed_forward_weight_ms={profile.FeedForwardWeightMs:F3}" +
+               $" feed_forward_gate_up_ms={profile.FeedForwardGateUpMs:F3} feed_forward_down_ms={profile.FeedForwardDownMs:F3}" +
+               $" sparse_chain_ms={profile.SparseChainMs:F3}" +
                $" logits_head_ms={profile.LogitsHeadMs:F3} total_ms={profile.TotalMs:F3}" +
                $" top_layers={string.Join(",", topLayers)}";
     }

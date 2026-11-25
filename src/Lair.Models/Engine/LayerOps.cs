@@ -1,3 +1,6 @@
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+
 using Lair.Contracts;
 using Lair.Backends.Cpu;
 using Lair.Kv;
@@ -456,6 +459,77 @@ internal static class LayerOps
     }
 
     /// <summary>
+    /// Scales one attention accumulator in place — <c>accumulator[j] *= factor</c> — eight lanes at a time on an AVX2
+    /// host and one element at a time otherwise. This is the rescale-on-new-max and final-normalization pass of every
+    /// attention kernel: the vector path broadcasts the factor and applies <c>Avx.Multiply</c>, which rounds each
+    /// lane's product exactly like the scalar multiply it replaces, so the accumulator lands bit-for-bit whichever path
+    /// the host runs. Elements past the last whole 8-lane group take the scalar tail, so a head dimension that is not a
+    /// multiple of 8 is covered exactly.
+    /// </summary>
+    internal static void ScaleAccumulator(Span<float> accumulator, float factor)
+    {
+        if (Avx2.IsSupported)
+        {
+            Vector256<float> f = Vector256.Create(factor);
+
+            int i = 0;
+            for (; i + 8 <= accumulator.Length; i += 8)
+            {
+                Avx.Multiply(Vector256.Create(accumulator.Slice(i, 8)), f).CopyTo(accumulator.Slice(i, 8));
+            }
+
+            for (; i < accumulator.Length; i++)
+            {
+                accumulator[i] *= factor;
+            }
+        }
+        else
+        {
+            for (int j = 0; j < accumulator.Length; j++)
+            {
+                accumulator[j] *= factor;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Accumulates one position's weighted V row into an attention accumulator in place —
+    /// <c>accumulator[j] += weight * values[j]</c> — eight lanes at a time on an AVX2 host and one element at a time
+    /// otherwise. The vector path keeps the scalar operation's two roundings: <c>Avx.Multiply</c> rounds each
+    /// product to a float and <c>Avx.Add</c> then adds that rounded product to the rounded accumulator, exactly as
+    /// the scalar loop does. <c>Fma.MultiplyAdd</c> is deliberately not used — fusing the pair rounds once instead
+    /// of twice and can land on different bits — which is also why these kernels do not call the backend's FMA axpy.
+    /// Elements past the last whole 8-lane group take the scalar tail, so a head dimension that is not a multiple of 8 is
+    /// covered exactly.
+    /// </summary>
+    internal static void AccumulateWeighted(Span<float> accumulator, ReadOnlySpan<float> values, float weight)
+    {
+        if (Avx2.IsSupported)
+        {
+            Vector256<float> w = Vector256.Create(weight);
+
+            int i = 0;
+            for (; i + 8 <= accumulator.Length; i += 8)
+            {
+                Vector256<float> product = Avx.Multiply(Vector256.Create(values.Slice(i, 8)), w);
+                Avx.Add(Vector256.Create(accumulator.Slice(i, 8)), product).CopyTo(accumulator.Slice(i, 8));
+            }
+
+            for (; i < accumulator.Length; i++)
+            {
+                accumulator[i] += weight * values[i];
+            }
+        }
+        else
+        {
+            for (int j = 0; j < accumulator.Length; j++)
+            {
+                accumulator[j] += weight * values[j];
+            }
+        }
+    }
+
+    /// <summary>
     /// Causal attention for one layer at the current position: head h reads kv-head (h * kvHeadCount / headCount),
     /// scores are q·k multiplied by attnScale — then capped by <see cref="Softcap"/> when softcap is positive —
     /// over logical positions 0..position, and softmax runs online with a running max/sum. A positive window
@@ -530,10 +604,7 @@ internal static class LayerOps
                             float rescale = MathF.Exp(runningMax - score);
                             sumExp *= rescale;
 
-                            for (int j = 0; j < headDim; j++)
-                            {
-                                outHead[j] *= rescale;
-                            }
+                            ScaleAccumulator(outHead, rescale);
                         }
 
                         runningMax = score;
@@ -543,18 +614,12 @@ internal static class LayerOps
                     sumExp += weight;
 
                     ReadOnlySpan<float> vt = kv.ReadV(read, t, layer).Slice(kvHead * headDim, headDim);
-                    for (int j = 0; j < headDim; j++)
-                    {
-                        outHead[j] += weight * vt[j];
-                    }
+                    AccumulateWeighted(outHead, vt, weight);
                 }
             }
 
             float invSum = 1f / sumExp; // >= 1 because the max term contributes exp(0)
-            for (int j = 0; j < headDim; j++)
-            {
-                outHead[j] *= invSum;
-            }
+            ScaleAccumulator(outHead, invSum);
         }
     }
 
@@ -657,10 +722,7 @@ internal static class LayerOps
                             float rescale = MathF.Exp(runningMax - score);
                             sumExp *= rescale;
 
-                            for (int j = 0; j < headDim; j++)
-                            {
-                                outHead[j] *= rescale;
-                            }
+                            ScaleAccumulator(outHead, rescale);
                         }
 
                         runningMax = score;
@@ -675,10 +737,7 @@ internal static class LayerOps
             }
 
             float invSum = 1f / sumExp; // >= 1 because the max term contributes exp(0)
-            for (int j = 0; j < headDim; j++)
-            {
-                outHead[j] *= invSum;
-            }
+            ScaleAccumulator(outHead, invSum);
         }
     }
 
@@ -814,10 +873,7 @@ internal static class LayerOps
                                     float rescale = MathF.Exp(runningMaxRowState[state] - score);
                                     sumExpRowState[state] *= rescale;
 
-                                    for (int j = 0; j < headDim; j++)
-                                    {
-                                        outHeadRow[h * headDim + j] *= rescale;
-                                    }
+                                    ScaleAccumulator(outHeadRow.Slice(h * headDim, headDim), rescale);
                                 }
 
                                 runningMaxRowState[state] = score;
@@ -826,10 +882,7 @@ internal static class LayerOps
                             float weight = MathF.Exp(score - runningMaxRowState[state]); // the current max term contributes exactly 1
                             sumExpRowState[state] += weight;
 
-                            for (int j = 0; j < headDim; j++)
-                            {
-                                outHeadRow[h * headDim + j] += weight * vt[j];
-                            }
+                            AccumulateWeighted(outHeadRow.Slice(h * headDim, headDim), vt, weight);
                         }
                     }
                 }
@@ -846,10 +899,7 @@ internal static class LayerOps
             for (int h = 0; h < headCount; h++)
             {
                 float invSum = 1f / sumExpRowState[r * headCount + h]; // >= 1 because the max term contributes exp(0)
-                for (int j = 0; j < headDim; j++)
-                {
-                    outHeadRow[h * headDim + j] *= invSum;
-                }
+                ScaleAccumulator(outHeadRow.Slice(h * headDim, headDim), invSum);
             }
         }
     }

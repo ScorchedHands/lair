@@ -1,0 +1,17 @@
+prefill-profile file=C:\Users\Chuck\AppData\Local\Temp\kilo\optimize-small-cpu\models\qwen2.5-3b-instruct-q4_k_m.gguf bytes=2104932768 threads=32 maxBatchSequences=16
+  arch=qwen2 layers=36 hidden=2048 heads=16 kvHeads=2 headDim=128 vocab=151936 windowedLayers=0 avx2=True
+  traversalBytes=1668685824 outputHeadBytes=255252480 kvBlocks=24 blockTokens=16 reps=1 perToken=off lengths=128,256 rowWidths=64 kernels=gemv stageProfile=on
+
+prefill-profile kernel=gemv
+
+prefill-profile rowWidth=64 subBatchActivationBytes=8388608
+  weightFit=1188.48 ms/traversal (UNRELIABLE: measured costs are not separable into the two terms on this run) impliedWeightGB/s=1.40
+  attentionFit=-35.152 us per position pair
+  crossover: not reached within 4x the longest measured length (256 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             2        2086.7         61.34        2377.0        -290.2           0.0          1.40
+         256             4        3597.6         71.16        4753.9       -1156.4           0.0          1.40
+  prefill-profile stage window=window kernel=gemv rowWidth=64 length=128 forwardCalls=1 seed_ms=0.148 cache_append_ms=0.012 attention_ms=761.370 attention_weight_ms=336.015 attention_projection_ms=196.641 attention_output_ms=139.375 attention_kernel_ms=370.652 kv_write_ms=0.806 feed_forward_ms=1310.854 feed_forward_weight_ms=1123.097 feed_forward_gate_up_ms=610.710 feed_forward_down_ms=512.387 sparse_chain_ms=0.000 logits_head_ms=14.309 total_ms=2086.742 top_layers=11:72.743,14:72.558,17:72.103
+  prefill-profile stage window=window kernel=gemv rowWidth=64 length=256 forwardCalls=1 seed_ms=0.198 cache_append_ms=0.028 attention_ms=1560.459 attention_weight_ms=530.373 attention_projection_ms=325.108 attention_output_ms=205.265 attention_kernel_ms=937.822 kv_write_ms=1.168 feed_forward_ms=2026.431 feed_forward_weight_ms=1764.079 feed_forward_gate_up_ms=940.985 feed_forward_down_ms=823.095 sparse_chain_ms=0.000 logits_head_ms=10.344 total_ms=3597.557 top_layers=2:117.293,4:116.770,3:116.297
+  peakWorkingSetMb=1965.6

@@ -1,0 +1,17 @@
+prefill-profile file=C:\Users\Chuck\AppData\Local\Temp\kilo\optimize-small-cpu\models\qwen2.5-3b-instruct-q4_k_m.gguf bytes=2104932768 threads=32 maxBatchSequences=16
+  arch=qwen2 layers=36 hidden=2048 heads=16 kvHeads=2 headDim=128 vocab=151936 windowedLayers=0 avx2=True
+  traversalBytes=1668685824 outputHeadBytes=255252480 kvBlocks=24 blockTokens=16 reps=1 perToken=off lengths=128,256 rowWidths=64 kernels=tiled stageProfile=on
+
+prefill-profile kernel=tiled
+
+prefill-profile rowWidth=64 subBatchActivationBytes=8388608
+  weightFit=681.82 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=2.45
+  attentionFit=95.179 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 239
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             2        2149.4         59.55        1363.6         785.8          -0.0          2.45
+         256             4        5858.3         43.70        2727.3        3131.0           0.0          2.45
+  prefill-profile stage window=window kernel=tiled rowWidth=64 length=128 forwardCalls=1 seed_ms=0.094 cache_append_ms=0.009 attention_ms=877.903 attention_weight_ms=257.558 attention_projection_ms=157.872 attention_output_ms=99.686 attention_kernel_ms=567.449 kv_write_ms=0.733 feed_forward_ms=1260.950 feed_forward_weight_ms=1102.013 feed_forward_gate_up_ms=656.884 feed_forward_down_ms=445.129 sparse_chain_ms=0.000 logits_head_ms=10.422 total_ms=2149.435 top_layers=28:75.310,29:74.421,32:72.517
+  prefill-profile stage window=window kernel=tiled rowWidth=64 length=256 forwardCalls=1 seed_ms=0.284 cache_append_ms=0.018 attention_ms=3059.537 attention_weight_ms=573.986 attention_projection_ms=351.584 attention_output_ms=222.403 attention_kernel_ms=2373.444 kv_write_ms=1.603 feed_forward_ms=2788.369 feed_forward_weight_ms=2428.619 feed_forward_gate_up_ms=1442.653 feed_forward_down_ms=985.966 sparse_chain_ms=0.000 logits_head_ms=9.976 total_ms=5858.286 top_layers=7:191.577,9:185.457,6:185.265
+  peakWorkingSetMb=1965.1

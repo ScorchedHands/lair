@@ -13,13 +13,14 @@ namespace Lair.Tests;
 /// Dense stage/layer profiling coverage on the generic dense forward paths, over synthetic llama-shaped GGUF fixtures only — no CUDA posture and
 /// no downloaded model. A default open reports every stage exactly zero and a reset after a measured window zeroes them again, so the seam never
 /// invents facts a host did not ask for. With the seam enabled, each prefill kernel this build executes, the single-token decode step, and the merged
-/// batched step report positive times on the stages that do real work (seed/embedding, attention blocks with their Q/K/V + output-projection traversals
-/// split out from their causal read spans, feed-forward blocks with their gate/up/down traversals split out, the output head, per-layer whole-block spans),
-/// parent stages keep their substages inside them rather than beside them, and every profiled forward lands raw-byte identical to its unprofiled twin —
-/// same logit bits, same KV bytes at every position of every layer. The two cache-interaction stages (slot reservations and K/V slot writes) are proven
-/// reported and never exceeding the window total: their individual spans are short enough that a tiny synthetic fixture can round one below a single clock
-/// tick, so they assert presence rather than strict positivity. Encoder forwards carry no dense stage profile by design — this seam measures prefill and
-/// decode windows only.
+/// batched step report positive times on the stages that do real work (seed/embedding, attention blocks with their Q/K/V projection traversals and
+/// their output-projection traversal split out from each other and from their causal read spans, feed-forward blocks with their gate/up pair and down
+/// traversals split out, the output head, per-layer whole-block spans), each traversal parent is exactly the sum of its traversal substages, parent
+/// stages keep their substages inside them rather than beside them, a dense fixture reports its sparse-chain substage as exactly zero, and every
+/// profiled forward lands raw-byte identical to its unprofiled twin — same logit bits, same KV bytes at every position of every layer. The two
+/// cache-interaction stages (slot reservations and K/V slot writes) are proven reported and never exceeding the window total: their individual spans
+/// are short enough that a tiny synthetic fixture can round one below a single clock tick, so they assert presence rather than strict positivity.
+/// Encoder forwards carry no dense stage profile by design — this seam measures prefill and decode windows only.
 /// </summary>
 [Trait("Category", "Engine")]
 [Trait("Category", "Prefill")]
@@ -34,6 +35,10 @@ public sealed class DenseForwardProfileTests : IDisposable
         FeedForwardLength: 128);
 
     private const int MaxContext = 192;
+
+    // A traversal parent is the exact sum of its traversal substages in raw ticks; the millisecond conversion of each tally rounds independently,
+    // so the parent-sum assertions allow this much conversion rounding and nothing more.
+    private const double SubstageSumToleranceMs = 1e-6;
 
     // A window length past one default sub-batch (16 rows), so several row windows run and the stage totals aggregate across them.
     private static readonly int[] WindowLengths = [40];
@@ -175,20 +180,36 @@ public sealed class DenseForwardProfileTests : IDisposable
         Assert.True(summary.SeedMs > 0.0, $"{context}: embedding lookups must carry a positive stage time");
         Assert.True(summary.AttentionMs > 0.0, $"{context}: attention blocks must carry a positive stage time");
         Assert.True(summary.AttentionWeightMs > 0.0, $"{context}: the Q/K/V and output-projection traversals must carry their own positive substage time");
+        Assert.True(summary.AttentionProjectionMs > 0.0, $"{context}: the batched Q/K/V projection traversals must carry their own positive substage time");
+        Assert.True(summary.AttentionOutputMs > 0.0, $"{context}: the output-projection traversal must carry its own positive substage time");
         Assert.True(summary.AttentionKernelMs > 0.0, $"{context}: the causal read spans must carry their own positive substage time");
         Assert.True(summary.FeedForwardMs > 0.0, $"{context}: feed-forward blocks must carry a positive stage time");
         Assert.True(summary.FeedForwardWeightMs > 0.0, $"{context}: the gate/up/down traversals must carry their own positive substage time");
+        Assert.True(summary.FeedForwardGateUpMs > 0.0, $"{context}: the gate/up traversal pair must carry its own positive substage time");
+        Assert.True(summary.FeedForwardDownMs > 0.0, $"{context}: the down traversal must carry its own positive substage time");
         Assert.True(summary.LogitsHeadMs > 0.0, $"{context}: the window's output head must carry a positive stage time");
 
         // The two cache-interaction stages are reported and never exceed the window: each individual reservation or slot write is short enough that one
         // can round below a single clock tick on a synthetic fixture of this size, so their presence rather than strict positivity is what gates here.
         Assert.True(summary.CacheAppendMs >= 0.0 && summary.KvWriteMs >= 0.0, $"{context}: the cache-interaction stages must be reported");
 
+        // A dense fixture runs no sparse chain: the named sparse-chain substage is reported as exactly zero rather than absorbing some other span.
+        Assert.Equal(0.0, summary.SparseChainMs);
+
         // Substages partition parents instead of adding beside them: attention's traversal, causal-read and K/V-write times sit inside the attention
         // stage, feed-forward traversal sits inside its parent, and every parent plus seed/cache interaction stays inside the whole forward.
         Assert.True(summary.AttentionMs >= summary.AttentionWeightMs, $"{context}: attention_weight_ms must stay inside attention_ms");
         Assert.True(summary.AttentionMs >= summary.AttentionKernelMs, $"{context}: attention_kernel_ms must stay inside attention_ms");
         Assert.True(summary.FeedForwardMs >= summary.FeedForwardWeightMs, $"{context}: feed_forward_weight_ms must stay inside feed_forward_ms");
+
+        // Each traversal parent is exactly the sum of its traversal substages: the projection/output pair partitions the attention weight tally and
+        // the gate-up/down pair partitions the feed-forward weight tally, within the rounding of two independent millisecond conversions of tick tallies.
+        Assert.True(summary.AttentionWeightMs >= summary.AttentionProjectionMs, $"{context}: attention_projection_ms must stay inside attention_weight_ms");
+        Assert.True(summary.AttentionWeightMs >= summary.AttentionOutputMs, $"{context}: attention_output_ms must stay inside attention_weight_ms");
+        Assert.True(summary.AttentionWeightMs + SubstageSumToleranceMs >= summary.AttentionProjectionMs + summary.AttentionOutputMs, $"{context}: attention_projection_ms + attention_output_ms must account for attention_weight_ms");
+        Assert.True(summary.FeedForwardWeightMs >= summary.FeedForwardGateUpMs, $"{context}: feed_forward_gate_up_ms must stay inside feed_forward_weight_ms");
+        Assert.True(summary.FeedForwardWeightMs >= summary.FeedForwardDownMs, $"{context}: feed_forward_down_ms must stay inside feed_forward_weight_ms");
+        Assert.True(summary.FeedForwardWeightMs + SubstageSumToleranceMs >= summary.FeedForwardGateUpMs + summary.FeedForwardDownMs, $"{context}: feed_forward_gate_up_ms + feed_forward_down_ms must account for feed_forward_weight_ms");
 
         double parents = summary.SeedMs + summary.CacheAppendMs + summary.AttentionMs + summary.FeedForwardMs + summary.LogitsHeadMs;
         Assert.True(parents <= summary.TotalMs, $"{context}: the parent stages plus seed and cache interaction must stay inside total_ms");
@@ -256,9 +277,17 @@ public sealed class DenseForwardProfileTests : IDisposable
         Assert.True(summary.TotalMs > 0.0, "the measured decode steps must carry a positive whole-forward total");
         Assert.True(summary.SeedMs > 0.0, "each step's embedding lookup must land in the seed stage");
         Assert.True(summary.AttentionWeightMs > 0.0, "each step's attention-side traversals must carry their own substage time");
+        Assert.True(summary.AttentionProjectionMs > 0.0, "each step's Q/K/V traversals must carry their own substage time");
+        Assert.True(summary.AttentionOutputMs > 0.0, "each step's output-projection traversal must carry its own substage time");
         Assert.True(summary.AttentionKernelMs > 0.0, "each step's causal read over its grown history must carry its own substage time");
         Assert.True(summary.FeedForwardWeightMs > 0.0, "each step's gate/up/down traversals must carry their own substage time");
+        Assert.True(summary.FeedForwardGateUpMs > 0.0, "each step's gate/up traversal pair must carry its own substage time");
+        Assert.True(summary.FeedForwardDownMs > 0.0, "each step's down traversal must carry its own substage time");
         Assert.True(summary.LogitsHeadMs > 0.0, "each step's output head must carry a positive stage time");
+        Assert.Equal(0.0, summary.SparseChainMs);
+
+        Assert.True(summary.AttentionWeightMs + SubstageSumToleranceMs >= summary.AttentionProjectionMs + summary.AttentionOutputMs, "the projection/output pair must account for attention_weight_ms");
+        Assert.True(summary.FeedForwardWeightMs + SubstageSumToleranceMs >= summary.FeedForwardGateUpMs + summary.FeedForwardDownMs, "the gate-up/down pair must account for feed_forward_weight_ms");
 
         double parents = summary.SeedMs + summary.CacheAppendMs + summary.AttentionMs + summary.FeedForwardMs + summary.LogitsHeadMs;
         Assert.True(parents <= summary.TotalMs, "the parent stages plus seed and cache interaction must stay inside total_ms");
@@ -303,9 +332,17 @@ public sealed class DenseForwardProfileTests : IDisposable
         Assert.True(summary.TotalMs > 0.0, "a merged batched step must carry a positive whole-forward total");
         Assert.True(summary.SeedMs > 0.0, "every sequence's embedding lookup in the merged step must land in the seed stage");
         Assert.True(summary.AttentionWeightMs > 0.0, "the merged step's attention-side traversals must carry their own substage time");
+        Assert.True(summary.AttentionProjectionMs > 0.0, "the merged step's Q/K/V traversals must carry their own substage time");
+        Assert.True(summary.AttentionOutputMs > 0.0, "the merged step's output-projection traversal must carry its own substage time");
         Assert.True(summary.AttentionKernelMs > 0.0, "each sequence's causal read in the merged step must carry its own substage time");
         Assert.True(summary.FeedForwardWeightMs > 0.0, "the merged step's gate/up/down traversals must carry their own substage time");
+        Assert.True(summary.FeedForwardGateUpMs > 0.0, "the merged step's gate/up traversal pair must carry its own substage time");
+        Assert.True(summary.FeedForwardDownMs > 0.0, "the merged step's down traversal must carry its own substage time");
         Assert.True(summary.LogitsHeadMs > 0.0, "the batched output head over every sequence must carry a positive stage time");
+        Assert.Equal(0.0, summary.SparseChainMs);
+
+        Assert.True(summary.AttentionWeightMs + SubstageSumToleranceMs >= summary.AttentionProjectionMs + summary.AttentionOutputMs, "the projection/output pair must account for attention_weight_ms in the merged step");
+        Assert.True(summary.FeedForwardWeightMs + SubstageSumToleranceMs >= summary.FeedForwardGateUpMs + summary.FeedForwardDownMs, "the gate-up/down pair must account for feed_forward_weight_ms in the merged step");
 
         double parents = summary.SeedMs + summary.CacheAppendMs + summary.AttentionMs + summary.FeedForwardMs + summary.LogitsHeadMs;
         Assert.True(parents <= summary.TotalMs, "the parent stages plus seed and cache interaction must stay inside total_ms for the merged step");
@@ -345,10 +382,15 @@ public sealed class DenseForwardProfileTests : IDisposable
         Assert.Equal(0.0, profile.CacheAppendMs);
         Assert.Equal(0.0, profile.AttentionMs);
         Assert.Equal(0.0, profile.AttentionWeightMs);
+        Assert.Equal(0.0, profile.AttentionProjectionMs);
+        Assert.Equal(0.0, profile.AttentionOutputMs);
         Assert.Equal(0.0, profile.AttentionKernelMs);
         Assert.Equal(0.0, profile.KvWriteMs);
         Assert.Equal(0.0, profile.FeedForwardMs);
         Assert.Equal(0.0, profile.FeedForwardWeightMs);
+        Assert.Equal(0.0, profile.FeedForwardGateUpMs);
+        Assert.Equal(0.0, profile.FeedForwardDownMs);
+        Assert.Equal(0.0, profile.SparseChainMs);
         Assert.Equal(0.0, profile.LogitsHeadMs);
         Assert.Equal(0.0, profile.TotalMs);
     }
