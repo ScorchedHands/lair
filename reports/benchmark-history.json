@@ -1,0 +1,217 @@
+{
+  "schemaVersion": 1,
+  "title": "LAIR CPU benchmark history - Qwen2.5-3B Q4_K_M prefill/decode vs llama.cpp",
+  "generatedUtc": "2026-11-26T00:25:00Z",
+  "purpose": "Curated machine-readable history consumed by scripts/generate-benchmark-overview.ps1 to render reports/index.html. Values are copied from committed report summaries/data files; heterogeneous legacy directories that predate this schema are represented here so the overview can plot them consistently.",
+  "namingConvention": {
+    "current": "reports/YYYY-MM-DDTHH-mm-ssZ-optimize-<process>/",
+    "note": "Left-most UTC timestamp is the sort key for new report directories. Legacy directories (date-suffixed or name-prefixed) keep their original names and are still linked from the overview."
+  },
+  "modelFamily": {
+    "file": "qwen2.5-3b-instruct-q4_k_m.gguf",
+    "bytes": 2104932768,
+    "arch": "qwen2",
+    "layers": 36,
+    "hidden": 2048,
+    "heads": 16,
+    "kvHeads": 2,
+    "headDim": 128,
+    "vocab": 151936,
+    "quant": "Q4_K_M (contains Q6_K ffn_down matrices)"
+  },
+  "hostLane": {
+    "os": "Windows 11 Pro",
+    "cpuClass": "13th Gen Intel Core i9-13900K-class, 24 physical / 32 logical processors",
+    "standardPosture": "threads=32 rowWidth=64 kernels gemv/tiled lengths 128/256 --reps 3 unprofiled (stage-profile medians marked separately)",
+    "llamaCppBuild": "b12359 (b1b770d90), ggml-cpu-alderlake",
+    "noiseNote": "Host noise between processes runs +/-10-35% on this box; only same-session alternating A/B medians are treated as measurement, cross-session points are directional reference."
+  },
+  "charts": {
+    "prefillThroughputLine": {
+      "canvasId": "prefillHistory",
+      "title": "LAIR prefill-profile throughput history (batchedTok/s medians) with llama.cpp prompt-processing reference bands",
+      "yAxisTitle": "batchedTok/s (median)",
+      "lairDatasets": ["gemv128", "gemv256", "tiled128", "tiled256"],
+      "milestones": [
+        {
+          "id": "thread-sweep-best-config",
+          "dateUtc": "2026-11-24T21:45:49Z",
+          "label": "2026-11-24 thread sweep best config (t32 w64)",
+          "sourceReport": "reports/2026-11-24T21-45-49Z-optimize-small-model-cpu-thread-sweep",
+          "posture": "prefill-profile --threads 32 --lengths 128,256 --widths 64 --kernel gemv,tiled --reps 3 (stable confirmation run)",
+          "profiled": false,
+          "lair_medians_tokPerSec": { "gemv128": 25.31, "gemv256": 22.76, "tiled128": 25.18, "tiled256": 22.55 },
+          "llama_same_session_pp128_tokPerSec": { "value": 279.94, "pm": 2.69 }
+        },
+        {
+          "id": "dense-cpu-traversal",
+          "dateUtc": "2026-11-25T01:23:00Z",
+          "label": "2026-11-25 dense CPU traversal",
+          "sourceReport": "reports/2026-11-25T01-23-00Z-optimize-dense-cpu-traversal",
+          "posture": "standard posture, unprofiled --reps 3 (lair-prefill-unprofiled.txt)",
+          "profiled": false,
+          "lair_medians_tokPerSec": { "gemv128": 66.00, "gemv256": 47.15, "tiled128": 48.30, "tiled256": 41.96 },
+          "llama_same_session_pp128_tokPerSec": { "value": 265.35, "pm": 6.62 },
+          "llama_same_session_pp256_tokPerSec": { "value": 164.06, "pm": 112.40 }
+        },
+        {
+          "id": "substage-profiling",
+          "dateUtc": "2026-11-25T09:50:12Z",
+          "label": "2026-11-25 substage profiling (profiled)",
+          "sourceReport": "reports/2026-11-25T09-50-12Z-optimize-prefill-substage-profiling",
+          "posture": "--reps 1 --stage-profile; report notes the stage-profile seam does not measurably distort throughput",
+          "profiled": true,
+          "lair_medians_tokPerSec": { "gemv128": 57.56, "gemv256": 40.81, "tiled128": 48.25, "tiled256": 48.44 },
+          "llama_same_session_pp128_tokPerSec": null
+        },
+        {
+          "id": "attention-kernel-vectorized",
+          "dateUtc": "2026-11-25T11:26:38Z",
+          "label": "2026-11-25 attention kernel vectorization (new arm)",
+          "sourceReport": "reports/2026-11-25T11-26-38Z-optimize-prefill-attention-kernel",
+          "posture": "same-session alternating A/B --reps 3; pre-item baseline arm also recorded",
+          "profiled": false,
+          "lair_medians_tokPerSec": { "gemv128": 63.66, "gemv256": 56.66, "tiled128": 58.48, "tiled256": 52.83 },
+          "baseline_arm_medians_tokPerSec": { "gemv128": 64.82, "gemv256": 44.92, "tiled128": 54.67, "tiled256": 44.00 }
+        },
+        {
+          "id": "gate-up-pair",
+          "dateUtc": "2026-11-25T13:45:35Z",
+          "label": "2026-11-25 gate/up fused pair (new arm)",
+          "sourceReport": "reports/2026-11-25T13-45-35Z-optimize-prefill-gate-up-pair",
+          "posture": "same-session alternating A/B --reps 3; pre-item baseline arm also recorded",
+          "profiled": false,
+          "lair_medians_tokPerSec": { "gemv128": 87.50, "gemv256": 77.30, "tiled128": 83.70, "tiled256": 68.70 },
+          "baseline_arm_medians_tokPerSec": { "gemv128": 77.80, "gemv256": 65.00, "tiled128": 63.20, "tiled256": 73.70 }
+        },
+        {
+          "id": "qkv-triple-fusion",
+          "dateUtc": "2026-11-25T16:06:41Z",
+          "label": "2026-11-25 Q/K/V triple fusion (new arm, committed baseline for Q6_K item)",
+          "sourceReport": "reports/2026-11-25T16-06-41Z-optimize-prefill-qkv-triple-fusion",
+          "posture": "same-session alternating A/B --reps 3; pre-item baseline arm also recorded",
+          "profiled": false,
+          "lair_medians_tokPerSec": { "gemv128": 84.91, "gemv256": 53.55, "tiled128": 65.86, "tiled256": 70.79 },
+          "baseline_arm_medians_tokPerSec": { "gemv128": 68.68, "gemv256": 63.19, "tiled128": 67.75, "tiled256": 60.13 }
+        },
+        {
+          "id": "q6k-hybrid-route",
+          "dateUtc": "2026-11-25T16:11:55Z",
+          "label": "2026-11-25 Q6_K hybrid dense-matrix route (current, pinned on)",
+          "sourceReport": "reports/2026-11-25T16-11-55Z-optimize-prefill-q6k-gemm",
+          "posture": "same-session alternating default/off/on --reps 3; default posture resolves to width 8 here (identical behavior to pinned on)",
+          "profiled": false,
+          "lair_medians_tokPerSec": { "gemv128": 100.86, "gemv256": 87.81, "tiled128": 111.28, "tiled256": 102.32 },
+          "baseline_arm_medians_tokPerSec": { "gemv128": 98.99, "gemv256": 86.59, "tiled128": 103.89, "tiled256": 94.48 },
+          "default_arm_medians_tokPerSec": { "gemv128": 99.03, "gemv256": 81.76, "tiled128": 103.66, "tiled256": 98.07 }
+        },
+        {
+          "id": "causal-attention-shared-k-dots",
+          "dateUtc": "2026-11-25T18:47:49Z",
+          "label": "2026-11-25 causal-attention shared-K batch dots (current, auto chain group 8)",
+          "sourceReport": "reports/2026-11-25T18-47-49Z-optimize-prefill-causal-attention-dot-batching",
+          "posture": "same-session alternating default/off/on --reps 3; default posture resolves to chain group 8 here (identical behavior to pinned on). Window tok/s is weight-traversal-dominated and mixed at this host window (+~3% gemv, -4% tiled); the measured signal for this item is attention_kernel_ms medians with full sample separation: gemv128 121.4->109.7, gemv256 590.0->519.4, tiled128 174.5->137.3, tiled256 608.9->518.0 (stage axis --reps 1).",
+          "profiled": false,
+          "lair_medians_tokPerSec": { "gemv128": 100.01, "gemv256": 82.08, "tiled128": 89.51, "tiled256": 82.35 },
+          "baseline_arm_medians_tokPerSec": { "gemv128": 96.92, "gemv256": 80.02, "tiled128": 93.57, "tiled256": 85.85 },
+          "default_arm_medians_tokPerSec": { "gemv128": 99.93, "gemv256": 82.48, "tiled128": 89.81, "tiled256": 82.76 }
+        }
+      ],
+      "llamaReferenceBands": [
+        {
+          "datasetLabel": "llama.cpp pp128 band (carried)",
+          "value": 265.35,
+          "pm": 6.62,
+          "measuredInReport": "reports/2026-11-25T01-23-00Z-optimize-dense-cpu-traversal (rerun-llama-bench-t32.txt)",
+          "carriedForwardToAllMilestones": true,
+          "note": "-t 32 llama-bench rerun; not re-measured in later sessions on this box."
+        },
+        {
+          "datasetLabel": "llama.cpp pp256 band (carried)",
+          "value": 164.06,
+          "pm": 112.40,
+          "measuredInReport": "reports/2026-11-25T01-23-00Z-optimize-dense-cpu-traversal (rerun-llama-bench-t32.txt)",
+          "carriedForwardToAllMilestones": true,
+          "note": "same rerun; the +/-112.40 spread is real host noise on this box at pp256."
+        }
+      ]
+    },
+    "q6kDownSubstageBar": {
+      "canvasId": "q6kDownBar",
+      "title": "Q6_K feed_forward_down_ms medians - batched-row route off vs hybrid width-8 (lower is better)",
+      "yAxisTitle": "feed_forward_down_ms (median)",
+      "preferredLiveSourceFile": "reports/2026-11-25T16-11-55Z-optimize-prefill-q6k-gemm/data.json",
+      "fallbackDataJsonPath": "stage_profile_feed_forward_down_ms_medians",
+      "labels": ["gemv 128", "gemv 256", "tiled 128", "tiled 256"],
+      "datasets": [
+        { "label": "route_off (ms)", "armKey": "route_off" },
+        { "label": "hybrid width-8 (ms)", "armKey": "default_hybrid" }
+      ],
+      "fallbackValues": {
+        "route_off": [373.11, 734.00, 387.56, 774.57],
+        "default_hybrid": [334.99, 672.68, 344.16, 681.14]
+      },
+      "note": "Same-session alternating stage-profile medians (3 rounds each); every shape shows full sample separation between arms."
+    },
+    "decodeBar": {
+      "canvasId": "decodeBar",
+      "title": "LAIR production decode vs llama.cpp tg32 (same host, threads 32)",
+      "yAxisTitle": "tok/s median (kv-quant baseline windows) / llama-bench tg32",
+      "milestones": [
+        {
+          "id": "dense-cpu-traversal-decode",
+          "label": "pre single-token decode optimization",
+          "sourceReport": "reports/2026-11-25T01-23-00Z-optimize-dense-cpu-traversal",
+          "lair_medians_tokPerSec": [5.299, 5.668],
+          "llama_tg32_tokPerSec": { "value": 13.79, "pm": 1.14 }
+        },
+        {
+          "id": "dense-decode-gemv-traversal",
+          "label": "single-token decode GEMV traversal + shared-input fusion (after)",
+          "sourceReport": "reports/2026-11-25T04-40-00Z-optimize-dense-decode-gemv-traversal",
+          "lair_medians_tokPerSec": [6.608, 6.384, 6.820],
+          "llama_tg32_tokPerSec": { "value": 18.86, "pm": 2.48 }
+        },
+        {
+          "id": "cpu-tuning-decode-gemm",
+          "label": "detection-driven CPU tuning (main validation reps)",
+          "sourceReport": "reports/2026-11-25T06-56-44Z-optimize-cpu-tuning-decode-gemm",
+          "lair_medians_tokPerSec": [5.870, 5.908, 6.163],
+          "llama_tg32_tokPerSec": { "value": 18.86, "pm": 2.48 },
+          "note": "resolved tuning is byte-identical to the staged candidate at this posture; band reflects host load/noise per that report's honesty note."
+        }
+      ]
+    },
+    "stageSharePie": {
+      "canvasId": "stageSharePie",
+      "title": "Current gemv length-256 window stage shares - causal-attention batch-dot auto arm (window total 3154.7 ms)",
+      "slices": [
+        { "label": "attention_ms", "value": 963.4 },
+        { "label": "feed_forward_gate_up_ms", "value": 895.8 },
+        { "label": "feed_forward_down_ms", "value": 983.2 },
+        { "label": "ffn_other + seed/cache/kv/logits ~312.3", "value": 312.3 }
+      ],
+      "backgroundColor": ["#3b6fb6", "#f2a65e", "#2a7f62", "#c9d4dd"],
+      "sourceReport": "reports/2026-11-25T18-47-49Z-optimize-prefill-causal-attention-dot-batching (report.html + summary.md; slices sum to the 3154.7 ms window median by construction)",
+      "note": "The attention stage fell from ~1042/3190 = 32.7% (individual-dot arm) to ~963/3155 = 30.5% (auto shared-K batch dots); inside it the causal score-dot kernel substage fell from 590 -> 519 ms."
+    }
+  },
+  "llamaCppBaselineTable": [
+    { "report": "reports/2026-11-24T21-09-07Z-optimize-small-model-cpu-baseline", "threads": 8, "pp128": "188.02 +/- 7.27", "pp256": "195.40 +/- 5.16", "tg32": "20.31 +/- 1.18", "tg64": "21.32 +/- 0.14" },
+    { "report": "reports/2026-11-24T21-45-49Z-optimize-small-model-cpu-thread-sweep", "threads": 8, "pp128": "185.31 +/- 6.84", "pp256": null, "tg32": "21.08 +/- 0.31", "tg64": null },
+    { "report": "reports/2026-11-24T21-45-49Z-optimize-small-model-cpu-thread-sweep", "threads": 16, "pp128": "252.71 +/- 9.36", "pp256": null, "tg32": "22.72 +/- 0.15", "tg64": null },
+    { "report": "reports/2026-11-24T21-45-49Z-optimize-small-model-cpu-thread-sweep", "threads": 32, "pp128": "279.94 +/- 2.69", "pp256": null, "tg32": "19.27 +/- 0.10", "tg64": null },
+    { "report": "reports/2026-11-25T01-23-00Z-optimize-dense-cpu-traversal (rerun)", "threads": 32, "pp128": "265.35 +/- 6.62", "pp256": "164.06 +/- 112.40", "tg32": "13.79 +/- 1.14", "tg64": "11.22 +/- 4.15" },
+    { "report": "reports/2026-11-25T04-40-00Z-optimize-dense-decode-gemv-traversal", "threads": 32, "pp128": null, "pp256": null, "tg32": "18.86 +/- 2.48", "tg64": "13.06 +/- 3.79" }
+  ],
+  "earlyThreads8LairPrefillTable": [
+    { "report": "reports/2026-11-24T21-09-07Z-optimize-small-model-cpu-baseline", "posture": "threads=8 default widths", "gemv128": 13.64, "gemv256": 13.19, "tiled128": 15.10, "tiled256": 14.56 },
+    { "report": "reports/2026-11-24T21-28-48Z-optimize-dense-prefill-rowwidth", "posture": "threads=8 best widths (gemv w64, tiled w16)", "gemv128": 16.28, "gemv256": 15.73, "tiled128": 19.18, "tiled256": 17.80 }
+  ],
+  "methodologyNotes": [
+    "LAIR throughput points are batchedTok/s medians from committed reports; A/B milestones plot the new arm and record the pre-item baseline arm in tables.",
+    "Cross-host-session comparisons on this box are directional reference only (documented +/-10-35% inter-process noise); same-session alternating medians carry the signal.",
+    "The substage-profiling point is a profiled run; its own report shows throughput lands inside the unprofiled band of the prior milestone.",
+    "llama.cpp bands are carried from the dense-cpu-traversal rerun for all later milestones because later sessions did not re-run llama-bench on this box."
+  ]
+}

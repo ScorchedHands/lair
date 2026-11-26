@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Prefill Q6_K GEMM / hybrid dense-matrix route — 2026-11-25T16-11-55Z</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  body { font-family: "Segoe UI", sans-serif; margin: 2rem auto; max-width: 960px; color: #1c1c1c; }
+  h1 { font-size: 1.35rem; } h2 { font-size: 1.1rem; margin-top: 2.2rem; }
+  .note { color: #444; font-size: 0.9rem; }
+  canvas { max-width: 920px; }
+  table { border-collapse: collapse; font-size: 0.85rem; margin-top: 1rem; }
+  th, td { border: 1px solid #bbb; padding: 4px 8px; text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+</style>
+</head>
+<body>
+<h1>Prefill Q6_K GEMM / hybrid dense-matrix route — <code>2026-11-25T16-11-55Z-optimize-prefill-q6k-gemm</code></h1>
+<p class="note">Qwen2.5-3B Q4_K_M, local CPU lane (threads=32, rowWidth=64), kernels gemv/tiled, lengths 128/256. Arms: <b>route_off</b> = batched-row scratch route for Q6_K; <b>hybrid</b> = blocked-matmul tile route at auto/pinned width 8 (posture-resolved default == pinned on). CPU-only lane: no CUDA benchmarking. Bit-identical outputs across routes (Q6KGemmRouteTests).</p>
+
+<h2>1. Q6_K down-traversal substage — hybrid vs off (<code>feed_forward_down_ms</code>, lower is better)</h2>
+<canvas id="downBar" height="380"></canvas>
+<p class="note">Same-session alternating stage-profile medians (3 rounds each). Every shape shows full sample separation between arms: hybrid max &lt; off min at all four shapes. Gate/up (untouched Q4_K pair route) medians moved &lt;±3% — the win is isolated to the routed substage.</p>
+
+<h2>2. Window throughput — matmul-route off vs default vs on (<code>batchedTok/s</code>)</h2>
+<canvas id="throughputBar" height="380"></canvas>
+<p class="note">Same-session alternating medians (--reps 3). Window throughput at these shapes is dominated by the causal attention kernel and swings ±10–35% between host windows; treat as noise-indeterminate direction support, not proof. The default arm resolves to width 8 here — identical behavior to pinned <code>on</code>; spread between them calibrates run noise.</p>
+
+<h2>3. Throughput history across report generations (batchedTok/s medians)</h2>
+<canvas id="historyLine" height="380"></canvas>
+<p class="note">Committed baseline = <code>reports/optimize-prefill-qkv-triple-fusion-2026-11-25T16-06-41Z</code> new-arm medians (different host session — directional reference only, per prior reports' methodology notes). Current points are this session's alternating medians.</p>
+
+<h2>4. Stage share of a gemv length-256 window — hybrid arm</h2>
+<canvas id="stagePie" height="380"></canvas>
+<p class="note">Cross-round medians, one representative window group (window totals 2890 ms; slices sum to 2895 due to per-column median rounding). <code>ffn_other</code> = feed_forward minus gate/up+down weight substages. The down slice fell from ~734/2964 ≈ 24.7% (off arm) to ~673/2890 ≈ 23.3% (hybrid); the causal attention kernel remains dominant (~41.7%).</p>
+
+<h2>Medians table</h2>
+<table>
+<tr><th>shape</th><th>down off ms</th><th>down hybrid ms</th><th>&Delta;</th><th>window off ms</th><th>window hybrid ms</th><th>&Delta;</th><th>tok/s off</th><th>tok/s default</th><th>tok/s on</th></tr>
+<tr><td>gemv 128</td><td>373.1</td><td>334.9</td><td>-10.2%</td><td>1290.6</td><td>1249.2</td><td>-3.2%</td><td>98.99</td><td>99.03</td><td>100.86</td></tr>
+<tr><td>gemv 256</td><td>734.0</td><td>672.7</td><td>-8.4%</td><td>2963.9</td><td>2890.2</td><td>-2.5%</td><td>86.59</td><td>81.76</td><td>87.81</td></tr>
+<tr><td>tiled 128</td><td>387.6</td><td>344.2</td><td>-11.2%</td><td>1227.7</td><td>1188.7</td><td>-3.2%</td><td>103.89</td><td>103.66</td><td>111.28</td></tr>
+<tr><td>tiled 256</td><td>774.6</td><td>681.1</td><td>-12.1%</td><td>2684.7</td><td>2619.4</td><td>-2.4%</td><td>94.48</td><td>98.07</td><td>102.32</td></tr>
+</table>
+
+<h2>Validation counts</h2>
+<p class="note">build 0 warn/0 err · targeted non-CUDA (Kernel|Backend|DenseWeightFusion|CpuTuning|Profile, &amp;Category!=Cuda) 449/449 · Q6KGemmRoute+GemmKernel+PrefillGemmCapabilityGate 101/101 · host-side CudaPrefillGemmCapabilityGate (no driver opened) 37/37 · broad Category!=Cuda gate 2512/2512, 0 skipped.</p>
+
+<script>
+const shapes = ["gemv 128", "gemv 256", "tiled 128", "tiled 256"];
+new Chart(document.getElementById("downBar"), {
+  type: "bar",
+  data: { labels: shapes, datasets: [
+    { label: "route_off (ms)", data: [373.1, 734.0, 387.6, 774.6], backgroundColor: "#9aa5b1" },
+    { label: "hybrid width-8 (ms)", data: [334.9, 672.7, 344.2, 681.1], backgroundColor: "#2a7f62" }
+  ]},
+  options: { scales: { y: { title: { display: true, text: "feed_forward_down_ms (median)" } } }, plugins: { legend: { position: "bottom" } } }
+});
+new Chart(document.getElementById("throughputBar"), {
+  type: "bar",
+  data: { labels: shapes, datasets: [
+    { label: "off (tok/s)", data: [98.99, 86.59, 103.89, 94.48], backgroundColor: "#9aa5b1" },
+    { label: "default hybrid (tok/s)", data: [99.03, 81.76, 103.66, 98.07], backgroundColor: "#f2a65e" },
+    { label: "on width-8 (tok/s)", data: [100.86, 87.81, 111.28, 102.32], backgroundColor: "#2a7f62" }
+  ]},
+  options: { scales: { y: { title: { display: true, text: "batchedTok/s (median)" } } }, plugins: { legend: { position: "bottom" } } }
+});
+new Chart(document.getElementById("historyLine"), {
+  type: "line",
+  data: { labels: ["qkv-triple-fusion committed new-arm medians", "current route_off medians", "current hybrid/on medians"], datasets: [
+    { label: "gemv 128", data: [84.91, 98.99, 100.86], borderColor: "#3b6fb6", tension: 0.2 },
+    { label: "gemv 256", data: [53.55, 86.59, 87.81], borderColor: "#a34c8f", tension: 0.2 },
+    { label: "tiled 128", data: [65.86, 103.89, 111.28], borderColor: "#2a7f62", tension: 0.2 },
+    { label: "tiled 256", data: [70.79, 94.48, 102.32], borderColor: "#c0603f", tension: 0.2 }
+  ]},
+  options: { scales: { y: { title: { display: true, text: "batchedTok/s (median)" } } }, plugins: { legend: { position: "bottom" } } }
+});
+new Chart(document.getElementById("stagePie"), {
+  type: "pie",
+  data: { labels: ["attention_ms 1206.5", "gate_up 775.1", "ffn_down 672.7 (was 734.0 off)", "ffn_other 230.7", "logits_head + seed/cache/kv ~10.2"], datasets: [{
+    data: [1206.5, 775.1, 672.7, 230.7, 10.2],
+    backgroundColor: ["#3b6fb6", "#f2a65e", "#2a7f62", "#c9d4dd", "#8a8f96"]
+  }]},
+  options: { plugins: { legend: { position: "bottom" } } }
+});
+</script>
+</body>
+</html>

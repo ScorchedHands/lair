@@ -1,0 +1,1572 @@
+{
+  "generated_utc": "2026-11-26T00-27-30Z",
+  "model": "models/qwen2.5-3b-instruct-q4_k_m.gguf",
+  "generation_note": "medians parsed from the -v2-registerchains raw logs (shipped register-resident chain kernel). The un-suffixed ab-stage-profile.txt / ab-throughput.txt in this directory are the superseded scratch-chain-generation runs kept for provenance.",
+  "arms": {
+    "default": "current code with the posture-resolved shared-input dot chain group (auto = 8 on this host, identical to --attention-batch-dots on)",
+    "route_off": "--attention-batch-dots off: every score dot against a shared K position is an individual backend Dot",
+    "route_on": "--attention-batch-dots on: batched shared-K dots pinned at chain group 8"
+  },
+  "rows": [
+    {
+      "axis": "throughput",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "batched_ms",
+      "samples": [
+        "2961.4",
+        "2988.2",
+        "2981.9"
+      ],
+      "median": 2981.9
+    },
+    {
+      "axis": "throughput",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "86.45",
+        "85.67",
+        "85.85"
+      ],
+      "median": 85.85
+    },
+    {
+      "axis": "throughput",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "batched_ms",
+      "samples": [
+        "1323.7",
+        "1320.7",
+        "1311.7"
+      ],
+      "median": 1320.7
+    },
+    {
+      "axis": "throughput",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "96.7",
+        "96.92",
+        "97.58"
+      ],
+      "median": 96.92
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_ms",
+      "samples": [
+        "1085.216",
+        "1034.372",
+        "1042.284"
+      ],
+      "median": 1042.284
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "355.769",
+        "349.069",
+        "360.084"
+      ],
+      "median": 355.769
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "183.575",
+        "180.495",
+        "187.532"
+      ],
+      "median": 183.575
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_output_ms",
+      "samples": [
+        "172.194",
+        "168.573",
+        "172.552"
+      ],
+      "median": 172.194
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "630.11",
+        "590",
+        "584.681"
+      ],
+      "median": 590.0
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "gate_up_ms",
+      "samples": [
+        "897.306",
+        "881.528",
+        "885.79"
+      ],
+      "median": 885.79
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "ffn_down_ms",
+      "samples": [
+        "999.936",
+        "966.543",
+        "971.039"
+      ],
+      "median": 971.039
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "total_ms",
+      "samples": [
+        "3299.659",
+        "3167.976",
+        "3189.97"
+      ],
+      "median": 3189.97
+    },
+    {
+      "axis": "throughput",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "batched_ms",
+      "samples": [
+        "1367.9",
+        "1358.9",
+        "1368.9"
+      ],
+      "median": 1367.9
+    },
+    {
+      "axis": "throughput",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "93.57",
+        "94.2",
+        "93.5"
+      ],
+      "median": 93.57
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_ms",
+      "samples": [
+        "345.709",
+        "363.574",
+        "342.61"
+      ],
+      "median": 345.709
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "162.289",
+        "167.537",
+        "157.383"
+      ],
+      "median": 162.289
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "78.946",
+        "84.98",
+        "75.368"
+      ],
+      "median": 78.946
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_output_ms",
+      "samples": [
+        "83.343",
+        "82.557",
+        "82.014"
+      ],
+      "median": 82.557
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "135.988",
+        "147.535",
+        "137.296"
+      ],
+      "median": 137.296
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "gate_up_ms",
+      "samples": [
+        "387.293",
+        "453.104",
+        "381.631"
+      ],
+      "median": 387.293
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "ffn_down_ms",
+      "samples": [
+        "482.772",
+        "491.571",
+        "483.604"
+      ],
+      "median": 483.604
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "total_ms",
+      "samples": [
+        "1368.391",
+        "1462.535",
+        "1366.92"
+      ],
+      "median": 1368.391
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_ms",
+      "samples": [
+        "960.976",
+        "998.785",
+        "963.446"
+      ],
+      "median": 963.446
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "345.612",
+        "350.952",
+        "349.931"
+      ],
+      "median": 349.931
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "177.053",
+        "181.944",
+        "180.684"
+      ],
+      "median": 180.684
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_output_ms",
+      "samples": [
+        "168.559",
+        "169.008",
+        "169.247"
+      ],
+      "median": 169.008
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "519.432",
+        "550.695",
+        "517.582"
+      ],
+      "median": 519.432
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "gate_up_ms",
+      "samples": [
+        "902.261",
+        "881.72",
+        "895.801"
+      ],
+      "median": 895.801
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "ffn_down_ms",
+      "samples": [
+        "985.162",
+        "983.189",
+        "974.218"
+      ],
+      "median": 983.189
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "total_ms",
+      "samples": [
+        "3154.702",
+        "3171.432",
+        "3127.221"
+      ],
+      "median": 3154.702
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_ms",
+      "samples": [
+        "1035.379",
+        "1010.603",
+        "1100.013"
+      ],
+      "median": 1035.379
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "327.776",
+        "322.741",
+        "355.603"
+      ],
+      "median": 327.776
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "184.838",
+        "181.73",
+        "182.436"
+      ],
+      "median": 182.436
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_output_ms",
+      "samples": [
+        "142.938",
+        "141.012",
+        "173.167"
+      ],
+      "median": 142.938
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "608.92",
+        "591.05",
+        "647.024"
+      ],
+      "median": 608.92
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "gate_up_ms",
+      "samples": [
+        "898.277",
+        "882.078",
+        "885.666"
+      ],
+      "median": 885.666
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "ffn_down_ms",
+      "samples": [
+        "976.836",
+        "972.596",
+        "959.004"
+      ],
+      "median": 972.596
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "total_ms",
+      "samples": [
+        "3215.708",
+        "3162.595",
+        "3242.4"
+      ],
+      "median": 3215.708
+    },
+    {
+      "axis": "throughput",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "batched_ms",
+      "samples": [
+        "1425.2",
+        "1361.3",
+        "1454"
+      ],
+      "median": 1425.2
+    },
+    {
+      "axis": "throughput",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "89.81",
+        "94.03",
+        "88.04"
+      ],
+      "median": 89.81
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_ms",
+      "samples": [
+        "1007.58",
+        "981.384",
+        "965.166"
+      ],
+      "median": 981.384
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "353.705",
+        "350.767",
+        "351.56"
+      ],
+      "median": 351.56
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "183.283",
+        "181.392",
+        "181.665"
+      ],
+      "median": 181.665
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_output_ms",
+      "samples": [
+        "170.422",
+        "169.375",
+        "169.895"
+      ],
+      "median": 169.895
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "555.996",
+        "534.14",
+        "517.87"
+      ],
+      "median": 534.14
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "gate_up_ms",
+      "samples": [
+        "886.233",
+        "890.363",
+        "886.137"
+      ],
+      "median": 886.233
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "ffn_down_ms",
+      "samples": [
+        "979.506",
+        "995.073",
+        "971.128"
+      ],
+      "median": 979.506
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "total_ms",
+      "samples": [
+        "3175.7",
+        "3162.433",
+        "3104.951"
+      ],
+      "median": 3162.433
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_ms",
+      "samples": [
+        "351.341",
+        "343.741",
+        "345.784"
+      ],
+      "median": 345.784
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "158.546",
+        "159.953",
+        "158.61"
+      ],
+      "median": 158.61
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "90.244",
+        "78.321",
+        "76.868"
+      ],
+      "median": 78.321
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_output_ms",
+      "samples": [
+        "68.302",
+        "81.632",
+        "81.743"
+      ],
+      "median": 81.632
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "144.354",
+        "135.903",
+        "139.125"
+      ],
+      "median": 139.125
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "gate_up_ms",
+      "samples": [
+        "440.648",
+        "380.684",
+        "382.408"
+      ],
+      "median": 382.408
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "ffn_down_ms",
+      "samples": [
+        "481.121",
+        "477.891",
+        "502.754"
+      ],
+      "median": 481.121
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "total_ms",
+      "samples": [
+        "1428.966",
+        "1354.328",
+        "1385.004"
+      ],
+      "median": 1385.004
+    },
+    {
+      "axis": "throughput",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "batched_ms",
+      "samples": [
+        "3133",
+        "2935.7",
+        "3093.2"
+      ],
+      "median": 3093.2
+    },
+    {
+      "axis": "throughput",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "81.71",
+        "87.2",
+        "82.76"
+      ],
+      "median": 82.76
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_ms",
+      "samples": [
+        "307.132",
+        "313.711",
+        "302.653"
+      ],
+      "median": 307.132
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "155.399",
+        "161.004",
+        "153.487"
+      ],
+      "median": 155.399
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "79.302",
+        "83.71",
+        "77.719"
+      ],
+      "median": 79.302
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_output_ms",
+      "samples": [
+        "76.097",
+        "77.294",
+        "75.768"
+      ],
+      "median": 76.097
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "109.661",
+        "110.806",
+        "107.348"
+      ],
+      "median": 109.661
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "gate_up_ms",
+      "samples": [
+        "410.529",
+        "420.49",
+        "409.179"
+      ],
+      "median": 410.529
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "ffn_down_ms",
+      "samples": [
+        "470.172",
+        "473.658",
+        "460.545"
+      ],
+      "median": 470.172
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "total_ms",
+      "samples": [
+        "1311.31",
+        "1334.649",
+        "1293.186"
+      ],
+      "median": 1311.31
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_ms",
+      "samples": [
+        "321.226",
+        "319.593",
+        "327.65"
+      ],
+      "median": 321.226
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "158.192",
+        "156.302",
+        "161.473"
+      ],
+      "median": 158.192
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "81.641",
+        "79.337",
+        "83.784"
+      ],
+      "median": 81.641
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_output_ms",
+      "samples": [
+        "76.55",
+        "76.964",
+        "77.689"
+      ],
+      "median": 76.964
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "120.288",
+        "121.423",
+        "124.13"
+      ],
+      "median": 121.423
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "gate_up_ms",
+      "samples": [
+        "412.503",
+        "409.354",
+        "413.457"
+      ],
+      "median": 412.503
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "ffn_down_ms",
+      "samples": [
+        "477.46",
+        "461.112",
+        "464.546"
+      ],
+      "median": 464.546
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "total_ms",
+      "samples": [
+        "1336.447",
+        "1313.86",
+        "1329.06"
+      ],
+      "median": 1329.06
+    },
+    {
+      "axis": "throughput",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "batched_ms",
+      "samples": [
+        "3220",
+        "3168.7",
+        "3199.4"
+      ],
+      "median": 3199.4
+    },
+    {
+      "axis": "throughput",
+      "arm": "off",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "79.5",
+        "80.79",
+        "80.02"
+      ],
+      "median": 80.02
+    },
+    {
+      "axis": "throughput",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "batched_ms",
+      "samples": [
+        "3129.2",
+        "3088.2",
+        "3103.8"
+      ],
+      "median": 3103.8
+    },
+    {
+      "axis": "throughput",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "81.81",
+        "82.9",
+        "82.48"
+      ],
+      "median": 82.48
+    },
+    {
+      "axis": "throughput",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "batched_ms",
+      "samples": [
+        "1279.9",
+        "1329.1",
+        "1275.2"
+      ],
+      "median": 1279.9
+    },
+    {
+      "axis": "throughput",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "100.01",
+        "96.3",
+        "100.38"
+      ],
+      "median": 100.01
+    },
+    {
+      "axis": "throughput",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "batched_ms",
+      "samples": [
+        "1430.1",
+        "1437.3",
+        "1354.7"
+      ],
+      "median": 1430.1
+    },
+    {
+      "axis": "throughput",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "89.51",
+        "89.05",
+        "94.48"
+      ],
+      "median": 89.51
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_ms",
+      "samples": [
+        "309.693",
+        "313.067",
+        "309.756"
+      ],
+      "median": 309.756
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "158.749",
+        "159.389",
+        "154.329"
+      ],
+      "median": 158.749
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "82.428",
+        "79.976",
+        "77.913"
+      ],
+      "median": 79.976
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_output_ms",
+      "samples": [
+        "76.32",
+        "79.413",
+        "76.416"
+      ],
+      "median": 76.416
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "109.206",
+        "111.181",
+        "113.249"
+      ],
+      "median": 111.181
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "gate_up_ms",
+      "samples": [
+        "410.145",
+        "417.238",
+        "412.173"
+      ],
+      "median": 412.173
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "ffn_down_ms",
+      "samples": [
+        "462.627",
+        "488.175",
+        "464.514"
+      ],
+      "median": 464.514
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "total_ms",
+      "samples": [
+        "1305.869",
+        "1343.022",
+        "1312.559"
+      ],
+      "median": 1312.559
+    },
+    {
+      "axis": "throughput",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "batched_ms",
+      "samples": [
+        "1313.5",
+        "1280.9",
+        "1280.2"
+      ],
+      "median": 1280.9
+    },
+    {
+      "axis": "throughput",
+      "arm": "default",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "97.45",
+        "99.93",
+        "99.99"
+      ],
+      "median": 99.93
+    },
+    {
+      "axis": "throughput",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "batched_ms",
+      "samples": [
+        "3118.9",
+        "3124.2",
+        "3025.3"
+      ],
+      "median": 3118.9
+    },
+    {
+      "axis": "throughput",
+      "arm": "on",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "82.08",
+        "81.94",
+        "84.62"
+      ],
+      "median": 82.08
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_ms",
+      "samples": [
+        "389.176",
+        "367.461",
+        "405.314"
+      ],
+      "median": 389.176
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "164.347",
+        "158.753",
+        "173.564"
+      ],
+      "median": 164.347
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "93.349",
+        "90.409",
+        "89.333"
+      ],
+      "median": 90.409
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_output_ms",
+      "samples": [
+        "70.998",
+        "68.344",
+        "84.23"
+      ],
+      "median": 70.998
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "174.507",
+        "159.75",
+        "182.709"
+      ],
+      "median": 174.507
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "gate_up_ms",
+      "samples": [
+        "455.917",
+        "442.42",
+        "439.84"
+      ],
+      "median": 442.42
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "ffn_down_ms",
+      "samples": [
+        "493.746",
+        "486.917",
+        "480.345"
+      ],
+      "median": 486.917
+    },
+    {
+      "axis": "stage",
+      "arm": "off",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "total_ms",
+      "samples": [
+        "1509.61",
+        "1452.657",
+        "1488.902"
+      ],
+      "median": 1488.902
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_ms",
+      "samples": [
+        "996.701",
+        "923.512",
+        "911.697"
+      ],
+      "median": 923.512
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "329.886",
+        "326.552",
+        "325.173"
+      ],
+      "median": 326.552
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "184.839",
+        "157.818",
+        "156.693"
+      ],
+      "median": 157.818
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_output_ms",
+      "samples": [
+        "145.048",
+        "168.735",
+        "168.48"
+      ],
+      "median": 168.48
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "564.257",
+        "503.049",
+        "489.603"
+      ],
+      "median": 503.049
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "gate_up_ms",
+      "samples": [
+        "897.99",
+        "760.105",
+        "767.268"
+      ],
+      "median": 767.268
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "ffn_down_ms",
+      "samples": [
+        "979.102",
+        "965.502",
+        "995.61"
+      ],
+      "median": 979.102
+    },
+    {
+      "axis": "stage",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "total_ms",
+      "samples": [
+        "3201.184",
+        "2939.23",
+        "2968.485"
+      ],
+      "median": 2968.485
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_ms",
+      "samples": [
+        "910.536",
+        "958.745",
+        "949.384"
+      ],
+      "median": 949.384
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "325.057",
+        "345.193",
+        "319.703"
+      ],
+      "median": 325.057
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "157.105",
+        "174.008",
+        "152.669"
+      ],
+      "median": 157.105
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_output_ms",
+      "samples": [
+        "167.952",
+        "171.185",
+        "167.033"
+      ],
+      "median": 167.952
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "488.478",
+        "517.989",
+        "531.372"
+      ],
+      "median": 517.989
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "gate_up_ms",
+      "samples": [
+        "779.063",
+        "901.449",
+        "766.692"
+      ],
+      "median": 779.063
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "ffn_down_ms",
+      "samples": [
+        "968.696",
+        "981.862",
+        "963.218"
+      ],
+      "median": 968.696
+    },
+    {
+      "axis": "stage",
+      "arm": "default",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "total_ms",
+      "samples": [
+        "2965.109",
+        "3142.944",
+        "2989.9"
+      ],
+      "median": 2989.9
+    },
+    {
+      "axis": "throughput",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "batched_ms",
+      "samples": [
+        "3108.8",
+        "3113.5",
+        "2968.4"
+      ],
+      "median": 3108.8
+    },
+    {
+      "axis": "throughput",
+      "arm": "on",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "82.35",
+        "82.22",
+        "86.24"
+      ],
+      "median": 82.35
+    }
+  ]
+}

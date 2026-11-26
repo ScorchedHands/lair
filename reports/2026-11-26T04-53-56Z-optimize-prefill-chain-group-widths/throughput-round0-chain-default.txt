@@ -1,0 +1,20 @@
+prefill-profile file=C:\source\gitlab.scorchedhands.com\personal\LAIR\models\qwen2.5-3b-instruct-q4_k_m.gguf bytes=2104932768 threads=32 maxBatchSequences=16
+  arch=qwen2 layers=36 hidden=2048 heads=16 kvHeads=2 headDim=128 vocab=151936 windowedLayers=0 avx2=True
+  traversalBytes=1668685824 outputHeadBytes=255252480 kvBlocks=24 blockTokens=16 reps=1 perToken=off lengths=128,256 rowWidths=64 kernels=gemv,tiled
+prefill-profile kernel=gemv
+prefill-profile rowWidth=64 subBatchActivationBytes=8388608
+  weightFit=480.75 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=3.47
+  attentionFit=26.948 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 567
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             2        1184.0        108.11         961.5         222.5          -0.0          3.47
+         256             4        2809.5         91.12        1923.0         886.5          -0.0          3.47
+prefill-profile kernel=tiled
+prefill-profile rowWidth=64 subBatchActivationBytes=8388608
+  weightFit=554.03 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=3.01
+  attentionFit=13.796 us per position pair
+  crossover: not reached within 4x the longest measured length (256 tokens)
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             2        1222.0        104.75        1108.1         113.9           0.0          3.01
+         256             4        2670.0         95.88        2216.1         453.8           0.0          3.01
+  peakWorkingSetMb=1977.7 cumulative across this process run: measure per-kernel peaks in separate processes

@@ -1,0 +1,91 @@
+{
+  "report": "optimize-prefill-q6k-gemm",
+  "timestamp_utc_host_clock": "2026-11-25T16:11:55Z",
+  "worktree_branch": "phase/mvp7",
+  "model": {
+    "path": "C:\\source\\gitlab.scorchedhands.com\\personal\\LAIR\\models\\qwen2.5-3b-instruct-q4_k_m.gguf",
+    "bytes": 2104932768,
+    "arch": "qwen2",
+    "layers": 36,
+    "hidden": 2048,
+    "heads": 16,
+    "kvHeads": 2,
+    "headDim": 128,
+    "vocab": 151936,
+    "avx2": true
+  },
+  "lane": {
+    "kind": "local CPU lane (no CUDA benchmarking)",
+    "threads": 32,
+    "rowWidths": [64],
+    "lengths": [128, 256],
+    "kernels": ["gemv", "tiled"]
+  },
+  "arms": {
+    "default_hybrid": "current uncommitted code; posture-resolved MatmulRouteBatchWidth=8 (identical to --matmul-route on)",
+    "route_off": "--matmul-route off: Q6_K batched passes keep their per-row scratch route",
+    "route_on": "--matmul-route on: hybrid dense-matrix route pinned at width 8"
+  },
+  "throughput_batchedTokPerSec_samples": {
+    "gemv_128": { "default_hybrid": [74.15, 99.03, 101.86], "route_off": [72.64, 98.99, 99.30], "route_on": [84.75, 102.29, 100.86] },
+    "gemv_256": { "default_hybrid": [62.48, 81.76, 88.31], "route_off": [85.55, 86.59, 86.30], "route_on": [69.72, 88.91, 87.81] },
+    "tiled_128": { "default_hybrid": [79.20, 103.66, 108.39], "route_off": [73.13, 103.89, 105.71], "route_on": [105.11, 111.28, 112.96] },
+    "tiled_256": { "default_hybrid": [69.30, 96.17, 98.07], "route_off": [92.02, 94.48, 96.35], "route_on": [67.22, 100.59, 102.32] }
+  },
+  "throughput_batchedTokPerSec_medians": {
+    "gemv_128": { "default_hybrid": 99.03, "route_off": 98.99, "route_on": 100.86 },
+    "gemv_256": { "default_hybrid": 81.76, "route_off": 86.59, "route_on": 87.81 },
+    "tiled_128": { "default_hybrid": 103.66, "route_off": 103.89, "route_on": 111.28 },
+    "tiled_256": { "default_hybrid": 98.07, "route_off": 94.48, "route_on": 102.32 }
+  },
+  "stage_profile_feed_forward_down_ms_samples": {
+    "gemv_128": { "default_hybrid": [333.278, 334.993, 349.119], "route_off": [366.641, 378.474, 373.111] },
+    "gemv_256": { "default_hybrid": [671.636, 672.676, 699.977], "route_off": [733.998, 762.937, 723.836] },
+    "tiled_128": { "default_hybrid": [344.161, 340.084, 347.651], "route_off": [387.555, 395.124, 376.283] },
+    "tiled_256": { "default_hybrid": [681.140, 671.044, 693.547], "route_off": [774.573, 790.010, 727.247] }
+  },
+  "stage_profile_feed_forward_down_ms_medians": {
+    "gemv_128": { "default_hybrid": 334.99, "route_off": 373.11, "delta_pct": -10.2 },
+    "gemv_256": { "default_hybrid": 672.68, "route_off": 734.00, "delta_pct": -8.4 },
+    "tiled_128": { "default_hybrid": 344.16, "route_off": 387.56, "delta_pct": -11.2 },
+    "tiled_256": { "default_hybrid": 681.14, "route_off": 774.57, "delta_pct": -12.1 }
+  },
+  "stage_profile_feed_forward_gate_up_ms_medians_sanity": {
+    "gemv_128": { "default_hybrid": 388.16, "route_off": 386.15 },
+    "gemv_256": { "default_hybrid": 775.13, "route_off": 783.45 },
+    "tiled_128": { "default_hybrid": 390.44, "route_off": 389.17 },
+    "tiled_256": { "default_hybrid": 779.18, "route_off": 777.28 }
+  },
+  "stage_profile_feed_forward_ms_medians": {
+    "gemv_128": { "default_hybrid": 838.11, "route_off": 876.10, "delta_pct": -4.3 },
+    "gemv_256": { "default_hybrid": 1678.48, "route_off": 1743.08, "delta_pct": -3.7 },
+    "tiled_128": { "default_hybrid": 852.19, "route_off": 882.05, "delta_pct": -3.4 },
+    "tiled_256": { "default_hybrid": 1692.29, "route_off": 1734.71, "delta_pct": -2.4 }
+  },
+  "stage_profile_window_total_ms_medians": {
+    "gemv_128": { "default_hybrid": 1249.16, "route_off": 1290.56, "delta_pct": -3.2 },
+    "gemv_256": { "default_hybrid": 2890.22, "route_off": 2963.93, "delta_pct": -2.5 },
+    "tiled_128": { "default_hybrid": 1188.71, "route_off": 1227.72, "delta_pct": -3.2 },
+    "tiled_256": { "default_hybrid": 2619.36, "route_off": 2684.73, "delta_pct": -2.4 }
+  },
+  "baseline_committed_report": {
+    "path": "reports/optimize-prefill-qkv-triple-fusion-2026-11-25T16-06-41Z",
+    "throughput_medians_new_arm_batchedTokPerSec": { "gemv_128": 84.91, "gemv_256": 53.55, "tiled_128": 65.86, "tiled_256": 70.79 },
+    "stage_profile_medians_length256_ms": {
+      "gemv_new": { "attention_projection": 219.5, "attention_kernel": 1579.2, "gate_up": 1076.8, "down": 1038.3 },
+      "tiled_new": { "attention_projection": 237.0, "attention_kernel": 1166.6, "gate_up": 1123.1, "down": 1120.8 }
+    }
+  },
+  "validation_counts": {
+    "build_release": "succeeded, 0 warnings, 0 errors",
+    "targeted_non_cuda_filter_CategoryKernel_Backend_DenseWeightFusion_CpuTuning_Profile": "449 passed / 0 failed / 0 skipped (exact filter without the guard also matched a CUDA-category suite that fails on this host's contended GPU; the CPU-only-lane equivalent adds &Category!=Cuda)",
+    "targeted_filter_Q6KGemmRouteTests_GemmKernelTests_PrefillGemmCapabilityGateTests": "101 passed / 0 failed / 0 skipped",
+    "host_side_CudaPrefillGemmCapabilityGateTests_no_driver_opened": "37 passed / 0 failed / 0 skipped",
+    "broad_gate_Category_not_Cuda": "2512 passed / 0 failed / 0 skipped (7m50s)"
+  },
+  "bit_identity": {
+    "gemvBatch_hybrid_vs_batched_row_route": "bit-identical at all tested shapes/counts/threadings/scalar posture (Q6KGemmRouteTests)",
+    "gemm_kernel_parity_and_capability_lanes": "green",
+    "full_model_logit_parity_repin": "not re-run this session; carried by existing Parity-category lanes in the broad gate"
+  }
+}

@@ -1,0 +1,87 @@
+{
+  "generated_utc": "2026-11-26T08:54:38Z",
+  "lane": "Xeon CPU-only lair-lab (root@192.168.33.53), threads=8, rowWidth=64",
+  "model_file": "/root/lair-measurements/qwen25-small-cpu/models/qwen2.5-3b-instruct-q4_k_m.gguf",
+  "model_bytes": 2104932768,
+  "lair_binary": "/root/lair-measurements/qwen25-small-cpu/app/Lair.Bench.dll",
+  "dotnet_runtime": "/usr/local/dotnet/dotnet",
+  "llama_binary": "/tmp/lair-tools/llama.cpp/b12032/llama-b12032/llama-bench",
+  "method": "Alternating same-session rounds: each round runs one LAIR prefill-profile reps=1 command followed by one llama.cpp pp128/pp256 reps=1 run. Medians/min/max parsed from raw logs in this directory.",
+  "host_noise_note": "Host noise for cross-process CPU benchmarks is high; ratios are medians only and should be read with the prior +/-10-35% caveat when same-host samples overlap.",
+  "rounds": 3,
+  "model_facts": {},
+  "rows": [
+    {
+      "key": "lair|gemv|128",
+      "arm": "LAIR gemv 128",
+      "samples": [
+        "12.820",
+        "11.870",
+        "13.380"
+      ],
+      "median": 12.82,
+      "min": 11.87,
+      "max": 13.38
+    },
+    {
+      "key": "lair|tiled|128",
+      "arm": "LAIR tiled 128",
+      "samples": [
+        "12.440",
+        "11.330",
+        "12.750"
+      ],
+      "median": 12.44,
+      "min": 11.33,
+      "max": 12.75
+    },
+    {
+      "key": "llama|pp128",
+      "arm": "llama.cpp b12032 pp128",
+      "samples": [
+        "73.800",
+        "70.220",
+        "70.890"
+      ],
+      "median": 70.89,
+      "min": 70.22,
+      "max": 73.8
+    },
+    {
+      "key": "lair|gemv|256",
+      "arm": "LAIR gemv 256",
+      "samples": [
+        "10.320",
+        "10.560",
+        "11.560"
+      ],
+      "median": 10.56,
+      "min": 10.32,
+      "max": 11.56
+    },
+    {
+      "key": "lair|tiled|256",
+      "arm": "LAIR tiled 256",
+      "samples": [
+        "12.000",
+        "10.560",
+        "12.230"
+      ],
+      "median": 12.0,
+      "min": 10.56,
+      "max": 12.23
+    },
+    {
+      "key": "llama|pp256",
+      "arm": "llama.cpp b12032 pp256",
+      "samples": [
+        "74.010",
+        "72.730",
+        "72.370"
+      ],
+      "median": 72.73,
+      "min": 72.37,
+      "max": 74.01
+    }
+  ]
+}

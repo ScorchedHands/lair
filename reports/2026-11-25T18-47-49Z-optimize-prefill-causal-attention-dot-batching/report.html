@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Prefill causal-attention shared-K batch dots — 2026-11-25T18-47-49Z</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  body { font-family: "Segoe UI", sans-serif; margin: 2rem auto; max-width: 960px; color: #1c1c1c; }
+  h1 { font-size: 1.35rem; } h2 { font-size: 1.1rem; margin-top: 2.2rem; }
+  .note { color: #444; font-size: 0.9rem; }
+  canvas { max-width: 920px; }
+  table { border-collapse: collapse; font-size: 0.85rem; margin-top: 1rem; }
+  th, td { border: 1px solid #bbb; padding: 4px 8px; text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+</style>
+</head>
+<body>
+<h1>Prefill causal-attention shared-K batch dots — <code>2026-11-25T18-47-49Z-optimize-prefill-causal-attention-dot-batching</code></h1>
+<p class="note">Qwen2.5-3B Q4_K_M, local CPU lane (auto thread posture resolving to threads=32, rowWidth=64), kernels gemv/tiled, lengths 128/256. Arms: <b>route_off</b> = every shared-K score dot is an individual backend Dot; <b>batched auto/pinned-on</b> = grouped head-group walk with register-resident chain batch dots at chain group 8 (posture-resolved default == pinned on). CPU-only lane: no CUDA benchmarking. Bit-identical outputs across routes (<code>AttentionSharedDotTests</code>). A superseded scratch-chain generation of the same seam regressed every shape and is documented in <code>commands.md</code>.</p>
+
+<h2>1. Causal score-dot substage — batched vs individual (<code>attention_kernel_ms</code>, lower is better)</h2>
+<canvas id="kernelBar" height="380"></canvas>
+<p class="note">Same-session alternating stage-profile medians (3 rounds each). Full sample separation between arms at all four shapes: gemv128 off min 120.3 &gt; batched maxes; gemv256 on max 556.0 &lt; off min 584.7; tiled128 off min 159.8 &gt; both arms' maxes; tiled256 on max 564.3 &lt; off min 591.1.</p>
+
+<h2>2. Window totals — stage-profile medians (<code>total_ms</code>)</h2>
+<canvas id="windowBar" height="380"></canvas>
+<p class="note">Same-session alternating medians. Tiled windows separate (length 256 fully: auto max 3133 &lt; off min 3162); gemv windows move ~1% with overlapping samples — weight traversal dominates those totals.</p>
+
+<h2>3. Window throughput — route off vs default vs on (<code>batchedTok/s</code>)</h2>
+<canvas id="throughputBar" height="380"></canvas>
+<p class="note">Same-session alternating medians (--reps 3). gemv favors batching (+~3%), tiled samples straddle (-4% at both lengths); window throughput is weight-traversal-dominated and swings ±10–35% between host windows — noise-indeterminate direction support, not proof.</p>
+
+<h2>4. attention_kernel_ms across report generations (medians; cross-session points are directional only)</h2>
+<canvas id="historyLine" height="380"></canvas>
+<p class="note">First series = committed <code>reports/2026-11-25T16-11-55Z-optimize-prefill-q6k-gemm</code> stage-log medians (different host session — directional reference only per prior reports' methodology notes). Current points are this session's alternating medians.</p>
+
+<h2>5. Stage share of a gemv length-256 window — batched auto arm</h2>
+<canvas id="stagePie" height="380"></canvas>
+<p class="note">Cross-round medians, one representative window group (window total 3154.7 ms). <code>other_ffn+seed/cache/kv/logits ≈ 312.3</code>. The attention stage fell from ~1042/3190 ≈ 32.7% (off arm) to ~963/3155 ≈ 30.5% (auto); the kernel slice inside it fell from 590 → 519 ms.</p>
+
+<h2>Medians table</h2>
+<table>
+<tr><th>shape</th><th>kernel off ms</th><th>kernel auto ms</th><th>&Delta;</th><th>kernel on ms</th><th>&Delta;</th><th>window off ms</th><th>window auto/on ms</th><th>&Delta;</th><th>tok/s off</th><th>tok/s default</th><th>tok/s on</th></tr>
+<tr><td>gemv 128</td><td>121.4</td><td>109.7</td><td>-9.7%</td><td>111.2</td><td>-8.4%</td><td>1329.1</td><td>1311.3 / 1312.6</td><td>-1.3% / -1.2%</td><td>96.92</td><td>99.93</td><td>100.01</td></tr>
+<tr><td>gemv 256</td><td>590.0</td><td>519.4</td><td>-12.0%</td><td>534.1</td><td>-9.5%</td><td>3190.0</td><td>3154.7 / 3162.4</td><td>-1.1% / -0.9%</td><td>80.02</td><td>82.48</td><td>82.08</td></tr>
+<tr><td>tiled 128</td><td>174.5</td><td>137.3</td><td>-21.3%</td><td>139.1</td><td>-20.3%</td><td>1488.9</td><td>1368.4 / 1385.0</td><td>-8.1% / -7.0%</td><td>93.57</td><td>89.81</td><td>89.51</td></tr>
+<tr><td>tiled 256</td><td>608.9</td><td>518.0</td><td>-14.9%</td><td>503.0</td><td>-17.4%</td><td>3215.7</td><td>2989.9 / 2968.5</td><td>-7.0% / -7.7%</td><td>85.85</td><td>82.76</td><td>82.35</td></tr>
+</table>
+
+<h2>Validation counts</h2>
+<p class="note">build 0 warn/0 err · Category=Attention|Kernel|CpuTuning &amp;Category!=Cuda 496/496 · Attention|Kernel|CpuTuning|Engine|Prefill &amp;Category!=Cuda 681/681 · AttentionSharedDot+AttentionAccumulator+GemmKernel+Q6KGemmRoute 114/114 · broad Category!=Cuda gate 2534/2534, 0 skipped.</p>
+
+<script>
+const shapes = ["gemv 128", "gemv 256", "tiled 128", "tiled 256"];
+new Chart(document.getElementById("kernelBar"), {
+  type: "bar",
+  data: { labels: shapes, datasets: [
+    { label: "route_off (ms)", data: [121.4, 590.0, 174.5, 608.9], backgroundColor: "#9aa5b1" },
+    { label: "batched auto chain-group-8 (ms)", data: [109.7, 519.4, 137.3, 518.0], backgroundColor: "#2a7f62" },
+    { label: "batched pinned on width-8 (ms)", data: [111.2, 534.1, 139.1, 503.0], backgroundColor: "#f2a65e" }
+  ]},
+  options: { scales: { y: { title: { display: true, text: "attention_kernel_ms (median)" } } }, plugins: { legend: { position: "bottom" } } }
+});
+new Chart(document.getElementById("windowBar"), {
+  type: "bar",
+  data: { labels: shapes, datasets: [
+    { label: "off window ms", data: [1329.1, 3190.0, 1488.9, 3215.7], backgroundColor: "#9aa5b1" },
+    { label: "auto batched window ms", data: [1311.3, 3154.7, 1368.4, 2989.9], backgroundColor: "#2a7f62" }
+  ]},
+  options: { scales: { y: { title: { display: true, text: "total_ms (median)" } } }, plugins: { legend: { position: "bottom" } } }
+});
+new Chart(document.getElementById("throughputBar"), {
+  type: "bar",
+  data: { labels: shapes, datasets: [
+    { label: "off (tok/s)", data: [96.92, 80.02, 93.57, 85.85], backgroundColor: "#9aa5b1" },
+    { label: "default batched (tok/s)", data: [99.93, 82.48, 89.81, 82.76], backgroundColor: "#f2a65e" },
+    { label: "on width-8 (tok/s)", data: [100.01, 82.08, 89.51, 82.35], backgroundColor: "#2a7f62" }
+  ]},
+  options: { scales: { y: { title: { display: true, text: "batchedTok/s (median)" } } }, plugins: { legend: { position: "bottom" } } }
+});
+new Chart(document.getElementById("historyLine"), {
+  type: "line",
+  data: { labels: ["q6k-gemm session medians (directional)", "current route_off medians", "current batched auto medians"], datasets: [
+    { label: "gemv 128", data: [204.7, 121.4, 109.7], borderColor: "#3b6fb6", tension: 0.2 },
+    { label: "gemv 256", data: [815.5, 590.0, 519.4], borderColor: "#a34c8f", tension: 0.2 },
+    { label: "tiled 128", data: [131.6, 174.5, 137.3], borderColor: "#2a7f62", tension: 0.2 },
+    { label: "tiled 256", data: [513.6, 608.9, 518.0], borderColor: "#c0603f", tension: 0.2 }
+  ]},
+  options: { scales: { y: { title: { display: true, text: "attention_kernel_ms (median)" } } }, plugins: { legend: { position: "bottom" } } }
+});
+new Chart(document.getElementById("stagePie"), {
+  type: "pie",
+  data: { labels: ["attention stage 963.4 (was 1042.5 off)", "gate_up 895.8", "ffn_down 983.2", "other_ffn+seed/cache/kv/logits ~312.3"], datasets: [{
+    data: [963.4, 895.8, 983.2, 312.3],
+    backgroundColor: ["#3b6fb6", "#f2a65e", "#2a7f62", "#c9d4dd"]
+  }]},
+  options: { plugins: { legend: { position: "bottom" } } }
+});
+</script>
+</body>
+</html>

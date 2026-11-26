@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>2026-11-26T08-46-39Z-optimize-prefill-vs-llama-xeon-t8 - LAIR vs llama.cpp prefill</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>body { font-family: 'Segoe UI', sans-serif; margin: 2rem auto; max-width: 1080px; color: #1c1c1c; } h1 { font-size: 1.45rem; } h2 { font-size: 1.1rem; margin-top: 2.2rem; } .note { color: #444; font-size: 0.9rem; max-width: 76ch; } canvas { max-width: 1020px; }</style>
+</head>
+<body>
+<h1>Prefill LAIR vs llama.cpp Xeon comparison</h1>
+<p class='note'>Generated at 2026-11-26T08:54:38Z. Lane: <code>Xeon CPU-only lair-lab (root@192.168.33.53), threads=8, rowWidth=64</code>. Model bytes: <code>2104932768</code>.</p>
+<p class='note'>Bar chart compares median batched tok/s for LAIR optimized prefill against llama.cpp pp medians on the same Xeon host. Host noise is high; ratios are medians only.</p>
+<h2>Median prefill throughput</h2>
+<canvas id="prefillComparisonBar" height="380"></canvas>
+<script>
+new Chart(document.getElementById('prefillComparisonBar'), {"type": "bar", "data": {"labels": ["128", "256"], "datasets": [{"label": "LAIR gemv", "data": [12.82, 10.56], "backgroundColor": "#3b6fb6"}, {"label": "LAIR tiled", "data": [12.44, 12.0], "backgroundColor": "#c0603f"}, {"label": "llama.cpp b12032 pp", "data": [70.89, 72.73], "backgroundColor": "#9aa5b1"}]}, "options": {"scales": {"y": {"title": {"display": true, "text": "tokens / second"}, "beginAtZero": true}}, "plugins": {"legend": {"position": "bottom"}}}});
+</script>
+<p class='note'>See <a href='summary.md'><code>summary.md</code></a> for median tables and ratios. Machine-readable rows are in <a href='data.json'><code>data.json</code></a>.</p>
+</body>
+</html>

@@ -1,0 +1,562 @@
+[
+  {
+    "axis": "throughput",
+    "arm": "default",
+    "kernel": "gemv",
+    "length": 128,
+    "metric": "tok_s",
+    "samples": [
+      "112.36",
+      "112.18"
+    ],
+    "median": 112.27,
+    "min": 112.18,
+    "max": 112.36
+  },
+  {
+    "axis": "throughput",
+    "arm": "on",
+    "kernel": "gemv",
+    "length": 128,
+    "metric": "tok_s",
+    "samples": [
+      "111.85",
+      "111.08"
+    ],
+    "median": 111.465,
+    "min": 111.08,
+    "max": 111.85
+  },
+  {
+    "axis": "throughput",
+    "arm": "off",
+    "kernel": "gemv",
+    "length": 128,
+    "metric": "tok_s",
+    "samples": [
+      "109.28",
+      "104.58"
+    ],
+    "median": 106.93,
+    "min": 104.58,
+    "max": 109.28
+  },
+  {
+    "axis": "throughput",
+    "arm": "g4",
+    "kernel": "gemv",
+    "length": 256,
+    "metric": "tok_s",
+    "samples": [
+      "94.68",
+      "88.63"
+    ],
+    "median": 91.655,
+    "min": 88.63,
+    "max": 94.68
+  },
+  {
+    "axis": "throughput",
+    "arm": "g2",
+    "kernel": "gemv",
+    "length": 128,
+    "metric": "tok_s",
+    "samples": [
+      "111.84",
+      "106.53"
+    ],
+    "median": 109.185,
+    "min": 106.53,
+    "max": 111.84
+  },
+  {
+    "axis": "throughput",
+    "arm": "on",
+    "kernel": "gemv",
+    "length": 256,
+    "metric": "tok_s",
+    "samples": [
+      "95.46",
+      "90.57"
+    ],
+    "median": 93.015,
+    "min": 90.57,
+    "max": 95.46
+  },
+  {
+    "axis": "throughput",
+    "arm": "off",
+    "kernel": "tiled",
+    "length": 128,
+    "metric": "tok_s",
+    "samples": [
+      "106.08",
+      "104.08"
+    ],
+    "median": 105.08,
+    "min": 104.08,
+    "max": 106.08
+  },
+  {
+    "axis": "throughput",
+    "arm": "on",
+    "kernel": "tiled",
+    "length": 128,
+    "metric": "tok_s",
+    "samples": [
+      "105.59",
+      "108.03"
+    ],
+    "median": 106.81,
+    "min": 105.59,
+    "max": 108.03
+  },
+  {
+    "axis": "throughput",
+    "arm": "g2",
+    "kernel": "tiled",
+    "length": 128,
+    "metric": "tok_s",
+    "samples": [
+      "108.5",
+      "99.74"
+    ],
+    "median": 104.12,
+    "min": 99.74,
+    "max": 108.5
+  },
+  {
+    "axis": "throughput",
+    "arm": "off",
+    "kernel": "gemv",
+    "length": 256,
+    "metric": "tok_s",
+    "samples": [
+      "90.37",
+      "93.09"
+    ],
+    "median": 91.73,
+    "min": 90.37,
+    "max": 93.09
+  },
+  {
+    "axis": "throughput",
+    "arm": "off",
+    "kernel": "tiled",
+    "length": 256,
+    "metric": "tok_s",
+    "samples": [
+      "95.65",
+      "94.4"
+    ],
+    "median": 95.025,
+    "min": 94.4,
+    "max": 95.65
+  },
+  {
+    "axis": "throughput",
+    "arm": "on",
+    "kernel": "tiled",
+    "length": 256,
+    "metric": "tok_s",
+    "samples": [
+      "97.58",
+      "98.13"
+    ],
+    "median": 97.855,
+    "min": 97.58,
+    "max": 98.13
+  },
+  {
+    "axis": "throughput",
+    "arm": "g4",
+    "kernel": "tiled",
+    "length": 128,
+    "metric": "tok_s",
+    "samples": [
+      "104.47",
+      "100.12"
+    ],
+    "median": 102.295,
+    "min": 100.12,
+    "max": 104.47
+  },
+  {
+    "axis": "throughput",
+    "arm": "default",
+    "kernel": "tiled",
+    "length": 128,
+    "metric": "tok_s",
+    "samples": [
+      "105.6",
+      "107.02"
+    ],
+    "median": 106.31,
+    "min": 105.6,
+    "max": 107.02
+  },
+  {
+    "axis": "throughput",
+    "arm": "g2",
+    "kernel": "gemv",
+    "length": 256,
+    "metric": "tok_s",
+    "samples": [
+      "91.72",
+      "86.31"
+    ],
+    "median": 89.015,
+    "min": 86.31,
+    "max": 91.72
+  },
+  {
+    "axis": "throughput",
+    "arm": "g4",
+    "kernel": "tiled",
+    "length": 256,
+    "metric": "tok_s",
+    "samples": [
+      "95.63",
+      "89.71"
+    ],
+    "median": 92.67,
+    "min": 89.71,
+    "max": 95.63
+  },
+  {
+    "axis": "throughput",
+    "arm": "g4",
+    "kernel": "gemv",
+    "length": 128,
+    "metric": "tok_s",
+    "samples": [
+      "111.55",
+      "106.53"
+    ],
+    "median": 109.04,
+    "min": 106.53,
+    "max": 111.55
+  },
+  {
+    "axis": "throughput",
+    "arm": "default",
+    "kernel": "gemv",
+    "length": 256,
+    "metric": "tok_s",
+    "samples": [
+      "95.47",
+      "93.3"
+    ],
+    "median": 94.385,
+    "min": 93.3,
+    "max": 95.47
+  },
+  {
+    "axis": "throughput",
+    "arm": "g2",
+    "kernel": "tiled",
+    "length": 256,
+    "metric": "tok_s",
+    "samples": [
+      "95.67",
+      "89.09"
+    ],
+    "median": 92.38,
+    "min": 89.09,
+    "max": 95.67
+  },
+  {
+    "axis": "throughput",
+    "arm": "default",
+    "kernel": "tiled",
+    "length": 256,
+    "metric": "tok_s",
+    "samples": [
+      "92.23",
+      "91.89"
+    ],
+    "median": 92.06,
+    "min": 91.89,
+    "max": 92.23
+  },
+  {
+    "axis": "throughput",
+    "arm": "default",
+    "kernel": "gemv",
+    "length": 128,
+    "metric": "batched_ms",
+    "samples": [
+      "1139.2",
+      "1141"
+    ],
+    "median": 1140.1,
+    "min": 1139.2,
+    "max": 1141.0
+  },
+  {
+    "axis": "throughput",
+    "arm": "on",
+    "kernel": "gemv",
+    "length": 128,
+    "metric": "batched_ms",
+    "samples": [
+      "1144.4",
+      "1152.3"
+    ],
+    "median": 1148.35,
+    "min": 1144.4,
+    "max": 1152.3
+  },
+  {
+    "axis": "throughput",
+    "arm": "off",
+    "kernel": "gemv",
+    "length": 128,
+    "metric": "batched_ms",
+    "samples": [
+      "1171.3",
+      "1224"
+    ],
+    "median": 1197.65,
+    "min": 1171.3,
+    "max": 1224.0
+  },
+  {
+    "axis": "throughput",
+    "arm": "g4",
+    "kernel": "gemv",
+    "length": 256,
+    "metric": "batched_ms",
+    "samples": [
+      "2703.8",
+      "2888.4"
+    ],
+    "median": 2796.1,
+    "min": 2703.8,
+    "max": 2888.4
+  },
+  {
+    "axis": "throughput",
+    "arm": "g2",
+    "kernel": "gemv",
+    "length": 128,
+    "metric": "batched_ms",
+    "samples": [
+      "1144.5",
+      "1201.6"
+    ],
+    "median": 1173.05,
+    "min": 1144.5,
+    "max": 1201.6
+  },
+  {
+    "axis": "throughput",
+    "arm": "on",
+    "kernel": "gemv",
+    "length": 256,
+    "metric": "batched_ms",
+    "samples": [
+      "2681.6",
+      "2826.5"
+    ],
+    "median": 2754.05,
+    "min": 2681.6,
+    "max": 2826.5
+  },
+  {
+    "axis": "throughput",
+    "arm": "off",
+    "kernel": "tiled",
+    "length": 128,
+    "metric": "batched_ms",
+    "samples": [
+      "1206.6",
+      "1229.8"
+    ],
+    "median": 1218.2,
+    "min": 1206.6,
+    "max": 1229.8
+  },
+  {
+    "axis": "throughput",
+    "arm": "on",
+    "kernel": "tiled",
+    "length": 128,
+    "metric": "batched_ms",
+    "samples": [
+      "1212.3",
+      "1184.9"
+    ],
+    "median": 1198.6,
+    "min": 1184.9,
+    "max": 1212.3
+  },
+  {
+    "axis": "throughput",
+    "arm": "g2",
+    "kernel": "tiled",
+    "length": 128,
+    "metric": "batched_ms",
+    "samples": [
+      "1179.8",
+      "1283.3"
+    ],
+    "median": 1231.55,
+    "min": 1179.8,
+    "max": 1283.3
+  },
+  {
+    "axis": "throughput",
+    "arm": "off",
+    "kernel": "gemv",
+    "length": 256,
+    "metric": "batched_ms",
+    "samples": [
+      "2832.8",
+      "2750"
+    ],
+    "median": 2791.4,
+    "min": 2750.0,
+    "max": 2832.8
+  },
+  {
+    "axis": "throughput",
+    "arm": "off",
+    "kernel": "tiled",
+    "length": 256,
+    "metric": "batched_ms",
+    "samples": [
+      "2676.3",
+      "2711.9"
+    ],
+    "median": 2694.1,
+    "min": 2676.3,
+    "max": 2711.9
+  },
+  {
+    "axis": "throughput",
+    "arm": "on",
+    "kernel": "tiled",
+    "length": 256,
+    "metric": "batched_ms",
+    "samples": [
+      "2623.4",
+      "2608.9"
+    ],
+    "median": 2616.15,
+    "min": 2608.9,
+    "max": 2623.4
+  },
+  {
+    "axis": "throughput",
+    "arm": "g4",
+    "kernel": "tiled",
+    "length": 128,
+    "metric": "batched_ms",
+    "samples": [
+      "1225.3",
+      "1278.4"
+    ],
+    "median": 1251.85,
+    "min": 1225.3,
+    "max": 1278.4
+  },
+  {
+    "axis": "throughput",
+    "arm": "default",
+    "kernel": "tiled",
+    "length": 128,
+    "metric": "batched_ms",
+    "samples": [
+      "1212.1",
+      "1196.1"
+    ],
+    "median": 1204.1,
+    "min": 1196.1,
+    "max": 1212.1
+  },
+  {
+    "axis": "throughput",
+    "arm": "g2",
+    "kernel": "gemv",
+    "length": 256,
+    "metric": "batched_ms",
+    "samples": [
+      "2791.1",
+      "2965.9"
+    ],
+    "median": 2878.5,
+    "min": 2791.1,
+    "max": 2965.9
+  },
+  {
+    "axis": "throughput",
+    "arm": "g4",
+    "kernel": "tiled",
+    "length": 256,
+    "metric": "batched_ms",
+    "samples": [
+      "2676.9",
+      "2853.7"
+    ],
+    "median": 2765.3,
+    "min": 2676.9,
+    "max": 2853.7
+  },
+  {
+    "axis": "throughput",
+    "arm": "g4",
+    "kernel": "gemv",
+    "length": 128,
+    "metric": "batched_ms",
+    "samples": [
+      "1147.5",
+      "1201.5"
+    ],
+    "median": 1174.5,
+    "min": 1147.5,
+    "max": 1201.5
+  },
+  {
+    "axis": "throughput",
+    "arm": "default",
+    "kernel": "gemv",
+    "length": 256,
+    "metric": "batched_ms",
+    "samples": [
+      "2681.5",
+      "2743.9"
+    ],
+    "median": 2712.7,
+    "min": 2681.5,
+    "max": 2743.9
+  },
+  {
+    "axis": "throughput",
+    "arm": "g2",
+    "kernel": "tiled",
+    "length": 256,
+    "metric": "batched_ms",
+    "samples": [
+      "2675.8",
+      "2873.5"
+    ],
+    "median": 2774.65,
+    "min": 2675.8,
+    "max": 2873.5
+  },
+  {
+    "axis": "throughput",
+    "arm": "default",
+    "kernel": "tiled",
+    "length": 256,
+    "metric": "batched_ms",
+    "samples": [
+      "2775.5",
+      "2785.8"
+    ],
+    "median": 2780.65,
+    "min": 2775.5,
+    "max": 2785.8
+  }
+]

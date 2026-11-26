@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>reports/2026-11-26T03-12-26Z-optimize-prefill-chain-group-widths - LAIR prefill tuning analysis</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  body { font-family: "Segoe UI", sans-serif; margin: 2rem auto; max-width: 1080px; color: #1c1c1c; }
+  h1 { font-size: 1.45rem; } h2 { font-size: 1.1rem; margin-top: 2.2rem; }
+  .note { color: #444; font-size: 0.9rem; max-width: 76ch; }
+  canvas { max-width: 1020px; }
+</style>
+</head>
+<body>
+<h1>Prefill chain-group and matmul-route tuning analysis</h1>
+<p class='note'>Generated at 2026-11-26T08:10:33Z. Source sweep: <code>reports/2026-11-26T03-12-26Z-optimize-prefill-chain-group-widths</code>. Posture: threads=32, rowWidth=64, lengths 128/256, kernels gemv/tiled.</p>
+<p class='note'>This analysis records that the current auto chain group and matmul-route widths remain justified; it does not change production constants. Bar charts compare completed same-session stage arms.</p>
+<h2>Shared-dot chain-group attention kernel medians (stage-profile ms)</h2>
+<canvas id="chainAttentionKernelBar" height="380"></canvas>
+<h2>Shared-dot chain-group throughput medians (batchedTok/s)</h2>
+<canvas id="chainThroughputBar" height="380"></canvas>
+<h2>Matmul-route gate/up stage medians with shared dots on (ms)</h2>
+<canvas id="matmulGateUpBar" height="380"></canvas>
+<h2>Matmul-route ffn_down stage medians with shared dots on (ms)</h2>
+<canvas id="matmulDownBar" height="380"></canvas>
+<h2>Matmul-route total window stage medians with shared dots on (ms)</h2>
+<canvas id="matmulTotalBar" height="380"></canvas>
+<script>
+new Chart(document.getElementById('chainAttentionKernelBar'), {"type":"bar","data":{"labels":["gemv 128","gemv 256","tiled 128","tiled 256"],"datasets":[{"label":"auto8","data":[107.266,548.031,143.63,528.13],"backgroundColor":"#3b6fb6"},{"label":"individual dots off","data":[120.785,609.935,156.059,606.711],"backgroundColor":"#9aa5b1"},{"label":"pinned 2","data":[125.405,616.437,179.694,605.104],"backgroundColor":"#c0603f"},{"label":"pinned 4","data":[108.348,538.863,138.974,558.327],"backgroundColor":"#a34c8f"},{"label":"pinned 8","data":[106.97,527.828,130.709,505.847],"backgroundColor":"#2a7f62"}]},"options":{"scales":{"y":{"title":{"display":true,"text":"ms"},"beginAtZero":true}},"plugins":{"legend":{"position":"bottom"}}}});
+new Chart(document.getElementById('chainThroughputBar'), {"type":"bar","data":{"labels":["gemv 128","gemv 256","tiled 128","tiled 256"],"datasets":[{"label":"auto8","data":[112.27,94.385,106.31,92.06],"backgroundColor":"#3b6fb6"},{"label":"individual dots off","data":[106.93,91.73,105.08,95.025],"backgroundColor":"#9aa5b1"},{"label":"pinned 2","data":[109.185,89.015,104.12,92.38],"backgroundColor":"#c0603f"},{"label":"pinned 4","data":[109.04,91.655,102.295,92.67],"backgroundColor":"#a34c8f"},{"label":"pinned 8","data":[111.465,93.015,106.81,97.855],"backgroundColor":"#2a7f62"}]},"options":{"scales":{"y":{"title":{"display":true,"text":"tok/s"},"beginAtZero":true}},"plugins":{"legend":{"position":"bottom"}}}});
+new Chart(document.getElementById('matmulGateUpBar'), {"type":"bar","data":{"labels":["gemv 128","gemv 256","tiled 128","tiled 256"],"datasets":[{"label":"route auto8","data":[404.851,820.635,403.431,825.109],"backgroundColor":"#3b6fb6"},{"label":"route off","data":[409.378,826.58,404.764,814.213],"backgroundColor":"#9aa5b1"},{"label":"route pinned 4","data":[396.012,798.249,415.147,834.276],"backgroundColor":"#c0603f"},{"label":"route pinned 8","data":[405.458,822.168,407.919,816.802],"backgroundColor":"#2a7f62"},{"label":"route pinned 16","data":[400.67,814.83,409.594,812.273],"backgroundColor":"#8a5b00"}]},"options":{"scales":{"y":{"title":{"display":true,"text":"ms"},"beginAtZero":true}},"plugins":{"legend":{"position":"bottom"}}}});
+new Chart(document.getElementById('matmulDownBar'), {"type":"bar","data":{"labels":["gemv 128","gemv 256","tiled 128","tiled 256"],"datasets":[{"label":"route auto8","data":[363.788,721.932,354.986,716.432],"backgroundColor":"#3b6fb6"},{"label":"route off","data":[405.502,789.156,395.852,791.25],"backgroundColor":"#9aa5b1"},{"label":"route pinned 4","data":[354.054,711.04,345.669,717.39],"backgroundColor":"#c0603f"},{"label":"route pinned 8","data":[359.98,705.735,356.23,719.031],"backgroundColor":"#2a7f62"},{"label":"route pinned 16","data":[351.013,702.058,349.002,708.92],"backgroundColor":"#8a5b00"}]},"options":{"scales":{"y":{"title":{"display":true,"text":"ms"},"beginAtZero":true}},"plugins":{"legend":{"position":"bottom"}}}});
+new Chart(document.getElementById('matmulTotalBar'), {"type":"bar","data":{"labels":["gemv 128","gemv 256","tiled 128","tiled 256"],"datasets":[{"label":"route auto8","data":[1222.024,2948.168,1288.543,2886.967],"backgroundColor":"#3b6fb6"},{"label":"route off","data":[1254.545,3002.655,1323.594,2947.741],"backgroundColor":"#9aa5b1"},{"label":"route pinned 4","data":[1189.879,2885.491,1295.388,2940.767],"backgroundColor":"#c0603f"},{"label":"route pinned 8","data":[1207.219,2939.9,1315.467,2931.904],"backgroundColor":"#2a7f62"},{"label":"route pinned 16","data":[1200.253,2900.482,1291.309,2875.168],"backgroundColor":"#8a5b00"}]},"options":{"scales":{"y":{"title":{"display":true,"text":"ms"},"beginAtZero":true}},"plugins":{"legend":{"position":"bottom"}}}});
+</script>
+<h2>Text summary</h2><p class='note'>See <a href='summary.md'><code>summary.md</code></a> for median tables and the decision. Machine-readable rows are in <a href='data.json'><code>data.json</code></a>.</p>
+</body>
+</html>
