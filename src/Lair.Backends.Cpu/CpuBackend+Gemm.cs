@@ -24,7 +24,7 @@ public sealed unsafe partial class CpuBackend
 
     /// <inheritdoc/>
     public bool SupportsGemm(QuantFormat format) =>
-        format is QuantFormat.Q8_0 or QuantFormat.Q4_K or QuantFormat.IQ4_XS;
+        format is QuantFormat.Q8_0 or QuantFormat.Q4_K or QuantFormat.IQ4_XS or QuantFormat.Q6_K;
 
     /// <inheritdoc/>
     public void GemmBatch(ReadOnlySpan<float> inputs, int count, WeightRef w, Span<float> outputs)
@@ -74,7 +74,7 @@ public sealed unsafe partial class CpuBackend
         {
             throw new ArgumentException(
                 $"no blocked matmul exists in this build for weights in format {w.Format}: only {QuantFormat.Q8_0}, " +
-                $"{QuantFormat.Q4_K}, and {QuantFormat.IQ4_XS} execute through the dense-matrix weight path.",
+                $"{QuantFormat.Q4_K}, {QuantFormat.IQ4_XS}, and {QuantFormat.Q6_K} execute through the dense-matrix weight path.",
                 nameof(w));
         }
 
@@ -89,21 +89,26 @@ public sealed unsafe partial class CpuBackend
         fixed (float* pIn = inputs)
         fixed (float* pOut = outputs)
         {
-            int workers = _effectiveThreads;
-
-            // One tuning snapshot for the whole call: threshold, block count, and claimed-block width all read the same resolved posture.
-            CpuKernelTuning tuning = _tuning;
-            bool parallel = workers > 1 && rows >= tuning.ParallelRowThreshold;
-
-            if (!parallel)
-            {
-                RunGemmRows(pBytes, pIn, pOut, stride, rows, cols, count, format, _useAvx2, 0, rows);
-                return;
-            }
-
-            WorkerPool pool = GetOrCreatePool();
-            pool.Run((rows + tuning.RowBlock - 1) / tuning.RowBlock, new GemmRowJob(pBytes, pIn, pOut, stride, rows, cols, count, format, _useAvx2, tuning));
+            RunMatmulDispatch(pBytes, stride, pIn, pOut, rows, cols, count, format);
         }
+    }
+
+    // The blocked-matmul dispatch the dense-matrix selection and the batched-row hybrid route share: one tuning snapshot,
+    // the same row-block partition, the same raw-pointer job contract. Callers hold the pinned spans.
+    private void RunMatmulDispatch(byte* pBytes, int stride, float* pIn, float* pOut, int rows, int cols, int count, QuantFormat format)
+    {
+        CpuKernelTuning tuning = _tuning;
+        int workers = _effectiveThreads;
+        bool parallel = workers > 1 && rows >= tuning.ParallelRowThreshold;
+
+        if (!parallel)
+        {
+            RunGemmRows(pBytes, pIn, pOut, stride, rows, cols, count, format, _useAvx2, 0, rows);
+            return;
+        }
+
+        WorkerPool pool = GetOrCreatePool();
+        pool.Run((rows + tuning.RowBlock - 1) / tuning.RowBlock, new GemmRowJob(pBytes, pIn, pOut, stride, rows, cols, count, format, _useAvx2, tuning));
     }
 
     // One run of weight rows: they advance through the column walk together, in tiles of GemmTileRows rows so a tile
@@ -120,6 +125,9 @@ public sealed unsafe partial class CpuBackend
                 case QuantFormat.Q4_K:
                     GemmQ4KAvx2(bytes, stride, firstRow, lastRow, inputs, count, rows, cols, outBase);
                     return;
+                case QuantFormat.Q6_K:
+                    GemmQ6KAvx2(bytes, stride, firstRow, lastRow, inputs, count, rows, cols, outBase);
+                    return;
                 default:
                     GemmIQ4XAvx2(bytes, stride, firstRow, lastRow, inputs, count, rows, cols, outBase);
                     return;
@@ -133,6 +141,9 @@ public sealed unsafe partial class CpuBackend
                 break;
             case QuantFormat.Q4_K:
                 GemmQ4KScalar(bytes, stride, firstRow, lastRow, inputs, count, rows, cols, outBase);
+                break;
+            case QuantFormat.Q6_K:
+                GemmQ6KScalar(bytes, stride, firstRow, lastRow, inputs, count, rows, cols, outBase);
                 break;
             default:
                 GemmIQ4XScalar(bytes, stride, firstRow, lastRow, inputs, count, rows, cols, outBase);
@@ -350,7 +361,15 @@ public sealed unsafe partial class CpuBackend
 
     // Q4_K tile: w = d*sc_j*q - dmin*m_j per group, materialized with the same fused scale-and-shift the reference
     // chunk builds, and with the same scalar arithmetic for the partial final chunk of a group that kernel leaves to
-    // its scalar tail.
+    // its scalar tail. The column block is one 256-element super-block wide, so the tile walk visits the same eight
+    // 32-element groups and the same eight-element chunks the vector kernels walk for a row.
+    //
+    // The dot is batch-major: one activation-vector load per chunk feeds all eight tile rows' accumulator chains, where
+    // each chain stays live in a YMM register across the whole column block instead of round-tripping through stack
+    // scratch once per FMA — the shape the Q6_K tile kernel already runs. Each chain still advances through the same
+    // ascending group and chunk positions with the same FMA association and the same scalar-tail cleanup, so every
+    // output lands bit-identical to a row-major walk of that row's chunks: grouping here only chooses which tile rows
+    // share one activation pass, never a chain's element order or its reduction.
     private static void GemmQ4KAvx2(byte* bytes, int stride, int rowFrom, int rowTo, float* inputs, int count, int rows, int cols, float* outBase)
     {
         Span<float> tile = stackalloc float[GemmTileRows * GemmTileCols];
@@ -419,18 +438,31 @@ public sealed unsafe partial class CpuBackend
                         }
                     }
 
-                    for (int r = 0; r < rn; r++)
+                    if (rn == GemmTileRows)
                     {
-                        float* tileRow = pTile + (long)r * GemmTileCols;
-
+                        // Full tile: the batch-major register route. Eight chains (one per tile row) stay live across the
+                        // whole column block beside the activation vector; the tile rows are the FMA memory operands.
                         for (int b = 0; b < count; b++)
                         {
-                            float* chain = pAcc + (r * MaxBatch + b) * 8;
-                            float* tailSlot = pTail + r * MaxBatch + b;
                             float* xRow = inputs + (long)b * cols + cb;
 
-                            Vector256<float> accV = Avx.LoadVector256(chain);
-                            float tailAcc = *tailSlot;
+                            Vector256<float> c0 = Avx.LoadVector256(pAcc + (0 * MaxBatch + b) * 8);
+                            Vector256<float> c1 = Avx.LoadVector256(pAcc + (1 * MaxBatch + b) * 8);
+                            Vector256<float> c2 = Avx.LoadVector256(pAcc + (2 * MaxBatch + b) * 8);
+                            Vector256<float> c3 = Avx.LoadVector256(pAcc + (3 * MaxBatch + b) * 8);
+                            Vector256<float> c4 = Avx.LoadVector256(pAcc + (4 * MaxBatch + b) * 8);
+                            Vector256<float> c5 = Avx.LoadVector256(pAcc + (5 * MaxBatch + b) * 8);
+                            Vector256<float> c6 = Avx.LoadVector256(pAcc + (6 * MaxBatch + b) * 8);
+                            Vector256<float> c7 = Avx.LoadVector256(pAcc + (7 * MaxBatch + b) * 8);
+
+                            float t0 = pTail[0 * MaxBatch + b];
+                            float t1 = pTail[1 * MaxBatch + b];
+                            float t2 = pTail[2 * MaxBatch + b];
+                            float t3 = pTail[3 * MaxBatch + b];
+                            float t4 = pTail[4 * MaxBatch + b];
+                            float t5 = pTail[5 * MaxBatch + b];
+                            float t6 = pTail[6 * MaxBatch + b];
+                            float t7 = pTail[7 * MaxBatch + b];
 
                             for (int j = 0; j < 8; j++)
                             {
@@ -441,20 +473,95 @@ public sealed unsafe partial class CpuBackend
                                 }
 
                                 int limit = Math.Min(32, cols - subStart);
+                                int lane = j * 32;
 
                                 for (int c = 0; c + 8 <= limit; c += 8)
                                 {
-                                    accV = Fma.MultiplyAdd(Avx.LoadVector256(xRow + j * 32 + c), Avx.LoadVector256(tileRow + j * 32 + c), accV);
+                                    Vector256<float> xv = Avx.LoadVector256(xRow + lane + c); // one activation load feeds all eight tile rows' chains.
+                                    c0 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + lane + c), c0);
+                                    c1 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + GemmTileCols + lane + c), c1);
+                                    c2 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + 2L * GemmTileCols + lane + c), c2);
+                                    c3 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + 3L * GemmTileCols + lane + c), c3);
+                                    c4 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + 4L * GemmTileCols + lane + c), c4);
+                                    c5 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + 5L * GemmTileCols + lane + c), c5);
+                                    c6 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + 6L * GemmTileCols + lane + c), c6);
+                                    c7 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + 7L * GemmTileCols + lane + c), c7);
                                 }
 
                                 for (int k = (limit / 8) * 8; k < limit; k++)
                                 {
-                                    tailAcc += xRow[j * 32 + k] * tileRow[j * 32 + k];
+                                    int p = lane + k;
+                                    t0 += xRow[p] * pTile[p];
+                                    t1 += xRow[p] * pTile[GemmTileCols + p];
+                                    t2 += xRow[p] * pTile[2L * GemmTileCols + p];
+                                    t3 += xRow[p] * pTile[3L * GemmTileCols + p];
+                                    t4 += xRow[p] * pTile[4L * GemmTileCols + p];
+                                    t5 += xRow[p] * pTile[5L * GemmTileCols + p];
+                                    t6 += xRow[p] * pTile[6L * GemmTileCols + p];
+                                    t7 += xRow[p] * pTile[7L * GemmTileCols + p];
                                 }
                             }
 
-                            Avx.Store(chain, accV);
-                            *tailSlot = tailAcc;
+                            Avx.Store(pAcc + (0 * MaxBatch + b) * 8, c0);
+                            Avx.Store(pAcc + (1 * MaxBatch + b) * 8, c1);
+                            Avx.Store(pAcc + (2 * MaxBatch + b) * 8, c2);
+                            Avx.Store(pAcc + (3 * MaxBatch + b) * 8, c3);
+                            Avx.Store(pAcc + (4 * MaxBatch + b) * 8, c4);
+                            Avx.Store(pAcc + (5 * MaxBatch + b) * 8, c5);
+                            Avx.Store(pAcc + (6 * MaxBatch + b) * 8, c6);
+                            Avx.Store(pAcc + (7 * MaxBatch + b) * 8, c7);
+
+                            pTail[0 * MaxBatch + b] = t0;
+                            pTail[1 * MaxBatch + b] = t1;
+                            pTail[2 * MaxBatch + b] = t2;
+                            pTail[3 * MaxBatch + b] = t3;
+                            pTail[4 * MaxBatch + b] = t4;
+                            pTail[5 * MaxBatch + b] = t5;
+                            pTail[6 * MaxBatch + b] = t6;
+                            pTail[7 * MaxBatch + b] = t7;
+                        }
+                    }
+                    else
+                    {
+                        // Partial final tile group (fewer than eight rows): the row-major dot, the same per-chain walks
+                        // the other formats' partial tiles run. Chain order and reduction are unchanged here too.
+                        for (int r = 0; r < rn; r++)
+                        {
+                            float* tileRow = pTile + (long)r * GemmTileCols;
+
+                            for (int b = 0; b < count; b++)
+                            {
+                                float* chain = pAcc + (r * MaxBatch + b) * 8;
+                                float* tailSlot = pTail + r * MaxBatch + b;
+                                float* xRow = inputs + (long)b * cols + cb;
+
+                                Vector256<float> accV = Avx.LoadVector256(chain);
+                                float tailAcc = *tailSlot;
+
+                                for (int j = 0; j < 8; j++)
+                                {
+                                    int subStart = cb + j * 32;
+                                    if (subStart >= cols)
+                                    {
+                                        break;
+                                    }
+
+                                    int limit = Math.Min(32, cols - subStart);
+
+                                    for (int c = 0; c + 8 <= limit; c += 8)
+                                    {
+                                        accV = Fma.MultiplyAdd(Avx.LoadVector256(xRow + j * 32 + c), Avx.LoadVector256(tileRow + j * 32 + c), accV);
+                                    }
+
+                                    for (int k = (limit / 8) * 8; k < limit; k++)
+                                    {
+                                        tailAcc += xRow[j * 32 + k] * tileRow[j * 32 + k];
+                                    }
+                                }
+
+                                Avx.Store(chain, accV);
+                                *tailSlot = tailAcc;
+                            }
                         }
                     }
                 }
@@ -516,6 +623,289 @@ public sealed unsafe partial class CpuBackend
                             for (int l = 0; l < limit; l++)
                             {
                                 tileRow[j * 32 + l] = ((q[l] >> (4 * (j & 1))) & 0xF) * scale - shift;
+                            }
+                        }
+                    }
+
+                    for (int r = 0; r < rn; r++)
+                    {
+                        float* tileRow = pTile + (long)r * GemmTileCols;
+
+                        for (int b = 0; b < count; b++)
+                        {
+                            float* xRow = inputs + (long)b * cols + cb;
+                            float* outSlot = outBase + (long)b * rows + rb + r;
+                            float acc = *outSlot;
+
+                            for (int l = 0; l < cn; l++)
+                            {
+                                acc += xRow[l] * tileRow[l];
+                            }
+
+                            *outSlot = acc;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- Q6_K
+
+    // Q6_K tile: w = d * sc_g * (q - 32) per group, materialized with the same 6-bit chunk unpack and fused scale the
+    // reference kernels build, and with the same scalar arithmetic for a group's partial final chunk that those kernels
+    // leave to their scalar tails. The column block is one 256-element super-block wide, so the tile walk visits the
+    // same sixteen 16-element groups and the same eight-element chunks the vector kernels walk for a row.
+    //
+    // The dot is batch-major: one activation-vector load per chunk feeds all eight tile rows' accumulator chains, where
+    // the batched-row scratch route re-reads the activation batch once per chain group. Each chain still advances
+    // through the same ascending group and chunk positions with the same FMA association and the same scalar tail
+    // cleanup, so every output lands bit-identical to that route's chain for its row — grouping here only chooses
+    // which tile rows share one activation pass, never a chain's element order or its reduction.
+    private static void GemmQ6KAvx2(byte* bytes, int stride, int rowFrom, int rowTo, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> tile = stackalloc float[GemmTileRows * GemmTileCols];
+        Span<float> acc = stackalloc float[GemmAccLanes];
+        Span<float> tail = stackalloc float[GemmAccTails];
+
+        fixed (float* pTile = tile)
+        fixed (float* pAcc = acc)
+        fixed (float* pTail = tail)
+        {
+            for (int rb = rowFrom; rb < rowTo; rb += GemmTileRows)
+            {
+                int rn = Math.Min(GemmTileRows, rowTo - rb);
+                acc.Slice(0, rn * MaxBatch * 8).Clear();
+                tail.Slice(0, rn * MaxBatch).Clear();
+
+                for (int cb = 0; cb < cols; cb += GemmTileCols)
+                {
+                    for (int r = 0; r < rn; r++)
+                    {
+                        byte* block = bytes + (long)(rb + r) * stride + (long)(cb / QkK) * Q6KBlockBytes;
+                        float* tileRow = pTile + (long)r * GemmTileCols;
+
+                        float dHalf = ReadHalfLE(block + 208);
+
+                        for (int g = 0; g < 16; g++)
+                        {
+                            int subStart = cb + g * 16;
+                            if (subStart >= cols)
+                            {
+                                break; // zero-padded tail block: no elements left to consume.
+                            }
+
+                            int h = g >> 3; // 128-element half of the super-block
+                            int k = g & 7; // 16-element group inside the half
+                            int quarter = k >> 1; // 0..3: which 32-element quarter of the half the group starts in
+                            byte* q = block + 64 * h + 16 * (k & 3); // ql window: bytes [q, q+16) always inside the block
+                            byte* qh = block + 128 + 32 * h + 16 * (k & 1); // 2-bit fields for the same elements, shift 2*quarter
+                            float scale = dHalf * (sbyte)block[192 + g];
+                            Vector256<float> scaleV = Avx.BroadcastScalarToVector256(&scale);
+                            int limit = Math.Min(16, cols - subStart); // padded quants are zero: stop at the real column count.
+
+                            for (int c = 0; c + 8 <= limit; c += 8)
+                            {
+                                Vector256<int> six = LoadQ6KChunk(q, qh, quarter, c); // dequantization unpack, materialized once per chunk
+                                Avx.Store(tileRow + g * 16 + c, Avx.Multiply(scaleV, Avx.ConvertToVector256Single(six))); // the same fused scale the dot chains consume
+                            }
+
+                            for (int e = (limit / 8) * 8; e < limit; e++)
+                            {
+                                // Partial final chunk of the group: scalar cleanup, at most seven elements per group.
+                                int six = ((q[e] >> (4 * (quarter >> 1))) & 0xF) | (((qh[e] >> (2 * quarter)) & 3) << 4);
+                                tileRow[g * 16 + e] = (six - 32) * scale;
+                            }
+                        }
+                    }
+
+                    if (rn == GemmTileRows)
+                    {
+                        // Full tile: the batch-major register route. Eight chains (one per tile row) stay live across the
+                        // whole column block beside the activation vector; the tile rows are the FMA memory operands.
+                        for (int b = 0; b < count; b++)
+                        {
+                            float* xRow = inputs + (long)b * cols + cb;
+
+                            Vector256<float> c0 = Avx.LoadVector256(pAcc + (0 * MaxBatch + b) * 8);
+                            Vector256<float> c1 = Avx.LoadVector256(pAcc + (1 * MaxBatch + b) * 8);
+                            Vector256<float> c2 = Avx.LoadVector256(pAcc + (2 * MaxBatch + b) * 8);
+                            Vector256<float> c3 = Avx.LoadVector256(pAcc + (3 * MaxBatch + b) * 8);
+                            Vector256<float> c4 = Avx.LoadVector256(pAcc + (4 * MaxBatch + b) * 8);
+                            Vector256<float> c5 = Avx.LoadVector256(pAcc + (5 * MaxBatch + b) * 8);
+                            Vector256<float> c6 = Avx.LoadVector256(pAcc + (6 * MaxBatch + b) * 8);
+                            Vector256<float> c7 = Avx.LoadVector256(pAcc + (7 * MaxBatch + b) * 8);
+
+                            float t0 = pTail[0 * MaxBatch + b];
+                            float t1 = pTail[1 * MaxBatch + b];
+                            float t2 = pTail[2 * MaxBatch + b];
+                            float t3 = pTail[3 * MaxBatch + b];
+                            float t4 = pTail[4 * MaxBatch + b];
+                            float t5 = pTail[5 * MaxBatch + b];
+                            float t6 = pTail[6 * MaxBatch + b];
+                            float t7 = pTail[7 * MaxBatch + b];
+
+                            for (int g = 0; g < 16; g++)
+                            {
+                                int subStart = cb + g * 16;
+                                if (subStart >= cols)
+                                {
+                                    break;
+                                }
+
+                                int limit = Math.Min(16, cols - subStart);
+                                int lane = g * 16;
+
+                                for (int c = 0; c + 8 <= limit; c += 8)
+                                {
+                                    Vector256<float> xv = Avx.LoadVector256(xRow + lane + c); // one activation load feeds all eight tile rows' chains.
+                                    c0 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + lane + c), c0);
+                                    c1 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + GemmTileCols + lane + c), c1);
+                                    c2 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + 2L * GemmTileCols + lane + c), c2);
+                                    c3 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + 3L * GemmTileCols + lane + c), c3);
+                                    c4 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + 4L * GemmTileCols + lane + c), c4);
+                                    c5 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + 5L * GemmTileCols + lane + c), c5);
+                                    c6 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + 6L * GemmTileCols + lane + c), c6);
+                                    c7 = Fma.MultiplyAdd(xv, Avx.LoadVector256(pTile + 7L * GemmTileCols + lane + c), c7);
+                                }
+
+                                for (int e = (limit / 8) * 8; e < limit; e++)
+                                {
+                                    int p = lane + e;
+                                    t0 += xRow[p] * pTile[p];
+                                    t1 += xRow[p] * pTile[GemmTileCols + p];
+                                    t2 += xRow[p] * pTile[2L * GemmTileCols + p];
+                                    t3 += xRow[p] * pTile[3L * GemmTileCols + p];
+                                    t4 += xRow[p] * pTile[4L * GemmTileCols + p];
+                                    t5 += xRow[p] * pTile[5L * GemmTileCols + p];
+                                    t6 += xRow[p] * pTile[6L * GemmTileCols + p];
+                                    t7 += xRow[p] * pTile[7L * GemmTileCols + p];
+                                }
+                            }
+
+                            Avx.Store(pAcc + (0 * MaxBatch + b) * 8, c0);
+                            Avx.Store(pAcc + (1 * MaxBatch + b) * 8, c1);
+                            Avx.Store(pAcc + (2 * MaxBatch + b) * 8, c2);
+                            Avx.Store(pAcc + (3 * MaxBatch + b) * 8, c3);
+                            Avx.Store(pAcc + (4 * MaxBatch + b) * 8, c4);
+                            Avx.Store(pAcc + (5 * MaxBatch + b) * 8, c5);
+                            Avx.Store(pAcc + (6 * MaxBatch + b) * 8, c6);
+                            Avx.Store(pAcc + (7 * MaxBatch + b) * 8, c7);
+
+                            pTail[0 * MaxBatch + b] = t0;
+                            pTail[1 * MaxBatch + b] = t1;
+                            pTail[2 * MaxBatch + b] = t2;
+                            pTail[3 * MaxBatch + b] = t3;
+                            pTail[4 * MaxBatch + b] = t4;
+                            pTail[5 * MaxBatch + b] = t5;
+                            pTail[6 * MaxBatch + b] = t6;
+                            pTail[7 * MaxBatch + b] = t7;
+                        }
+                    }
+                    else
+                    {
+                        // Partial final tile group (fewer than eight rows): the row-major dot, the same per-chain walks
+                        // the other formats' tile kernels run. Chain order and reduction are unchanged here too.
+                        for (int r = 0; r < rn; r++)
+                        {
+                            float* tileRow = pTile + (long)r * GemmTileCols;
+
+                            for (int b = 0; b < count; b++)
+                            {
+                                float* chain = pAcc + (r * MaxBatch + b) * 8;
+                                float* tailSlot = pTail + r * MaxBatch + b;
+                                float* xRow = inputs + (long)b * cols + cb;
+
+                                Vector256<float> accV = Avx.LoadVector256(chain);
+                                float tailAcc = *tailSlot;
+
+                                for (int g = 0; g < 16; g++)
+                                {
+                                    int subStart = cb + g * 16;
+                                    if (subStart >= cols)
+                                    {
+                                        break;
+                                    }
+
+                                    int limit = Math.Min(16, cols - subStart);
+
+                                    for (int c = 0; c + 8 <= limit; c += 8)
+                                    {
+                                        accV = Fma.MultiplyAdd(Avx.LoadVector256(xRow + g * 16 + c), Avx.LoadVector256(tileRow + g * 16 + c), accV);
+                                    }
+
+                                    for (int e = (limit / 8) * 8; e < limit; e++)
+                                    {
+                                        tailAcc += xRow[g * 16 + e] * tileRow[g * 16 + e];
+                                    }
+                                }
+
+                                Avx.Store(chain, accV);
+                                *tailSlot = tailAcc;
+                            }
+                        }
+                    }
+                }
+
+                FinishGemmTile(pAcc, pTail, rn, count, rows, rb, outBase);
+            }
+        }
+    }
+
+    // Q6_K scalar tile: w = d * sc_g * (q - 32) per group, one accumulator advanced in ascending column order exactly
+    // as RowDotQ6KScalar advances its own.
+    private static void GemmQ6KScalar(byte* bytes, int stride, int rowFrom, int rowTo, float* inputs, int count, int rows, int cols, float* outBase)
+    {
+        Span<float> tile = stackalloc float[GemmTileRows * GemmTileCols];
+
+        fixed (float* pTile = tile)
+        {
+            for (int rb = rowFrom; rb < rowTo; rb += GemmTileRows)
+            {
+                int rn = Math.Min(GemmTileRows, rowTo - rb);
+
+                // The scalar route carries each output element's running sum in its own output slot: opened here once
+                // per tile group, then advanced by the ascending column walk below and written nowhere else.
+                for (int r = 0; r < rn; r++)
+                {
+                    for (int b = 0; b < count; b++)
+                    {
+                        outBase[(long)b * rows + rb + r] = 0f;
+                    }
+                }
+
+                for (int cb = 0; cb < cols; cb += GemmTileCols)
+                {
+                    int cn = Math.Min(GemmTileCols, cols - cb);
+
+                    for (int r = 0; r < rn; r++)
+                    {
+                        byte* block = bytes + (long)(rb + r) * stride + (long)(cb / QkK) * Q6KBlockBytes;
+                        float* tileRow = pTile + (long)r * GemmTileCols;
+
+                        float d = ReadHalfLE(block + 208);
+
+                        for (int g = 0; g < 16; g++)
+                        {
+                            int subStart = cb + g * 16;
+                            if (subStart >= cols)
+                            {
+                                break;
+                            }
+
+                            int h = g >> 3;
+                            int k = g & 7;
+                            int quarter = k >> 1;
+                            byte* q = block + 64 * h + 16 * (k & 3);
+                            byte* qh = block + 128 + 32 * h + 16 * (k & 1);
+                            float scale = d * (sbyte)block[192 + g];
+
+                            int limit = Math.Min(16, cols - subStart);
+
+                            for (int l = 0; l < limit; l++)
+                            {
+                                int six = ((q[l] >> (4 * (quarter >> 1))) & 0xF) | (((qh[l] >> (2 * quarter)) & 3) << 4);
+                                tileRow[g * 16 + l] = (six - 32) * scale;
                             }
                         }
                     }

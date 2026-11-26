@@ -236,24 +236,25 @@ public sealed class CudaPrefillGemmCapabilityGateTests : IDisposable
     [Fact]
     public void OffloadedCudaPromptBackend_FormatOnlyThatDeviceMultipliesInBulk_OpensOnGemmAndReportsIt()
     {
-        string path = SyntheticLlamaGguf.WriteQuantizedMatrices("gemm-offload-q6k", QuantFormat.Q6_K, QuantizedShape);
+        // Q5_K is the format this build's CUDA seam multiplies in bulk while the CPU backend has no blocked matmul for it.
+        string path = SyntheticLlamaGguf.WriteQuantizedMatrices("gemm-offload-q5k", QuantFormat.Q5_K, QuantizedShape);
         _tempFiles.Add(path);
 
-        ModelRoute route = SingleCpuSegmentRoute("gemm-offload-q6k");
+        ModelRoute route = SingleCpuSegmentRoute("gemm-offload-q5k");
 
         using GgufFile gguf = GgufFile.Open(path);
         using CpuBackend decodeSide = new(threads: 2);
         CountingCudaCapabilityStandIn cuda = new(decodeSide);
 
-        Assert.False(decodeSide.SupportsGemm(QuantFormat.Q6_K), "the CPU backend claimed a blocked matmul it does not carry");
-        Assert.True(CudaBackend.HasGemvKernel(QuantFormat.Q6_K), "the CUDA seam stopped reporting its Q6_K GEMV kernel: the decode side still dots this file's rows");
+        Assert.False(decodeSide.SupportsGemm(QuantFormat.Q5_K), "the CPU backend claimed a blocked matmul it does not carry");
+        Assert.True(CudaBackend.HasGemvKernel(QuantFormat.Q5_K), "the CUDA seam stopped reporting its Q5_K GEMV kernel: the decode side still dots this file's rows");
 
         using TransformerModel model = TransformerModel.Open(
             gguf, decodeSide, maxContextTokens: 32, logLine: null, PrefillKernel.Gemm, route, prefillsBackend: cuda);
 
         // The selection is decided from the backend that actually runs each window range: this engine's own CPU backend multiplies nothing in bulk here and never blocks the open.
         Assert.Equal(PrefillKernel.Gemm, model.ResolvedPrefillKernel);
-        Assert.Contains(QuantFormat.Q6_K, model.MatmulWeightFormats);
+        Assert.Contains(QuantFormat.Q5_K, model.MatmulWeightFormats);
     }
 
     [Fact]
@@ -333,24 +334,24 @@ public sealed class CudaPrefillGemmCapabilityGateTests : IDisposable
     [Fact]
     public void HybridSplitRoute_RangeNamingAFormatItsOwnBackendCannotMultiplyInBulk_RefusesAtOpenNamingSelectionAndFormat()
     {
-        string path = SyntheticLlamaGguf.WriteQuantizedMatrices("gemm-split-q6k", QuantFormat.Q6_K, QuantizedShape);
+        string path = SyntheticLlamaGguf.WriteQuantizedMatrices("gemm-split-q5k", QuantFormat.Q5_K, QuantizedShape);
         _tempFiles.Add(path);
 
-        ModelRoute route = CudaFirstSplitRoute("gemm-split-q6k");
+        ModelRoute route = CudaFirstSplitRoute("gemm-split-q5k");
 
         using GgufFile gguf = GgufFile.Open(path);
         using CpuBackend decodeSide = new(threads: 2);
         CountingCudaCapabilityStandIn cuda = new(decodeSide);
 
-        Assert.True(CudaBackend.HasGemmKernel(QuantFormat.Q6_K), "the CUDA seam stopped reporting its Q6_K blocked matmul");
-        Assert.False(decodeSide.SupportsGemm(QuantFormat.Q6_K), "the CPU backend claimed a blocked matmul it does not carry");
+        Assert.True(CudaBackend.HasGemmKernel(QuantFormat.Q5_K), "the CUDA seam stopped reporting its Q5_K blocked matmul");
+        Assert.False(decodeSide.SupportsGemm(QuantFormat.Q5_K), "the CPU backend claimed a blocked matmul it does not carry");
 
         // The accelerator-backed first span could run this format in bulk; the CPU tail's own range cannot, so the route is refused rather than split across kernel shapes mid-window.
         ModelException error = Assert.Throws<ModelException>(
             () => TransformerModel.Open(gguf, decodeSide, maxContextTokens: 32, logLine: null, PrefillKernel.Gemm, route, [cuda, decodeSide]));
 
         Assert.Contains("prefill kernel 'gemm'", error.Message, StringComparison.Ordinal);
-        Assert.Contains("Q6_K", error.Message, StringComparison.Ordinal);
+        Assert.Contains("Q5_K", error.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("no GEMV kernel", error.Message, StringComparison.Ordinal);
     }
 

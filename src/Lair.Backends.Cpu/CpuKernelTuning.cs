@@ -19,6 +19,15 @@ public sealed record CpuKernelTuningOverrides
     /// <summary>Row-scratch column ceiling for the scratch batch-dot route (<see cref="CpuKernelTuning.MaxScratchColsMin"/>..<see cref="CpuKernelTuning.MaxScratchColsMax"/>) or null to resolve.</summary>
     public int? MaxScratchCols { get; init; }
 
+    /// <summary>Batch count at or above which an eligible single-matrix batched pass takes the blocked-matmul tile route (<see cref="MatmulRouteBatchWidthMin"/>..<see cref="MatmulRouteBatchWidthMax"/>; 0 keeps every batched pass on its batched-row kernel) or null to resolve.</summary>
+    public int? MatmulRouteBatchWidth { get; init; }
+
+    /// <summary>The same crossover stated for Q4_K dense matrices specifically, which no resolved posture promotes on its own (<see cref="MatmulRouteBatchWidthMin"/>..<see cref="MatmulRouteBatchWidthMax"/>) or null to resolve.</summary>
+    public int? MatmulRouteBatchWidthQ4K { get; init; }
+
+    /// <summary>Accumulator chains sharing one pass over a shared dot operand (<see cref="CpuKernelTuning.SharedInputDotChainGroupMin"/>..<see cref="CpuKernelTuning.SharedInputDotChainGroupMax"/>; 0 keeps every such dot individual) or null to resolve.</summary>
+    public int? SharedInputDotChainGroup { get; init; }
+
     /// <summary>The posture-resolved posture itself: no field pinned, every value resolved from detected topology and worker count.</summary>
     internal static readonly CpuKernelTuningOverrides Auto = new();
 }
@@ -69,6 +78,20 @@ public sealed record CpuKernelTuning
     // on any posture these kernels run on, and the streaming route wins there anyway — so wider ceilings refuse rather than pretend to tune.
     public const int MaxScratchColsMax = 65_536;
 
+    /// <summary>0 disables the hybrid dense-matrix route: every batched pass keeps its batched-row kernel.</summary>
+    public const int MatmulRouteBatchWidthMin = 0;
+
+    /// <summary>The batch ceiling every dense kernel's scratch is sized for: a hybrid width above it could never dispatch.</summary>
+    public const int MatmulRouteBatchWidthMax = 64;
+
+    /// <summary>0 keeps every shared-operand dot individual: the batched chain route stays off.</summary>
+    public const int SharedInputDotChainGroupMin = 0;
+
+    // A shared-operand dot batch is bounded by the same register budget as every other chain-group kernel here: ChainGroupMax chains plus
+    // one common-vector chunk fit AVX2's sixteen YMM registers. Wider groups spill accumulators past that budget, so they refuse rather
+    // than substitute — like every other chain group in this posture vocabulary it is a property of the vector posture, not of one CPU model.
+    public const int SharedInputDotChainGroupMax = ChainGroupMax;
+
     /// <summary>Output rows per scheduling unit for threaded dense kernels: every row-block partition of a GEMV/GemvBatch/Gemm/fused dispatch claims this many contiguous rows (the final block may be shorter).</summary>
     public required int RowBlock { get; init; }
 
@@ -87,6 +110,16 @@ public sealed record CpuKernelTuning
     /// <summary>The scratch batch-dot route's column ceiling: matrices wider than this keep their streaming kernels instead of staging a whole row.</summary>
     public required int MaxScratchCols { get; init; }
 
+    /// <summary>Batch count at or above which an eligible single-matrix batched pass routes its rows through the blocked matmul tile executor instead of the batched-row scratch dot (0 disables the hybrid route). Only formats that carry a blocked matmul take it; every other format keeps its batched-row kernel.</summary>
+    public required int MatmulRouteBatchWidth { get; init; }
+
+    /// <summary>The same crossover for Q4_K dense matrices, which no auto posture promotes (0 unless stated): stating it through an internal seam makes the choice measurable and refusable rather than promoted from posture. A local AVX2-class prefill stage profile shows single-matrix Q4_K passes taking the tile route cheaper while fused gate/up pairs stay on their own traversal; promotion still waits for same-target-host validation.
+    /// At 0 every unpromoted Q4_K batched pass keeps its batched-row kernel.</summary>
+    public required int MatmulRouteBatchWidthQ4K { get; init; }
+
+    /// <summary>Accumulator chains sharing one pass over a shared dot operand: how many consecutive inputs of a shared-operand dot batch keep their own accumulator chain beside the common vector's chunk (0 keeps every such dot individual). A batch wider than this is split into consecutive chunks of it.</summary>
+    public required int SharedInputDotChainGroup { get; init; }
+
     /// <summary>
     /// Resolves one backend's tuning from its effective worker count and vector posture, applying explicit overrides field by field.
     /// Auto defaults:
@@ -102,6 +135,9 @@ public sealed record CpuKernelTuning
     /// - Triple chain group = the resolved chain group capped at <see cref="TripleChainGroupMax"/>: the fused triple route keeps three
     ///   matrices' chains live beside three weight chunks, so its register budget is three chains per matrix plus three weight chunks.
     /// - Max scratch columns = 16_384 floats: a staged row plus its packed bytes stay cache-resident at that width on AVX2-class postures; wider matrices keep their streaming kernels.
+    /// - Matmul route batch width = 8 with a vector posture and 0 without one: at or above it a single-matrix batched pass whose format carries a blocked matmul runs through the tile executor, where one activation load per chunk feeds every tile row's chain instead of the batched-row scratch route re-reading the batch once per chain group.
+    /// - Q4_K matmul route batch width = 0 at every posture: this build measures the tile crossover for its Q6_K dense traversal and measured a Q4_K dense-matrix pass as a regression on the AVX2-only target host, so promoting Q4_K to that route is something an internal seam states explicitly (for measurement) rather than something a posture decides.
+    /// - Shared-input dot chain group = <see cref="ChainGroupMax"/> with a vector posture and 0 without one: how many consecutive inputs of a shared-operand dot batch keep their own accumulator chain beside one load of the common operand's chunk; 0 keeps every such dot individual, where no batched chain kernel runs.
     /// An override outside its accepted range fails the open naming the qualified key, its value, and the accepted span — never clamped silently.
     /// </summary>
     internal static CpuKernelTuning Resolve(int effectiveWorkerCount, bool vectorPosture, CpuKernelTuningOverrides overrides)
@@ -141,7 +177,36 @@ public sealed record CpuKernelTuning
             ? Validate(pinnedCols, "engine.cpu.tuning.max_scratch_cols", MaxScratchColsMin, MaxScratchColsMax, "wider staging no longer stays cache-resident beside the packed row it replaces")
             : AutoMaxScratchCols;
 
-        return new CpuKernelTuning { RowBlock = rowBlock, ParallelRowThreshold = parallelThreshold, ChainGroup = chainGroup, PairChainGroup = pairChainGroup, TripleChainGroup = tripleChainGroup, MaxScratchCols = maxScratchCols };
+        // The hybrid dense-matrix route's batch width: at or above it, a single-matrix batched pass whose format carries a
+        // blocked matmul runs its rows through the tile executor, where one activation-vector load per eight-column chunk
+        // feeds every tile row's accumulator chain — the batched-row scratch route re-reads the activation batch once per
+        // chain group instead. The measured crossover for tile reuse at prefill batch widths is a full chain group of batch
+        // vectors; 0 without a vector posture, where the tile kernels do not run anyway.
+        const int AutoMatmulRouteBatchWidth = 8; // the full chain-group width: the measured crossover where tile reuse starts paying at prefill batch widths
+        int autoMatmulRouteBatchWidth = vectorPosture ? AutoMatmulRouteBatchWidth : 0; // without a vector posture the tile kernels never run, so the hybrid route stays off
+        int matmulRouteBatchWidth = overrides.MatmulRouteBatchWidth is { } pinnedWidth
+            ? Validate(pinnedWidth, "engine.cpu.tuning.matmul_route_batch_width", MatmulRouteBatchWidthMin, MatmulRouteBatchWidthMax, "a hybrid width above the batch ceiling never dispatches")
+            : autoMatmulRouteBatchWidth;
+
+        // The same crossover stated for Q4_K dense matrices rather than resolved from posture, leaving the measured Q6_K crossover untouched: a local AVX2-class prefill stage profile shows single-matrix Q4_K passes taking the tile route cheaper while fused gate/up pairs remain on their own traversal. That is not yet target-host promotion evidence, so no auto posture promotes this format; an internal seam states a width when same-host measurement wants to open that question. Whatever
+        // the value, it only chooses which executor walks one matrix's chunks in the same ascending order with the same operand association, so outputs stay byte-identical at every width.
+        const int AutoMatmulRouteBatchWidthQ4K = 0; // no auto promotion: Q4_K dense-matrix traversal stays on its batched-row kernels until a target-host measurement separates the two routes
+        int matmulRouteBatchWidthQ4K = overrides.MatmulRouteBatchWidthQ4K is { } pinnedQ4KWidth
+            ? Validate(pinnedQ4KWidth, "engine.cpu.tuning.matmul_route_batch_width_q4k", MatmulRouteBatchWidthMin, MatmulRouteBatchWidthMax, "a hybrid width above the batch ceiling never dispatches")
+            : AutoMatmulRouteBatchWidthQ4K;
+
+        // Shared-operand dot batching: at this chain-group width a shared-input dot call keeps that many inputs' accumulator chains live
+        // beside one load of the common vector's chunk, where individual dots re-read the common operand once per input. The measured
+        // crossover for reuse is again a full chain group; 0 without a vector posture, where every such dot stays scalar and re-reading
+        // the shared operand costs nothing the batch would remove. A pinned width never widens past the register budget — it only decides
+        // how many independent chains share one pass over the common operand, so outputs stay byte-identical at every value here.
+        const int AutoSharedInputDotChainGroup = ChainGroupMax; // a full chain group: where sharing one common-vector load starts paying
+        int autoSharedInputDotChainGroup = vectorPosture ? AutoSharedInputDotChainGroup : SharedInputDotChainGroupMin;
+        int sharedInputDotChainGroup = overrides.SharedInputDotChainGroup is { } pinnedDotGroup
+            ? Validate(pinnedDotGroup, "engine.cpu.tuning.shared_input_dot_chain_group", SharedInputDotChainGroupMin, SharedInputDotChainGroupMax, "a shared-dot chain group wider than eight spills accumulators past the vector posture's register budget")
+            : autoSharedInputDotChainGroup;
+
+        return new CpuKernelTuning { RowBlock = rowBlock, ParallelRowThreshold = parallelThreshold, ChainGroup = chainGroup, PairChainGroup = pairChainGroup, TripleChainGroup = tripleChainGroup, MaxScratchCols = maxScratchCols, MatmulRouteBatchWidth = matmulRouteBatchWidth, MatmulRouteBatchWidthQ4K = matmulRouteBatchWidthQ4K, SharedInputDotChainGroup = sharedInputDotChainGroup };
     }
 
     private static int Validate(int value, string key, int min, int max, string rationale) =>

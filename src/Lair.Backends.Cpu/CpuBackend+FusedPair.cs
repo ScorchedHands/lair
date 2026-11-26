@@ -347,6 +347,11 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
         // One tuning snapshot for the whole call: eligibility, dispatch threshold, block width, and scratch grouping all read the same resolved posture.
         CpuKernelTuning tuning = _tuning;
 
+        // The hybrid dense-matrix route is a statement about single-matrix batched passes only (see GemvBatch): it chooses which executor walks
+        // one matrix's rows when no shared-input fusion opportunity exists. This route already shares one activation walk across both matrices'
+        // accumulator chains, so a stated crossover width for either format says nothing here — the pair stays on its own measured posture and
+        // every scratch-eligible pair fuses exactly as it does before that seam is stated at all. Formats outside the scratch route decline for
+        // their own reason below; neither this fusion decision nor its bit-parity contract depends on a matmul-route width.
         if (!ScratchBatchDotEligible(formatA, cols, count, tuning.ChainGroup, tuning.MaxScratchCols) || !ScratchBatchDotEligible(formatB, cols, count, tuning.ChainGroup, tuning.MaxScratchCols))
         {
             return false; // formats outside the scratch route (Q8_K i-quants included) fall back to independent GemvBatch calls.

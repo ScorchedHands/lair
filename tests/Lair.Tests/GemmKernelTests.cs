@@ -27,7 +27,7 @@ public sealed class GemmKernelTests
     private static readonly int[] BatchCounts = [1, 2, 8, 16, 32, 64];
 
     /// <summary>The formats the dense weight path executes.</summary>
-    public static TheoryData<QuantFormat> SupportedFormats() => [QuantFormat.Q8_0, QuantFormat.Q4_K, QuantFormat.IQ4_XS];
+    public static TheoryData<QuantFormat> SupportedFormats() => [QuantFormat.Q8_0, QuantFormat.Q4_K, QuantFormat.Q6_K, QuantFormat.IQ4_XS];
 
     [Theory]
     [MemberData(nameof(SupportedFormats))]
@@ -133,7 +133,6 @@ public sealed class GemmKernelTests
     [InlineData(QuantFormat.F16)]
     [InlineData(QuantFormat.Q5_0)]
     [InlineData(QuantFormat.Q5_K)]
-    [InlineData(QuantFormat.Q6_K)]
     [InlineData(QuantFormat.Q2_K)]
     [InlineData(QuantFormat.Q3_K)]
     [InlineData(QuantFormat.IQ4_NL)]

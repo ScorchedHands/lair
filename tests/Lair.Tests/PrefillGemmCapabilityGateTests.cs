@@ -11,7 +11,7 @@ namespace Lair.Tests;
 
 /// <summary>
 /// The CPU posture of the same dense-matrix capability gate, pinned on synthetic files so it never skips: formats this
-/// build multiplies in bulk (<c>Q8_0</c>, <c>Q4_K</c>, <c>IQ4_XS</c>) select cleanly at open and re-point to the dense
+/// build multiplies in bulk (<c>Q8_0</c>, <c>Q4_K</c>, <c>Q6_K</c>, <c>IQ4_XS</c>) select cleanly at open and re-point to the dense
 /// route byte-for-byte; a format with no blocked matmul refuses naming itself and the backend that reports none, at open
 /// and on a hot re-point alike, and never falls back to the window shape that happens to work. No CPU GEMM behavior is
 /// changed by these lanes — they read the same capability answer the kernels resolve from. Runs in the serialized
@@ -51,6 +51,7 @@ public sealed class PrefillGemmCapabilityGateTests : IDisposable
     [Theory]
     [InlineData(QuantFormat.Q8_0)]
     [InlineData(QuantFormat.Q4_K)]
+    [InlineData(QuantFormat.Q6_K)]
     public void CpuRoute_EveryWindowFormatHasABlockedMatmul_OpenOnGemmAndReportIt(QuantFormat format)
     {
         string path = SyntheticLlamaGguf.WriteQuantizedMatrices($"gemm-cpu-{format}", format, QuantizedShape);
@@ -75,6 +76,7 @@ public sealed class PrefillGemmCapabilityGateTests : IDisposable
     [Theory]
     [InlineData(QuantFormat.Q8_0, true)]
     [InlineData(QuantFormat.Q4_K, true)]
+    [InlineData(QuantFormat.Q6_K, true)]
     [InlineData(QuantFormat.IQ4_XS, true)] // the capability fact is pinned straight from the backend: this suite's synthetic writer ships no block geometry for it
     [InlineData(QuantFormat.Q5_K, false)]
     [InlineData(QuantFormat.IQ3_S, false)]

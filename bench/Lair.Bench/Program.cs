@@ -888,7 +888,7 @@ static int BenchPrefillProfile(string[] args)
 {
     if (args.Length < 2)
     {
-        Console.WriteLine("usage: prefill-profile <gguf path> [--threads N] [--lengths 16,32,...] [--widths 16,32,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--stage-profile] [--out <path>]");
+        Console.WriteLine("usage: prefill-profile <gguf path> [--threads N] [--lengths 16,32,...] [--widths 16,32,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--stage-profile] [--matmul-route off|on|N] [--q4k-matmul-route off|on|N] [--attention-batch-dots off|on|N] [--out <path>]");
         return 1;
     }
 
@@ -896,6 +896,9 @@ static int BenchPrefillProfile(string[] args)
     int reps = 3;
     bool perToken = false;
     bool stageProfile = false; // off keeps every report line exactly as this profile has always printed them
+    int? matmulRouteWidth = null; // --matmul-route off|on|N pins the hybrid dense-matrix route's batch width for measurement; absent keeps the posture-resolved default
+    int? matmulRouteWidthQ4K = null; // --q4k-matmul-route off|on|N states the Q4_K crossover of that same route, which no resolved posture promotes on its own; absent leaves every Q4_K batched pass on its current traversal
+    int? sharedDotChainGroup = null; // --attention-batch-dots off|on|N pins how many score-dot accumulator chains share one pass over a shared K operand; absent keeps the posture-resolved default
     string? outPath = null;
     List<int> lengths = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048];
     List<int>? rowWidths = null; // the resolved-row-count axis: one candidate engine per listed width; absent keeps the single default engine
@@ -1019,6 +1022,72 @@ static int BenchPrefillProfile(string[] args)
             case "--stage-profile":
                 stageProfile = true; // the engine's dense stage/layer seam reports one machine-readable line per measured window group
                 break;
+            case "--matmul-route":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--matmul-route' needs a value");
+                    return 1;
+                }
+
+                string routeValue = args[++i];
+                matmulRouteWidth = routeValue switch
+                {
+                    "off" => 0, // every batched pass keeps its batched-row kernel
+                    "on" => 8, // the auto crossover width, pinned explicitly
+                    _ => int.TryParse(routeValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out int pinned) ? pinned : -1,
+                };
+
+                if (matmulRouteWidth < 0 || matmulRouteWidth > CpuKernelTuning.MatmulRouteBatchWidthMax)
+                {
+                    Console.WriteLine($"prefill-profile: --matmul-route '{routeValue}' must be off, on, or a batch width 0..{CpuKernelTuning.MatmulRouteBatchWidthMax}");
+                    return 1;
+                }
+
+                break;
+            case "--q4k-matmul-route":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--q4k-matmul-route' needs a value");
+                    return 1;
+                }
+
+                string q4KRouteValue = args[++i];
+                matmulRouteWidthQ4K = q4KRouteValue switch
+                {
+                    "off" => 0, // every Q4_K batched pass keeps its current traversal — what no posture resolves on its own anyway
+                    "on" => 8, // the crossover width this route is measured at for Q6_K, stated explicitly for Q4_K measurement
+                    _ => int.TryParse(q4KRouteValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out int pinnedWidth) ? pinnedWidth : -1,
+                };
+
+                if (matmulRouteWidthQ4K < 0 || matmulRouteWidthQ4K > CpuKernelTuning.MatmulRouteBatchWidthMax)
+                {
+                    Console.WriteLine($"prefill-profile: --q4k-matmul-route '{q4KRouteValue}' must be off, on, or a batch width 0..{CpuKernelTuning.MatmulRouteBatchWidthMax}");
+                    return 1;
+                }
+
+                break;
+            case "--attention-batch-dots":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--attention-batch-dots' needs a value");
+                    return 1;
+                }
+
+                string sharedDotValue = args[++i];
+                sharedDotChainGroup = sharedDotValue switch
+                {
+                    "off" => 0, // every score dot against a shared K operand stays an individual Dot call
+                    "on" => CpuKernelTuning.SharedInputDotChainGroupMax, // the auto chain-group width, pinned explicitly
+                    _ => int.TryParse(sharedDotValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out int pinnedWidth) ? pinnedWidth : -1,
+                };
+
+                if (sharedDotChainGroup < 0 || sharedDotChainGroup > CpuKernelTuning.SharedInputDotChainGroupMax)
+                {
+                    Console.WriteLine($"prefill-profile: --attention-batch-dots '{sharedDotValue}' must be off, on, or a chain group 0..{CpuKernelTuning.SharedInputDotChainGroupMax}");
+                    return 1;
+                }
+
+                break;
             case "--out":
                 if (i + 1 >= args.Length)
                 {
@@ -1053,8 +1122,15 @@ static int BenchPrefillProfile(string[] args)
         }
     }
 
+    CpuKernelTuningOverrides? pinnedTuning = matmulRouteWidth is null && matmulRouteWidthQ4K is null && sharedDotChainGroup is null
+        ? null // nothing stated: every knob resolves from the opened posture, exactly as an engine open would.
+        : new CpuKernelTuningOverrides { MatmulRouteBatchWidth = matmulRouteWidth, MatmulRouteBatchWidthQ4K = matmulRouteWidthQ4K, SharedInputDotChainGroup = sharedDotChainGroup };
+
     using GgufFile gguf = GgufFile.Open(args[1]);
-    using CpuBackend backend = new(threads: threads, allowAvx2: true);
+    using CpuBackend backend = new(
+        threads: threads,
+        allowAvx2: true,
+        tuning: pinnedTuning);
 
     // Each candidate engine owns and releases its own mmap view of the file: a shared source would be released by whichever
     // candidate disposes first while later candidates still read tensors through it.
@@ -1374,7 +1450,7 @@ static int BenchPrefillProfile(string[] args)
         [
             $"prefill-profile file={gguf.Path} bytes={gguf.FileSize} threads={backend.EffectiveWorkerCount} maxBatchSequences={TransformerModel.MaxBatchSequences}",
             $"  arch={geometry.Architecture} layers={geometry.LayerCount} hidden={geometry.HiddenSize} heads={geometry.HeadCount} kvHeads={geometry.KvHeadCount} headDim={geometry.HeadDim} vocab={geometry.VocabSize} windowedLayers={windowedLayers} avx2={Avx2.IsSupported}",
-            $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" + (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : "") + (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : "") + (stageProfile ? " stageProfile=on" : ""),
+            $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" + (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : "") + (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : "") + (stageProfile ? " stageProfile=on" : "") + (matmulRouteWidth is { } mw ? $" matmulRoute={mw}" : "") + (matmulRouteWidthQ4K is { } mqw ? $" q4kMatmulRoute={mqw}" : "") + (sharedDotChainGroup is { } sdg ? $" attentionBatchDots={sdg}" : ""),
             .. reportBody,
         ];
 

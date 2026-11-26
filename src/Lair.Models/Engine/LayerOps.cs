@@ -16,6 +16,12 @@ namespace Lair.Models.Engine;
 /// </summary>
 internal static class LayerOps
 {
+    // Ceiling for one shared-operand score-dot batch: the width of a vector posture's accumulator chain group, so a call maps to one
+    // chain-group pass over the shared K operand. A grouped-query run longer than this walks in consecutive batches of it — batching only
+    // ever covers independent accumulator chains, so the split changes nothing numerically. Backends that cap their own chain group lower
+    // chunk calls into groups of their budget rather than refusing them.
+    private const int MaxSharedInputDotBatch = 8;
+
     /// <summary>RMSNorm with weight: dst[i] = src[i] / sqrt(mean(src^2) + eps) * w[i]. The mean accumulates in double.</summary>
     internal static void RmsNormWeighted(ReadOnlySpan<float> src, ReadOnlySpan<float> weight, float eps, Span<float> dst)
     {
@@ -544,6 +550,10 @@ internal static class LayerOps
     /// the selection fails instead of reaching past the window. Positions excluded this way stay written and readable
     /// for every other layer's own selection. The weighted V accumulation is normalized in place into outConcat
     /// (head-major layout). A non-positive softcap disables the cap: the score path is then exactly the uncapped one.
+    /// Heads are walked in consecutive runs that share a kv-head, so each scored position's K and V are read once for the whole run and its
+    /// scores come from one shared-operand dot batch when the backend offers <see cref="IDenseSharedInputDot"/> with its shared-dot route on;
+    /// otherwise every score is an individual <see cref="IBackend.Dot"/>. Either way each head keeps its own running max/sum and visits exactly
+    /// its selection's positions in ascending order, so the batched walk lands bit-for-bit where per-head dots leave it.
     /// </summary>
     internal static void CausalAttention(
         IBackend backend,
@@ -570,56 +580,110 @@ internal static class LayerOps
         BlockSelection read = kv.SelectCausalRead(position, window); // the in-window positions and exactly which blocks they live in
         int blockTokens = kv.BlockTokens;
 
-        for (int h = 0; h < headCount; h++)
+        IDenseSharedInputDot? sharedDots = backend as IDenseSharedInputDot; // resolved once per call like the dense fusion seam: a backend that does not implement it, or resolves its shared-dot route off, keeps every score an individual Dot.
+
+        // One batch's worth of walk state and scores, sized to the shared-dot cap and reused across batches and positions by this single-threaded pass:
+        // each head in the current batch keeps its own running max/sum here, and a position's batched scores land in the score buffer before that
+        // batch's heads consume them in ascending order.
+        Span<float> batchMax = stackalloc float[MaxSharedInputDotBatch];
+        Span<float> batchSumExp = stackalloc float[MaxSharedInputDotBatch];
+        Span<float> scores = stackalloc float[MaxSharedInputDotBatch];
+
+        // Grouped-query walk over consecutive heads sharing one kv-head: each scored position's K and V are read once for the whole batch
+        // instead of once per head, and the batch's query regions — already consecutive in the row's head-major layout — feed one shared-operand
+        // dot call. Every head keeps its own online-softmax state across the walk and advances through exactly the ascending positions its own
+        // single-head pass would have scored, with the same scaled-then-capped score path, rescale-on-new-max rule, weight accumulation order,
+        // and final 1f / sumExp normalization, so a batched window lands bit-for-bit where per-head dots leave it. A group longer than the cap
+        // walks in consecutive batches of it: batching only ever covers independent accumulator chains, never one chain's internal order.
+        for (int hStart = 0; hStart < headCount;)
         {
-            ReadOnlySpan<float> qh = qHeads.Slice(h * headDim, headDim);
-            int kvHead = h * kvHeadCount / headCount; // grouped-query mapping: consecutive heads share a kv-head
-            Span<float> outHead = outConcat.Slice(h * headDim, headDim);
+            int kvHead = hStart * kvHeadCount / headCount; // grouped-query mapping: consecutive heads share a kv-head
 
-            float runningMax = float.NegativeInfinity;
-            float sumExp = 0f;
-            outHead.Clear();
-
-            for (int blockIndex = read.FirstBlockIndex; blockIndex <= read.LastBlockIndex; blockIndex++)
+            int groupEnd = hStart + 1;
+            while (groupEnd < headCount && groupEnd * kvHeadCount / headCount == kvHead)
             {
-                // Only the selected block's slots inside the windowed range: a partial first or last block contributes its
-                // in-range positions, and no position outside the selection is ever addressed.
-                int slotFirst = Math.Max(read.FirstPosition, blockIndex * blockTokens);
-                int slotLast = Math.Min(read.LastPosition, (blockIndex + 1) * blockTokens - 1);
-
-                for (int t = slotFirst; t <= slotLast; t++)
-                {
-                    ReadOnlySpan<float> kt = kv.ReadK(read, t, layer).Slice(kvHead * headDim, headDim);
-                    float score = backend.Dot(qh, kt) * attnScale;
-                    if (softcap > 0f)
-                    {
-                        score = Softcap(score, softcap); // after scaling, before the online softmax sees it
-                    }
-
-                    if (score > runningMax)
-                    {
-                        // Rescale everything accumulated under the old max so all weights share the new exponent base.
-                        if (!float.IsNegativeInfinity(runningMax))
-                        {
-                            float rescale = MathF.Exp(runningMax - score);
-                            sumExp *= rescale;
-
-                            ScaleAccumulator(outHead, rescale);
-                        }
-
-                        runningMax = score;
-                    }
-
-                    float weight = MathF.Exp(score - runningMax); // the current max term contributes exactly 1
-                    sumExp += weight;
-
-                    ReadOnlySpan<float> vt = kv.ReadV(read, t, layer).Slice(kvHead * headDim, headDim);
-                    AccumulateWeighted(outHead, vt, weight);
-                }
+                groupEnd++;
             }
 
-            float invSum = 1f / sumExp; // >= 1 because the max term contributes exp(0)
-            ScaleAccumulator(outHead, invSum);
+            for (int batchStart = hStart; batchStart < groupEnd;)
+            {
+                int batchSize = Math.Min(MaxSharedInputDotBatch, groupEnd - batchStart); // the shared-dot cap: sizes the score scratch and per-head state against the vector posture's chain-group ceiling.
+                ReadOnlySpan<float> qBatch = qHeads.Slice(batchStart * headDim, batchSize * headDim);
+
+                Span<float> runningMax = batchMax.Slice(0, batchSize); // this batch's online state lives in the call's reusable buffers
+                Span<float> sumExp = batchSumExp.Slice(0, batchSize);
+                for (int i = 0; i < batchSize; i++)
+                {
+                    // Seeded exactly as the per-head walk seeds each head it runs: running max at negative infinity, weight sum at zero, accumulator cleared.
+                    runningMax[i] = float.NegativeInfinity;
+                    sumExp[i] = 0f;
+
+                    outConcat.Slice((batchStart + i) * headDim, headDim).Clear();
+                }
+
+                for (int blockIndex = read.FirstBlockIndex; blockIndex <= read.LastBlockIndex; blockIndex++)
+                {
+                    // Only the selected block's slots inside the windowed range: a partial first or last block contributes its
+                    // in-range positions, and no position outside the selection is ever addressed.
+                    int slotFirst = Math.Max(read.FirstPosition, blockIndex * blockTokens);
+                    int slotLast = Math.Min(read.LastPosition, (blockIndex + 1) * blockTokens - 1);
+
+                    for (int t = slotFirst; t <= slotLast; t++)
+                    {
+                        ReadOnlySpan<float> kt = kv.ReadK(read, t, layer).Slice(kvHead * headDim, headDim); // this position's K read once for every head in the batch sharing its kv-head
+
+                        if (!(sharedDots is not null && sharedDots.TryDotBatchSharedInput(qBatch, batchSize, kt, scores.Slice(0, batchSize))))
+                        {
+                            for (int i = 0; i < batchSize; i++)
+                            {
+                                scores[i] = backend.Dot(qHeads.Slice((batchStart + i) * headDim, headDim), kt); // the individual-dot posture: exactly what this walk scored before the seam existed.
+                            }
+                        }
+
+                        ReadOnlySpan<float> vt = kv.ReadV(read, t, layer).Slice(kvHead * headDim, headDim); // and its V once for the same batch of heads
+
+                        for (int i = 0; i < batchSize; i++)
+                        {
+                            Span<float> outHead = outConcat.Slice((batchStart + i) * headDim, headDim);
+
+                            float score = scores[i] * attnScale; // scaled first, exactly as this head's own dot result was scaled before.
+                            if (softcap > 0f)
+                            {
+                                score = Softcap(score, softcap); // after scaling, before the online softmax sees it
+                            }
+
+                            if (score > runningMax[i])
+                            {
+                                // Rescale everything accumulated under this head's old max so all its weights share the new exponent base.
+                                if (!float.IsNegativeInfinity(runningMax[i]))
+                                {
+                                    float rescale = MathF.Exp(runningMax[i] - score);
+                                    sumExp[i] *= rescale;
+
+                                    ScaleAccumulator(outHead, rescale);
+                                }
+
+                                runningMax[i] = score;
+                            }
+
+                            float weight = MathF.Exp(score - runningMax[i]); // the current max term contributes exactly 1
+                            sumExp[i] += weight;
+
+                            AccumulateWeighted(outHead, vt, weight);
+                        }
+                    }
+                }
+
+                for (int i = 0; i < batchSize; i++)
+                {
+                    float invSum = 1f / sumExp[i]; // >= 1 because the max term contributes exp(0)
+                    ScaleAccumulator(outConcat.Slice((batchStart + i) * headDim, headDim), invSum);
+                }
+
+                batchStart += batchSize; // the next batch of this group starts where this one's heads end
+            }
+
+            hStart = groupEnd; // the next group starts where this one's kv-head run ends
         }
     }
 
@@ -764,6 +828,10 @@ internal static class LayerOps
     /// attnScale per row, then <see cref="Softcap"/> when softcap is positive, before that row's running max sees them. Row
     /// state lives in caller-owned arrays indexed by head and row (head-major within each row), reused across calls so the
     /// pass allocates nothing itself. A non-positive softcap disables the cap: the score path stays exactly the uncapped one.
+    /// Within a group, consecutive heads of that group are scored against the position's K read in one shared-operand dot batch when the backend offers
+    /// <see cref="IDenseSharedInputDot"/> with its shared-dot route on — those heads' query regions sit consecutively in each row's head-major layout — and
+    /// individual <see cref="IBackend.Dot"/> calls otherwise. A group longer than one batch walks in consecutive batches of it; batching only ever covers
+    /// independent accumulator chains, so every (row, head) pair keeps the exact ascending-position update sequence its own walk had.
     /// </summary>
     internal static void CausalAttentionTiledRows(
         IBackend backend,
@@ -811,6 +879,11 @@ internal static class LayerOps
 
         int blockTokens = kv.BlockTokens;
 
+        IDenseSharedInputDot? sharedDots = backend as IDenseSharedInputDot; // resolved once per call like the dense fusion seam: a backend that does not implement it, or resolves its shared-dot route off, keeps every score an individual Dot.
+
+        // One head batch's scores, sized to the shared-dot cap and reused across groups, blocks, positions, and rows by this single-threaded walk before each row's own head updates consume them in ascending order.
+        Span<float> dotBatchScores = stackalloc float[MaxSharedInputDotBatch];
+
         // Seed every row's online-softmax state exactly as the single-row pass seeds each head it runs: running max at negative infinity, weight sum at zero, accumulator cleared. The state arrays live across blocks and positions while a row walks them in ascending order.
         outConcat.Slice(0, rowCount * region).Clear();
 
@@ -854,35 +927,50 @@ internal static class LayerOps
                         ReadOnlySpan<float> qRow = qRows.Slice(r * region, region); // this row's queries: each head slices its assigned region under the same grouped-query mapping as the single-row pass
                         Span<float> outHeadRow = outConcat.Slice(r * region, region);
 
-                        for (int h = hStart; h < groupEnd; h++)
+                        // One shared-K dot batch per consecutive head run of this group: every score at this position against these rows' own queries comes from a single pass over the K read the whole group already shares, where each head's query region sits consecutively in that row's head-major layout. The update walk below still runs those heads in ascending order with their own row-state entries, so batching changes only how a score is produced — never which positions a (row, head) pair sees or in what order it updates max/sum/rescale/AccumulateWeighted.
+                        for (int hBatchStart = hStart; hBatchStart < groupEnd;)
                         {
-                            ReadOnlySpan<float> qh = qRow.Slice(h * headDim, headDim);
-                            int state = r * headCount + h; // this row's online-softmax entry for the walked head across blocks and positions
+                            int batchSize = Math.Min(MaxSharedInputDotBatch, groupEnd - hBatchStart); // the shared-dot cap: sizes the score scratch against the vector posture's chain-group ceiling.
 
-                            float score = backend.Dot(qh, kt) * attnScale;
-                            if (softcap > 0f)
+                            if (!(sharedDots is not null && sharedDots.TryDotBatchSharedInput(qRow.Slice(hBatchStart * headDim, batchSize * headDim), batchSize, kt, dotBatchScores.Slice(0, batchSize))))
                             {
-                                score = Softcap(score, softcap); // after scaling, before that row's online max sees it — per row as in the single-row pass
+                                for (int i = 0; i < batchSize; i++)
+                                {
+                                    dotBatchScores[i] = backend.Dot(qRow.Slice((hBatchStart + i) * headDim, headDim), kt); // the individual-dot posture: exactly what this walk scored before the seam existed.
+                                }
                             }
 
-                            if (score > runningMaxRowState[state])
+                            for (int h = hBatchStart; h < hBatchStart + batchSize; h++)
                             {
-                                // Rescale everything accumulated under this row's old max so all its weights share the new exponent base.
-                                if (!float.IsNegativeInfinity(runningMaxRowState[state]))
-                                {
-                                    float rescale = MathF.Exp(runningMaxRowState[state] - score);
-                                    sumExpRowState[state] *= rescale;
+                                int state = r * headCount + h; // this row's online-softmax entry for the walked head across blocks and positions
 
-                                    ScaleAccumulator(outHeadRow.Slice(h * headDim, headDim), rescale);
+                                float score = dotBatchScores[h - hBatchStart] * attnScale;
+                                if (softcap > 0f)
+                                {
+                                    score = Softcap(score, softcap); // after scaling, before that row's online max sees it — per row as in the single-row pass
                                 }
 
-                                runningMaxRowState[state] = score;
+                                if (score > runningMaxRowState[state])
+                                {
+                                    // Rescale everything accumulated under this row's old max so all its weights share the new exponent base.
+                                    if (!float.IsNegativeInfinity(runningMaxRowState[state]))
+                                    {
+                                        float rescale = MathF.Exp(runningMaxRowState[state] - score);
+                                        sumExpRowState[state] *= rescale;
+
+                                        ScaleAccumulator(outHeadRow.Slice(h * headDim, headDim), rescale);
+                                    }
+
+                                    runningMaxRowState[state] = score;
+                                }
+
+                                float weight = MathF.Exp(score - runningMaxRowState[state]); // the current max term contributes exactly 1
+                                sumExpRowState[state] += weight;
+
+                                AccumulateWeighted(outHeadRow.Slice(h * headDim, headDim), vt, weight);
                             }
 
-                            float weight = MathF.Exp(score - runningMaxRowState[state]); // the current max term contributes exactly 1
-                            sumExpRowState[state] += weight;
-
-                            AccumulateWeighted(outHeadRow.Slice(h * headDim, headDim), vt, weight);
+                            hBatchStart += batchSize; // the next batch of this group starts where this one's heads end
                         }
                     }
                 }

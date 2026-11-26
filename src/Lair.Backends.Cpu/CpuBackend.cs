@@ -454,6 +454,20 @@ public sealed unsafe partial class CpuBackend : IBackend
         int stride = (int)strideBytes;
         QuantFormat format = w.Format;
 
+        // The hybrid dense-matrix route: at or above the resolved batch width, a Q6_K batched pass runs its rows through
+        // the blocked matmul tile executor instead of the per-row scratch batch dot — one activation-vector load per chunk
+        // feeds every tile row's accumulator chain where the scratch route re-reads the activation batch once per chain
+        // group. The same crossover applies to Q4_K only when a width is stated for it: no resolved posture promotes that
+        // format (see CpuKernelTuning), so an auto open keeps today's batched-row kernels and an internal seam states a
+        // width when a measurement wants the tile executor there instead. The tile executor's own bit-identity contract
+        // covers either switch: every output element keeps the same ascending chunk walk, FMA association, and scalar-tail
+        // cleanup as the batched-row kernel for it. Formats outside the blocked matmul keep their batched-row kernels
+        // unchanged, and neither format is a Q8_K-activation one, so this route never interacts with the quantized-
+        // activation staging below.
+        bool q6KMatmulRoute = format == QuantFormat.Q6_K && _tuning.MatmulRouteBatchWidth > 0 && count >= _tuning.MatmulRouteBatchWidth;
+        bool q4KMatmulRoute = format == QuantFormat.Q4_K && _tuning.MatmulRouteBatchWidthQ4K > 0 && count >= _tuning.MatmulRouteBatchWidthQ4K;
+        bool matmulRoute = q6KMatmulRoute || q4KMatmulRoute;
+
         // Same shared quantized activation as Gemv: one Q8_K region per batch vector, built once for the whole call.
         bool usesQ8K = UsesQ8KActivation(format);
         int q8Blocks = Q8KBlockCount(cols);
@@ -487,7 +501,11 @@ public sealed unsafe partial class CpuBackend : IBackend
             CpuKernelTuning tuning = _tuning;
             bool parallel = workers > 1 && rows >= tuning.ParallelRowThreshold;
 
-            if (!parallel)
+            if (matmulRoute)
+            {
+                RunMatmulDispatch(pBytes, stride, pIn, pOut, rows, cols, count, format);
+            }
+            else if (!parallel)
             {
                 for (int row = 0; row < rows; row++)
                 {
