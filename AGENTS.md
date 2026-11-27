@@ -4,12 +4,12 @@ Repository-specific guidance for anyone (human or agent) working in this tree. R
 
 ## Documentation is part of the deliverable
 
-LAIR keeps two documentation trees, both authoritative, both maintained with the code:
+LAIR keeps two documentation trees, both authoritative, both maintained with the code — [`docs/README.md`](docs/README.md) explains which tree a change belongs to:
 
 | Tree | Audience | Contents |
 |---|---|---|
 | `docs/user/` | operators | What LAIR does today, how to run it, every CLI flag and config key, what is planned but not yet accepted. Entry point `docs/user/README.md`, detail in `docs/user/reference/CLI.md` and `docs/user/reference/CONFIG.md`. |
-| `docs/engine/` | contributors and engine readers | How the implemented engine actually works: module map, each stage of the inference pipeline, scheduler and step composition, CPU kernel design, quantization handling, CUDA backend, KV cache and prefix reuse, residency tiers and budgets, model profiles, tokenizer/template/tool/sampling behavior, measurement harnesses, comparison with other engines, and the catalog of tricks/tweaks. Entry point `docs/engine/README.md`. |
+| `docs/engine/` | contributors and engine readers | How the implemented engine actually works: module map, each stage of the inference pipeline, scheduler and step composition, CPU kernel design, quantization handling, CUDA backend, KV cache and prefix reuse, residency tiers and budgets, model profiles, tokenizer/template/tool/sampling behavior, measurement harnesses, comparison with other engines, and the catalog of tricks/tweaks. Entry point `docs/engine/README.md`, detail pages under `docs/engine/reference/`. |
 
 Rules that apply to both trees:
 
@@ -26,18 +26,18 @@ Every change to engine behavior updates at least one page here — no exceptions
 |---|---|
 | routes, CLI verbs, flags, exit codes, error shapes | `docs/user/reference/CLI.md`, `docs/user/README.md` |
 | config keys, defaults, constraints, hot-reload mutation class | `docs/user/reference/CONFIG.md`, `lair.example.yaml`, `docs/user/README.md` |
-| scheduler, admission, batching, step composition, lanes, concurrency gates | `docs/engine/scheduling.md`, `docs/engine/request-lifecycle.md` |
-| prefill kernels, GEMV/GEMM paths, ISA dispatch, fusion, grid modes, row widths | `docs/engine/cpu-kernels.md`, `docs/engine/tricks-and-tweaks.md` |
-| quant format coverage (loader acceptance, kernel support) | `docs/engine/quantization.md`, plus the model-family section of `docs/user/README.md` and both backend pages |
-| CUDA kernels, PTX binding, device step composition, KV mirroring, streams, capability gates | `docs/engine/cuda-backend.md` |
-| block pools, KV formats, prefix cache, windowed KV | `docs/engine/kv-cache.md` |
-| ledgers, tier chains, budget caps, host posture, NUMA placement, weight residency | `docs/engine/residency-and-budgets.md` |
-| architecture profiles, rope scaling, softcap/windowing, MoE descriptors, new model families | `docs/engine/model-profiles.md`, plus the model-family section of `docs/user/README.md` |
-| tokenizer profiles, chat templates, tool parsing, reasoning regions/budgets | `docs/engine/tokenizer-templating-tools.md` |
-| sampler, penalties, logprobs, drafting seams | `docs/engine/sampling-and-drafting.md`, plus the sampling fields in `docs/user/reference/CONFIG.md` |
-| monitor stream, metrics bus, accounting | `docs/engine/monitoring-and-metrics.md`, plus `/monitor/stream` and monitor rows in `docs/user/README.md` |
-| bench harness verbs, parity gates, new measurement workflow | `docs/engine/measurement-harnesses.md` and `DEVELOP.md` |
-| a decision that changes how the engine behaves relative to other engines | `docs/engine/comparisons.md`, plus an entry in `CHANGELOG.md` |
+| scheduler, admission, batching, step composition, lanes, concurrency gates | `docs/engine/reference/scheduling.md`, `docs/engine/reference/request-lifecycle.md` |
+| prefill kernels, GEMV/GEMM paths, ISA dispatch, fusion, grid modes, row widths | `docs/engine/reference/cpu-kernels.md`, `docs/engine/reference/tricks-and-tweaks.md` |
+| quant format coverage (loader acceptance, kernel support) | `docs/engine/reference/quantization.md`, plus the model-family section of `docs/user/README.md` and both backend pages |
+| CUDA kernels, PTX binding, device step composition, KV mirroring, streams, capability gates | `docs/engine/reference/cuda-backend.md` |
+| block pools, KV formats, prefix cache, windowed KV | `docs/engine/reference/kv-cache.md` |
+| ledgers, tier chains, budget caps, host posture, NUMA placement, weight residency | `docs/engine/reference/residency-and-budgets.md` |
+| architecture profiles, rope scaling, softcap/windowing, MoE descriptors, new model families | `docs/engine/reference/model-profiles.md`, plus the model-family section of `docs/user/README.md` |
+| tokenizer profiles, chat templates, tool parsing, reasoning regions/budgets | `docs/engine/reference/tokenizer-templating-tools.md` |
+| sampler, penalties, logprobs, drafting seams | `docs/engine/reference/sampling-and-drafting.md`, plus the sampling fields in `docs/user/reference/CONFIG.md` |
+| monitor stream, metrics bus, accounting | `docs/engine/reference/monitoring-and-metrics.md`, plus `/monitor/stream` and monitor rows in `docs/user/README.md` |
+| bench harness verbs, parity gates, new measurement workflow | `docs/engine/reference/measurement-harnesses.md` and `DEVELOP.md` |
+| a decision that changes how the engine behaves relative to other engines | `docs/engine/reference/comparisons.md`, plus an entry in `CHANGELOG.md` |
 
 Also expected on each ship:
 

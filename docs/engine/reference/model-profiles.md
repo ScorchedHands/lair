@@ -2,9 +2,9 @@
 
 Scope: how a GGUF file's `general.architecture` resolves to a profile, what the resolved plan carries, where each strategy value lands in the forward, and which postures refuse at load or engine open. As of 2026-11-27.
 
-A **profile** is the load-time fact sheet for one architecture: its metadata prefix, the strategy values the forward switches on, the tensor map naming every logical role, and (for MoE-shaped families) a sparse-FFN shape carrying zero counts — the real counts come from the file's declared metadata, never the profile. A **plan** (`ModelPlan`) is what one resolved against one file: geometry read under the prefix plus strategy values landed once so the hot forward path stays concrete and never dispatches per token ([`src/Lair.Models/ModelProfile.cs`](../../src/Lair.Models/ModelProfile.cs), [`src/Lair.Models/ModelPlans.cs`](../../src/Lair.Models/ModelPlans.cs)).
+A **profile** is the load-time fact sheet for one architecture: its metadata prefix, the strategy values the forward switches on, the tensor map naming every logical role, and (for MoE-shaped families) a sparse-FFN shape carrying zero counts — the real counts come from the file's declared metadata, never the profile. A **plan** (`ModelPlan`) is what one resolved against one file: geometry read under the prefix plus strategy values landed once so the hot forward path stays concrete and never dispatches per token ([`src/Lair.Models/ModelProfile.cs`](../../../src/Lair.Models/ModelProfile.cs), [`src/Lair.Models/ModelPlans.cs`](../../../src/Lair.Models/ModelPlans.cs)).
 
-Strategy values are profile facts, not file facts — which tensors a family ships is decided by the registry entry and no metadata key overrides placement, interleave, or layout today ([`src/Lair.Models/ModelProfile.cs`](../../src/Lair.Models/ModelProfile.cs) line 108). That asymmetry is deliberate: the plan resolves once at load so the forward switches on concrete values and never dispatches through a per-token interface (the same reason `NormStrategy`, `ActivationStrategy` and friends carry no runtime probe). Adding a family means adding one registry entry plus its tensor map and strategy values ([`src/Lair.Models/ModelProfiles.cs`](../../src/Lair.Models/ModelProfiles.cs) header lines 3–9); nothing else in the engine changes.
+Strategy values are profile facts, not file facts — which tensors a family ships is decided by the registry entry and no metadata key overrides placement, interleave, or layout today ([`src/Lair.Models/ModelProfile.cs`](../../../src/Lair.Models/ModelProfile.cs) line 108). That asymmetry is deliberate: the plan resolves once at load so the forward switches on concrete values and never dispatches through a per-token interface (the same reason `NormStrategy`, `ActivationStrategy` and friends carry no runtime probe). Adding a family means adding one registry entry plus its tensor map and strategy values ([`src/Lair.Models/ModelProfiles.cs`](../../../src/Lair.Models/ModelProfiles.cs) header lines 3–9); nothing else in the engine changes.
 
 ## Resolution flow
 
@@ -21,7 +21,7 @@ flowchart TD
     G --> I["ModelPlan: strategy values from profile,<br/>feature defaults overridden by file declarations"]
 ```
 
-`ModelProfiles.ResolveOrFallback` returns a registered profile or the generic one; `ModelPlans.Resolve` then verifies the fallback's tensor-table match before reading any metadata, deriving block extent from the table itself ([`src/Lair.Models/ModelProfiles.cs`](../../src/Lair.Models/ModelProfiles.cs), [`src/Lair.Models/ModelPlans.cs`](../../src/Lair.Models/ModelPlans.cs) lines 63–87). An unregistered name never reaches `Resolve`: it fails with
+`ModelProfiles.ResolveOrFallback` returns a registered profile or the generic one; `ModelPlans.Resolve` then verifies the fallback's tensor-table match before reading any metadata, deriving block extent from the table itself ([`src/Lair.Models/ModelProfiles.cs`](../../../src/Lair.Models/ModelProfiles.cs), [`src/Lair.Models/ModelPlans.cs`](../../../src/Lair.Models/ModelPlans.cs) lines 63–87). An unregistered name never reaches `Resolve`: it fails with
 
 ```
 model architecture '<x>' is not supported (supported architectures: llama, qwen2, qwen3, gemma2, gemma3, phi3, qwen2moe, qwen3moe, olmoe, qwen4exp)
@@ -48,7 +48,7 @@ model architecture '<x>' is not supported (supported architectures: ...): the ll
 | `olmoe` | RmsNorm · SwiGLU | adjacent (reference asserts full-head coverage) | `DefaultQkNorm = StreamWeighted`: one RMS norm over each side's whole projected stream before head splitting, scaled by a hidden-sized vector the file ships whether or not it declares the feature; no shared expert, no routing-weight gain declared by reference |
 | `qwen4exp` | RmsNorm · SwiGLU | rotate-half (qwen3 lineage) | see §qwen4exp below — geometry flag + sparse shape reused from qwen2moe |
 
-Strategy enums live in [`src/Lair.Models/ModelStrategies.cs`](../../src/Lair.Models/ModelStrategies.cs): `NormStrategy {RmsNorm, LayerNorm}`, `ActivationStrategy {SwiGLU, GeGlu, GeGluExact}`, `BiasPolicy {ByTensorPresence, Declared}`, `QkNormMode {Off, PerHeadWeighted, PerHeadUnweighted, StreamWeighted}` (per-head over each head's own slice weighted or with epsilon alone; stream-weighted jointly normalizes every head of one side under a single mean), `RopeStrategy {StandardFullHead, RotateHalfFullHead}`, `NormPlacement {PreOnly, PostSublayerOutputs}` — the post placement adds a second norm on each sublayer output and makes those tensors required at load while pre-only treats their presence as a layout failure.
+Strategy enums live in [`src/Lair.Models/ModelStrategies.cs`](../../../src/Lair.Models/ModelStrategies.cs): `NormStrategy {RmsNorm, LayerNorm}`, `ActivationStrategy {SwiGLU, GeGlu, GeGluExact}`, `BiasPolicy {ByTensorPresence, Declared}`, `QkNormMode {Off, PerHeadWeighted, PerHeadUnweighted, StreamWeighted}` (per-head over each head's own slice weighted or with epsilon alone; stream-weighted jointly normalizes every head of one side under a single mean), `RopeStrategy {StandardFullHead, RotateHalfFullHead}`, `NormPlacement {PreOnly, PostSublayerOutputs}` — the post placement adds a second norm on each sublayer output and makes those tensors required at load while pre-only treats their presence as a layout failure.
 
 ## Plan metadata keys
 
@@ -71,19 +71,19 @@ Feature defaults resolve against declarations exactly as the profile table above
 
 ## Tensor maps: what is required, optional, or unread material
 
-`CanonicalTensors()` names the llama.cpp GGUF layout every supported profile ships ([`src/Lair.Models/ModelProfiles.cs`](../../src/Lair.Models/ModelProfiles.cs) lines 372–408). The required core is embedding, per-layer q/k/v/output projections, gate/up/down triplet, and the pre-sublayer + output norm vectors; everything family-specific rides as optional so a load can **report** a file rather than reject its material:
+`CanonicalTensors()` names the llama.cpp GGUF layout every supported profile ships ([`src/Lair.Models/ModelProfiles.cs`](../../../src/Lair.Models/ModelProfiles.cs) lines 372–408). The required core is embedding, per-layer q/k/v/output projections, gate/up/down triplet, and the pre-sublayer + output norm vectors; everything family-specific rides as optional so a load can **report** a file rather than reject its material:
 
 - Attention bias quartets (`attn_q/k/v.bias`, `attn_output.bias`) are optional in every map — llama files carry none while qwen2/qwen3 may — and the resolved bias policy decides whether they're consumed, required, or logged-as-ignored.
 - Per-head QK-norm vectors (`attn_q_norm/attn_k_norm.weight`) ride optional because the resolved mode decides at load: a profile defaulting them on makes a file without them fail naming them; an off mode ignores present ones. Norm-bias vectors follow the same rule against `attention.norm_bias`.
 - Post-sublayer norm vectors are declared in every canonical map but consumed only under `PostSublayerOutputs`; presence of one under a pre-only placement is a **layout failure**, not ignorable material — that asymmetry is deliberate so misplacement surfaces at load.
-- The output head (`output.weight`) and its bias are optional: a model without an untied head produces logits through tied token-embedding rows instead, which the final-logit softcap also saturates ([`src/Lair.Models/Engine/TransformerModel.cs`](../../src/Lair.Models/Engine/TransformerModel.cs) header lines 15–20).
+- The output head (`output.weight`) and its bias are optional: a model without an untied head produces logits through tied token-embedding rows instead, which the final-logit softcap also saturates ([`src/Lair.Models/Engine/TransformerModel.cs`](../../../src/Lair.Models/Engine/TransformerModel.cs) header lines 15–20).
 - `PhiTensors()` swaps in the fused roles: required `blk.{layer}.attn_qkv.weight`, with split q/k/v and a separate gate matrix demoted to optional — shipping them for phi3 is "material this block does not read", reported rather than loaded.
 - `MoeTensors()` relaxes the dense gate/up/down triplet (an expert-routed block ships per-expert stacks instead) and adds every sparse role as optional: router (`ffn_gate_inp.weight`), stacked triplets (`ffn_gate_exps/ffn_up_exps/ffn_down_exps.weight`), shared triplet (`*_shexp.weight`), the hidden-sized selector `ffn_gate_inp_shexp.weight`, plus factorized basis/coefficient/output-basis names with plural aliases. Dense profiles carry no sparse roles at all, and the generic fallback treats a tensor under any of those names as unexpected material.
 - `Qwen4ExpTensors()` relaxes dense FFN roles, the split q/k/v/output quartet **and** plain per-sublayer norms too: which layers need them is decided by each layer's resolved attention kind (only sparse-full layers project through separate tensors; only linear-layer blocks run without hyper-connection stream norms), so a flat required flag would reject one half of this family's own blocks. The plan gate over the resolved interleave — not the map flags — makes material required where its kind needs it and reports missing names concretely (see §qwen4exp).
 
 ## Where plan values land in the forward
 
-From `TransformerModel.cs` header docs and [`src/Lair.Models/Engine/LayerOps.cs`](../../src/Lair.Models/Engine/LayerOps.cs):
+From `TransformerModel.cs` header docs and [`src/Lair.Models/Engine/LayerOps.cs`](../../../src/Lair.Models/Engine/LayerOps.cs):
 
 - Each layer normalizes its input stream (norm × weight under the resolved norm strategy) before QKV GEMVs; RoPE rotates q/k pairs at absolute position with `theta_i = base^(-2i/headDim)` using adjacent or rotate-half pairing per profile. Rotation tables precompute cos/sin per position up to the context ceiling so decode reads bit-identical rotations, and windowed layers get their own theta tables from `rope.freq_base_swa` when any layer carries a window (lines ~2073–2103).
 - Attention scores scale by `(RopeScaling?.AttentionFactor ?? 1f) / sqrt(headDim)` then pass through the attention-score softcap — `LayerOps.Softcap(x, cap) = cap · tanh(x / cap)` evaluated in double and rounded once to float — before any online softmax sees it; identical scaled-then-capped order across the float kernel, quantized dot route, row-tiled batched pass, and device-composed window.
@@ -93,7 +93,7 @@ From `TransformerModel.cs` header docs and [`src/Lair.Models/Engine/LayerOps.cs`
 
 ## Sparse FFN: descriptor, layout, strategy
 
-A file declaring `<prefix>expert_count` replaces its dense gate/up/down triplet with an expert-routed block; a file declaring no count keeps the dense block ([`src/Lair.Models/SparseFfnDescriptor.cs`](../../src/Lair.Models/SparseFfnDescriptor.cs), `ModelPlans.ResolveSparseFfn`).
+A file declaring `<prefix>expert_count` replaces its dense gate/up/down triplet with an expert-routed block; a file declaring no count keeps the dense block ([`src/Lair.Models/SparseFfnDescriptor.cs`](../../../src/Lair.Models/SparseFfnDescriptor.cs), `ModelPlans.ResolveSparseFfn`).
 
 | Key | Resolution |
 |---|---|
@@ -106,7 +106,7 @@ A file declaring `<prefix>expert_count` replaces its dense gate/up/down triplet 
 | `<prefix>expert_rank` | required positive integer for a `shared_basis` declaration; declaring one on a stacked block fails: "only a block whose expert_layout is 'shared_basis' can declare expert_rank" |
 | `<prefix>sparse_ffn_strategy` | absent keeps the profile default — every registered family today defaults to `dense_resident`; only `dense_resident` / `low_rank_shared_basis` are recognized, and an inconsistent pair refuses rather than downgrades: "declares sparse-FFN strategy 'low_rank_shared_basis' on a block whose expert_layout stores its experts as stacked dense matrices with no rank: … declare expert_layout 'shared_basis' with an expert_rank, or select 'dense_resident'" |
 
-Selecting `low_rank_shared_basis` therefore stays visible in the plan and reports at engine open — nothing resident computes coefficient-space sums yet. The factorized tensor roles (`ffn_exps_basis_in.weight`, `ffn_exps_coefficient.weight`, `ffn_exps_basis_out.weight`, each with a plural alias) exist only as optional map entries an alternate weight provider could reach; no published conversion ships them ([`src/Lair.Models/ModelProfiles.cs`](../../src/Lair.Models/ModelProfiles.cs) lines 458–485). The analytical side lives in the `lowrank-svd` bench verb.
+Selecting `low_rank_shared_basis` therefore stays visible in the plan and reports at engine open — nothing resident computes coefficient-space sums yet. The factorized tensor roles (`ffn_exps_basis_in.weight`, `ffn_exps_coefficient.weight`, `ffn_exps_basis_out.weight`, each with a plural alias) exist only as optional map entries an alternate weight provider could reach; no published conversion ships them ([`src/Lair.Models/ModelProfiles.cs`](../../../src/Lair.Models/ModelProfiles.cs) lines 458–485). The analytical side lives in the `lowrank-svd` bench verb.
 
 Dense-resident execution per token, from `TransformerModel.cs` header docs (lines 41–46):
 
@@ -189,12 +189,12 @@ classDiagram
     Qwen4ExpGeometry --|> ModelPlan : only under DeclaresQwen4ExpSemantics profiles
 ```
 
-`ModelDesc.cs` is the narrow read-only view a host may query without the plan (`SupportedArchitectures` straight from the registry, plus geometry and both softcaps); `ModelRoute.CpuDefault()` lands on every plan that no host placement resolved ([`src/Lair.Models/ModelPlan.cs`](../../src/Lair.Models/ModelPlan.cs), [`src/Lair.Models/Qwen4ExpGeometry.cs`](../../src/Lair.Models/Qwen4ExpGeometry.cs)).
+`ModelDesc.cs` is the narrow read-only view a host may query without the plan (`SupportedArchitectures` straight from the registry, plus geometry and both softcaps); `ModelRoute.CpuDefault()` lands on every plan that no host placement resolved ([`src/Lair.Models/ModelPlan.cs`](../../../src/Lair.Models/ModelPlan.cs), [`src/Lair.Models/Qwen4ExpGeometry.cs`](../../../src/Lair.Models/Qwen4ExpGeometry.cs)).
 
 ## Knobs and refusals summary
 
-- The only engine knob a profile page touches is `engine.prefill_kernel` → `PrefillKernel {GemV, Tiled, Gemm}` (`gemv`/`tiled`/`gemm`, [`src/Lair.Models/ModelStrategies.cs`](../../src/Lair.Models/ModelStrategies.cs) lines 255–303): re-read at every window boundary; a selection the backend has no dense weight path for refuses at open naming formats and device — never a silent fallback. Kernel internals live in [cpu-kernels.md](./cpu-kernels.md).
-- `/v1/models` reports each model's resolved `sparse_ffn_strategy` when its plan routes experts (omitted otherwise) alongside architecture and quant facts ([`src/Lair.Http/ApiContracts.cs`](../../src/Lair.Http/ApiContracts.cs)).
+- The only engine knob a profile page touches is `engine.prefill_kernel` → `PrefillKernel {GemV, Tiled, Gemm}` (`gemv`/`tiled`/`gemm`, [`src/Lair.Models/ModelStrategies.cs`](../../../src/Lair.Models/ModelStrategies.cs) lines 255–303): re-read at every window boundary; a selection the backend has no dense weight path for refuses at open naming formats and device — never a silent fallback. Kernel internals live in [cpu-kernels.md](./cpu-kernels.md).
+- `/v1/models` reports each model's resolved `sparse_ffn_strategy` when its plan routes experts (omitted otherwise) alongside architecture and quant facts ([`src/Lair.Http/ApiContracts.cs`](../../../src/Lair.Http/ApiContracts.cs)).
 - Load-time refusals: unsupported architecture name; empty architecture key; generic fallback table mismatch; non-positive/non-finite softcap or window declarations; unrecognized rope variant or stray scaling operands; bad rotary slice; sparse count/layout/rank/strategy inconsistencies. Engine-open refusals: unrunnable prefill kernel selection, quantized-KV postures the opened route cannot serve (see [architecture.md](./architecture.md)), and every qwen4exp posture above — each names what was declared and what to change instead of falling back to whatever happens to work.
 
 Related pages: [kv-cache.md](./kv-cache.md) (windowed block selection), [cpu-kernels.md](./cpu-kernels.md) (gather kernels, prefill routes), [residency-and-budgets.md](./residency-and-budgets.md) (tier chains), [sampling-and-drafting.md](./sampling-and-drafting.md) (what sees the capped logit vector), [measurement-harnesses.md](./measurement-harnesses.md).
