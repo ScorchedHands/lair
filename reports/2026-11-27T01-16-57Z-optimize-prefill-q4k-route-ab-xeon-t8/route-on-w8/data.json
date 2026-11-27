@@ -1,0 +1,851 @@
+{
+  "report_started_utc": "2026-11-27T01:25:12Z",
+  "generated_utc": "2026-11-27T01:31:52Z",
+  "lane": "Xeon CPU-only lair-lab (root@192.168.33.53), threads=8, rowWidth=64",
+  "model_file": "/root/lair-measurements/qwen25-small-cpu/models/qwen2.5-3b-instruct-q4_k_m.gguf",
+  "lair_binary": "/root/lair-measurements/qwen25-small-cpu/build/app-q4k-ab/Lair.Bench.dll",
+  "method": "3 alternating same-session stage-profile reps=1 commands with kernels gemv, tiled; medians/min/max parsed from raw logs after ANSI stripping.",
+  "rounds": 3,
+  "rows": [
+    {
+      "key": "stage|gemv|128|attention_kernel_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "350.907",
+        "328.800",
+        "325.846"
+      ],
+      "median": 328.8,
+      "min": 325.846,
+      "max": 350.907
+    },
+    {
+      "key": "stage|gemv|128|attention_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_ms",
+      "samples": [
+        "1816.994",
+        "1766.975",
+        "1745.117"
+      ],
+      "median": 1766.975,
+      "min": 1745.117,
+      "max": 1816.994
+    },
+    {
+      "key": "stage|gemv|128|attention_output_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_output_ms",
+      "samples": [
+        "549.081",
+        "563.498",
+        "526.466"
+      ],
+      "median": 549.081,
+      "min": 526.466,
+      "max": 563.498
+    },
+    {
+      "key": "stage|gemv|128|attention_projection_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "824.309",
+        "785.477",
+        "798.274"
+      ],
+      "median": 798.274,
+      "min": 785.477,
+      "max": 824.309
+    },
+    {
+      "key": "stage|gemv|128|attention_weight_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "1373.391",
+        "1348.975",
+        "1324.740"
+      ],
+      "median": 1348.975,
+      "min": 1324.74,
+      "max": 1373.391
+    },
+    {
+      "key": "stage|gemv|128|cache_append_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "cache_append_ms",
+      "samples": [
+        "0.028",
+        "0.028",
+        "0.071"
+      ],
+      "median": 0.028,
+      "min": 0.028,
+      "max": 0.071
+    },
+    {
+      "key": "stage|gemv|128|feed_forward_down_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "feed_forward_down_ms",
+      "samples": [
+        "3159.417",
+        "3178.482",
+        "3031.313"
+      ],
+      "median": 3159.417,
+      "min": 3031.313,
+      "max": 3178.482
+    },
+    {
+      "key": "stage|gemv|128|feed_forward_gate_up_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "feed_forward_gate_up_ms",
+      "samples": [
+        "4015.384",
+        "4213.856",
+        "4083.802"
+      ],
+      "median": 4083.802,
+      "min": 4015.384,
+      "max": 4213.856
+    },
+    {
+      "key": "stage|gemv|128|feed_forward_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "feed_forward_ms",
+      "samples": [
+        "7550.481",
+        "7744.889",
+        "7483.982"
+      ],
+      "median": 7550.481,
+      "min": 7483.982,
+      "max": 7744.889
+    },
+    {
+      "key": "stage|gemv|128|feed_forward_weight_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "feed_forward_weight_ms",
+      "samples": [
+        "7174.801",
+        "7392.337",
+        "7115.115"
+      ],
+      "median": 7174.801,
+      "min": 7115.115,
+      "max": 7392.337
+    },
+    {
+      "key": "stage|gemv|128|kv_write_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "kv_write_ms",
+      "samples": [
+        "2.194",
+        "2.103",
+        "6.118"
+      ],
+      "median": 2.194,
+      "min": 2.103,
+      "max": 6.118
+    },
+    {
+      "key": "stage|gemv|128|logits_head_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "logits_head_ms",
+      "samples": [
+        "111.922",
+        "108.596",
+        "107.527"
+      ],
+      "median": 108.596,
+      "min": 107.527,
+      "max": 111.922
+    },
+    {
+      "key": "stage|gemv|128|seed_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "seed_ms",
+      "samples": [
+        "0.349",
+        "0.296",
+        "0.294"
+      ],
+      "median": 0.296,
+      "min": 0.294,
+      "max": 0.349
+    },
+    {
+      "key": "stage|gemv|128|sparse_chain_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "sparse_chain_ms",
+      "samples": [
+        "0.000",
+        "0.000",
+        "0.000"
+      ],
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    {
+      "key": "stage|gemv|128|total_ms",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "total_ms",
+      "samples": [
+        "9479.836",
+        "9620.842",
+        "9337.042"
+      ],
+      "median": 9479.836,
+      "min": 9337.042,
+      "max": 9620.842
+    },
+    {
+      "key": "stage|gemv|256|attention_kernel_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "1213.349",
+        "1363.997",
+        "1260.613"
+      ],
+      "median": 1260.613,
+      "min": 1213.349,
+      "max": 1363.997
+    },
+    {
+      "key": "stage|gemv|256|attention_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_ms",
+      "samples": [
+        "4542.424",
+        "4765.772",
+        "4639.604"
+      ],
+      "median": 4639.604,
+      "min": 4542.424,
+      "max": 4765.772
+    },
+    {
+      "key": "stage|gemv|256|attention_output_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_output_ms",
+      "samples": [
+        "1244.098",
+        "1335.363",
+        "1270.907"
+      ],
+      "median": 1270.907,
+      "min": 1244.098,
+      "max": 1335.363
+    },
+    {
+      "key": "stage|gemv|256|attention_projection_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "1894.496",
+        "1880.504",
+        "1919.404"
+      ],
+      "median": 1894.496,
+      "min": 1880.504,
+      "max": 1919.404
+    },
+    {
+      "key": "stage|gemv|256|attention_weight_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "3138.594",
+        "3215.867",
+        "3190.311"
+      ],
+      "median": 3190.311,
+      "min": 3138.594,
+      "max": 3215.867
+    },
+    {
+      "key": "stage|gemv|256|cache_append_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "cache_append_ms",
+      "samples": [
+        "0.065",
+        "0.045",
+        "0.030"
+      ],
+      "median": 0.045,
+      "min": 0.03,
+      "max": 0.065
+    },
+    {
+      "key": "stage|gemv|256|feed_forward_down_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "feed_forward_down_ms",
+      "samples": [
+        "7221.318",
+        "7434.582",
+        "7286.350"
+      ],
+      "median": 7286.35,
+      "min": 7221.318,
+      "max": 7434.582
+    },
+    {
+      "key": "stage|gemv|256|feed_forward_gate_up_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "feed_forward_gate_up_ms",
+      "samples": [
+        "9225.863",
+        "10114.156",
+        "9695.427"
+      ],
+      "median": 9695.427,
+      "min": 9225.863,
+      "max": 10114.156
+    },
+    {
+      "key": "stage|gemv|256|feed_forward_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "feed_forward_ms",
+      "samples": [
+        "17135.046",
+        "18277.278",
+        "17700.530"
+      ],
+      "median": 17700.53,
+      "min": 17135.046,
+      "max": 18277.278
+    },
+    {
+      "key": "stage|gemv|256|feed_forward_weight_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "feed_forward_weight_ms",
+      "samples": [
+        "16447.181",
+        "17548.737",
+        "16981.777"
+      ],
+      "median": 16981.777,
+      "min": 16447.181,
+      "max": 17548.737
+    },
+    {
+      "key": "stage|gemv|256|kv_write_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "kv_write_ms",
+      "samples": [
+        "12.153",
+        "4.306",
+        "4.273"
+      ],
+      "median": 4.306,
+      "min": 4.273,
+      "max": 12.153
+    },
+    {
+      "key": "stage|gemv|256|logits_head_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "logits_head_ms",
+      "samples": [
+        "110.277",
+        "108.960",
+        "104.874"
+      ],
+      "median": 108.96,
+      "min": 104.874,
+      "max": 110.277
+    },
+    {
+      "key": "stage|gemv|256|seed_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "seed_ms",
+      "samples": [
+        "0.615",
+        "0.572",
+        "0.605"
+      ],
+      "median": 0.605,
+      "min": 0.572,
+      "max": 0.615
+    },
+    {
+      "key": "stage|gemv|256|sparse_chain_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "sparse_chain_ms",
+      "samples": [
+        "0.000",
+        "0.000",
+        "0.000"
+      ],
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    {
+      "key": "stage|gemv|256|total_ms",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "total_ms",
+      "samples": [
+        "21788.554",
+        "23152.737",
+        "22445.766"
+      ],
+      "median": 22445.766,
+      "min": 21788.554,
+      "max": 23152.737
+    },
+    {
+      "key": "stage|tiled|128|attention_kernel_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "432.024",
+        "468.562",
+        "393.052"
+      ],
+      "median": 432.024,
+      "min": 393.052,
+      "max": 468.562
+    },
+    {
+      "key": "stage|tiled|128|attention_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_ms",
+      "samples": [
+        "2099.376",
+        "2226.633",
+        "1771.804"
+      ],
+      "median": 2099.376,
+      "min": 1771.804,
+      "max": 2226.633
+    },
+    {
+      "key": "stage|tiled|128|attention_output_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_output_ms",
+      "samples": [
+        "602.009",
+        "648.803",
+        "591.050"
+      ],
+      "median": 602.009,
+      "min": 591.05,
+      "max": 648.803
+    },
+    {
+      "key": "stage|tiled|128|attention_projection_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "967.342",
+        "995.949",
+        "697.450"
+      ],
+      "median": 967.342,
+      "min": 697.45,
+      "max": 995.949
+    },
+    {
+      "key": "stage|tiled|128|attention_weight_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "1569.351",
+        "1644.751",
+        "1288.500"
+      ],
+      "median": 1569.351,
+      "min": 1288.5,
+      "max": 1644.751
+    },
+    {
+      "key": "stage|tiled|128|cache_append_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "cache_append_ms",
+      "samples": [
+        "0.014",
+        "0.015",
+        "0.012"
+      ],
+      "median": 0.014,
+      "min": 0.012,
+      "max": 0.015
+    },
+    {
+      "key": "stage|tiled|128|feed_forward_down_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "feed_forward_down_ms",
+      "samples": [
+        "3949.100",
+        "4085.025",
+        "3718.702"
+      ],
+      "median": 3949.1,
+      "min": 3718.702,
+      "max": 4085.025
+    },
+    {
+      "key": "stage|tiled|128|feed_forward_gate_up_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "feed_forward_gate_up_ms",
+      "samples": [
+        "4820.264",
+        "5289.757",
+        "3748.532"
+      ],
+      "median": 4820.264,
+      "min": 3748.532,
+      "max": 5289.757
+    },
+    {
+      "key": "stage|tiled|128|feed_forward_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "feed_forward_ms",
+      "samples": [
+        "9169.124",
+        "9890.355",
+        "7844.602"
+      ],
+      "median": 9169.124,
+      "min": 7844.602,
+      "max": 9890.355
+    },
+    {
+      "key": "stage|tiled|128|feed_forward_weight_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "feed_forward_weight_ms",
+      "samples": [
+        "8769.365",
+        "9374.782",
+        "7467.234"
+      ],
+      "median": 8769.365,
+      "min": 7467.234,
+      "max": 9374.782
+    },
+    {
+      "key": "stage|tiled|128|kv_write_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "kv_write_ms",
+      "samples": [
+        "2.041",
+        "2.288",
+        "2.043"
+      ],
+      "median": 2.043,
+      "min": 2.041,
+      "max": 2.288
+    },
+    {
+      "key": "stage|tiled|128|logits_head_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "logits_head_ms",
+      "samples": [
+        "106.350",
+        "104.393",
+        "107.664"
+      ],
+      "median": 106.35,
+      "min": 104.393,
+      "max": 107.664
+    },
+    {
+      "key": "stage|tiled|128|seed_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "seed_ms",
+      "samples": [
+        "0.347",
+        "0.352",
+        "0.329"
+      ],
+      "median": 0.347,
+      "min": 0.329,
+      "max": 0.352
+    },
+    {
+      "key": "stage|tiled|128|sparse_chain_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "sparse_chain_ms",
+      "samples": [
+        "0.000",
+        "0.000",
+        "0.000"
+      ],
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    {
+      "key": "stage|tiled|128|total_ms",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "total_ms",
+      "samples": [
+        "11375.281",
+        "12221.819",
+        "9724.465"
+      ],
+      "median": 11375.281,
+      "min": 9724.465,
+      "max": 12221.819
+    },
+    {
+      "key": "stage|tiled|256|attention_kernel_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_kernel_ms",
+      "samples": [
+        "1444.274",
+        "1619.420",
+        "1603.513"
+      ],
+      "median": 1603.513,
+      "min": 1444.274,
+      "max": 1619.42
+    },
+    {
+      "key": "stage|tiled|256|attention_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_ms",
+      "samples": [
+        "4625.107",
+        "4794.049",
+        "4415.339"
+      ],
+      "median": 4625.107,
+      "min": 4415.339,
+      "max": 4794.049
+    },
+    {
+      "key": "stage|tiled|256|attention_output_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_output_ms",
+      "samples": [
+        "1156.329",
+        "1174.063",
+        "1207.982"
+      ],
+      "median": 1174.063,
+      "min": 1156.329,
+      "max": 1207.982
+    },
+    {
+      "key": "stage|tiled|256|attention_projection_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_projection_ms",
+      "samples": [
+        "1848.173",
+        "1812.980",
+        "1421.031"
+      ],
+      "median": 1812.98,
+      "min": 1421.031,
+      "max": 1848.173
+    },
+    {
+      "key": "stage|tiled|256|attention_weight_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "attention_weight_ms",
+      "samples": [
+        "3004.502",
+        "2987.043",
+        "2629.013"
+      ],
+      "median": 2987.043,
+      "min": 2629.013,
+      "max": 3004.502
+    },
+    {
+      "key": "stage|tiled|256|cache_append_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "cache_append_ms",
+      "samples": [
+        "0.032",
+        "0.032",
+        "0.016"
+      ],
+      "median": 0.032,
+      "min": 0.016,
+      "max": 0.032
+    },
+    {
+      "key": "stage|tiled|256|feed_forward_down_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "feed_forward_down_ms",
+      "samples": [
+        "7618.297",
+        "7360.121",
+        "7448.593"
+      ],
+      "median": 7448.593,
+      "min": 7360.121,
+      "max": 7618.297
+    },
+    {
+      "key": "stage|tiled|256|feed_forward_gate_up_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "feed_forward_gate_up_ms",
+      "samples": [
+        "9175.576",
+        "9576.686",
+        "7667.685"
+      ],
+      "median": 9175.576,
+      "min": 7667.685,
+      "max": 9576.686
+    },
+    {
+      "key": "stage|tiled|256|feed_forward_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "feed_forward_ms",
+      "samples": [
+        "17486.646",
+        "17707.510",
+        "15857.053"
+      ],
+      "median": 17486.646,
+      "min": 15857.053,
+      "max": 17707.51
+    },
+    {
+      "key": "stage|tiled|256|feed_forward_weight_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "feed_forward_weight_ms",
+      "samples": [
+        "16793.872",
+        "16936.806",
+        "15116.278"
+      ],
+      "median": 16793.872,
+      "min": 15116.278,
+      "max": 16936.806
+    },
+    {
+      "key": "stage|tiled|256|kv_write_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "kv_write_ms",
+      "samples": [
+        "3.628",
+        "3.948",
+        "4.239"
+      ],
+      "median": 3.948,
+      "min": 3.628,
+      "max": 4.239
+    },
+    {
+      "key": "stage|tiled|256|logits_head_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "logits_head_ms",
+      "samples": [
+        "104.244",
+        "111.778",
+        "101.506"
+      ],
+      "median": 104.244,
+      "min": 101.506,
+      "max": 111.778
+    },
+    {
+      "key": "stage|tiled|256|seed_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "seed_ms",
+      "samples": [
+        "0.619",
+        "0.645",
+        "0.564"
+      ],
+      "median": 0.619,
+      "min": 0.564,
+      "max": 0.645
+    },
+    {
+      "key": "stage|tiled|256|sparse_chain_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "sparse_chain_ms",
+      "samples": [
+        "0.000",
+        "0.000",
+        "0.000"
+      ],
+      "median": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    {
+      "key": "stage|tiled|256|total_ms",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "total_ms",
+      "samples": [
+        "22216.766",
+        "22614.136",
+        "20375.639"
+      ],
+      "median": 22216.766,
+      "min": 20375.639,
+      "max": 22614.136
+    }
+  ]
+}

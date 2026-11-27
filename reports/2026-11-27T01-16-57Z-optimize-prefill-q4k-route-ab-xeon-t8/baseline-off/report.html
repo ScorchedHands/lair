@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>2026-11-27T01-16-57Z-optimize-prefill-stage-profile-xeon-t8 - LAIR Xeon stage profile</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>body { font-family: 'Segoe UI', sans-serif; margin: 2rem auto; max-width: 1080px; color: #1c1c1c; } h1 { font-size: 1.45rem; } h2 { font-size: 1.1rem; margin-top: 2.2rem; } .note { color: #444; font-size: 0.9rem; max-width: 76ch; } canvas { max-width: 1020px; }</style>
+</head>
+<body>
+<h1>2026-11-27T01-16-57Z-optimize-prefill-stage-profile-xeon-t8</h1>
+<p class='note'>Generated at 2026-11-27T01:24:08Z. Lane: <code>Xeon CPU-only lair-lab (root@192.168.33.53), threads=8, rowWidth=64</code>. Method: 3 alternating same-session stage-profile reps=1 commands with kernels gemv, tiled; medians/min/max parsed from raw logs after ANSI stripping.</p>
+<h2>Stage medians by kernel and length</h2>
+<canvas id="stageBar" height="420"></canvas>
+<script>
+new Chart(document.getElementById('stageBar'), {"type": "bar", "data": {"labels": ["gemv 128", "gemv 256", "tiled 128", "tiled 256"], "datasets": [{"label": "Feed-forward gate/up ms", "data": [4266.929, 9426.881, 4494.021, 9678.568], "backgroundColor": "#3b6fb6"}, {"label": "Feed-forward down ms", "data": [3523.381, 8000.003, 3703.291, 8039.567], "backgroundColor": "#f2a65e"}, {"label": "Attention weight traversal ms", "data": [1578.202, 3575.554, 1579.59, 3309.882], "backgroundColor": "#2a7f62"}, {"label": "Attention projection ms", "data": [827.562, 1835.644, 883.56, 1873.378], "backgroundColor": "#c0603f"}, {"label": "Attention output ms", "data": [750.64, 1739.91, 661.808, 1387.987], "backgroundColor": "#8a5b00"}, {"label": "Attention kernel ms", "data": [351.676, 1279.44, 396.669, 1462.762], "backgroundColor": "#9aa5b1"}, {"label": "Logit head ms", "data": [96.381, 115.848, 106.282, 107.289], "backgroundColor": "#4d4d4d"}]}, "options": {"scales": {"y": {"title": {"display": true, "text": "ms median (lower is better)"}, "beginAtZero": true}}, "plugins": {"legend": {"position": "bottom"}}}});
+</script>
+<h2>Stage shares</h2>
+<canvas id="gemvPie" height="380"></canvas>
+<script>
+new Chart(document.getElementById('gemvPie'), {"type": "pie", "data": {"labels": ["attention_weight_ms", "feed_forward_gate_up_ms", "feed_forward_down_ms", "seed/cache/kv/logits/other"], "datasets": [{"label": "gemv length 256 stage medians (ms)", "data": [3575.554, 9426.881, 8000.003, -2304.955], "backgroundColor": ["#3b6fb6", "#f2a65e", "#2a7f62", "#c9d4dd"]}]}});
+</script>
+<p class='note'>See <a href='summary.md'><code>summary.md</code></a> for tables and <a href='data.json'><code>data.json</code></a> for machine-readable medians.</p>
+</body>
+</html>
