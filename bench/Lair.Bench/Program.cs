@@ -888,7 +888,7 @@ static int BenchPrefillProfile(string[] args)
 {
     if (args.Length < 2)
     {
-        Console.WriteLine("usage: prefill-profile <gguf path> [--threads N] [--lengths 16,32,...] [--widths 16,32,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--stage-profile] [--matmul-route off|on|N] [--q4k-matmul-route off|on|N] [--attention-batch-dots off|on|N] [--out <path>]");
+        Console.WriteLine("usage: prefill-profile <gguf path> [--threads N] [--lengths 16,32,...] [--widths 16,32,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--stage-profile] [--matmul-route off|on|N] [--q4k-matmul-route off|on|N] [--pair-matmul-route off|on|N] [--attention-batch-dots off|on|N] [--out <path>]");
         return 1;
     }
 
