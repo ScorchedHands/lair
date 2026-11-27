@@ -52,8 +52,9 @@ If a page no longer matches the code because of an unrelated edit you are landin
 
 - One topic per file; cross-link instead of duplicating. Each page opens with a scope line and an "as of" date so readers can judge freshness.
 - Prefer the shape: what this subsystem is for → how data actually flows through it (with real type names) → why it is built that way (measured reason, rejected alternative) → what knobs select it → what it refuses today.
-- Diagrams in fenced `mermaid` blocks; keep them to flow rather than class detail. Tables are preferred over prose for format coverage and knob lists.
-- Code snippets show the real API (`IBackend`, `IKvPool`, `PlacementPolicy`) with a path beside it, not paraphrase.
+- **Every engine page carries visual aids.** Use fenced `mermaid` blocks as the primary explanation device: `flowchart` for control/data flow through a subsystem, `sequenceDiagram` for a request or step advancing across assemblies, `stateDiagram-v2` for lifecycle state machines (pipeline stages, admission, residency transitions), `classDiagram` sparingly for seam contracts, and charts (`xychart-beta`, `pie`) for measured cost curves, format-coverage proportions, and posture breakdowns. A page should hold at least two diagrams unless its topic is genuinely a flat list.
+- Charts are supplements, never the only carrier: every chart also states its numbers in an adjacent table with measurement posture (model file, context length, thread quota/kernel selection, ISA/backend path, tool used) and a pointer to `bench/reports/` or `reports/<timestamp>/`. If a renderer may not support a chart type, keep the table as the authoritative version.
+- Tables are preferred over prose for format coverage and knob lists. Code snippets show the real API (`IBackend`, `IKvPool`, `PlacementPolicy`) with a path beside it, not paraphrase.
 
 ## Verification before you call anything done
 
