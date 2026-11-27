@@ -4,19 +4,15 @@ using System.Runtime.InteropServices;
 namespace Lair.Backends.Cpu;
 
 /// <summary>
-/// Platform-guarded threading helpers for the CPU backend: applying a logical-core affinity mask to the calling
-/// thread and detecting how many physical cores back the machine's logical processors. Pinning is implemented on
-/// Windows only via kernel32 <c>SetThreadAffinityMask</c>; on other operating systems <see cref="ApplyCoreSet"/> is
-/// a documented no-op that reports itself once at startup (Linux affinity through sched_setaffinity is later
-/// hardening and is deliberately not faked here). Physical-core detection reads the kernel's own topology via
-/// <c>GetLogicalProcessorInformationEx(RelationProcessorCore)</c>, which returns one record per physical core with
-/// its SMT siblings folded into that record's group mask, so counting records counts cores and never logical
-/// processors. Any detection failure reports 0 and callers fall back to <see cref="Environment.ProcessorCount"/>.
+/// Platform-guarded threading helpers for the CPU backend: applying a logical-core affinity mask to the calling thread and detecting how many physical cores back the machine's logical processors. Windows pins through kernel32 <c>SetThreadAffinityMask</c>; Linux applies processor sets through libc <c>sched_setaffinity</c> (pid 0, which is the calling thread exactly as sched_setaffinity(2) documents it — no tid bookkeeping needed for worker-thread binding). On any other operating system <see cref="ApplyCoreSet"/> remains a documented no-op that reports itself once at startup and leaves threads unpinned rather than approximating affinity. Physical-core detection reads the kernel's own topology: on Windows one record per physical core from <c>GetLogicalProcessorInformationEx(RelationProcessorCore)</c>, which folds SMT siblings into each record; on Linux distinct SMT sibling groups read out of sysfs by <see cref="WorkerPlacement"/>, restricted to the processor set sched_getaffinity says this process may run on (a container's cpuset narrows detection, and a host whose files cannot be read reports 0). Any detection failure reports 0 and callers fall back to <see cref="Environment.ProcessorCount"/>.
 /// </summary>
 internal static unsafe partial class ThreadAffinity
 {
-    // Affinity masks are per-group 64-bit processor sets, so core ids above 63 cannot be expressed through this API.
+    // Affinity masks are per-group 64-bit processor sets on Windows, so an explicit core set above id 63 cannot be expressed through the single-word API this seam has always carried. Multi-word processor masks (BuildProcessorMask/ApplyProcessorMask) carry the Linux auto-placement seam past one group; that path never crosses MaxCoreId on Windows.
     public const int MaxCoreId = 63;
+
+    // cpu_set_t as one kernel word set of 1024 bits — the same size the loader's measurement lane builds, and enough for any host whose ids sysfs names below 1024. A mask wider than this reports unappliable rather than truncating into a wrong pin.
+    private const int MaxAffinityBytes = 16 * sizeof(ulong);
 
     private const int RelationProcessorCore = 0;
 
@@ -39,10 +35,17 @@ internal static unsafe partial class ThreadAffinity
 
     private static int _physicalCoreProbe = NotProbed;
 
-    private static int _nonWindowsWarningShown;
+    // Allowed-mask cache for Linux: null states "this platform has no affinity restriction to report" (Windows, macOS, or a failed probe) — callers treat it as unrestricted rather than as an empty mask.
+    private static IReadOnlyList<int>? _allowedProcessorIds;
+    private static int _allowedProbeDone;
 
-    /// <summary>True when this platform has a real affinity implementation (pinning is Windows-only in this build).</summary>
+    private static int _unsupportedPlatformWarningShown;
+
+    /// <summary>True when this host's placement seam can derive a processor-group core set for unpinned models (Windows today). Mask application itself exists on Windows and Linux: the CPU backend places its own workers from detected physical cores on Linux instead of deriving a node mask — see WorkerPlacement and CpuBackend.</summary>
     public static bool SupportsPinning => OperatingSystem.IsWindows();
+
+    /// <summary>Whether this platform can apply a processor set to worker threads at all (Windows and Linux today; anything else is the documented no-op).</summary>
+    public static bool SupportsMaskApplication => OperatingSystem.IsWindows() || OperatingSystem.IsLinux();
 
     /// <summary>
     /// Builds the 64-bit processor mask for a logical core set. Core ids must lie within one processor group;
@@ -70,9 +73,42 @@ internal static unsafe partial class ThreadAffinity
     }
 
     /// <summary>
+    /// Builds a multi-word processor mask covering ids beyond one 64-bit group: word w covers ids [w*64, w*64+63). This is the shape Linux auto placement hands to sched_setaffinity on hosts with more than 64 logical processors; Windows keeps its single-group contract and refuses anything wider rather than pinning a high id through the wrong group.
+    /// </summary>
+    public static IReadOnlyList<ulong> BuildProcessorMask(IReadOnlyCollection<int> processorIds)
+    {
+        ArgumentNullException.ThrowIfNull(processorIds);
+
+        int highest = -1;
+        foreach (int id in processorIds)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(id);
+            if (id > highest)
+            {
+                highest = id;
+            }
+        }
+
+        if (highest < 0)
+        {
+            return []; // an empty set requests no placement: nothing to express
+        }
+
+        ulong[] words = new ulong[highest / 64 + 1];
+        foreach (int id in processorIds)
+        {
+            words[id / 64] |= 1UL << (id % 64);
+        }
+
+        return words;
+    }
+
+    /// <summary>
     /// Pins the calling thread to the processor set described by <paramref name="coreMask"/> for its whole lifetime.
-    /// Returns true when the mask was applied. On non-Windows hosts this is a documented no-op: it reports once via
-    /// a startup warning line and returns false, leaving threads unpinned rather than approximating affinity.
+    /// Returns true when the mask was applied. On Windows this is SetThreadAffinityMask; on Linux it is a one-word
+    /// sched_setaffinity cpu_set_t (ids up to 63, which every explicit core set stays inside). On any other platform
+    /// this remains a documented no-op: it reports once via a startup warning line and returns false, leaving threads
+    /// unpinned rather than approximating affinity.
     /// </summary>
     public static bool ApplyCoreSet(ulong coreMask)
     {
@@ -81,20 +117,89 @@ internal static unsafe partial class ThreadAffinity
             return true; // no processor set requested: nothing to apply
         }
 
-        if (!OperatingSystem.IsWindows())
+        if (OperatingSystem.IsWindows())
         {
-            ReportNonWindowsNoOpOnce();
+            return SetThreadAffinityMask(GetCurrentThread(), coreMask) != 0;
+        }
+
+        if (OperatingSystem.IsLinux())
+        {
+            byte[] mask = new byte[MaxAffinityBytes]; // cpu_set_t: one bit per processor id, exactly the layout sched_setaffinity(2) expects. A single-group mask never reaches past word zero of this buffer.
+            for (int bit = 0; bit < sizeof(ulong) * 8; bit++)
+            {
+                if (((coreMask >> bit) & 1UL) != 0)
+                {
+                    mask[bit / 8] |= (byte)(1 << (bit % 8));
+                }
+            }
+
+            // pid 0 means the calling thread exactly as sched_setaffinity(2) documents it — no tid bookkeeping needed for worker-thread binding. A refused ask reads as false: placement falls back to unpinned, never to a partial pin someone else guessed.
+            return SchedSetAffinity(0, (nuint)MaxAffinityBytes, mask) == 0;
+        }
+
+        ReportUnsupportedPlatformOnce();
+        return false;
+    }
+
+    /// <summary>
+    /// Applies a multi-word processor set to the calling thread — the seam Linux auto placement uses when selected ids cross one group. Windows applies only masks that fit its single-group contract and reports anything wider as unappliable rather than pinning through the wrong group; other platforms keep the documented no-op. An empty word list means no placement was requested and trivially succeeds, matching <see cref="ApplyCoreSet"/> with a zero mask.
+    /// </summary>
+    public static bool ApplyProcessorMask(IReadOnlyList<ulong> maskWords)
+    {
+        ArgumentNullException.ThrowIfNull(maskWords);
+
+        if (maskWords.Count == 0)
+        {
+            return true; // no processor set requested: nothing to apply
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            if (!AllZeroAboveFirstWord(maskWords))
+            {
+                return false; // ids above group zero cannot be expressed through SetThreadAffinityMask: reported as unappliable, never pinned to a wrong processor.
+            }
+
+            ulong single = maskWords[0];
+            if (single == 0)
+            {
+                return true; // an all-zero first word asks for nothing — the same trivial accept ApplyCoreSet gives a zero mask.
+            }
+
+            return SetThreadAffinityMask(GetCurrentThread(), single) != 0;
+        }
+
+        if (!OperatingSystem.IsLinux())
+        {
+            ReportUnsupportedPlatformOnce();
             return false;
         }
 
-        return SetThreadAffinityMask(GetCurrentThread(), coreMask) != 0;
+        int bytes = maskWords.Count * sizeof(ulong);
+        if (bytes > MaxAffinityBytes)
+        {
+            return false; // a processor set wider than the kernel word set this seam builds: reported as unappliable rather than truncated into a wrong pin.
+        }
+
+        byte[] cpuSet = new byte[MaxAffinityBytes];
+        for (int word = 0; word < maskWords.Count; word++)
+        {
+            ulong value = maskWords[word]; // little-endian placement: bit i of word w names processor id w*64+i, the exact cpu_set_t layout.
+            int offset = word * sizeof(ulong);
+
+            for (int byteIndex = 0; byteIndex < sizeof(ulong); byteIndex++)
+            {
+                cpuSet[offset + byteIndex] |= (byte)(value >> (byteIndex * 8));
+            }
+        }
+
+        return SchedSetAffinity(0, (nuint)MaxAffinityBytes, cpuSet) == 0;
     }
 
     /// <summary>
     /// Physical cores behind this machine's logical processors, probed once and cached: the number of
     /// RelationProcessorCore records from <c>GetLogicalProcessorInformationEx</c>, which never counts SMT siblings as
-    /// extra cores. Returns 0 when no detection is available (non-Windows, unsupported call shape, or API failure);
-    /// callers document that fallback explicitly.
+    /// extra cores. Returns 0 when no detection is available (unsupported call shape or API failure); callers document that fallback explicitly. On Linux, distinct sysfs sibling groups restricted to this process's affinity mask — so a container confined to part of the machine detects only its own physical cores.
     /// </summary>
     public static int DetectPhysicalCoreCount()
     {
@@ -118,8 +223,52 @@ internal static unsafe partial class ThreadAffinity
         }
     }
 
+    /// <summary>
+    /// The processor ids this process may run on, read once from sched_getaffinity on Linux. Null means unrestricted or unreadable (Windows, macOS, a failed probe): callers treat it as "no confinement reported", never as an empty mask that would strand every worker. A container's cpuset comes back narrowed — placement built against it can only ever shrink further.
+    /// </summary>
+    public static IReadOnlyList<int>? DetectAllowedProcessorIds()
+    {
+        if (Volatile.Read(ref _allowedProbeDone) != 0)
+        {
+            return Volatile.Read(ref _allowedProcessorIds);
+        }
+
+        lock (_probeGate)
+        {
+            if (Volatile.Read(ref _allowedProbeDone) == 0)
+            {
+                IReadOnlyList<int>? allowed = OperatingSystem.IsLinux() ? ProbeAllowedProcessorIds() : null;
+                Volatile.Write(ref _allowedProcessorIds, allowed);
+                Volatile.Write(ref _allowedProbeDone, 1);
+            }
+
+            return Volatile.Read(ref _allowedProcessorIds);
+        }
+    }
+
     private static unsafe int ProbePhysicalCoreCount()
     {
+        if (OperatingSystem.IsLinux())
+        {
+            CpuPlacementTopology? posture = WorkerPlacement.DetectLinuxPosture();
+            if (posture is null)
+            {
+                return 0; // sysfs unreadable: the documented fallback, never a crash in backend sizing.
+            }
+
+            IReadOnlyList<int>? allowed = posture.AllowedProcessorIds;
+            int cores = 0;
+            foreach (PhysicalCore core in posture.Cores)
+            {
+                if (allowed is null || core.SiblingIds.Any(allowed.Contains))
+                {
+                    cores++; // a core with no processor inside the mask this process may run on cannot back an auto worker here.
+                }
+            }
+
+            return cores;
+        }
+
         if (!OperatingSystem.IsWindows())
         {
             return 0;
@@ -197,12 +346,47 @@ internal static unsafe partial class ThreadAffinity
         }
     }
 
-    private static void ReportNonWindowsNoOpOnce()
+    private static IReadOnlyList<int>? ProbeAllowedProcessorIds()
     {
-        if (Interlocked.Exchange(ref _nonWindowsWarningShown, 1) == 0)
+        byte[] cpuSet = new byte[MaxAffinityBytes];
+
+        // pid 0 reads the calling thread's affinity mask; a kernel that refuses (or cannot answer) leaves placement unrestricted rather than guessing one.
+        if (SchedGetAffinity(0, (nuint)MaxAffinityBytes, cpuSet) != 0)
+        {
+            return null;
+        }
+
+        List<int> ids = [];
+        for (int bit = 0; bit < MaxAffinityBytes * 8; bit++)
+        {
+            if ((cpuSet[bit / 8] & (1 << (bit % 8))) != 0)
+            {
+                ids.Add(bit);
+            }
+        }
+
+        return ids.Count == 0 ? null : ids; // an all-zero read cannot be trusted as a confinement claim: treat it like no answer.
+    }
+
+    private static bool AllZeroAboveFirstWord(IReadOnlyList<ulong> maskWords)
+    {
+        for (int word = 1; word < maskWords.Count; word++)
+        {
+            if (maskWords[word] != 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static void ReportUnsupportedPlatformOnce()
+    {
+        if (Interlocked.Exchange(ref _unsupportedPlatformWarningShown, 1) == 0)
         {
             Console.Error.WriteLine(
-                "lair: core-set pinning is implemented on Windows only; configured core sets are ignored on this platform.");
+                "lair: core-set pinning is implemented on Windows and Linux; configured core sets are ignored on this platform.");
         }
     }
 
@@ -221,7 +405,13 @@ internal static unsafe partial class ThreadAffinity
     [return: MarshalAs(UnmanagedType.Bool)]
     private static unsafe partial bool GetLogicalProcessorInformationEx(int relationshipType, byte* buffer, ref uint returnedLength);
 
-    // Sampling hook for the backend's own execution instrumentation (test-visible): returns the processor number a
-    // worker block ran on. Kept here so every affinity-adjacent P/Invoke lives in one documented place.
-    internal static int CurrentProcessorNumber() => (int)GetCurrentProcessorNumber();
+    // Linux affinity seam — the same libc calls the loader's measurement lane already binds through. pid 0 names the calling thread; a nonzero return is the kernel refusing the mask (errno stays with Marshal).
+    [LibraryImport("libc", EntryPoint = "sched_setaffinity", SetLastError = true)]
+    private static partial int SchedSetAffinity(int pid, nuint cpusetsize, byte[] cpuSet);
+
+    [LibraryImport("libc", EntryPoint = "sched_getaffinity", SetLastError = true)]
+    private static partial int SchedGetAffinity(int pid, nuint cpusetsize, byte[] cpuSet);
+
+    // Sampling hook for the backend's own execution instrumentation (test-visible): returns the processor number a worker block ran on, or -1 where this platform cannot answer through kernel32 — an unreported sample reads as absent rather than crashing a Linux pool that armed sampling. Kept here so every affinity-adjacent P/Invoke lives in one documented place.
+    internal static int CurrentProcessorNumber() => OperatingSystem.IsWindows() ? (int)GetCurrentProcessorNumber() : -1;
 }

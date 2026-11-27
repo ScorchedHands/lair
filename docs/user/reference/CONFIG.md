@@ -149,7 +149,7 @@ Constraints enforced beyond the value lists:
 
 - Pinned core sets must partition the machine: two models pinning the same core id are refused naming both, unless the later model sets `core_overcommit: true`.
 - A core id outside `[0, 63]` is refused at engine open: an affinity mask cannot express a wider processor group.
-- Core pinning is applied on Windows only. On other platforms a configured `core_set` is a documented no-op that warns once at startup rather than being approximated.
+- Core pinning is applied on Windows and Linux (Linux through `sched_setaffinity`). On other platforms a configured `core_set` is a documented no-op that warns once at startup rather than being approximated. On Linux, a model with **no** core set has its worker threads placed automatically onto detected physical cores — node-local first, SMT siblings only when the thread posture exceeds distinct-core capacity, and never widened past a container's allowed CPU subset; unresolvable topology leaves threads unpinned (engine detail: `docs/engine/residency-and-budgets.md`). There is no YAML key selecting or disabling this auto placement.
 - A non-empty `core_set` beside `numa_spread: interleave` is refused naming the model and the conflict; a pinned set spanning reported nodes is refused for `auto` and `local`.
 - `numa_spread` is a preference resolved against reported topology, never a promise that the operating system moved anything.
 

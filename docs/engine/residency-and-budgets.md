@@ -1,4 +1,4 @@
-Scope: This page covers how LAIR accounts capacity today — the compute-capacity ledger and the device (tier/resource) ledger, budget chains per model resource and what each tier actually backs in this build, weight arenas and mmap placement of model files, host posture detection with declared-override semantics, NUMA spread preferences, prefill-buffer row-width clamps, PLE row residency gating, and `budget_exhausted` refusal semantics. As of 2026-11-27 this reflects implemented behavior under `src/` only; planned placement capabilities are stated as refused vocabulary, never as working posture.
+Scope: This page covers how LAIR accounts capacity today — the compute-capacity ledger and the device (tier/resource) ledger, budget chains per model resource and what each tier actually backs in this build, weight arenas and mmap placement of model files, host posture detection with declared-override semantics, NUMA spread preferences, CPU worker placement on Linux physical cores with auto worker sizing, prefill-buffer row-width clamps, PLE row residency gating, and `budget_exhausted` refusal semantics. As of 2026-11-27 this reflects implemented behavior under `src/` only; planned placement capabilities are stated as refused vocabulary, never as working posture.
 
 # Capacity accounting: ledgers, budget chains, weight arenas, host posture
 
@@ -118,6 +118,44 @@ A declared `prefill_buffers` chain sizes prompt windows instead of claiming stan
 Operators may declare over it (`host.dram_mb`, `host.vram_mb`, `host.cpu_cores`, `host.disk_path`, plus `host.numa.nodes` per-node overrides — the loader's `HostPostureKeys`). Each must state a positive number where it states anything; `disk_path` declares only *that this host reads from disk* ("no ceiling belongs at that position, so nothing here reads a number beside it"). A declared total disagreeing with probed topology is **accepted with a warning naming both**: `host_capacity model='…' … — accepted against reported topology` (`GenerationService.ReportDeclaredCapacity`). Ledger seats follow the *effective* posture after acceptance. The monitor publishes the resolved reading as `compute_topology model=…` rows (monitoring-and-metrics.md owns the stream).
 
 NUMA placement is a preference, never a promise: `models[].placement.numa_spread` accepts `auto`, `local`, or `interleave`; what lands on this host's node layout is decided at open per OS path (`NumaSpreadPreference` in the loader/placement seams), and no refusal claims cross-node movement that the OS declines to give.
+
+### CPU worker placement: physical cores, auto sizing, and Linux affinity
+
+An unpinned model's compute threads land wherever the OS puts them — for DRAM-bound weight streaming that drift is measurable cost, not noise. On the lab Xeon lane (dual E5-2683 v4, AVX2+FMA only, governor performance), tasksetting a prefill process to node0 *physical* cores lifted implied Q4_K weight bandwidth from 0.415 GB/s (two unpinned runs, spread ~7%) to 0.54 GB/s and end-to-end prefill throughput by roughly +7% at gemv/length-128 through +14% at tiled/length-256; pinning the same process across node0's HT siblings instead *dropped* implied bandwidth to 0.36 GB/s — below unpinned. Those arms, their posture table, and the raw logs live in `reports/2026-11-27T14-14-58Z-optimize-q4k-widebatch-xeon-pinning` (Lair.Bench prefill-profile + q4k-widebatch, Qwen2.5-3B Instruct Q4_K_M, threads=8). The same report's threads=32 auto arms carry a recorded 84% run-to-run dispersion signature consistent with pool/dispatch overhead rather than kernel limits — placement and worker-count posture are the live levers there, not ISA paths.
+
+What this build does today follows from that measurement:
+
+- **Auto worker sizing** (`CpuBackend.AutoWorkerCount`, `src/Lair.Backends.Cpu/CpuBackend.cs`) sizes an auto open by *detected physical cores*, never by logical processor count, on both Windows (the topology API) and Linux. On Linux the detection is sysfs-derived: distinct SMT sibling groups read from per-CPU `thread_siblings_list` files (`WorkerPlacement.BuildCores`, `src/Lair.Backends.Cpu/WorkerPlacement.cs`), restricted to the processor set sched_getaffinity reports for this process — a container confined to part of the machine detects only its own physical cores. On the lab host that resolves an auto open to 32 workers (its distinct-core capacity) instead of the 64 logical processors `Environment.ProcessorCount` would report. An explicit nonzero `engine.threads` still wins over auto-sizing, and a per-model `thread_quota` caps either choice; placement follows the chosen count and never changes it.
+- **Worker-thread affinity application** now exists on Windows (`SetThreadAffinityMask`) *and* Linux (libc `sched_setaffinity`, pid 0 — the calling thread exactly as sched_setaffinity(2) documents), all through one seam: `src/Lair.Backends.Cpu/ThreadAffinity.cs`. Explicitly configured core sets keep their documented contract — ids inside `[0, 63]`, refused at open outside it (`BuildCoreMask`); on any other platform a configured core set remains the documented once-warned no-op. Multi-word processor masks (word *w* covering ids `[w·64, w·64+63)`) carry auto placement past one group; Windows refuses anything wider rather than pinning through the wrong group, and Linux hosts with more than 1024 named processors report unappliable masks instead of truncating.
+- **Auto placement of unpinned models on Linux** (`WorkerPlacement.Select`, applied in the `CpuBackend` open): candidates are confined to the allowed processor mask first — a restricted cpuset can only narrow placement, never widen it; cores with no member inside the mask drop out and cores whose primary is outside participate through their lowest allowed sibling. Candidates then sort node-local (lowest NUMA index, then package id, then primary id), so a quota that fits one socket never spans another; each worker gets one distinct physical core while capacity lasts; only when quota exceeds the number of usable distinct cores does placement borrow HT siblings, round-robin across already-chosen cores rather than stacking a pair. On this host with an 8-worker auto posture, selection resolves primaries like `0-7` — exactly the measured-winner cpu list shape. The derived mask covers the engine's uncapped thread choice for the model's whole lifetime; live quota edits change participation counts, not placement (scheduling.md).
+- **Fallback semantics are silent by design.** Unreadable sysfs (`DetectLinuxPosture()` returns null), a topology that cannot express the requested quota with zero usable cores, or an all-zero affinity read leaves today's unpinned posture standing — no new failure mode, no partial pin invented. A placement shorter than quota (a cpuset holding four primaries but none of their siblings) pins those four and lets the remaining workers run unpinned-by-necessity rather than escaping the mask. The internal `autoPlaceWorkers` open parameter exists so measurement/test opens can disable derivation; it is not a host knob and changes no worker count.
+
+```mermaid
+flowchart TD
+    Q[open with threads=0 auto or explicit quota] --> S{AutoWorkerCount:<br/>detected physical cores?}
+    S -->|Windows API or Linux sysfs groups<br/>&#47; affinity-mask restricted| A[sized by distinct cores,<br/>capped by logical count]
+    S -->|detection unavailable| B[fallback: Environment.ProcessorCount]
+    Q2[core set configured?] -->|yes, ids in 0..63| P1[pin workers to it:<br/>Windows SetThreadAffinityMask<br/>Linux sched_setaffinity]
+    Q2 -->|no + Linux host| D{sysfs posture readable?}
+    D -->|null: unreadable sysfs| U[unpinned posture, silently]
+    D -->|readable| E[confine cores to allowed mask<br/>never widen a cpuset]
+    E --> F[node-local order: node index,<br/>package id, primary id]
+    F --> G{quota ≤ usable distinct cores?}
+    G -->|yes| H[pin primaries only:<br/>one core per worker]
+    G -->|no| I[borrow HT siblings round-robin<br/>across already-chosen cores]
+    I --> J{selection empty?}
+    J -->|empty: no usable core in mask| U
+```
+
+Measured posture behind these choices (from the report directory cited above; gemv/tiled e2e prefill arms, threads=8, lengths 128/256):
+
+| arm | cpu list applied | implied weight GB/s (gemv) | tok/s medians (len 128 / 256) |
+|---|---|---:|---|
+| unpinned | none — OS placement | 0.415 (runs 0.43, 0.40) | gemv 13.42 / 11.58 · tiled 11.59 / 10.53 |
+| physical-pinned | node0 primaries `0-15` | 0.54 | gemv 14.37 / 10.99 · tiled 12.73 / 12.01 |
+| HT-pinned | node0 with siblings `0-15,32-47` | 0.36 | gemv 12.13 / 10.93 · tiled 11.46 / 10.69 |
+
+The engine documents what the build does: physical-preference placement is landed for Linux opens; node-derived full-cpulist masks remain a Windows-only derivation (`CpuBackend.SupportsCorePinning`) precisely because HT-wide masks measured worse than distinct-physical-core selection on this host, and nothing in this build derives such a mask on Linux. No public knob selects or disables auto placement — `engine.threads`, `placement.core_set`, and `placement.thread_quota` behave exactly as documented in the user reference; there is no YAML key for core lists wider than group zero, no per-model placement override beyond what already exists, and macOS/other platforms keep their once-warned no-op rather than a faked affinity.
 
 ## Knobs this page owns
 

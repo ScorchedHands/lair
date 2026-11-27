@@ -155,6 +155,8 @@ Dedicated lanes have hard boundaries today:
 
 Live `placement.thread_quota` edits under dedicated lanes map onto the decode side only. The load-resolved prefill share keeps its worker pool, mask, activation buffers, and collision posture for the model's lifetime; an edit that cannot leave at least one worker on each side is refused as a lane-layout change requiring restart (`src/Lair.Http/GenerationService.cs`).
 
+Worker placement inside these pools follows residency-and-budgets.md: where no explicit core set or derived node mask exists, a Linux-opened CPU backend places its own workers from detected physical cores (distinct cores first, SMT siblings only beyond capacity), and quota edits keep changing participation counts exactly as before — the placement mask covers the engine's uncapped thread choice for the model's whole lifetime. Windows lane postures are unchanged in this build.
+
 ## Token budgets
 
 Admission reserves blocks for the whole sequence lifetime: prompt tokens plus the generation ceiling. The scheduler therefore does not expect admitted pipelines to trip KV capacity mid-run; it first evicts cached prefix entries enough to satisfy effective free capacity, then refuses if still short (`src/Lair.Models/Scheduling/GenerationScheduler.cs`).

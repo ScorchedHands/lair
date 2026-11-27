@@ -46,7 +46,11 @@ public sealed unsafe partial class CpuBackend : IBackend
     // are serialized by the scheduler's gate, so a swap never races an in-flight kernel job.
     private readonly object _poolGate = new();
 
-    private readonly ulong? _coreMask;
+    // Processor set every pool worker pins to, as one or more 64-bit mask words: null when the model is placed by nothing. An explicit core set stays exactly its single group word (the documented [0,63] contract); Linux auto placement builds multi-word masks covering distinct physical cores selected from sysfs topology inside this process's allowed processor set.
+    private readonly IReadOnlyList<ulong>? _coreSetMask;
+
+    // What the internal auto-placement seam resolved to at open (null when nothing was derived — an explicit core set, a non-Linux host, or unresolvable topology). Internal measurement/reporting visibility only: no knob reaches it.
+    private readonly PlacementSelection? _autoPlacement;
     private bool _samplingRequested; // test-only instrumentation flag, read when the pool is created and pushed on enable
     private readonly bool _useAvx2;
     private readonly CpuIsa _requestedIsa;
@@ -68,9 +72,10 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// bandwidth-bound and two threads on one core share that core's front-end, L1/L2 caches, and execution ports, so
     /// a sibling thread adds contention rather than bandwidth; logical processor counts therefore overstate usable
     /// parallelism for this workload. Physical cores come from <see cref="ThreadAffinity.DetectPhysicalCoreCount"/>
-    /// (Windows topology API, probed once per process); when detection is unavailable the count falls back to
-    /// <see cref="Environment.ProcessorCount"/>, which can only overestimate and is then capped by it. An explicit
-    /// nonzero thread request wins over auto-sizing, and a per-model quota caps either choice.
+    /// (Windows topology API or Linux sysfs sibling groups restricted to this process's affinity mask, probed once per
+    /// process); when detection is unavailable the count falls back to <see cref="Environment.ProcessorCount"/>, which
+    /// can only overestimate and is then capped by it. An explicit nonzero thread request wins over auto-sizing, and a
+    /// per-model quota caps either choice — placement follows the chosen count, sizing never overrides an explicit one.
     /// </summary>
     public static int AutoWorkerCount
     {
@@ -78,9 +83,7 @@ public sealed unsafe partial class CpuBackend : IBackend
         {
             int detected = ThreadAffinity.DetectPhysicalCoreCount();
 
-            // Detection present (Windows topology) sizes by physical cores, capped by the logical ceiling; detection
-            // absent (non-Windows or an unsupported probe shape) sizes by the logical processor count rather than
-            // collapsing to a single worker, which is what the documented fallback promises.
+            // Detection present (Windows topology or Linux sysfs sibling groups) sizes by physical cores, capped by the logical ceiling; detection absent (an unsupported probe shape or unreadable sysfs) sizes by the logical processor count rather than collapsing to a single worker, which is what the documented fallback promises.
             return detected > 0 ? Math.Min(detected, Environment.ProcessorCount) : Environment.ProcessorCount;
         }
     }
@@ -89,9 +92,12 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// Opens the CPU backend for one model placement. <paramref name="threads"/> is the global worker request (0 = auto-size by
     /// <see cref="AutoWorkerCount"/>); <paramref name="threadQuota"/> optionally caps that count to 1 or more; and a non-empty
     /// <paramref name="coreSet"/> pins every persistent pool worker to those logical cores for their whole lifetime, so all of the
-    /// model's compute stays inside its configured processor set. Pinning is applied on Windows only: on other platforms it is a
-    /// documented no-op that warns once at startup (Linux affinity via sched_setaffinity is later hardening). Core ids must lie
-    /// within one 64-bit processor group ([0, 63]) because that is what an affinity mask can express.
+    /// model's compute stays inside its configured processor set. A configured core set is applied on Windows (SetThreadAffinityMask)
+    /// and Linux (sched_setaffinity); other platforms keep the documented no-op that warns once at startup. Core ids must lie within
+    /// one 64-bit processor group ([0, 63]) because that is what an explicit affinity mask can express. With no configured core set on
+    /// a Linux host, the backend places its workers itself: distinct physical cores selected from sysfs topology inside this process's
+    /// allowed processor set (node-local first, SMT siblings only when quota exceeds capacity) — see WorkerPlacement; unresolvable
+    /// topology or an empty selection falls back to today's unpinned posture silently.
     /// <paramref name="requestedIsa"/> is the engine.cpu.isa axis: it resolves against this host's reported CPU features exactly
     /// once here, and every i-quant integer dot this backend runs - solo GEMV, batched GEMV, threaded or not - uses that resolved
     /// encoding for the backend's whole lifetime. A forced ISA this CPU does not report fails the open naming the missing feature;
@@ -102,10 +108,12 @@ public sealed unsafe partial class CpuBackend : IBackend
     {
     }
 
-    // The full open seam every sub-4-bit axis flows through. Host config never reaches the last two parameters: a stated grid
+    // The full open seam every sub-4-bit axis flows through. Host config never reaches the last three parameters: a stated grid
     // encoding or prefetch posture arrives only from internal seams (test and bench opens), while an auto open resolves both
     // itself - the grid encoding from one process-wide sub-4-bit GEMV benchmark, cached for later auto opens. A forced gather on a
     // posture that cannot run gathers fails exactly like a forced ISA does, naming what is missing instead of substituting.
+    // autoPlaceWorkers=false exists so measurement and tests can open an unpinned Linux backend without its physical-core
+    // selection; it is not a host knob and changes no worker count — only whether the placement mask is derived at all.
     internal CpuBackend(
         int threads,
         IReadOnlySet<int>? coreSet,
@@ -115,7 +123,8 @@ public sealed unsafe partial class CpuBackend : IBackend
         CpuFeaturePosture? cpuFeatures,
         GridLoadEncoding? forcedGrid,
         bool? forcePrefetchWeights,
-        CpuKernelTuningOverrides? tuning = null)
+        CpuKernelTuningOverrides? tuning = null,
+        bool autoPlaceWorkers = true)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(threads);
         if (threadQuota is < 1)
@@ -131,7 +140,21 @@ public sealed unsafe partial class CpuBackend : IBackend
         if (coreSet is { Count: > 0 })
         {
             // Validate ids before any pool exists so an out-of-group core set fails the open call instead of a worker loop.
-            _coreMask = ThreadAffinity.BuildCoreMask(coreSet);
+            _coreSetMask = [ThreadAffinity.BuildCoreMask(coreSet)];
+        }
+        else if (autoPlaceWorkers && OperatingSystem.IsLinux())
+        {
+            // An unpinned model on Linux is placed by the backend itself: distinct physical cores, node-local first, confined to the processor set sched_getaffinity reports for this process. Sizing already follows detected physical cores above; placement now names those same cores so workers land where the measured improvement lives instead of wherever the OS puts threads (report 2026-11-27T14-14-58Z-optimize-q4k-widebatch-xeon-pinning). An unresolvable posture or an empty selection leaves today's unpinned posture standing, silently — this seam never adds a failure mode.
+            CpuPlacementTopology? posture = WorkerPlacement.DetectLinuxPosture();
+            if (posture is { IsResolvable: true })
+            {
+                PlacementSelection placement = WorkerPlacement.Select(posture.Cores, posture.AllowedProcessorIds, global);
+                if (placement.IsResolved)
+                {
+                    _autoPlacement = placement;
+                    _coreSetMask = placement.BuildMaskWords();
+                }
+            }
         }
 
         // One capability posture for this whole open, read once: it gates both the vector baseline every kernel uses and the
@@ -244,10 +267,10 @@ public sealed unsafe partial class CpuBackend : IBackend
         }
     }
 
-    /// <summary>Physical cores detected on the machine by the topology probe (0 when detection is unavailable); see <see cref="AutoWorkerCount"/>.</summary>
+    /// <summary>Physical cores detected on the machine by the topology probe (0 when detection is unavailable — Windows API, Linux sysfs sibling groups inside this process's affinity mask, or neither); see <see cref="AutoWorkerCount"/>.</summary>
     public static int DetectedPhysicalCoreCount => ThreadAffinity.DetectPhysicalCoreCount();
 
-    /// <summary>Whether this host has a real affinity seam for pool workers (Windows-only in this build; elsewhere a configured mask is the documented no-op). A host consults this before deriving a node mask for an unpinned model.</summary>
+    /// <summary>Whether the placement seam derives a processor-group node mask for an unpinned model (Windows today). On Linux nothing is derived from raw node cpulists — those masks carry HT siblings, and HT-wide pinning measured worse than distinct-physical-core selection on the lab lane (report 2026-11-27T14-14-58Z-optimize-q4k-widebatch-xeon-pinning); there the CPU backend places its own workers from sysfs topology instead. A host consults this before deriving a node mask for an unpinned model.</summary>
     public static bool SupportsCorePinning => ThreadAffinity.SupportsPinning;
 
     /// <summary>The highest logical core id a processor mask can express; ids above it cannot be pinned through this seam.</summary>
@@ -1201,7 +1224,7 @@ public sealed unsafe partial class CpuBackend : IBackend
             // no job can be mid-Run on the old pool — every Run returns only after all its blocks finished.
             pool?.Dispose();
 
-            WorkerPool grown = new WorkerPool(workersNeeded, _coreMask);
+            WorkerPool grown = new WorkerPool(workersNeeded, _coreSetMask);
 
             if (_samplingRequested)
             {
@@ -1213,8 +1236,11 @@ public sealed unsafe partial class CpuBackend : IBackend
         }
     }
 
-    /// <summary>Whether this backend pins its pool workers (a core set was configured) or leaves them unpinned.</summary>
-    internal bool IsPinningConfigured => _coreMask is not null;
+    /// <summary>Whether this backend pins its pool workers (a core set was configured, or Linux auto placement derived one) or leaves them unpinned.</summary>
+    internal bool IsPinningConfigured => _coreSetMask is not null;
+
+    /// <summary>The processor ids Linux auto placement selected for this open's uncapped thread choice when it pinned an otherwise-unpinned model (null when nothing was derived). Internal measurement/reporting visibility only — no knob reaches it and no host config reads it.</summary>
+    internal PlacementSelection? ResolvedAutoPlacement => _autoPlacement;
 
     private static float RowDot(byte* row, float* x, int cols, QuantFormat format, bool avx2)
     {
@@ -1781,7 +1807,7 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// Persistent worker pool: workers park on a monitor and are woken per job; the dispatcher thread joins the
     /// claim loop so small jobs pay no wake-up cost. All block claims happen under one lock, which is negligible
     /// next to a row-block of kernel work. Workers outlive individual GEMV calls until Dispose. Each worker pins
-    /// itself to <c>coreMask</c> (when configured) at loop start and re-pins defensively after any wake-up gap —
+    /// itself to <c>_workerMask</c> (when configured) at loop start and re-pins defensively after any wake-up gap —
     /// pinning lives in the thread body so pool bookkeeping can never undo it — and records the logical processor of
     /// every block it executes while execution sampling is enabled on the owning backend. The dispatcher's own blocks
     /// are deliberately neither pinned nor sampled: that thread belongs to the caller, not to the pool.
@@ -1793,7 +1819,7 @@ public sealed unsafe partial class CpuBackend : IBackend
 
         private readonly object _gate = new();
         private readonly Thread[]? _workers;
-        private readonly ulong? _coreMask; // processor set for every pool worker, or null when the model is unpinned
+        private readonly IReadOnlyList<ulong>? _workerMask; // processor set for every pool worker, as mask words, or null when the model is unpinned
         private ConcurrentQueue<int>? _samples; // armed lazily via Interlocked so volatile-field type rules hold
         private int _sampleCount;
 
@@ -1803,9 +1829,9 @@ public sealed unsafe partial class CpuBackend : IBackend
         private int _pendingBlocks;
         private bool _disposed;
 
-        public WorkerPool(int workerCount, ulong? coreMask)
+        public WorkerPool(int workerCount, IReadOnlyList<ulong>? maskWords)
         {
-            _coreMask = coreMask;
+            _workerMask = maskWords is null or { Count: 0 } ? null : maskWords;
 
             if (workerCount == 0)
             {
@@ -1906,19 +1932,18 @@ public sealed unsafe partial class CpuBackend : IBackend
 
         private void WorkerLoop()
         {
-            // Pin at thread start: affinity is process-lifetime state of this thread, so one call covers the whole
-            // loop. Unpinned models pass a zero mask and get the trivial accept back; Linux hosts get the documented
-            // no-op here. The pin re-asserts itself below on every wake-up for defense in depth.
-            ThreadAffinity.ApplyCoreSet(_coreMask ?? 0UL);
+            // Pin at thread start: affinity is process-lifetime state of this thread, so one call covers the whole loop. Unpinned models carry no mask and pin nothing; Windows applies its group word through SetThreadAffinityMask and Linux hands the cpu_set_t to sched_setaffinity — multi-word masks included. The pin re-asserts itself below on every wake-up for defense in depth.
+            if (_workerMask is not null)
+            {
+                ThreadAffinity.ApplyProcessorMask(_workerMask);
+            }
 
             while (true)
             {
-                if (_coreMask is not null)
+                if (_workerMask is not null)
                 {
-                    // Defensive re-pin at each wake-up: cheap next to kernel work, and it keeps the pin even if an
-                    // external tool or a thread-pool reuse ever reset this worker's affinity. The start-of-loop call
-                    // above already covers unpinned models with a trivial no-op return.
-                    ThreadAffinity.ApplyCoreSet(_coreMask.Value);
+                    // Defensive re-pin at each wake-up: cheap next to kernel work, and it keeps the pin even if an external tool or a thread-pool reuse ever reset this worker's affinity.
+                    ThreadAffinity.ApplyProcessorMask(_workerMask);
                 }
 
                 IGemvJob job;
@@ -1942,11 +1967,10 @@ public sealed unsafe partial class CpuBackend : IBackend
                     job = _job!;
                 }
 
-                if (_coreMask is not null)
+                if (_workerMask is not null)
                 {
-                    // Defensive re-pin on every wake-up: cheap next to kernel work, and it keeps the pin even if an
-                    // external tool or a thread-pool reuse ever reset this worker's affinity.
-                    ThreadAffinity.ApplyCoreSet(_coreMask.Value);
+                    // Defensive re-pin on every wake-up: cheap next to kernel work, and it keeps the pin even if an external tool or a thread-pool reuse ever reset this worker's affinity.
+                    ThreadAffinity.ApplyProcessorMask(_workerMask);
                 }
 
                 ConcurrentQueue<int>? samples = Volatile.Read(ref _samples);
