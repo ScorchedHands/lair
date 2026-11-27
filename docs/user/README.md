@@ -152,8 +152,9 @@ Some of the following is available only in part where the row says so; status la
 
 ## Documentation map
 
-- [docs/README.md](README.md) — this page: platform overview and basic operation.
+- [docs/user/README.md](README.md) — this page: platform overview and basic operation for operators.
 - [reference/CLI.md](reference/CLI.md) — every command, flag, output, exit code; planned CLI surface.
 - [reference/CONFIG.md](reference/CONFIG.md) — every config key, defaults, mutation classes; planned configuration axes.
+- [../engine/README.md](../engine/README.md) — engine documentation: how the implemented engine works internally (pipeline stages, kernels and backends, KV cache, residency and budgets, model profiles, comparisons with other engines).
 - [../README.md](../README.md) — repository entry point.
 - [../DEVELOP.md](../DEVELOP.md) — build, test harnesses, parity gates, contributor detail.
