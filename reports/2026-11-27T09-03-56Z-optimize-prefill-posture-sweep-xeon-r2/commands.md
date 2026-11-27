@@ -14,10 +14,11 @@ python3 scripts/run-xeon-prefill-posture-sweep.py --root /root/lair-measurements
 
 Repo HEAD at run time `016dd9c`. Arms ran strictly sequentially; measured arm order rotated on odd rounds. Completed with exit success and wrote `data.json`, `summary.md`, `report.html` plus raw logs (`posture-warm{0,1}-*`, `posture-r{0..3}-*`).
 
-## Remote artifact hashes (sha256sum on the measurement host)
-- `data.json` `c705b6b56f32f89478d14c99b7378d4a4b7fc3f99412327c0b413144acf0cf44`
-- `summary.md` (full version) `cb3833d64f02194c1a6997c8c2523fa860aa17a39aeef7052aa65e07b987913d`
-- Raw logs remain only on the measurement host under `…/reports/2026-11-27T09-03-56Z-optimize-prefill-posture-sweep-xeon-r2/logs/`; not copied into this tree, so this directory is a headline extract.
+## Artifact hashes (sha256sum on the measurement host; local copies verified identical)
+- `data.json` `c705b6b56f32f89478d14c99b7378d4a4b7fc3f99412327c0b413144acf0cf44` — committed here, byte-identical to the host copy.
+- `report.html` `aa65f154577ded35ce0342652c3ad927fbc64a90cdf179fa3a2961202e43a453` — committed here, byte-identical to the host copy.
+- `summary.md`: this directory holds a main-authored headline extract; the full run summary stays on the measurement host with hash `cb3833d64f02194c1a6997c8c2523fa860aa17a39aeef7052aa65e07b987913d`.
+- Raw logs remain only on the measurement host under `…/reports/2026-11-27T09-03-56Z-optimize-prefill-posture-sweep-xeon-r2/logs/`; not copied into this tree.
 
 ## Anomalies
 None for the run itself: every arm exited zero and no refusal lines appeared. LAIR spread at threads=32 (up to 43.5%) is larger than at lower postures — noted in `summary.md` rather than treated as an error, since llama arms under the same posture stayed within 16%.

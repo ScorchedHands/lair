@@ -16,10 +16,11 @@ Warmup arms (×2 rounds) then measured arms (×2 rounds, order rotated on odd ro
 
 Run launched as a background SSH session on the host from `/root/lair-measurements/qwen25-small-cpu/repo`; finished cleanly at 09:01 host time with `data.json`, `summary.md`, `report.html` and 24 raw logs (`posture-warm{0,1}-*`, `posture-r{0,1}-*`).
 
-## Remote artifact hashes (sha256sum on the measurement host)
-- `data.json` `875c44fbc173119b3f1528cba69ea049735c8a2185f028a0f60a2579d9e2345e`
-- `summary.md` (full version, 4,948 B) `e5e80ddf1e73aba1449329d54497e9a978aa21be099a5af256e632db15c1804e`
-- Raw logs (24 files) remain only on the measurement host under `…/reports/2026-11-27T08-39-52Z-optimize-prefill-posture-sweep-xeon-r1/logs/`; they were not copied into this working tree, so this directory holds a headline extract rather than the complete artifact set.
+## Artifact hashes (sha256sum on the measurement host; local copies verified identical)
+- `data.json` `875c44fbc173119b3f1528cba69ea049735c8a2185f028a0f60a2579d9e2345e` — committed here, byte-identical to the host copy.
+- `report.html` `a64481d6d1ab11ae5f0b3af39f541b92be6d20c1db5cf69b2ecbce8392cacc14` — committed here, byte-identical to the host copy.
+- `summary.md`: this directory holds a main-authored headline extract; the full 4,948-byte run summary stays on the measurement host with hash `e5e80ddf1e73aba1449329d54497e9a978aa21be099a5af256e632db15c1804e`.
+- Raw logs (24 files) remain only on the measurement host under `…/reports/2026-11-27T08-39-52Z-optimize-prefill-posture-sweep-xeon-r1/logs/`; they were not copied into this working tree.
 
 ## Anomalies
 - Transfer of the runner to the host required 29 marker-chunked parts with per-part hash gates (streaming SFTP file tools are refused on the Windows client); one part drifted once and was retried byte-exact before assembly, and the assembled file hashed equal to local.
