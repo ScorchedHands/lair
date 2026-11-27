@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>2026-11-27T09-03-56Z-optimize-prefill-posture-sweep-xeon-r2 - LAIR Xeon thread-posture sweep</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>body { font-family: 'Segoe UI', sans-serif; margin: 2rem auto; max-width: 1080px; color: #1c1c1c; } h1 { font-size: 1.45rem; } h2 { font-size: 1.1rem; margin-top: 2.2rem; } .note { color: #444; font-size: 0.9rem; max-width: 76ch; } canvas { max-width: 1020px; }</style>
+</head>
+<body>
+<h1>2026-11-27T09-03-56Z-optimize-prefill-posture-sweep-xeon-r2</h1>
+<p class='note'>Generated at 2026-11-27T09:36:49Z. Lane: <code>Xeon CPU-only lair-lab (root@192.168.33.53), rowWidth=64</code>. Method: 2 warmup rounds then 4 measured rounds x arms [lair:8, lair:16, lair:32, llama:8, llama:16, llama:32] interleaved back-to-back in one session so host drift cancels; measured arm order rotates on odd rounds to cancel positional bias while warmups run each arm once per round for cold-start/page-cache handling; reps=1 per command with kernels gemv, tiled and lengths 128,256; LAIR batchedTok/s medians parsed from prefill-profile throughput rows, llama pp token medians parsed from llama-bench markdown columns (-ngl 0 -t N -p <lengths> -n 0 -r 1); taskset pins CPUs only for lair arms.</p>
+<h2>LAIR batchedTok/s medians by arm, kernel and length</h2>
+<canvas id="postureBar" height="420"></canvas>
+<script>
+new Chart(document.getElementById('postureBar'), {"type": "bar", "data": {"labels": ["gemv 128", "gemv 256", "tiled 128", "tiled 256"], "datasets": [{"label": "lair:8 batchedTok/s", "data": [13.655, 10.585, 12.030000000000001, 11.01], "backgroundColor": "#3b6fb6"}, {"label": "lair:16 batchedTok/s", "data": [18.955, 17.18, 18.52, 16.939999999999998], "backgroundColor": "#f2a65e"}, {"label": "lair:32 batchedTok/s", "data": [21.799999999999997, 19.84, 23.439999999999998, 21.015], "backgroundColor": "#2a7f62"}]}, "options": {"scales": {"y": {"title": {"display": true, "text": "batchedTok/s median"}, "beginAtZero": true}}, "plugins": {"legend": {"position": "bottom"}}}});
+</script>
+<h2>LAIR arms beside matched-posture llama pp medians (same shape labels)</h2>
+<canvas id="pairedBar" height="460"></canvas>
+<script>
+new Chart(document.getElementById('pairedBar'), {"type": "bar", "data": {"labels": ["gemv 128", "gemv 256", "tiled 128", "tiled 256"], "datasets": [{"label": "lair:8 batchedTok/s", "data": [13.655, 10.585, 12.030000000000001, 11.01], "backgroundColor": "#3b6fb6"}, {"label": "lair:16 batchedTok/s", "data": [18.955, 17.18, 18.52, 16.939999999999998], "backgroundColor": "#f2a65e"}, {"label": "lair:32 batchedTok/s", "data": [21.799999999999997, 19.84, 23.439999999999998, 21.015], "backgroundColor": "#2a7f62"}, {"label": "llama:8 pp tok/s", "data": [74.285, 73.515, 74.285, 73.515], "backgroundColor": "#c0603f"}, {"label": "llama:16 pp tok/s", "data": [134.1, 140.49, 134.1, 140.49], "backgroundColor": "#8a5b00"}, {"label": "llama:32 pp tok/s", "data": [230.395, 223.98000000000002, 230.395, 223.98000000000002], "backgroundColor": "#9aa5b1"}]}, "options": {"scales": {"y": {"title": {"display": true, "text": "batchedTok/s median"}, "beginAtZero": true}}, "plugins": {"legend": {"position": "bottom"}}}});
+</script>
+<h2>LAIR/llama matched-posture ratios (%) per shape</h2>
+<canvas id="ratioBar" height="400"></canvas>
+<script>
+new Chart(document.getElementById('ratioBar'), {"type": "bar", "data": {"labels": ["gemv 128", "gemv 256", "tiled 128", "tiled 256"], "datasets": [{"label": "threads=8 LAIR/llama %", "data": [18.38, 14.4, 16.19, 14.98], "backgroundColor": "#3b6fb6"}, {"label": "threads=16 LAIR/llama %", "data": [14.13, 12.23, 13.81, 12.06], "backgroundColor": "#f2a65e"}, {"label": "threads=32 LAIR/llama %", "data": [9.46, 8.86, 10.17, 9.38], "backgroundColor": "#2a7f62"}]}, "options": {"scales": {"y": {"title": {"display": true, "text": "LAIR tok/s as % of matched llama pp tok/s"}, "beginAtZero": true}}, "plugins": {"legend": {"position": "bottom"}}}});
+</script>
+<p class='note'>See <a href='summary.md'><code>summary.md</code></a> for posture-scaling tables, noise bands and separation verdicts and <a href='data.json'><code>data.json</code></a> for machine-readable medians.</p>
+</body>
+</html>

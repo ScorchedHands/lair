@@ -1,0 +1,1134 @@
+{
+  "generatedFrom": ".",
+  "arms": {
+    "arm1_t8_gemv-tiled-gemm_w32-64_l128-256_r3": {
+      "kind": "prefill-profile",
+      "meta": {
+        "threads": 8,
+        "modelBytes": 2104932768,
+        "reps": 3,
+        "perToken": "off",
+        "traversalBytes": 1668685824
+      },
+      "blocks": [
+        {
+          "kernel": "gemv",
+          "rowWidth": 32,
+          "fitLines": [
+            "weightFit=2091.68 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.80"
+          ],
+          "crossover": "fitted attention term >= fitted weight term at length >= 441",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 4,
+              "batchedMs": 10853.6,
+              "batchedTok_s": 11.79,
+              "weightMs": 8366.7,
+              "attentionMs": 2486.8,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.8
+            },
+            {
+              "length": 256,
+              "subBatches": 8,
+              "batchedMs": 26642.3,
+              "batchedTok_s": 9.61,
+              "weightMs": 16733.4,
+              "attentionMs": 9908.8,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.8
+            }
+          ]
+        },
+        {
+          "kernel": "gemv",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=5214.24 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.32"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 11032.6,
+              "batchedTok_s": 11.6,
+              "weightMs": 10428.5,
+              "attentionMs": 604.1,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.32
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 23264.1,
+              "batchedTok_s": 11.0,
+              "weightMs": 20857.0,
+              "attentionMs": 2407.2,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.32
+            }
+          ]
+        },
+        {
+          "kernel": "tiled",
+          "rowWidth": 32,
+          "fitLines": [
+            "weightFit=2879.88 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.58"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 4,
+              "batchedMs": 12424.6,
+              "batchedTok_s": 10.3,
+              "weightMs": 11519.5,
+              "attentionMs": 905.0,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.58
+            },
+            {
+              "length": 256,
+              "subBatches": 8,
+              "batchedMs": 26645.1,
+              "batchedTok_s": 9.61,
+              "weightMs": 23039.0,
+              "attentionMs": 3606.1,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.58
+            }
+          ]
+        },
+        {
+          "kernel": "tiled",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=4277.01 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.39"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 9587.3,
+              "batchedTok_s": 13.35,
+              "weightMs": 8554.0,
+              "attentionMs": 1033.3,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.39
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 21225.0,
+              "batchedTok_s": 12.06,
+              "weightMs": 17108.0,
+              "attentionMs": 4117.0,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.39
+            }
+          ]
+        },
+        {
+          "kernel": "gemm",
+          "rowWidth": 32,
+          "fitLines": [
+            "weightFit=3015.65 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.55"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 4,
+              "batchedMs": 12722.3,
+              "batchedTok_s": 10.06,
+              "weightMs": 12062.6,
+              "attentionMs": 659.7,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.55
+            },
+            {
+              "length": 256,
+              "subBatches": 8,
+              "batchedMs": 26753.9,
+              "batchedTok_s": 9.57,
+              "weightMs": 24125.2,
+              "attentionMs": 2628.7,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.55
+            }
+          ]
+        },
+        {
+          "kernel": "gemm",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=6114.57 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.27"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 12516.1,
+              "batchedTok_s": 10.23,
+              "weightMs": 12229.1,
+              "attentionMs": 286.9,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.27
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 25601.6,
+              "batchedTok_s": 10.0,
+              "weightMs": 24458.3,
+              "attentionMs": 1143.3,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.27
+            }
+          ]
+        }
+      ],
+      "stage_lines": [],
+      "refusals": []
+    },
+    "arm2_t32_gemv-tiled-gemm_w32-64_l128-256_r3": {
+      "kind": "prefill-profile",
+      "meta": {
+        "threads": 32,
+        "modelBytes": 2104932768,
+        "reps": 3,
+        "perToken": "off",
+        "traversalBytes": 1668685824
+      },
+      "blocks": [
+        {
+          "kernel": "gemv",
+          "rowWidth": 32,
+          "fitLines": [
+            "weightFit=1931.02 ms/traversal (UNRELIABLE: measured costs are not separable into the two terms on this run) impliedWeightGB/s=0.86"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 4,
+              "batchedMs": 7035.7,
+              "batchedTok_s": 18.19,
+              "weightMs": 7724.1,
+              "attentionMs": -688.3,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.86
+            },
+            {
+              "length": 256,
+              "subBatches": 8,
+              "batchedMs": 12705.5,
+              "batchedTok_s": 20.15,
+              "weightMs": 15448.2,
+              "attentionMs": -2742.7,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.86
+            }
+          ]
+        },
+        {
+          "kernel": "gemv",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=2615.68 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.64"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 5827.9,
+              "batchedTok_s": 21.96,
+              "weightMs": 5231.4,
+              "attentionMs": 596.6,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.64
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 12839.8,
+              "batchedTok_s": 19.94,
+              "weightMs": 10462.7,
+              "attentionMs": 2377.1,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.64
+            }
+          ]
+        },
+        {
+          "kernel": "tiled",
+          "rowWidth": 32,
+          "fitLines": [
+            "weightFit=1460.12 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=1.14"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 4,
+              "batchedMs": 6338.8,
+              "batchedTok_s": 20.19,
+              "weightMs": 5840.5,
+              "attentionMs": 498.3,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 1.14
+            },
+            {
+              "length": 256,
+              "subBatches": 8,
+              "batchedMs": 13666.4,
+              "batchedTok_s": 18.73,
+              "weightMs": 11680.9,
+              "attentionMs": 1985.5,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 1.14
+            }
+          ]
+        },
+        {
+          "kernel": "tiled",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=2604.69 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.64"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 5453.6,
+              "batchedTok_s": 23.47,
+              "weightMs": 5209.4,
+              "attentionMs": 244.3,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.64
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 11392.0,
+              "batchedTok_s": 22.47,
+              "weightMs": 10418.7,
+              "attentionMs": 973.2,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.64
+            }
+          ]
+        },
+        {
+          "kernel": "gemm",
+          "rowWidth": 32,
+          "fitLines": [
+            "weightFit=1917.90 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.87"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 4,
+              "batchedMs": 8442.8,
+              "batchedTok_s": 15.16,
+              "weightMs": 7671.6,
+              "attentionMs": 771.2,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.87
+            },
+            {
+              "length": 256,
+              "subBatches": 8,
+              "batchedMs": 18415.9,
+              "batchedTok_s": 13.9,
+              "weightMs": 15343.2,
+              "attentionMs": 3072.7,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.87
+            }
+          ]
+        },
+        {
+          "kernel": "gemm",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=3326.87 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.50"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 6892.6,
+              "batchedTok_s": 18.57,
+              "weightMs": 6653.7,
+              "attentionMs": 238.8,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.5
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 14259.1,
+              "batchedTok_s": 17.95,
+              "weightMs": 13307.5,
+              "attentionMs": 951.6,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.5
+            }
+          ]
+        }
+      ],
+      "stage_lines": [],
+      "refusals": []
+    },
+    "arm3a_t8_perToken_gemv-tiled-gemm_w32-64_l128-256_r1": {
+      "kind": "prefill-profile",
+      "meta": {
+        "threads": 8,
+        "modelBytes": 2104932768,
+        "reps": 1,
+        "perToken": "on",
+        "traversalBytes": 1668685824
+      },
+      "blocks": [
+        {
+          "kernel": "gemv",
+          "rowWidth": 32,
+          "fitLines": [
+            "weightFit=1797.95 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.93"
+          ],
+          "crossover": "fitted attention term >= fitted weight term at length >= 345",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 4,
+              "batchedMs": 9929.5,
+              "batchedTok_s": 12.89,
+              "perTokenMs": 64884.0,
+              "perTokenTok_s": 1.97,
+              "weightMs": 7191.8,
+              "attentionMs": 2737.7,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.93
+            },
+            {
+              "length": 256,
+              "subBatches": 8,
+              "batchedMs": 25292.0,
+              "batchedTok_s": 10.12,
+              "perTokenMs": 130241.4,
+              "perTokenTok_s": 1.97,
+              "weightMs": 14383.6,
+              "attentionMs": 10908.4,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.93
+            }
+          ]
+        },
+        {
+          "kernel": "gemv",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=5303.55 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.31"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 10987.4,
+              "batchedTok_s": 11.65,
+              "perTokenMs": 62392.3,
+              "perTokenTok_s": 2.05,
+              "weightMs": 10607.1,
+              "attentionMs": 380.3,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.31
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 22729.6,
+              "batchedTok_s": 11.26,
+              "perTokenMs": 135804.0,
+              "perTokenTok_s": 1.89,
+              "weightMs": 21214.2,
+              "attentionMs": 1515.4,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.31
+            }
+          ]
+        },
+        {
+          "kernel": "tiled",
+          "rowWidth": 32,
+          "fitLines": [
+            "weightFit=2867.74 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.58"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 4,
+              "batchedMs": 12496.2,
+              "batchedTok_s": 10.24,
+              "perTokenMs": 60755.5,
+              "perTokenTok_s": 2.11,
+              "weightMs": 11471.0,
+              "attentionMs": 1025.2,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.58
+            },
+            {
+              "length": 256,
+              "subBatches": 8,
+              "batchedMs": 27026.8,
+              "batchedTok_s": 9.47,
+              "perTokenMs": 131979.8,
+              "perTokenTok_s": 1.94,
+              "weightMs": 22941.9,
+              "attentionMs": 4084.9,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.58
+            }
+          ]
+        },
+        {
+          "kernel": "tiled",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=5910.16 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.28"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 12072.5,
+              "batchedTok_s": 10.6,
+              "perTokenMs": 63076.0,
+              "perTokenTok_s": 2.03,
+              "weightMs": 11820.3,
+              "attentionMs": 252.2,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.28
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 24645.4,
+              "batchedTok_s": 10.39,
+              "perTokenMs": 135553.5,
+              "perTokenTok_s": 1.89,
+              "weightMs": 23640.6,
+              "attentionMs": 1004.7,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.28
+            }
+          ]
+        },
+        {
+          "kernel": "gemm",
+          "rowWidth": 32,
+          "fitLines": [
+            "weightFit=2768.94 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.60"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 4,
+              "batchedMs": 11965.0,
+              "batchedTok_s": 10.7,
+              "perTokenMs": 60257.5,
+              "perTokenTok_s": 2.12,
+              "weightMs": 11075.8,
+              "attentionMs": 889.3,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.6
+            },
+            {
+              "length": 256,
+              "subBatches": 8,
+              "batchedMs": 25694.8,
+              "batchedTok_s": 9.96,
+              "perTokenMs": 125163.4,
+              "perTokenTok_s": 2.05,
+              "weightMs": 22151.5,
+              "attentionMs": 3543.2,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.6
+            }
+          ]
+        },
+        {
+          "kernel": "gemm",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=4543.77 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.37"
+          ],
+          "crossover": "fitted attention term >= fitted weight term at length >= 737",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 10745.9,
+              "batchedTok_s": 11.91,
+              "perTokenMs": 65304.6,
+              "perTokenTok_s": 1.96,
+              "weightMs": 9087.5,
+              "attentionMs": 1658.4,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.37
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 24783.0,
+              "batchedTok_s": 10.33,
+              "perTokenMs": 129502.2,
+              "perTokenTok_s": 1.98,
+              "weightMs": 18175.1,
+              "attentionMs": 6607.9,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.37
+            }
+          ]
+        }
+      ],
+      "stage_lines": [],
+      "refusals": []
+    },
+    "arm3a_t8_perToken_gemv-tiled-gemm_w32-64_l128-256_r3": {
+      "kind": "prefill-profile",
+      "meta": {
+        "threads": 8,
+        "modelBytes": 2104932768,
+        "reps": 3,
+        "perToken": "on",
+        "traversalBytes": 1668685824
+      },
+      "blocks": [
+        {
+          "kernel": "gemv",
+          "rowWidth": 32,
+          "fitLines": [],
+          "crossover": null,
+          "rows": []
+        }
+      ],
+      "stage_lines": [],
+      "refusals": []
+    },
+    "arm3b_t32_perToken_gemv-tiled-gemm_w32-64_l128-256_r1": {
+      "kind": "prefill-profile",
+      "meta": {
+        "threads": 32,
+        "modelBytes": 2104932768,
+        "reps": 1,
+        "perToken": "on",
+        "traversalBytes": 1668685824
+      },
+      "blocks": [
+        {
+          "kernel": "gemv",
+          "rowWidth": 32,
+          "fitLines": [
+            "weightFit=1733.73 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.96"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 4,
+              "batchedMs": 7062.7,
+              "batchedTok_s": 18.12,
+              "perTokenMs": 95105.9,
+              "perTokenTok_s": 1.35,
+              "weightMs": 6934.9,
+              "attentionMs": 127.7,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.96
+            },
+            {
+              "length": 256,
+              "subBatches": 8,
+              "batchedMs": 14378.9,
+              "batchedTok_s": 17.8,
+              "perTokenMs": 194345.1,
+              "perTokenTok_s": 1.32,
+              "weightMs": 13869.9,
+              "attentionMs": 509.0,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.96
+            }
+          ]
+        },
+        {
+          "kernel": "gemv",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=2761.27 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.60"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 5883.3,
+              "batchedTok_s": 21.76,
+              "perTokenMs": 98420.3,
+              "perTokenTok_s": 1.3,
+              "weightMs": 5522.5,
+              "attentionMs": 360.8,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.6
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 12482.5,
+              "batchedTok_s": 20.51,
+              "perTokenMs": 196597.4,
+              "perTokenTok_s": 1.3,
+              "weightMs": 11045.1,
+              "attentionMs": 1437.4,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.6
+            }
+          ]
+        },
+        {
+          "kernel": "tiled",
+          "rowWidth": 32,
+          "fitLines": [
+            "weightFit=1405.15 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=1.19"
+          ],
+          "crossover": "fitted attention term >= fitted weight term at length >= 792",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 4,
+              "batchedMs": 6546.1,
+              "batchedTok_s": 19.55,
+              "perTokenMs": 98382.5,
+              "perTokenTok_s": 1.3,
+              "weightMs": 5620.6,
+              "attentionMs": 925.5,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 1.19
+            },
+            {
+              "length": 256,
+              "subBatches": 8,
+              "batchedMs": 14928.9,
+              "batchedTok_s": 17.15,
+              "perTokenMs": 201182.7,
+              "perTokenTok_s": 1.27,
+              "weightMs": 11241.2,
+              "attentionMs": 3687.7,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 1.19
+            }
+          ]
+        },
+        {
+          "kernel": "tiled",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=1916.80 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.87"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 4115.6,
+              "batchedTok_s": 31.1,
+              "perTokenMs": 99847.1,
+              "perTokenTok_s": 1.28,
+              "weightMs": 3833.6,
+              "attentionMs": 282.0,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.87
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 8790.7,
+              "batchedTok_s": 29.12,
+              "perTokenMs": 194027.0,
+              "perTokenTok_s": 1.32,
+              "weightMs": 7667.2,
+              "attentionMs": 1123.5,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.87
+            }
+          ]
+        },
+        {
+          "kernel": "gemm",
+          "rowWidth": 32,
+          "fitLines": [
+            "weightFit=1867.50 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.89"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 4,
+              "batchedMs": 8331.5,
+              "batchedTok_s": 15.36,
+              "perTokenMs": 95069.8,
+              "perTokenTok_s": 1.35,
+              "weightMs": 7470.0,
+              "attentionMs": 861.5,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.89
+            },
+            {
+              "length": 256,
+              "subBatches": 8,
+              "batchedMs": 18372.6,
+              "batchedTok_s": 13.93,
+              "perTokenMs": 193960.9,
+              "perTokenTok_s": 1.32,
+              "weightMs": 14940.0,
+              "attentionMs": 3432.7,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.89
+            }
+          ]
+        },
+        {
+          "kernel": "gemm",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=2993.48 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.56"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 6684.8,
+              "batchedTok_s": 19.15,
+              "perTokenMs": 94169.1,
+              "perTokenTok_s": 1.36,
+              "weightMs": 5987.0,
+              "attentionMs": 697.8,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.56
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 14754.3,
+              "batchedTok_s": 17.35,
+              "perTokenMs": 187391.4,
+              "perTokenTok_s": 1.37,
+              "weightMs": 11973.9,
+              "attentionMs": 2780.4,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.56
+            }
+          ]
+        }
+      ],
+      "stage_lines": [],
+      "refusals": []
+    },
+    "arm4_t32_stageProfile_gemv-tiled-gemm_w64_l128-256_r2": {
+      "kind": "prefill-profile",
+      "meta": {
+        "threads": 32,
+        "modelBytes": 2104932768,
+        "reps": 2,
+        "perToken": "off",
+        "traversalBytes": 1668685824
+      },
+      "blocks": [
+        {
+          "kernel": "gemv",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=3155.20 ms/traversal (UNRELIABLE: measured costs are not separable into the two terms on this run) impliedWeightGB/s=0.53"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 6071.6,
+              "batchedTok_s": 21.08,
+              "weightMs": 6310.4,
+              "attentionMs": -238.8,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.53
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 11669.2,
+              "batchedTok_s": 21.94,
+              "weightMs": 12620.8,
+              "attentionMs": -951.6,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.53
+            }
+          ]
+        },
+        {
+          "kernel": "tiled",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=2686.83 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.62"
+          ],
+          "crossover": "not reached within 4x the longest measured length (256 tokens)",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 5816.7,
+              "batchedTok_s": 22.01,
+              "weightMs": 5373.7,
+              "attentionMs": 443.1,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.62
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 12512.7,
+              "batchedTok_s": 20.46,
+              "weightMs": 10747.3,
+              "attentionMs": 1765.4,
+              "fitResidualMs": 0.0,
+              "weightGB_s": 0.62
+            }
+          ]
+        },
+        {
+          "kernel": "gemm",
+          "rowWidth": 64,
+          "fitLines": [
+            "weightFit=2870.56 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.58"
+          ],
+          "crossover": "fitted attention term >= fitted weight term at length >= 954",
+          "rows": [
+            {
+              "length": 128,
+              "subBatches": 2,
+              "batchedMs": 6521.7,
+              "batchedTok_s": 19.63,
+              "weightMs": 5741.1,
+              "attentionMs": 780.6,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.58
+            },
+            {
+              "length": 256,
+              "subBatches": 4,
+              "batchedMs": 14592.4,
+              "batchedTok_s": 17.54,
+              "weightMs": 11482.3,
+              "attentionMs": 3110.1,
+              "fitResidualMs": -0.0,
+              "weightGB_s": 0.58
+            }
+          ]
+        }
+      ],
+      "stage_lines": [
+        {
+          "kernel": "gemv",
+          "rowWidth": 64,
+          "length": 128,
+          "forwardCalls": 2,
+          "seed_ms": 0.904,
+          "cache_append_ms": 0.259,
+          "attention_ms": 3579.745,
+          "attention_weight_ms": 1815.145,
+          "attention_projection_ms": 944.293,
+          "attention_output_ms": 870.852,
+          "attention_kernel_ms": 1457.345,
+          "kv_write_ms": 5.767,
+          "feed_forward_ms": 8549.784,
+          "feed_forward_weight_ms": 7011.609,
+          "feed_forward_gate_up_ms": 3894.422,
+          "feed_forward_down_ms": 3117.187,
+          "sparse_chain_ms": 0.0,
+          "logits_head_ms": 94.197,
+          "total_ms": 12225.077
+        },
+        {
+          "kernel": "gemv",
+          "rowWidth": 64,
+          "length": 256,
+          "forwardCalls": 2,
+          "seed_ms": 1.718,
+          "cache_append_ms": 0.159,
+          "attention_ms": 8898.214,
+          "attention_weight_ms": 3474.745,
+          "attention_projection_ms": 1791.845,
+          "attention_output_ms": 1682.899,
+          "attention_kernel_ms": 4836.112,
+          "kv_write_ms": 10.81,
+          "feed_forward_ms": 15948.891,
+          "feed_forward_weight_ms": 13066.891,
+          "feed_forward_gate_up_ms": 7198.07,
+          "feed_forward_down_ms": 5868.821,
+          "sparse_chain_ms": 0.0,
+          "logits_head_ms": 76.465,
+          "total_ms": 24925.757
+        },
+        {
+          "kernel": "tiled",
+          "rowWidth": 64,
+          "length": 128,
+          "forwardCalls": 2,
+          "seed_ms": 0.833,
+          "cache_append_ms": 0.027,
+          "attention_ms": 3689.876,
+          "attention_weight_ms": 1693.275,
+          "attention_projection_ms": 899.248,
+          "attention_output_ms": 794.027,
+          "attention_kernel_ms": 1696.424,
+          "kv_write_ms": 5.16,
+          "feed_forward_ms": 8019.86,
+          "feed_forward_weight_ms": 6529.909,
+          "feed_forward_gate_up_ms": 3567.804,
+          "feed_forward_down_ms": 2962.104,
+          "sparse_chain_ms": 0.0,
+          "logits_head_ms": 79.48,
+          "total_ms": 11790.237
+        },
+        {
+          "kernel": "tiled",
+          "rowWidth": 64,
+          "length": 256,
+          "forwardCalls": 2,
+          "seed_ms": 2.69,
+          "cache_append_ms": 1.249,
+          "attention_ms": 10656.689,
+          "attention_weight_ms": 3468.79,
+          "attention_projection_ms": 1796.84,
+          "attention_output_ms": 1671.95,
+          "attention_kernel_ms": 6610.946,
+          "kv_write_ms": 10.261,
+          "feed_forward_ms": 15907.494,
+          "feed_forward_weight_ms": 13075.63,
+          "feed_forward_gate_up_ms": 7174.743,
+          "feed_forward_down_ms": 5900.887,
+          "sparse_chain_ms": 0.0,
+          "logits_head_ms": 82.438,
+          "total_ms": 26652.196
+        },
+        {
+          "kernel": "gemm",
+          "rowWidth": 64,
+          "length": 128,
+          "forwardCalls": 2,
+          "seed_ms": 0.898,
+          "cache_append_ms": 0.047,
+          "attention_ms": 4227.113,
+          "attention_weight_ms": 2356.084,
+          "attention_projection_ms": 1612.468,
+          "attention_output_ms": 743.616,
+          "attention_kernel_ms": 1544.596,
+          "kv_write_ms": 6.129,
+          "feed_forward_ms": 8777.191,
+          "feed_forward_weight_ms": 7150.964,
+          "feed_forward_gate_up_ms": 4428.671,
+          "feed_forward_down_ms": 2722.293,
+          "sparse_chain_ms": 0.0,
+          "logits_head_ms": 77.7,
+          "total_ms": 13083.138
+        },
+        {
+          "kernel": "gemm",
+          "rowWidth": 64,
+          "length": 256,
+          "forwardCalls": 2,
+          "seed_ms": 1.977,
+          "cache_append_ms": 0.066,
+          "attention_ms": 11499.258,
+          "attention_weight_ms": 4699.597,
+          "attention_projection_ms": 3212.364,
+          "attention_output_ms": 1487.234,
+          "attention_kernel_ms": 6030.763,
+          "kv_write_ms": 12.251,
+          "feed_forward_ms": 17725.762,
+          "feed_forward_weight_ms": 14464.746,
+          "feed_forward_gate_up_ms": 8911.358,
+          "feed_forward_down_ms": 5553.388,
+          "sparse_chain_ms": 0.0,
+          "logits_head_ms": 80.564,
+          "total_ms": 29309.357
+        }
+      ],
+      "refusals": []
+    },
+    "arm5a_llama-bench_t8_p128-256-512_r3": {
+      "kind": "llama-bench",
+      "tests": [
+        {
+          "test": "pp128",
+          "threads": 8,
+          "mean_t_s": 70.69,
+          "std_t_s": 4.83
+        },
+        {
+          "test": "pp256",
+          "threads": 8,
+          "mean_t_s": 74.45,
+          "std_t_s": 2.56
+        },
+        {
+          "test": "pp512",
+          "threads": 8,
+          "mean_t_s": 69.33,
+          "std_t_s": 4.64
+        }
+      ]
+    },
+    "arm5b_llama-bench_t32_p128-256-512_r3": {
+      "kind": "llama-bench",
+      "tests": [
+        {
+          "test": "pp128",
+          "threads": 32,
+          "mean_t_s": 228.18,
+          "std_t_s": 10.14
+        },
+        {
+          "test": "pp256",
+          "threads": 32,
+          "mean_t_s": 239.48,
+          "std_t_s": 9.1
+        },
+        {
+          "test": "pp512",
+          "threads": 32,
+          "mean_t_s": 227.23,
+          "std_t_s": 5.56
+        }
+      ]
+    },
+    "chain_runner": {
+      "kind": "prefill-profile",
+      "meta": {},
+      "blocks": [],
+      "stage_lines": [],
+      "refusals": []
+    }
+  }
+}

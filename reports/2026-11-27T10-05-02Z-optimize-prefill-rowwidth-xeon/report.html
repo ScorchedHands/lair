@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>LAIR prefill row-width probe — Xeon E5-2683 v4 — 2026-11-27</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+body{font-family:system-ui,sans-serif;margin:2rem;max-width:1100px;color:#1a1a1a}
+h2{margin-top:2.5rem}table{border-collapse:collapse;margin:.8rem 0;font-size:.9rem}
+th,td{border:1px solid #bbb;padding:4px 8px;text-align:right}th:first-child,td:first-child{text-align:left}
+.note{color:#555;font-size:.85rem}.chartbox{margin-bottom:2.5rem}
+canvas{max-width:100%}code{background:#f3f3f3;padding:1px 4px}
+</style>
+</head>
+<body>
+<h1>LAIR prefill row-width probe — dual Xeon E5-2683 v4 (AVX2+FMA), <code>phase/mvp7</code> @ 016dd9c, as of 2026-11-27</h1>
+<p class="note">Model qwen2.5-3b-instruct-q4_k_m.gguf; traversalBytes=1,668,685,824 per weight pass. LAIR.Bench prefill-profile; llama-b12032 with defaults <code>-b 2048 -ub 512</code>. Posture: governor performance, no pinning (matching prior sweeps). Tables are authoritative; charts restate the same numbers from data.json.</p>
+
+<h2>1. Batched tok/s at width 32 vs 64 — throughput does NOT double with width</h2>
+<div class="chartbox"><canvas id="c1" height="90"></canvas><script>
+const K=["gemv","tiled","gemm"],L=[128,256];
+new Chart(document.getElementById("c1"),{type:"bar",data:{labels:["t8 gemv l128","t8 gemv l256","t8 tiled l128","t8 tiled l256","t8 gemm l128","t8 gemm l256","t32 gemv l128","t32 gemv l256","t32 tiled l128","t32 tiled l256","t32 gemm l128","t32 gemm l256"],datasets:[
+{label:"w32 (r3)",data:[11.79,9.61,10.30,9.61,10.06,9.57,18.19,20.15,20.19,18.73,15.16,13.90]},
+{label:"w64 (r3)",data:[11.60,11.00,13.35,12.06,10.23,10.00,21.96,19.94,23.47,22.47,18.57,17.95]},
+{label:"w32 (r1 per-token arm)",data:[12.89,10.12,10.24,9.47,10.70,9.96,18.12,17.80,19.55,17.15,15.36,13.93]},
+{label:"w64 (r1 per-token arm)",data:[11.65,11.26,10.60,10.39,11.91,10.33,21.76,20.51,31.10,29.12,19.15,17.35]}]},options:{plugins:{title:{display:true,text:"batchedTok/s — arm1/arm2 (reps=3) and per-token arms (reps=1); ratios 0.90–1.70, never ~2"}}}});
+</script>
+<table><tr><th>posture/kernel/len</th><th>w32 r3</th><th>w64 r3</th><th>ratio</th></tr>
+<tr><td>t8 gemv 128 / 256</td><td>11.79 / 9.61</td><td>11.60 / 11.00</td><td>0.98 / 1.14</td></tr>
+<tr><td>t8 tiled 128 / 256</td><td>10.30 / 9.61</td><td>13.35 / 12.06</td><td>1.30 / 1.25</td></tr>
+<tr><td>t8 gemm 128 / 256</td><td>10.06 / 9.57</td><td>10.23 / 10.00</td><td>1.02 / 1.04</td></tr>
+<tr><td>t32 gemv 128 / 256</td><td>18.19 / 20.15</td><td>21.96 / 19.94</td><td>1.21 / 0.99</td></tr>
+<tr><td>t32 tiled 128 / 256 (r1 arm)</td><td>19.55–20.19 / 17.15–18.73</td><td>23.47–31.10 / 22.47–29.12</td><td>1.16–1.59 / 1.20–1.70</td></tr>
+<tr><td>t32 gemm 128 / 256</td><td>15.16 / 13.90</td><td>18.57 / 17.95</td><td>1.22 / 1.29</td></tr></table>
+
+<h2>2. Amortization factor (batched ÷ per-token) vs theoretical rows-per-pass (= stated width)</h2>
+<div class="chartbox"><canvas id="c2" height="80"></canvas><script>
+new Chart(document.getElementById("c2"),{type:"bar",data:{labels:["t8 gemv w32","t8 gemv w64","t8 tiled w32","t8 tiled w64","t8 gemm w32","t8 gemm w64","t32 gemv w32","t32 gemv w64","t32 tiled w32","t32 tiled w64","t32 gemm w32","t32 gemm w64"],datasets:[
+{label:"measured factor (len128)",data:[6.54,5.68,4.85,5.22,5.05,6.08,13.42,16.74,15.04,24.30,11.38,14.08]},
+{label:"measured factor (len256)",data:[5.14,5.96,4.88,5.50,4.86,5.22,13.48,15.78,13.50,22.06,10.55,12.66]},
+{label:"theoretical rows/pass (stated width)",data:[32,64,32,64,32,64,32,64,32,64,32,64]}]},options:{plugins:{title:{display:true,text:"plateau ≈5–6× at t8 regardless of stated width; ≤24× even at t32 — far below 32/64"}}}});
+</script>
+<table><tr><th>arm/posture/kernel/w (l128/l256)</th><th>factor</th><th>% of stated width</th></tr>
+<tr><td>t8 gemv w32 / w64</td><td>6.54, 5.14 / 5.68, 5.96</td><td>20%,16% / 9%,9%</td></tr>
+<tr><td>t8 tiled w32 / w64</td><td>4.85, 4.88 / 5.22, 5.50</td><td>15% / 8–9%</td></tr>
+<tr><td>t8 gemm w32 / w64</td><td>5.05, 4.86 / 6.08, 5.22</td><td>15–16% / 8–9%</td></tr>
+<tr><td>t32 gemv w32 / w64</td><td>13.42, 13.48 / 16.74, 15.78</td><td>42% / 25–26%</td></tr>
+<tr><td>t32 tiled w32 / w64</td><td>15.04, 13.50 / 24.30, 22.06</td><td>42–47% / 34–38%</td></tr>
+<tr><td>t32 gemm w32 / w64</td><td>11.38, 10.55 / 14.08, 12.66</td><td>33–36% / 20–22%</td></tr></table>
+<p class="note">perTokenTok/s is width-independent (≈1.9–2.1 t8; ≈1.3 t32) — kernels do not re-walk weights per token, but effective rows carried per weight traversal plateau at ~5–6 (t8) to ≤~24 (t32), never the stated 32/64.</p>
+
+<h2>3. Implied weight-traversal bandwidth falls when width doubles</h2>
+<div class="chartbox"><canvas id="c3" height="70"></canvas><script>
+new Chart(document.getElementById("c3"),{type:"bar",data:{labels:["gemv t8","tiled t8","gemm t8","gemv t32(r1)","tiled t32(r1)","gemm t32(r1)"],datasets:[
+{label:"impliedWeightGB/s w32",data:[0.93,0.58,0.60,0.96,1.19,0.89]},
+{label:"impliedWeightGB/s w64",data:[0.31,0.28,0.37,0.60,0.87,0.56]}]},options:{plugins:{title:{display:true,text:"arm3a/arm3b fit lines; arm1: gemv 0.80→0.32, tiled 0.58→0.39, gemm 0.55→0.27"}}}});
+</script>
+
+<h2>4. Stage shares at width 64, threads 32 (arm4, reps=2) — gate_up dominates every kernel</h2>
+<div class="chartbox"><canvas id="c4" height="80"></canvas><script>
+new Chart(document.getElementById("c4"),{type:"bar",data:{labels:["gemv l128","gemv l256","tiled l128","tiled l256","gemm l128","gemm l256"],datasets:[
+{label:"gate_up %",data:[31.9,28.9,30.3,26.9,33.9,30.4]},
+{label:"down %",data:[25.5,23.5,25.1,22.1,20.8,18.9]},
+{label:"attention_weight %",data:[14.8,13.9,14.4,13.0,18.0,16.0]},
+{label:"attn_kernel %",data:[11.9,19.4,14.4,24.8,11.8,20.6]}]},options:{plugins:{title:{display:true,text:"share of total_ms per stage line"}}}});
+</script>
+
+<h2>5. llama reference and LAIR÷llama (pp256 / pp512)</h2>
+<div class="chartbox"><canvas id="c5" height="70"></canvas><script>
+new Chart(document.getElementById("c5"),{type:"bar",data:{labels:["t8","t32"],datasets:[
+{label:"llama pp128",data:[70.69,228.18]},{label:"pp256",data:[74.45,239.48]},{label:"pp512",data:[69.33,227.23]},
+{label:"LAIR gemv w64 (l128)",data:[11.60,21.96]},{label:"tiled w64 (l128, r3 arm; r1 arm t32 up to 31.10)",data:[13.35,23.47]}]},options:{plugins:{title:{display:true,text:"llama flat across pp sizes because ubatch default 512 already covers them"}}}});
+</script>
+<table><tr><th>LAIR w64 kernel/posture (l128/l256)</th><th>÷ llama pp256</th><th>÷ pp512</th></tr>
+<tr><td>t8 gemv 0.156/0.148 · tiled 0.179/0.162 · gemm 0.137/0.134 (l128/l256)</td><td colspan="2">t32: gemv 0.092/0.083 · tiled 0.098–0.130 / 0.094–0.122 · gemm 0.078/0.075; vs pp512 add ≈+0.006–0.01</td></tr></table>
+
+<h2>Verdict</h2>
+<p><strong>Candidate B.</strong> Effective amortization plateaus far below stated row width (factor 4.9–6.1 at t8 for every kernel whether w32 or w64; ≤24 vs theoretical 64 even at best posture), doubling the ceiling gains only −10%…+70%, and implied per-pass bandwidth roughly <em>halves</em> when width doubles (e.g., gemv t8: impliedWeightGB/s=0.93 → 0.31). Widening MaxPrefillRowWidth alone will not deliver a near-proportional gain; kernel grouping must be restructured first so each traversal actually amortizes its rows.</p>
+<p class="note">Deviation note: per-token baselines ran at reps=1 (per-token cost ≈0.5 s/token t8, ≈0.75 s/token t32 made spec's reps=3 impractical — one aborted r3 attempt kept as evidence). Fit lines for arm2 gemv w32 and arm4 gemv w64 carry engine-reported UNRELIABLE markers; their tok/s values are still used. No kernel refusals occurred on any span.</p>
+</body></html>

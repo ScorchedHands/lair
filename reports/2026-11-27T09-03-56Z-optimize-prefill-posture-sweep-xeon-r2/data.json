@@ -1,0 +1,999 @@
+{
+  "report_started_utc": "2026-11-27T09:03:56Z",
+  "generated_utc": "2026-11-27T09:36:49Z",
+  "lane": "Xeon CPU-only lair-lab (root@192.168.33.53), rowWidth=64",
+  "model_file": "/root/lair-measurements/qwen25-small-cpu/models/qwen2.5-3b-instruct-q4_k_m.gguf",
+  "lair_binary": "/root/lair-measurements/qwen25-small-cpu/build/app-posture-2026-11-27T06-53-30Z/Lair.Bench.dll",
+  "dotnet_runtime": "/usr/local/dotnet/dotnet",
+  "llama_binary": "/root/lair-tools/llama-b12032/llama-bench",
+  "method": "2 warmup rounds then 4 measured rounds x arms [lair:8, lair:16, lair:32, llama:8, llama:16, llama:32] interleaved back-to-back in one session so host drift cancels; measured arm order rotates on odd rounds to cancel positional bias while warmups run each arm once per round for cold-start/page-cache handling; reps=1 per command with kernels gemv, tiled and lengths 128,256; LAIR batchedTok/s medians parsed from prefill-profile throughput rows, llama pp token medians parsed from llama-bench markdown columns (-ngl 0 -t N -p <lengths> -n 0 -r 1); taskset pins CPUs only for lair arms.",
+  "rounds": 4,
+  "warmup_rounds": 2,
+  "rotate_arm_order": true,
+  "arms": [
+    {
+      "raw": "lair:8",
+      "kind": "lair",
+      "threads": 8,
+      "cpulist": ""
+    },
+    {
+      "raw": "lair:16",
+      "kind": "lair",
+      "threads": 16,
+      "cpulist": ""
+    },
+    {
+      "raw": "lair:32",
+      "kind": "lair",
+      "threads": 32,
+      "cpulist": ""
+    },
+    {
+      "raw": "llama:8",
+      "kind": "llama",
+      "threads": 8,
+      "cpulist": ""
+    },
+    {
+      "raw": "llama:16",
+      "kind": "llama",
+      "threads": 16,
+      "cpulist": ""
+    },
+    {
+      "raw": "llama:32",
+      "kind": "llama",
+      "threads": 32,
+      "cpulist": ""
+    }
+  ],
+  "llama_model_facts_by_arm": {
+    "llama:16": {
+      "model": "qwen2 3B Q4_K - Medium",
+      "size": "1.95 GiB",
+      "params": "3.40 B",
+      "backend": "CPU",
+      "threads": 16
+    },
+    "llama:32": {
+      "model": "qwen2 3B Q4_K - Medium",
+      "size": "1.95 GiB",
+      "params": "3.40 B",
+      "backend": "CPU",
+      "threads": 32
+    },
+    "llama:8": {
+      "model": "qwen2 3B Q4_K - Medium",
+      "size": "1.95 GiB",
+      "params": "3.40 B",
+      "backend": "CPU",
+      "threads": 8
+    }
+  },
+  "rows": [
+    {
+      "key": "lair|lair:8|gemv|128|tok_s",
+      "kind": "lair",
+      "arm": "lair:8",
+      "threads": 8,
+      "cpulist": "",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "13.620",
+        "13.690",
+        "14.470",
+        "12.400"
+      ],
+      "median": 13.655,
+      "min": 12.4,
+      "max": 14.47,
+      "count": 4,
+      "spread": 0.15159282314170636
+    },
+    {
+      "key": "lair|lair:8|gemv|256|tok_s",
+      "kind": "lair",
+      "arm": "lair:8",
+      "threads": 8,
+      "cpulist": "",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "10.440",
+        "10.610",
+        "11.130",
+        "10.560"
+      ],
+      "median": 10.585,
+      "min": 10.44,
+      "max": 11.13,
+      "count": 4,
+      "spread": 0.065186584789797
+    },
+    {
+      "key": "lair|lair:8|tiled|128|tok_s",
+      "kind": "lair",
+      "arm": "lair:8",
+      "threads": 8,
+      "cpulist": "",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "12.370",
+        "11.640",
+        "12.130",
+        "11.930"
+      ],
+      "median": 12.030000000000001,
+      "min": 11.64,
+      "max": 12.37,
+      "count": 4,
+      "spread": 0.06068162926018276
+    },
+    {
+      "key": "lair|lair:8|tiled|256|tok_s",
+      "kind": "lair",
+      "arm": "lair:8",
+      "threads": 8,
+      "cpulist": "",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "11.010",
+        "11.450",
+        "11.010",
+        "10.620"
+      ],
+      "median": 11.01,
+      "min": 10.62,
+      "max": 11.45,
+      "count": 4,
+      "spread": 0.07538601271571299
+    },
+    {
+      "key": "lair|lair:16|gemv|128|tok_s",
+      "kind": "lair",
+      "arm": "lair:16",
+      "threads": 16,
+      "cpulist": "",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "19.210",
+        "17.780",
+        "18.700",
+        "19.640"
+      ],
+      "median": 18.955,
+      "min": 17.78,
+      "max": 19.64,
+      "count": 4,
+      "spread": 0.09812714323397519
+    },
+    {
+      "key": "lair|lair:16|gemv|256|tok_s",
+      "kind": "lair",
+      "arm": "lair:16",
+      "threads": 16,
+      "cpulist": "",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "18.100",
+        "16.660",
+        "17.460",
+        "16.900"
+      ],
+      "median": 17.18,
+      "min": 16.66,
+      "max": 18.1,
+      "count": 4,
+      "spread": 0.08381839348079169
+    },
+    {
+      "key": "lair|lair:16|tiled|128|tok_s",
+      "kind": "lair",
+      "arm": "lair:16",
+      "threads": 16,
+      "cpulist": "",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "18.660",
+        "18.380",
+        "18.000",
+        "19.790"
+      ],
+      "median": 18.52,
+      "min": 18.0,
+      "max": 19.79,
+      "count": 4,
+      "spread": 0.09665226781857447
+    },
+    {
+      "key": "lair|lair:16|tiled|256|tok_s",
+      "kind": "lair",
+      "arm": "lair:16",
+      "threads": 16,
+      "cpulist": "",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "16.680",
+        "15.570",
+        "17.200",
+        "18.260"
+      ],
+      "median": 16.939999999999998,
+      "min": 15.57,
+      "max": 18.26,
+      "count": 4,
+      "spread": 0.1587957497048407
+    },
+    {
+      "key": "lair|lair:32|gemv|128|tok_s",
+      "kind": "lair",
+      "arm": "lair:32",
+      "threads": 32,
+      "cpulist": "",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "27.210",
+        "20.490",
+        "22.770",
+        "20.830"
+      ],
+      "median": 21.799999999999997,
+      "min": 20.49,
+      "max": 27.21,
+      "count": 4,
+      "spread": 0.3082568807339451
+    },
+    {
+      "key": "lair|lair:32|gemv|256|tok_s",
+      "kind": "lair",
+      "arm": "lair:32",
+      "threads": 32,
+      "cpulist": "",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "19.540",
+        "19.840",
+        "19.840",
+        "26.580"
+      ],
+      "median": 19.84,
+      "min": 19.54,
+      "max": 26.58,
+      "count": 4,
+      "spread": 0.3548387096774193
+    },
+    {
+      "key": "lair|lair:32|tiled|128|tok_s",
+      "kind": "lair",
+      "arm": "lair:32",
+      "threads": 32,
+      "cpulist": "",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "23.480",
+        "31.210",
+        "23.400",
+        "21.010"
+      ],
+      "median": 23.439999999999998,
+      "min": 21.01,
+      "max": 31.21,
+      "count": 4,
+      "spread": 0.4351535836177475
+    },
+    {
+      "key": "lair|lair:32|tiled|256|tok_s",
+      "kind": "lair",
+      "arm": "lair:32",
+      "threads": 32,
+      "cpulist": "",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "21.030",
+        "21.000",
+        "18.810",
+        "22.600"
+      ],
+      "median": 21.015,
+      "min": 18.81,
+      "max": 22.6,
+      "count": 4,
+      "spread": 0.18034737092552952
+    },
+    {
+      "key": "llama|llama:8||128|tok_s",
+      "kind": "llama",
+      "arm": "llama:8",
+      "threads": 8,
+      "cpulist": "",
+      "kernel": "",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "74.140",
+        "73.250",
+        "75.180",
+        "74.430"
+      ],
+      "median": 74.285,
+      "min": 73.25,
+      "max": 75.18,
+      "count": 4,
+      "spread": 0.02598101904826017
+    },
+    {
+      "key": "llama|llama:8||256|tok_s",
+      "kind": "llama",
+      "arm": "llama:8",
+      "threads": 8,
+      "cpulist": "",
+      "kernel": "",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "72.570",
+        "75.240",
+        "73.360",
+        "73.670"
+      ],
+      "median": 73.515,
+      "min": 72.57,
+      "max": 75.24,
+      "count": 4,
+      "spread": 0.03631911854723528
+    },
+    {
+      "key": "llama|llama:16||128|tok_s",
+      "kind": "llama",
+      "arm": "llama:16",
+      "threads": 16,
+      "cpulist": "",
+      "kernel": "",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "137.800",
+        "133.570",
+        "128.500",
+        "134.630"
+      ],
+      "median": 134.1,
+      "min": 128.5,
+      "max": 137.8,
+      "count": 4,
+      "spread": 0.06935123042505602
+    },
+    {
+      "key": "llama|llama:16||256|tok_s",
+      "kind": "llama",
+      "arm": "llama:16",
+      "threads": 16,
+      "cpulist": "",
+      "kernel": "",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "141.670",
+        "139.310",
+        "141.730",
+        "137.590"
+      ],
+      "median": 140.49,
+      "min": 137.59,
+      "max": 141.73,
+      "count": 4,
+      "spread": 0.029468289557975556
+    },
+    {
+      "key": "llama|llama:32||128|tok_s",
+      "kind": "llama",
+      "arm": "llama:32",
+      "threads": 32,
+      "cpulist": "",
+      "kernel": "",
+      "length": 128,
+      "metric": "tok_s",
+      "samples": [
+        "241.800",
+        "204.830",
+        "222.050",
+        "238.740"
+      ],
+      "median": 230.395,
+      "min": 204.83,
+      "max": 241.8,
+      "count": 4,
+      "spread": 0.16046355172638294
+    },
+    {
+      "key": "llama|llama:32||256|tok_s",
+      "kind": "llama",
+      "arm": "llama:32",
+      "threads": 32,
+      "cpulist": "",
+      "kernel": "",
+      "length": 256,
+      "metric": "tok_s",
+      "samples": [
+        "200.130",
+        "215.800",
+        "232.850",
+        "232.160"
+      ],
+      "median": 223.98000000000002,
+      "min": 200.13,
+      "max": 232.85,
+      "count": 4,
+      "spread": 0.14608447182784176
+    },
+    {
+      "key": "lair|lair:8|gemv|128|batched_ms",
+      "kind": "lair",
+      "arm": "lair:8",
+      "threads": 8,
+      "cpulist": "",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "batched_ms",
+      "samples": [
+        "9401.100",
+        "9349.400",
+        "8847.000",
+        "10321.900"
+      ],
+      "median": 9375.25,
+      "min": 8847.0,
+      "max": 10321.9,
+      "count": 4,
+      "spread": 0.15731847150742642
+    },
+    {
+      "key": "lair|lair:8|gemv|256|batched_ms",
+      "kind": "lair",
+      "arm": "lair:8",
+      "threads": 8,
+      "cpulist": "",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "batched_ms",
+      "samples": [
+        "24523.700",
+        "24120.600",
+        "23000.300",
+        "24237.500"
+      ],
+      "median": 24179.05,
+      "min": 23000.3,
+      "max": 24523.7,
+      "count": 4,
+      "spread": 0.06300495677042735
+    },
+    {
+      "key": "lair|lair:8|tiled|128|batched_ms",
+      "kind": "lair",
+      "arm": "lair:8",
+      "threads": 8,
+      "cpulist": "",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "batched_ms",
+      "samples": [
+        "10349.800",
+        "11000.300",
+        "10549.500",
+        "10733.200"
+      ],
+      "median": 10641.35,
+      "min": 10349.8,
+      "max": 11000.3,
+      "count": 4,
+      "spread": 0.06112946195736443
+    },
+    {
+      "key": "lair|lair:8|tiled|256|batched_ms",
+      "kind": "lair",
+      "arm": "lair:8",
+      "threads": 8,
+      "cpulist": "",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "batched_ms",
+      "samples": [
+        "23261.400",
+        "22352.400",
+        "23241.100",
+        "24110.500"
+      ],
+      "median": 23251.25,
+      "min": 22352.4,
+      "max": 24110.5,
+      "count": 4,
+      "spread": 0.0756131390785441
+    },
+    {
+      "key": "lair|lair:16|gemv|128|batched_ms",
+      "kind": "lair",
+      "arm": "lair:16",
+      "threads": 16,
+      "cpulist": "",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "batched_ms",
+      "samples": [
+        "6664.200",
+        "7198.900",
+        "6843.400",
+        "6516.500"
+      ],
+      "median": 6753.799999999999,
+      "min": 6516.5,
+      "max": 7198.9,
+      "count": 4,
+      "spread": 0.10103941484793741
+    },
+    {
+      "key": "lair|lair:16|gemv|256|batched_ms",
+      "kind": "lair",
+      "arm": "lair:16",
+      "threads": 16,
+      "cpulist": "",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "batched_ms",
+      "samples": [
+        "14146.600",
+        "15369.600",
+        "14664.500",
+        "15151.700"
+      ],
+      "median": 14908.1,
+      "min": 14146.6,
+      "max": 15369.6,
+      "count": 4,
+      "spread": 0.08203594019358604
+    },
+    {
+      "key": "lair|lair:16|tiled|128|batched_ms",
+      "kind": "lair",
+      "arm": "lair:16",
+      "threads": 16,
+      "cpulist": "",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "batched_ms",
+      "samples": [
+        "6858.200",
+        "6964.400",
+        "7112.200",
+        "6466.500"
+      ],
+      "median": 6911.299999999999,
+      "min": 6466.5,
+      "max": 7112.2,
+      "count": 4,
+      "spread": 0.09342670698710805
+    },
+    {
+      "key": "lair|lair:16|tiled|256|batched_ms",
+      "kind": "lair",
+      "arm": "lair:16",
+      "threads": 16,
+      "cpulist": "",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "batched_ms",
+      "samples": [
+        "15348.200",
+        "16447.100",
+        "14880.200",
+        "14017.100"
+      ],
+      "median": 15114.2,
+      "min": 14017.1,
+      "max": 16447.1,
+      "count": 4,
+      "spread": 0.16077595903190364
+    },
+    {
+      "key": "lair|lair:32|gemv|128|batched_ms",
+      "kind": "lair",
+      "arm": "lair:32",
+      "threads": 32,
+      "cpulist": "",
+      "kernel": "gemv",
+      "length": 128,
+      "metric": "batched_ms",
+      "samples": [
+        "4705.000",
+        "6245.500",
+        "5620.900",
+        "6143.500"
+      ],
+      "median": 5882.2,
+      "min": 4705.0,
+      "max": 6245.5,
+      "count": 4,
+      "spread": 0.26189180918703886
+    },
+    {
+      "key": "lair|lair:32|gemv|256|batched_ms",
+      "kind": "lair",
+      "arm": "lair:32",
+      "threads": 32,
+      "cpulist": "",
+      "kernel": "gemv",
+      "length": 256,
+      "metric": "batched_ms",
+      "samples": [
+        "13099.900",
+        "12902.100",
+        "12905.000",
+        "9631.800"
+      ],
+      "median": 12903.55,
+      "min": 9631.8,
+      "max": 13099.9,
+      "count": 4,
+      "spread": 0.2687709971286972
+    },
+    {
+      "key": "lair|lair:32|tiled|128|batched_ms",
+      "kind": "lair",
+      "arm": "lair:32",
+      "threads": 32,
+      "cpulist": "",
+      "kernel": "tiled",
+      "length": 128,
+      "metric": "batched_ms",
+      "samples": [
+        "5450.600",
+        "4100.600",
+        "5470.400",
+        "6092.500"
+      ],
+      "median": 5460.5,
+      "min": 4100.6,
+      "max": 6092.5,
+      "count": 4,
+      "spread": 0.36478344473949265
+    },
+    {
+      "key": "lair|lair:32|tiled|256|batched_ms",
+      "kind": "lair",
+      "arm": "lair:32",
+      "threads": 32,
+      "cpulist": "",
+      "kernel": "tiled",
+      "length": 256,
+      "metric": "batched_ms",
+      "samples": [
+        "12173.700",
+        "12190.900",
+        "13611.800",
+        "11329.500"
+      ],
+      "median": 12182.3,
+      "min": 11329.5,
+      "max": 13611.8,
+      "count": 4,
+      "spread": 0.18734557513769973
+    }
+  ],
+  "posture_scaling_rows": [
+    {
+      "kernel": "gemv",
+      "length": 128,
+      "thread_posture": "8 threads",
+      "lair_arm": "lair:8",
+      "median_tok_s": 13.655,
+      "per_thread_efficiency_tok_s_per_thread": 1.7069
+    },
+    {
+      "kernel": "gemv",
+      "length": 256,
+      "thread_posture": "8 threads",
+      "lair_arm": "lair:8",
+      "median_tok_s": 10.585,
+      "per_thread_efficiency_tok_s_per_thread": 1.3231
+    },
+    {
+      "kernel": "tiled",
+      "length": 128,
+      "thread_posture": "8 threads",
+      "lair_arm": "lair:8",
+      "median_tok_s": 12.03,
+      "per_thread_efficiency_tok_s_per_thread": 1.5038
+    },
+    {
+      "kernel": "tiled",
+      "length": 256,
+      "thread_posture": "8 threads",
+      "lair_arm": "lair:8",
+      "median_tok_s": 11.01,
+      "per_thread_efficiency_tok_s_per_thread": 1.3762
+    },
+    {
+      "kernel": "gemv",
+      "length": 128,
+      "thread_posture": "16 threads",
+      "lair_arm": "lair:16",
+      "median_tok_s": 18.955,
+      "per_thread_efficiency_tok_s_per_thread": 1.1847
+    },
+    {
+      "kernel": "gemv",
+      "length": 256,
+      "thread_posture": "16 threads",
+      "lair_arm": "lair:16",
+      "median_tok_s": 17.18,
+      "per_thread_efficiency_tok_s_per_thread": 1.0737
+    },
+    {
+      "kernel": "tiled",
+      "length": 128,
+      "thread_posture": "16 threads",
+      "lair_arm": "lair:16",
+      "median_tok_s": 18.52,
+      "per_thread_efficiency_tok_s_per_thread": 1.1575
+    },
+    {
+      "kernel": "tiled",
+      "length": 256,
+      "thread_posture": "16 threads",
+      "lair_arm": "lair:16",
+      "median_tok_s": 16.94,
+      "per_thread_efficiency_tok_s_per_thread": 1.0587
+    },
+    {
+      "kernel": "gemv",
+      "length": 128,
+      "thread_posture": "32 threads",
+      "lair_arm": "lair:32",
+      "median_tok_s": 21.8,
+      "per_thread_efficiency_tok_s_per_thread": 0.6812
+    },
+    {
+      "kernel": "gemv",
+      "length": 256,
+      "thread_posture": "32 threads",
+      "lair_arm": "lair:32",
+      "median_tok_s": 19.84,
+      "per_thread_efficiency_tok_s_per_thread": 0.62
+    },
+    {
+      "kernel": "tiled",
+      "length": 128,
+      "thread_posture": "32 threads",
+      "lair_arm": "lair:32",
+      "median_tok_s": 23.44,
+      "per_thread_efficiency_tok_s_per_thread": 0.7325
+    },
+    {
+      "kernel": "tiled",
+      "length": 256,
+      "thread_posture": "32 threads",
+      "lair_arm": "lair:32",
+      "median_tok_s": 21.015,
+      "per_thread_efficiency_tok_s_per_thread": 0.6567
+    }
+  ],
+  "matched_posture_pairs": [
+    {
+      "threads": 8,
+      "lair_arm": "lair:8",
+      "cpulist": "",
+      "llama_arms": [
+        "llama:8"
+      ],
+      "shapes": [
+        {
+          "kernel": "gemv",
+          "length": 128,
+          "lair_median_tok_s": 13.655,
+          "llama_arm": "llama:8",
+          "llama_median_tok_s": 74.285,
+          "ratio_lair_over_llama_pct": 18.38,
+          "delta_vs_matched_pp_pct": -81.62,
+          "lair_spread_at_shape_pct": 15.16,
+          "llama_spread_at_length_pct": 2.6,
+          "noise_band_pct": 15.16,
+          "separates_beyond_noise": true
+        },
+        {
+          "kernel": "gemv",
+          "length": 256,
+          "lair_median_tok_s": 10.585,
+          "llama_arm": "llama:8",
+          "llama_median_tok_s": 73.515,
+          "ratio_lair_over_llama_pct": 14.4,
+          "delta_vs_matched_pp_pct": -85.6,
+          "lair_spread_at_shape_pct": 6.52,
+          "llama_spread_at_length_pct": 3.63,
+          "noise_band_pct": 6.52,
+          "separates_beyond_noise": true
+        },
+        {
+          "kernel": "tiled",
+          "length": 128,
+          "lair_median_tok_s": 12.03,
+          "llama_arm": "llama:8",
+          "llama_median_tok_s": 74.285,
+          "ratio_lair_over_llama_pct": 16.19,
+          "delta_vs_matched_pp_pct": -83.81,
+          "lair_spread_at_shape_pct": 6.07,
+          "llama_spread_at_length_pct": 2.6,
+          "noise_band_pct": 6.07,
+          "separates_beyond_noise": true
+        },
+        {
+          "kernel": "tiled",
+          "length": 256,
+          "lair_median_tok_s": 11.01,
+          "llama_arm": "llama:8",
+          "llama_median_tok_s": 73.515,
+          "ratio_lair_over_llama_pct": 14.98,
+          "delta_vs_matched_pp_pct": -85.02,
+          "lair_spread_at_shape_pct": 7.54,
+          "llama_spread_at_length_pct": 3.63,
+          "noise_band_pct": 7.54,
+          "separates_beyond_noise": true
+        }
+      ],
+      "worst_case_noise_band_pct": 15.16,
+      "verdict": "yes: LAIR medians at posture lair:8 differ from matched llama pp on every shape beyond the noise band."
+    },
+    {
+      "threads": 16,
+      "lair_arm": "lair:16",
+      "cpulist": "",
+      "llama_arms": [
+        "llama:16"
+      ],
+      "shapes": [
+        {
+          "kernel": "gemv",
+          "length": 128,
+          "lair_median_tok_s": 18.955,
+          "llama_arm": "llama:16",
+          "llama_median_tok_s": 134.1,
+          "ratio_lair_over_llama_pct": 14.13,
+          "delta_vs_matched_pp_pct": -85.87,
+          "lair_spread_at_shape_pct": 9.81,
+          "llama_spread_at_length_pct": 6.94,
+          "noise_band_pct": 9.81,
+          "separates_beyond_noise": true
+        },
+        {
+          "kernel": "gemv",
+          "length": 256,
+          "lair_median_tok_s": 17.18,
+          "llama_arm": "llama:16",
+          "llama_median_tok_s": 140.49,
+          "ratio_lair_over_llama_pct": 12.23,
+          "delta_vs_matched_pp_pct": -87.77,
+          "lair_spread_at_shape_pct": 8.38,
+          "llama_spread_at_length_pct": 2.95,
+          "noise_band_pct": 8.38,
+          "separates_beyond_noise": true
+        },
+        {
+          "kernel": "tiled",
+          "length": 128,
+          "lair_median_tok_s": 18.52,
+          "llama_arm": "llama:16",
+          "llama_median_tok_s": 134.1,
+          "ratio_lair_over_llama_pct": 13.81,
+          "delta_vs_matched_pp_pct": -86.19,
+          "lair_spread_at_shape_pct": 9.67,
+          "llama_spread_at_length_pct": 6.94,
+          "noise_band_pct": 9.67,
+          "separates_beyond_noise": true
+        },
+        {
+          "kernel": "tiled",
+          "length": 256,
+          "lair_median_tok_s": 16.94,
+          "llama_arm": "llama:16",
+          "llama_median_tok_s": 140.49,
+          "ratio_lair_over_llama_pct": 12.06,
+          "delta_vs_matched_pp_pct": -87.94,
+          "lair_spread_at_shape_pct": 15.88,
+          "llama_spread_at_length_pct": 2.95,
+          "noise_band_pct": 15.88,
+          "separates_beyond_noise": true
+        }
+      ],
+      "worst_case_noise_band_pct": 15.88,
+      "verdict": "yes: LAIR medians at posture lair:16 differ from matched llama pp on every shape beyond the noise band."
+    },
+    {
+      "threads": 32,
+      "lair_arm": "lair:32",
+      "cpulist": "",
+      "llama_arms": [
+        "llama:32"
+      ],
+      "shapes": [
+        {
+          "kernel": "gemv",
+          "length": 128,
+          "lair_median_tok_s": 21.8,
+          "llama_arm": "llama:32",
+          "llama_median_tok_s": 230.395,
+          "ratio_lair_over_llama_pct": 9.46,
+          "delta_vs_matched_pp_pct": -90.54,
+          "lair_spread_at_shape_pct": 30.83,
+          "llama_spread_at_length_pct": 16.05,
+          "noise_band_pct": 30.83,
+          "separates_beyond_noise": true
+        },
+        {
+          "kernel": "gemv",
+          "length": 256,
+          "lair_median_tok_s": 19.84,
+          "llama_arm": "llama:32",
+          "llama_median_tok_s": 223.98,
+          "ratio_lair_over_llama_pct": 8.86,
+          "delta_vs_matched_pp_pct": -91.14,
+          "lair_spread_at_shape_pct": 35.48,
+          "llama_spread_at_length_pct": 14.61,
+          "noise_band_pct": 35.48,
+          "separates_beyond_noise": true
+        },
+        {
+          "kernel": "tiled",
+          "length": 128,
+          "lair_median_tok_s": 23.44,
+          "llama_arm": "llama:32",
+          "llama_median_tok_s": 230.395,
+          "ratio_lair_over_llama_pct": 10.17,
+          "delta_vs_matched_pp_pct": -89.83,
+          "lair_spread_at_shape_pct": 43.52,
+          "llama_spread_at_length_pct": 16.05,
+          "noise_band_pct": 43.52,
+          "separates_beyond_noise": true
+        },
+        {
+          "kernel": "tiled",
+          "length": 256,
+          "lair_median_tok_s": 21.015,
+          "llama_arm": "llama:32",
+          "llama_median_tok_s": 223.98,
+          "ratio_lair_over_llama_pct": 9.38,
+          "delta_vs_matched_pp_pct": -90.62,
+          "lair_spread_at_shape_pct": 18.03,
+          "llama_spread_at_length_pct": 14.61,
+          "noise_band_pct": 18.03,
+          "separates_beyond_noise": true
+        }
+      ],
+      "worst_case_noise_band_pct": 43.52,
+      "verdict": "yes: LAIR medians at posture lair:32 differ from matched llama pp on every shape beyond the noise band."
+    }
+  ],
+  "pinned_pairings": []
+}
