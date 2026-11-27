@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>2026-11-27T02-28-33Z-optimize-prefill-q4k-route-ab-interleaved-xeon-t8 - LAIR Xeon q4k route A/B interleaved</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>body { font-family: 'Segoe UI', sans-serif; margin: 2rem auto; max-width: 1080px; color: #1c1c1c; } h1 { font-size: 1.45rem; } h2 { font-size: 1.1rem; margin-top: 2.2rem; } .note { color: #444; font-size: 0.9rem; max-width: 76ch; } canvas { max-width: 1020px; }</style>
+</head>
+<body>
+<h1>2026-11-27T02-28-33Z-optimize-prefill-q4k-route-ab-interleaved-xeon-t8</h1>
+<p class='note'>Generated at 2026-11-27T02:55:44Z. Lane: <code>Xeon CPU-only lair-lab (root@192.168.33.53), threads=8, rowWidth=64</code>. Method: 4 rounds x arms [off, on, 16] interleaved back-to-back in one session so host drift cancels; reps=1 per command with kernels gemv, tiled; medians/min/max/spread parsed from raw logs after ANSI stripping.</p>
+<h2>total_ms medians by arm, kernel and length</h2>
+<canvas id="abBar" height="420"></canvas>
+<script>
+new Chart(document.getElementById('abBar'), {"type": "bar", "data": {"labels": ["gemv 128", "gemv 256", "tiled 128", "tiled 256"], "datasets": [{"label": "arm off total_ms", "data": [10360.553, 23598.6435, 11337.854, 23143.792], "backgroundColor": "#3b6fb6"}, {"label": "arm on total_ms", "data": [8734.1555, 22582.34, 11232.481, 23214.5435], "backgroundColor": "#f2a65e"}, {"label": "arm 16 total_ms", "data": [9572.9675, 22144.328, 10438.1655, 22933.03], "backgroundColor": "#2a7f62"}]}, "options": {"scales": {"y": {"title": {"display": true, "text": "total_ms median (lower is better)"}, "beginAtZero": true}}, "plugins": {"legend": {"position": "bottom"}}}});
+</script>
+<h2>Intra-arm total_ms spread per shape</h2>
+<canvas id="spreadBar" height="380"></canvas>
+<script>
+new Chart(document.getElementById('spreadBar'), {"type": "bar", "data": {"labels": ["gemv 128", "gemv 256", "tiled 128", "tiled 256"], "datasets": [{"label": "arm off intra-arm total_ms spread %", "data": [20.216884175970147, 8.965460239271799, 13.324708538317736, 12.16571165174661], "backgroundColor": "#3b6fb6"}, {"label": "arm on intra-arm total_ms spread %", "data": [22.643688906156978, 5.993311587727403, 26.568288875805802, 11.469176639204642], "backgroundColor": "#f2a65e"}, {"label": "arm 16 intra-arm total_ms spread %", "data": [23.892664421977813, 13.218405182582197, 14.700485444496922, 8.496317320476185], "backgroundColor": "#2a7f62"}]}, "options": {"scales": {"y": {"title": {"display": true, "text": "(max-min)/median % per arm"}, "beginAtZero": true}}, "plugins": {"legend": {"position": "bottom"}}}});
+</script>
+<p class='note'>See <a href='summary.md'><code>summary.md</code></a> for tables and noise bands and <a href='data.json'><code>data.json</code></a> for machine-readable medians.</p>
+</body>
+</html>
