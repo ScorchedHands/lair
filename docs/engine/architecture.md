@@ -30,6 +30,127 @@ The architecture is deliberately split so kernel behavior can be tested independ
 
 ## Core seams and data types
 
+### Seam map: contracts, implementations, and who holds them
+
+The diagram below draws only relationships that exist in `src/`: dashed arrows are interface implementation, solid arrows are construction or field ownership at the points named in code. Served defaults today are `CpuBackend`, `GgufMmapWeightSource`, `BlockPool` / `SequenceKv`; everything else shown is a landed seam with its own posture, and each row's status is stated both below this table and in "Default posture versus landed internal seams" later on this page.
+
+```mermaid
+classDiagram
+  direction LR
+
+  class IModelLoader {
+    +Load(modelPath)
+  }
+  class LogicalTensorTable
+  class GgufModelLoader
+
+  class IWeightSource {
+    +Resolve(tensor)
+  }
+  class IExpertSlabSource {
+    +ResolveSlab(stack, expertIndex, expertBytes)
+  }
+  class GgufMmapWeightSource
+  class CpuWeightArena
+  class ExpertSlabWeightSource
+  class RamHotExpertTier
+
+  class WeightRef
+  class IBackend {
+    +DeviceId
+    +WeightTier
+    +Gemv(x, w, output)
+    +GemvBatch(inputs, count, w, outputs)
+    +GemmBatch(inputs, count, w, outputs)
+    +DequantRow(w, row, output)
+    +OpenKvMirror(request)
+  }
+  class CpuBackend
+  class CudaBackend
+  class IKvDeviceMirror
+
+  class IDeviceAttentionStep {
+    +MaxWindowRows
+    +RunAttentionWindow(layer, positionBase, qRows, kRows, vRows, attnScale, softcap, window, output)
+  }
+  class CudaDeviceStep
+
+  class IGatherKernel {
+    +Gather(source, gate, up, down, expertIndexes, handle)
+  }
+  class CpuGatherKernel
+
+  class IResidencyTier {
+    +BudgetBytes
+    +HotUnits
+    +NoteActiveExperts(gate, up, down, indexes, counts)
+    +IsResident(stack, expertIndex)
+  }
+
+  class IKvPool {
+    +Allocate()
+    +AddRef(id)
+    +Release(id)
+    +EffectiveFreeBlocks
+    +NewSequence()
+  }
+  class IKvSequence {
+    +Append()
+    +WriteK(pos, layer, values)
+    +SelectCausalRead(queryPosition, layerWindow)
+  }
+  class BlockPool
+  class SequenceKv
+
+  class TransformerModel
+  class GenerationScheduler
+  class RequestPipeline
+  class Sampler
+  class PrefixCache
+
+  GgufModelLoader ..|> IModelLoader
+  IModelLoader ..> LogicalTensorTable : Load returns it
+  GgufMmapWeightSource ..|> IWeightSource
+  CpuWeightArena ..|> IWeightSource
+  RamHotExpertTier ..|> IWeightSource
+  ExpertSlabWeightSource ..|> IExpertSlabSource
+  RamHotExpertTier ..|> IExpertSlabSource
+  TransformerModel --> IWeightSource : default when none injected
+  CpuBackend ..|> IBackend
+  CudaBackend ..|> IBackend
+  IBackend ..> WeightRef : kernels read packed bytes
+  TransformerModel --> IBackend : resolved route backends
+  IBackend ..> IKvDeviceMirror : OpenKvMirror posture
+  CudaBackend ..> IDeviceAttentionStep : opens a device step
+  CudaDeviceStep ..|> IDeviceAttentionStep
+  TransformerModel ..> IDeviceAttentionStep : internal device-prefill seam
+  CpuGatherKernel ..|> IGatherKernel
+  IGatherKernel ..> IExpertSlabSource : gathers slabs through it
+  TransformerModel --> IGatherKernel : sparse chains only
+  RamHotExpertTier ..|> IResidencyTier
+  TransformerModel ..> IResidencyTier : only when the opened source answers it
+  BlockPool ..|> IKvPool
+  SequenceKv ..|> IKvSequence
+  IKvPool ..> IKvSequence : NewSequence hands out its own type
+  GenerationScheduler --> TransformerModel
+  GenerationScheduler --> IKvPool
+  GenerationScheduler --> PrefixCache : optional prefix cache
+  PrefixCache --> IKvPool : shares blocks through it
+  RequestPipeline o-- IKvSequence : owns one sequence
+  RequestPipeline --> Sampler : per-pipeline sampler
+```
+
+| Class | Path | Status in this build |
+|---|---|---|
+| `IModelLoader` / `GgufModelLoader` | `src/Lair.Contracts/IModelLoader.cs`, `src/Lair.Loader/GgufModelLoader.cs` | Loader seam parses metadata into a logical tensor table without materializing payload bytes. The implementation exists and is exercised by test/bench opens; the served engine reaches its file's metadata through `GgufFile.Open` instead (`src/Lair.Http/GenerationService.cs`). |
+| `IWeightSource` / `GgufMmapWeightSource` | `src/Lair.Contracts/IWeightSource.cs`, `src/Lair.Loader/GgufMmapWeightSource.cs` | Default weight view for every served model: `TransformerModel` falls back to a mmap source when none is injected. `CpuWeightArena` (`src/Lair.Contracts/CpuWeightArena.cs`) is the in-memory alternate its own documentation describes as proving retrieval is pluggable behind the seam. |
+| `IBackend` / `CpuBackend`, `CudaBackend` | `src/Lair.Contracts/IBackend.cs`, `src/Lair.Backends.Cpu/CpuBackend.cs`, `src/Lair.Backends.Cuda/CudaBackend.cs` | CPU backend is the served default (opened by `GenerationService`, plus a second one when `placement.prefill_lane: dedicated`). A CUDA backend opens only behind a declared accelerator-backed posture (`placement.gpu_layers` for a layer split, device-backed KV residency for the storage seam) and owns its own opened weight tier. |
+| `IDeviceAttentionStep` / `CudaDeviceStep` | `src/Lair.Contracts/DeviceAttentionStep.cs`, `src/Lair.Backends.Cuda/CudaDeviceStep.cs` (with `CudaGroupedAttentionStep`) | Internal device-prefill seam installed only from bench/test or accelerator-backed opens; the engine never disposes a step its caller owns. |
+| `IGatherKernel` / `CpuGatherKernel`, `IExpertSlabSource` / `ExpertSlabWeightSource` | `src/Lair.Contracts/IGatherKernel.cs`, `src/Lair.Models/Engine/CpuGatherKernel.cs`, `src/Lair.Loader/ExpertSlabWeightSource.cs` | Built for sparse-FFN chains only: the model resolves one gather kernel and a slab view of its weight source at load (`TransformerModel`). Prefetch-only posture — arithmetic unchanged. |
+| `IResidencyTier` / `RamHotExpertTier` | `src/Lair.Contracts/IResidencyTier.cs`, `src/Lair.Models/Engine/RamHotExpertTier.cs` | A tier runs only when the opened weight source itself answers slab resolutions; a plain mmap source gets no tier, and the tier wraps that cold backing store. |
+| `IKvPool` / `BlockPool`, `IKvSequence` / `SequenceKv` | `src/Lair.Kv/IKvPool.cs`, `src/Lair.Kv/BlockPool.cs`, `src/Lair.Kv/IKvSequence.cs`, `src/Lair.Kv/SequenceKv.cs` | Default storage pair. The typed generic variants (`BlockPool{TK, TV}`, `SequenceKv{TK, TV}` in `BlockPoolGeneric.cs` / `SequenceKvGeneric.cs`) implement the same contracts for a quantized format pair; `NewSequence()` decides which concrete type a pipeline gets. |
+| Consumers | `src/Lair.Models/Engine/TransformerModel.cs`, `src/Lair.Models/Scheduling/GenerationScheduler.cs`, `src/Lair.Models/Scheduling/RequestPipeline.cs`, `src/Lair.Kv/PrefixCache.cs` | The scheduler holds the model, pool, and optional prefix cache; each pipeline owns its own sequence and sampler. |
+
 ### Weight retrieval seam
 
 Weight bytes are reached through logical tensor names rather than a monolithic model object:
@@ -211,11 +332,12 @@ Admission answers whether a pipeline exists with capacity reserved. Step composi
 
 ## Related engine pages
 
-This page intentionally stays high-level; detailed subsystem behavior lives in sibling engine notes when present:
+This page intentionally stays high-level; detailed subsystem behavior lives in sibling engine pages:
 
-- scheduling.md
-- kv-cache.md
-- cpu-kernels.md
-- sampling-and-drafting.md
-- tokenizer-templating-tools.md
-- monitoring-and-metrics.md
+- [scheduling.md](scheduling.md) — pipelines, merged steps, arbiter cost model, lanes, budgets.
+- [request-lifecycle.md](request-lifecycle.md) — one request traced from HTTP bytes to the closing chunk.
+- [kv-cache.md](kv-cache.md) — block pools, prefix sharing and copy-on-write, quantized KV pairs.
+- [cpu-kernels.md](cpu-kernels.md) and [cuda-backend.md](cuda-backend.md) — kernel selection per backend.
+- [quantization.md](quantization.md) — format coverage and decode strategy per family.
+- [sampling-and-drafting.md](sampling-and-drafting.md), [tokenizer-templating-tools.md](tokenizer-templating-tools.md), [model-profiles.md](model-profiles.md) — front-end and profile behavior.
+- [monitoring-and-metrics.md](monitoring-and-metrics.md), [measurement-harnesses.md](measurement-harnesses.md), [tricks-and-tweaks.md](tricks-and-tweaks.md), [comparisons.md](comparisons.md) — observability, measurement posture, individual engine tricks, and how this design compares to other engines.

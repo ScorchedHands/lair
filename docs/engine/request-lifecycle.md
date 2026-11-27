@@ -1,4 +1,4 @@
-Scope: This page follows one OpenAI-compatible generation request through HTTP routing, model facade encoding, scheduler admission, prefix adoption, prefill/decode forwards, sampling, output parsing, and result publication. As of 2026-11-27 this reflects implemented behavior under `src/` only; planned lifecycle stages are not described as current.
+Scope: This page follows one OpenAI-compatible generation request through HTTP routing, model facade encoding, scheduler admission, prefix adoption, prefill/decode forwards, sampling, output parsing, and result publication, plus the encoder-only (`type 'embed'`) serving posture that answers pooled vectors instead of sampled tokens. As of 2026-11-27 this reflects implemented behavior under `src/` only; planned lifecycle stages are not described as current.
 
 # Request lifecycle: chat completion through generation internals
 
@@ -189,22 +189,104 @@ The final result carries prompt token count, completion token count, cached prom
 
 Path: `src/Lair.Http/GenerationResult.cs`.
 
+## Encoder-only serving: the `/v1/embeddings` route
+
+A model declared `type 'embed'` (`src/Lair.Http/Config/LairConfig.cs`, `ModelTypeValues`) serves encoder forwards only. Its requests arrive on `/v1/embeddings`, run a bidirectional encode pass over each input, and answer one pooled vector per input — no sampler, no decode step, no pipeline stage machine advances on such an engine. The route shares the API surface's named-model routing, response lease, correlation id, and error taxonomy with its sampling siblings (`src/Lair.Http/ApiApp.cs`).
+
+### What accepts a request here
+
+| Step | Behavior this build implements | Path |
+|---|---|---|
+| Route and lease | `/v1/embeddings` is mapped in both single-model and registry modes. Registry mode resolves the named instance from the body before any per-model validation and holds the lease across the whole encoder call, so a retiring instance drains what it admitted before releasing. `x-lair-request-id` rides every response like its siblings do. | `src/Lair.Http/ApiApp.cs` |
+| Input spellings | The body is read from its raw JSON document rather than bound to one shape: `"input": "text"` answers one vector and `"input": ["a","b"]` answers one vector per entry at the index that entry arrived at. A non-string array element refuses naming `input[i]`; any other JSON kind refuses naming what it got; an absent key reaches the request-shape message "an embeddings request requires a non-empty 'input': one text or a list of texts." | `src/Lair.Http/ApiApp.cs`, `src/Lair.Http/ApiContracts.cs` (`EmbeddingBody`) |
+| Model-type mirror gate | A model served as `type 'chat'` is refused on this endpoint before any tokenization or admission, naming the endpoint and both postures: sample from it through chat/completions, or declare it with `type 'embed'`. It answers where every other request-shape refusal lands (`400 invalid_request_error`). | `src/Lair.Http/ApiApp.cs` |
+| Encoder posture facts on `/v1/models` | An encoder entry advertises its sentence-vector posture — `pooling` and `normalize` — beside the queue facts; a chat entry leaves both fields out entirely. Asserted in `tests/Lair.Tests/EmbeddingApiTests.cs` (`Models_CarriesPoolingPostureOnlyForEncoderModels`). | `src/Lair.Http/ApiApp.cs`, `src/Lair.Http/Config/YamlConfigLoader.cs` |
+
+### What an encoder-only model does instead of the sampled pipeline
+
+`GenerationService.EmbedAsync` runs one call to completion and returns an `EmbeddingOutcome` (`src/Lair.Http/EmbeddingContracts.cs`: the vectors, total input tokens, pooling mode, and whether normalization followed). The order below is what the code does:
+
+1. **Posture snapshot for this call.** The response-shape posture — `models[0].pooling` (`mean` or `cls`) and `models[0].normalize` — comes from configuration only; nothing in a GGUF file selects pooling, and an unrecognized value fails load naming the qualified path, model, value, and accepted set. Both keys are read once from the config in force when the request is admitted, exactly like a generation run captures its output-parser plan. A live edit to either retitles later requests only; vectors already answered keep the posture their request started with (`tests/Lair.Tests/EmbeddingApiTests.cs`, `PoolingAndNormalizeHotEdit_AppliesForLaterRequests_AndReadvertisesWithoutRestart`). A model's `type` itself stays restart-only.
+2. **Tokenization, prompt-side rules.** Every input is tokenized like an ordinary prompt through the loaded tokenizer with its BOS policy — `_tokenizer.AddBosToken ? EncodeWithBos(text) : Encode(text)` — so a model whose profile adds BOS gets it here too. No chat template renders, no tool schemas are injected, and reasoning policy plays no part: those belong to sampled serving. An input that tokenizes to zero tokens refuses naming its index.
+3. **Prompt-side ceilings.** Each input must clear two counts before any work runs: `TransformerModel.MaxEncodeTokens` (256) — the ceiling one encoder forward carries, with a message telling the caller to shorten it — and this model's resolved context window. Both refusals name the token count they measured against.
+4. **Whole-call KV arithmetic up front.** An encoder forward writes every input position's K/V before pooling anything, so the call's total block need (`ceil(tokens / pool.BlockTokens)` per fresh sequence) is checked against `IKvPool.EffectiveFreeBlocks` before admission: short inputs answer `EngineBusyException.ForEncoderKvCapacity`, naming needed blocks and free blocks with what to change (`kv_blocks`). A mid-forward overflow maps to the same refusal carrying the honest counts.
+5. **One encoder lane, same queue posture.** The engine holds a single forward-lane semaphore for this serving mode: a free lane is taken outright with no seat spent; a held lane with `max_queued_requests` absent or `0` answers `EngineBusyException.ForEncoderLaneBusy` (`engine_overloaded`, recorded as a concurrency-quota admission refusal); a positive posture takes one queue seat and waits within the `queue_timeout_ms` ceiling in force at entry, releasing that seat whether it admits, refuses, or is cancelled. Waiting reserves no pool block and no token budget, and the retirement gate participates in the wait so draining instances keep their semantics.
+6. **Monitor frames without a tok/s series.** An admitted call mints request-lifecycle rows keyed to the caller's correlation id (`kind "embeddings"`), drives `BeginEncoderRequest` / `RecordEncoderPositions` per composed batch / `EndEncoderRequest(allInputsPooled:)`, and closes with status `"encoded"`, `cachedTokens: 0`, and no finish reason — nothing sampled, and this path consults no prefix cache. Its frames carry prompt size and elapsed time only, which is what keeps an `embed` model visible on `/monitor/stream` at all (`src/Lair.Http/Monitoring/EngineMetricsBus.cs`; detail in [monitoring-and-metrics.md](monitoring-and-metrics.md)).
+7. **Merged encoder batches preserve input order.** Inputs compose into calls of at most `MaxEncodeSequences` sequences (equal to the decode ceiling, 16) whose flattened rows stay within `MaxEncodeBatchRows` (`4 × MaxEncodeTokens` = 1024); a wider set composes as several calls in order. Each vector lands where its input was read — asserted by `tests/Lair.Tests/EmbeddingsTests.cs` (`EncodeBatch_PreservesMemberOrder_RepeatInputsMatch_AndRejectsBadArguments`) and the API-level batching parity test (`Embeddings_BatchedRequestMatchesTheSameInputsSentSeparately`).
+8. **Forward internals.** `TransformerModel.EncodeBatch` maps one fresh sequence per input from `_pool.NewSequence()`, seeds each position from its dequantized `token_embd` row, then runs the pre-attention norm, QKV projections plus biases with RoPE at absolute positions, the K/V writes, and finally gate/up/down as three batched weight passes — all in windows of `EncodeChunkTokens = 8` rows through `IBackend.GemvBatch`. Encoder dense passes request the batched-GEMV form (`denseMatmul: false`), so `engine.prefill_kernel` selection plays no part on this route. Every position's KV slot is reserved before any attention runs, so each query scores against its own sequence's finished span via `LayerOps.BidirectionalAttention` over `[0, last position]`, narrowed per layer to that layer's resolved window on the layers its declared interleave masks (`src/Lair.Models/ModelStrategies.cs`, `WindowInterleave`). Results are independent of chunking and equal what an independent single-sequence `Encode` call produces; the output is final hidden states after the model's output norm — no lm_head logits, so nothing to sample.
+9. **Pooling then optional normalization.** Pooling reads only what that input's forward produced: `cls` copies the first position's row verbatim through `Pooling.FirstToken`, and `mean` averages every position per column in `Pooling.MeanPool`, accumulating in double before the final division — the same discipline as the engine's norms (`src/Lair.Models/Pooling.cs`). Normalization, when configured, runs strictly after pooling: a mean over normalized rows is not the same vector as a normalized mean. Every helper writes an exact hidden-size result and reads only inputs, so repeat calls are bit-for-bit identical; `normalize` on a zero vector leaves it untouched rather than dividing by zero.
+10. **Answer envelope.** The handler completes synchronously — the facade's bounded queue wait resolves before any forward composes — and answers OpenAI's list shape: `object "list"`, the served model id, one datum per input (`index` plus its embedding floats), and prompt-side usage where `total_tokens` carries `prompt_tokens` because nothing was generated. Pooling mode and normalization are facts of the served model, not request knobs; a body asking for them changes nothing.
+
+Paths: `src/Lair.Http/GenerationService.cs`, `src/Lair.Models/Engine/TransformerModel.cs`, `src/Lair.Models/Pooling.cs`, `src/Lair.Http/ApiContracts.cs`.
+
+### Where tokenization and KV work differ from the sampled route
+
+| Aspect | Generation request | Encoder-only request |
+|---|---|---|
+| Prompt construction | Chat bodies render through the loaded Minja template with declared tool schemas injected; completion bodies pass raw prompt text. | Each `input` string is tokenized directly, BOS policy included; no template or tool rendering exists on this path. |
+| Sequence ownership | One pipeline-owned `IKvSequence` lives across prefill chunks and decode steps, seeded from prefix-adoption where eligible. | One fresh sequence per input for the duration of its batch: nothing carries over between calls and no block is shared. |
+| Prefix cache | Scheduler-side adoption places shared read-only blocks into the table before forwarding; results report cached prompt tokens when any were shared. | Consulted never — completion reports `cachedTokens: 0`, so an encoder answer can claim no reuse. |
+| Capacity arithmetic | Admission reserves for the whole sequence lifetime (prompt plus generation ceiling) with eviction-before-refusal and admission windows. | The call's own positions are summed up front against free blocks, because every K/V must exist before pooling; shortfall answers `EngineBusyException`, which reaches the wire as 503 `engine_overloaded_error` code `engine_overloaded` naming both block counts (`src/Lair.Http/ApiExceptions.cs`). |
+| Attention reads | Causal: each decode step appends one position and attends only positions at or before it. | Bidirectional over the finished span after all writes, narrowed by resolved windows; sequential one-position-at-a-time encodes agree with incremental decode steps bit-for-bit — `tests/Lair.Tests/EmbeddingsTests.cs` (`Encode_SequentialPositions_MatchIncrementalDecode_BitForBit`) pins that agreement and a sibling test pins that full-window rows genuinely differ from causal-prefix rows. |
+| Concurrency control | Per-model admission slots through the pipeline concurrency gate plus batch composition ceilings. | One forward-lane semaphore with the same `max_queued_requests` / `queue_timeout_ms` posture keys; no scheduler step ever advances. |
+
+```mermaid
+flowchart TD
+  A["POST /v1/embeddings<br/>ReadEmbeddingBodyAsync"] --> B{"model type gate<br/>ServesEncoderPosture"}
+  B -- served as chat --> R1["refusal naming endpoint and both postures"]
+  B -- served as embed --> C["tokenize each input<br/>EncodeWithBos or Encode, BOS policy applies"]
+  C --> D{"per-input ceilings<br/>MaxEncodeTokens 256 and model context"}
+  D -- over ceiling --> R2["refusal naming index and token count"]
+  D --> E["sum needed blocks for the whole call"]
+  E -- pool cannot back them --> R3["EngineBusyException kv_capacity<br/>engine_overloaded at 503"]
+  E --> F{"AcquireEncoderLaneAsync"}
+  F -- lane held, queue disabled --> R4["ForEncoderLaneBusy refusal naming max_queued_requests"]
+  F -- free lane or bounded wait seat --> G["compose merged batches in input order<br/>MaxEncodeSequences and MaxEncodeBatchRows ceilings"]
+  G --> H["_pool.NewSequence per input"]
+  H -- pool hands out a non-float sequence type --> R5["ModelEncoderUnsupportedException<br/>400 encoder_unsupported naming kv.quant to omit"]
+  H --> I["TransformerModel EncodeBatch<br/>chunks of EncodeChunkTokens rows via GemvBatch<br/>all K/V appended before any attention"]
+  I --> J["LayerOps BidirectionalAttention<br/>whole finished span, narrowed by resolved window and interleave"]
+  J --> K{"posture pooling choice"}
+  K -- cls --> L1["Pooling FirstToken: first row verbatim"]
+  K -- mean --> L2["Pooling MeanPool: double accumulation then divide"]
+  L1 --> M{"normalize configured"}
+  L2 --> M
+  M -- yes --> N["Pooling NormalizeL2 after pooling<br/>zero vector stays zero"]
+  M -- no --> O["raw pooled vector"]
+  N --> P["EmbeddingResponse list envelope<br/>one datum per input at its index, prompt-side usage only"]
+  O --> P
+```
+
+### What refuses on this route today
+
+| Boundary | Refusal and what it names | Path |
+|---|---|---|
+| Chat-served model on `/v1/embeddings` | `400 invalid_request_error`, naming the endpoint, both postures, and the two ways to fix it. | `src/Lair.Http/ApiApp.cs` |
+| Missing, empty, or wrongly-typed `input` | Request-shape refusal; a bad array element names its own index. | `src/Lair.Http/ApiApp.cs` |
+| Input tokenizing to nothing, past 256 tokens, or past model context | Per-input refusal naming the measured count and what to shorten or raise. | `src/Lair.Http/GenerationService.cs` |
+| Encoder lane held with queueing disabled | `engine_overloaded` naming the blocked resource and the key that would let submissions wait. | `src/Lair.Http/ApiExceptions.cs`, `src/Lair.Http/GenerationService.cs` |
+| Pool cannot back the call's positions | Up-front `kv_capacity` refusal naming needed versus free blocks; a mid-forward overflow carries the same shape with honest counts. | `src/Lair.Http/GenerationService.cs` |
+| Quantized KV pair opened on an encoder model | `400 invalid_request_error` code `encoder_unsupported`, naming both sides' formats and stating that omitting `kv.quant` serves the FP32 posture — raised either where the pool hands out a non-float sequence type or where the forward checks its storage posture. No quantized encoder route exists in this build. Asserted at HTTP level in `tests/Lair.Tests/EmbeddingApiTests.cs` (`Embeddings_QuantizedKvModel_RefusesWithEncoderUnsupported_NamingWhatToOmit`). | `src/Lair.Http/GenerationService.cs`, `src/Lair.Models/Engine/TransformerModel.cs` (`EnsureEncoderForwardPosture`) |
+| Route crossing backends (a declared layer split) | Same `encoder_unsupported` family: an encoder forward rents streams past what those crossings stage, so the refusal tells the operator to open this model as one span. Engine-side refusal in `src/Lair.Models/Engine/TransformerModel.cs`; it reaches the wire wrapped by `EncodeBatchMapped`. | `src/Lair.Models/Engine/TransformerModel.cs` |
+| Sparse-FFN architecture | Refused naming expert count and per-token routing: "the encoder forward runs dense gate/up/down blocks only" — serve a dense checkpoint on this endpoint instead. Engine-side refusal; no HTTP-level fixture covers it in this build. | `src/Lair.Models/Engine/TransformerModel.cs` (`EnsureDenseEncoderBlocks`) |
+
 ## Lifecycle refusal boundaries worth knowing when reading source
 
 | Boundary | What refuses before what runs next |
 |---|---|
 | Unserved/draining model route | API lease routing refuses without touching that named engine instance's scheduler or forward path. |
 | Encoder-only model on sampled endpoint | Model type gate refuses chat/completions before prompt encoding, budget validation, and scheduler submission. |
+| Chat-served model on the embeddings endpoint | The mirror posture gate: refused naming both postures before any tokenization or forward; the encoder route's own posture refusals (quantized KV pair, backend-crossing route, sparse-FFN block) are tabulated in the encoder section above. |
 | Concurrency full with queue disabled | Scheduler concurrency gate refuses admission naming quota; no pipeline advancement starts for the rejected request. |
 | Queue wait timeout or capacity revalidation failure | Waiting submissions can still be refused after wake because waiting reserves nothing: KV blocks and budgets are not consumed by unadmitted requests. |
 | Context/token-budget over-limit | Admission-side validation rejects before engine advancement consumes shared prefix adoption slots, prefill windows, decode steps, or token budget counters for that request. |
 
 ## Related lifecycle notes
 
-For deeper subsystem behavior, these sibling pages carry detail when present:
+For deeper subsystem behavior, these sibling engine pages carry the detail:
 
-- scheduling.md
-- kv-cache.md
-- tokenizer-templating-tools.md
-- sampling-and-drafting.md
-- monitoring-and-metrics.md
+- [scheduling.md](scheduling.md) — admission slots, merged steps, arbiter cost model, prefill lanes, budgets.
+- [kv-cache.md](kv-cache.md) — block pools and sequences both routes address, prefix sharing and copy-on-write, quantized KV pairs.
+- [tokenizer-templating-tools.md](tokenizer-templating-tools.md) — tokenizer profiles and BOS policy, chat templates, tool parsing, reasoning regions.
+- [sampling-and-drafting.md](sampling-and-drafting.md) — sampler stage order, penalties, logprobs, drafting seams (the sampled route only).
+- [monitoring-and-metrics.md](monitoring-and-metrics.md) — lifecycle frames, encode-side counters, and what each serving posture publishes.

@@ -1,6 +1,6 @@
 # Measurement harnesses
 
-Scope: how LAIR's bench verbs, committed report artifacts, scripted lanes, and pinned parity fixtures turn engine behavior into numbers this build can defend. As of 2026-11-27. Command syntax for building and running lives in `DEVELOP.md`; kernel selection semantics live in [cpu-kernels](cpu-kernels.md); cross-tool standing is owned by comparisons when that page lands.
+Scope: how LAIR's bench verbs, committed report artifacts, scripted lanes, and pinned parity fixtures turn engine behavior into numbers this build can defend. As of 2026-11-27. Command syntax for building and running lives in `DEVELOP.md`; kernel selection semantics live in [cpu-kernels](cpu-kernels.md); cross-tool standing is owned by [comparisons.md](comparisons.md).
 
 ## Two harness families, one evidence contract
 
@@ -39,7 +39,7 @@ Every `reports/` directory is self-describing — the manifest states goal, comm
 
 1. **Classic single-run form** — `manifest.json`, `host.json`, `bench.json`, `report.html`. Example: `reports/cuda-gemv-parity-2026-11-18/`, `reports/kernel-comparison-2026-11-14/` (the latter's committed kernel comparison: gemv 23.37 prefill tok/s at peak RSS 1,353.8 MB vs tiled 25.11 tok/s at 1,222.8 MB on the IQ4_XS fixture).
 2. **Timestamped A/B form** — `commands.md`, `data.json`, `summary.md`, `report.html`, plus per-round arm logs `logs/stage-ab-rN-<arm>.txt`. Example: `reports/2026-11-27T02-28-33Z-optimize-prefill-q4k-route-ab-interleaved-xeon-t8/`.
-3. **Strict re-pair form** — per-arm log subdirectories (`logs/baseline-off/`, `logs/route-on-w8/`, `logs/route-w16/`) with `manifest.json`, `meta.json`, `analysis.md` separating stage metrics from window totals and noise bands. Example: `reports/2026-11-27T04-06-34Z-optimize-prefill-q4k-route-repair-xeon-t8/`.
+3. **Strict re-pair form** — per-arm log subdirectories (`logs/baseline-off/`, `logs/route-on-w8/`, `logs/route-w16/`) with a paired `analysis.md` separating stage metrics from window totals and noise bands. Example: `reports/2026-11-27T01-16-57Z-optimize-prefill-q4k-route-ab-xeon-t8/`.
 
 Narrative Markdown with raw tables beside it lives in `bench/reports/` (e.g. `bench/reports/sub4bit-cost-repin-2026-11-17.md` retains its three raw GEMV tables as `.txt` files). Directory naming convention is `reports/YYYY-MM-DDTHH-mm-ssZ-optimize-<process>/`; 15 of the 43 committed report directories follow it, so older directories keep their short names.
 

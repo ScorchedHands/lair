@@ -4,6 +4,18 @@ All notable changes to LAIR are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Engine documentation tree `docs/engine/` documenting implemented engine internals: architecture and seam map, request lifecycle including the encoder-only route, scheduler and step composition, CPU kernel design, quantization format coverage, CUDA backend, KV cache and prefix reuse, residency tiers and budgets, model profiles, tokenizer/template/tool behavior, sampling and drafting seams, measurement harnesses, engine comparisons, and a tricks/tweaks catalog. Each page states its own freshness date, cites code paths and committed measurement artifacts, and labels landed-but-not-default seams.
+- Repository `AGENTS.md` carrying the documentation maintenance contract: which page every class of change must update, honesty rules for status claims, posture requirements on numbers, and the visual-aid convention (mermaid flow/sequence/state diagrams plus charts paired with authoritative tables).
+
+### Changed
+
+- User documentation moved from `docs/` to `docs/user/` (`README.md`, `reference/CLI.md`, `reference/CONFIG.md`); root `README.md`, `DEVELOP.md`, and the plan's build/deployment convention now point at both trees.
+- Corrected stale CPU blocked-matmul coverage in user docs: the prefill `gemm` route covers `Q8_0`, `Q4_K`, `IQ4_XS`, and `Q6_K`.
+
 ## [0.6.0] - 2026-11-19
 
 ### Added

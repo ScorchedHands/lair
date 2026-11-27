@@ -91,7 +91,7 @@ Quantized attention is **host-resident CPU work over the batched-row window only
 
 ## Windowed block selection
 
-Model profiles may resolve a **sliding attention window per layer** (`Plan.AttentionWindowForLayer` → `pool.DeclareAttentionWindows(int[])`; profile semantics live in model-profiles.md when that page lands). A windowed read addresses only the tail of each sequence's table:
+Model profiles may resolve a **sliding attention window per layer** (`Plan.AttentionWindowForLayer` → `pool.DeclareAttentionWindows(int[])`; profile semantics live in [model-profiles.md](model-profiles.md)). A windowed read addresses only the tail of each sequence's table:
 
 ```text
 selected positions = [max(0, pos - window + 1) .. pos]   (per layer, per step — TransformerModel.cs)
@@ -152,4 +152,4 @@ The chart is a supplement; the table above (with its artifact pointers) is autho
 - Evicting any block still named by an active sequence, regardless of LRU order — admission either fits after eviction or refuses as capacity exhaustion (scheduling.md covers the refusal surface).
 - Cross-instance prefix reuse: a new pool opens with an empty cache; there is no persistence layer for published prefixes.
 
-Cross-links: pipeline states and adoption timing in [request-lifecycle.md](request-lifecycle.md); admission arithmetic, eviction-before-refusal, and hot-edit behavior in [scheduling.md](scheduling.md); mirror postures, device attention kernels, and their refusal wording in [cuda-backend.md](cuda-backend.md); tier chains the residency claims seat against in [residency-and-budgets.md](residency-and-budgets.md); window/softcap profile semantics in model-profiles.md (planned page — not yet written); bench verbs behind every number above (`kv-quant`, `generate-kv-cache-type-parity.ps1`) in measurement-harnesses.md (planned page).
+Cross-links: pipeline states and adoption timing in [request-lifecycle.md](request-lifecycle.md); admission arithmetic, eviction-before-refusal, and hot-edit behavior in [scheduling.md](scheduling.md); mirror postures, device attention kernels, and their refusal wording in [cuda-backend.md](cuda-backend.md); tier chains the residency claims seat against in [residency-and-budgets.md](residency-and-budgets.md); window/softcap profile semantics in [model-profiles.md](model-profiles.md); bench verbs behind every number above (`kv-quant`, `generate-kv-cache-type-parity.ps1`) in [measurement-harnesses.md](measurement-harnesses.md).

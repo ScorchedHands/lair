@@ -56,7 +56,7 @@ Engine-wide knobs shared by the served model.
 
 Tuning pins belong to an opened CPU backend exactly like `engine.cpu.isa`: every value resolves once at engine open against detected topology and the model's effective worker count, and a hot edit is refused — only a restart re-resolves them. An absent key (or an omitted block) declares nothing: that knob stays posture-resolved rather than fixed to one machine class.
 
-`prefill_kernel` accepts all three values at load, but a selection this engine cannot run for the served file is refused **at model open**, naming that file's own weight formats. Today the blocked-matmul path exists only for `Q8_0`, `Q4_K`, and `IQ4_XS`: a file with any other dense format is refused rather than falling back.
+`prefill_kernel` accepts all three values at load, but a selection this engine cannot run for the served file is refused **at model open**, naming that file's own weight formats. Today the CPU blocked-matmul path exists only for `Q8_0`, `Q4_K`, `IQ4_XS`, and `Q6_K`: a file whose dense matrices carry any other format is refused rather than falling back.
 
 Chunk width and row width are separate numbers: `max_batch_tokens` bounds how many prompt tokens a step forwards, while the engine's prompt windows run in sub-batches of a resolved **row** count (measured default 32, engine ceiling 64) that no configuration key sets on this build. A declared `prefill_buffers` cap can narrow that effective row width; see budgets below.
 

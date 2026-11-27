@@ -2,7 +2,7 @@
 
 Technical documentation of the implemented engine: how each subsystem works, why it is built that way, what it refuses today, and which measurement justifies its defaults. Operator-facing material — commands, flags, config keys, feature overview — lives in [`docs/user/README.md`](../user/README.md) and [`docs/user/reference/`](../user/reference/).
 
-As of 2026-11-27 (v0.7.x line, MVP7 in progress). Each page carries its own "as of" date; when a page and the code disagree, the code is authoritative and the page is a bug — `AGENTS.md` lists which page every kind of change must update.
+As of 2026-11-27. Each page carries its own "as of" date; when a page and the code disagree, the code is authoritative and the page is a bug — `AGENTS.md` lists which page every kind of change must update.
 
 ## Reading order
 

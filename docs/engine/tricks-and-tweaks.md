@@ -129,9 +129,18 @@ xychart-beta
 
 **Technique.** `MatmulRouteBatchWidthQ4K` (`src/Lair.Backends.Cpu/CpuKernelTuning.cs`) states the crossover only through an internal pin; the resolved value is 0: "no auto posture promotes this format … a hybrid width above the batch ceiling never dispatches" refuses on out-of-range pins naming the qualified key `engine.cpu.tuning.matmul_route_batch_width_q4k`. This keeps the candidate measurable without promoting it from one host's profile.
 
-**Measured effect.** The strict re-pair analysis (`reports/2026-11-27T04-06-34Z-optimize-prefill-q4k-route-repair-xeon-t8/analysis.md`; posture: Xeon lane `threads=8 rowWidth=64`, warmup rounds first, per-arm log subdirectories) is the honest verdict: **no candidate arm separates on total_ms at any shape** — e.g. width-16 gemv@256 −7.16% against a ±11.01% band; width-8 tiled@128 −6.32% against ±17.43%. Stage-level metrics *do* separate beyond their bands: attention_weight_ms −11.64% (±8.27%) and attention_output_ms −24.65% (±17.23%) at gemv@256 width 8; tiled@256 attention_output_ms −28.68% (±24.92%). A kv_write_ms +144.11% delta is recorded as a magnitude artifact and called meaningless rather than reported as a win. An earlier same-host pass had shown mean-of-medians total gains of −3.8%/−5.1% with spreads up to ~32%, which the repair run's band analysis superseded.
+**Measured effect.** The committed strict re-pair (`reports/2026-11-27T03-09-24Z-optimize-prefill-q4k-route-repair-xeon-t8/summary.md`; posture from its `commands.md`: fixture `qwen2.5-3b-instruct-q4_k_m.gguf` on a Xeon CPU-only lane, `--threads 8 --widths 64`, lengths 128 and 256, kernels gemv/tiled, arms `off`/`on`/`16`, 2 warmup rounds then 5 measured rounds interleaved back-to-back in one session with arm order rotated on odd rounds) is the verdict this build quotes: **no candidate arm separates on `total_ms` at any shape.** Its pooled worst-case intra-arm `total_ms` spreads are 25.53% for `off`, 34.20% for `on`, and 26.04% for `16`; every delta sits inside its own arm's band:
 
-**Status.** Unpromoted candidate, open by pin only (`--q4k-matmul-route off|on|N`). Promotion waits for same-target-host validation — recorded as a decision, not left implicit.
+| Shape | off median (ms) | on median / delta vs own band | 16 median / delta vs own band |
+|---|---:|---:|---:|
+| gemv @128 | 9,650.9 | 8,910.4 — −7.67% vs ±34.20% | 9,863.4 — +2.20% vs ±26.04% |
+| gemv @256 | 23,375.3 | 22,982.1 — −1.68% vs ±13.39% | 21,724.6 — −7.06% vs ±8.54% |
+| tiled @128 | 10,050.4 | 11,416.9 — +13.60% vs ±18.54% | 10,785.4 — +7.31% vs ±16.81% |
+| tiled @256 | 23,053.4 | 22,430.6 — −2.70% vs ±7.74% | 23,354.6 — +1.31% vs ±11.08% |
+
+The artifact's own interpretation column answers "separates beyond own spread: no" for all eight candidate readings, including the two apparent wins (`gemv@128 on` at −7.67%, `gemv@256 16` at −7.06%) and the one clear-looking regression (`tiled@128 on` at +13.60%). Stage medians are recorded beside each arm in that summary (for example gemv @256 `attention_weight`: off 3,659.7 / on 3,168.7 / 16 3,015.5 ms) but the artifact computes bands over `total_ms` only, so those columns carry no separation verdict and are not read as wins. The same lane's first interleaved pass (`reports/2026-11-27T02-28-33Z-optimize-prefill-q4k-route-ab-interleaved-xeon-t8/summary.md`) had put `gemv @128 on` at 8,734.2 against `off` 10,360.6 under spreads of 22.64% and 20.22%; the repair run's warmup-plus-order-rotation design superseded it as the citable posture, and [cpu-kernels](cpu-kernels.md) carries that earlier pass. A later re-pair exists locally but is not committed on this branch, so no number from it is quotable here.
+
+**Status.** Unpromoted candidate, open by pin only (`--q4k-matmul-route off|on|N`). The committed re-pairs already measure it on the serving-class Xeon lane and none separates at window totals, so promotion stays blocked until a committed run puts a `total_ms` delta outside its own arm's spread — recorded as a decision, not left implicit.
 
 ## 8. Ascending-walk bit identity: the invariant that makes every route swap safe
 
