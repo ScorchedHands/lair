@@ -26,8 +26,9 @@ Continue LAIR `phase/mvp7` from worktree `C:\source\gitlab.scorchedhands.com\per
 - A/B collected at `reports/2026-11-27T01-16-57Z-optimize-prefill-q4k-route-ab-xeon-t8` from fresh clone of `phase/mvp7@e3f001f` (remote `/root/lair-measurements/qwen25-small-cpu/repo`) + publish to `build/app-q4k-ab`. Kernels gemv,tiled; lengths 128,256; t8 w64; rounds 3.
 - total_ms medians vs baseline(off): gemv@128 −9.1% (w8) / −10.0% (w16); gemv@256 −4.7% / −7.7%; tiled@256 −7.3% / −2.5%; tiled@128 +6.0% at w8 but inside its 22% noise band, −0.4% at w16. Mean-of-medians −3.8% (w8), −5.1% (w16).
 - Interleaved re-pair at `reports/2026-11-27T02-28-33Z-optimize-prefill-q4k-route-ab-interleaved-xeon-t8` (alternating off/on/16 per round, rounds 4): gemv@128 −15.7% w8 / −7.6% w16; gemv@256 −4.3% / −6.2%; tiled@128 −0.9% / −7.9%; tiled@256 +0.3% / −0.9%. Intra-arm spreads ran 6-27%, so no arm separated beyond its own band and the auto width stays 0.
-- Runner extended for a warmup-aware repair pass: `scripts/run-xeon-prefill-stage-ab.py` now supports `--warmup-rounds`, odd-round arm-order rotation, `--report-name`, `--dry-run`; verified with py_compile + local dry-run schedule dump.
-- Aborted remote dir `reports/2026-11-27T01-22-48Z-*` left on host, excluded from evidence.
+- Runner extended for a warmup-aware repair pass: `scripts/run-xeon-prefill-stage-ab.py` now supports `--warmup-rounds`, odd-round arm-order rotation, `--report-name`, `--dry-run`; verified with py_compile + local dry-run schedule dump. Repair pass at `reports/2026-11-27T03-09-24Z-optimize-prefill-q4k-route-repair-xeon-t8` (rounds 5, warmup 2) shows no separation either: deltas gemv@128 −7.67%/+2.20%, gemv@256 −1.68%/−7.06%, tiled@128 +13.60%/+7.31%, tiled@256 −2.70%/+1.31% with pooled spreads 25.5/34.2/26.0%.
+- Decision: `AutoMatmulRouteBatchWidthQ4K` stays 0 after three passes; width 8 rejected (tiled regression), width 16 not separable. Next Xeon target is dense feed-forward gate/up + down (~70% of the window per repair baseline stage medians).
+- Remote leftovers pending cleanup: aborted dir `reports/2026-11-27T01-22-48Z-*`, transfer scratch `stage/`, and a stale untracked runner copy parked in `repo/attic/` (it blocked one ff-merge) — all documented, none deleted.
 
 ### Follow-up optimization prompt (run after initial continuation)
 
