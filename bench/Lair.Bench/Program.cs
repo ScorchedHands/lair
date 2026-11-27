@@ -12,7 +12,7 @@ using Lair.Tokenizer;
 
 if (args.Length == 0)
 {
-    Console.WriteLine("usage: Lair.Bench <gemv|gguf-dump|gemv-file|prefill-profile|kv-spike|kv-micro|q4-parity|kv-quant|mtp|cuda-gemv|cuda-gemm|cuda-prefill|cuda-concurrency|gather|ple-latency|ple-policy|lowrank-svd|qwen4exp-forward-file|help>");
+    Console.WriteLine("usage: Lair.Bench <gemv|gguf-dump|gemv-file|prefill-profile|kv-spike|kv-micro|q4-parity|kv-quant|mtp|cuda-gemv|cuda-gemm|cuda-prefill|cuda-concurrency|gather|ple-latency|ple-policy|lowrank-svd|qwen4exp-forward-file|q4k-widebatch|help>");
     return 1;
 }
 
@@ -36,6 +36,7 @@ return args[0] switch
     "ple-policy" => PlePolicyBench.Run(args), // PLE access-scheduling measurement: demand-only gather, bounded computed-address prefetch overlap, frequency-sketch hot-row residency with and without prefetch under declared caps, and Linux NUMA/huge-page placement facts where the host offers them — storage/governance evidence only with no posture or config change
     "lowrank-svd" => LowRankSvdBench.Run(args), // Analytical low-rank viability measurement: contiguous per-expert slabs of the stacked MoE gate/up/down tensors dequantize row-by-row through the engine's CPU dequant route into float32 matrices (one expert resident at a time over slab views, never a whole-stack copy), their exact singular spectra come from numpy.linalg.svd driven by the bench-side spike script, and rank-energy fractions plus per-role median aggregates publish beside an active-routed-expert bytes/token baseline read off the assembled tensor table against conservative fp32-factorization storage estimates for candidate ranks; analytical viability evidence only - it measures how much energy each matrix's leading singular directions hold, benchmarks no low-rank kernel throughput, and changes no posture or config
     "qwen4exp-forward-file" => Qwen4ExpForwardBench.Run(args), // Bounded qwen4exp CPU forward measurement: short synthetic prompt windows and argmax-driven single-token steps run through the engine's assembly-internal chunk seam over a plain CPU backend against real (possibly split) pinned shards, publishing prefill/decode tokens-per-second plus peak working-set facts or one status=refused line naming what this build cannot open that file; no serving route, KV pool, lane posture or config change participates
+    "q4k-widebatch" => Q4KWideBatchBench.Run(args), // Kernel-level attribution seam for the Q4_K batched dense dot: auto scratch traversal vs forced streaming fallback (and an optional chain-group-1 diagnostic arm) over synthetic pinned tensors at realistic feed-forward widths and counts 1/8/16/32/64, publishing per-count med/min/max ms, ns/MAC, GFLOP/s and effective weight GB/s with a bit-parity guard between arms; bench-only measurement seam - no posture or config change
     _ => Usage(),
 };
 
