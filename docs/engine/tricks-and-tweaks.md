@@ -1,0 +1,162 @@
+# Tricks and tweaks
+
+Scope: the hot-path techniques this build actually runs, each with the wall it solves, where it lives in `src/`, what a committed measurement says about it (with posture), and its status today — default behavior, internal pin, or unpromoted candidate. As of 2026-11-27. Kernel mechanics are owned by [cpu-kernels](cpu-kernels.md); this page catalogizes *why* each technique exists and where the evidence sits.
+
+```mermaid
+flowchart TB
+    subgraph decode["Decode hot path (one token)"]
+        M[mmap span over model file\nGgufMmapWeightSource] --> G{grid encoding\nauto probe, per process}
+        G -- gather --> GI[gather-indexed integer dot]
+        G -- scalar --> SC[scalar-load walk]
+        Q["activation quantized once per call\none shared Q8_K copy"] --> GI & SC
+    end
+    subgraph prefill["Prefill hot path (window of tokens)"]
+        RW[batched-row traversal] --> CG[shared-input dot chain groups]
+        CG --> FP[fused pairs / triples\nshared activation walk]
+        FP -. internal seam .-> TE[blocked matmul tile executor\nhybrid route width 8]
+    end
+```
+
+Node legend: solid nodes are default behavior today; the dashed edge is a measured-but-unpromoted candidate for Q4_K single-matrix and fused-pair passes. KV-side techniques (block pools, quantized-KV formats) belong to [kv-cache](kv-cache.md); residency tiers to [residency-and-budgets](residency-and-budgets.md).
+
+## 1. Zero-copy mmap spans instead of loaded weight buffers
+
+**Wall.** A multi-gigabyte GGUF must serve without a second copy in RAM, and split models must not be reassembled into memory.
+
+**Technique.** `src/Lair.Loader/GgufMmapWeightSource.cs` maps the file (or each physical shard separately for an assembled split) read-only: every tensor resolution returns a span at `shard.DataStart + tensor.Offset` — "No whole-model copy exists." Nothing in this build's placement code locks, prefaults, or migrates model-file pages; NUMA behavior is first-touch discipline through pinned workers only (`NumaPlacement.PagePlacementAdvisory`, see [cpu-kernels](cpu-kernels.md)). Page-cache residency does the rest.
+
+**Measured effect.** `gemv-file` prints peak working set per process so a cost claim never hides its memory: on the live-decode re-pin, peak working sets were 1430.9 MB (Q4_K_M), 1344.2 MB (IQ4_XS), and 1222.0 MB (mixed-tier UD file) under a declared 4 GB ceiling (`bench/reports/sub4bit-cost-repin-2026-11-17.md`; posture: serving with `thread_quota: 8`, engine `threads: 0`, one server at a time). The kernel-comparison artifact shows the traversal trade directly: gemv peak RSS 1,353.8 MB vs tiled 1,222.8 MB on the IQ4_XS fixture (`reports/kernel-comparison-2026-11-14/`).
+
+**Status.** Default for all GGUF loading; no locking knob exists and none is described — a host that wants pages pinned has to do it outside LAIR, which this build states rather than emulates.
+
+## 2. Process-wide auto grid probe: gather vs scalar weight loads
+
+**Wall.** Sub-4-bit i-quants load weights through nibble/gather paths whose speed depends on the actual CPU; a fixed encoding choice would be wrong on some hosts.
+
+**Technique.** `src/Lair.Backends.Cpu/CpuBackend+Grid.cs` — `ResolveAutoGrid` runs one synthetic sub-4-bit GEMV benchmark per process (128×1024 rows, 6 interleaved best-of passes over generated weights through two forced backends with row hints off), then caches the answer for later auto opens; forced opens never consult it. Acceptance is conservative on both sides: one clear collapse (`gatherBestTicks > scalarBestTicks * 6 / 5` on any format) keeps scalar, and overall gather must win by a margin — `gatherTotalTicks * 25 < scalarTotalTicks * 24`.
+
+**Measured effect.** The probe resolves real serving differences: in the corrected quota-8 live runs, Q4_K_M and the mixed-tier file resolved `gather` while IQ4_XS resolved `scalar`, even though all bench processes on the same build resolved `gather` (`bench/reports/sub4bit-cost-repin-2026-11-17.md`, "Selection variance" section — posture: Release bench, `--threads 8 --reps 200 --max-rows 256`). The report records each run's actual startup selection instead of treating one global encoding as fixed.
+
+**Status.** Default under `auto`; ISA/grid overrides exist as explicit pins (documented on [cpu-kernels](cpu-kernels.md)). Prefetch hints ride the same posture (`resolvedPrefetch=auto` → `prefetchHints=on` in the same runs); a prefetch instruction "performs no read and changes nothing," so hint failure is harmless by construction.
+
+## 3. Integer-dot GEMV with one shared Q8_K activation copy per call
+
+**Wall.** Sub-4-bit formats measured at roughly 6.5× dense cost when each row re-dequantized into float multiplies.
+
+**Technique.** Production quantizes the activation vector **once per `Gemv`/`GemvBatch` call** and shares that single Q8_K copy across every row of the traversal; rows then run integer dots against stored weights instead of per-row dequantization (`src/Lair.Backends.Cpu/CpuBackend.cs`). The gate proving this is production, not a test-side fiction: `tests/Lair.Tests/KernelTests.cs` requires an FP-activation oracle over the *same* stored weights to land visibly away from the kernels' totals while the backend stays bit-exact against the published reference — "a float dot … would move both numbers together and break one gate loudly instead of hiding inside a tolerance band."
+
+**Measured effect.** The penalty is gone at kernel level: settled per-element costs are ~1.5–2.3× the Q4_K baseline, not 6.5× (`bench/reports/sub4bit-cost-repin-2026-11-17.md`; posture: resident single-threaded GEMV summary against pinned fixtures `Llama-3.2-1B-Instruct-Q4_K_M.gguf` / `-IQ4_XS.gguf` / `-UD-IQ3_XXS.gguf`, Release build, settled high-repetition runs):
+
+| Format (in UD file) | ns/GEMV summary | ns/elt | vs Q4_K baseline 0.164 ns/elt |
+|---|---:|---:|---:|
+| IQ2_S | 553.0 | 0.270 | ≈1.50–1.51× settled (summary ≈1.65× with warm-up skew) |
+| IQ2_XS | 655.3 | 0.320 | ≈1.95× |
+| IQ3_S | 692.1 | 0.338 | ≈2.06–2.07× |
+| IQ3_XXS | 783.9 | 0.383 | ≈2.32–2.35× — recorded as a premise miss, not smoothed into "≤2×" |
+
+```mermaid
+xychart-beta
+    title "Resident single-thread GEMV cost per element (ns/elt, settled samples)"
+    x-axis ["Q4_K anchor", "IQ2_S", "IQ2_XS", "IQ3_S", "IQ3_XXS"]
+    y-axis "ns/element" 0 --> 0.45
+    bar [0.166, 0.270, 0.320, 0.338, 0.383]
+```
+
+Live decode on the same re-pin: IQ4_XS fastest at ≈16.46 monitor-windowed tok/s vs Q4_K_M ≈12.43 and mixed-tier UD ≈12.97 (posture as in entry 1; client-aggregate numbers are reported but labeled confounded by differing output lengths — the monitor window is the primary comparison).
+
+**Status.** Default for all quantized GEMV/GEMM paths; raw tables retained beside the report (`bench/reports/gemv-mvp5-*-reps200-2026-11-17.txt`). `IQ2_XXS` remains correctness-covered by Kernel/Parity fixtures with no dedicated speed fixture — explicitly recorded as a coverage gap, not claimed.
+
+## 4. Shared-input dot chain groups: one operand pass feeds several accumulators
+
+**Wall.** Attention scores and shared-dot batches re-read the common vector once per accumulator; wide batches spill register-resident chains.
+
+**Technique.** `CpuKernelTuning.SharedInputDotChainGroup` (`src/Lair.Backends.Cpu/CpuKernelTuning.cs`) states how many consecutive inputs of a shared-operand dot keep their own accumulator chain beside one load of the common vector's chunk; 0 keeps every such dot individual, and pinning wider than eight refuses: "a shared-dot chain group wider than eight spills accumulators past the vector posture's register budget." The auto posture resolves to width 8 on a vector host (bench arm labels `default`/`auto8`, pinned arms `off`/`g2`/`g4`/`on`).
+
+**Measured effect.** Same-session stage medians, attention kernel time (`reports/2026-11-26T03-12-26Z-optimize-prefill-chain-group-widths/summary.md`; posture `threads=32 rowWidth=64 lengths 128,256 kernels gemv,tiled`, Xeon-class local lane):
+
+| Shape | auto (8) | off (individual dots) | pinned 2 | pinned 4 | on (8) |
+|---|---:|---:|---:|---:|---:|
+| gemv @128 attention_kernel_ms | 107.27 | 120.78 | 125.41 | 108.35 | 106.97 |
+| gemv @256 | 548.03 | 609.93 | 616.44 | 538.86 | 527.83 |
+| tiled @128 | 143.63 | 156.06 | 179.69 | 138.97 | 130.71 |
+| tiled @256 | 528.13 | 606.71 | 605.10 | 558.33 | 505.85 |
+
+The width-8 arms beat `off` at every shape; the sweep exists precisely because narrower pins are *not* uniformly better (pinned 2 loses to off on gemv@256).
+
+**Status.** Width 8 default with vector posture; widths selectable through internal tuning keys and bench pin `--attention-batch-dots off|on`. [measurement-harnesses](measurement-harnesses.md) owns how the arms were run.
+
+## 5. Blocked matmul tile executor + hybrid dense-matrix route (promoted for covered formats)
+
+**Wall.** A batched GEMV pass re-reads its activation batch once per chain group; a blocked matmul reads one activation vector per eight-column chunk and feeds all eight tile rows' accumulator chains from it. For window-sized batches the second walk is cheaper — but only where a real blocked kernel exists for the format.
+
+**Technique.** `MatmulRouteBatchWidth` (auto = 8 with vector posture, 0 without) hands eligible batched passes to the shared `RunMatmulDispatch` tile executor (`src/Lair.Backends.Cpu/CpuBackend.cs`, `CpuBackend+Gemm.cs`). The format coverage was extended rather than faked: Q6_K gained genuine blocked kernels (`GemmQ6KAvx2`, `GemmQ6KScalar`) "same ascending group/chunk walk, FMA association, and scalar-tail cleanup as the existing per-row Q6_K kernels," so `prefill_kernel=gemm` selects cleanly for Q6_K windows. Bit identity is proven, not asserted: 19 new cases in `tests/Lair.Tests/Q6KGemmRouteTests.cs` pin bit-for-bit equality between hybrid tile route and batched-row scratch route across five shapes including ragged column tails (137/264/300), counts 8..64, threaded vs single-thread under forced tiny row blocks.
+
+**Measured effect.** `feed_forward_down_ms` medians, alternating arms (`reports/2026-11-25T16-11-55Z-optimize-prefill-q6k-gemm/summary.md`; posture: `qwen2.5-3b-instruct-q4_k_m.gguf`, 2,104,932,768 bytes, local CPU lane `threads=32 rowWidth=64`, kernels gemv/tiled, lengths 128/256; stage medians from alternating rounds):
+
+| Shape | route off | hybrid (width 8) | separation |
+|---|---:|---:|---|
+| gemv @128 down_ms | 373.1 | 334.9 (−10.2%) | full sample separation |
+| gemv @256 down_ms | 734.0 | 672.7 (−8.4%) | every hybrid below every off |
+| tiled @128 down_ms | 387.6 | 344.2 (−11.2%) | full sample separation |
+| tiled @256 down_ms | 774.6 | 681.1 (−12.1%) | every hybrid below every off |
+
+Window totals moved only −2.4…−3.2% and window throughput was noise-indeterminate at medians — the report states this plainly rather than promoting the substage win to a headline number, consistent with its ±10–35% documented inter-process band (calibrated ~±5% between behaviorally identical arms).
+
+```mermaid
+xychart-beta
+    title "Q6_K hybrid route: feed_forward_down_ms medians (off vs tile width 8)"
+    x-axis ["gemv@128", "tiled@128", "gemv@256", "tiled@256"]
+    y-axis "ms" 0 --> 800
+    bar [373.1, 387.6, 734.0, 774.6]
+    bar [334.9, 344.2, 672.7, 681.1]
+```
+
+**Status.** Default at width 8 for formats the blocked matmul genuinely covers (Q8_0/Q4_K/IQ4_XS and now Q6_K; `prefill_kernel=gemm` capability gates green). The auto width was chosen from prior tile-reuse measurements with a dedicated 4/16/32 sweep recorded as not-yet-run — the bench pin exists for that re-confirmation.
+
+## 6. Fused shared-input pairs and triples (QKV triple, gate/up pair)
+
+**Wall.** Q/K/V reads of one hidden vector, and gate/up reads feeding one MLP block, each traverse the same activation twice or three times independently.
+
+**Technique.** Shared-input fusion walks a group through one staged traversal: the batched Q/K/V **triple** is intact in this build (baseline for committed prefill work at `reports/optimize-prefill-qkv-triple-fusion-2026-11-25T16-06-41Z/`), and gate/up run as a fused pair whose two staged rows share one activation pass. Phi-3's single qkv buffer is read as three head-region slices, with its gate living inside `blk.N.ffn_up.weight` where the file has no separate gate tensor at all (`tests/Lair.Tests/ParityTests.cs` fixture description; profile semantics owned by [model-profiles](model-profiles.md)).
+
+**Measured effect.** Fusion itself is carried as a bit-identity invariant rather than a speed headline: whatever route and chain-group width runs, "each matrix's outputs keep that format's own ascending chunk walk, FMA association, and scalar-tail cleanup," so a pair on either traversal is byte-identical to its two independent batched passes (`src/Lair.Backends.Cpu/CpuKernelTuning.cs` documentation; proven per-route in `Q6KGemmRouteTests`). The stage profile shows the consequence: after entry 5, gate/up remains the *larger* FFN substage (down 672 vs gate_up 775 ms hybrid at gemv@256), and causal attention stays the dominant window substage (~42% of a gemv length-256 window) — which is exactly why the pair route below exists as a seam. The committed fusion report's own arm medians (gemv128 84.9, gemv256 53.6, tiled128 65.9, tiled256 70.8 batchedTok/s) sit below current hybrid numbers at every shape, but those baselines came from a different host session and are labeled directional reference only in `reports/2026-11-25T16-11-55Z-optimize-prefill-q6k-gemm/summary.md`.
+
+**Status.** Triple and pair traversals are default behavior; handing fused pairs to the tile executor (`PairMatmulRouteBatchWidth`, bench pin `--pair-matmul-route off|on|N`) resolves to 0 — "no posture promotes it: the fused pair traversal stays in force until a target-host measurement separates the two routes for pairs."
+
+## 7. Stated-but-unpromoted crossovers as internal seams (Q4_K single-matrix route)
+
+**Wall.** A local AVX2-class stage profile showed single-matrix Q4_K passes taking the tile route cheaper — but on a *different* host than the serving lane, and window totals could not confirm it.
+
+**Technique.** `MatmulRouteBatchWidthQ4K` (`src/Lair.Backends.Cpu/CpuKernelTuning.cs`) states the crossover only through an internal pin; the resolved value is 0: "no auto posture promotes this format … a hybrid width above the batch ceiling never dispatches" refuses on out-of-range pins naming the qualified key `engine.cpu.tuning.matmul_route_batch_width_q4k`. This keeps the candidate measurable without promoting it from one host's profile.
+
+**Measured effect.** The strict re-pair analysis (`reports/2026-11-27T04-06-34Z-optimize-prefill-q4k-route-repair-xeon-t8/analysis.md`; posture: Xeon lane `threads=8 rowWidth=64`, warmup rounds first, per-arm log subdirectories) is the honest verdict: **no candidate arm separates on total_ms at any shape** — e.g. width-16 gemv@256 −7.16% against a ±11.01% band; width-8 tiled@128 −6.32% against ±17.43%. Stage-level metrics *do* separate beyond their bands: attention_weight_ms −11.64% (±8.27%) and attention_output_ms −24.65% (±17.23%) at gemv@256 width 8; tiled@256 attention_output_ms −28.68% (±24.92%). A kv_write_ms +144.11% delta is recorded as a magnitude artifact and called meaningless rather than reported as a win. An earlier same-host pass had shown mean-of-medians total gains of −3.8%/−5.1% with spreads up to ~32%, which the repair run's band analysis superseded.
+
+**Status.** Unpromoted candidate, open by pin only (`--q4k-matmul-route off|on|N`). Promotion waits for same-target-host validation — recorded as a decision, not left implicit.
+
+## 8. Ascending-walk bit identity: the invariant that makes every route swap safe
+
+**Wall.** Fusing, tiling, batching, and ISA switching all risk reordering accumulation — which would break golden parity against pinned llama.cpp b12032.
+
+**Technique.** Every kernel variant in `src/Lair.Backends.Cpu/` preserves the format's own ascending group/chunk walk, operand association order, and scalar-tail cleanup; route decisions choose *which executor* walks those chunks, never how they combine. The CUDA side gets the same discipline as a near-tie guarantee (`tests/Lair.Tests/CudaNearTieArgMaxTests.cs`): candidates separated by one fp16 mantissa step (~9.7e-4 relative) must resolve to identical argmax across CPU and CUDA chains, with separation 5×–2000× the recorded per-format bands (2e-6 IQ4_NL/IQ4_XS; 1e-6 Q8_0/Q5_0 family), while a deliberately true-tie lane bounds divergence at 4× band against a scalar CPU oracle. Semantics detail belongs to [cuda-backend](cuda-backend.md).
+
+**Measured effect.** This is what makes the tolerance bands in [measurement-harnesses](measurement-harnesses.md) meaningful: parity failures localize to forward math, never to kernel reassociation; entry 5's route landed with *zero* introduced tolerance ("No output-bit tolerance introduced anywhere").
+
+**Status.** Default invariant across all promoted and candidate routes.
+
+## 9. PLE hot-row arenas: parity-checked copies on huge-page asks that report honestly
+
+**Wall.** A ~28.8 GB n-gram table cannot be loaded; only the rows a policy selects should become resident, under a declared byte ceiling — without pretending the host gave you memory it didn't.
+
+**Technique.** `src/Lair.Loader/PleHotRowProvider.cs` admits exactly its selection into an aligned anonymous arena (`mmap(MAP_PRIVATE|MAP_ANONYMOUS)` madvise'd `MADV_HUGEPAGE` on Linux; plain committed elsewhere — "the requested backing reports as not applied rather than emulated"); every copy is parity-checked against its source span before counting as resident, and hits/misses are tallied so throughput attributes to what actually ran. Ceiling gating divides declared `ple.caps.dram_mb` by the table's own row stride (`src/Lair.Models/PleResidencyGate.cs`) — admission and budgeting share one division "so they can never disagree about how many rows fit," and a clamped selection reports as refused rather than silently narrowed. Explicit hugetlb pages are never reserved or required.
+
+**Measured effect.** Committed policy runs on disk-backed Xeon shards (`reports/2026-11-22T05-35-09Z/bench.json`; posture: `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS` shard pair, 65,536 tokens, Zipf and uniform arms): the 32 MiB hot-slot arena admitted 372,827 rows; backing facts recorded `madvise_hugepage_succeeded: true`, `explicit_hugetlb_used: false`, and full transparent-page coverage in `smaps` (`smaps_anon_hugepages_bytes_over_arena = 33554432`) on a host whose THP posture is `always [madvise] never` with `HugePages_Total=0`. The measured policy candidate is hot-slot residency plus NUMA-local first-touch; promotion of prefetch overlap waits behind direct stall measurement, and the harness states that gate rather than claiming past it.
+
+**Status.** Measurement lanes (`ple-latency`, `ple-policy`) landed; production forward integration for flagship files remains open — stated as unfinished, not glossed. Details on [residency-and-budgets](residency-and-budgets.md).
+
+## 10. Honest refusals that double as tweaks
+
+Several "tweaks" are decisions to *not* do something, kept visible: no mlock/prefaulting (entry 1); no synthetic stand-in for real-file or idle-GPU measurement ([measurement-harnesses](measurement-harnesses.md) refusal table); no Q5_K CPU blocked matmul invented to satisfy a capability test — when Q6_K gained one, the refusal lanes were re-pinned to Q5_K instead (`reports/2026-11-25T16-11-55Z-optimize-prefill-q6k-gemm/summary.md`); and per-element cost premises that miss (IQ3_XXS at ≈2.3×) are recorded as misses rather than smoothed into assertions. Each refusal names its key or substrate, which is what lets a later measurement reopen the question without re-deriving posture from scratch.
+
+## See also
+
+[cpu-kernels](cpu-kernels.md) · [quantization](quantization.md) · [kv-cache](kv-cache.md) · [cuda-backend](cuda-backend.md) · [residency-and-budgets](residency-and-budgets.md) · [model-profiles](model-profiles.md) · [measurement-harnesses](measurement-harnesses.md)
