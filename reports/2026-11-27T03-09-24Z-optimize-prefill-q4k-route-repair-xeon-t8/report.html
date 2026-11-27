@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>2026-11-27T03-09-24Z-optimize-prefill-q4k-route-repair-xeon-t8 - LAIR Xeon q4k route A/B interleaved</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>body { font-family: 'Segoe UI', sans-serif; margin: 2rem auto; max-width: 1080px; color: #1c1c1c; } h1 { font-size: 1.45rem; } h2 { font-size: 1.1rem; margin-top: 2.2rem; } .note { color: #444; font-size: 0.9rem; max-width: 76ch; } canvas { max-width: 1020px; }</style>
+</head>
+<body>
+<h1>2026-11-27T03-09-24Z-optimize-prefill-q4k-route-repair-xeon-t8</h1>
+<p class='note'>Generated at 2026-11-27T03:56:39Z. Lane: <code>Xeon CPU-only lair-lab (root@192.168.33.53), threads=8, rowWidth=64</code>. Method: 2 warmup rounds then 5 measured rounds x arms [off, on, 16] interleaved back-to-back in one session so host drift cancels; measured arm order rotates on odd rounds to cancel positional bias while warmups run each arm once per round for cold-start/page-cache handling; reps=1 per command with kernels gemv, tiled; medians/min/max/spread parsed from raw measured logs after ANSI stripping.</p>
+<h2>total_ms medians by arm, kernel and length</h2>
+<canvas id="abBar" height="420"></canvas>
+<script>
+new Chart(document.getElementById('abBar'), {"type": "bar", "data": {"labels": ["gemv 128", "gemv 256", "tiled 128", "tiled 256"], "datasets": [{"label": "arm off total_ms", "data": [9650.862, 23375.293, 10050.419, 23053.436], "backgroundColor": "#3b6fb6"}, {"label": "arm on total_ms", "data": [8910.367, 22982.124, 11416.879, 22430.599], "backgroundColor": "#f2a65e"}, {"label": "arm 16 total_ms", "data": [9863.406, 21724.614, 10785.38, 23354.602], "backgroundColor": "#2a7f62"}]}, "options": {"scales": {"y": {"title": {"display": true, "text": "total_ms median (lower is better)"}, "beginAtZero": true}}, "plugins": {"legend": {"position": "bottom"}}}});
+</script>
+<h2>Intra-arm total_ms spread per shape</h2>
+<canvas id="spreadBar" height="380"></canvas>
+<script>
+new Chart(document.getElementById('spreadBar'), {"type": "bar", "data": {"labels": ["gemv 128", "gemv 256", "tiled 128", "tiled 256"], "datasets": [{"label": "arm off intra-arm total_ms spread %", "data": [25.53171934279032, 8.542100413457925, 16.810592672802994, 4.301831622843558], "backgroundColor": "#3b6fb6"}, {"label": "arm on intra-arm total_ms spread %", "data": [34.20042070096551, 13.391490708169536, 18.54446385916852, 7.743649645736167], "backgroundColor": "#f2a65e"}, {"label": "arm 16 intra-arm total_ms spread %", "data": [26.039706770663194, 5.900505297815652, 14.46898486655083, 11.079923348725885], "backgroundColor": "#2a7f62"}]}, "options": {"scales": {"y": {"title": {"display": true, "text": "(max-min)/median % per arm"}, "beginAtZero": true}}, "plugins": {"legend": {"position": "bottom"}}}});
+</script>
+<p class='note'>See <a href='summary.md'><code>summary.md</code></a> for tables and noise bands and <a href='data.json'><code>data.json</code></a> for machine-readable medians.</p>
+</body>
+</html>

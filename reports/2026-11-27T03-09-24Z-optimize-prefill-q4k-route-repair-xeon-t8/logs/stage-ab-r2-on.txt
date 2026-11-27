@@ -1,0 +1,30 @@
+prefill-profile file=/root/lair-measurements/qwen25-small-cpu/models/qwen2.5-3b-instruct-q4_k_m.gguf bytes=2104932768 threads=8 maxBatchSequences=16
+  arch=qwen2 layers=36 hidden=2048 heads=16 kvHeads=2 headDim=128 vocab=151936 windowedLayers=0 avx2=True
+  traversalBytes=1668685824 outputHeadBytes=255252480 kvBlocks=24 blockTokens=16 reps=1 perToken=off lengths=128,256 rowWidths=64 kernels=gemv,tiled stageProfile=on
+
+prefill-profile kernel=gemv
+
+prefill-profile rowWidth=64 subBatchActivationBytes=8388608
+  weightFit=2403.46 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.69
+  attentionFit=383.525 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 224
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             2        7973.3         16.05        4806.9        3166.4           0.0          0.69
+         256             4       22230.3         11.52        9613.8       12616.4           0.0          0.69
+  prefill-profile stage window=window kernel=gemv rowWidth=64 length=128 forwardCalls=1 seed_ms=0.299 cache_append_ms=0.025 attention_ms=1519.250 attention_weight_ms=1109.736 attention_projection_ms=637.771 attention_output_ms=471.965 attention_kernel_ms=321.247 kv_write_ms=3.061 feed_forward_ms=6340.523 feed_forward_weight_ms=5988.602 feed_forward_gate_up_ms=3437.792 feed_forward_down_ms=2550.810 sparse_chain_ms=0.000 logits_head_ms=113.144 total_ms=7973.292 top_layers=34:256.678,35:251.260,32:249.145
+  prefill-profile stage window=window kernel=gemv rowWidth=64 length=256 forwardCalls=1 seed_ms=0.576 cache_append_ms=0.027 attention_ms=4562.200 attention_weight_ms=3125.060 attention_projection_ms=1811.666 attention_output_ms=1313.394 attention_kernel_ms=1257.710 kv_write_ms=3.968 feed_forward_ms=17565.329 feed_forward_weight_ms=16855.916 feed_forward_gate_up_ms=9752.216 feed_forward_down_ms=7103.700 sparse_chain_ms=0.000 logits_head_ms=102.008 total_ms=22230.270 top_layers=4:674.219,5:661.378,6:646.440
+
+prefill-profile kernel=tiled
+
+prefill-profile rowWidth=64 subBatchActivationBytes=8388608
+  weightFit=4814.19 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.35
+  attentionFit=72.750 us per position pair
+  crossover: not reached within 4x the longest measured length (256 tokens)
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         128             2       10229.0         12.51        9628.4         600.6           0.0          0.35
+         256             4       21649.9         11.82       19256.8        2393.2           0.0          0.35
+  prefill-profile stage window=window kernel=tiled rowWidth=64 length=128 forwardCalls=1 seed_ms=0.340 cache_append_ms=0.019 attention_ms=1893.962 attention_weight_ms=1404.355 attention_projection_ms=723.449 attention_output_ms=680.905 attention_kernel_ms=395.309 kv_write_ms=2.082 feed_forward_ms=8222.209 feed_forward_weight_ms=7838.472 feed_forward_gate_up_ms=3991.898 feed_forward_down_ms=3846.574 sparse_chain_ms=0.000 logits_head_ms=112.386 total_ms=10228.990 top_layers=21:307.375,18:305.436,11:303.063
+  prefill-profile stage window=window kernel=tiled rowWidth=64 length=256 forwardCalls=1 seed_ms=0.623 cache_append_ms=0.019 attention_ms=4695.264 attention_weight_ms=2871.738 attention_projection_ms=1483.350 attention_output_ms=1388.388 attention_kernel_ms=1630.146 kv_write_ms=4.045 feed_forward_ms=16836.638 feed_forward_weight_ms=16049.359 feed_forward_gate_up_ms=8243.680 feed_forward_down_ms=7805.679 sparse_chain_ms=0.000 logits_head_ms=117.251 total_ms=21649.922 top_layers=27:655.906,30:643.666,33:642.880
+  peakWorkingSetMb=1966.4 cumulative across this process run: measure per-kernel peaks in separate processes
