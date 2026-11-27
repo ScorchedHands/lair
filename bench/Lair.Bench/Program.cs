@@ -898,6 +898,7 @@ static int BenchPrefillProfile(string[] args)
     bool stageProfile = false; // off keeps every report line exactly as this profile has always printed them
     int? matmulRouteWidth = null; // --matmul-route off|on|N pins the hybrid dense-matrix route's batch width for measurement; absent keeps the posture-resolved default
     int? matmulRouteWidthQ4K = null; // --q4k-matmul-route off|on|N states the Q4_K crossover of that same route, which no resolved posture promotes on its own; absent leaves every Q4_K batched pass on its current traversal
+    int? pairMatmulRouteWidth = null; // --pair-matmul-route off|on|N states the fused-pair crossover into that same tile executor, which no resolved posture states either; absent keeps every fused pair on its staged traversal
     int? sharedDotChainGroup = null; // --attention-batch-dots off|on|N pins how many score-dot accumulator chains share one pass over a shared K operand; absent keeps the posture-resolved default
     string? outPath = null;
     List<int> lengths = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048];
@@ -1066,6 +1067,28 @@ static int BenchPrefillProfile(string[] args)
                 }
 
                 break;
+            case "--pair-matmul-route":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--pair-matmul-route' needs a value");
+                    return 1;
+                }
+
+                string pairRouteValue = args[++i];
+                pairMatmulRouteWidth = pairRouteValue switch
+                {
+                    "off" => 0, // every fused pair keeps its staged traversal — what no posture resolves on its own anyway
+                    "on" => 8, // the crossover width the single-matrix tile route is measured at, stated for fused pairs as well
+                    _ => int.TryParse(pairRouteValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out int pinnedPairWidth) ? pinnedPairWidth : -1,
+                };
+
+                if (pairMatmulRouteWidth < 0 || pairMatmulRouteWidth > CpuKernelTuning.MatmulRouteBatchWidthMax)
+                {
+                    Console.WriteLine($"prefill-profile: --pair-matmul-route '{pairRouteValue}' must be off, on, or a batch width 0..{CpuKernelTuning.MatmulRouteBatchWidthMax}");
+                    return 1;
+                }
+
+                break;
             case "--attention-batch-dots":
                 if (i + 1 >= args.Length)
                 {
@@ -1122,9 +1145,9 @@ static int BenchPrefillProfile(string[] args)
         }
     }
 
-    CpuKernelTuningOverrides? pinnedTuning = matmulRouteWidth is null && matmulRouteWidthQ4K is null && sharedDotChainGroup is null
+    CpuKernelTuningOverrides? pinnedTuning = matmulRouteWidth is null && matmulRouteWidthQ4K is null && pairMatmulRouteWidth is null && sharedDotChainGroup is null
         ? null // nothing stated: every knob resolves from the opened posture, exactly as an engine open would.
-        : new CpuKernelTuningOverrides { MatmulRouteBatchWidth = matmulRouteWidth, MatmulRouteBatchWidthQ4K = matmulRouteWidthQ4K, SharedInputDotChainGroup = sharedDotChainGroup };
+        : new CpuKernelTuningOverrides { MatmulRouteBatchWidth = matmulRouteWidth, MatmulRouteBatchWidthQ4K = matmulRouteWidthQ4K, PairMatmulRouteBatchWidth = pairMatmulRouteWidth, SharedInputDotChainGroup = sharedDotChainGroup };
 
     using GgufFile gguf = GgufFile.Open(args[1]);
     using CpuBackend backend = new(
@@ -1450,7 +1473,7 @@ static int BenchPrefillProfile(string[] args)
         [
             $"prefill-profile file={gguf.Path} bytes={gguf.FileSize} threads={backend.EffectiveWorkerCount} maxBatchSequences={TransformerModel.MaxBatchSequences}",
             $"  arch={geometry.Architecture} layers={geometry.LayerCount} hidden={geometry.HiddenSize} heads={geometry.HeadCount} kvHeads={geometry.KvHeadCount} headDim={geometry.HeadDim} vocab={geometry.VocabSize} windowedLayers={windowedLayers} avx2={Avx2.IsSupported}",
-            $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" + (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : "") + (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : "") + (stageProfile ? " stageProfile=on" : "") + (matmulRouteWidth is { } mw ? $" matmulRoute={mw}" : "") + (matmulRouteWidthQ4K is { } mqw ? $" q4kMatmulRoute={mqw}" : "") + (sharedDotChainGroup is { } sdg ? $" attentionBatchDots={sdg}" : ""),
+            $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" + (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : "") + (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : "") + (stageProfile ? " stageProfile=on" : "") + (matmulRouteWidth is { } mw ? $" matmulRoute={mw}" : "") + (matmulRouteWidthQ4K is { } mqw ? $" q4kMatmulRoute={mqw}" : "") + (pairMatmulRouteWidth is { } pmw ? $" pairMatmulRoute={pmw}" : "") + (sharedDotChainGroup is { } sdg ? $" attentionBatchDots={sdg}" : ""),
             .. reportBody,
         ];
 

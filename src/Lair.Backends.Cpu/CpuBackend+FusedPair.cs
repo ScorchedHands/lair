@@ -324,7 +324,7 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
         return true;
     }
 
-    /// <summary>Fusion covers the scratch batch-dot formats only; every other posture returns false and the caller keeps its calls.</summary>
+    /// <summary>Fusion covers the scratch batch-dot formats only; every other posture returns false and the caller keeps its calls. A fused call that takes fusion may still choose its executor: with a stated pair crossover width (<see cref="CpuKernelTuning.PairMatmulRouteBatchWidth"/>, 0 at every resolved posture) each matrix's rows run through the blocked matmul tile executor instead of this file's staged-pair traversal, byte-identical either way.</summary>
     public bool TryGemvBatchSharedInput(ReadOnlySpan<float> inputs, int count, WeightRef weightA, Span<float> outputsA, WeightRef weightB, Span<float> outputsB)
     {
         ValidateFusableMatrix(weightA, nameof(weightA));
@@ -376,6 +376,15 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
         {
             int strideA = (int)weightA.Shape.RowStrideBytes(formatA);
             int strideB = (int)weightB.Shape.RowStrideBytes(formatB);
+
+            // A stated pair crossover hands each matrix's rows to the blocked matmul tile executor instead of this seam's staged-row traversal: where a fused pair re-reads its two staged rows once per chain group across every weight row, the tile executor amortizes one activation-vector load over a tile group's eight rows' chains. No resolved posture states a width here (see CpuKernelTuning), so an auto open runs exactly the traversal below. Each matrix takes that format's own tile walk — same ascending chunk order, FMA association, and scalar-tail cleanup as its batched-row kernel — so both sides land byte-identical to two independent GemvBatch calls at any thread count.
+            if (tuning.PairMatmulRouteBatchWidth is > 0 && count >= tuning.PairMatmulRouteBatchWidth && SupportsGemm(formatA) && SupportsGemm(formatB))
+            {
+                RunMatmulDispatch(bytesA, strideA, pIn, outA, rows, cols, count, formatA);
+                RunMatmulDispatch(bytesB, strideB, pIn, outB, rows, cols, count, formatB);
+
+                return true;
+            }
 
             // Same per-call participation sample as Gemv/GemvBatch: a quota applied on another thread takes effect from this kernel on.
             int workers = _effectiveThreads;
