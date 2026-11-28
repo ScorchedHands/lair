@@ -33,6 +33,7 @@ internal static class Q4KWideBatchBench
         int reps = 3;
         bool diagScratchG1 = false;
         bool integerDotArm = false;
+        List<int> integerChainGroups = []; // each stated group width adds its own integer arm beside the default one, so candidate widths share the same settle and rotation schedule as every other arm here.
         List<int> counts = [1, 8, 16, 32, 64];
         List<(int Rows, int Cols)> shapes = [(11_008, 2_048), (2_048, 11_008)]; // gate/up and down widths of Qwen2.5-3B hidden=2048, intermediate=11008
 
@@ -61,6 +62,33 @@ internal static class Q4KWideBatchBench
                     break;
                 case "--integer-dot":
                     integerDotArm = true; // adds the unpromoted integer-domain Q4_K dot arm: stated width 8 on an AVX2-only posture, measured beside the float routes with its divergence classified rather than asserted identical
+                    break;
+                case "--integer-chain-group":
+                    if (i + 1 >= args.Length)
+                    {
+                        Console.WriteLine("q4k-widebatch: option '--integer-chain-group' needs a value");
+                        return 1;
+                    }
+
+                    List<int> parsedGroups = [];
+                    foreach (string part in args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    {
+                        if (!int.TryParse(part, out int group) || group < 1 || group > Lair.Backends.Cpu.CpuKernelTuning.ChainGroupMax)
+                        {
+                            Console.WriteLine($"q4k-widebatch: invalid chain group '{part}' (expected 1..{Lair.Backends.Cpu.CpuKernelTuning.ChainGroupMax})");
+                            return 1;
+                        }
+
+                        parsedGroups.Add(group);
+                    }
+
+                    if (parsedGroups.Count == 0)
+                    {
+                        Console.WriteLine("q4k-widebatch: --integer-chain-group listed no widths");
+                        return 1;
+                    }
+
+                    integerChainGroups = [.. parsedGroups.Distinct().OrderBy(g => g)]; // each stated width becomes its own arm beside the default one, sharing this run's settle and rotation schedule.
                     break;
                 case "--shapes":
                     if (i + 1 >= args.Length)
@@ -150,10 +178,18 @@ internal static class Q4KWideBatchBench
                 ? new Lair.Backends.Cpu.CpuBackend(threads: threads, tuning: new Lair.Backends.Cpu.CpuKernelTuningOverrides { ChainGroup = 1 })
                 : null;
 
-            // The unpromoted integer-domain arm states the Q4_K batch width (8) on an AVX2-only posture so its ladder is forced deterministically even on hosts whose auto selection lands on vpdpbusd. Its outputs are expected to diverge from the float arms by activation-quantization loss, which this harness classifies rather than asserting identical.
-            using Lair.Backends.Cpu.CpuBackend? integerDot = integerDotArm
-                ? new Lair.Backends.Cpu.CpuBackend(threads: threads, cpuFeatures: new Lair.Backends.Cpu.CpuFeaturePosture(Avx2Available: true, AvxVnniAvailable: false), tuning: new Lair.Backends.Cpu.CpuKernelTuningOverrides { Q4KIntegerDotBatchWidth = 8 })
-                : null;
+            // The unpromoted integer-domain arm states the Q4_K batch width (8) on an AVX2-only posture so its ladder is forced deterministically even on hosts whose auto selection lands on vpdpbusd. Its outputs are expected to diverge from the float arms by activation-quantization loss, which this harness classifies rather than asserting identical. A stated chain group adds another integer arm beside it — same width, narrower shared-input grouping — so candidate widths land in one run's settle and rotation schedule instead of separate runs.
+            List<(string Name, Lair.Backends.Cpu.CpuBackend Backend)> integerArms = [];
+
+            if (integerDotArm)
+            {
+                integerArms.Add(("integer-dot", new Lair.Backends.Cpu.CpuBackend(threads: threads, cpuFeatures: new Lair.Backends.Cpu.CpuFeaturePosture(Avx2Available: true, AvxVnniAvailable: false), tuning: new Lair.Backends.Cpu.CpuKernelTuningOverrides { Q4KIntegerDotBatchWidth = 8 })));
+            }
+
+            foreach (int group in integerChainGroups)
+            {
+                integerArms.Add(($"integer-g{group}", new Lair.Backends.Cpu.CpuBackend(threads: threads, cpuFeatures: new Lair.Backends.Cpu.CpuFeaturePosture(Avx2Available: true, AvxVnniAvailable: false), tuning: new Lair.Backends.Cpu.CpuKernelTuningOverrides { Q4KIntegerDotBatchWidth = 8, ChainGroup = group })));
+            }
 
             // One arm list drives every phase below (parity, settle, rotated timing): arms are measured as a set, never one after another to completion.
             List<(string Name, Lair.Backends.Cpu.CpuBackend Backend)> arms = [("auto", autoRoute), ("streaming", streamingRoute), ("tile", tileRoute)];
@@ -163,11 +199,11 @@ internal static class Q4KWideBatchBench
                 arms.Add(("scratch-g1", scratchG1));
             }
 
-            int integerArmIndex = -1;
-            if (integerDot is not null)
+            List<int> integerArmIndices = [];
+            foreach ((string name, Lair.Backends.Cpu.CpuBackend backend) in integerArms)
             {
-                integerArmIndex = arms.Count;
-                arms.Add(("integer-dot", integerDot));
+                integerArmIndices.Add(arms.Count);
+                arms.Add((name, backend)); // an integer arm is just another member of the same measured set.
             }
 
             Console.WriteLine($"q4k-widebatch shape={rows}x{cols} stride_bytes={strideBytes} packed_mib={(weights.Length / (1024.0 * 1024.0)):F2} auto_tuning=[chain_group={autoRoute.ResolvedTuning.ChainGroup},max_scratch_cols={autoRoute.ResolvedTuning.MaxScratchCols}] streaming_tuning=[chain_group={streamingRoute.ResolvedTuning.ChainGroup},max_scratch_cols={streamingRoute.ResolvedTuning.MaxScratchCols}] tile_tuning=[matmul_route_batch_width_q4k={tileRoute.ResolvedTuning.MatmulRouteBatchWidthQ4K}]");
@@ -189,7 +225,7 @@ internal static class Q4KWideBatchBench
                 bool bitIdentical = true;
                 for (int i = 1; i < arms.Count; i++)
                 {
-                    if (i == integerArmIndex)
+                    if (integerArmIndices.Contains(i))
                     {
                         continue; // the integer arm quantizes its activations: divergence from the float arms is expected and classified below instead.
                     }
@@ -243,24 +279,31 @@ internal static class Q4KWideBatchBench
                 }
 
                 string divergenceNote = "";
-                if (integerArmIndex >= 0)
+                foreach (int armIndex in integerArmIndices)
                 {
                     double maxAbsDiff = 0;
                     int differing = 0;
-                    for (int i = 0; i < outs[integerArmIndex].Length; i++)
+                    for (int i = 0; i < outs[armIndex].Length; i++)
                     {
-                        if (BitConverter.SingleToUInt32Bits(outs[0][i]) != BitConverter.SingleToUInt32Bits(outs[integerArmIndex][i]))
+                        if (BitConverter.SingleToUInt32Bits(outs[0][i]) != BitConverter.SingleToUInt32Bits(outs[armIndex][i]))
                         {
                             differing++;
                         }
 
-                        maxAbsDiff = Math.Max(maxAbsDiff, Math.Abs((double)outs[integerArmIndex][i] - outs[0][i]));
+                        maxAbsDiff = Math.Max(maxAbsDiff, Math.Abs((double)outs[armIndex][i] - outs[0][i]));
                     }
 
-                    divergenceNote = $" integer_divergence=[differing_elements={differing}/{outs[integerArmIndex].Length},max_abs_diff={maxAbsDiff:E3}]"; // expected activation-quantization loss against the float arms, published not asserted.
+                    // expected activation-quantization loss against the float arms, published not asserted — each integer arm carries its own divergence record.
+                    string tokenName = arms[armIndex].Name == "integer-dot" ? "integer_divergence" : $"{arms[armIndex].Name}_divergence";
+                    divergenceNote += $" {tokenName}=[differing_elements={differing}/{outs[armIndex].Length},max_abs_diff={maxAbsDiff:E3}]";
                 }
 
                 Console.WriteLine($"q4k-widebatch shape={rows}x{cols} count={count} arms_bit_parity={(bitIdentical ? "bit_identical" : "MISMATCH")}{divergenceNote}");
+            }
+
+            foreach ((string name, Lair.Backends.Cpu.CpuBackend backend) in integerArms)
+            {
+                backend.Dispose(); // the shape's stated-width integer arms end here, on the same per-shape scope the float arms above already use.
             }
         }
 
@@ -343,6 +386,6 @@ internal static class Q4KWideBatchBench
 
     private static void Usage()
     {
-        Console.WriteLine("q4k-widebatch [--threads N=1] [--reps R=3] [--shapes rowsxcols,...=11008x2048,2048x11008] [--counts 1,8,16,32,64] [--diag-scratch-g1] [--integer-dot] (kernel-level attribution for the Q4_K batched dense dot: auto scratch route vs forced streaming fallback vs the unpromoted tile-executor arm (Q4_K crossover stated at 8; counts below it keep the batched-row walk), a chain-group-1 diagnostic, and optionally the unpromoted integer-domain AVX2 Q4_K dot pinned at width 8 on an AVX2-only posture — its divergence from the float arms is classified as expected activation-quantization loss instead of asserted identical; over synthetic pinned tensors at realistic feed-forward widths; arms share settle passes and rotated timing rounds like the committed Xeon runners, then publish per-count true med/min/max ms, ns/MAC, GFLOP/s and effective weight GB/s with a bit-parity guard between float arms; bench-only measurement seam - no posture or config change)");
+        Console.WriteLine("q4k-widebatch [--threads N=1] [--reps R=3] [--shapes rowsxcols,...=11008x2048,2048x11008] [--counts 1,8,16,32,64] [--diag-scratch-g1] [--integer-dot] [--integer-chain-group 2,4,8] (kernel-level attribution for the Q4_K batched dense dot: auto scratch route vs forced streaming fallback vs the unpromoted tile-executor arm (Q4_K crossover stated at 8; counts below it keep the batched-row walk), a chain-group-1 diagnostic, and optionally the unpromoted integer-domain AVX2 Q4_K dot pinned at width 8 on an AVX2-only posture — each listed --integer-chain-group value adds another integer arm beside it at that stated shared-input grouping, so candidate widths share one run's settle and rotation schedule; divergence from the float arms is classified as expected activation-quantization loss instead of asserted identical; over synthetic pinned tensors at realistic feed-forward widths; arms share settle passes and rotated timing rounds like the committed Xeon runners, then publish per-count true med/min/max ms, ns/MAC, GFLOP/s and effective weight GB/s with a bit-parity guard between float arms; bench-only measurement seam - no posture or config change)");
     }
 }

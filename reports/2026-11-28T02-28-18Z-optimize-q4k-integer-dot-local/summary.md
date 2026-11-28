@@ -21,3 +21,36 @@ Posture: dev box CPU lane, `q4k-widebatch` bench seam with the new pin `--intege
 
 ## Decision posture
 Landed-but-unpromoted internal seam only: `Q4KIntegerDotBatchWidth` auto-resolves to 0 at every posture, runs solely when a stated width is reached and the ISA oracle resolved AVX2 (VNNI/scalar keep float kernels bit-for-bit). No promotion claim; candidate B (chain-group amortization inside the integer variant) must land and separate locally before any `lair-lab` attribution run or parity classification question becomes real.
+
+## Mermaid charts for this directory’s raw log
+
+```mermaid
+xychart-beta
+    title "Gate/up Q4_K first-cut integer dot vs float routes"
+    x-axis [16, 32, 64]
+    y-axis "ns/MAC" 0 --> 0.025
+    line "integer-dot" [0.0238, 0.0213, 0.0204]
+    line "float tile" [0.0090, 0.0070, 0.0064]
+    line "float auto" [0.0072, 0.0058, 0.0057]
+```
+
+```mermaid
+xychart-beta
+    title "Down Q4_K first-cut integer dot vs float routes"
+    x-axis [16, 32, 64]
+    y-axis "ns/MAC" 0 --> 0.03
+    line "integer-dot" [0.0240, 0.0229, 0.0265]
+    line "float tile" [0.0092, 0.0078, 0.0070]
+    line "float auto" [0.0087, 0.0069, 0.0086]
+```
+
+```mermaid
+xychart-beta
+    title "Count-64 first-cut integer dot medians (lower better)"
+    x-axis ["auto", "tile", "integer-dot"]
+    y-axis "median ms" 0 --> 40
+    bar "gate/up 11008x2048" [8.192, 9.257, 29.410]
+    bar "down 2048x11008" [12.348, 10.050, 38.259]
+```
+
+Later candidate-B comparison with chain-group arms is in `reports/2026-11-28T03-50-04Z-optimize-q4k-integer-chain-groups-local/summary.md`.

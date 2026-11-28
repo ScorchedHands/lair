@@ -513,6 +513,16 @@ public sealed unsafe partial class CpuBackend : IBackend
             daRent = ArrayPool<float>.Shared.Rent(count * q8Blocks);
         }
 
+        // The integer executor's other shared table: one exact activation group sum per (batch vector, super-block, group) as
+        // an int16 lane value, built once for the whole call beside its Q8_K staging. Every row and worker reads identical
+        // values from it, so a chain-group pass costs integer MACs rather than re-summing each chain's groups inside every
+        // weight walk.
+        short[]? groupSumsRent = null;
+        if (q4KIntegerDot)
+        {
+            groupSumsRent = ArrayPool<short>.Shared.Rent(count * q8Blocks * Q4KGroups);
+        }
+
         // Same raw-pointer job contract as Gemv: pinned spans stay stable for the duration of the call and every
         // claimed block finishes before WorkerPool.Run returns. Rows are independent, so row partitioning stays
         // bit-identical; each batch vector is computed by its own accumulator chain exactly like a single GEMV.
@@ -521,10 +531,16 @@ public sealed unsafe partial class CpuBackend : IBackend
         fixed (float* pOut = outputs)
         fixed (byte* qa = qaRent)
         fixed (float* da = daRent)
+        fixed (short* groupSums = groupSumsRent)
         {
             if (stageQuantizedActivation)
             {
                 QuantizeActivationsToQ8K(pIn, count, cols, qa, da); // identical operands for the i-quant dots and for the integer Q4_K chains alike.
+            }
+
+            if (q4KIntegerDot)
+            {
+                StageQ4KIntegerGroupSums(qa, q8Blocks, count, groupSums); // each chain's exact activation group sums, staged once here instead of re-summed per row and worker.
             }
 
             Q8KKernelOptions opts = new(_integerDot, _grid, _prefetchWeights); // same resolved posture for every row and batch vector of the call
@@ -551,7 +567,7 @@ public sealed unsafe partial class CpuBackend : IBackend
                     }
                     else if (q4KIntegerDot)
                     {
-                        RowBatchDotQ4KInteger(pBytes + (long)row * stride, qa, da, q8Blocks, count, rows, tuning.ChainGroup, pOut + row); // the unpromoted integer executor over this call's staged activations.
+                        RowBatchDotQ4KInteger(pBytes + (long)row * stride, qa, da, groupSums, q8Blocks, count, rows, tuning.ChainGroup, pOut + row); // the unpromoted integer executor over this call's staged activations and shared group sums.
                     }
                     else
                     {
@@ -562,7 +578,7 @@ public sealed unsafe partial class CpuBackend : IBackend
             else
             {
                 WorkerPool pool = GetOrCreatePool();
-                pool.Run((rows + tuning.RowBlock - 1) / tuning.RowBlock, new BatchRowJob(pBytes, pIn, qa, da, usesQ8K ? 1 : 0, q8Blocks, pOut, stride, rows, cols, count, format, _useAvx2, opts, tuning, q4KIntegerDot ? 1 : 0));
+                pool.Run((rows + tuning.RowBlock - 1) / tuning.RowBlock, new BatchRowJob(pBytes, pIn, qa, da, groupSums, usesQ8K ? 1 : 0, q8Blocks, pOut, stride, rows, cols, count, format, _useAvx2, opts, tuning, q4KIntegerDot ? 1 : 0));
             }
         }
 
@@ -574,6 +590,11 @@ public sealed unsafe partial class CpuBackend : IBackend
         if (daRent is not null)
         {
             ArrayPool<float>.Shared.Return(daRent);
+        }
+
+        if (groupSumsRent is not null)
+        {
+            ArrayPool<short>.Shared.Return(groupSumsRent); // the table is this call's only extra buffer: rows and workers share it, never copy it.
         }
     }
 
@@ -1356,6 +1377,7 @@ public sealed unsafe partial class CpuBackend : IBackend
         private readonly float* _inputs;
         private readonly byte* _qa;
         private readonly float* _da;
+        private readonly short* _groupSums; // this call's shared per-chain activation group sums for the integer-domain Q4_K executor (null when no route uses them)
         private readonly int _q8k; // 1 when this format dots against the shared Q8_K activations instead of _inputs
         private readonly int _blocks; // Q8_K super-blocks per batch vector
         private readonly float* _out;
@@ -1371,12 +1393,13 @@ public sealed unsafe partial class CpuBackend : IBackend
         private readonly int _maxScratchCols;
         private readonly int _q4kInteger; // 1 when this call's rows run through the unpromoted integer-domain Q4_K executor over _qa/_da instead of any float batched-row kernel
 
-        public BatchRowJob(byte* bytes, float* inputs, byte* qa, float* da, int q8k, int blocks, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2, Q8KKernelOptions opts, CpuKernelTuning tuning, int q4kInteger)
+        public BatchRowJob(byte* bytes, float* inputs, byte* qa, float* da, short* groupSums, int q8k, int blocks, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2, Q8KKernelOptions opts, CpuKernelTuning tuning, int q4kInteger)
         {
             _bytes = bytes;
             _inputs = inputs;
             _qa = qa;
             _da = da;
+            _groupSums = groupSums; // built once for the whole call, so every worker's chains read identical table values.
             _q8k = q8k;
             _blocks = blocks;
             _out = outPtr;
@@ -1410,7 +1433,7 @@ public sealed unsafe partial class CpuBackend : IBackend
                 }
                 else if (_q4kInteger != 0)
                 {
-                    RowBatchDotQ4KInteger(rowBytes, _qa, _da, _blocks, _count, _rows, _chainGroup, _out + row); // the same staged operands every block's chains read: partition never moves a value.
+                    RowBatchDotQ4KInteger(rowBytes, _qa, _da, _groupSums, _blocks, _count, _rows, _chainGroup, _out + row); // the same staged operands and group sums every block's chains read: partition never moves a value.
                 }
                 else
                 {

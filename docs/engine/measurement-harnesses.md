@@ -23,6 +23,7 @@ The contract both families enforce: every performance claim names a committed ar
 | `prefill-profile` | windowed prefill throughput and stage breakdown | `--threads N --lengths <list> --widths <list> --kernel gemv,tiled,gemm --reps R (3) --per-token --stage-profile --matmul-route off\|on\|N --q4k-matmul-route off\|on\|N --pair-matmul-route off\|on\|N --attention-batch-dots off\|on\|N --out <path>` |
 | `kv-spike`, `kv-micro` | KV write/quantization micro-costs | owned by [kv-cache](kv-cache.md) semantics |
 | `q4-parity` | Q4-family logit comparison | — |
+| `q4k-widebatch` | synthetic wide-batch Q4_K dense-dot attribution (`Q4KWideBatchBench.cs`) | `--threads N --reps R (3) --shapes rowsxcols,... --counts 1..64`; float arms auto/streaming/tile plus optional internal integer-domain arms via `--integer-dot` and stated shared-input widths via `--integer-chain-group 1..8`, each adding an arm beside the default one in the same settle/rotation schedule; divergence from the float routes is classified rather than asserted identical — bench-side measurement seams onto internal tuning keys, no posture or config change |
 | `kv-quant` | quantized-KV decode throughput (`KvQuantDecodeBench.cs`) | — |
 | `mtp` | multi-token drafting seam latency (`MtpDraftBench.cs`) | seam measurement, not promoted serving |
 | `cuda-gemv`, `cuda-gemm`, `cuda-prefill`, `cuda-concurrency` | CUDA-side kernel and step measurements | refuse or report posture when no idle device is available; see lane gates below |

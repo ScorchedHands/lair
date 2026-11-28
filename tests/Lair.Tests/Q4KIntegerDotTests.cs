@@ -41,12 +41,15 @@ public sealed class Q4KIntegerDotTests
             float[] expected = new float[count * rows];
             reference.GemvBatch(inputs, count, weight, expected);
 
-            // Ragged chain grouping: a pinned group of 3 splits every batch into groups of 3 plus tails — same chains, same order.
-            using CpuBackend grouped = new(threads: 1, cpuFeatures: Avx2Only, tuning: new CpuKernelTuningOverrides { Q4KIntegerDotBatchWidth = 8, ChainGroup = 3 });
-            float[] actualGrouped = new float[count * rows];
-            grouped.GemvBatch(inputs, count, weight, actualGrouped);
+            // Ragged chain grouping: every stated group splits the batch into consecutive groups plus a tail — same chains, same order, identical bits whatever width walked them.
+            foreach (int group in new[] { 2, 5 })
+            {
+                using CpuBackend grouped = new(threads: 1, cpuFeatures: Avx2Only, tuning: new CpuKernelTuningOverrides { Q4KIntegerDotBatchWidth = 8, ChainGroup = group });
+                float[] actualGrouped = new float[count * rows];
+                grouped.GemvBatch(inputs, count, weight, actualGrouped);
 
-            BatchKernelTests.AssertBitsEqual(expected, actualGrouped, $"Q4_K integer dot at {rows}x{cols} count {count} under a ragged chain group");
+                BatchKernelTests.AssertBitsEqual(expected, actualGrouped, $"Q4_K integer dot at {rows}x{cols} count {count} under chain group {group}");
+            }
 
             // Threaded arm: forced tiny row blocks hand every row to a worker — the same per-row walks, partitioned.
             using CpuBackend threaded = new(threads: 8, cpuFeatures: Avx2Only, tuning: new CpuKernelTuningOverrides { Q4KIntegerDotBatchWidth = 8, RowBlock = 1, ParallelRowThreshold = 1 });
