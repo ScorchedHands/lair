@@ -142,6 +142,16 @@ The artifact's own interpretation column answers "separates beyond own spread: n
 
 **Status.** Unpromoted candidate, open by pin only (`--q4k-matmul-route off|on|N`). The committed re-pairs already measure it on the serving-class Xeon lane and none separates at window totals, so promotion stays blocked until a committed run puts a `total_ms` delta outside its own arm's spread — recorded as a decision, not left implicit.
 
+### 7b. Integer-domain Q4_K batched dot (same seam discipline)
+
+**Wall.** The pinned reference dots a Q4_K row against quantized activations entirely in integer lanes (`pmaddubsw`/`pmaddwd`) where LAIR's float kernels dequantize per element; the question is whether that shape amortizes better across chain groups for wide batches.
+
+**Technique.** `Q4KIntegerDotBatchWidth` states the seam: at a stated count **and only on an AVX2-resolved backend**, one Q4_K batch pass stages its activations through ordinary Q8_K blocks and dots nibbles against them in exact int32 lanes with a fixed per-block float fold (`src/Lair.Backends.Cpu/CpuBackend+Q4KIntegerDot.cs`). Outputs intentionally diverge from the float kernels by activation-quantization loss; what must hold bit-for-bit is the variant's own reproducibility across batch order, chain grouping, and worker count. Vnni or Scalar resolutions never run it whatever a seam states.
+
+**Measured effect.** `q4k-widebatch --integer-dot` times this arm beside the auto/streaming/tile float routes with divergence classified rather than asserted identical (`bench/Lair.Bench/Q4KWideBatchBench.cs`). Local dev-host attribution runs (threads 8, counts 8..64, both Qwen2.5-3B feed-forward shapes) show the integer arm losing to every measured float route at count ≥ 8 — but those logs are not committed artifacts on this branch, so no number from them is quotable as a claim here; promotion stays refused pending target-host validation like its sibling seam above.
+
+**Status.** Landed-but-unpromoted: measurable by pin (`Q4KIntegerDotBatchWidth` qualified key), never selected by any auto posture, and today slower than the float traversals on every measured local posture.
+
 ## 8. Ascending-walk bit identity: the invariant that makes every route swap safe
 
 **Wall.** Fusing, tiling, batching, and ISA switching all risk reordering accumulation — which would break golden parity against pinned llama.cpp b12032.

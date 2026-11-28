@@ -32,6 +32,7 @@ internal static class Q4KWideBatchBench
         int threads = 1; // single-threaded by default: this seam attributes per-kernel efficiency, not host scaling
         int reps = 3;
         bool diagScratchG1 = false;
+        bool integerDotArm = false;
         List<int> counts = [1, 8, 16, 32, 64];
         List<(int Rows, int Cols)> shapes = [(11_008, 2_048), (2_048, 11_008)]; // gate/up and down widths of Qwen2.5-3B hidden=2048, intermediate=11008
 
@@ -57,6 +58,9 @@ internal static class Q4KWideBatchBench
                     break;
                 case "--diag-scratch-g1":
                     diagScratchG1 = true; // adds the chain-group-1 scratch arm (stack-chain re-walk per batch vector) as a diagnostic third route
+                    break;
+                case "--integer-dot":
+                    integerDotArm = true; // adds the unpromoted integer-domain Q4_K dot arm: stated width 8 on an AVX2-only posture, measured beside the float routes with its divergence classified rather than asserted identical
                     break;
                 case "--shapes":
                     if (i + 1 >= args.Length)
@@ -146,12 +150,24 @@ internal static class Q4KWideBatchBench
                 ? new Lair.Backends.Cpu.CpuBackend(threads: threads, tuning: new Lair.Backends.Cpu.CpuKernelTuningOverrides { ChainGroup = 1 })
                 : null;
 
+            // The unpromoted integer-domain arm states the Q4_K batch width (8) on an AVX2-only posture so its ladder is forced deterministically even on hosts whose auto selection lands on vpdpbusd. Its outputs are expected to diverge from the float arms by activation-quantization loss, which this harness classifies rather than asserting identical.
+            using Lair.Backends.Cpu.CpuBackend? integerDot = integerDotArm
+                ? new Lair.Backends.Cpu.CpuBackend(threads: threads, cpuFeatures: new Lair.Backends.Cpu.CpuFeaturePosture(Avx2Available: true, AvxVnniAvailable: false), tuning: new Lair.Backends.Cpu.CpuKernelTuningOverrides { Q4KIntegerDotBatchWidth = 8 })
+                : null;
+
             // One arm list drives every phase below (parity, settle, rotated timing): arms are measured as a set, never one after another to completion.
             List<(string Name, Lair.Backends.Cpu.CpuBackend Backend)> arms = [("auto", autoRoute), ("streaming", streamingRoute), ("tile", tileRoute)];
 
             if (scratchG1 is not null)
             {
                 arms.Add(("scratch-g1", scratchG1));
+            }
+
+            int integerArmIndex = -1;
+            if (integerDot is not null)
+            {
+                integerArmIndex = arms.Count;
+                arms.Add(("integer-dot", integerDot));
             }
 
             Console.WriteLine($"q4k-widebatch shape={rows}x{cols} stride_bytes={strideBytes} packed_mib={(weights.Length / (1024.0 * 1024.0)):F2} auto_tuning=[chain_group={autoRoute.ResolvedTuning.ChainGroup},max_scratch_cols={autoRoute.ResolvedTuning.MaxScratchCols}] streaming_tuning=[chain_group={streamingRoute.ResolvedTuning.ChainGroup},max_scratch_cols={streamingRoute.ResolvedTuning.MaxScratchCols}] tile_tuning=[matmul_route_batch_width_q4k={tileRoute.ResolvedTuning.MatmulRouteBatchWidthQ4K}]");
@@ -173,6 +189,11 @@ internal static class Q4KWideBatchBench
                 bool bitIdentical = true;
                 for (int i = 1; i < arms.Count; i++)
                 {
+                    if (i == integerArmIndex)
+                    {
+                        continue; // the integer arm quantizes its activations: divergence from the float arms is expected and classified below instead.
+                    }
+
                     if (!BitsEqual(outs[0], outs[i]))
                     {
                         bitIdentical = false;
@@ -221,7 +242,25 @@ internal static class Q4KWideBatchBench
                     Console.WriteLine(StatsLine(rows, cols, count, threads, reps, weight.Bytes.Length, arms[i].Name, sorted));
                 }
 
-                Console.WriteLine($"q4k-widebatch shape={rows}x{cols} count={count} arms_bit_parity={(bitIdentical ? "bit_identical" : "MISMATCH")}");
+                string divergenceNote = "";
+                if (integerArmIndex >= 0)
+                {
+                    double maxAbsDiff = 0;
+                    int differing = 0;
+                    for (int i = 0; i < outs[integerArmIndex].Length; i++)
+                    {
+                        if (BitConverter.SingleToUInt32Bits(outs[0][i]) != BitConverter.SingleToUInt32Bits(outs[integerArmIndex][i]))
+                        {
+                            differing++;
+                        }
+
+                        maxAbsDiff = Math.Max(maxAbsDiff, Math.Abs((double)outs[integerArmIndex][i] - outs[0][i]));
+                    }
+
+                    divergenceNote = $" integer_divergence=[differing_elements={differing}/{outs[integerArmIndex].Length},max_abs_diff={maxAbsDiff:E3}]"; // expected activation-quantization loss against the float arms, published not asserted.
+                }
+
+                Console.WriteLine($"q4k-widebatch shape={rows}x{cols} count={count} arms_bit_parity={(bitIdentical ? "bit_identical" : "MISMATCH")}{divergenceNote}");
             }
         }
 
@@ -304,6 +343,6 @@ internal static class Q4KWideBatchBench
 
     private static void Usage()
     {
-        Console.WriteLine("q4k-widebatch [--threads N=1] [--reps R=3] [--shapes rowsxcols,...=11008x2048,2048x11008] [--counts 1,8,16,32,64] [--diag-scratch-g1] (kernel-level attribution for the Q4_K batched dense dot: auto scratch route vs forced streaming fallback vs the unpromoted tile-executor arm (Q4_K crossover stated at 8; counts below it keep the batched-row walk) and a chain-group-1 diagnostic over synthetic pinned tensors at realistic feed-forward widths; arms share settle passes and rotated timing rounds like the committed Xeon runners, then publish per-count true med/min/max ms, ns/MAC, GFLOP/s and effective weight GB/s with a bit-parity guard between arms; bench-only measurement seam - no posture or config change)");
+        Console.WriteLine("q4k-widebatch [--threads N=1] [--reps R=3] [--shapes rowsxcols,...=11008x2048,2048x11008] [--counts 1,8,16,32,64] [--diag-scratch-g1] [--integer-dot] (kernel-level attribution for the Q4_K batched dense dot: auto scratch route vs forced streaming fallback vs the unpromoted tile-executor arm (Q4_K crossover stated at 8; counts below it keep the batched-row walk), a chain-group-1 diagnostic, and optionally the unpromoted integer-domain AVX2 Q4_K dot pinned at width 8 on an AVX2-only posture — its divergence from the float arms is classified as expected activation-quantization loss instead of asserted identical; over synthetic pinned tensors at realistic feed-forward widths; arms share settle passes and rotated timing rounds like the committed Xeon runners, then publish per-count true med/min/max ms, ns/MAC, GFLOP/s and effective weight GB/s with a bit-parity guard between float arms; bench-only measurement seam - no posture or config change)");
     }
 }

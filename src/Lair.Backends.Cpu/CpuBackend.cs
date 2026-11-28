@@ -489,14 +489,25 @@ public sealed unsafe partial class CpuBackend : IBackend
         // activation staging below.
         bool q6KMatmulRoute = format == QuantFormat.Q6_K && _tuning.MatmulRouteBatchWidth > 0 && count >= _tuning.MatmulRouteBatchWidth;
         bool q4KMatmulRoute = format == QuantFormat.Q4_K && _tuning.MatmulRouteBatchWidthQ4K > 0 && count >= _tuning.MatmulRouteBatchWidthQ4K;
-        bool matmulRoute = q6KMatmulRoute || q4KMatmulRoute;
 
-        // Same shared quantized activation as Gemv: one Q8_K region per batch vector, built once for the whole call.
+        // The unpromoted integer-domain Q4_K executor: a stated width (never resolved from posture, see CpuKernelTuning) plus an
+        // ISA resolution that landed on the AVX2 rung claims this format's batched pass before any float traversal does. Staging
+        // is the same shared Q8_K activation region the sub-4-bit dots build — one quantized copy per batch vector, built once for
+        // the whole call so every row and worker sees identical operands — and stating it never reaches a fused pair or another format:
+        // those keep their traversals. When both this seam and a stated Q4_K tile crossover are pinned for the same pass, the integer
+        // executor claims it; the two statements are separate measurement seams over the same rows, not stacked routes.
+        bool q4KIntegerDot = Q4KIntegerDotSelected(format, count);
+
+        bool matmulRoute = (q6KMatmulRoute || q4KMatmulRoute) && !q4KIntegerDot; // a claimed integer executor is never also handed to the tile route.
+
+        // Same shared quantized activation as Gemv: one Q8_K region per batch vector, built once for the whole call — now also staged
+        // when the unpromoted integer dot claims the pass, whose chains read exactly these identical operands.
         bool usesQ8K = UsesQ8KActivation(format);
+        bool stageQuantizedActivation = usesQ8K || q4KIntegerDot;
         int q8Blocks = Q8KBlockCount(cols);
         byte[]? qaRent = null;
         float[]? daRent = null;
-        if (usesQ8K)
+        if (stageQuantizedActivation)
         {
             qaRent = ArrayPool<byte>.Shared.Rent(count * q8Blocks * QkK);
             daRent = ArrayPool<float>.Shared.Rent(count * q8Blocks);
@@ -511,9 +522,9 @@ public sealed unsafe partial class CpuBackend : IBackend
         fixed (byte* qa = qaRent)
         fixed (float* da = daRent)
         {
-            if (usesQ8K)
+            if (stageQuantizedActivation)
             {
-                QuantizeActivationsToQ8K(pIn, count, cols, qa, da);
+                QuantizeActivationsToQ8K(pIn, count, cols, qa, da); // identical operands for the i-quant dots and for the integer Q4_K chains alike.
             }
 
             Q8KKernelOptions opts = new(_integerDot, _grid, _prefetchWeights); // same resolved posture for every row and batch vector of the call
@@ -538,6 +549,10 @@ public sealed unsafe partial class CpuBackend : IBackend
                     {
                         RowBatchDotQ8K(pBytes + (long)row * stride, qa, da, q8Blocks, count, rows, format, opts, pOut + row);
                     }
+                    else if (q4KIntegerDot)
+                    {
+                        RowBatchDotQ4KInteger(pBytes + (long)row * stride, qa, da, q8Blocks, count, rows, tuning.ChainGroup, pOut + row); // the unpromoted integer executor over this call's staged activations.
+                    }
                     else
                     {
                         RowBatchDot(pBytes + (long)row * stride, pIn, count, rows, cols, format, _useAvx2, tuning.ChainGroup, tuning.MaxScratchCols, pOut + row);
@@ -547,7 +562,7 @@ public sealed unsafe partial class CpuBackend : IBackend
             else
             {
                 WorkerPool pool = GetOrCreatePool();
-                pool.Run((rows + tuning.RowBlock - 1) / tuning.RowBlock, new BatchRowJob(pBytes, pIn, qa, da, usesQ8K ? 1 : 0, q8Blocks, pOut, stride, rows, cols, count, format, _useAvx2, opts, tuning));
+                pool.Run((rows + tuning.RowBlock - 1) / tuning.RowBlock, new BatchRowJob(pBytes, pIn, qa, da, usesQ8K ? 1 : 0, q8Blocks, pOut, stride, rows, cols, count, format, _useAvx2, opts, tuning, q4KIntegerDot ? 1 : 0));
             }
         }
 
@@ -1354,8 +1369,9 @@ public sealed unsafe partial class CpuBackend : IBackend
         private readonly int _rowBlock; // captured from the dispatch snapshot so every claimed block uses the same width as Run's block count
         private readonly int _chainGroup; // scratch batch-dot grouping of the same snapshot, held across every row of this job
         private readonly int _maxScratchCols;
+        private readonly int _q4kInteger; // 1 when this call's rows run through the unpromoted integer-domain Q4_K executor over _qa/_da instead of any float batched-row kernel
 
-        public BatchRowJob(byte* bytes, float* inputs, byte* qa, float* da, int q8k, int blocks, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2, Q8KKernelOptions opts, CpuKernelTuning tuning)
+        public BatchRowJob(byte* bytes, float* inputs, byte* qa, float* da, int q8k, int blocks, float* outPtr, int stride, int rows, int cols, int count, QuantFormat format, bool avx2, Q8KKernelOptions opts, CpuKernelTuning tuning, int q4kInteger)
         {
             _bytes = bytes;
             _inputs = inputs;
@@ -1374,6 +1390,7 @@ public sealed unsafe partial class CpuBackend : IBackend
             _rowBlock = tuning.RowBlock;
             _chainGroup = tuning.ChainGroup;
             _maxScratchCols = tuning.MaxScratchCols;
+            _q4kInteger = q4kInteger; // captured from the same dispatch snapshot that claimed this job's rows.
         }
 
         public void ProcessBlock(int block)
@@ -1390,6 +1407,10 @@ public sealed unsafe partial class CpuBackend : IBackend
                 if (_q8k != 0)
                 {
                     RowBatchDotQ8K(rowBytes, _qa, _da, _blocks, _count, _rows, _format, _opts, _out + row);
+                }
+                else if (_q4kInteger != 0)
+                {
+                    RowBatchDotQ4KInteger(rowBytes, _qa, _da, _blocks, _count, _rows, _chainGroup, _out + row); // the same staged operands every block's chains read: partition never moves a value.
                 }
                 else
                 {

@@ -28,6 +28,9 @@ public sealed record CpuKernelTuningOverrides
     /// <summary>The crossover at which a shared-input fused pair hands each matrix's rows to the blocked matmul tile executor instead of its own scratch traversal (<see cref="MatmulRouteBatchWidthMin"/>..<see cref="MatmulRouteBatchWidthMax"/>, 0 keeps every fused pair on its measured traversal). No resolved posture states this: it is a measurement seam, not a promotion. Null leaves the pair route exactly as today.</summary>
     public int? PairMatmulRouteBatchWidth { get; init; }
 
+    /// <summary>The batch count at or above which an eligible Q4_K dense pass runs its rows through the integer-domain AVX2 executor (Q8_K-staged activations and pmaddubsw/pmaddwd chains) instead of today's float batched-row kernels (<see cref="MatmulRouteBatchWidthMin"/>..<see cref="MatmulRouteBatchWidthMax"/>) or null to resolve. No resolved posture states it: the variant is a measurement seam whose parity classification against pinned goldens decides promotion, and its integer executor only runs when this backend's ISA resolution landed on the AVX2 rung.</summary>
+    public int? Q4KIntegerDotBatchWidth { get; init; }
+
     /// <summary>Accumulator chains sharing one pass over a shared dot operand (<see cref="CpuKernelTuning.SharedInputDotChainGroupMin"/>..<see cref="CpuKernelTuning.SharedInputDotChainGroupMax"/>; 0 keeps every such dot individual) or null to resolve.</summary>
     public int? SharedInputDotChainGroup { get; init; }
 
@@ -123,6 +126,9 @@ public sealed record CpuKernelTuning
     /// <summary>The crossover at which a shared-input fused pair hands each matrix's rows to the blocked matmul tile executor instead of walking them through the pair scratch traversal (0 unless stated): no auto posture states it, because the pair route shares one activation walk across both matrices' chains today while the tile executor amortizes its activation loads across eight tile rows per chain group — which side pays at a given batch width is a target-host question an internal seam opens for measurement rather than something a posture decides. Whatever width a call runs at, each matrix's outputs keep that format's own ascending chunk walk, FMA association, and scalar-tail cleanup, so both traversals stay byte-identical.</summary>
     public required int PairMatmulRouteBatchWidth { get; init; }
 
+    /// <summary>The batch count at or above which a Q4_K dense pass takes the integer-domain AVX2 executor instead of today's float batched-row kernels (0 unless stated): no posture promotes it, because quantized activations lose precision against FP32 operands and promotion waits for parity classification against pinned goldens plus seam-and-window measurement. The variant keeps its own determinism contract — ascending super-block walks with fixed int32 chain order and a fixed per-block float fold sequence, batched = solo = threaded at any worker count — but it is a different executor over lossy operands rather than another traversal of the same values: parity against unpinned-class expectations stays an open question until measured. A stated width only takes effect when this backend's ISA resolution landed on the AVX2 rung; every other posture and every format outside Q4_K keeps its current kernels at any value here.</summary>
+    public required int Q4KIntegerDotBatchWidth { get; init; }
+
     /// <summary>Accumulator chains sharing one pass over a shared dot operand: how many consecutive inputs of a shared-operand dot batch keep their own accumulator chain beside the common vector's chunk (0 keeps every such dot individual). A batch wider than this is split into consecutive chunks of it.</summary>
     public required int SharedInputDotChainGroup { get; init; }
 
@@ -208,6 +214,12 @@ public sealed record CpuKernelTuning
             ? Validate(pinnedPairWidth, "engine.cpu.tuning.pair_matmul_route_batch_width", MatmulRouteBatchWidthMin, MatmulRouteBatchWidthMax, "a hybrid width above the batch ceiling never dispatches")
             : AutoPairMatmulRouteBatchWidth;
 
+        // The integer-domain Q4_K executor's own crossover, stated rather than resolved: no posture promotes a quantized-activation dot over FP32 operands without parity classification against pinned goldens first (the activation staging loses precision against them), and the kernel only runs when an opened backend's ISA resolution landed on the AVX2 rung — so at every auto posture this stays 0, and stating it through an internal seam makes the variant measurable while its outputs keep their own fixed-order determinism contract inside themselves. Whatever width a call states, chains advance in ascending super-block order with exact int32 lane totals folded per block; grouping only chooses how many chains share one nibble-unpack pass, so batched equals solo equals threaded at any value here.
+        const int AutoQ4KIntegerDotBatchWidth = 0; // no posture promotes it: Q4_K dense passes keep their float traversals until a seam plus window measurement and a parity classification separate the integer executor.
+        int q4kIntegerDotBatchWidth = overrides.Q4KIntegerDotBatchWidth is { } pinnedIntegerWidth
+            ? Validate(pinnedIntegerWidth, "engine.cpu.tuning.q4k_integer_dot_batch_width", MatmulRouteBatchWidthMin, MatmulRouteBatchWidthMax, "an integer-executor width above the batch ceiling never dispatches")
+            : AutoQ4KIntegerDotBatchWidth;
+
         // Shared-operand dot batching: at this chain-group width a shared-input dot call keeps that many inputs' accumulator chains live
         // beside one load of the common vector's chunk, where individual dots re-read the common operand once per input. The measured
         // crossover for reuse is again a full chain group; 0 without a vector posture, where every such dot stays scalar and re-reading
@@ -219,7 +231,7 @@ public sealed record CpuKernelTuning
             ? Validate(pinnedDotGroup, "engine.cpu.tuning.shared_input_dot_chain_group", SharedInputDotChainGroupMin, SharedInputDotChainGroupMax, "a shared-dot chain group wider than eight spills accumulators past the vector posture's register budget")
             : autoSharedInputDotChainGroup;
 
-        return new CpuKernelTuning { RowBlock = rowBlock, ParallelRowThreshold = parallelThreshold, ChainGroup = chainGroup, PairChainGroup = pairChainGroup, TripleChainGroup = tripleChainGroup, MaxScratchCols = maxScratchCols, MatmulRouteBatchWidth = matmulRouteBatchWidth, MatmulRouteBatchWidthQ4K = matmulRouteBatchWidthQ4K, PairMatmulRouteBatchWidth = pairMatmulRouteBatchWidth, SharedInputDotChainGroup = sharedInputDotChainGroup };
+        return new CpuKernelTuning { RowBlock = rowBlock, ParallelRowThreshold = parallelThreshold, ChainGroup = chainGroup, PairChainGroup = pairChainGroup, TripleChainGroup = tripleChainGroup, MaxScratchCols = maxScratchCols, MatmulRouteBatchWidth = matmulRouteBatchWidth, MatmulRouteBatchWidthQ4K = matmulRouteBatchWidthQ4K, PairMatmulRouteBatchWidth = pairMatmulRouteBatchWidth, Q4KIntegerDotBatchWidth = q4kIntegerDotBatchWidth, SharedInputDotChainGroup = sharedInputDotChainGroup };
     }
 
     private static int Validate(int value, string key, int min, int max, string rationale) =>

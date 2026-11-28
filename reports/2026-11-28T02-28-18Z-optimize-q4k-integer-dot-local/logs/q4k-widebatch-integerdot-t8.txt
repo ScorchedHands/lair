@@ -1,0 +1,43 @@
+q4k-widebatch threads=8 reps=5 avx2=yes shapes=11008x2048,2048x11008 counts=8,16,32,64
+q4k-widebatch shape=11008x2048 stride_bytes=1152 packed_mib=12.09 auto_tuning=[chain_group=8,max_scratch_cols=16384] streaming_tuning=[chain_group=8,max_scratch_cols=512] tile_tuning=[matmul_route_batch_width_q4k=8]
+q4k-widebatch shape=11008x2048 arm=auto count=8 threads=8 rounds=5 med_ms=25.481 min_ms=1.576 max_ms=26.543 ns_per_mac=0.1413 gflops=14.156 weight_gbs=0.498
+q4k-widebatch shape=11008x2048 arm=streaming count=8 threads=8 rounds=5 med_ms=5.236 min_ms=3.960 max_ms=5.665 ns_per_mac=0.0290 gflops=68.888 weight_gbs=2.422
+q4k-widebatch shape=11008x2048 arm=tile count=8 threads=8 rounds=5 med_ms=3.790 min_ms=2.419 max_ms=3.932 ns_per_mac=0.0210 gflops=95.167 weight_gbs=3.346
+q4k-widebatch shape=11008x2048 arm=integer-dot count=8 threads=8 rounds=5 med_ms=8.014 min_ms=6.329 max_ms=8.997 ns_per_mac=0.0444 gflops=45.008 weight_gbs=1.582
+q4k-widebatch shape=11008x2048 count=8 arms_bit_parity=bit_identical integer_divergence=[differing_elements=88063/88064,max_abs_diff=9.466E+000]
+q4k-widebatch shape=11008x2048 arm=auto count=16 threads=8 rounds=5 med_ms=2.585 min_ms=2.264 max_ms=3.034 ns_per_mac=0.0072 gflops=279.090 weight_gbs=4.906
+q4k-widebatch shape=11008x2048 arm=streaming count=16 threads=8 rounds=5 med_ms=7.121 min_ms=6.637 max_ms=8.059 ns_per_mac=0.0197 gflops=101.307 weight_gbs=1.781
+q4k-widebatch shape=11008x2048 arm=tile count=16 threads=8 rounds=5 med_ms=3.248 min_ms=2.847 max_ms=4.275 ns_per_mac=0.0090 gflops=222.133 weight_gbs=3.905
+q4k-widebatch shape=11008x2048 arm=integer-dot count=16 threads=8 rounds=5 med_ms=8.575 min_ms=7.542 max_ms=9.185 ns_per_mac=0.0238 gflops=84.130 weight_gbs=1.479
+q4k-widebatch shape=11008x2048 count=16 arms_bit_parity=bit_identical integer_divergence=[differing_elements=176127/176128,max_abs_diff=9.466E+000]
+q4k-widebatch shape=11008x2048 arm=auto count=32 threads=8 rounds=5 med_ms=4.155 min_ms=4.059 max_ms=5.116 ns_per_mac=0.0058 gflops=347.221 weight_gbs=3.052
+q4k-widebatch shape=11008x2048 arm=streaming count=32 threads=8 rounds=5 med_ms=14.565 min_ms=14.282 max_ms=15.106 ns_per_mac=0.0202 gflops=99.064 weight_gbs=0.871
+q4k-widebatch shape=11008x2048 arm=tile count=32 threads=8 rounds=5 med_ms=5.083 min_ms=4.710 max_ms=7.037 ns_per_mac=0.0070 gflops=283.851 weight_gbs=2.495
+q4k-widebatch shape=11008x2048 arm=integer-dot count=32 threads=8 rounds=5 med_ms=15.369 min_ms=14.566 max_ms=16.668 ns_per_mac=0.0213 gflops=93.881 weight_gbs=0.825
+q4k-widebatch shape=11008x2048 count=32 arms_bit_parity=bit_identical integer_divergence=[differing_elements=352254/352256,max_abs_diff=1.013E+001]
+q4k-widebatch shape=11008x2048 arm=auto count=64 threads=8 rounds=5 med_ms=8.192 min_ms=7.514 max_ms=8.775 ns_per_mac=0.0057 gflops=352.247 weight_gbs=1.548
+q4k-widebatch shape=11008x2048 arm=streaming count=64 threads=8 rounds=5 med_ms=34.783 min_ms=33.664 max_ms=36.269 ns_per_mac=0.0241 gflops=82.961 weight_gbs=0.365
+q4k-widebatch shape=11008x2048 arm=tile count=64 threads=8 rounds=5 med_ms=9.257 min_ms=8.199 max_ms=10.877 ns_per_mac=0.0064 gflops=311.736 weight_gbs=1.370
+q4k-widebatch shape=11008x2048 arm=integer-dot count=64 threads=8 rounds=5 med_ms=29.410 min_ms=28.578 max_ms=31.458 ns_per_mac=0.0204 gflops=98.120 weight_gbs=0.431
+q4k-widebatch shape=11008x2048 count=64 arms_bit_parity=bit_identical integer_divergence=[differing_elements=704509/704512,max_abs_diff=1.057E+001]
+q4k-widebatch shape=2048x11008 stride_bytes=6192 packed_mib=12.09 auto_tuning=[chain_group=8,max_scratch_cols=16384] streaming_tuning=[chain_group=8,max_scratch_cols=512] tile_tuning=[matmul_route_batch_width_q4k=8]
+q4k-widebatch shape=2048x11008 arm=auto count=8 threads=8 rounds=5 med_ms=1.531 min_ms=1.352 max_ms=2.209 ns_per_mac=0.0085 gflops=235.589 weight_gbs=8.282
+q4k-widebatch shape=2048x11008 arm=streaming count=8 threads=8 rounds=5 med_ms=4.244 min_ms=3.586 max_ms=4.894 ns_per_mac=0.0235 gflops=84.985 weight_gbs=2.988
+q4k-widebatch shape=2048x11008 arm=tile count=8 threads=8 rounds=5 med_ms=1.778 min_ms=1.732 max_ms=2.336 ns_per_mac=0.0099 gflops=202.863 weight_gbs=7.132
+q4k-widebatch shape=2048x11008 arm=integer-dot count=8 threads=8 rounds=5 med_ms=4.367 min_ms=4.019 max_ms=5.166 ns_per_mac=0.0242 gflops=82.592 weight_gbs=2.904
+q4k-widebatch shape=2048x11008 count=8 arms_bit_parity=bit_identical integer_divergence=[differing_elements=16384/16384,max_abs_diff=1.855E+001]
+q4k-widebatch shape=2048x11008 arm=auto count=16 threads=8 rounds=5 med_ms=3.139 min_ms=2.543 max_ms=3.458 ns_per_mac=0.0087 gflops=229.861 weight_gbs=4.041
+q4k-widebatch shape=2048x11008 arm=streaming count=16 threads=8 rounds=5 med_ms=8.105 min_ms=7.395 max_ms=8.263 ns_per_mac=0.0225 gflops=89.006 weight_gbs=1.565
+q4k-widebatch shape=2048x11008 arm=tile count=16 threads=8 rounds=5 med_ms=3.326 min_ms=3.092 max_ms=4.436 ns_per_mac=0.0092 gflops=216.884 weight_gbs=3.812
+q4k-widebatch shape=2048x11008 arm=integer-dot count=16 threads=8 rounds=5 med_ms=8.671 min_ms=8.327 max_ms=9.250 ns_per_mac=0.0240 gflops=83.198 weight_gbs=1.462
+q4k-widebatch shape=2048x11008 count=16 arms_bit_parity=bit_identical integer_divergence=[differing_elements=32768/32768,max_abs_diff=2.279E+001]
+q4k-widebatch shape=2048x11008 arm=auto count=32 threads=8 rounds=5 med_ms=4.996 min_ms=4.567 max_ms=5.330 ns_per_mac=0.0069 gflops=288.782 weight_gbs=2.538
+q4k-widebatch shape=2048x11008 arm=streaming count=32 threads=8 rounds=5 med_ms=16.747 min_ms=14.957 max_ms=17.757 ns_per_mac=0.0232 gflops=86.156 weight_gbs=0.757
+q4k-widebatch shape=2048x11008 arm=tile count=32 threads=8 rounds=5 med_ms=5.659 min_ms=4.955 max_ms=6.008 ns_per_mac=0.0078 gflops=254.986 weight_gbs=2.241
+q4k-widebatch shape=2048x11008 arm=integer-dot count=32 threads=8 rounds=5 med_ms=16.485 min_ms=16.285 max_ms=18.108 ns_per_mac=0.0229 gflops=87.524 weight_gbs=0.769
+q4k-widebatch shape=2048x11008 count=32 arms_bit_parity=bit_identical integer_divergence=[differing_elements=65536/65536,max_abs_diff=2.280E+001]
+q4k-widebatch shape=2048x11008 arm=auto count=64 threads=8 rounds=5 med_ms=12.348 min_ms=11.332 max_ms=13.431 ns_per_mac=0.0086 gflops=233.698 weight_gbs=1.027
+q4k-widebatch shape=2048x11008 arm=streaming count=64 threads=8 rounds=5 med_ms=34.888 min_ms=33.419 max_ms=55.188 ns_per_mac=0.0242 gflops=82.712 weight_gbs=0.363
+q4k-widebatch shape=2048x11008 arm=tile count=64 threads=8 rounds=5 med_ms=10.050 min_ms=9.902 max_ms=12.986 ns_per_mac=0.0070 gflops=287.127 weight_gbs=1.262
+q4k-widebatch shape=2048x11008 arm=integer-dot count=64 threads=8 rounds=5 med_ms=38.259 min_ms=33.640 max_ms=54.359 ns_per_mac=0.0265 gflops=75.425 weight_gbs=0.331
+q4k-widebatch shape=2048x11008 count=64 arms_bit_parity=bit_identical integer_divergence=[differing_elements=131071/131072,max_abs_diff=2.280E+001]
