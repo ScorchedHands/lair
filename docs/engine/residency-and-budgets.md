@@ -1,4 +1,4 @@
-Scope: This page covers how LAIR accounts capacity today — the compute-capacity ledger and the device (tier/resource) ledger, budget chains per model resource and what each tier actually backs in this build, weight arenas and mmap placement of model files, host posture detection with declared-override semantics, NUMA spread preferences, CPU worker placement on Linux physical cores with auto worker sizing, prefill-buffer row-width clamps, PLE row residency gating, and `budget_exhausted` refusal semantics. As of 2026-11-27 this reflects implemented behavior under `src/` only; planned placement capabilities are stated as refused vocabulary, never as working posture.
+Scope: This page covers how LAIR accounts capacity today — the compute-capacity ledger and the device (tier/resource) ledger, budget chains per model resource and what each tier actually backs in this build, weight arenas and mmap placement of model files, host posture detection with declared-override semantics, NUMA spread preferences, CPU worker placement on Linux physical cores with auto worker sizing, prefill-buffer row-width clamps, PLE row residency gating, and `budget_exhausted` refusal semantics. As of 2026-11-28 this reflects implemented behavior under `src/` only; planned placement capabilities are stated as refused vocabulary, never as working posture.
 
 # Capacity accounting: ledgers, budget chains, weight arenas, host posture
 
@@ -106,6 +106,32 @@ Views layered on that backing stay copies-free: `ExpertSlabWeightSource` exposes
 PLE rows map exactly the shard that owns them (`PleRowSource`, `src/Lair.Loader/PleRowSource.cs`): one whole-physical-shard mapping, touched row pages only, with prefetch hints naming ranges inside the view's own extent. Hot-row residency (`PleHotRowProvider`) admits copies parity-checked against their source spans before counting as resident; on Linux the hot arena is an anonymous `mmap(MAP_PRIVATE|MAP_ANONYMOUS)` range madvise'd `MADV_HUGEPAGE`, and on every other host it is plain committed aligned memory — **the requested backing reports as not applied rather than emulated**. Hits/misses are tallied so measured hit rates describe what actually ran.
 
 PLE residency ceilings gate whole rows, never guessed bytes: `PleResidencyGate` (`src/Lair.Models/PleResidencyGate.cs`) divides declared `ple.caps.dram_mb` against each table's own row stride (same ceiling division the provider applies at admission — "admission and budget gating can never disagree about how many rows fit"), and a selection the clamp cuts is reported as refused rather than silently narrowed.
+
+### Repacked resident Q4_K weight copies — measurement seam only
+
+A dense Q4_K matrix can be copied once into a resident repacked layout and read back through the AVX2 integer-dot kernel family, but this build keeps that behavior as an internal measurement seam rather than serving posture. The default forward never prepares or consults such a copy: `CpuKernelTuning.Q4KRepackedResidencyBatchWidth` resolves to 0 at every auto posture (`src/Lair.Backends.Cpu/CpuKernelTuning.cs`), and no engine open asks for residency preparation on its own.
+
+The gate arithmetic is owned by the same budget vocabulary as other weight claims: `Lair.Models/Q4KRepackedResidencyGate.cs` bounds resident rows against declared weights-budget ceilings using this build's Q4_K cost constants — packed Q4_K costs 144 bytes per super-block / row, while a resident repacked copy adds 272 bytes per 256-element super-block / row. `CpuBackend+Q4KRepackedResidency.cs` refuses instead of narrowing: an over-cap request names the matrix shape, packed total, added resident-copy total, both per-row costs, and the ceiling it compared; duplicate preparation for one source span also refuses rather than letting two resident copies claim the same bytes.
+
+| Path | Implemented behavior today | Refusal / fallback semantics |
+|---|---|---|
+| `Q4KRepackedResidencyGate.Compute(...)` | Divides declared weights-budget ceilings against repacked Q4_K row cost; no ceiling means no clamp, wrong resource chain refuses rather than borrowing another budget. | A zero-row or over-cap request answers with the gate's own arithmetic and never narrows to a smaller resident set. |
+| `CpuBackend.PrepareDenseQ4KResidency(...)` | Prepares one dense Q4_K copy on an AVX2 integer-dot backend under a caller-stated weights-budget cap in MB; registers admitted copies by source pointer/length so the ordinary batch route can find exactly that prepared matrix later. | Refuses non-dense shape, wrong format, byte-length mismatch, duplicate source span, VNNI/Scalar resolution, or over-cap budget before claiming resident bytes. `OutOfMemory` and overflow are reported as refusal facts by bench arms rather than retried with a smaller copy. |
+| `CpuBackend.EnableQ4KRepackedResidencyMeasurements(...)` | Enables ordinary dense batched Q4_K passes to consult already-prepared copies when the backend resolved to the AVX2 integer-dot rung, tuning width is at or above the call's count, and the source span matches a prepared residency. It allocates nothing itself. | Refuses on VNNI/Scalar backends naming that no resident AVX2 read path exists; otherwise unmatched/disabled passes fall through unchanged to today's float traversal. |
+| `CpuBackend.Dispose()` | Releases prepared Q4_K residencies before disposing the worker pool, so backend teardown does not leave repacked copies counted as live residency. | No silent fallback: disposed backends stop consulting source-keyed matrices and zero `_repackedResidencyBytes`. |
+
+```mermaid
+stateDiagram-v2
+    [*] --> DefaultFloatRoute: resolved Q4KRepackedResidencyBatchWidth = 0 / no engagement
+    DefaultFloatRoute --> PreparedCopy: PrepareDenseQ4KResidency admitted under weights cap on AVX2 rung
+    PreparedCopy --> RefusedOverCap: gate ceiling too small; no copy allocated
+    PreparedCopy --> DuplicateRefusal: same source span already has a residency
+    PreparedCopy --> ExplicitSeamReads: named-copy overload at or above stated width
+    PreparedCopy --> EngagedOrdinaryReads: EnableQ4KRepackedResidencyMeasurements on AVX2 rung
+    EngagedOrdinaryReads --> DefaultFloatRoute: no matching source span, count below stated width, or disabled engagement — ordinary pass falls through unchanged
+```
+
+Measurement harnesses may state the internal key and prepare copies for a profile (`q4k-widebatch --repacked-residency W[,…] --repacked-cap-mb auto|N`, `prefill-profile --repacked-residency off|on|N --repacked-cap-mb auto|N`); that is bench-side measurement, not accepted YAML config. The current local attribution verdict and promotion refusal are carried in [tricks-and-tweaks.md](tricks-and-tweaks.md) entry 7d; kernel participation details live in [cpu-kernels.md](cpu-kernels.md).
 
 ## Prefill-buffer clamps: ceilings that narrow work, not refuse it
 

@@ -1,0 +1,21 @@
+  Determining projects to restore...
+  All projects are up-to-date for restore.
+  Lair.Templating.Minja -> C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp7\src\Lair.Templating.Minja\bin\Debug\net10.0\Lair.Templating.Minja.dll
+  Lair.Contracts -> C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp7\src\Lair.Contracts\bin\Debug\net10.0\Lair.Contracts.dll
+  Lair.Backends.Cpu -> C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp7\src\Lair.Backends.Cpu\bin\Debug\net10.0\Lair.Backends.Cpu.dll
+  Lair.Backends.Cuda -> C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp7\src\Lair.Backends.Cuda\bin\Debug\net10.0\Lair.Backends.Cuda.dll
+  Lair.Sampling -> C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp7\src\Lair.Sampling\bin\Debug\net10.0\Lair.Sampling.dll
+  Lair.Loader -> C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp7\src\Lair.Loader\bin\Debug\net10.0\Lair.Loader.dll
+  Lair.Kv -> C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp7\src\Lair.Kv\bin\Debug\net10.0\Lair.Kv.dll
+  Lair.Tokenizer -> C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp7\src\Lair.Tokenizer\bin\Debug\net10.0\Lair.Tokenizer.dll
+  Lair.Models -> C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp7\src\Lair.Models\bin\Debug\net10.0\Lair.Models.dll
+  Lair.Bench -> C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp7\bench\Lair.Bench\bin\Debug\net10.0\Lair.Bench.dll
+  Lair.Http -> C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp7\src\Lair.Http\bin\Debug\net10.0\Lair.Http.dll
+  Lair.Host -> C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp7\src\Lair.Host\bin\Debug\net10.0\lair.dll
+  Lair.Tests -> C:\source\gitlab.scorchedhands.com\personal\LAIR\.agent-worktrees\mvp7\tests\Lair.Tests\bin\Debug\net10.0\Lair.Tests.dll
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:03.31

@@ -34,6 +34,9 @@ public sealed record CpuKernelTuningOverrides
     /// <summary>The batch count at or above which a threaded single-matrix dense batched dispatch hands each participant one contiguous range of canonical rows instead of letting workers claim scheduling blocks dynamically (<see cref="StaticRowPartitionMin"/>..<see cref="StaticRowPartitionMax"/>; 0 keeps today's dynamic claim loop everywhere) or null to resolve. No resolved posture states it: the static partition is a measurement seam, and stating it changes only which participant walks each independent row — never a kernel, an accumulator order, or a byte written.</summary>
     public int? StaticRowPartitionBatchWidth { get; init; }
 
+    /// <summary>The batch count at or above which a repacked resident Q4_K read is allowed to run (<see cref="MatmulRouteBatchWidthMin"/>..<see cref="MatmulRouteBatchWidthMax"/>) or null to resolve. No resolved posture states it, and no engine open prepares the residency this crossover reads: it gates an explicit internal seam only (see <c>CpuBackend+Q4KRepackedResidency.cs</c>), where a call naming its prepared copy refuses when this width is unstated or below its batch count.</summary>
+    public int? Q4KRepackedResidencyBatchWidth { get; init; }
+
     /// <summary>A stated static-partition width below one batch vector would claim the single-vector decode path too, which this seam deliberately leaves alone. 0 keeps every dispatch on today's dynamic claim loop.</summary>
     public const int StaticRowPartitionMin = 0;
 
@@ -144,6 +147,9 @@ public sealed record CpuKernelTuning
     /// <summary>The crossover at which a threaded single-matrix dense batched dispatch (the batched-row route or the blocked-matmul tile route) replaces dynamic block claiming with one contiguous canonical row range per participant — llama-style <c>[p*rows/T, (p+1)*rows/T)</c> resolved from the call's own worker count and scheduling-block width (0 unless stated): no posture promotes it, because static ranges trade the claim loop's load-stealing for a schedule with zero hand-off jitter, and which side pays at a given thread quota is exactly what the seam exists to measure. Whatever width a call states, every row keeps its own independent walk, so batched equals solo equals threaded byte-for-byte across any partition this value selects; single-vector GEMV decode, fused pair/triple traversals, shared-operand dot batching, and an unthreaded dispatch never consult it.</summary>
     public required int StaticRowPartitionBatchWidth { get; init; }
 
+    /// <summary>The batch count at or above which an explicit repacked resident Q4_K read may run (0 unless stated): no posture promotes it, because nothing in this build's engine opens a resident copy — the crossover exists so a measurement seam that does state one can also state when its reads engage, and an unstated width refuses the seam rather than letting prepared bytes change what any pass runs.</summary>
+    public required int Q4KRepackedResidencyBatchWidth { get; init; }
+
     /// <summary>
     /// Resolves one backend's tuning from its effective worker count and vector posture, applying explicit overrides field by field.
     /// Auto defaults:
@@ -164,6 +170,7 @@ public sealed record CpuKernelTuning
     /// - Pair matmul route batch width = 0 at every posture: the fused pair traversal already shares one activation walk across both matrices' chains and no measurement separates it from two tile dispatches yet, so handing a fused pair's rows to the tile executor is something an internal seam states explicitly (for measurement) rather than something a posture decides.
     /// - Shared-input dot chain group = <see cref="ChainGroupMax"/> with a vector posture and 0 without one: how many consecutive inputs of a shared-operand dot batch keep their own accumulator chain beside one load of the common operand's chunk; 0 keeps every such dot individual, where no batched chain kernel runs.
     /// - Static row partition batch width = 0 at every posture, vector or not: threaded dense dispatches keep today's dynamic block claiming until an internal seam states a crossover for measurement. A stated width only decides which participant walks each independent contiguous range of canonical rows, so outputs stay byte-identical whatever it resolves to.
+    /// - Repacked resident Q4_K read width = 0 at every posture, vector or not: no posture prepares a resident copy and no dense forward asks for one, so the crossover gates an explicit internal seam only (see CpuBackend+Q4KRepackedResidency.cs). A stated value never reaches any float route.
     /// An override outside its accepted range fails the open naming the qualified key, its value, and the accepted span — never clamped silently.
     /// </summary>
     internal static CpuKernelTuning Resolve(int effectiveWorkerCount, bool vectorPosture, CpuKernelTuningOverrides overrides)
@@ -256,7 +263,16 @@ public sealed record CpuKernelTuning
             ? Validate(pinnedPartitionWidth, "engine.cpu.tuning.static_row_partition_batch_width", CpuKernelTuningOverrides.StaticRowPartitionMin, CpuKernelTuningOverrides.StaticRowPartitionMax, "a static-partition width above the batch ceiling never dispatches")
             : AutoStaticRowPartitionBatchWidth;
 
-        return new CpuKernelTuning { RowBlock = rowBlock, ParallelRowThreshold = parallelThreshold, ChainGroup = chainGroup, PairChainGroup = pairChainGroup, TripleChainGroup = tripleChainGroup, MaxScratchCols = maxScratchCols, MatmulRouteBatchWidth = matmulRouteBatchWidth, MatmulRouteBatchWidthQ4K = matmulRouteBatchWidthQ4K, PairMatmulRouteBatchWidth = pairMatmulRouteBatchWidth, Q4KIntegerDotBatchWidth = q4kIntegerDotBatchWidth, SharedInputDotChainGroup = sharedInputDotChainGroup, StaticRowPartitionBatchWidth = staticRowPartitionBatchWidth };
+        // The repacked resident Q4_K read's own crossover, stated rather than resolved: no posture opens a resident copy and nothing in any dense
+        // forward asks for one, so this stays 0 at every auto posture; an internal seam that prepared a matrix under a budget gate states the width
+        // beside it to say which batch counts may read the copy back. Whatever value lands here only gates explicit seam calls — no float route, no
+        // unprepared pass, and no engine open consults it, so every production traversal stays byte-identical whatever this resolves to.
+        const int AutoQ4KRepackedResidencyBatchWidth = 0; // no posture states a width: the residency seam engages only where an internal call both prepared a copy and stated its crossover.
+        int q4kRepackedResidencyBatchWidth = overrides.Q4KRepackedResidencyBatchWidth is { } pinnedRepinnedWidth
+            ? Validate(pinnedRepinnedWidth, "engine.cpu.tuning.q4k_repacked_residency_batch_width", MatmulRouteBatchWidthMin, MatmulRouteBatchWidthMax, "a residency-read width above the batch ceiling never dispatches")
+            : AutoQ4KRepackedResidencyBatchWidth;
+
+        return new CpuKernelTuning { RowBlock = rowBlock, ParallelRowThreshold = parallelThreshold, ChainGroup = chainGroup, PairChainGroup = pairChainGroup, TripleChainGroup = tripleChainGroup, MaxScratchCols = maxScratchCols, MatmulRouteBatchWidth = matmulRouteBatchWidth, MatmulRouteBatchWidthQ4K = matmulRouteBatchWidthQ4K, PairMatmulRouteBatchWidth = pairMatmulRouteBatchWidth, Q4KIntegerDotBatchWidth = q4kIntegerDotBatchWidth, SharedInputDotChainGroup = sharedInputDotChainGroup, StaticRowPartitionBatchWidth = staticRowPartitionBatchWidth, Q4KRepackedResidencyBatchWidth = q4kRepackedResidencyBatchWidth };
     }
 
     private static int Validate(int value, string key, int min, int max, string rationale) =>

@@ -1,0 +1,7 @@
+{
+  "os": "Microsoft Windows 11 Pro",
+  "logicalProcessors": 32,
+  "totalPhysicalMemoryGB": 63.7,
+  "dotnetVersion": "10.0.403",
+  "cpu": "13th Gen Intel(R) Core(TM) i9-13900K"
+}

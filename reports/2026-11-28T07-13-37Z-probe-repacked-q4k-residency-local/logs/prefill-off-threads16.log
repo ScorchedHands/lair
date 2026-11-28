@@ -1,0 +1,14 @@
+prefill-profile file=C:\source\gitlab.scorchedhands.com\personal\LAIR\models\qwen2.5-3b-instruct-q4_k_m.gguf bytes=2104932768 threads=16 maxBatchSequences=16
+  arch=qwen2 layers=36 hidden=2048 heads=16 kvHeads=2 headDim=128 vocab=151936 windowedLayers=0 avx2=True
+  traversalBytes=1668685824 outputHeadBytes=255252480 kvBlocks=72 blockTokens=16 reps=3 perToken=off lengths=256,1024 stageProfile=on
+  prefill-profile repacked_residency engagement=off stated_width=0 resolved_width=0 cap_mb=auto admitted_matrices=0 refused_matrices=0 resident_backend_bytes=0
+  weightFit=532.27 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=3.14
+  attentionFit=25.254 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 1331
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+         256             8        5088.9         50.31        4258.2         830.7          -0.0          3.14
+        1024            32       30285.9         33.81       17032.6       13253.2          -0.0          3.14
+  prefill-profile stage window=window kernel=gemv rowWidth=32 length=256 forwardCalls=3 seed_ms=0.886 cache_append_ms=0.100 attention_ms=4836.198 attention_weight_ms=1834.514 attention_projection_ms=960.129 attention_output_ms=874.385 attention_kernel_ms=2615.172 kv_write_ms=6.058 feed_forward_ms=10547.393 feed_forward_weight_ms=9297.589 feed_forward_gate_up_ms=4624.456 feed_forward_down_ms=4673.133 sparse_chain_ms=0.000 logits_head_ms=53.353 total_ms=15438.530 top_layers=0:476.167,30:458.827,32:456.472
+  prefill-profile stage window=window kernel=gemv rowWidth=32 length=1024 forwardCalls=3 seed_ms=3.468 cache_append_ms=0.232 attention_ms=48096.073 attention_weight_ms=7655.975 attention_projection_ms=3982.126 attention_output_ms=3673.850 attention_kernel_ms=39011.939 kv_write_ms=25.869 feed_forward_ms=43346.118 feed_forward_weight_ms=38350.219 feed_forward_gate_up_ms=19212.729 feed_forward_down_ms=19137.490 sparse_chain_ms=0.000 logits_head_ms=56.865 total_ms=91505.331 top_layers=17:2685.094,10:2667.345,0:2663.233
+  peakWorkingSetMb=2028.9

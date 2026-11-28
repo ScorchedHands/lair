@@ -484,6 +484,13 @@ public sealed unsafe partial class CpuBackend : IBackend
                 nameof(outputs));
         }
 
+        // The engine-open measurement seam only: a disabled or unmatched backend falls through to its resolved traversal unchanged. When it does
+        // engage, the explicit repacked overload re-checks matrix identity and its own refusal semantics before any float route can run.
+        if (TryRunQ4KMeasurementResidency(inputs, count, w, outputs))
+        {
+            return;
+        }
+
         int stride = (int)strideBytes;
         QuantFormat format = w.Format;
 
@@ -1256,6 +1263,7 @@ public sealed unsafe partial class CpuBackend : IBackend
 
     public void Dispose()
     {
+        DisposeQ4KMeasurementResidency(); // every repacked copy prepared through this backend ends with it, including engine-open measurement arms.
         _pool?.Dispose();
         _pool = null;
     }

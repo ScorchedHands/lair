@@ -889,7 +889,7 @@ static int BenchPrefillProfile(string[] args)
 {
     if (args.Length < 2)
     {
-        Console.WriteLine("usage: prefill-profile <gguf path> [--threads N] [--lengths 16,32,...] [--widths 16,32,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--stage-profile] [--matmul-route off|on|N] [--q4k-matmul-route off|on|N] [--pair-matmul-route off|on|N] [--attention-batch-dots off|on|N] [--out <path>]");
+        Console.WriteLine("usage: prefill-profile <gguf path> [--threads N] [--lengths 16,32,...] [--widths 16,32,...] [--kernel gemv,tiled,gemm] [--reps R] [--per-token] [--stage-profile] [--matmul-route off|on|N] [--q4k-matmul-route off|on|N] [--pair-matmul-route off|on|N] [--attention-batch-dots off|on|N] [--static-row-partition off|on|N] [--repacked-residency off|on|N] [--repacked-cap-mb auto|N] [--out <path>]");
         return 1;
     }
 
@@ -902,6 +902,8 @@ static int BenchPrefillProfile(string[] args)
     int? pairMatmulRouteWidth = null; // --pair-matmul-route off|on|N states the fused-pair crossover into that same tile executor, which no resolved posture states either; absent keeps every fused pair on its staged traversal
     int? sharedDotChainGroup = null; // --attention-batch-dots off|on|N pins how many score-dot accumulator chains share one pass over a shared K operand; absent keeps the posture-resolved default
     int? staticRowPartitionWidth = null; // --static-row-partition off|on|N states the unpromoted contiguous per-participant row-range crossover for threaded dense dispatches, which no resolved posture promotes on its own; absent keeps every threaded pass on dynamic block claiming
+    int? repackedResidencyWidth = null; // --repacked-residency off|on|N states the engine-open Q4_K resident-read crossover. Stating it opens a bench-side measurement arm and pins this profile's backend to the AVX2 integer-dot rung so the candidate posture is comparable across off/on runs; absent leaves every pass on its resolved traversal unchanged.
+    long repackedCapMegabytes = 0; // --repacked-cap-mb auto|N: zero states per-tensor exact-fit rounded-up caps for admitted copies; a stated value applies that ceiling to each dense Q4_K profile weight and prints refusal lines instead of narrowing anything.
     string? outPath = null;
     List<int> lengths = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048];
     List<int>? rowWidths = null; // the resolved-row-count axis: one candidate engine per listed width; absent keeps the single default engine
@@ -1135,6 +1137,51 @@ static int BenchPrefillProfile(string[] args)
                 }
 
                 break;
+            case "--repacked-residency":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--repacked-residency' needs a value");
+                    return 1;
+                }
+
+                string residencyValue = args[++i];
+                repackedResidencyWidth = residencyValue switch
+                {
+                    "off" => 0, // measurement mode is opened but no engine-open read engages: every dense Q4_K pass keeps its resolved traversal.
+                    "on" => 8, // the crossover existing kernel measurements compare at, stated explicitly for this seam.
+                    _ => int.TryParse(residencyValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out int pinnedResidencyWidth) ? pinnedResidencyWidth : -1,
+                };
+
+                if (repackedResidencyWidth < 0 || repackedResidencyWidth > CpuKernelTuning.MatmulRouteBatchWidthMax)
+                {
+                    Console.WriteLine($"prefill-profile: --repacked-residency '{residencyValue}' must be off, on, or a batch width 0..{CpuKernelTuning.MatmulRouteBatchWidthMax}");
+                    return 1;
+                }
+
+                break;
+            case "--repacked-cap-mb":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--repacked-cap-mb' needs a value");
+                    return 1;
+                }
+
+                string capValue = args[++i];
+                if (string.Equals(capValue, "auto", StringComparison.OrdinalIgnoreCase))
+                {
+                    repackedCapMegabytes = 0; // per-tensor exact-fit rounded up: the default engine-open arm set measures admitted copies rather than gate refusals.
+                }
+                else if (!long.TryParse(capValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out long parsedCap) || parsedCap < 0)
+                {
+                    Console.WriteLine($"prefill-profile: invalid --repacked-cap-mb '{capValue}' (expected auto or a non-negative megabyte count)");
+                    return 1;
+                }
+                else
+                {
+                    repackedCapMegabytes = parsedCap;
+                }
+
+                break;
             case "--out":
                 if (i + 1 >= args.Length)
                 {
@@ -1173,14 +1220,26 @@ static int BenchPrefillProfile(string[] args)
         ? null // nothing stated: every knob resolves from the opened posture, exactly as an engine open would.
         : new CpuKernelTuningOverrides { MatmulRouteBatchWidth = matmulRouteWidth, MatmulRouteBatchWidthQ4K = matmulRouteWidthQ4K, PairMatmulRouteBatchWidth = pairMatmulRouteWidth, SharedInputDotChainGroup = sharedDotChainGroup, StaticRowPartitionBatchWidth = staticRowPartitionWidth };
 
-    using GgufFile gguf = GgufFile.Open(args[1]);
-    using CpuBackend backend = new(
-        threads: threads,
-        allowAvx2: true,
-        tuning: pinnedTuning);
+    if (repackedResidencyWidth is { } statedRepackedWidth)
+    {
+        pinnedTuning = (pinnedTuning ?? new CpuKernelTuningOverrides()) with { Q4KRepackedResidencyBatchWidth = statedRepackedWidth };
+    }
 
-    // Each candidate engine owns and releases its own mmap view of the file: a shared source would be released by whichever
-    // candidate disposes first while later candidates still read tensors through it.
+    using GgufFile gguf = GgufFile.Open(args[1]);
+    // A stated engine-open repacked arm pins the whole profile backend to the AVX2 integer-dot rung this resident read is built for; omitting --repacked-residency keeps today's auto feature posture. The off value still opens a comparable measurement process (same forced ISA and weight-source seam) without preparing or engaging any copy, so an off/on pair differs only in residency engagement/cap facts.
+    using CpuBackend backend = repackedResidencyWidth is null
+        ? new(threads: threads, allowAvx2: true, tuning: pinnedTuning)
+        : new(threads: threads, allowAvx2: true, cpuFeatures: new Lair.Backends.Cpu.CpuFeaturePosture(Avx2Available: true, AvxVnniAvailable: false), tuning: pinnedTuning);
+
+    using GgufMmapWeightSource? measurementWeights = repackedResidencyWidth is null ? null : new(gguf); // when stated, the profile's models read this bench-owned mapping instead of opening their own mmap per candidate; backend disposal releases any prepared resident copies at method exit.
+    List<string> repackedMeasurementLines = [];
+
+    if (repackedResidencyWidth is { } prepStatedWidth && measurementWeights is GgufMmapWeightSource weights)
+    {
+        repackedMeasurementLines.AddRange(PreparePrefillProfileRepackedResidency(gguf, weights, backend, prepStatedWidth, repackedCapMegabytes));
+    }
+
+    // Without a stated engine-open arm each candidate opens its own mmap view through TransformerModel.Open; with one, this bench-owned source stays alive for the whole profile and every candidate reads tensors from that same mapping. The backend owns any prepared resident copies it admits and releases them at method exit after peak-working-set reporting.
     int maxLength = lengths[^1];
 
     // Geometry every candidate shares over one file: pool sizing and the header line come from the resolved plan so no measurement depends on whichever engine happens to be open. Candidate engines differ only in their resolved prefill row count.
@@ -1239,7 +1298,12 @@ static int BenchPrefillProfile(string[] args)
         }
     }
 
-    List<string> reportBody = []; // summary and table lines of every candidate, for --out; blank separators are console-only
+    List<string> reportBody = [.. repackedMeasurementLines]; // stated engine-open facts precede candidate tables; omitted measurements leave the original shape unchanged.
+    foreach (string measurementLine in repackedMeasurementLines)
+    {
+        Console.WriteLine(measurementLine);
+    }
+
     PrefillKernel? sectionedKernel = null; // a kernel header is printed once per kernel section when the axis was requested
     foreach ((PrefillKernel kernel, int requested) in candidateEngines)
     {
@@ -1253,7 +1317,17 @@ static int BenchPrefillProfile(string[] args)
             sectionedKernel = kernel;
         }
 
-        TransformerModel? opened = OpenCandidate(gguf, backend, maxLength, kernel, requested, out string? refusalReason);
+        TransformerModel? opened;
+        string? refusalReason;
+
+        if (measurementWeights is GgufMmapWeightSource profileWeights)
+        {
+            opened = OpenMeasurementCandidate(gguf, profileWeights, backend, maxLength, kernel, requested, out refusalReason);
+        }
+        else
+        {
+            opened = OpenCandidate(gguf, backend, maxLength, kernel, requested, out refusalReason);
+        }
         if (opened is null)
         {
             string refusalLine = $"  kernel={kernelName} status=refused reason={refusalReason}";
@@ -1577,8 +1651,92 @@ static TransformerModel? OpenCandidate(GgufFile gguf, CpuBackend backend, int ma
     }
 }
 
+// Opens one engine through the alternate-weight-source seam so a stated repacked arm can read tensors from the same mapping its resident copies were prepared from. A kernel this file cannot run still comes back null with the engine's own refusal reason, never as some fallback route.
+static TransformerModel? OpenMeasurementCandidate(GgufFile gguf, GgufMmapWeightSource weights, CpuBackend backend, int maxContextTokens, PrefillKernel kernel, int rowWidth, out string? refusalReason)
+{
+    try
+    {
+        refusalReason = null;
+        return TransformerModel.Open(gguf, weights, backend, maxContextTokens, kernel, rowWidth);
+    }
+    catch (ModelException failure)
+    {
+        refusalReason = CollapseWhitespace(failure.Message);
+        return null;
+    }
+}
+
 // A refusal arrives as one long sentence; collapsing its whitespace keeps it on a single report line without rewording it.
 static string CollapseWhitespace(string text) => string.Join(' ', text.Split(" \t\r\n", StringSplitOptions.RemoveEmptyEntries));
+
+// Prepares the engine-open repacked Q4_K arm for prefill-profile only: every dense profile weight this build already counts as attention/MLP/output-head traversal is offered to the backend's budget gate, admitted copies stay resident until the profile backend disposes, and refused tensors print their own refusal line rather than narrowing anything.
+static List<string> PreparePrefillProfileRepackedResidency(GgufFile gguf, GgufMmapWeightSource weights, CpuBackend backend, int width, long capMegabytes)
+{
+    const long MiB = 1024L * 1024;
+
+    if (width == 0)
+    {
+        return [
+            $"  prefill-profile repacked_residency engagement=off stated_width=0 resolved_width={backend.ResolvedTuning.Q4KRepackedResidencyBatchWidth} cap_mb={(capMegabytes == 0 ? "auto" : capMegabytes.ToString(CultureInfo.InvariantCulture))} admitted_matrices=0 refused_matrices=0 resident_backend_bytes=0",
+        ];
+    }
+
+    int admitted = 0;
+    int refused = 0;
+    List<string> refusalLines = [];
+
+    foreach (LogicalTensor tensor in gguf.Tensors.Tensors)
+    {
+        if (tensor.Format != QuantFormat.Q4_K || tensor.Shape.Dims.Length < 2 || tensor.Shape.Dims[0] <= 0 || tensor.Shape.Dims[^1] <= 0)
+        {
+            continue; // only dense matrix rows have a repacked Q4_K layout to read back.
+        }
+
+        if (!IsAttentionOrMlp(tensor.Name) && !tensor.Name.Contains("output.weight", StringComparison.Ordinal) && !tensor.Name.Contains("lm_head", StringComparison.Ordinal))
+        {
+            continue; // this profile counts attention/MLP/output-head traversal bytes as the dense weight passes that stage profiles report.
+        }
+
+        int rows = tensor.Shape.Dims[0];
+        int cols = tensor.Shape.Dims[^1];
+        long requiredRepackedBytes = (long)rows * Q4KResidencyLayout.RepackedRowBytes(cols);
+        long tensorCapMegabytes = capMegabytes == 0 ? (requiredRepackedBytes + MiB - 1L) / MiB : capMegabytes;
+
+        try
+        {
+            backend.PrepareDenseQ4KResidency(new WeightRef(weights.Resolve(tensor), tensor.Shape, QuantFormat.Q4_K), tensorCapMegabytes);
+            admitted++;
+        }
+        catch (Exception error) when (error is Q4KRepackedResidencyException or OutOfMemoryException || error is OverflowException)
+        {
+            refused++; // the gate's own refusal text carries packed bytes, repacked bytes, per-row costs, and the ceiling it compared.
+            refusalLines.Add($"  prefill-profile tensor={tensor.Name} status=refused cap_mb={tensorCapMegabytes.ToString(CultureInfo.InvariantCulture)} reason={CollapseWhitespace(error.Message)}");
+        }
+    }
+
+    string? engagementReason = null;
+
+    try
+    {
+        backend.EnableQ4KRepackedResidencyMeasurements(capMegabytes);
+    }
+    catch (Exception error) when (error is Q4KRepackedResidencyException or InvalidOperationException || error is ArgumentOutOfRangeException)
+    {
+        engagementReason = CollapseWhitespace(error.Message);
+    }
+
+    List<string> lines = [
+        $"  prefill-profile repacked_residency engagement={(engagementReason is null ? "on" : "refused")} stated_width={width} resolved_width={backend.ResolvedTuning.Q4KRepackedResidencyBatchWidth} cap_mb={(capMegabytes == 0 ? "auto" : capMegabytes.ToString(CultureInfo.InvariantCulture))} admitted_matrices={admitted} refused_matrices={refused} resident_backend_bytes={backend.PreparedQ4KResidencyBytes}",
+    ];
+
+    if (engagementReason is not null)
+    {
+        lines.Add($"  prefill-profile repacked_residency engagement_refusal reason={engagementReason}");
+    }
+
+    return [.. lines, .. refusalLines];
+}
+
 
 static int ParseOption(string value, int fallback) => int.TryParse(value, out int parsed) ? parsed : fallback;
 

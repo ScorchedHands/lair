@@ -1,0 +1,13 @@
+q4k-widebatch threads=1 reps=3 avx2=yes shapes=5000x256 counts=8,64
+q4k-widebatch shape=5000x256 stride_bytes=144 packed_mib=0.69 auto_tuning=[chain_group=8,max_scratch_cols=16384] streaming_tuning=[chain_group=8,max_scratch_cols=512] tile_tuning=[matmul_route_batch_width_q4k=8]
+q4k-widebatch shape=5000x256 arm=repacked-w8_refusal=[cap_mb=1,message=repacked Q4_K residency refused: format Q4_K dense matrix 5000x256 costs 720000 packed bytes (144-byte super-blocks, 144 per row) and its resident copy adds 1360000 bytes (272 per 256-element super-block, 272 per row), above the stated 'weights.caps.dram_mb' ceiling of 1 megabytes (1048576 bytes) — no repacked rows are admitted and nothing falls back to a narrower copy.]
+q4k-widebatch shape=5000x256 arm=auto count=8 threads=1 rounds=3 med_ms=5.694 min_ms=5.088 max_ms=16.003 stddev_ms=6.1342 band_pct=191.68 ns_per_mac=0.5561 gflops=3.597 weight_gbs=0.126
+q4k-widebatch shape=5000x256 arm=streaming count=8 threads=1 rounds=3 med_ms=13.189 min_ms=8.449 max_ms=16.360 stddev_ms=3.9814 band_pct=59.98 ns_per_mac=1.2880 gflops=1.553 weight_gbs=0.055
+q4k-widebatch shape=5000x256 arm=tile count=8 threads=1 rounds=3 med_ms=2.214 min_ms=1.724 max_ms=4.610 stddev_ms=1.5446 band_pct=130.39 ns_per_mac=0.2162 gflops=9.251 weight_gbs=0.325
+q4k-widebatch shape=5000x256 arm=integer-dot count=8 threads=1 rounds=3 med_ms=1.876 min_ms=1.853 max_ms=2.870 stddev_ms=0.5804 band_pct=54.20 ns_per_mac=0.1832 gflops=10.915 weight_gbs=0.384
+q4k-widebatch shape=5000x256 count=8 arms_bit_parity=bit_identical integer_divergence=[differing_elements=39999/40000,max_abs_diff=3.209E+000]
+q4k-widebatch shape=5000x256 arm=auto count=64 threads=1 rounds=3 med_ms=2.379 min_ms=2.340 max_ms=21.380 stddev_ms=10.9815 band_pct=800.31 ns_per_mac=0.0290 gflops=68.866 weight_gbs=0.303
+q4k-widebatch shape=5000x256 arm=streaming count=64 threads=1 rounds=3 med_ms=3.417 min_ms=2.549 max_ms=4.675 stddev_ms=1.0690 band_pct=62.22 ns_per_mac=0.0417 gflops=47.947 weight_gbs=0.211
+q4k-widebatch shape=5000x256 arm=tile count=64 threads=1 rounds=3 med_ms=4.131 min_ms=3.818 max_ms=4.806 stddev_ms=0.5049 band_pct=23.92 ns_per_mac=0.0504 gflops=39.658 weight_gbs=0.174
+q4k-widebatch shape=5000x256 arm=integer-dot count=64 threads=1 rounds=3 med_ms=10.615 min_ms=7.972 max_ms=12.061 stddev_ms=2.0733 band_pct=38.52 ns_per_mac=0.1296 gflops=15.435 weight_gbs=0.068
+q4k-widebatch shape=5000x256 count=64 arms_bit_parity=bit_identical integer_divergence=[differing_elements=319998/320000,max_abs_diff=4.580E+000]

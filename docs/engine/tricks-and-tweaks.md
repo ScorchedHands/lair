@@ -171,6 +171,47 @@ The artifact's own interpretation column answers "separates beyond own spread: n
 
 **Status.** Landed-but-unpromoted: resolvable only by pin (`--static-row-partition off|on|N` in `prefill-profile`, `--static-partition W[,…]` in `q4k-widebatch`), auto 0 everywhere, and behind dynamic claiming at every posture measured so far. Closed as a null candidate after local + Xeon attribution; the static schedule does not earn promotion even where it tightens pathological low-count bands.
 
+### 7d. Budget-gated repacked Q4_K residency (measurement seam)
+
+**Wall.** Synthetic wide-batch attribution showed a resident repacked Q4_K read can beat the unpromoted integer-dot arm in some cells and occasionally sit near `auto`/`tile`, but real model forwards also pay activation staging, duplicate-copy bytes, and many small dense passes. The question is whether budgeted residency buys stage-level prefill cost rather than just isolated kernel throughput.
+
+**Technique.** `Q4KRepackedResidencyBatchWidth` (`src/Lair.Backends.Cpu/CpuKernelTuning.cs`) resolves to 0 at every posture; no public YAML key states it, and no engine open prepares a resident copy by default. Preparation is explicit: `CpuBackend.PrepareDenseQ4KResidency(...)` admits one dense Q4_K matrix on an AVX2 integer-dot backend under a caller-stated weights-budget cap in MB, using the same budget arithmetic as `src/Lair.Models/Q4KRepackedResidencyGate.cs` (144 packed bytes per super-block/row versus 272 resident repacked bytes per 256-element super-block/row). Over-cap requests refuse with both cost totals and the ceiling; duplicate source spans also refuse. Measurement engagement is separate: `EnableQ4KRepackedResidencyMeasurements(...)` only permits ordinary dense batched Q4_K passes to consult already-prepared copies, keyed by `(source pointer, length)` in `_q4kResidencyBySource`. The hook runs after input/output validation and before the normal stride/route selection; if no prepared copy matches or engagement is disabled, today's float traversal continues unchanged. `CpuBackend.Dispose()` releases residency before pool disposal. Bench pins force comparable AVX2 posture for stated off/on arms (`prefill-profile --repacked-residency off\|on\|N`) and can print per-tensor refusal facts instead of narrowing copies (`--repacked-cap-mb auto\|N`).
+
+**Measured effect.** Local dev-host attribution `reports/2026-11-28T07-13-37Z-probe-repacked-q4k-residency-local/` (Windows 11 / i9-13900K, .NET Release bench, AVX2-only synthetic backends for residency arms) shows mixed kernel-level results:
+
+| Threads | Shape / count | Best float med | Repacked-w8 med (band) | Reading |
+|---:|---|---:|---:|---|
+| 8 | `11008x2048` @32 | auto 4.246 ms (27.58%) | 5.426 ms (21.59%) | slower than float routes |
+| 8 | `11008x2048` @64 | auto 7.467 ms (12.43%) | 7.536 ms (8.84%) | near tie, inside noise |
+| 8 | `2048x11008` @32 | auto 4.517 ms (17.23%) | 4.974 ms (19.96%) | slower than float routes |
+| 8 | `2048x11008` @64 | tile 8.660 ms (15.08%) | 9.118 ms (9.32%) | slower than tile, faster than auto/integer |
+| 16 | `11008x2048` @32 | tile 3.859 ms (25.73%) | 6.224 ms (45.42%) | clear regression |
+| 16 | `11008x2048` @64 | auto 5.908 ms (19.74%) / tile 6.126 ms (11.71%) | 5.589 ms (15.03%) | candidate win, but wide band |
+| 16 | `2048x11008` @32 | tile 3.486 ms (18.47%) | 3.649 ms (17.80%) | near tie / slight regression |
+| 16 | `2048x11008` @64 | tile 5.850 ms (6.04%) | 7.039 ms (15.88%) | slower than tile, faster than auto/integer |
+
+Full-model stage totals tell the promotion story more clearly: fixture `qwen2.5-3b-instruct-q4_k_m.gguf` on this dev host, kernel `gemv`, resolved row width 32, lengths 256 and 1024, reps=3 with `--stage-profile`; stated repacked arms prepare 216 dense Q4_K profile matrices totaling 2,506,752,000 resident bytes.
+
+| Threads | Length | off total_ms | on total_ms | Δ |
+|---:|---:|---:|---:|---:|
+| 8 | 256 | 14,872.3 | 21,799.9 | +46.6% |
+| 8 | 1024 | 94,514.9 | 122,811.2 | +29.9% |
+| 16 | 256 | 15,438.5 | 16,480.7 | +6.7% |
+| 16 | 1024 | 91,505.3 | 92,715.5 | +1.3% |
+
+```mermaid
+xychart-beta
+  title "Repacked residency stage totals vs off (Qwen2.5-3B Q4_K_M dev host)"
+  x-axis ["t8@256", "t8@1024", "t16@256", "t16@1024"]
+  y-axis "total_ms" 0 --> 130000
+  bar [14872.3,94514.9,15438.5,91505.3]
+  line [21799.9,122811.2,16480.7,92715.5]
+```
+
+The table is authoritative if a renderer lacks `xychart-beta`. Peak working set rises from about 2.03 GB in the off arms to about 4.41 GB in the on arms because prepared repacked Q4_K matrices remain backend-owned while the model forward reads them. At threads=8, stage substages regress together (`feed_forward_down` +40.9% at length 256 and +21.9% at 1024; `attention_output` +39.0%/+20.5%). At threads=16 the result is mixed: only `feed_forward_down` @1024 improves slightly (−4.3%), while window total still moves worse by +1.3%.
+
+**Status.** Landed-but-unpromoted measurement seam, locally null/regressive and not quotable as a promotion win. Auto posture remains 0 everywhere, Parity goldens remain untouched because default traversal never engages the resident route, and any future reopening needs target-host interleaved stage-profile attribution that separates a window or substage delta from its own noise band before promotion language can be written.
+
 ## 8. Ascending-walk bit identity: the invariant that makes every route swap safe
 
 **Wall.** Fusing, tiling, batching, and ISA switching all risk reordering accumulation — which would break golden parity against pinned llama.cpp b12032.
