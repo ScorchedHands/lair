@@ -1,0 +1,54 @@
+{
+  "schema": "lair.report.v1",
+  "runId": "2026-11-28T08-59-17Z-probe-repacked-q4k-residency-xeon-t8-phys8-interleaved-l1024",
+  "posture": {
+    "hostProfile": "lair-lab",
+    "worktreeCommit": "47efa42f7a289fe5fc61b45448c74d558a6f71fe",
+    "modelFile": "/root/lair-measurements/qwen25-small-cpu/models/qwen2.5-3b-instruct-q4_k_m.gguf",
+    "threads": 8,
+    "pinning": "taskset -c 0-15 node0 physical cores",
+    "kernel": "gemv",
+    "rowWidth": 64,
+    "lengths": [1024],
+    "repsPerInvocation": 3,
+    "stageProfile": true,
+    "roundOrder": ["off-r1", "on-r1", "off-r2", "on-r2", "off-r3", "on-r3"]
+  },
+  "arms": {
+    "off": {
+      "engagement": {"stated_width":0,"resolved_width":0,"cap_mb":"auto","admitted_matrices":0,"refused_matrices":0,"resident_backend_bytes":0},
+      "rounds": [
+        {"round":1,"total_ms":329326.589,"attention_output_ms":21755.742,"feed_forward_down_ms":95172.725,"peakWorkingSetMb":2167.0},
+        {"round":2,"total_ms":332519.291,"attention_output_ms":21669.566,"feed_forward_down_ms":94382.510,"peakWorkingSetMb":2166.0},
+        {"round":3,"total_ms":333092.161,"attention_output_ms":21426.875,"feed_forward_down_ms":99113.415,"peakWorkingSetMb":2168.5}
+      ]
+    },
+    "on": {
+      "engagement": {"stated_width":8,"resolved_width":8,"cap_mb":"auto","admitted_matrices":216,"refused_matrices":0,"resident_backend_bytes":2506752000},
+      "rounds": [
+        {"round":1,"total_ms":321310.293,"attention_output_ms":16606.176,"feed_forward_down_ms":92096.118,"peakWorkingSetMb":4558.1},
+        {"round":2,"total_ms":315852.759,"attention_output_ms":15672.752,"feed_forward_down_ms":89180.257,"peakWorkingSetMb":4559.5},
+        {"round":3,"total_ms":306701.575,"attention_output_ms":15729.268,"feed_forward_down_ms":79026.911,"peakWorkingSetMb":4558.8}
+      ]
+    }
+  },
+  "mediansLowerBetter": {
+    "off": {"total_ms":332519.291,"attention_output_ms":21669.566,"feed_forward_down_ms":95172.725},
+    "on": {"total_ms":315852.759,"attention_output_ms":15729.268,"feed_forward_down_ms":89180.257}
+  },
+  "rangesLowerBetterSortedAscending": {
+    "off": {"total_ms":[329326.589,332519.291,333092.161],"attention_output_ms":[21426.875,21669.566,21755.742],"feed_forward_down_ms":[94382.510,95172.725,99113.415]},
+    "on": {"total_ms":[306701.575,315852.759,321310.293],"attention_output_ms":[15672.752,15729.268,16606.176],"feed_forward_down_ms":[79026.911,89180.257,92096.118]}
+  },
+  "deltaPctMediansLowerBetter": {
+    "total_ms":-5.01,
+    "attention_output_ms":-27.41,
+    "feed_forward_down_ms":-6.30
+  },
+  "memory": {
+    "offPeakWorkingSetMbRange":[2166.0,2167.0,2168.5],
+    "onPeakWorkingSetMbRange":[4558.1,4558.8,4559.5],
+    "residentBackendBytes":2506752000,
+    "admittedMatrices":216
+  }
+}
