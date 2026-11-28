@@ -53,4 +53,30 @@ If that report directory is missing, first complete the saved continuation bench
 - Row-width probe (`...T10-05-02Z-optimize-prefill-rowwidth-xeon`): width 32→64 buys only −10…+70%, per-pass bandwidth halves, amortization plateaus at ~5 rows/pass (t8) to ~24 (t32). Candidate B confirmed: kernel chain grouping caps effective rows-per-traversal far below stated width; FF gate_up 29–34% + down 19–26% of the window.
 - Remote leftovers deliberately kept: aborted chained-session attempt left nothing behind; worker scratch `/root/lair-tools/sweep.*` and `run_arms*.sh`, `analyze.py`, `CHECKSUMS.curated.remote.txt` inside the rowwidth report dir on host remain (nothing deleted). Raw logs of the three sweep dirs stay on host only — local copies are headline extracts with sha256 pointers in each `commands.md`.
 - New bench seam `q4k-widebatch` (settle passes + rotated arms + true median + inter-arm bit parity): locally the auto Q4_K scratch route hits ~9.07 GB/s weight bandwidth / 32 GFLOP/thread at counts ≥8, i.e. the same kernels that imply ≤1.3 GB/s on `lair-lab` — so the target-host deficit is host-specific efficiency, not kernel quality. Column-block staging candidate (`WidebatchColBlockQ4K`) measured 2–6× slower locally and was reverted (src/tests/bench clean; gates 479/479).
-- Next: pinned vs unpinned `q4k-widebatch` attribution on `lair-lab` (`taskset -c 0-15`, threads 8), then decide between affinity/residency work (Linux `sched_setaffinity` is still a documented no-op gap in `ThreadAffinity.ApplyCoreSet`) and further kernel restructuring. Engine auto worker count on Linux currently falls back to logical CPU count (`CpuBackend.cs` `AutoWorkerCount`) — noted as fact, not yet changed.
+- Next: pinned vs unpinned `q4k-widebatch` attribution on `lair-lab` (`taskset -c 0-15`, threads 8), then decide between affinity/residency work (Linux `sched_setaffinity` is still a documented no-op gap in `ThreadAffinity.ApplyCoreSet`) and further kernel restructuring. Engine auto worker count on Linux previously fell back to logical CPU count (`CpuBackend.cs` `AutoWorkerCount`) — since fixed by `1dcb354 feat(cpu)` (sysfs physical-core detection + node-local placement), though the alternating-build validation showed no window-level win from worker-only affinity; whole-process posture test still queued.
+
+## llama.cpp idea ledger for LAIR CPU prefill (2026-11-28)
+
+Reference of record is **tag b12032** (`git show b12032:ggml/src/ggml-cpu/...`) — the binary measured on `lair-lab`. The local clone working tree (`C:\source\github.com\llama.cpp`, HEAD ≈ `b12819-7-g8e23278c7`) is newer and must not be cited for claims about benchmarked behavior.
+
+Grounded llama facts:
+- AVX2 Q4_K×Q8_K dot = integer MACs: AND/SRL nibble unpack, `_mm256_maddubs_epi16` × 2 then `_mm256_madd_epi16(scale, p16)` per 32-byte pair, int32 `sumi`, exactly one float FMA per 64 elements (`arch/x86/quants.c:2173-2195`); min/dmin folded through precomputed `bsums` via `_mm_madd_epi16` (`:2163-2166`).
+- vpdpbusd exists only under AVX512VNNI/AVX-VNNI guards (`arch/x86/quants.c:106-113`, `repack.cpp:151-155`) — E5 v4 cannot run it; an earlier "llama uses dpbusd here" claim was wrong and corrected.
+- b12032 ships `ggml/src/ggml-cpu/repack.cpp` + `tiled/tiled-kernel.cpp`, but x86 repack variants lean AVX512F/VNNI → Broadwell falls back to the plain integer vec_dot path.
+
+Grounded LAIR facts:
+- Q4_K dot converts weights to float and FMAs per 8 lanes (`src/Lair.Backends.Cpu/CpuBackend+Q4_K.cs:101`, `:232`); batched pass reloads activation vectors from memory inside the weight-row loop (`CpuBackend.cs:169`).
+- LAIR already stages shared Q8_K activations and carries chain groups (auto 8) + a tile executor; measured effective rows-per-traversal is only ~5–6 at t8 despite rowWidth 64.
+- Seam evidence: local kernels reach ~9 GB/s weight bandwidth vs ≤1.3 implied on `lair-lab` → host-specific uop/clock deficit, not generic kernel quality.
+
+Ranked candidates (each needs `/plan-refine`, then gates in order: `q4k-widebatch` seam separation → window totals → parity):
+- **A. Integer-domain AVX2 Q4_K dot** mirroring llama's instruction shape; biggest expected lever on Broadwell-class hosts.
+- **B. Chaining on top of that shape**: unpack once per weight row and feed up to 8 activation accumulators — strictly better than llama's one-pair-per-`vec_dot` for wide prefill batches if the register budget survives (int accumulators are cheaper than float chains).
+- **C. Budget-gated repacked residency**: LAIR ledgers/tier budgets hold repacked int8/int16 weight copies only where caps allow; llama pays that memory unconditionally and gates its x86 repack off this host's ISA. Speed bought per budget with explicit refusal semantics.
+- Cheap side item: static contiguous row partitioning (llama-style OpenMP chunking) to attack the 84% auto-arm dispersion at threads=32 without touching kernels.
+
+Explicitly out: attention-kernel borrowing (crossover shows FF weight traversal dominates until length ≥616), any AVX512VNNI/AMX copy, wholesale ggml graph machinery port, and treating posture work as the main line (+7…14% against a ~6× per-thread gap).
+
+Open parity question blocking A (recorded in PLAN): integer maddubs/madd accumulation vs DN-M313-2 one-numerics-path + pinned b12032 goldens. Options: documented second numerics path for quantized dense dots; golden regeneration scoped to those paths from b12032 outputs; or keep bit-identity absolute and accept the float cost. My recommended default (owner confirmation needed at `/plan-refine MVP7`): adopt the integer path with shape-scoped golden regeneration — the pinned reference is llama.cpp itself, so matching its arithmetic should strengthen parity culture rather than weaken it, provided every other format keeps the existing contract untouched.
+
+Bookkeeping ideas not yet done: a comparison ledger section in `docs/engine/comparisons.md` pairing each b12032 mechanism with LAIR's seam + measured status (citing tag source and committed report dirs); harness for old-vs-new build alternation already exists (`scripts/run-xeon-alternating-build-ab.py`).
