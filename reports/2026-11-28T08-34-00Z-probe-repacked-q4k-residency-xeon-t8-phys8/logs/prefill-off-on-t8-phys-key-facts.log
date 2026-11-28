@@ -1,0 +1,23 @@
+OFF_REPACKED_RESIDENCY
+prefill-profile repacked_residency engagement=off stated_width=0 resolved_width=0 cap_mb=auto admitted_matrices=0 refused_matrices=0 resident_backend_bytes=0
+weightFit=3786.72 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.44
+attentionFit=245.367 us per position pair
+crossover: fitted attention term >= fitted weight term at length >= 497
+length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+128             2        9599.2         13.33        7573.4        2025.7          -0.0          0.44
+256             4       23218.5         11.03       15146.9        8071.6          -0.0          0.44
+stage window=window kernel=gemv rowWidth=64 length=128 forwardCalls=3 seed_ms=1.001 cache_append_ms=0.060 attention_ms=6345.046 attention_weight_ms=5074.111 attention_projection_ms=2645.121 attention_output_ms=2428.990 attention_kernel_ms=1029.640 kv_write_ms=4.900 feed_forward_ms=25159.613 feed_forward_weight_ms=24123.440 feed_forward_gate_up_ms=13021.332 feed_forward_down_ms=11102.108 sparse_chain_ms=0.000 logits_head_ms=318.432 total_ms=31824.327 top_layers=35:970.361,34:941.119,33:937.793
+stage window=window kernel=gemv rowWidth=64 length=256 forwardCalls=3 seed_ms=1.778 cache_append_ms=0.087 attention_ms=15905.493 attention_weight_ms=11183.166 attention_projection_ms=5766.760 attention_output_ms=5416.406 attention_kernel_ms=4218.898 kv_write_ms=13.104 feed_forward_ms=55504.271 feed_forward_weight_ms=53347.563 feed_forward_gate_up_ms=28667.214 feed_forward_down_ms=24680.349 sparse_chain_ms=0.000 logits_head_ms=314.829 total_ms=71726.801 top_layers=33:2037.004,34:2032.039,21:2025.944
+peakWorkingSetMb=2028.6
+
+ON_REPACKED_RESIDENCY
+prefill-profile repacked_residency engagement=on stated_width=8 resolved_width=8 cap_mb=auto admitted_matrices=216 refused_matrices=0 resident_backend_bytes=2506752000
+weightFit=5329.93 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=0.31
+attentionFit=39.699 us per position pair
+crossover: not reached within 4x the longest measured length (256 tokens)
+length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+128             2       10987.6         11.65       10659.9         327.8          -0.0          0.31
+256             4       22625.7         11.31       21319.7        1305.9          -0.0          0.31
+stage window=window kernel=gemv rowWidth=64 length=128 forwardCalls=3 seed_ms=1.013 cache_append_ms=0.058 attention_ms=6172.695 attention_weight_ms=4886.718 attention_projection_ms=2816.547 attention_output_ms=2070.171 attention_kernel_ms=1032.452 kv_write_ms=9.261 feed_forward_ms=26651.670 feed_forward_weight_ms=25595.600 feed_forward_gate_up_ms=14240.473 feed_forward_down_ms=11355.127 sparse_chain_ms=0.000 logits_head_ms=330.315 total_ms=33155.959 top_layers=35:1000.886,27:995.787,24:981.970
+stage window=window kernel=gemv rowWidth=64 length=256 forwardCalls=3 seed_ms=1.878 cache_append_ms=1.130 attention_ms=14288.543 attention_weight_ms=9849.405 attention_projection_ms=5717.935 attention_output_ms=4131.469 attention_kernel_ms=3951.660 kv_write_ms=10.367 feed_forward_ms=53820.494 feed_forward_weight_ms=51748.099 feed_forward_gate_up_ms=28908.005 feed_forward_down_ms=22840.095 sparse_chain_ms=0.000 logits_head_ms=338.425 total_ms=68450.853 top_layers=35:2001.685,10:1998.463,11:1998.230
+peakWorkingSetMb=4421.0
