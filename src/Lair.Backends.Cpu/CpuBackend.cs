@@ -285,6 +285,14 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// <summary>The processor number of each sampled worker-block execution since sampling was enabled (empty before the first threaded call).</summary>
     internal IReadOnlyList<int> ExecutionSamples => _pool?.SampleSnapshot() ?? [];
 
+    // Test-only instrumentation for the static contiguous row partition seam: one interlocked tally of threaded dense dispatches that
+    // actually ran on stated contiguous per-participant ranges. It never touches a hot path when the seam is off (no statement reaches
+    // it from any resolved posture), and it exists so tests can prove which schedule a call engaged instead of inferring it from timing.
+    private long _staticPartitionDispatches;
+
+    /// <summary>How many threaded dense dispatches this backend has run on static contiguous row ranges since open (test-only seam visibility).</summary>
+    internal long StaticRowPartitionDispatchCount => Volatile.Read(ref _staticPartitionDispatches);
+
     public MemoryHandle AllocateAligned(long bytes, int alignment)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(bytes);
@@ -415,6 +423,8 @@ public sealed unsafe partial class CpuBackend : IBackend
             }
             else
             {
+                // Single-vector GEMV always keeps dynamic claiming: the static contiguous partition is gated on a batch count this call does not have,
+                // and decode's one-row-per-call shape has no per-participant range to hand out (see GemvBatch and CpuKernelTuning).
                 WorkerPool pool = GetOrCreatePool();
                 pool.Run((rows + tuning.RowBlock - 1) / tuning.RowBlock, new RowBlockJob(pBytes, pX, qa, da, usesQ8K ? 1 : 0, pOut, stride, rows, cols, format, _useAvx2, opts, tuning));
             }
@@ -546,14 +556,21 @@ public sealed unsafe partial class CpuBackend : IBackend
             Q8KKernelOptions opts = new(_integerDot, _grid, _prefetchWeights); // same resolved posture for every row and batch vector of the call
 
             // Participation is sampled per call so a quota applied on another thread takes effect from this kernel on. One tuning snapshot
-            // for the whole call: block count, claimed-block width, and scratch grouping all come from the same resolved posture.
+            // for the whole call: block count, claimed-block width, scratch grouping, and the partition schedule all come from the same resolved posture.
             int workers = _effectiveThreads;
             CpuKernelTuning tuning = _tuning;
             bool parallel = workers > 1 && rows >= tuning.ParallelRowThreshold;
 
+            // The unpromoted static contiguous row partition: a stated crossover (never resolved from posture, see CpuKernelTuning) plus this
+            // call's own batch count claims the dispatch schedule for single-matrix dense passes at or above it — both the batched-row route and
+            // the blocked-matmul tile route. Below the width, without threading, or with no width stated every posture keeps today's dynamic claim
+            // loop; a fused pair/triple traversal and shared-operand dot batching are never reached by this gate at any value (those dispatches ask
+            // for the partition explicitly and get none). Rows stay independent either way, so both schedules write identical bytes.
+            bool staticRowPartition = tuning.StaticRowPartitionBatchWidth > 0 && count >= tuning.StaticRowPartitionBatchWidth;
+
             if (matmulRoute)
             {
-                RunMatmulDispatch(pBytes, stride, pIn, pOut, rows, cols, count, format);
+                RunMatmulDispatch(pBytes, stride, pIn, pOut, rows, cols, count, format, staticRowPartition); // the same gate and snapshot this call already resolved.
             }
             else if (!parallel)
             {
@@ -578,7 +595,7 @@ public sealed unsafe partial class CpuBackend : IBackend
             else
             {
                 WorkerPool pool = GetOrCreatePool();
-                pool.Run((rows + tuning.RowBlock - 1) / tuning.RowBlock, new BatchRowJob(pBytes, pIn, qa, da, groupSums, usesQ8K ? 1 : 0, q8Blocks, pOut, stride, rows, cols, count, format, _useAvx2, opts, tuning, q4KIntegerDot ? 1 : 0));
+                RunThreadedDispatch(pool, (rows + tuning.RowBlock - 1) / tuning.RowBlock, workers, staticRowPartition, new BatchRowJob(pBytes, pIn, qa, da, groupSums, usesQ8K ? 1 : 0, q8Blocks, pOut, stride, rows, cols, count, format, _useAvx2, opts, tuning, q4KIntegerDot ? 1 : 0));
             }
         }
 
@@ -1272,6 +1289,45 @@ public sealed unsafe partial class CpuBackend : IBackend
         }
     }
 
+    /// <summary>
+    /// The static contiguous row partition's schedule math, shared by the worker pool and exposed for measurement/tests: participant
+    /// <paramref name="participant"/> of <paramref name="participants"/> owns scheduling blocks [from, to) computed llama-style as floor
+    /// divisions over canonical block order — every range is one uninterrupted run of consecutive blocks, each block belongs to exactly
+    /// one participant, and the ranges together cover the call's whole row span with no gap or overlap. Ragged splits land on whichever
+    /// participants their rows fall to instead of being shared: a wider quota gives more (possibly empty) contiguous pieces rather than a
+    /// different order. The calling thread is always participant 0; pool worker i hosts participant i+1. Internal seam visibility only —
+    /// no host knob reaches it, and every resolved posture keeps the dynamic claim loop instead.
+    /// </summary>
+    internal static (int FromBlock, int ToBlock) StaticPartitionRange(int participant, int participants, int totalBlocks)
+    {
+        if (participants < 2 || (uint)participant >= (uint)participants)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(participant), participant, $"A static row partition needs at least two participants and a participant index inside them; got participant {participant} of {participants}.");
+        }
+
+        ArgumentOutOfRangeException.ThrowIfNegative(totalBlocks); // zero blocks is nothing to schedule: every threaded dispatch has at least one.
+
+        return ((int)((long)participant * totalBlocks / participants), (int)((long)(participant + 1) * totalBlocks / participants));
+    }
+
+    /// <summary>
+    /// Runs one threaded dense dispatch on the partition its call's tuning snapshot selected: today's dynamic block claiming, or — only when
+    /// a stated static-partition width covers this call's batch count — contiguous per-participant ranges over canonical row order. Same job,
+    /// same rows, same bytes either way; which participant walks each independent row is the whole difference (see CpuKernelTuning).
+    /// </summary>
+    private void RunThreadedDispatch(WorkerPool pool, int blockCount, int participants, bool staticRowPartition, IGemvJob job)
+    {
+        if (!staticRowPartition)
+        {
+            pool.Run(blockCount, job); // the posture-resolved default at every width: dynamic claiming.
+            return;
+        }
+
+        Interlocked.Increment(ref _staticPartitionDispatches); // test-only tally of dispatches that actually ran on stated contiguous ranges.
+        pool.RunStatic(participants, blockCount, job);
+    }
+
     /// <summary>Whether this backend pins its pool workers (a core set was configured, or Linux auto placement derived one) or leaves them unpinned.</summary>
     internal bool IsPinningConfigured => _coreSetMask is not null;
 
@@ -1855,6 +1911,14 @@ public sealed unsafe partial class CpuBackend : IBackend
     /// pinning lives in the thread body so pool bookkeeping can never undo it — and records the logical processor of
     /// every block it executes while execution sampling is enabled on the owning backend. The dispatcher's own blocks
     /// are deliberately neither pinned nor sampled: that thread belongs to the caller, not to the pool.
+    /// <para>
+    /// Two schedules share this pool. <see cref="Run"/> hands scheduling blocks to whichever participant claims one next — today's posture at
+    /// every resolved value. <see cref="RunStatic"/> instead gives each participant one contiguous range of canonical blocks computed from the
+    /// call's own participant count (<see cref="StaticPartitionRange"/>) with no shared claim counter at all: worker i owns participant i+1's
+    /// range for that job and nothing else, ranges are cleared as they are claimed so a wake-up cannot re-run one, and Run returns only after
+    /// every non-empty range finished. Both schedules process the identical blocks of the same job; which schedule a call runs is decided by its
+    /// tuning snapshot upstream (see CpuKernelTuning), never here.
+    /// </para>
     /// </summary>
     private sealed class WorkerPool : IDisposable
     {
@@ -1873,20 +1937,30 @@ public sealed unsafe partial class CpuBackend : IBackend
         private int _pendingBlocks;
         private bool _disposed;
 
+        // Static-partition job state (RunStatic only): each worker's contiguous block range for the current job, cleared as it is claimed so a
+        // later wake-up cannot re-run it, plus how many non-empty ranges still have to finish. Both arrays exist exactly when _workers does — every
+        // dereference below lives in code that runs only for a pool with workers. Sized once with the pool; every value lives under _gate.
+        private readonly int[]? _staticFrom;
+        private readonly int[]? _staticTo;
+        private bool _staticMode;
+        private int _pendingWorkers;
+
         public WorkerPool(int workerCount, IReadOnlyList<ulong>? maskWords)
         {
             _workerMask = maskWords is null or { Count: 0 } ? null : maskWords;
 
             if (workerCount == 0)
             {
-                return; // pool exists only to satisfy GetOrCreatePool; Run is never called for it
+                return; // pool exists only to satisfy GetOrCreatePool; Run and RunStatic are never called for it
             }
 
             _workers = new Thread[workerCount];
+            _staticFrom = new int[workerCount];
+            _staticTo = new int[workerCount];
             for (int i = 0; i < workerCount; i++)
             {
-                int index = i; // captured loop variable per worker name only
-                Thread thread = new(WorkerLoop)
+                int index = i; // captured loop variable per worker name and per static-participant slot: worker i hosts participant i+1.
+                Thread thread = new(() => WorkerLoop(index))
                 {
                     IsBackground = true,
                     Name = $"lair-gemv-worker-{index}",
@@ -1904,6 +1978,7 @@ public sealed unsafe partial class CpuBackend : IBackend
             lock (_gate)
             {
                 _job = job;
+                _staticMode = false; // a dynamic dispatch always re-arms claiming, so no stale static range can wake anyone.
                 _totalBlocks = blockCount;
                 _nextBlock = 0;
                 _pendingBlocks = blockCount;
@@ -1943,6 +2018,68 @@ public sealed unsafe partial class CpuBackend : IBackend
             }
         }
 
+        /// <summary>
+        /// Runs one job on contiguous per-participant ranges instead of dynamic claiming: participant 0 is the calling thread, pool worker i hosts
+        /// participant i+1's range for this whole job, and capacity beyond this call's participation stays parked at an empty range. Ranges come from
+        /// <see cref="StaticPartitionRange"/> over canonical block order, so every scheduling block runs exactly once with no shared claim counter: a
+        /// worker checks its own range under the same lock hold that clears it (the same discipline claiming uses above), and Run returns only after every
+        /// non-empty range has finished. Refused naming both counts when this pool cannot host the participant count asked for — an internal seam misuse,
+        /// never a silently narrowed schedule.
+        /// </summary>
+        public void RunStatic(int participants, int totalBlocks, IGemvJob job)
+        {
+            if (participants < 2 || _workers is null || WorkerCapacity < participants - 1)
+            {
+                throw new InvalidOperationException(
+                    $"A static row partition of {participants} participants needs a worker pool hosting at least {participants - 1} workers; this pool hosts {WorkerCapacity}.");
+            }
+
+            lock (_gate)
+            {
+                _job = job;
+                _staticMode = true;
+                _totalBlocks = totalBlocks; // published for the wait predicate's symmetry only: static claiming reads no shared counter.
+                int pending = 0;
+
+                for (int i = 0; i < _workers.Length; i++)
+                {
+                    if (i + 1 < participants)
+                    {
+                        (int from, int to) = StaticPartitionRange(i + 1, participants, totalBlocks);
+                        _staticFrom![i] = from;
+                        _staticTo![i] = to;
+
+                        if (from < to)
+                        {
+                            pending++; // only a non-empty range has something left to finish.
+                        }
+                    }
+                    else
+                    {
+                        _staticFrom![i] = 0;
+                        _staticTo![i] = 0; // parked capacity beyond this call's participation claims nothing and counts nothing.
+                    }
+                }
+
+                _pendingWorkers = pending;
+                Monitor.PulseAll(_gate);
+            }
+
+            (int ownFrom, int ownTo) = StaticPartitionRange(0, participants, totalBlocks); // the calling thread is participant 0: it owns this call's contiguous head of canonical order.
+            for (int block = ownFrom; block < ownTo; block++)
+            {
+                job.ProcessBlock(block); // neither pinned nor sampled, exactly like a dispatcher-claimed block above: this thread belongs to the caller.
+            }
+
+            lock (_gate)
+            {
+                while (_pendingWorkers != 0 && !_disposed)
+                {
+                    Monitor.Wait(_gate);
+                }
+            }
+        }
+
         public void Dispose()
         {
             lock (_gate)
@@ -1974,7 +2111,7 @@ public sealed unsafe partial class CpuBackend : IBackend
         /// <summary>Snapshots the processor number recorded by each sampled worker-block execution so far.</summary>
         internal IReadOnlyList<int> SampleSnapshot() => Volatile.Read(ref _samples) is ConcurrentQueue<int> queue ? [.. queue] : [];
 
-        private void WorkerLoop()
+        private void WorkerLoop(int index)
         {
             // Pin at thread start: affinity is process-lifetime state of this thread, so one call covers the whole loop. Unpinned models carry no mask and pin nothing; Windows applies its group word through SetThreadAffinityMask and Linux hands the cpu_set_t to sched_setaffinity — multi-word masks included. The pin re-asserts itself below on every wake-up for defense in depth.
             if (_workerMask is not null)
@@ -1991,11 +2128,15 @@ public sealed unsafe partial class CpuBackend : IBackend
                 }
 
                 IGemvJob job;
-                int block;
-                bool claimed;
+                int block = 0;
+                bool claimedDynamic = false;
+                bool staticJob = false;
+                bool claimedStatic = false;
+                int fromBlock = 0;
+                int toBlock = 0;
                 lock (_gate)
                 {
-                    while (!_disposed && _nextBlock >= _totalBlocks)
+                    while (!_disposed && !HasWorkFor(index))
                     {
                         Monitor.Wait(_gate);
                     }
@@ -2005,10 +2146,28 @@ public sealed unsafe partial class CpuBackend : IBackend
                         return;
                     }
 
-                    // A woken worker may find all blocks already claimed: claim fails, so loop back to sleep.
-                    block = _nextBlock++;
-                    claimed = block < _totalBlocks;
                     job = _job!;
+                    staticJob = _staticMode;
+
+                    if (staticJob)
+                    {
+                        // This worker's own contiguous range for the current job, checked and claimed under one lock hold: claiming clears the high edge, so a later
+                        // wake-up — or a call whose participation excluded this index — finds an empty range and parks again instead of re-walking rows.
+                        fromBlock = _staticFrom![index];
+                        toBlock = _staticTo![index];
+
+                        if (fromBlock < toBlock)
+                        {
+                            claimedStatic = true;
+                            _staticTo![index] = fromBlock;
+                        }
+                    }
+                    else
+                    {
+                        // A woken worker may find all blocks already claimed: claim fails, so loop back to sleep.
+                        block = _nextBlock++;
+                        claimedDynamic = block < _totalBlocks;
+                    }
                 }
 
                 if (_workerMask is not null)
@@ -2018,7 +2177,38 @@ public sealed unsafe partial class CpuBackend : IBackend
                 }
 
                 ConcurrentQueue<int>? samples = Volatile.Read(ref _samples);
-                if (claimed && samples is not null && _sampleCount < MaxSamples)
+
+                if (staticJob)
+                {
+                    if (!claimedStatic)
+                    {
+                        continue; // nothing to walk for this job: park again, claiming and counting nothing.
+                    }
+
+                    for (int claimedBlock = fromBlock; claimedBlock < toBlock; claimedBlock++)
+                    {
+                        if (samples is not null && _sampleCount < MaxSamples)
+                        {
+                            // Same bounded per-block sampling the dynamic path records below: one processor number per block this participant walked.
+                            _sampleCount++;
+                            samples.Enqueue(ThreadAffinity.CurrentProcessorNumber());
+                        }
+
+                        job.ProcessBlock(claimedBlock); // identical block numbers and per-row walks to a dynamic claim — only who claims them differs.
+                    }
+
+                    lock (_gate)
+                    {
+                        if (--_pendingWorkers == 0)
+                        {
+                            Monitor.PulseAll(_gate);
+                        }
+                    }
+
+                    continue; // this participant's whole contiguous range is done: park until the next dispatch.
+                }
+
+                if (claimedDynamic && samples is not null && _sampleCount < MaxSamples)
                 {
                     // Approximate cap under concurrent workers: a few blocks may race past it, which is fine for an
                     // unbounded-memory guard on a test-only hook. The number records where this block executes; the
@@ -2038,5 +2228,8 @@ public sealed unsafe partial class CpuBackend : IBackend
                 }
             }
         }
+
+        /// <summary>What a worker may claim right now: under static partitioning, only its own still-open contiguous range; otherwise any unclaimed scheduling block.</summary>
+        private bool HasWorkFor(int index) => _staticMode ? _staticFrom![index] < _staticTo![index] : _nextBlock < _totalBlocks;
     }
 }

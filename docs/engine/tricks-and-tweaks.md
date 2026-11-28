@@ -152,6 +152,25 @@ The artifact's own interpretation column answers "separates beyond own spread: n
 
 **Status.** Landed-but-unpromoted: measurable by pin (`Q4KIntegerDotBatchWidth` qualified key), never selected by any auto posture, and in local attribution runs behind today's default scratch/tile dense traversals at the measured counts even after sharing activation group sums across chains.
 
+### 7c. Dispatch-schedule seam: static contiguous row ranges (llama-style per-thread blocks)
+
+**Wall.** Wide thread quotas show run-to-run collapse on batched dense passes — a pinned-host record puts the `q4k-widebatch` auto arm at count 8, threads 32 in an 84.03% dispersion band (`reports/2026-11-27T14-14-58Z-optimize-q4k-widebatch-xeon-pinning/summary.md`). The llama-style claim is that handing each thread a fixed contiguous span of canonical rows, instead of letting workers race for scheduling blocks, removes the hand-off that such collapses were attributed to.
+
+**Technique.** `StaticRowPartitionBatchWidth` (`src/Lair.Backends.Cpu/CpuKernelTuning.cs`) states the crossover; every resolved posture sets it to 0, so a threaded dense dispatch keeps dynamic block claiming unless a run pins a width in `[1..64]`, and an out-of-range pin refuses by naming `engine.cpu.tuning.static_row_partition_batch_width`. When engaged, participant 0 is the calling thread and pool worker *i* hosts participant *i+1*, each owning one contiguous range of canonical blocks over this dispatch's rows (`CpuBackend.StaticPartitionRange`); a claimed range is cleared so no wake-up re-walks it, `WorkerPool.RunStatic` refuses when the pool cannot host `participants − 1` workers, and only single-matrix dense batched passes take part — fused pair/triple traversals, shared-input dot batching, single-vector `GEMV` decode, and unthreaded calls stay on dynamic claiming by construction (`src/Lair.Backends.Cpu/CpuBackend.cs`, `RunThreadedDispatch`). Kernels are untouched: which executor walks a row changes, the arithmetic does not.
+
+**Measured effect.** Dev-host attribution run `reports/2026-11-28T05-48-20Z-probe-static-row-partitioning-local/` (AVX2-resolved backend, explicit quota `threads=32` → `workers=32`, unpinned placement; synthetic pinned Q4_K tensors at `11008x2048` and `2048x11008`, counts 8/16/32/64, `--static-partition 8 --reps 7`, arms bit-parity-checked per count; plus a real-model arm on `models/qwen2.5-3b-instruct-q4_k_m.gguf` at lengths 1024/2048). Static ranges are slower in every measured cell and no more stable:
+
+| Shape / count | auto med (band) | static-w8 med (band) | Δ |
+|---|---:|---:|---:|
+| gate/up @32 | 3.016 ms (23%) / 2.704 ms (10%) | 3.648 ms (29%) / 3.147 ms (19%) | +21% / +16% |
+| gate/up @64 | 4.925 ms (6%) / 4.739 ms (23%) | 6.093 ms (54%) / 6.426 ms (28%) | +24% / +36% |
+| down @32 | 2.353 ms (14%) / 2.399 ms (20%) | 3.054 ms (42%) / 2.620 ms (38%) | +30% / +9% |
+| down @64 | 4.606 ms (16%) / 5.053 ms (20%) | 6.031 ms (13%) / 5.749 ms (5%) | +31% / +14% |
+
+(gate/up `11008x2048`, down `2048x11008`; two identical repeat runs A/B.) The wide-quota instability reproduced on this host too — both runs put the *auto* arm at count 16 in a 472%/484% band while counts 32/64 sat near 10–25%, and the static arms inherited bands of 571%/609% at that same count. Reading: at `workers=32` on logical processors completion is straggler-bound under either schedule, so a fixed span buys no stability and forfeits the stealing that absorbs jitter. The real-model arm agrees directionally: single-matrix windows slow (`feed_forward_down` +16.7% at 1024, +17.1% at 2048; `attention_output` +14.0%/+15.1%) while the fused gate/up window — which cannot take the seam — moves −5.5%/−5.3%. These are dev-host attribution numbers from committed evidence `reports/2026-11-28T05-48-20Z-probe-static-row-partitioning-local/` and carry no promotion weight because the pinned-Xeon re-run that could settle the original claim has not been done.
+
+**Status.** Landed-but-unpromoted: resolvable only by pin (`--static-row-partition off|on|N` in `prefill-profile`, `--static-partition W[,…]` in `q4k-widebatch`), auto 0 everywhere, and behind dynamic claiming at every posture measured so far. The pinned-Xeon collapse it was probed against is not addressed by this seam on the dev host.
+
 ## 8. Ascending-walk bit identity: the invariant that makes every route swap safe
 
 **Wall.** Fusing, tiling, batching, and ISA switching all risk reordering accumulation — which would break golden parity against pinned llama.cpp b12032.

@@ -15,9 +15,13 @@ namespace Lair.Bench;
 /// Xeon runners measure arms: one untimed parity pass per arm, two untimed settle passes (forward then reversed) so
 /// tier-up and page/cache settling land on every arm before timing, then `--reps` timed rounds whose arm order is
 /// rotated round by round — an arm's number never benefits from a warmer machine state than its neighbours saw. Each
-/// line publishes true median/min/max wall ms plus ns/MAC and effective weight GB/s so amortization collapse across
-/// counts is visible as a per-count efficiency curve at fixed thread posture. No production route or config posture
-/// changes.
+/// line publishes true median/min/max wall ms plus a per-arm dispersion pair (sample stddev_ms and the max-min band as a
+/// fraction of that median) across its own rotated rounds, ns/MAC and effective weight GB/s so amortization collapse across
+/// counts is visible as a per-count efficiency curve at fixed thread posture, and so a schedule change can be read against
+/// the run-to-run jitter it claims to remove. An optional dispatch-schedule arm states the unpromoted static contiguous row
+/// partition crossover: identical kernels over the same fixture with each participant walking one contiguous range of canonical
+/// rows instead of claiming scheduling blocks dynamically, joined to the float bit-parity guard because only who walks a row
+/// changes. No production route or config posture changes.
 /// </summary>
 internal static class Q4KWideBatchBench
 {
@@ -34,6 +38,7 @@ internal static class Q4KWideBatchBench
         bool diagScratchG1 = false;
         bool integerDotArm = false;
         List<int> integerChainGroups = []; // each stated group width adds its own integer arm beside the default one, so candidate widths share the same settle and rotation schedule as every other arm here.
+        List<int> staticPartitionWidths = []; // each stated crossover adds a dispatch-schedule arm: identical kernels on contiguous per-participant row ranges instead of dynamic block claiming.
         List<int> counts = [1, 8, 16, 32, 64];
         List<(int Rows, int Cols)> shapes = [(11_008, 2_048), (2_048, 11_008)]; // gate/up and down widths of Qwen2.5-3B hidden=2048, intermediate=11008
 
@@ -89,6 +94,33 @@ internal static class Q4KWideBatchBench
                     }
 
                     integerChainGroups = [.. parsedGroups.Distinct().OrderBy(g => g)]; // each stated width becomes its own arm beside the default one, sharing this run's settle and rotation schedule.
+                    break;
+                case "--static-partition":
+                    if (i + 1 >= args.Length)
+                    {
+                        Console.WriteLine("q4k-widebatch: option '--static-partition' needs a value");
+                        return 1;
+                    }
+
+                    List<int> parsedWidths = [];
+                    foreach (string part in args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                    {
+                        if (!int.TryParse(part, out int width) || width < 1 || width > Lair.Backends.Cpu.CpuKernelTuningOverrides.StaticRowPartitionMax)
+                        {
+                            Console.WriteLine($"q4k-widebatch: invalid static-partition width '{part}' (expected 1..{Lair.Backends.Cpu.CpuKernelTuningOverrides.StaticRowPartitionMax})");
+                            return 1;
+                        }
+
+                        parsedWidths.Add(width);
+                    }
+
+                    if (parsedWidths.Count == 0)
+                    {
+                        Console.WriteLine("q4k-widebatch: --static-partition listed no widths");
+                        return 1;
+                    }
+
+                    staticPartitionWidths = [.. parsedWidths.Distinct().OrderBy(w => w)]; // each stated crossover adds its own schedule arm beside the auto arm, sharing this run's settle and rotation schedule.
                     break;
                 case "--shapes":
                     if (i + 1 >= args.Length)
@@ -191,6 +223,14 @@ internal static class Q4KWideBatchBench
                 integerArms.Add(($"integer-g{group}", new Lair.Backends.Cpu.CpuBackend(threads: threads, cpuFeatures: new Lair.Backends.Cpu.CpuFeaturePosture(Avx2Available: true, AvxVnniAvailable: false), tuning: new Lair.Backends.Cpu.CpuKernelTuningOverrides { Q4KIntegerDotBatchWidth = 8, ChainGroup = group })));
             }
 
+            // The unpromoted static contiguous row partition arms: identical kernels and traversals, only the dispatch schedule differs — each participant walks one contiguous range of canonical rows instead of claiming scheduling blocks dynamically. These are float-classified arms, so this run's bit-parity guard asserts they write exactly what the auto arm writes.
+            List<(string Name, Lair.Backends.Cpu.CpuBackend Backend)> staticArms = [];
+
+            foreach (int width in staticPartitionWidths)
+            {
+                staticArms.Add(($"static-w{width}", new Lair.Backends.Cpu.CpuBackend(threads: threads, tuning: new Lair.Backends.Cpu.CpuKernelTuningOverrides { StaticRowPartitionBatchWidth = width })));
+            }
+
             // One arm list drives every phase below (parity, settle, rotated timing): arms are measured as a set, never one after another to completion.
             List<(string Name, Lair.Backends.Cpu.CpuBackend Backend)> arms = [("auto", autoRoute), ("streaming", streamingRoute), ("tile", tileRoute)];
 
@@ -206,7 +246,14 @@ internal static class Q4KWideBatchBench
                 arms.Add((name, backend)); // an integer arm is just another member of the same measured set.
             }
 
-            Console.WriteLine($"q4k-widebatch shape={rows}x{cols} stride_bytes={strideBytes} packed_mib={(weights.Length / (1024.0 * 1024.0)):F2} auto_tuning=[chain_group={autoRoute.ResolvedTuning.ChainGroup},max_scratch_cols={autoRoute.ResolvedTuning.MaxScratchCols}] streaming_tuning=[chain_group={streamingRoute.ResolvedTuning.ChainGroup},max_scratch_cols={streamingRoute.ResolvedTuning.MaxScratchCols}] tile_tuning=[matmul_route_batch_width_q4k={tileRoute.ResolvedTuning.MatmulRouteBatchWidthQ4K}]");
+            string staticArmFacts = "";
+            foreach ((string name, Lair.Backends.Cpu.CpuBackend backend) in staticArms)
+            {
+                arms.Add((name, backend)); // a schedule arm is another member of the same measured set, with its own posture facts published beside it.
+                staticArmFacts += $" {name}_tuning=[static_row_partition_batch_width={backend.ResolvedTuning.StaticRowPartitionBatchWidth},row_block={backend.ResolvedTuning.RowBlock},parallel_row_threshold={backend.ResolvedTuning.ParallelRowThreshold},workers={backend.EffectiveWorkerCount}]";
+            }
+
+            Console.WriteLine($"q4k-widebatch shape={rows}x{cols} stride_bytes={strideBytes} packed_mib={(weights.Length / (1024.0 * 1024.0)):F2} auto_tuning=[chain_group={autoRoute.ResolvedTuning.ChainGroup},max_scratch_cols={autoRoute.ResolvedTuning.MaxScratchCols}] streaming_tuning=[chain_group={streamingRoute.ResolvedTuning.ChainGroup},max_scratch_cols={streamingRoute.ResolvedTuning.MaxScratchCols}] tile_tuning=[matmul_route_batch_width_q4k={tileRoute.ResolvedTuning.MatmulRouteBatchWidthQ4K}]{staticArmFacts}");
 
             foreach (int count in counts)
             {
@@ -301,9 +348,9 @@ internal static class Q4KWideBatchBench
                 Console.WriteLine($"q4k-widebatch shape={rows}x{cols} count={count} arms_bit_parity={(bitIdentical ? "bit_identical" : "MISMATCH")}{divergenceNote}");
             }
 
-            foreach ((string name, Lair.Backends.Cpu.CpuBackend backend) in integerArms)
+            foreach ((string name, Lair.Backends.Cpu.CpuBackend backend) in integerArms.Concat(staticArms))
             {
-                backend.Dispose(); // the shape's stated-width integer arms end here, on the same per-shape scope the float arms above already use.
+                backend.Dispose(); // the shape's stated-width arms end here, on the same per-shape scope the float arms above already use.
             }
         }
 
@@ -316,9 +363,28 @@ internal static class Q4KWideBatchBench
         double medMs = sortedSamples.Length % 2 == 1 ? sortedSamples[sortedSamples.Length / 2] : (sortedSamples[sortedSamples.Length / 2 - 1] + sortedSamples[sortedSamples.Length / 2]) / 2.0;
         long macs = (long)rows * cols * count;
 
+        // Run-to-run dispersion for this arm's own posture across the rotated rounds: sample standard deviation, plus the max-min band as a fraction of that median — the same band metric committed reports quote when an auto-arm collapse is attributed to dispatch behavior.
+        double mean = 0.0;
+        foreach (double sample in sortedSamples)
+        {
+            mean += sample;
+        }
+
+        mean /= sortedSamples.Length;
+
+        double varianceSum = 0.0;
+        foreach (double sample in sortedSamples)
+        {
+            double deviation = sample - mean;
+            varianceSum += deviation * deviation;
+        }
+
+        double stddevMs = sortedSamples.Length > 1 ? Math.Sqrt(varianceSum / (sortedSamples.Length - 1)) : 0.0;
+        double bandPct = medMs > 0.0 ? (sortedSamples[^1] - sortedSamples[0]) / medMs * 100.0 : 0.0;
+
         return string.Create(
             CultureInfo.InvariantCulture,
-            $"q4k-widebatch shape={rows}x{cols} arm={arm} count={count} threads={threads} rounds={reps} med_ms={medMs:F3} min_ms={sortedSamples[0]:F3} max_ms={sortedSamples[^1]:F3} ns_per_mac={(medMs * 1_000_000.0 / macs):F4} gflops={(2.0 * macs / (medMs / 1000.0) / 1e9):F3} weight_gbs={(weightBytes / (medMs / 1000.0) / 1e9):F3}");
+            $"q4k-widebatch shape={rows}x{cols} arm={arm} count={count} threads={threads} rounds={reps} med_ms={medMs:F3} min_ms={sortedSamples[0]:F3} max_ms={sortedSamples[^1]:F3} stddev_ms={stddevMs:F4} band_pct={bandPct:F2} ns_per_mac={(medMs * 1_000_000.0 / macs):F4} gflops={(2.0 * macs / (medMs / 1000.0) / 1e9):F3} weight_gbs={(weightBytes / (medMs / 1000.0) / 1e9):F3}");
     }
 
     private static bool BitsEqual(ReadOnlySpan<float> a, ReadOnlySpan<float> b)
@@ -386,6 +452,6 @@ internal static class Q4KWideBatchBench
 
     private static void Usage()
     {
-        Console.WriteLine("q4k-widebatch [--threads N=1] [--reps R=3] [--shapes rowsxcols,...=11008x2048,2048x11008] [--counts 1,8,16,32,64] [--diag-scratch-g1] [--integer-dot] [--integer-chain-group 2,4,8] (kernel-level attribution for the Q4_K batched dense dot: auto scratch route vs forced streaming fallback vs the unpromoted tile-executor arm (Q4_K crossover stated at 8; counts below it keep the batched-row walk), a chain-group-1 diagnostic, and optionally the unpromoted integer-domain AVX2 Q4_K dot pinned at width 8 on an AVX2-only posture — each listed --integer-chain-group value adds another integer arm beside it at that stated shared-input grouping, so candidate widths share one run's settle and rotation schedule; divergence from the float arms is classified as expected activation-quantization loss instead of asserted identical; over synthetic pinned tensors at realistic feed-forward widths; arms share settle passes and rotated timing rounds like the committed Xeon runners, then publish per-count true med/min/max ms, ns/MAC, GFLOP/s and effective weight GB/s with a bit-parity guard between float arms; bench-only measurement seam - no posture or config change)");
+        Console.WriteLine("q4k-widebatch [--threads N=1] [--reps R=3] [--shapes rowsxcols,...=11008x2048,2048x11008] [--counts 1,8,16,32,64] [--diag-scratch-g1] [--integer-dot] [--integer-chain-group 2,4,8] [--static-partition 8,16] (kernel-level attribution for the Q4_K batched dense dot: auto scratch route vs forced streaming fallback vs the unpromoted tile-executor arm (Q4_K crossover stated at 8; counts below it keep the batched-row walk), a chain-group-1 diagnostic, optionally the unpromoted integer-domain AVX2 Q4_K dot pinned at width 8 on an AVX2-only posture — each listed --integer-chain-group value adds another integer arm beside it at that stated shared-input grouping — and optionally one arm per listed --static-partition crossover (the unpromoted dispatch schedule: identical kernels with contiguous per-participant canonical row ranges instead of dynamic block claiming; these arms join the float bit-parity guard because only who walks a row changes); divergence from the float arms is classified as expected activation-quantization loss for integer arms only, while every arm publishes true med/min/max ms plus stddev_ms and band_pct dispersion across its own rotated rounds, ns/MAC, GFLOP/s and effective weight GB/s; arms share settle passes and rotated timing rounds like the committed Xeon runners; bench-only measurement seam - no posture or config change)");
     }
 }

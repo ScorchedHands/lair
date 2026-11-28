@@ -1,0 +1,28 @@
+{
+  "goal": "Probe static contiguous row partitioning for CPU worker dispatch against dynamic block claiming, without touching kernel arithmetic",
+  "branch": "phase/mvp7 (worktree .agent-worktrees/mvp7)",
+  "date_utc": "2026-11-28T05:48:20Z",
+  "host": {
+    "cpu": "13th Gen Intel(R) Core(TM) i9-13900K",
+    "physicalCores": 24,
+    "logicalProcessors": 32,
+    "totalMemoryGb": 63.7,
+    "os": "Microsoft Windows 11 Pro",
+    "threadPosture": "explicit --threads 32 (oversubscribes logical processors; engine auto-sizing would have chosen physical cores)",
+    "placement": "unpinned: bench verbs expose no core mask, and models[].placement.core_set is a host-config knob not used by these runs",
+    "isaPath": "AVX2-resolved CpuBackend (bench opens with allowAvx2: true)"
+  },
+  "modelFixture": {
+    "path": "models/qwen2.5-3b-instruct-q4_k_m.gguf",
+    "bytes": 2104932768,
+    "usedBy": "prefill-profile arms only; q4k-widebatch arms run on synthetic pinned Q4_K tensors"
+  },
+  "tools": ["bench/Lair.Bench q4k-widebatch", "bench/Lair.Bench prefill-profile", "dotnet test (Release)"],
+  "gates": {
+    "StaticRowDispatchTests": { "passed": 95, "failed": 0 },
+    "Category=Kernel|CpuTuning&Category!=Cuda": { "passed": 805, "failed": 0 },
+    "Category=DenseWeightFusion|Kernel|CpuTuning|Profile&Category!=Cuda": { "passed": 510, "failed": 0 },
+    "Category=Parity": { "passed": 154, "failed": 0 }
+  },
+  "verdict": "keep unpromoted: static contiguous ranges are slower in every measured cell and no steadier run-to-run on this host; auto posture keeps static_row_partition_batch_width = 0"
+}

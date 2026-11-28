@@ -1,0 +1,13 @@
+prefill-profile file=C:\source\gitlab.scorchedhands.com\personal\LAIR\models\qwen2.5-3b-instruct-q4_k_m.gguf bytes=2104932768 threads=32 maxBatchSequences=16
+  arch=qwen2 layers=36 hidden=2048 heads=16 kvHeads=2 headDim=128 vocab=151936 windowedLayers=0 avx2=True
+  traversalBytes=1668685824 outputHeadBytes=255252480 kvBlocks=136 blockTokens=16 reps=2 perToken=off lengths=1024,2048 stageProfile=on
+  weightFit=354.52 ms/traversal (least-squares fit over 2 lengths) impliedWeightGB/s=4.71
+  attentionFit=13.038 us per position pair
+  crossover: fitted attention term >= fitted weight term at length >= 1714
+
+      length    subBatches     batchedMs  batchedTok/s      weightMs   attentionMs  fitResidualMs    weightGB/s
+        1024            32       18186.7         56.30       11344.6        6842.2          -0.0          4.71
+        2048            64       50044.4         40.92       22689.1       27355.3          -0.0          4.71
+  prefill-profile stage window=window kernel=gemv rowWidth=32 length=1024 forwardCalls=2 seed_ms=1.402 cache_append_ms=0.089 attention_ms=18683.562 attention_weight_ms=4014.006 attention_projection_ms=1983.442 attention_output_ms=2030.564 attention_kernel_ms=13913.824 kv_write_ms=9.409 feed_forward_ms=17691.355 feed_forward_weight_ms=15677.447 feed_forward_gate_up_ms=8815.052 feed_forward_down_ms=6862.395 sparse_chain_ms=0.000 logits_head_ms=21.916 total_ms=36399.458 top_layers=0:1052.369,34:1035.653,31:1032.725
+  prefill-profile stage window=window kernel=gemv rowWidth=32 length=2048 forwardCalls=2 seed_ms=3.056 cache_append_ms=0.195 attention_ms=63830.638 attention_weight_ms=8305.707 attention_projection_ms=4083.234 attention_output_ms=4222.473 attention_kernel_ms=54043.236 kv_write_ms=18.577 feed_forward_ms=36452.934 feed_forward_weight_ms=32491.176 feed_forward_gate_up_ms=18269.500 feed_forward_down_ms=14221.676 sparse_chain_ms=0.000 logits_head_ms=25.256 total_ms=100314.140 top_layers=7:2830.019,27:2827.694,11:2827.206
+  peakWorkingSetMb=2097.3

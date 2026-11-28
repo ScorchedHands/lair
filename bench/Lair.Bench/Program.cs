@@ -36,7 +36,7 @@ return args[0] switch
     "ple-policy" => PlePolicyBench.Run(args), // PLE access-scheduling measurement: demand-only gather, bounded computed-address prefetch overlap, frequency-sketch hot-row residency with and without prefetch under declared caps, and Linux NUMA/huge-page placement facts where the host offers them — storage/governance evidence only with no posture or config change
     "lowrank-svd" => LowRankSvdBench.Run(args), // Analytical low-rank viability measurement: contiguous per-expert slabs of the stacked MoE gate/up/down tensors dequantize row-by-row through the engine's CPU dequant route into float32 matrices (one expert resident at a time over slab views, never a whole-stack copy), their exact singular spectra come from numpy.linalg.svd driven by the bench-side spike script, and rank-energy fractions plus per-role median aggregates publish beside an active-routed-expert bytes/token baseline read off the assembled tensor table against conservative fp32-factorization storage estimates for candidate ranks; analytical viability evidence only - it measures how much energy each matrix's leading singular directions hold, benchmarks no low-rank kernel throughput, and changes no posture or config
     "qwen4exp-forward-file" => Qwen4ExpForwardBench.Run(args), // Bounded qwen4exp CPU forward measurement: short synthetic prompt windows and argmax-driven single-token steps run through the engine's assembly-internal chunk seam over a plain CPU backend against real (possibly split) pinned shards, publishing prefill/decode tokens-per-second plus peak working-set facts or one status=refused line naming what this build cannot open that file; no serving route, KV pool, lane posture or config change participates
-    "q4k-widebatch" => Q4KWideBatchBench.Run(args), // Kernel-level attribution seam for the Q4_K batched dense dot: auto scratch traversal vs forced streaming fallback (and an optional chain-group-1 diagnostic arm) over synthetic pinned tensors at realistic feed-forward widths and counts 1/8/16/32/64, publishing per-count med/min/max ms, ns/MAC, GFLOP/s and effective weight GB/s with a bit-parity guard between arms; bench-only measurement seam - no posture or config change
+            "q4k-widebatch" => Q4KWideBatchBench.Run(args), // Kernel-level attribution seam for the Q4_K batched dense dot: auto scratch traversal vs forced streaming fallback (and an optional chain-group-1 diagnostic arm) over synthetic pinned tensors at realistic feed-forward widths and counts 1/8/16/32/64, publishing per-count med/min/max ms with stddev_ms and band_pct dispersion, ns/MAC, GFLOP/s and effective weight GB/s plus a bit-parity guard between arms; optional integer-domain arms and optional static contiguous row-partition schedule arms (bench-only measurement seam - no posture or config change)
     _ => Usage(),
 };
 
@@ -901,6 +901,7 @@ static int BenchPrefillProfile(string[] args)
     int? matmulRouteWidthQ4K = null; // --q4k-matmul-route off|on|N states the Q4_K crossover of that same route, which no resolved posture promotes on its own; absent leaves every Q4_K batched pass on its current traversal
     int? pairMatmulRouteWidth = null; // --pair-matmul-route off|on|N states the fused-pair crossover into that same tile executor, which no resolved posture states either; absent keeps every fused pair on its staged traversal
     int? sharedDotChainGroup = null; // --attention-batch-dots off|on|N pins how many score-dot accumulator chains share one pass over a shared K operand; absent keeps the posture-resolved default
+    int? staticRowPartitionWidth = null; // --static-row-partition off|on|N states the unpromoted contiguous per-participant row-range crossover for threaded dense dispatches, which no resolved posture promotes on its own; absent keeps every threaded pass on dynamic block claiming
     string? outPath = null;
     List<int> lengths = [16, 32, 64, 128, 256, 512, 1024, 1536, 2048];
     List<int>? rowWidths = null; // the resolved-row-count axis: one candidate engine per listed width; absent keeps the single default engine
@@ -1090,6 +1091,28 @@ static int BenchPrefillProfile(string[] args)
                 }
 
                 break;
+            case "--static-row-partition":
+                if (i + 1 >= args.Length)
+                {
+                    Console.WriteLine("prefill-profile: option '--static-row-partition' needs a value");
+                    return 1;
+                }
+
+                string partitionValue = args[++i];
+                staticRowPartitionWidth = partitionValue switch
+                {
+                    "off" => 0, // every threaded dense dispatch keeps dynamic block claiming — what no posture resolves on its own anyway.
+                    "on" => 8, // the batch width existing schedule measurements compare at, stated explicitly for this seam.
+                    _ => int.TryParse(partitionValue, NumberStyles.Integer, CultureInfo.InvariantCulture, out int pinnedWidth) ? pinnedWidth : -1,
+                };
+
+                if (staticRowPartitionWidth < 0 || staticRowPartitionWidth > CpuKernelTuningOverrides.StaticRowPartitionMax)
+                {
+                    Console.WriteLine($"prefill-profile: --static-row-partition '{partitionValue}' must be off, on, or a batch width 0..{CpuKernelTuningOverrides.StaticRowPartitionMax}");
+                    return 1;
+                }
+
+                break;
             case "--attention-batch-dots":
                 if (i + 1 >= args.Length)
                 {
@@ -1146,9 +1169,9 @@ static int BenchPrefillProfile(string[] args)
         }
     }
 
-    CpuKernelTuningOverrides? pinnedTuning = matmulRouteWidth is null && matmulRouteWidthQ4K is null && pairMatmulRouteWidth is null && sharedDotChainGroup is null
+    CpuKernelTuningOverrides? pinnedTuning = matmulRouteWidth is null && matmulRouteWidthQ4K is null && pairMatmulRouteWidth is null && sharedDotChainGroup is null && staticRowPartitionWidth is null
         ? null // nothing stated: every knob resolves from the opened posture, exactly as an engine open would.
-        : new CpuKernelTuningOverrides { MatmulRouteBatchWidth = matmulRouteWidth, MatmulRouteBatchWidthQ4K = matmulRouteWidthQ4K, PairMatmulRouteBatchWidth = pairMatmulRouteWidth, SharedInputDotChainGroup = sharedDotChainGroup };
+        : new CpuKernelTuningOverrides { MatmulRouteBatchWidth = matmulRouteWidth, MatmulRouteBatchWidthQ4K = matmulRouteWidthQ4K, PairMatmulRouteBatchWidth = pairMatmulRouteWidth, SharedInputDotChainGroup = sharedDotChainGroup, StaticRowPartitionBatchWidth = staticRowPartitionWidth };
 
     using GgufFile gguf = GgufFile.Open(args[1]);
     using CpuBackend backend = new(
@@ -1474,7 +1497,7 @@ static int BenchPrefillProfile(string[] args)
         [
             $"prefill-profile file={gguf.Path} bytes={gguf.FileSize} threads={backend.EffectiveWorkerCount} maxBatchSequences={TransformerModel.MaxBatchSequences}",
             $"  arch={geometry.Architecture} layers={geometry.LayerCount} hidden={geometry.HiddenSize} heads={geometry.HeadCount} kvHeads={geometry.KvHeadCount} headDim={geometry.HeadDim} vocab={geometry.VocabSize} windowedLayers={windowedLayers} avx2={Avx2.IsSupported}",
-            $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" + (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : "") + (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : "") + (stageProfile ? " stageProfile=on" : "") + (matmulRouteWidth is { } mw ? $" matmulRoute={mw}" : "") + (matmulRouteWidthQ4K is { } mqw ? $" q4kMatmulRoute={mqw}" : "") + (pairMatmulRouteWidth is { } pmw ? $" pairMatmulRoute={pmw}" : "") + (sharedDotChainGroup is { } sdg ? $" attentionBatchDots={sdg}" : ""),
+            $"  traversalBytes={traversalBytes} outputHeadBytes={outputHeadBytes} kvBlocks={capacityBlocks} blockTokens={blockTokens} reps={reps} perToken={(perToken ? "on" : "off")} lengths={string.Join(",", lengths)}" + (rowWidths is not null ? $" rowWidths={string.Join(",", rowWidths)}" : "") + (kernelAxis ? $" kernels={string.Join(",", kernels.Select(PrefillKernelNames.Of))}" : "") + (stageProfile ? " stageProfile=on" : "") + (matmulRouteWidth is { } mw ? $" matmulRoute={mw}" : "") + (matmulRouteWidthQ4K is { } mqw ? $" q4kMatmulRoute={mqw}" : "") + (pairMatmulRouteWidth is { } pmw ? $" pairMatmulRoute={pmw}" : "") + (sharedDotChainGroup is { } sdg ? $" attentionBatchDots={sdg}" : "") + (staticRowPartitionWidth is { } spw ? $" staticRowPartition={spw}" : ""),
             .. reportBody,
         ];
 

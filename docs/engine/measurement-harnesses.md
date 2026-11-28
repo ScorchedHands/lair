@@ -20,10 +20,10 @@ The contract both families enforce: every performance claim names a committed ar
 | `gemv` | synthetic GEMV micro-costs | — |
 | `gguf-dump` | tensor table of a GGUF | read-only dump |
 | `gemv-file` | per-tensor GEMV cost over real model files | defaults: thread quota 8, `--reps 150`, `--max-rows 1024`; prints peak working set at process end; warns "unusable split" when a tensor's measured cost stops rising with causal span |
-| `prefill-profile` | windowed prefill throughput and stage breakdown | `--threads N --lengths <list> --widths <list> --kernel gemv,tiled,gemm --reps R (3) --per-token --stage-profile --matmul-route off\|on\|N --q4k-matmul-route off\|on\|N --pair-matmul-route off\|on\|N --attention-batch-dots off\|on\|N --out <path>` |
+| `prefill-profile` | windowed prefill throughput and stage breakdown | `--threads N --lengths <list> --widths <list> --kernel gemv,tiled,gemm --reps R (3) --per-token --stage-profile --matmul-route off\|on\|N --q4k-matmul-route off\|on\|N --pair-matmul-route off\|on\|N --attention-batch-dots off\|on\|N --static-row-partition off\|on\|N --out <path>` |
 | `kv-spike`, `kv-micro` | KV write/quantization micro-costs | owned by [kv-cache](kv-cache.md) semantics |
 | `q4-parity` | Q4-family logit comparison | — |
-| `q4k-widebatch` | synthetic wide-batch Q4_K dense-dot attribution (`Q4KWideBatchBench.cs`) | `--threads N --reps R (3) --shapes rowsxcols,... --counts 1..64`; float arms auto/streaming/tile plus optional internal integer-domain arms via `--integer-dot` and stated shared-input widths via `--integer-chain-group 1..8`, each adding an arm beside the default one in the same settle/rotation schedule; divergence from the float routes is classified rather than asserted identical — bench-side measurement seams onto internal tuning keys, no posture or config change |
+| `q4k-widebatch` | synthetic wide-batch Q4_K dense-dot attribution (`Q4KWideBatchBench.cs`) | `--threads N --reps R (3) --shapes rowsxcols,... --counts 1..64`; float arms auto/streaming/tile plus optional internal integer-domain arms via `--integer-dot` and stated shared-input widths via `--integer-chain-group 1..8`, plus optional dispatch-schedule arms via `--static-partition W[,…]` that pin the unpromoted contiguous per-participant row-range crossover; each option adds an arm beside the default ones in the same settle/rotation schedule, float-classified arms (including static-schedule arms) share a bit-parity guard while integer-domain divergence is classified rather than asserted identical — bench-side measurement seams onto internal tuning keys, no posture or config change |
 | `kv-quant` | quantized-KV decode throughput (`KvQuantDecodeBench.cs`) | — |
 | `mtp` | multi-token drafting seam latency (`MtpDraftBench.cs`) | seam measurement, not promoted serving |
 | `cuda-gemv`, `cuda-gemm`, `cuda-prefill`, `cuda-concurrency` | CUDA-side kernel and step measurements | refuse or report posture when no idle device is available; see lane gates below |
@@ -34,13 +34,16 @@ The contract both families enforce: every performance claim names a committed ar
 
 The route pins in the table are bench-side measurement seams onto internal tuning keys; [cpu-kernels](cpu-kernels.md) owns what each resolved posture actually promotes, and this page's Q6_K example below shows how a seam graduates to default.
 
-## Report artifacts: three committed shapes
+`q4k-widebatch` also publishes dispersion per arm so a schedule or route claim can be read against the jitter it argues about: every arm line carries true median/min/max wall ms plus sample `stddev_ms` and `band_pct` (max−min as a fraction of that median) across its own rotated rounds, alongside `ns_per_mac`, GFLOP/s and effective weight GB/s. A delta is quotable only against the arm's own band — the same rule the committed re-pair artifacts apply to window totals below.
 
-Every `reports/` directory is self-describing — the manifest states goal, command line, working directory, model path; `host.json` records host facts (processor count, memory, huge-page posture); `bench.json` holds per-arm measurements. Three layouts are in use:
+## Report artifacts: four shapes in use
+
+Every `reports/` directory is self-describing — the manifest states goal, command line, working directory, model path; `host.json` records host facts (processor count, memory, huge-page posture); `bench.json` holds per-arm measurements. Four layouts are in use, and a directory may mix them as long as it stays readable on its own:
 
 1. **Classic single-run form** — `manifest.json`, `host.json`, `bench.json`, `report.html`. Example: `reports/cuda-gemv-parity-2026-11-18/`, `reports/kernel-comparison-2026-11-14/` (the latter's committed kernel comparison: gemv 23.37 prefill tok/s at peak RSS 1,353.8 MB vs tiled 25.11 tok/s at 1,222.8 MB on the IQ4_XS fixture).
 2. **Timestamped A/B form** — `commands.md`, `data.json`, `summary.md`, `report.html`, plus per-round arm logs `logs/stage-ab-rN-<arm>.txt`. Example: `reports/2026-11-27T02-28-33Z-optimize-prefill-q4k-route-ab-interleaved-xeon-t8/`.
 3. **Strict re-pair form** — per-arm log subdirectories (`logs/baseline-off/`, `logs/route-on-w8/`, `logs/route-w16/`) with a paired `analysis.md` separating stage metrics from window totals and noise bands. Example: `reports/2026-11-27T01-16-57Z-optimize-prefill-q4k-route-ab-xeon-t8/`.
+4. **Attribution-lane form** — `host.json` (processor count, memory, thread posture, placement), `data.json` parsed verbatim from the run's own logs plus a per-arm `logs/`, with `commands.md` and `summary.md` carrying posture facts and the verdict; no generated HTML. Example: `reports/2026-11-28T05-48-20Z-probe-static-row-partitioning-local/`.
 
 Narrative Markdown with raw tables beside it lives in `bench/reports/` (e.g. `bench/reports/sub4bit-cost-repin-2026-11-17.md` retains its three raw GEMV tables as `.txt` files). Directory naming convention is `reports/YYYY-MM-DDTHH-mm-ssZ-optimize-<process>/`; 15 of the 43 committed report directories follow it, so older directories keep their short names.
 

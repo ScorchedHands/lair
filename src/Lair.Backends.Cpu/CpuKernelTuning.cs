@@ -31,6 +31,15 @@ public sealed record CpuKernelTuningOverrides
     /// <summary>The batch count at or above which an eligible Q4_K dense pass runs its rows through the integer-domain AVX2 executor (Q8_K-staged activations and pmaddubsw/pmaddwd chains) instead of today's float batched-row kernels (<see cref="MatmulRouteBatchWidthMin"/>..<see cref="MatmulRouteBatchWidthMax"/>) or null to resolve. No resolved posture states it: the variant is a measurement seam whose parity classification against pinned goldens decides promotion, and its integer executor only runs when this backend's ISA resolution landed on the AVX2 rung.</summary>
     public int? Q4KIntegerDotBatchWidth { get; init; }
 
+    /// <summary>The batch count at or above which a threaded single-matrix dense batched dispatch hands each participant one contiguous range of canonical rows instead of letting workers claim scheduling blocks dynamically (<see cref="StaticRowPartitionMin"/>..<see cref="StaticRowPartitionMax"/>; 0 keeps today's dynamic claim loop everywhere) or null to resolve. No resolved posture states it: the static partition is a measurement seam, and stating it changes only which participant walks each independent row — never a kernel, an accumulator order, or a byte written.</summary>
+    public int? StaticRowPartitionBatchWidth { get; init; }
+
+    /// <summary>A stated static-partition width below one batch vector would claim the single-vector decode path too, which this seam deliberately leaves alone. 0 keeps every dispatch on today's dynamic claim loop.</summary>
+    public const int StaticRowPartitionMin = 0;
+
+    /// <summary>The batch ceiling every dense kernel's scratch is sized for: a static-partition width above it could never be reached by a call that threads at all.</summary>
+    public const int StaticRowPartitionMax = CpuKernelTuning.MatmulRouteBatchWidthMax;
+
     /// <summary>Accumulator chains sharing one pass over a shared dot operand (<see cref="CpuKernelTuning.SharedInputDotChainGroupMin"/>..<see cref="CpuKernelTuning.SharedInputDotChainGroupMax"/>; 0 keeps every such dot individual) or null to resolve.</summary>
     public int? SharedInputDotChainGroup { get; init; }
 
@@ -132,6 +141,9 @@ public sealed record CpuKernelTuning
     /// <summary>Accumulator chains sharing one pass over a shared dot operand: how many consecutive inputs of a shared-operand dot batch keep their own accumulator chain beside the common vector's chunk (0 keeps every such dot individual). A batch wider than this is split into consecutive chunks of it.</summary>
     public required int SharedInputDotChainGroup { get; init; }
 
+    /// <summary>The crossover at which a threaded single-matrix dense batched dispatch (the batched-row route or the blocked-matmul tile route) replaces dynamic block claiming with one contiguous canonical row range per participant — llama-style <c>[p*rows/T, (p+1)*rows/T)</c> resolved from the call's own worker count and scheduling-block width (0 unless stated): no posture promotes it, because static ranges trade the claim loop's load-stealing for a schedule with zero hand-off jitter, and which side pays at a given thread quota is exactly what the seam exists to measure. Whatever width a call states, every row keeps its own independent walk, so batched equals solo equals threaded byte-for-byte across any partition this value selects; single-vector GEMV decode, fused pair/triple traversals, shared-operand dot batching, and an unthreaded dispatch never consult it.</summary>
+    public required int StaticRowPartitionBatchWidth { get; init; }
+
     /// <summary>
     /// Resolves one backend's tuning from its effective worker count and vector posture, applying explicit overrides field by field.
     /// Auto defaults:
@@ -151,6 +163,7 @@ public sealed record CpuKernelTuning
     /// - Q4_K matmul route batch width = 0 at every posture: this build measures the tile crossover for its Q6_K dense traversal and measured a Q4_K dense-matrix pass as a regression on the AVX2-only target host, so promoting Q4_K to that route is something an internal seam states explicitly (for measurement) rather than something a posture decides.
     /// - Pair matmul route batch width = 0 at every posture: the fused pair traversal already shares one activation walk across both matrices' chains and no measurement separates it from two tile dispatches yet, so handing a fused pair's rows to the tile executor is something an internal seam states explicitly (for measurement) rather than something a posture decides.
     /// - Shared-input dot chain group = <see cref="ChainGroupMax"/> with a vector posture and 0 without one: how many consecutive inputs of a shared-operand dot batch keep their own accumulator chain beside one load of the common operand's chunk; 0 keeps every such dot individual, where no batched chain kernel runs.
+    /// - Static row partition batch width = 0 at every posture, vector or not: threaded dense dispatches keep today's dynamic block claiming until an internal seam states a crossover for measurement. A stated width only decides which participant walks each independent contiguous range of canonical rows, so outputs stay byte-identical whatever it resolves to.
     /// An override outside its accepted range fails the open naming the qualified key, its value, and the accepted span — never clamped silently.
     /// </summary>
     internal static CpuKernelTuning Resolve(int effectiveWorkerCount, bool vectorPosture, CpuKernelTuningOverrides overrides)
@@ -231,7 +244,19 @@ public sealed record CpuKernelTuning
             ? Validate(pinnedDotGroup, "engine.cpu.tuning.shared_input_dot_chain_group", SharedInputDotChainGroupMin, SharedInputDotChainGroupMax, "a shared-dot chain group wider than eight spills accumulators past the vector posture's register budget")
             : autoSharedInputDotChainGroup;
 
-        return new CpuKernelTuning { RowBlock = rowBlock, ParallelRowThreshold = parallelThreshold, ChainGroup = chainGroup, PairChainGroup = pairChainGroup, TripleChainGroup = tripleChainGroup, MaxScratchCols = maxScratchCols, MatmulRouteBatchWidth = matmulRouteBatchWidth, MatmulRouteBatchWidthQ4K = matmulRouteBatchWidthQ4K, PairMatmulRouteBatchWidth = pairMatmulRouteBatchWidth, Q4KIntegerDotBatchWidth = q4kIntegerDotBatchWidth, SharedInputDotChainGroup = sharedInputDotChainGroup };
+        // The static contiguous row partition's own crossover, stated rather than resolved: today every threaded dense dispatch hands its
+        // scheduling blocks to whichever participant claims one next, which balances a stalled worker at the cost of a shared counter and a
+        // lock per claim. A stated width gives each participant one contiguous range of canonical rows instead — no hand-off jitter, but no
+        // stealing either, so a descheduled participant delays its whole range. Which side pays is a thread-quota question this build has
+        // measured only at 8/16 workers on the lab lane and once at threads=32 (the recorded auto-arm dispersion), so no posture promotes it:
+        // an internal seam states a width when same-host measurement wants to open that question. Whatever value lands here, every row keeps
+        // its own independent walk, so batched equals solo equals threaded byte-for-byte and the only thing the choice moves is who walks it.
+        const int AutoStaticRowPartitionBatchWidth = 0; // no posture promotes it: dense dispatches keep today's dynamic claim loop until a same-build A/B separates the two schedules at a given quota.
+        int staticRowPartitionBatchWidth = overrides.StaticRowPartitionBatchWidth is { } pinnedPartitionWidth
+            ? Validate(pinnedPartitionWidth, "engine.cpu.tuning.static_row_partition_batch_width", CpuKernelTuningOverrides.StaticRowPartitionMin, CpuKernelTuningOverrides.StaticRowPartitionMax, "a static-partition width above the batch ceiling never dispatches")
+            : AutoStaticRowPartitionBatchWidth;
+
+        return new CpuKernelTuning { RowBlock = rowBlock, ParallelRowThreshold = parallelThreshold, ChainGroup = chainGroup, PairChainGroup = pairChainGroup, TripleChainGroup = tripleChainGroup, MaxScratchCols = maxScratchCols, MatmulRouteBatchWidth = matmulRouteBatchWidth, MatmulRouteBatchWidthQ4K = matmulRouteBatchWidthQ4K, PairMatmulRouteBatchWidth = pairMatmulRouteBatchWidth, Q4KIntegerDotBatchWidth = q4kIntegerDotBatchWidth, SharedInputDotChainGroup = sharedInputDotChainGroup, StaticRowPartitionBatchWidth = staticRowPartitionBatchWidth };
     }
 
     private static int Validate(int value, string key, int min, int max, string rationale) =>

@@ -380,8 +380,10 @@ public sealed unsafe partial class CpuBackend : IDenseWeightPairFusion
             // A stated pair crossover hands each matrix's rows to the blocked matmul tile executor instead of this seam's staged-row traversal: where a fused pair re-reads its two staged rows once per chain group across every weight row, the tile executor amortizes one activation-vector load over a tile group's eight rows' chains. No resolved posture states a width here (see CpuKernelTuning), so an auto open runs exactly the traversal below. Each matrix takes that format's own tile walk — same ascending chunk order, FMA association, and scalar-tail cleanup as its batched-row kernel — so both sides land byte-identical to two independent GemvBatch calls at any thread count.
             if (tuning.PairMatmulRouteBatchWidth is > 0 && count >= tuning.PairMatmulRouteBatchWidth && SupportsGemm(formatA) && SupportsGemm(formatB))
             {
-                RunMatmulDispatch(bytesA, strideA, pIn, outA, rows, cols, count, formatA);
-                RunMatmulDispatch(bytesB, strideB, pIn, outB, rows, cols, count, formatB);
+                // The static contiguous row partition never reaches a fused pair at any stated width: these two per-matrix tile dispatches run one after
+                // another on the same backend, and pairing their schedules is not part of what this seam measures (see CpuKernelTuning). Both keep dynamic claiming.
+                RunMatmulDispatch(bytesA, strideA, pIn, outA, rows, cols, count, formatA, staticRowPartition: false);
+                RunMatmulDispatch(bytesB, strideB, pIn, outB, rows, cols, count, formatB, staticRowPartition: false);
 
                 return true;
             }

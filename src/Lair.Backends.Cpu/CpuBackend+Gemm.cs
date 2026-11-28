@@ -81,6 +81,11 @@ public sealed unsafe partial class CpuBackend
         int stride = (int)strideBytes;
         QuantFormat format = w.Format;
 
+        // This is a single-matrix dense batched pass, so it consults the same unpromoted static-partition crossover GemvBatch does: only a stated
+        // width at or below this call's count asks for contiguous per-participant ranges, and every resolved posture (which states none) keeps dynamic claiming.
+        CpuKernelTuning dispatchTuning = _tuning;
+        bool staticRowPartition = dispatchTuning.StaticRowPartitionBatchWidth > 0 && count >= dispatchTuning.StaticRowPartitionBatchWidth;
+
         // Same raw-pointer job contract as GemvBatch: pinned spans stay stable for the duration of the call and every
         // claimed block finishes before WorkerPool.Run returns. A scheduling block owns whole weight rows and sweeps
         // every column for them, so each output element is produced by one uninterrupted ascending walk of its own
@@ -89,13 +94,17 @@ public sealed unsafe partial class CpuBackend
         fixed (float* pIn = inputs)
         fixed (float* pOut = outputs)
         {
-            RunMatmulDispatch(pBytes, stride, pIn, pOut, rows, cols, count, format);
+            RunMatmulDispatch(pBytes, stride, pIn, pOut, rows, cols, count, format, staticRowPartition);
         }
     }
 
     // The blocked-matmul dispatch the dense-matrix selection and the batched-row hybrid route share: one tuning snapshot,
-    // the same row-block partition, the same raw-pointer job contract. Callers hold the pinned spans.
-    private void RunMatmulDispatch(byte* pBytes, int stride, float* pIn, float* pOut, int rows, int cols, int count, QuantFormat format)
+    // the same row-block partition, the same raw-pointer job contract. Callers hold the pinned spans. <paramref name="staticRowPartition"/>
+    // is each call site's own decision against its tuning snapshot — a single-matrix dense pass may state it, a fused pair's two per-matrix
+    // tile dispatches never does (that traversal keeps today's dynamic claim loop at any stated width), and an unthreaded run ignores it
+    // entirely because there is no participant to partition. Whichever schedule runs, a block owns whole weight rows and sweeps every column
+    // for them, so each output element still comes from one uninterrupted ascending walk of its own accumulator chain.
+    private void RunMatmulDispatch(byte* pBytes, int stride, float* pIn, float* pOut, int rows, int cols, int count, QuantFormat format, bool staticRowPartition)
     {
         CpuKernelTuning tuning = _tuning;
         int workers = _effectiveThreads;
@@ -108,7 +117,7 @@ public sealed unsafe partial class CpuBackend
         }
 
         WorkerPool pool = GetOrCreatePool();
-        pool.Run((rows + tuning.RowBlock - 1) / tuning.RowBlock, new GemmRowJob(pBytes, pIn, pOut, stride, rows, cols, count, format, _useAvx2, tuning));
+        RunThreadedDispatch(pool, (rows + tuning.RowBlock - 1) / tuning.RowBlock, workers, staticRowPartition, new GemmRowJob(pBytes, pIn, pOut, stride, rows, cols, count, format, _useAvx2, tuning));
     }
 
     // One run of weight rows: they advance through the column walk together, in tiles of GemmTileRows rows so a tile

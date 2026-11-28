@@ -137,6 +137,8 @@ The CPU backend answers `SupportsGemv(QuantFormat) => true` for every current st
 
 Single-vector GEMV participation follows one tuning snapshot: `workers > 1 && rows >= ParallelRowThreshold`. If threaded, block count is `(rows + RowBlock - 1) / RowBlock`; each worker claims whole row blocks and evaluates its own contiguous slice (`src/Lair.Backends.Cpu/CpuBackend.cs`). Batched GEMV follows the same rule after any Q8_K activation staging; each batch vector keeps its own accumulator chain, so grouping changes which vectors share one weight traversal but not per-vector arithmetic.
 
+A second schedule exists for threaded dense *batched* passes and is never selected by an auto posture: `StaticRowPartitionBatchWidth` (qualified seam key `engine.cpu.tuning.static_row_partition_batch_width`, resolved 0 everywhere) engages only when a stated width is nonzero **and** this dispatch's batch count reaches it, on the single-matrix row-walk or tile-executor route. Participant 0 then runs on the calling thread and pool worker *i* hosts participant *i+1*, each owning one contiguous range of canonical blocks (`CpuBackend.StaticPartitionRange`, `WorkerPool.RunStatic`); a claimed range is cleared so wake-ups cannot re-walk it, and `RunStatic` refuses when the pool cannot host `participants − 1` workers. Fused pair/triple traversals, shared-input dot batching, single-vector `GEMV` decode, and unthreaded calls keep dynamic block claiming whatever a seam states (`src/Lair.Backends.Cpu/CpuBackend.cs`, `CpuBackend+Gemm.cs`, `CpuBackend+FusedPair.cs`). Kernel arithmetic is identical under both schedules — only who walks a row changes — so batched output stays bit-identical across counts, ragged tails, and worker counts (`tests/Lair.Tests/StaticRowDispatchTests.cs`); measured posture verdicts belong to [tricks-and-tweaks.md](tricks-and-tweaks.md) entry 7c.
+
 ```mermaid
 sequenceDiagram
   participant Engine as TransformerModel/LayerOps
@@ -150,9 +152,14 @@ sequenceDiagram
   alt rows below ParallelRowThreshold or single worker
     Backend->>Kernel: serial row loop with prefetch hints clamped to owned row region
   else threaded dispatch eligible
-    Backend->>Pool: Run((rows + RowBlock - 1)/RowBlock) with IGemvJob snapshot
-    Pool->>Pool: re-pin configured core mask on wake-up, claim block index
-    Pool->>Kernel: ProcessBlock(row slice) using same evaluator operands/order
+    alt default posture (static row partition width resolves to 0)
+      Backend->>Pool: Run((rows + RowBlock - 1)/RowBlock) with IGemvJob snapshot
+      Pool->>Pool: re-pin configured core mask on wake-up, claim block index
+      Pool->>Kernel: ProcessBlock(row slice) using same evaluator operands/order
+    else static row partition pinned and batch count reaches stated width (single-matrix dense pass only)
+      Backend->>Pool: RunStatic(participants, totalBlocks) over StaticPartitionRange spans
+      Pool->>Kernel: ProcessBlock(own contiguous range) using same evaluator operands/order
+    end
   end
 ```
 
@@ -231,6 +238,8 @@ This is a locality kernel, not an arithmetic variant: prefetch performs no memor
 | `MatmulRouteBatchWidthQ4K` | no public YAML key in current loader vocabulary | qualified override range 0..64 | always 0 unless stated through internal seam | Q4_K blocked matmul remains unpromoted by default. Committed Xeon t8 interleaved lane under `reports/2026-11-27T02-28-33Z-optimize-prefill-q4k-route-ab-interleaved-xeon-t8/summary.md` compares arms `[off, on, 16]`, but every measured delta falls inside its own arm noise band; the code keeps Q4_K auto width at zero. |
 | `Q4KIntegerDotBatchWidth` | no public YAML key in current loader vocabulary | qualified override range 0..64 | always 0 unless stated through internal seam | Internal seam selects the integer-domain AVX2 Q4_K batched dot (`CpuBackend+Q4KIntegerDot.cs`) at/above a stated count, and only when this backend's ISA resolution landed on the AVX2 rung; Vnni or Scalar resolutions keep the float kernels. `q4k-widebatch --integer-dot` (with optional `--integer-chain-group 1..8` arms) measures it beside the float routes with divergence classified rather than asserted identical; promotion stays refused pending committed target-host validation, and no cost claim is stated here. |
 | `SharedInputDotChainGroup` | no public YAML key in current loader vocabulary | qualified override range 0..8 | 8 with vector posture, else 0 | Internal seam controls how many independent shared-operand dot chains share one load of common operand; zero keeps every dot individual. |
+| `PairMatmulRouteBatchWidth` | no public YAML key in current loader vocabulary | qualified override range 0..64 (`engine.cpu.tuning.pair_matmul_route_batch_width`) | always 0 unless stated through internal seam | Would hand a fused pair's two matrices to the tile executor at/above a stated count; no posture promotes it, so the fused traversal stays in force. Bench pin `--pair-matmul-route off|on|N`. Verdict context belongs to [tricks-and-tweaks.md](tricks-and-tweaks.md) entry 6. |
+| `StaticRowPartitionBatchWidth` | no public YAML key in current loader vocabulary | qualified override range 0..64 (`engine.cpu.tuning.static_row_partition_batch_width`) | always 0 unless stated through internal seam | Dispatch-schedule seam, not a kernel choice: at/above a stated batch count each participant of a threaded single-matrix dense pass walks one contiguous canonical row range instead of claiming scheduling blocks. Measured dev-host attribution run `reports/2026-11-28T05-48-20Z-probe-static-row-partitioning-local/` (AVX2 backend, `threads=32`, both Qwen2.5-3B feed-forward shapes) puts it behind dynamic claiming at every count measured and no steadier run-to-run, so promotion stays refused; behavior and refusal semantics in this page's dispatch section and [tricks-and-tweaks.md](tricks-and-tweaks.md) entry 7c. |
 
 Hot-reload classification is explicit: `engine.prefill_kernel` affects new requests only because each request's forward can re-read the resolved selection at window boundaries after validation succeeds, while ISA and tuning pins are facts of opened backend kernels/scratch layout (`src/Lair.Http/Config/ConfigReload.cs`). Model-level thread quota classifies live because kernel calls sample effective worker count per call; core-set changes and placement rebinding require restart semantics documented in [scheduling.md](scheduling.md) and [residency-and-budgets.md](residency-and-budgets.md).
 
@@ -240,5 +249,6 @@ Hot-reload classification is explicit: `engine.prefill_kernel` affects new reque
 - An explicit prefill row width outside `1..64` through the internal seam fails model-open validation; host config cannot state it today, and zero means use plan default (`src/Lair.Models/Engine/TransformerModel.cs`).
 - A `gemm` selection for a prompt-window span whose dense weight formats lack blocked matmul kernels on that span's resolved backend refuses at load naming the model, segment, device, missing format(s), and runnable alternatives; no fallback to another kernel/device occurs (`src/Lair.Models/Engine/TransformerModel.cs`).
 - Out-of-range tuning pins fail with `ArgumentOutOfRangeException` naming qualified key/value/range/rationale rather than clamping silently (`src/Lair.Backends.Cpu/CpuKernelTuning.cs`).
+- A stated static row partition that the opened pool cannot host refuses at dispatch time: `WorkerPool.RunStatic` throws when a partition of *participants* needs more workers than `WorkerCapacity`, naming both numbers, and never falls back to dynamic claiming mid-dispatch. The seam also declines by construction rather than degrading: fused pair/triple traversals, shared-input dot batching, single-vector `GEMV` decode, and unthreaded calls stay on the claim loop whatever `static_row_partition_batch_width` states (`src/Lair.Backends.Cpu/CpuBackend.cs`, `CpuBackend+FusedPair.cs`).
 - A forced gather grid encoding without vector posture fails the internal backend open because gathers use AVX2 staging; host config cannot force it today (`src/Lair.Backends.Cpu/CpuBackend+Grid.cs`, `CpuBackend.cs`).
 - CPU-backed models refuse device-resident KV mirrors: every block handed out by `CpuBackend` stays in host memory, so a mirror request names backend/tier/resource instead of answering with a fake stand-in (`src/Lair.Backends.Cpu/CpuBackend.cs`). Quantized KV pair posture belongs to [kv-cache.md](kv-cache.md).
