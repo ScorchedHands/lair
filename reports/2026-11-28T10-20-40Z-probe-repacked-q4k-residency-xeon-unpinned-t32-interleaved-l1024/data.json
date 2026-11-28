@@ -1,0 +1,54 @@
+{
+  "schema": "lair.report.v1",
+  "runId": "2026-11-28T10-20-40Z-probe-repacked-q4k-residency-xeon-unpinned-t32-interleaved-l1024",
+  "posture": {
+    "hostProfile": "lair-lab",
+    "worktreeCommit": "47efa42f7a289fe5fc61b45448c74d558a6f71fe",
+    "modelFile": "/root/lair-measurements/qwen25-small-cpu/models/qwen2.5-3b-instruct-q4_k_m.gguf",
+    "threads": 32,
+    "pinning": "unpinned process affinity (all host CPUs allowed)",
+    "kernel": "gemv",
+    "rowWidth": 64,
+    "lengths": [1024],
+    "repsPerInvocation": 3,
+    "stageProfile": true,
+    "roundOrder": ["off-r1", "on-r1", "off-r2", "on-r2", "off-r3", "on-r3"]
+  },
+  "arms": {
+    "off": {
+      "engagement": {"stated_width":0,"resolved_width":0,"cap_mb":"auto","admitted_matrices":0,"refused_matrices":0,"resident_backend_bytes":0},
+      "rounds": [
+        {"round":1,"total_ms":192579.320,"attention_output_ms":9393.624,"feed_forward_down_ms":32690.487,"peakWorkingSetMb":2159.1},
+        {"round":2,"total_ms":177372.037,"attention_output_ms":9203.767,"feed_forward_down_ms":31094.101,"peakWorkingSetMb":2154.3},
+        {"round":3,"total_ms":183634.426,"attention_output_ms":9418.333,"feed_forward_down_ms":30702.376,"peakWorkingSetMb":2156.8}
+      ]
+    },
+    "on": {
+      "engagement": {"stated_width":8,"resolved_width":8,"cap_mb":"auto","admitted_matrices":216,"refused_matrices":0,"resident_backend_bytes":2506752000},
+      "rounds": [
+        {"round":1,"total_ms":179506.014,"attention_output_ms":9450.811,"feed_forward_down_ms":32230.565,"peakWorkingSetMb":4546.6},
+        {"round":2,"total_ms":183220.916,"attention_output_ms":9540.108,"feed_forward_down_ms":30909.764,"peakWorkingSetMb":4550.1},
+        {"round":3,"total_ms":187589.844,"attention_output_ms":9234.230,"feed_forward_down_ms":32404.534,"peakWorkingSetMb":4546.8}
+      ]
+    }
+  },
+  "mediansLowerBetter": {
+    "off": {"total_ms":183634.426,"attention_output_ms":9393.624,"feed_forward_down_ms":31094.101},
+    "on": {"total_ms":183220.916,"attention_output_ms":9450.811,"feed_forward_down_ms":32230.565}
+  },
+  "rangesLowerBetterSortedAscending": {
+    "off": {"total_ms":[177372.037,183634.426,192579.320],"attention_output_ms":[9203.767,9393.624,9418.333],"feed_forward_down_ms":[30702.376,31094.101,32690.487]},
+    "on": {"total_ms":[179506.014,183220.916,187589.844],"attention_output_ms":[9234.230,9450.811,9540.108],"feed_forward_down_ms":[30909.764,32230.565,32404.534]}
+  },
+  "deltaPctMediansLowerBetter": {
+    "total_ms":-0.23,
+    "attention_output_ms":0.61,
+    "feed_forward_down_ms":3.65
+  },
+  "memory": {
+    "offPeakWorkingSetMbRange":[2154.3,2156.8,2159.1],
+    "onPeakWorkingSetMbRange":[4546.6,4546.8,4550.1],
+    "residentBackendBytes":2506752000,
+    "admittedMatrices":216
+  }
+}
