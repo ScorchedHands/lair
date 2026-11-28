@@ -1,0 +1,54 @@
+{
+  "schema": "lair.report.v1",
+  "runId": "2026-11-28T08-45-16Z-probe-repacked-q4k-residency-xeon-t8-phys8-interleaved-l256",
+  "posture": {
+    "hostProfile": "lair-lab",
+    "worktreeCommit": "47efa42f7a289fe5fc61b45448c74d558a6f71fe",
+    "modelFile": "/root/lair-measurements/qwen25-small-cpu/models/qwen2.5-3b-instruct-q4_k_m.gguf",
+    "threads": 8,
+    "pinning": "taskset -c 0-15 node0 physical cores",
+    "kernel": "gemv",
+    "rowWidth": 64,
+    "lengths": [256],
+    "repsPerInvocation": 3,
+    "stageProfile": true,
+    "roundOrder": ["off-r1", "on-r1", "off-r2", "on-r2", "off-r3", "on-r3"]
+  },
+  "arms": {
+    "off": {
+      "engagement": {"stated_width":0,"resolved_width":0,"cap_mb":"auto","admitted_matrices":0,"refused_matrices":0,"resident_backend_bytes":0},
+      "rounds": [
+        {"round":1,"total_ms":68068.490,"attention_output_ms":5059.633,"feed_forward_down_ms":22386.754,"peakWorkingSetMb":2012.0},
+        {"round":2,"total_ms":70200.645,"attention_output_ms":5246.869,"feed_forward_down_ms":23199.659,"peakWorkingSetMb":2012.3},
+        {"round":3,"total_ms":71669.936,"attention_output_ms":5179.978,"feed_forward_down_ms":24051.682,"peakWorkingSetMb":2014.0}
+      ]
+    },
+    "on": {
+      "engagement": {"stated_width":8,"resolved_width":8,"cap_mb":"auto","admitted_matrices":216,"refused_matrices":0,"resident_backend_bytes":2506752000},
+      "rounds": [
+        {"round":1,"total_ms":67080.603,"attention_output_ms":3736.751,"feed_forward_down_ms":22069.505,"peakWorkingSetMb":4404.4},
+        {"round":2,"total_ms":67252.470,"attention_output_ms":3886.567,"feed_forward_down_ms":20880.823,"peakWorkingSetMb":4405.2},
+        {"round":3,"total_ms":64517.882,"attention_output_ms":3853.939,"feed_forward_down_ms":19183.136,"peakWorkingSetMb":4403.7}
+      ]
+    }
+  },
+  "mediansLowerBetter": {
+    "off": {"total_ms":70200.645,"attention_output_ms":5179.978,"feed_forward_down_ms":23199.659},
+    "on": {"total_ms":67080.603,"attention_output_ms":3853.939,"feed_forward_down_ms":20880.823}
+  },
+  "rangesLowerBetterSortedAscending": {
+    "off": {"total_ms":[68068.490,70200.645,71669.936],"attention_output_ms":[5059.633,5179.978,5246.869],"feed_forward_down_ms":[22386.754,23199.659,24051.682]},
+    "on": {"total_ms":[64517.882,67080.603,67252.470],"attention_output_ms":[3736.751,3853.939,3886.567],"feed_forward_down_ms":[19183.136,20880.823,22069.505]}
+  },
+  "deltaPctMediansLowerBetter": {
+    "total_ms":-4.44,
+    "attention_output_ms":-25.60,
+    "feed_forward_down_ms":-10.00
+  },
+  "memory": {
+    "offPeakWorkingSetMbRange":[2012.0,2012.3,2014.0],
+    "onPeakWorkingSetMbRange":[4403.7,4404.4,4405.2],
+    "residentBackendBytes":2506752000,
+    "admittedMatrices":216
+  }
+}
