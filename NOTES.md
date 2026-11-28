@@ -70,7 +70,7 @@ Grounded LAIR facts:
 - Seam evidence: local kernels reach ~9 GB/s weight bandwidth vs ≤1.3 implied on `lair-lab` → host-specific uop/clock deficit, not generic kernel quality.
 
 Ranked candidates (each needs `/plan-refine`, then gates in order: `q4k-widebatch` seam separation → window totals → parity):
-- **A. Integer-domain AVX2 Q4_K dot** mirroring llama's instruction shape; biggest expected lever on Broadwell-class hosts.
+- **A. Integer-domain AVX2 Q4_K dot** mirroring llama's instruction shape; biggest expected lever on Broadwell-class hosts — and note LAIR already dispatches `pmaddubsw`/`pmaddwd` vs vpdpbusd by capability probe for the Q8_K i-quants (`src/Lair.Backends.Cpu/CpuIsa.cs`, `CpuBackend+Q8K.cs`), so this candidate extends an existing integer-lane seam rather than inventing one.
 - **B. Chaining on top of that shape**: unpack once per weight row and feed up to 8 activation accumulators — strictly better than llama's one-pair-per-`vec_dot` for wide prefill batches if the register budget survives (int accumulators are cheaper than float chains).
 - **C. Budget-gated repacked residency**: LAIR ledgers/tier budgets hold repacked int8/int16 weight copies only where caps allow; llama pays that memory unconditionally and gates its x86 repack off this host's ISA. Speed bought per budget with explicit refusal semantics.
 - Cheap side item: static contiguous row partitioning (llama-style OpenMP chunking) to attack the 84% auto-arm dispersion at threads=32 without touching kernels.
@@ -79,4 +79,4 @@ Explicitly out: attention-kernel borrowing (crossover shows FF weight traversal 
 
 Open parity question blocking A (recorded in PLAN): integer maddubs/madd accumulation vs DN-M313-2 one-numerics-path + pinned b12032 goldens. Options: documented second numerics path for quantized dense dots; golden regeneration scoped to those paths from b12032 outputs; or keep bit-identity absolute and accept the float cost. My recommended default (owner confirmation needed at `/plan-refine MVP7`): adopt the integer path with shape-scoped golden regeneration — the pinned reference is llama.cpp itself, so matching its arithmetic should strengthen parity culture rather than weaken it, provided every other format keeps the existing contract untouched.
 
-Bookkeeping ideas not yet done: a comparison ledger section in `docs/engine/comparisons.md` pairing each b12032 mechanism with LAIR's seam + measured status (citing tag source and committed report dirs); harness for old-vs-new build alternation already exists (`scripts/run-xeon-alternating-build-ab.py`).
+Bookkeeping status: the comparison ledger now exists as "Pinned-tag mechanism ledger (llama.cpp b12032, as measured)" in `docs/engine/comparisons.md` §2 with the worker-placement amendment; harness for old-vs-new build alternation already exists (`scripts/run-xeon-alternating-build-ab.py`). Still open: `/plan-refine MVP7` parity decision before candidate A code.
